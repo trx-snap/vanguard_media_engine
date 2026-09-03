@@ -3,14 +3,15 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, and focus response diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, and route-change diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
 // Diagnostic-only - drives the production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
-// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through seven
+// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through ten
 // scenarios:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
@@ -19,8 +20,11 @@
 //   5. Repeated forward seek while paused (T1 then T2, third seek rejected) to EOS.
 //   6. Focus duck, restore, transient pause, auto-resume, and noisy terminal pause.
 //   7. Focus permanent loss terminal pause without auto-resume.
+//   8. Route change observation without transport mutation (independently bounded; no disconnect posted).
+//   9. Route disconnect terminal pause, public resume blocked, and routing teardown (independently bounded, fresh PLAYING session).
+//  10. Route disconnect while paused by focus policy: public resume blocked and focus auto-resume blocked.
 //
-// Required proof lanes (37 native lanes plus canonical equals 38 total lanes):
+// Required proof lanes (42 native lanes plus canonical equals 43 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -58,10 +62,15 @@
 //  35. focusNoisyTerminalPauseOk: noisy event triggers terminal pause, subsequent gain ignored
 //  36. focusPermanentLossPauseOk: permanent loss triggers terminal pause, subsequent gain ignored
 //  37. focusMonitorTeardownOk: focus monitor thread exited/joined and controller released cleanly
+//  38. routingSetupOk: routing controller attached and monitor thread started cleanly
+//  39. routeChangeObservationOk: route change observed without mutating transport state
+//  40. routeDisconnectTerminalPauseOk: route disconnect triggers terminal pause with AudioTrack paused at park
+//  41. routeDisconnectResumeBlockedOk: public resume rejected and subsequent focus gain does not auto-resume
+//  42. routingMonitorTeardownOk: routing controller released, monitor thread exited and joined cleanly
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -73,6 +82,8 @@
 //     two ordered forward seeks while paused and verifies third rejected without teardown.
 //   - Audio focus proof operates on synthetic focus change / becoming noisy seams without
 //     requiring real OS phone calls or bluetooth events during headless diagnostic runs.
+//   - Route change and route disconnect proof operates on synthetic route change / disconnect seams without
+//     requiring real OS bluetooth or headphone events during headless diagnostic runs.
 
 import 'dart:async';
 
@@ -136,6 +147,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.focusNoisyTerminalPauseOk,
     required this.focusPermanentLossPauseOk,
     required this.focusMonitorTeardownOk,
+    required this.routingSetupOk,
+    required this.routeChangeObservationOk,
+    required this.routeDisconnectTerminalPauseOk,
+    required this.routeDisconnectResumeBlockedOk,
+    required this.routingMonitorTeardownOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -164,7 +180,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -205,6 +221,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'focusNoisyTerminalPauseOk',
     'focusPermanentLossPauseOk',
     'focusMonitorTeardownOk',
+    'routingSetupOk',
+    'routeChangeObservationOk',
+    'routeDisconnectTerminalPauseOk',
+    'routeDisconnectResumeBlockedOk',
+    'routingMonitorTeardownOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -347,6 +368,21 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether audio focus controller released, monitor thread exited and joined cleanly.
   final bool focusMonitorTeardownOk;
 
+  /// Whether audio routing setup and monitor thread start succeeded.
+  final bool routingSetupOk;
+
+  /// Whether route change observation succeeded without transport mutation.
+  final bool routeChangeObservationOk;
+
+  /// Whether route disconnect triggered terminal pause with AudioTrack paused at park.
+  final bool routeDisconnectTerminalPauseOk;
+
+  /// Whether public resume was rejected and subsequent focus gain did not auto-resume.
+  final bool routeDisconnectResumeBlockedOk;
+
+  /// Whether routing controller was released and monitor thread exited and joined cleanly.
+  final bool routingMonitorTeardownOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -414,7 +450,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       focusTransientPauseResumeOk &&
       focusNoisyTerminalPauseOk &&
       focusPermanentLossPauseOk &&
-      focusMonitorTeardownOk;
+      focusMonitorTeardownOk &&
+      routingSetupOk &&
+      routeChangeObservationOk &&
+      routeDisconnectTerminalPauseOk &&
+      routeDisconnectResumeBlockedOk &&
+      routingMonitorTeardownOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -476,6 +517,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         focusNoisyTerminalPauseOk: false,
         focusPermanentLossPauseOk: false,
         focusMonitorTeardownOk: false,
+        routingSetupOk: false,
+        routeChangeObservationOk: false,
+        routeDisconnectTerminalPauseOk: false,
+        routeDisconnectResumeBlockedOk: false,
+        routingMonitorTeardownOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -612,6 +658,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final focusNoisyTerminalPauseOk = parseBool('focusNoisyTerminalPauseOk');
     final focusPermanentLossPauseOk = parseBool('focusPermanentLossPauseOk');
     final focusMonitorTeardownOk = parseBool('focusMonitorTeardownOk');
+    final routingSetupOk = parseBool('routingSetupOk');
+    final routeChangeObservationOk = parseBool('routeChangeObservationOk');
+    final routeDisconnectTerminalPauseOk = parseBool(
+      'routeDisconnectTerminalPauseOk',
+    );
+    final routeDisconnectResumeBlockedOk = parseBool(
+      'routeDisconnectResumeBlockedOk',
+    );
+    final routingMonitorTeardownOk = parseBool('routingMonitorTeardownOk');
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -657,7 +712,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         focusTransientPauseResumeOk &&
         focusNoisyTerminalPauseOk &&
         focusPermanentLossPauseOk &&
-        focusMonitorTeardownOk;
+        focusMonitorTeardownOk &&
+        routingSetupOk &&
+        routeChangeObservationOk &&
+        routeDisconnectTerminalPauseOk &&
+        routeDisconnectResumeBlockedOk &&
+        routingMonitorTeardownOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -755,6 +815,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'focusNoisyTerminalPauseOk': focusNoisyTerminalPauseOk,
       'focusPermanentLossPauseOk': focusPermanentLossPauseOk,
       'focusMonitorTeardownOk': focusMonitorTeardownOk,
+      'routingSetupOk': routingSetupOk,
+      'routeChangeObservationOk': routeChangeObservationOk,
+      'routeDisconnectTerminalPauseOk': routeDisconnectTerminalPauseOk,
+      'routeDisconnectResumeBlockedOk': routeDisconnectResumeBlockedOk,
+      'routingMonitorTeardownOk': routingMonitorTeardownOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -804,6 +869,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       focusNoisyTerminalPauseOk: focusNoisyTerminalPauseOk,
       focusPermanentLossPauseOk: focusPermanentLossPauseOk,
       focusMonitorTeardownOk: focusMonitorTeardownOk,
+      routingSetupOk: routingSetupOk,
+      routeChangeObservationOk: routeChangeObservationOk,
+      routeDisconnectTerminalPauseOk: routeDisconnectTerminalPauseOk,
+      routeDisconnectResumeBlockedOk: routeDisconnectResumeBlockedOk,
+      routingMonitorTeardownOk: routingMonitorTeardownOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -891,6 +961,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       focusNoisyTerminalPauseOk: false,
       focusPermanentLossPauseOk: false,
       focusMonitorTeardownOk: false,
+      routingSetupOk: false,
+      routeChangeObservationOk: false,
+      routeDisconnectTerminalPauseOk: false,
+      routeDisconnectResumeBlockedOk: false,
+      routingMonitorTeardownOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1029,6 +1104,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.focusNoisyTerminalPauseOk == focusNoisyTerminalPauseOk &&
         other.focusPermanentLossPauseOk == focusPermanentLossPauseOk &&
         other.focusMonitorTeardownOk == focusMonitorTeardownOk &&
+        other.routingSetupOk == routingSetupOk &&
+        other.routeChangeObservationOk == routeChangeObservationOk &&
+        other.routeDisconnectTerminalPauseOk ==
+            routeDisconnectTerminalPauseOk &&
+        other.routeDisconnectResumeBlockedOk ==
+            routeDisconnectResumeBlockedOk &&
+        other.routingMonitorTeardownOk == routingMonitorTeardownOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1079,6 +1161,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     focusNoisyTerminalPauseOk,
     focusPermanentLossPauseOk,
     focusMonitorTeardownOk,
+    routingSetupOk,
+    routeChangeObservationOk,
+    routeDisconnectTerminalPauseOk,
+    routeDisconnectResumeBlockedOk,
+    routingMonitorTeardownOk,
     canonical,
   ]);
 
@@ -1110,6 +1197,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'focusNoisyTerminalPauseOk: $focusNoisyTerminalPauseOk, '
       'focusPermanentLossPauseOk: $focusPermanentLossPauseOk, '
       'focusMonitorTeardownOk: $focusMonitorTeardownOk, '
+      'routingSetupOk: $routingSetupOk, '
+      'routeChangeObservationOk: $routeChangeObservationOk, '
+      'routeDisconnectTerminalPauseOk: $routeDisconnectTerminalPauseOk, '
+      'routeDisconnectResumeBlockedOk: $routeDisconnectResumeBlockedOk, '
+      'routingMonitorTeardownOk: $routingMonitorTeardownOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 
@@ -1160,4 +1252,55 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Number of auto-resume transitions applied after ignored gain event.
   int get ignoredGainAutoResumeCount =>
       (metrics['ignoredGainAutoResumeCount'] as num?)?.toInt() ?? 0;
+
+  // ---- Routing Telemetry Getters ----------------------------------------
+
+  /// Whether audio routing response was enabled.
+  bool get routingEnabled => metrics['routingEnabled'] == true;
+
+  /// Whether routing controller is attached.
+  bool get routingControllerAttached =>
+      metrics['routingControllerAttached'] == true;
+
+  /// Whether routing controller is released.
+  bool get routingControllerReleased =>
+      metrics['routingControllerReleased'] == true;
+
+  /// Number of routing attach attempts.
+  int get routingAttachCount =>
+      (metrics['routingAttachCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of routing detach attempts.
+  int get routingDetachCount =>
+      (metrics['routingDetachCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of route change transitions applied.
+  int get routeChangedAppliedCount =>
+      (metrics['routeChangedAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of route disconnect transitions applied.
+  int get routeDisconnectAppliedCount =>
+      (metrics['routeDisconnectAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Whether terminal route disconnect was triggered.
+  bool get routingTerminalDisconnect =>
+      metrics['routingTerminalDisconnect'] == true;
+
+  /// Whether playback was paused by routing policy.
+  bool get routingPausedByPolicy => metrics['routingPausedByPolicy'] == true;
+
+  /// Last observed routing action string.
+  String get routingLastAction =>
+      metrics['routingLastAction']?.toString() ?? '';
+
+  /// Last observed routing reason string.
+  String get routingLastReason =>
+      metrics['routingLastReason']?.toString() ?? '';
+
+  /// Whether public resume call was accepted during routing disconnect proof.
+  bool get publicResumeAccepted => metrics['publicResumeAccepted'] == true;
+
+  /// Public resume rejection reason during routing disconnect proof.
+  String get publicResumeReason =>
+      metrics['publicResumeReason']?.toString() ?? '';
 }

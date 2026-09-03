@@ -12,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -62,6 +62,11 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'focusNoisyTerminalPauseOk': true,
     'focusPermanentLossPauseOk': true,
     'focusMonitorTeardownOk': true,
+    'routingSetupOk': true,
+    'routeChangeObservationOk': true,
+    'routeDisconnectTerminalPauseOk': true,
+    'routeDisconnectResumeBlockedOk': true,
+    'routingMonitorTeardownOk': true,
     'canonical': true,
   };
 
@@ -165,6 +170,19 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'focusState': 'held',
     'sinkEffectiveGain': 0.5,
     'duckGain': 0.1,
+    'routingEnabled': true,
+    'routingControllerAttached': false,
+    'routingControllerReleased': true,
+    'routingAttachCount': 1,
+    'routingDetachCount': 1,
+    'routeChangedAppliedCount': 1,
+    'routeDisconnectAppliedCount': 1,
+    'routingTerminalDisconnect': true,
+    'routingPausedByPolicy': true,
+    'routingLastAction': 'terminal_disconnect',
+    'routingLastReason': 'route_disconnect',
+    'publicResumeAccepted': false,
+    'publicResumeReason': 'routing_terminal_disconnect',
     'failureReason': '',
     'lastError': 'none',
   };
@@ -177,7 +195,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b/Y9/Y10b/Y11b realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS',
+        'Y8a/Y8b/Y9/Y10b/Y11b/Y12 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -246,11 +264,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(37),
+        equals(42),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(38),
+        equals(43),
       );
 
       final expectedLanes = <String>[
@@ -291,6 +309,11 @@ void main() {
         'focusNoisyTerminalPauseOk',
         'focusPermanentLossPauseOk',
         'focusMonitorTeardownOk',
+        'routingSetupOk',
+        'routeChangeObservationOk',
+        'routeDisconnectTerminalPauseOk',
+        'routeDisconnectResumeBlockedOk',
+        'routingMonitorTeardownOk',
         'canonical',
       ];
 
@@ -354,6 +377,11 @@ void main() {
       expect(report.focusNoisyTerminalPauseOk, isTrue);
       expect(report.focusPermanentLossPauseOk, isTrue);
       expect(report.focusMonitorTeardownOk, isTrue);
+      expect(report.routingSetupOk, isTrue);
+      expect(report.routeChangeObservationOk, isTrue);
+      expect(report.routeDisconnectTerminalPauseOk, isTrue);
+      expect(report.routeDisconnectResumeBlockedOk, isTrue);
+      expect(report.routingMonitorTeardownOk, isTrue);
       expect(report.focusEnabled, isTrue);
       expect(report.focusDuckAppliedCount, equals(1));
       expect(report.focusGainRestoreAppliedCount, equals(1));
@@ -366,6 +394,19 @@ void main() {
       expect(report.ignoredGainAutoResumeCount, equals(1));
       expect(report.focusState, equals('held'));
       expect(report.sinkEffectiveGain, equals(0.5));
+      expect(report.routingEnabled, isTrue);
+      expect(report.routingControllerAttached, isFalse);
+      expect(report.routingControllerReleased, isTrue);
+      expect(report.routingAttachCount, equals(1));
+      expect(report.routingDetachCount, equals(1));
+      expect(report.routeChangedAppliedCount, equals(1));
+      expect(report.routeDisconnectAppliedCount, equals(1));
+      expect(report.routingTerminalDisconnect, isTrue);
+      expect(report.routingPausedByPolicy, isTrue);
+      expect(report.routingLastAction, equals('terminal_disconnect'));
+      expect(report.routingLastReason, equals('route_disconnect'));
+      expect(report.publicResumeAccepted, isFalse);
+      expect(report.publicResumeReason, equals('routing_terminal_disconnect'));
       expect(report.canonical, isTrue);
       expect(report.allRequiredNonCanonicalLanesPass, isTrue);
 
@@ -640,6 +681,125 @@ void main() {
         expect(report.status, equals('missing_lane'));
         expect(report.lastError, equals('missing_lane_$lane'));
       }
+    });
+
+    test('missing one new required Y11b lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'focusSetupOk',
+        'focusDuckRestoreOk',
+        'focusTransientPauseResumeOk',
+        'focusNoisyTerminalPauseOk',
+        'focusPermanentLossPauseOk',
+        'focusMonitorTeardownOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test('missing one new required Y12 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'routingSetupOk',
+        'routeChangeObservationOk',
+        'routeDisconnectTerminalPauseOk',
+        'routeDisconnectResumeBlockedOk',
+        'routingMonitorTeardownOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test(
+      'new Y12 routing metric keys parse and are present in metrics map',
+      () {
+        final report = _createSampleReport();
+        expect(report.metrics.containsKey('routingEnabled'), isTrue);
+        expect(report.metrics['routingEnabled'], isTrue);
+        expect(report.metrics.containsKey('routingControllerAttached'), isTrue);
+        expect(report.metrics['routingControllerAttached'], isFalse);
+        expect(report.metrics.containsKey('routingControllerReleased'), isTrue);
+        expect(report.metrics['routingControllerReleased'], isTrue);
+        expect(report.metrics.containsKey('routingAttachCount'), isTrue);
+        expect(report.metrics['routingAttachCount'], equals(1));
+        expect(report.metrics.containsKey('routingDetachCount'), isTrue);
+        expect(report.metrics['routingDetachCount'], equals(1));
+        expect(report.metrics.containsKey('routeChangedAppliedCount'), isTrue);
+        expect(report.metrics['routeChangedAppliedCount'], equals(1));
+        expect(
+          report.metrics.containsKey('routeDisconnectAppliedCount'),
+          isTrue,
+        );
+        expect(report.metrics['routeDisconnectAppliedCount'], equals(1));
+        expect(report.metrics.containsKey('routingTerminalDisconnect'), isTrue);
+        expect(report.metrics['routingTerminalDisconnect'], isTrue);
+        expect(report.metrics.containsKey('routingPausedByPolicy'), isTrue);
+        expect(report.metrics['routingPausedByPolicy'], isTrue);
+        expect(report.metrics.containsKey('routingLastAction'), isTrue);
+        expect(
+          report.metrics['routingLastAction'],
+          equals('terminal_disconnect'),
+        );
+        expect(report.metrics.containsKey('routingLastReason'), isTrue);
+        expect(report.metrics['routingLastReason'], equals('route_disconnect'));
+        expect(report.metrics.containsKey('publicResumeAccepted'), isTrue);
+        expect(report.metrics['publicResumeAccepted'], isFalse);
+        expect(report.metrics.containsKey('publicResumeReason'), isTrue);
+        expect(
+          report.metrics['publicResumeReason'],
+          equals('routing_terminal_disconnect'),
+        );
+      },
+    );
+
+    test('report details contains all three Y12 route scenarios', () {
+      final report = _createSampleReport();
+      expect(
+        report.details.contains('SCENARIO_ROUTE_CHANGE_OBSERVATION'),
+        isTrue,
+      );
+      expect(
+        report.details.contains('SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE'),
+        isTrue,
+      );
+      expect(
+        report.details.contains('SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED'),
+        isTrue,
+      );
     });
 
     test('fail map with deadObjectBaseStepBounded=false fails validation', () {

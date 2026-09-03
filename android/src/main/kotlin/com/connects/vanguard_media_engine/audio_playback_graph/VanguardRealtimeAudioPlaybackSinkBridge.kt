@@ -78,6 +78,18 @@ import kotlin.concurrent.withLock
 // decomposed into lost frames + publication lag for the proof lane only.
 // Any unarmed (real) or second ERROR_DEAD_OBJECT fails closed; the
 // replacement's final release still goes through [releaseAudioTrackOnce].
+//
+// Routing (Y12, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE), default
+// off ([Config.routingController] absent): this bridge owns ONLY the
+// android.media.AudioTrack listener attach/detach lifecycle of an optional
+// caller-owned [VanguardRealtimePlaybackRoutingController] -- attach once
+// gain is applied on a newly created AudioTrack (fail closed on attach
+// failure), detach/release before this bridge's own final AudioTrack
+// release, and detach-then-reattach across a Y8b dead-object replacement
+// (attach before that replacement's play() / remainder resume, fail closed
+// on attach failure). This bridge never polls, drains or reacts to a
+// routing event; the caller-owned monitor consuming the SAME controller's
+// queue is the only consumer (see [VanguardRealtimeAudioPlaybackSession]).
 class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     data class Config(
@@ -102,6 +114,11 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         // Y8b diagnostic seam, default OFF (0): arms exactly one synthetic
         // ERROR_DEAD_OBJECT once this many frames were written (class comment).
         val syntheticDeadObjectInjectAfterFrames: Long = 0L,
+        // Y12 production route-change/disconnect response, default OFF
+        // (absent): when present, this bridge attaches/detaches its
+        // OnRoutingChangedListener lifecycle (class comment); it never
+        // consumes a routing event itself.
+        val routingController: VanguardRealtimePlaybackRoutingController? = null,
     )
 
     enum class Phase { SETUP, READY, RUNNING, PARK_REQUESTED, PARKED, EXITED }
@@ -690,6 +707,11 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (track.setVolume(config.gain) != AudioTrack.SUCCESS) throw FailClosed("audio_track_set_volume_failed")
         gainValue = config.gain
         gainSetOk = config.gain > 0f
+        // Y12: attach only after the AudioTrack is initialized and its gain
+        // applied (class comment); fail closed before anything is drained.
+        config.routingController?.let { routing ->
+            if (!routing.attach(track)) throw FailClosed("routing_listener_attach_failed:${routing.lastAttachError}")
+        }
     }
 
     // Bounded, cancel-aware wait for the session's allowDrain().
@@ -845,6 +867,16 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         clockWriter.deadObjectEpochCloseAccepted = closeOutcome.accepted
         if (!closeOutcome.accepted) throw FailClosed("dead_object_epoch_close_rejected:${closeOutcome.name.lowercase()}")
 
+        // Step 1.5 (Y12): detach the routing listener from the dying
+        // instance before it is released, mirroring [releaseAudioTrackOnce].
+        // A genuine detach failure (something was attached and the removal
+        // itself threw) fails closed rather than releasing a track a
+        // listener may still reference.
+        val routing = config.routingController
+        if (routing != null && routing.isAttached && !routing.detach()) {
+            throw FailClosed("routing_listener_detach_failed_before_dead_object_release:${routing.lastDetachError}")
+        }
+
         // Step 2: release the old instance once (never the final releaseCounter);
         // a dead object accepts no control calls, so no stop/flush precedes it.
         audioTrack = null
@@ -883,6 +915,16 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (newTrack.setVolume(recoveryGain) != AudioTrack.SUCCESS) throw FailClosed("recreated_audio_track_set_volume_failed")
         clockWriter.deadObjectNewTrackVolumeOk = true
         gainValue = recoveryGain
+
+        // Step 4.5 (Y12): attach the routing listener to the replacement
+        // instance before play()/remainder resume, so no routing callback
+        // can ever target a track without a listener across the handoff;
+        // fail closed if the replacement attach itself fails.
+        if (routing != null) {
+            if (!routing.attach(newTrack)) {
+                throw FailClosed("routing_listener_attach_failed_after_dead_object:${routing.lastAttachError}")
+            }
+        }
 
         // Step 5: play; MODE_STREAM consumes once the remainder lands.
         newTrack.play()
@@ -1185,6 +1227,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val track = audioTrack ?: return
         audioTrack = null
         if (releaseCounter.get() > 0) return
+        // Y12: release/detach the routing controller before this AudioTrack
+        // is stopped/released (class comment); idempotent even if the
+        // owning session already released the SAME controller.
+        config.routingController?.release()
         releaseExecutedOnSinkThread = Thread.currentThread().id == threadId
         try {
             playbackHeadFinal = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL

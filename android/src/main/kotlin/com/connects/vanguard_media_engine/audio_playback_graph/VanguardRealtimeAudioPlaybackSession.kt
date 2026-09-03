@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.SystemClock
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackAudioFocusController.Tag as FocusTag
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession.Reply
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackRoutingController.Tag as RoutingTag
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine.State as TransportState
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -120,6 +121,50 @@ import kotlin.concurrent.withLock
 // controller queue; both are false when focus response is disabled. All of
 // this is published through [Snapshot.focus] as
 // [VanguardRealtimeAudioPlaybackFocusTelemetry].
+//
+// Production route-change/disconnect response (Y12, P4-AUDIO-REALTIME-
+// PLAYBACK-PRODUCTION-ROUTE-CHANGE), default OFF
+// ([Config.enableAudioRoutingResponse]): this session owns exactly one
+// [VanguardRealtimePlaybackRoutingController] and exactly one routing
+// monitor thread that is its only event consumer, mirroring the Y11b focus
+// monitor (Opus Option B) rather than introducing a second consumer
+// pattern. The controller is created before the sink exists (so
+// [VanguardRealtimeAudioPlaybackSinkBridge.Config.routingController] can
+// receive the SAME instance) and the monitor itself only starts once the
+// sink is READY, before the transport starts (class comment order): the
+// sink owns ONLY the AudioTrack listener attach/detach lifecycle (attach
+// after the AudioTrack is initialized and gain applied; detach/release
+// before its own final AudioTrack release; detach-then-reattach across a
+// Y8b dead-object replacement before play/remainder resume) and never
+// consumes a routing event itself.
+// ROUTE_CHANGED is observation-only (counted, no transport command).
+// ROUTE_DISCONNECT is a terminal fail-closed pause: it sets
+// [routingTerminalDisconnect] before anything else, then (only when
+// PLAYING) runs the SAME bounded pause order as the public API
+// ([pauseBoundedLocked]); once set, the terminal flag is never cleared by
+// this session, so both the public [resume] and the Y11b FOCUS_GAIN
+// auto-resume path reject/skip a resume with routing_terminal_disconnect
+// while it holds. A rise in the controller's droppedCount fails the whole
+// session closed (routing_event_dropped) rather than parking, unlike the
+// focus monitor's queue-drop handling, because a dropped route event's
+// consequence for the current output device is unknown and cannot be
+// treated as merely transient. Teardown signals the monitor to stop,
+// releases commandLock while joining it bounded (same pattern as the focus
+// monitor), then releases the controller; the sink bridge also releases
+// the SAME controller before its own final AudioTrack release, so
+// whichever runs first performs the actual listener detach (idempotent).
+// [postSyntheticRouteChanged] / [postSyntheticRouteDisconnect] are a
+// diagnostic seam onto the same controller queue; both are false when
+// routing response is disabled. All of this is published through
+// [Snapshot.routing] as [VanguardRealtimeAudioPlaybackRoutingTelemetry].
+//
+// Modularity note: this session file stays a single cohesive class rather
+// than being split by lifecycle concern. Y12 is another additive,
+// default-OFF lifecycle extension of the existing production session/sink
+// model (seek, focus, now routing), grouped with its siblings under
+// matching "── Y<n> ... internals ──" sections below; extracting it would
+// separate tightly command-lock-coupled state without reducing the actual
+// coordination the class performs.
 class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
 
     data class Config(
@@ -160,6 +205,15 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val focusGainApplyTimeoutMs: Long = 500L,
         // Bounded join of the focus monitor thread at teardown.
         val focusMonitorJoinMs: Long = 1000L,
+        // Y12 production route-change/disconnect response, default OFF
+        // (false): every field below is validated only when this is true
+        // (class comment). Reuses [mainHandler] above (already required by
+        // Y11b) as the routing listener's callback Handler.
+        val enableAudioRoutingResponse: Boolean = false,
+        // Bounded slice the routing monitor blocks on the controller's queue per iteration.
+        val routingEventPollMs: Long = 10L,
+        // Bounded join of the routing monitor thread at teardown.
+        val routingMonitorJoinMs: Long = 1000L,
     )
 
     enum class State { IDLE, STARTING, PLAYING, PAUSED, SEEKING, COMPLETED, STOPPED, FAILED, DISPOSED }
@@ -227,6 +281,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val sessionWallMs: Long,
         val seek: VanguardRealtimeAudioPlaybackSeekObservation,
         val focus: VanguardRealtimeAudioPlaybackFocusTelemetry,
+        val routing: VanguardRealtimeAudioPlaybackRoutingTelemetry,
     )
 
     companion object {
@@ -363,6 +418,27 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     @Volatile private var lastFocusAction = ""
     @Volatile private var lastFocusReason = ""
 
+    // Y12 production route-change/disconnect response (command-lock-confined
+    // mutation of the transport-facing flags; the monitor thread otherwise
+    // single-writes its own bookkeeping below, published through
+    // [buildRoutingTelemetry] / [Snapshot.routing]).
+    @Volatile private var routingController: VanguardRealtimePlaybackRoutingController? = null
+    @Volatile private var routingMonitorThread: Thread? = null
+    private val routingMonitorShutdown = AtomicBoolean(false)
+    @Volatile private var routingMonitorStarted = false
+    @Volatile private var routingMonitorExited = false
+    @Volatile private var routingMonitorJoined = false
+    @Volatile private var routingMonitorThreadId = -1L
+    @Volatile private var routingTerminalDisconnect = false
+    @Volatile private var routingPausedByPolicy = false
+    @Volatile private var routeChangedAppliedCount = 0L
+    @Volatile private var routeDisconnectAppliedCount = 0L
+    @Volatile private var lastRoutingEventTag = ""
+    @Volatile private var lastRoutingEventSeq = -1L
+    @Volatile private var lastRoutingEventSource = ""
+    @Volatile private var lastRoutingAction = ""
+    @Volatile private var lastRoutingReason = ""
+
     val currentState: State get() = state
     val failureReason: String get() = failure.get() ?: ""
 
@@ -442,6 +518,14 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             if (config.focusEventPollMs <= 0L) return failClosed("invalid_focus_event_poll_ms")
             if (config.focusGainApplyTimeoutMs <= 0L) return failClosed("invalid_focus_gain_apply_timeout_ms")
             if (config.focusMonitorJoinMs <= 0L) return failClosed("invalid_focus_monitor_join_ms")
+        }
+        // Y12: validated only when enabled (class comment); mainHandler is
+        // required independently here so routing can be enabled without
+        // focus response also being on.
+        if (config.enableAudioRoutingResponse) {
+            if (config.mainHandler == null) return failClosed("routing_main_handler_required")
+            if (config.routingEventPollMs <= 0L) return failClosed("invalid_routing_event_poll_ms")
+            if (config.routingMonitorJoinMs <= 0L) return failClosed("invalid_routing_monitor_join_ms")
         }
         state = State.STARTING
         // Only an accepted start attempt (validation above already passed)
@@ -575,6 +659,18 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             focusState = "held"
         }
 
+        // Y12 production route-change/disconnect response, default OFF:
+        // this session owns exactly one [VanguardRealtimePlaybackRoutingController],
+        // created before the sink so its [VanguardRealtimeAudioPlaybackSinkBridge.Config]
+        // can be handed the SAME instance to attach/detach against its
+        // AudioTrack (class comment). The monitor thread itself is NOT
+        // started here, mirroring Y11b: only once the sink exists and is
+        // READY, below.
+        if (config.enableAudioRoutingResponse) {
+            val routingHandler = config.mainHandler ?: throw FailClosed("routing_main_handler_required")
+            routingController = VanguardRealtimePlaybackRoutingController(routingHandler)
+        }
+
         // Sink exists and is READY (AudioTrack created, gain set) before the
         // transport starts; it only drains after allowDrain().
         val s = VanguardRealtimeAudioPlaybackSinkBridge(
@@ -592,6 +688,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                 externallyCancelled = { cancelled.get() },
                 onExited = { reason -> onSinkExited(reason) },
                 syntheticDeadObjectInjectAfterFrames = config.syntheticDeadObjectInjectAfterFrames,
+                routingController = routingController,
             ),
         )
         sink = s
@@ -615,6 +712,18 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             focusMonitorThread = monitor
             monitor.start()
             focusMonitorStarted = true
+        }
+
+        // Y12: the ONE session-owned routing monitor thread starts only now
+        // that the sink exists and is READY, and strictly before
+        // transport.start/allowDrain below (class comment / Y11b
+        // precedent), so a ROUTE_CHANGED/ROUTE_DISCONNECT can always find a
+        // live sink and command path to react against.
+        if (config.enableAudioRoutingResponse) {
+            val monitor = Thread({ runRoutingMonitor() }, "${config.threadNamePrefix}RoutingMonitor")
+            routingMonitorThread = monitor
+            monitor.start()
+            routingMonitorStarted = true
         }
 
         val startRes = machine.start()
@@ -674,7 +783,11 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // transport.resume -> sink unpark -> ack (AudioTrack.play, new epoch).
     // A user resume always sets user intent (Y11b); the focus monitor's own
     // auto-resume goes through [resumeLocked] directly and never touches it.
+    // Y12: a terminal route disconnect must reject without mutating any
+    // session flags, so [routingTerminalDisconnect] is checked before
+    // [userIntentPlaying] is ever set.
     fun resume(): CommandResult = commandLock.withLock {
+        if (routingTerminalDisconnect) return reject("routing_terminal_disconnect")
         userIntentPlaying = true
         resumeLocked()
     }
@@ -684,6 +797,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // resume); never mutates [userIntentPlaying].
     private fun resumeLocked(): CommandResult {
         if (state != State.PAUSED) return reject("invalid_state_${state.name.lowercase()}")
+        // Y12: a terminal route disconnect fails any resume closed-off
+        // (never cleared by this session) without altering state or flags.
+        if (routingTerminalDisconnect) return reject("routing_terminal_disconnect")
         failure.get()?.let { return failClosed(it) }
         val s = sink ?: return failClosed("sink_missing")
         val machine = transport ?: return failClosed("transport_missing")
@@ -789,6 +905,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         // join itself only happens at teardown.
         focusMonitorShutdown.set(true)
         focusMonitorThread?.takeIf { it.isAlive && Thread.currentThread() !== it }?.interrupt()
+        // Y12: same non-blocking wake for the routing monitor (if any).
+        routingMonitorShutdown.set(true)
+        routingMonitorThread?.takeIf { it.isAlive && Thread.currentThread() !== it }?.interrupt()
     }
 
     // Y11b diagnostic seam (any thread): posts one synthetic focus-change /
@@ -804,6 +923,21 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     fun postSyntheticBecomingNoisy(): Boolean {
         if (!config.enableAudioFocusResponse) return false
         return focusController?.postSyntheticBecomingNoisy() ?: false
+    }
+
+    // Y12 diagnostic seam (any thread): posts one synthetic route-changed /
+    // route-disconnect event onto the SAME controller queue the routing
+    // monitor drains, so it is indistinguishable from a real OS callback /
+    // policy trigger. False whenever routing response is disabled or the
+    // controller is absent or already released (never throws).
+    fun postSyntheticRouteChanged(): Boolean {
+        if (!config.enableAudioRoutingResponse) return false
+        return routingController?.postSyntheticRouteChanged() ?: false
+    }
+
+    fun postSyntheticRouteDisconnect(): Boolean {
+        if (!config.enableAudioRoutingResponse) return false
+        return routingController?.postSyntheticRouteDisconnect() ?: false
     }
 
     // ── Waits (any thread; lock-free) ──────────────────────────────────────
@@ -956,6 +1090,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                 decoder = f?.seekTelemetry(),
             ),
             focus = buildFocusTelemetry(),
+            routing = buildRoutingTelemetry(),
         )
     }
 
@@ -1036,6 +1171,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         if (!teardownDone.compareAndSet(false, true)) return
         cancelled.set(true)
         shutdownAndJoinFocusMonitorUnlocked()
+        shutdownAndJoinRoutingMonitorUnlocked()
         val s = sink
         val f = feed
         s?.cancel()
@@ -1163,8 +1299,11 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                     // pause was ours, we are actually PAUSED and neither
                     // terminal-loss flag is set (functional requirement 4).
                     commandLock.withLock {
+                        // Y12: a terminal route disconnect blocks this
+                        // auto-resume the same way it blocks a public
+                        // [resume] call, without clearing the flag.
                         if (userIntentPlaying && focusPausedByPolicy && state == State.PAUSED &&
-                            !focusTerminalPermanentLoss && !focusTerminalNoisyLoss
+                            !focusTerminalPermanentLoss && !focusTerminalNoisyLoss && !routingTerminalDisconnect
                         ) {
                             if (resumeLocked().accepted) {
                                 lastFocusAction = "auto_resume"
@@ -1296,6 +1435,155 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             lastEventSource = lastFocusEventSource,
             lastAction = lastFocusAction,
             lastReason = lastFocusReason,
+        )
+    }
+
+    // ── Y12 production route-change/disconnect response internals ──────────
+
+    // Command-lock holder only, called from [teardownLocked]. Mirrors
+    // [shutdownAndJoinFocusMonitorUnlocked]: releases commandLock while
+    // joining the routing monitor thread (whose only lock use is a short,
+    // bounded commandLock.withLock around one ROUTE_DISCONNECT reaction),
+    // then reacquires the lock before returning. Never joins the monitor
+    // from its own thread. Release here is idempotent even though the sink
+    // bridge already releases the SAME controller before its own final
+    // AudioTrack release (class comment); whichever runs first performs the
+    // actual listener detach.
+    private fun shutdownAndJoinRoutingMonitorUnlocked() {
+        val controller = routingController ?: return
+        routingMonitorShutdown.set(true)
+        val t = routingMonitorThread
+        if (t != null && t.isAlive && Thread.currentThread() !== t) {
+            t.interrupt()
+            commandLock.unlock()
+            try {
+                t.join(config.routingMonitorJoinMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                commandLock.lock()
+            }
+        }
+        routingMonitorJoined = t == null || !t.isAlive
+        controller.release()
+    }
+
+    // The session's ONE routing monitor thread and the controller's ONE
+    // event consumer (mirrors [runFocusMonitor], Opus Option B).
+    // Bounded-slices on the controller's queue so [routingMonitorShutdown] /
+    // [cancelled] are re-checked regularly; never holds commandLock across
+    // that wait, only around one event's transport-command reaction.
+    private fun runRoutingMonitor() {
+        routingMonitorThreadId = Thread.currentThread().id
+        val controller = routingController
+        if (controller == null) {
+            routingMonitorExited = true
+            return
+        }
+        var lastDropped = controller.droppedCount
+        try {
+            while (!routingMonitorShutdown.get() && !cancelled.get()) {
+                val event = try {
+                    controller.awaitEvent(config.routingEventPollMs) { !routingMonitorShutdown.get() && !cancelled.get() }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    null
+                }
+                if (routingMonitorShutdown.get() || cancelled.get()) break
+                if (event != null) handleRoutingEvent(event)
+                val dropped = controller.droppedCount
+                if (dropped > lastDropped) {
+                    lastDropped = dropped
+                    handleRoutingEventDropped()
+                }
+            }
+        } catch (t: Throwable) {
+            commandLock.withLock { failClosed("routing_monitor_exception:${t.javaClass.simpleName}:${t.message}") }
+        } finally {
+            routingMonitorExited = true
+        }
+    }
+
+    // Routing monitor thread only. ROUTE_CHANGED is observation-only
+    // (telemetry: applied count, last seq/source/action); no transport
+    // command runs for it. ROUTE_DISCONNECT is a terminal fail-closed pause
+    // (class comment): set the terminal flag first (so it stays set even if
+    // the transport was already PAUSED for another reason, and no racing
+    // resume can slip past it), then pause through the SAME bounded pause
+    // order as the public API only when PLAYING; the applied count and
+    // [routingPausedByPolicy] are only bumped on an accepted pause.
+    private fun handleRoutingEvent(event: VanguardRealtimePlaybackRoutingController.Event) {
+        lastRoutingEventTag = event.tag.name
+        lastRoutingEventSeq = event.seq
+        lastRoutingEventSource = event.source.name
+        when (event.tag) {
+            RoutingTag.ROUTE_CHANGED -> {
+                lastRoutingAction = "observed"
+                lastRoutingReason = "route_changed"
+                routeChangedAppliedCount++
+            }
+            RoutingTag.ROUTE_DISCONNECT -> {
+                lastRoutingAction = "terminal_disconnect"
+                lastRoutingReason = "route_disconnect"
+                routingTerminalDisconnect = true
+                commandLock.withLock {
+                    // Already PAUSED (e.g. by focus policy): the terminal
+                    // flag above still stands; no pause is attempted here
+                    // and the FOCUS_GAIN auto-resume gate now also checks
+                    // !routingTerminalDisconnect, so nothing auto-resumes it.
+                    if (state == State.PLAYING) {
+                        if (pauseBoundedLocked().accepted) {
+                            routingPausedByPolicy = true
+                            routeDisconnectAppliedCount++
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Routing monitor thread only: the controller's queue was full at
+    // offer() time, so the dropped event's routing consequence for the
+    // current output device is unknown and unrecoverable; unlike the focus
+    // monitor's queue-drop (which only parks), this fails the whole session
+    // closed (class comment).
+    private fun handleRoutingEventDropped() {
+        lastRoutingAction = "dropped_fail_closed"
+        lastRoutingReason = "routing_event_dropped"
+        commandLock.withLock { failClosed("routing_event_dropped") }
+    }
+
+    // Any thread, lock-free: mirrors the controller's own counters live
+    // (its accessors stay valid after release()) plus this session's
+    // single-writer bookkeeping. Disabled / not-yet-set-up sessions report
+    // enabled=false / empty defaults without needing a separate branch.
+    private fun buildRoutingTelemetry(): VanguardRealtimeAudioPlaybackRoutingTelemetry {
+        val controller = routingController
+        return VanguardRealtimeAudioPlaybackRoutingTelemetry(
+            enabled = config.enableAudioRoutingResponse,
+            controllerAttached = controller?.isAttached ?: false,
+            controllerReleased = controller?.isReleased ?: false,
+            attachCount = controller?.attachCount ?: 0,
+            detachCount = controller?.detachCount ?: 0,
+            lastAttachError = controller?.lastAttachError ?: "",
+            lastDetachError = controller?.lastDetachError ?: "",
+            monitorStarted = routingMonitorStarted,
+            monitorExited = routingMonitorExited,
+            monitorJoined = routingMonitorJoined,
+            monitorThreadId = routingMonitorThreadId,
+            eventsEnqueued = controller?.enqueuedCount ?: 0L,
+            eventsDrained = controller?.drainedCount ?: 0L,
+            eventsDropped = controller?.droppedCount ?: 0L,
+            eventsPending = controller?.pendingCount ?: 0,
+            routeChangedAppliedCount = routeChangedAppliedCount,
+            routeDisconnectAppliedCount = routeDisconnectAppliedCount,
+            routingTerminalDisconnect = routingTerminalDisconnect,
+            routingPausedByPolicy = routingPausedByPolicy,
+            lastEventTag = lastRoutingEventTag,
+            lastEventSeq = lastRoutingEventSeq,
+            lastEventSource = lastRoutingEventSource,
+            lastAction = lastRoutingAction,
+            lastReason = lastRoutingReason,
         )
     }
 

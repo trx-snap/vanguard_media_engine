@@ -25,19 +25,23 @@ import java.util.concurrent.atomic.AtomicLong
 //   Handler as a real callback, so it enters the queue on the same thread
 //   and path.
 // - postSyntheticRouteDisconnect -> ROUTE_DISCONNECT enqueued synchronously
-//   on the caller's (sink run) thread so it is applied at the very next
-//   drain point on that same thread (X11 precedent: no main-handler wait).
-//   There is no OS source for ROUTE_DISCONNECT; it is synthetic-only.
+//   on the calling thread so it is visible to the consumer at the very next
+//   drain point (X11 precedent: no main-handler wait). There is no OS
+//   source for ROUTE_DISCONNECT; it is synthetic-only.
 //
-// Nothing is ever applied here: the sink pops events on its own run thread
-// at explicit drain points and applies them itself. No AudioTrack mutation
-// happens from any callback.
+// Nothing is ever applied here: this controller only queues typed events.
+// For Y12 production, the session's own routing monitor thread is the sole
+// consumer, popping events at its own drain points and applying them
+// itself; the sink bridge never drains this queue and owns only listener
+// attach/detach/release. No AudioTrack mutation happens from any callback.
 //
 // Fail-closed rules:
 // - attach/detach exceptions are recorded and reported as false; they never
 //   propagate.
-// - A full queue drops the event and increments [droppedCount]; the sink
-//   gates any non-zero drop count to a failed verdict.
+// - A full queue drops the event and increments [droppedCount]; for Y12
+//   production, the session-owned routing monitor detects droppedCount growth
+//   and fails the session closed with routing_event_dropped; the sink bridge
+//   owns only listener attach/detach and never drains/gates events.
 // - Callbacks arriving while no listener is attached or after [release] are
 //   counted, not enqueued.
 // - [release] is idempotent: it detaches the listener at most once when it

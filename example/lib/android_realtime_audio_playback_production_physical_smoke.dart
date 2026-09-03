@@ -3,15 +3,16 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, and focus response diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, and route-change diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -23,6 +24,8 @@
 //     two ordered forward seeks while paused and verifies third rejected without teardown.
 //   - Audio focus proof operates on synthetic focus change / becoming noisy seams without
 //     requiring real OS phone calls or bluetooth events during headless diagnostic runs.
+//   - Route change and route disconnect proof operates on synthetic route change / disconnect seams without
+//     requiring real OS bluetooth or headphone events during headless diagnostic runs.
 //
 // This is a component diagnostic smoke. It must not claim
 // product/editor/UI/ConnectsApp/iOS/streaming/cache/CPP/JNI proof.
@@ -31,7 +34,7 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'io_stub.dart' if (dart.library.io) 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -61,7 +64,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek & Focus Response smoke...';
+      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response & Route-Change smoke...';
 
   @override
   void initState() {
@@ -138,6 +141,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       print('Selected fixture path: $selectedFixturePath');
 
       // 2. Invoke wrapper over production component diagnostic route.
+      const physicalSmokeTimeout = Duration(seconds: 180);
       report =
           await VGRealtimeAudioPlaybackProductionSmokeReport.runRealtimeAudioPlaybackProductionSmoke(
             sourcePath: selectedFixturePath,
@@ -153,7 +157,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
             preSeekHoldWindows: 64,
             maxSeekHoldMs: 15000,
             duckGain: 0.1,
-            timeout: const Duration(seconds: 40),
+            timeout: physicalSmokeTimeout,
           );
     } on TimeoutException catch (te) {
       topLevelError = 'timeout: $te';
@@ -269,6 +273,19 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [LANE] focusMonitorTeardownOk: ${activeReport.focusMonitorTeardownOk}',
     );
+    print('  [LANE] routingSetupOk: ${activeReport.routingSetupOk}');
+    print(
+      '  [LANE] routeChangeObservationOk: ${activeReport.routeChangeObservationOk}',
+    );
+    print(
+      '  [LANE] routeDisconnectTerminalPauseOk: ${activeReport.routeDisconnectTerminalPauseOk}',
+    );
+    print(
+      '  [LANE] routeDisconnectResumeBlockedOk: ${activeReport.routeDisconnectResumeBlockedOk}',
+    );
+    print(
+      '  [LANE] routingMonitorTeardownOk: ${activeReport.routingMonitorTeardownOk}',
+    );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -287,6 +304,12 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     const focusDuckTransientNoisyScenarioKey =
         'SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY';
     const focusPermanentLossScenarioKey = 'SCENARIO_FOCUS_PERMANENT_LOSS';
+    const routeChangeObservationScenarioKey =
+        'SCENARIO_ROUTE_CHANGE_OBSERVATION';
+    const routeDisconnectTerminalPauseScenarioKey =
+        'SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE';
+    const routeDisconnectFocusGainBlockedScenarioKey =
+        'SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -309,6 +332,15 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final focusPermanentLossMetrics = asStringKeyedMap(
       topMetrics[focusPermanentLossScenarioKey],
+    );
+    final routeChangeObservationMetrics = asStringKeyedMap(
+      topMetrics[routeChangeObservationScenarioKey],
+    );
+    final routeDisconnectTerminalPauseMetrics = asStringKeyedMap(
+      topMetrics[routeDisconnectTerminalPauseScenarioKey],
+    );
+    final routeDisconnectFocusGainBlockedMetrics = asStringKeyedMap(
+      topMetrics[routeDisconnectFocusGainBlockedScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -445,6 +477,36 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       'duckGain',
     };
 
+    const routingScenarioOwnedKeys = <String>{
+      'routingEnabled',
+      'routingControllerAttached',
+      'routingControllerReleased',
+      'routingAttachCount',
+      'routingDetachCount',
+      'routingLastAttachError',
+      'routingLastDetachError',
+      'routingMonitorStarted',
+      'routingMonitorExited',
+      'routingMonitorJoined',
+      'routingMonitorThreadId',
+      'routingEventsEnqueued',
+      'routingEventsDrained',
+      'routingEventsDropped',
+      'routingEventsPending',
+      'routeChangedAppliedCount',
+      'routeDisconnectAppliedCount',
+      'routingTerminalDisconnect',
+      'routingPausedByPolicy',
+      'routingLastEventTag',
+      'routingLastEventSeq',
+      'routingLastEventSource',
+      'routingLastAction',
+      'routingLastReason',
+      'publicResumeAccepted',
+      'publicResumeReason',
+      'afterRejectedResumeState',
+    };
+
     bool isFocusPermanentLossMetric(String key) {
       return key == 'focusPausePermanentAppliedCount' ||
           key == 'focusTerminalPermanentLoss';
@@ -454,6 +516,12 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       return key.startsWith('focus') ||
           key.startsWith('ignoredGain') ||
           focusScenarioOwnedKeys.contains(key);
+    }
+
+    bool isRoutingOwnedMetric(String key) {
+      return key.startsWith('routing') ||
+          key.startsWith('route') ||
+          routingScenarioOwnedKeys.contains(key);
     }
 
     bool isDeadObjectOwnedMetric(String key) {
@@ -476,15 +544,34 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     }
 
     Object? lookupMetric(String key) {
+      if (isRoutingOwnedMetric(key)) {
+        return topMetrics[key] ??
+            routeChangeObservationMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeDisconnectFocusGainBlockedMetrics[key] ??
+            playthroughMetrics[key] ??
+            stopDisposeMetrics[key] ??
+            deadObjectMetrics[key] ??
+            forwardSeekMetrics[key] ??
+            repeatedSeekMetrics[key] ??
+            focusDuckTransientNoisyMetrics[key] ??
+            focusPermanentLossMetrics[key];
+      }
       if (isFocusPermanentLossMetric(key)) {
         return topMetrics[key] ??
             focusPermanentLossMetrics[key] ??
-            focusDuckTransientNoisyMetrics[key];
+            focusDuckTransientNoisyMetrics[key] ??
+            routeDisconnectFocusGainBlockedMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeChangeObservationMetrics[key];
       }
       if (isFocusOwnedMetric(key)) {
         return topMetrics[key] ??
             focusDuckTransientNoisyMetrics[key] ??
             focusPermanentLossMetrics[key] ??
+            routeDisconnectFocusGainBlockedMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeChangeObservationMetrics[key] ??
             playthroughMetrics[key] ??
             stopDisposeMetrics[key] ??
             deadObjectMetrics[key] ??
@@ -499,7 +586,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
             stopDisposeMetrics[key] ??
             deadObjectMetrics[key] ??
             focusDuckTransientNoisyMetrics[key] ??
-            focusPermanentLossMetrics[key];
+            focusPermanentLossMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeChangeObservationMetrics[key];
       }
       if (isForwardSeekOwnedMetric(key)) {
         return forwardSeekMetrics[key] ??
@@ -509,7 +598,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
             stopDisposeMetrics[key] ??
             deadObjectMetrics[key] ??
             focusDuckTransientNoisyMetrics[key] ??
-            focusPermanentLossMetrics[key];
+            focusPermanentLossMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeChangeObservationMetrics[key];
       }
       if (isDeadObjectOwnedMetric(key)) {
         return deadObjectMetrics[key] ??
@@ -519,6 +610,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
             repeatedSeekMetrics[key] ??
             focusDuckTransientNoisyMetrics[key] ??
             focusPermanentLossMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeChangeObservationMetrics[key] ??
             topMetrics[key];
       }
       return topMetrics[key] ??
@@ -528,7 +621,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           forwardSeekMetrics[key] ??
           repeatedSeekMetrics[key] ??
           focusDuckTransientNoisyMetrics[key] ??
-          focusPermanentLossMetrics[key];
+          focusPermanentLossMetrics[key] ??
+          routeDisconnectTerminalPauseMetrics[key] ??
+          routeChangeObservationMetrics[key];
     }
 
     Map<String, Object?> extractCompactScenario(
@@ -731,6 +826,99 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       focusCompactKeys,
     );
 
+    const routeChangeObservationCompactKeys = <String>[
+      'routingEnabled',
+      'routingControllerAttached',
+      'routingControllerReleased',
+      'routingAttachCount',
+      'routingDetachCount',
+      'routingMonitorStarted',
+      'routingMonitorExited',
+      'routingMonitorJoined',
+      'routingMonitorThreadId',
+      'routingEventsEnqueued',
+      'routingEventsDrained',
+      'routingEventsDropped',
+      'routingEventsPending',
+      'routeChangedAppliedBaseline',
+      'routeChangedAppliedCount',
+      'routeDisconnectAppliedCount',
+      'routingTerminalDisconnect',
+      'routingLastAction',
+      'routingLastReason',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRouteChangeObservation = extractCompactScenario(
+      routeChangeObservationMetrics,
+      routeChangeObservationCompactKeys,
+    );
+
+    const routeDisconnectTerminalPauseCompactKeys = <String>[
+      'routingEnabled',
+      'routingControllerAttached',
+      'routingControllerReleased',
+      'routingAttachCount',
+      'routingDetachCount',
+      'routingMonitorStarted',
+      'routingMonitorExited',
+      'routingMonitorJoined',
+      'routingMonitorThreadId',
+      'routingEventsEnqueued',
+      'routingEventsDrained',
+      'routingEventsDropped',
+      'routingEventsPending',
+      'routeDisconnectAppliedBaseline',
+      'routeDisconnectAppliedCount',
+      'routingTerminalDisconnect',
+      'routingPausedByPolicy',
+      'routingLastAction',
+      'routingLastReason',
+      'publicResumeAccepted',
+      'publicResumeReason',
+      'afterRejectedResumeState',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRouteDisconnectTerminalPause = extractCompactScenario(
+      routeDisconnectTerminalPauseMetrics,
+      routeDisconnectTerminalPauseCompactKeys,
+    );
+
+    const routeFocusBlockedCompactKeys = <String>[
+      'routingEnabled',
+      'routingControllerAttached',
+      'routingControllerReleased',
+      'routingAttachCount',
+      'routingDetachCount',
+      'routingMonitorStarted',
+      'routingMonitorExited',
+      'routingMonitorJoined',
+      'routingMonitorThreadId',
+      'routingTerminalDisconnect',
+      'routingLastEventTag',
+      'routingLastAction',
+      'pauseTransientAppliedCount',
+      'focusPausedByPolicy',
+      'ignoredGainEventsDrained',
+      'ignoredGainRestoreAppliedCount',
+      'ignoredGainAutoResumeCount',
+      'focusPausedByPolicyAfterGain',
+      'routingTerminalDisconnectAfterGain',
+      'publicResumeAccepted',
+      'publicResumeReason',
+      'afterRejectedResumeState',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRouteDisconnectFocusGainBlocked = extractCompactScenario(
+      routeDisconnectFocusGainBlockedMetrics,
+      routeFocusBlockedCompactKeys,
+    );
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -881,6 +1069,51 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       '  [METRIC] ignoredGainAutoResumeCount: ${lookupMetric('ignoredGainAutoResumeCount')}',
     );
     print('  [METRIC] sinkEffectiveGain: ${lookupMetric('sinkEffectiveGain')}');
+    print('  [METRIC] routingEnabled: ${lookupMetric('routingEnabled')}');
+    print(
+      '  [METRIC] routingControllerAttached: ${lookupMetric('routingControllerAttached')}',
+    );
+    print(
+      '  [METRIC] routingControllerReleased: ${lookupMetric('routingControllerReleased')}',
+    );
+    print(
+      '  [METRIC] routingAttachCount: ${lookupMetric('routingAttachCount')}',
+    );
+    print(
+      '  [METRIC] routingDetachCount: ${lookupMetric('routingDetachCount')}',
+    );
+    print(
+      '  [METRIC] routingMonitorStarted: ${lookupMetric('routingMonitorStarted')}',
+    );
+    print(
+      '  [METRIC] routingMonitorExited: ${lookupMetric('routingMonitorExited')}',
+    );
+    print(
+      '  [METRIC] routingMonitorJoined: ${lookupMetric('routingMonitorJoined')}',
+    );
+    print(
+      '  [METRIC] routeChangedAppliedCount: ${lookupMetric('routeChangedAppliedCount')}',
+    );
+    print(
+      '  [METRIC] routeDisconnectAppliedCount: ${lookupMetric('routeDisconnectAppliedCount')}',
+    );
+    print(
+      '  [METRIC] routingTerminalDisconnect: ${lookupMetric('routingTerminalDisconnect')}',
+    );
+    print(
+      '  [METRIC] routingPausedByPolicy: ${lookupMetric('routingPausedByPolicy')}',
+    );
+    print('  [METRIC] routingLastAction: ${lookupMetric('routingLastAction')}');
+    print('  [METRIC] routingLastReason: ${lookupMetric('routingLastReason')}');
+    print(
+      '  [METRIC] publicResumeAccepted: ${lookupMetric('publicResumeAccepted')}',
+    );
+    print(
+      '  [METRIC] publicResumeReason: ${lookupMetric('publicResumeReason')}',
+    );
+    print(
+      '  [METRIC] routingTerminalDisconnectAfterGain: ${lookupMetric('routingTerminalDisconnectAfterGain')}',
+    );
     print('  [METRIC] failureReason: ${activeReport.failureReason}');
     print('  [METRIC] lastError: ${activeReport.lastError}');
     print('--- SCENARIO METRICS ---');
@@ -894,6 +1127,15 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     print(
       '  [SCENARIO] $focusPermanentLossScenarioKey: $compactFocusPermanentLoss',
+    );
+    print(
+      '  [SCENARIO] $routeChangeObservationScenarioKey: $compactRouteChangeObservation',
+    );
+    print(
+      '  [SCENARIO] $routeDisconnectTerminalPauseScenarioKey: $compactRouteDisconnectTerminalPause',
+    );
+    print(
+      '  [SCENARIO] $routeDisconnectFocusGainBlockedScenarioKey: $compactRouteDisconnectFocusGainBlocked',
     );
 
     // 5. Verification evaluation.
@@ -912,13 +1154,18 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       repeatedSeekScenarioKey: compactRepeatedSeek,
       focusDuckTransientNoisyScenarioKey: compactFocusDuckTransientNoisy,
       focusPermanentLossScenarioKey: compactFocusPermanentLoss,
+      routeChangeObservationScenarioKey: compactRouteChangeObservation,
+      routeDisconnectTerminalPauseScenarioKey:
+          compactRouteDisconnectTerminalPause,
+      routeDisconnectFocusGainBlockedScenarioKey:
+          compactRouteDisconnectFocusGainBlocked,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE',
-      'subSlice': 'Y11b',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE',
+      'subSlice': 'Y12',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
@@ -1032,6 +1279,27 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           'ignoredGainAutoResumeCount',
         ),
         'sinkEffectiveGain': lookupMetric('sinkEffectiveGain'),
+        'routingEnabled': lookupMetric('routingEnabled'),
+        'routingControllerAttached': lookupMetric('routingControllerAttached'),
+        'routingControllerReleased': lookupMetric('routingControllerReleased'),
+        'routingAttachCount': lookupMetric('routingAttachCount'),
+        'routingDetachCount': lookupMetric('routingDetachCount'),
+        'routingMonitorStarted': lookupMetric('routingMonitorStarted'),
+        'routingMonitorExited': lookupMetric('routingMonitorExited'),
+        'routingMonitorJoined': lookupMetric('routingMonitorJoined'),
+        'routeChangedAppliedCount': lookupMetric('routeChangedAppliedCount'),
+        'routeDisconnectAppliedCount': lookupMetric(
+          'routeDisconnectAppliedCount',
+        ),
+        'routingTerminalDisconnect': lookupMetric('routingTerminalDisconnect'),
+        'routingPausedByPolicy': lookupMetric('routingPausedByPolicy'),
+        'routingLastAction': lookupMetric('routingLastAction'),
+        'routingLastReason': lookupMetric('routingLastReason'),
+        'publicResumeAccepted': lookupMetric('publicResumeAccepted'),
+        'publicResumeReason': lookupMetric('publicResumeReason'),
+        'routingTerminalDisconnectAfterGain': lookupMetric(
+          'routingTerminalDisconnectAfterGain',
+        ),
       },
       'error': topLevelError,
     };

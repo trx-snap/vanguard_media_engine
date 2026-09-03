@@ -37,6 +37,11 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_COMMAND
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_THIRD_REJECT
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_MONITOR_TEARDOWN
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_SETUP
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTE_CHANGE_OBSERVATION
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTE_DISCONNECT_RESUME_BLOCKED
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SEEK_CLOCK_EPOCH
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SEEK_COMMAND
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SEEK_QUIESCE_ACCOUNTING
@@ -49,7 +54,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.PROOF_BOUNDARY_TOKENS
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.REQUIRED_LANES
 
-// Per-invocation Y8a/Y8b/Y9/Y10b/Y11b smoke arguments, shared by scenario sequencing
+// Per-invocation Y8a/Y8b/Y9/Y10b/Y11b/Y12 smoke arguments, shared by scenario sequencing
 // (coordinator) and lane evaluation (this file).
 data class SmokeConfig(
     val sourcePath: String,
@@ -135,10 +140,18 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             final.transportState == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
             final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED && final.transportStopAccepted &&
             final.transportFailedCallbacks == 0
-        val monitorThreadOk = if (final.focus.monitorThreadId > 0L) {
+        val focusMonitorThreadOk = if (final.focus.monitorThreadId > 0L) {
             final.focus.monitorThreadId != coordinatorThreadId &&
                 final.focus.monitorThreadId != sink.threadId &&
                 final.focus.monitorThreadId != final.decoderThreadId
+        } else {
+            true
+        }
+        val routingMonitorThreadOk = if (final.routing.monitorThreadId > 0L) {
+            final.routing.monitorThreadId != coordinatorThreadId &&
+                final.routing.monitorThreadId != sink.threadId &&
+                final.routing.monitorThreadId != final.decoderThreadId &&
+                final.routing.monitorThreadId != final.focus.monitorThreadId
         } else {
             true
         }
@@ -148,7 +161,7 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
             final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
             sink.audioTrackCallsOffSinkThread == 0L && clock.offWriterThreadCalls == 0L && clock.writerThreadId == sink.threadId &&
-            monitorThreadOk
+            focusMonitorThreadOk && routingMonitorThreadOk
         out.lanes[LANE_NO_FEEDBACK] = sink.drainRequestSizeChanges == 0L && sink.timestampMaxPollsInOnePass <= 1L &&
             sink.timestampPollAttempts <= sink.productiveDrainPasses &&
             sink.timestampPollAttempts == clock.timestampSuccessCount + clock.timestampUnavailableCount &&
@@ -775,6 +788,295 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.lanes[LANE_FOCUS_MONITOR_TEARDOWN] = final.focus.controllerReleased &&
             final.focus.monitorExited &&
             final.focus.monitorJoined &&
+            sink.releaseCount == 1 &&
+            sink.releaseExecutedOnSinkThread &&
+            final.sinkJoined &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            final.transportDisposeCalls == 1 &&
+            final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
+            final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
+            final.failureReason.isBlank()
+    }
+
+    // Y12 lane: route change observation only (independently bounded scenario, no
+    // disconnect ever posted). Uses a monotonic baseline increase on
+    // routeChangedAppliedCount rather than an exact-equality check so a real OS
+    // ROUTE_CHANGED callback racing the synthetic one cannot skip the check past the
+    // polling loop and starve the whole scenario on the session's own deadline.
+    fun evaluateRouteChangeObservation(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterStart: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterRouteChange: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+        coordinatorThreadId: Long,
+    ) {
+        val sink = final.sink ?: return
+        val playing = VanguardRealtimePlaybackTransportStateMachine.State.PLAYING
+
+        out.metrics["routeChangedAppliedBaseline"] = afterStart.routing.routeChangedAppliedCount
+        out.metrics["routeChangedAppliedCount"] = afterRouteChange.routing.routeChangedAppliedCount
+        out.metrics["routeDisconnectAppliedCount"] = afterRouteChange.routing.routeDisconnectAppliedCount
+        out.metrics["routingTerminalDisconnect"] = afterRouteChange.routing.routingTerminalDisconnect
+        out.metrics["routingMonitorThreadId"] = afterStart.routing.monitorThreadId
+        out.metrics["routingAttachCount"] = afterStart.routing.attachCount
+        out.metrics["routingDetachCount"] = final.routing.detachCount
+
+        val focusMonitorThreadOk = if (final.focus.monitorThreadId > 0L) {
+            final.focus.monitorThreadId != coordinatorThreadId &&
+                final.focus.monitorThreadId != sink.threadId &&
+                final.focus.monitorThreadId != final.decoderThreadId
+        } else {
+            true
+        }
+        val routingMonitorThreadOk = final.routing.monitorThreadId > 0L &&
+            final.routing.monitorThreadId != coordinatorThreadId &&
+            final.routing.monitorThreadId != sink.threadId &&
+            final.routing.monitorThreadId != final.decoderThreadId &&
+            (final.focus.monitorThreadId == 0L || final.routing.monitorThreadId != final.focus.monitorThreadId)
+
+        out.lanes[LANE_THREAD_OWNERSHIP] = final.decoderThreadId > 0L && sink.threadId > 0L &&
+            final.decoderThreadId != sink.threadId &&
+            final.decoderThreadId != coordinatorThreadId && sink.threadId != coordinatorThreadId &&
+            !final.decoderThreadIsTransportOwner && !sink.threadIsTransportOwner &&
+            final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
+            final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
+            sink.audioTrackCallsOffSinkThread == 0L &&
+            focusMonitorThreadOk && routingMonitorThreadOk
+
+        out.lanes[LANE_PROOF_BOUNDARY] = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
+
+        out.lanes[LANE_ROUTING_SETUP] = afterStart.routing.enabled &&
+            afterStart.routing.controllerAttached &&
+            afterStart.routing.attachCount == 1 &&
+            afterStart.routing.monitorStarted &&
+            routingMonitorThreadOk &&
+            afterStart.routing.eventsDropped == 0L &&
+            final.routing.eventsDropped == 0L
+
+        out.lanes[LANE_ROUTE_CHANGE_OBSERVATION] = afterRouteChange.routing.routeChangedAppliedCount >=
+            afterStart.routing.routeChangedAppliedCount + 1L &&
+            afterRouteChange.routing.lastEventTag == "ROUTE_CHANGED" &&
+            afterRouteChange.routing.lastAction == "observed" &&
+            (afterRouteChange.routing.lastEventSource == "SYNTHETIC" || afterRouteChange.routing.lastEventSource == "OS_ROUTING_CALLBACK") &&
+            afterRouteChange.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING &&
+            afterRouteChange.transportState == playing &&
+            !afterRouteChange.routing.routingTerminalDisconnect &&
+            afterRouteChange.routing.routeDisconnectAppliedCount == afterStart.routing.routeDisconnectAppliedCount
+
+        out.lanes[LANE_ROUTING_MONITOR_TEARDOWN] = final.routing.controllerReleased &&
+            !final.routing.controllerAttached &&
+            final.routing.detachCount >= 1 &&
+            final.routing.monitorExited &&
+            final.routing.monitorJoined &&
+            final.routing.eventsPending == 0 &&
+            final.routing.eventsDropped == 0L &&
+            sink.releaseCount == 1 &&
+            sink.releaseExecutedOnSinkThread &&
+            final.sinkJoined &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            final.transportDisposeCalls == 1 &&
+            final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
+            final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
+            final.failureReason.isBlank()
+    }
+
+    // Y12 lane: route disconnect terminal pause -> public resume rejected -> routing
+    // teardown (independently bounded scenario, fresh PLAYING session so the native
+    // bounded-pause path runs and routeDisconnectAppliedCount is a valid monotonic
+    // proof signal here).
+    fun evaluateRouteDisconnectTerminalPause(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterStart: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterDisconnect: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterRejectedResume: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        resumeRes: VanguardRealtimeAudioPlaybackSession.CommandResult,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+        coordinatorThreadId: Long,
+    ) {
+        val sink = final.sink ?: return
+        val paused = VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+
+        out.metrics["routeDisconnectAppliedBaseline"] = afterStart.routing.routeDisconnectAppliedCount
+        out.metrics["routeDisconnectAppliedCount"] = afterDisconnect.routing.routeDisconnectAppliedCount
+        out.metrics["routingTerminalDisconnect"] = afterDisconnect.routing.routingTerminalDisconnect
+        out.metrics["routingPausedByPolicy"] = afterDisconnect.routing.routingPausedByPolicy
+        out.metrics["publicResumeAccepted"] = resumeRes.accepted
+        out.metrics["publicResumeReason"] = resumeRes.reason
+        out.metrics["afterRejectedResumeState"] = afterRejectedResume.state.name
+        out.metrics["routingMonitorThreadId"] = afterStart.routing.monitorThreadId
+        out.metrics["routingAttachCount"] = afterStart.routing.attachCount
+        out.metrics["routingDetachCount"] = final.routing.detachCount
+
+        val focusMonitorThreadOk = if (final.focus.monitorThreadId > 0L) {
+            final.focus.monitorThreadId != coordinatorThreadId &&
+                final.focus.monitorThreadId != sink.threadId &&
+                final.focus.monitorThreadId != final.decoderThreadId
+        } else {
+            true
+        }
+        val routingMonitorThreadOk = final.routing.monitorThreadId > 0L &&
+            final.routing.monitorThreadId != coordinatorThreadId &&
+            final.routing.monitorThreadId != sink.threadId &&
+            final.routing.monitorThreadId != final.decoderThreadId &&
+            (final.focus.monitorThreadId == 0L || final.routing.monitorThreadId != final.focus.monitorThreadId)
+
+        out.lanes[LANE_THREAD_OWNERSHIP] = final.decoderThreadId > 0L && sink.threadId > 0L &&
+            final.decoderThreadId != sink.threadId &&
+            final.decoderThreadId != coordinatorThreadId && sink.threadId != coordinatorThreadId &&
+            !final.decoderThreadIsTransportOwner && !sink.threadIsTransportOwner &&
+            final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
+            final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
+            sink.audioTrackCallsOffSinkThread == 0L &&
+            focusMonitorThreadOk && routingMonitorThreadOk
+
+        out.lanes[LANE_PROOF_BOUNDARY] = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
+
+        out.lanes[LANE_ROUTING_SETUP] = afterStart.routing.enabled &&
+            afterStart.routing.controllerAttached &&
+            afterStart.routing.attachCount == 1 &&
+            afterStart.routing.monitorStarted &&
+            routingMonitorThreadOk &&
+            afterStart.routing.eventsDropped == 0L &&
+            final.routing.eventsDropped == 0L
+
+        val disconnectSink = afterDisconnect.sink
+        out.lanes[LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE] = afterDisconnect.routing.routingTerminalDisconnect &&
+            afterDisconnect.routing.routingPausedByPolicy &&
+            afterDisconnect.routing.routeDisconnectAppliedCount >= afterStart.routing.routeDisconnectAppliedCount + 1L &&
+            afterDisconnect.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterDisconnect.transportState == paused &&
+            disconnectSink != null &&
+            disconnectSink.playStateAtPark == AudioTrack.PLAYSTATE_PAUSED &&
+            disconnectSink.parkCount >= 1 &&
+            !resumeRes.accepted &&
+            resumeRes.reason == "routing_terminal_disconnect" &&
+            resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterRejectedResume.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterRejectedResume.transportState == paused &&
+            afterRejectedResume.routing.routingTerminalDisconnect
+
+        out.lanes[LANE_ROUTING_MONITOR_TEARDOWN] = final.routing.controllerReleased &&
+            !final.routing.controllerAttached &&
+            final.routing.detachCount >= 1 &&
+            final.routing.monitorExited &&
+            final.routing.monitorJoined &&
+            final.routing.eventsPending == 0 &&
+            final.routing.eventsDropped == 0L &&
+            sink.releaseCount == 1 &&
+            sink.releaseExecutedOnSinkThread &&
+            final.sinkJoined &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            final.transportDisposeCalls == 1 &&
+            final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
+            final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
+            final.failureReason.isBlank()
+    }
+
+    // Y12 lanes (Scenario 10): route disconnect while paused by focus policy ->
+    // focus auto-resume blocked -> public resume rejected.
+    fun evaluateRouteDisconnectFocusGainBlocked(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterStart: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterTransientPause: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterDisconnect: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterIgnoredGain: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterRejectedResume: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        resumeRes: VanguardRealtimeAudioPlaybackSession.CommandResult,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+        coordinatorThreadId: Long,
+    ) {
+        val sink = final.sink ?: return
+        val paused = VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+
+        out.metrics["pauseTransientAppliedCount"] = afterTransientPause.focus.pauseTransientAppliedCount
+        out.metrics["focusPausedByPolicy"] = afterTransientPause.focus.focusPausedByPolicy
+        out.metrics["routingTerminalDisconnect"] = afterDisconnect.routing.routingTerminalDisconnect
+        out.metrics["routingLastEventTag"] = afterDisconnect.routing.lastEventTag
+        out.metrics["routingLastAction"] = afterDisconnect.routing.lastAction
+        out.metrics["ignoredGainEventsDrained"] = afterIgnoredGain.focus.eventsDrained
+        out.metrics["ignoredGainRestoreAppliedCount"] = afterIgnoredGain.focus.gainRestoreAppliedCount
+        out.metrics["ignoredGainAutoResumeCount"] = afterIgnoredGain.focus.autoResumeAppliedCount
+        out.metrics["focusPausedByPolicyAfterGain"] = afterIgnoredGain.focus.focusPausedByPolicy
+        out.metrics["routingTerminalDisconnectAfterGain"] = afterIgnoredGain.routing.routingTerminalDisconnect
+        out.metrics["publicResumeAccepted"] = resumeRes.accepted
+        out.metrics["publicResumeReason"] = resumeRes.reason
+        out.metrics["afterRejectedResumeState"] = afterRejectedResume.state.name
+        out.metrics["routingMonitorThreadId"] = afterStart.routing.monitorThreadId
+        out.metrics["routingAttachCount"] = afterStart.routing.attachCount
+        out.metrics["routingDetachCount"] = final.routing.detachCount
+
+        val focusMonitorThreadOk = if (final.focus.monitorThreadId > 0L) {
+            final.focus.monitorThreadId != coordinatorThreadId &&
+                final.focus.monitorThreadId != sink.threadId &&
+                final.focus.monitorThreadId != final.decoderThreadId
+        } else {
+            true
+        }
+        val routingMonitorThreadOk = final.routing.monitorThreadId > 0L &&
+            final.routing.monitorThreadId != coordinatorThreadId &&
+            final.routing.monitorThreadId != sink.threadId &&
+            final.routing.monitorThreadId != final.decoderThreadId &&
+            (final.focus.monitorThreadId == 0L || final.routing.monitorThreadId != final.focus.monitorThreadId)
+
+        out.lanes[LANE_THREAD_OWNERSHIP] = final.decoderThreadId > 0L && sink.threadId > 0L &&
+            final.decoderThreadId != sink.threadId &&
+            final.decoderThreadId != coordinatorThreadId && sink.threadId != coordinatorThreadId &&
+            !final.decoderThreadIsTransportOwner && !sink.threadIsTransportOwner &&
+            final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
+            final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
+            sink.audioTrackCallsOffSinkThread == 0L &&
+            focusMonitorThreadOk && routingMonitorThreadOk
+
+        out.lanes[LANE_PROOF_BOUNDARY] = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
+
+        out.lanes[LANE_ROUTING_SETUP] = afterStart.routing.enabled &&
+            afterStart.routing.controllerAttached &&
+            afterStart.routing.attachCount == 1 &&
+            afterStart.routing.monitorStarted &&
+            routingMonitorThreadOk &&
+            afterStart.routing.eventsDropped == 0L &&
+            final.routing.eventsDropped == 0L
+
+        out.lanes[LANE_ROUTE_DISCONNECT_RESUME_BLOCKED] = !resumeRes.accepted &&
+            resumeRes.reason == "routing_terminal_disconnect" &&
+            resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterRejectedResume.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterRejectedResume.transportState == paused &&
+            afterRejectedResume.routing.routingTerminalDisconnect &&
+            afterTransientPause.focus.focusPausedByPolicy &&
+            afterTransientPause.focus.autoResumeAppliedCount == 0L &&
+            afterTransientPause.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterTransientPause.transportState == paused &&
+            // The session was already PAUSED (by focus policy) when the disconnect
+            // landed, so the native session's bounded-pause path never ran and
+            // routeDisconnectAppliedCount never bumped (session code only bumps it from
+            // PLAYING); the sticky routingTerminalDisconnect transition from the
+            // pre-disconnect baseline is therefore the reliable proof signal here, not a
+            // count delta or a snapshot of lastEventTag/lastAction, which are
+            // last-writer-wins fields a later real OS ROUTE_CHANGED callback can
+            // overwrite before this snapshot is captured.
+            !afterTransientPause.routing.routingTerminalDisconnect &&
+            afterDisconnect.routing.routingTerminalDisconnect &&
+            afterDisconnect.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterDisconnect.transportState == paused &&
+            afterIgnoredGain.focus.eventsDrained >= afterDisconnect.focus.eventsDrained + 1L &&
+            afterIgnoredGain.focus.gainRestoreAppliedCount >= 1L &&
+            afterIgnoredGain.focus.autoResumeAppliedCount == 0L &&
+            afterIgnoredGain.focus.focusPausedByPolicy &&
+            afterIgnoredGain.routing.routingTerminalDisconnect &&
+            afterIgnoredGain.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterIgnoredGain.transportState == paused
+
+        out.lanes[LANE_ROUTING_MONITOR_TEARDOWN] = final.routing.controllerReleased &&
+            !final.routing.controllerAttached &&
+            final.routing.detachCount >= 1 &&
+            final.routing.monitorExited &&
+            final.routing.monitorJoined &&
+            final.routing.eventsPending == 0 &&
+            final.routing.eventsDropped == 0L &&
             sink.releaseCount == 1 &&
             sink.releaseExecutedOnSinkThread &&
             final.sinkJoined &&

@@ -2,6 +2,7 @@ package com.connects.vanguard_media_engine.diagnostics
 
 import android.content.Context
 import android.media.AudioManager
+import android.media.AudioTrack
 import android.os.Handler
 import android.os.SystemClock
 import android.util.Log
@@ -17,13 +18,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
- * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b):
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12):
  * production-component diagnostic smoke coordinator.
  *
  * Owns the [METHOD_NAME] MethodChannel route only. It drives the PRODUCTION
  * [VanguardRealtimeAudioPlaybackSession] (real MediaExtractor/MediaCodec ->
  * Y5a external ingest -> Y1 transport -> sink-thread-owned non-zero-gain
- * AudioTrack + presentation clock) through seven scenarios on a worker
+ * AudioTrack + presentation clock) through ten scenarios on a worker
  * thread, evaluates proof lanes from the session's snapshots, posts the
  * payload on the main handler and logs the START / JSON / PASS / FAIL
  * markers. Every lifecycle decision lives in the session; this class only
@@ -60,6 +62,32 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Scenario 7 (Y11b) starts a focus-enabled session: proves permanent loss pause
  * and verified rejection of auto-resume on subsequent gain.
+ *
+ * Scenario 8 (Y12) starts a fresh routing- and focus-enabled session: proves
+ * observation of route change without transport mutation using a monotonic
+ * baseline increase on routeChangedAppliedCount (robust to real OS
+ * ROUTE_CHANGED callbacks racing the synthetic one), then stops/disposes.
+ * This scenario never posts a disconnect, so it carries its own independent
+ * [SmokeConfig.deadlineMs] budget separate from Scenario 9's.
+ *
+ * Scenario 9 (Y12) starts a second fresh routing- and focus-enabled session:
+ * proves terminal fail-closed pause on route disconnect (from PLAYING) with
+ * AudioTrack paused at park and routeDisconnectAppliedCount increased by a
+ * monotonic baseline, rejection of public resume, and routing teardown. It
+ * carries its own independent [SmokeConfig.deadlineMs] budget separate from
+ * Scenario 8's, so a slow/racy route-change observation can never starve the
+ * disconnect proof (or vice versa).
+ *
+ * Scenario 10 (Y12) starts a routing- and focus-enabled session: proves route
+ * disconnect while paused by focus policy blocks focus auto-resume on
+ * subsequent focus gain and continues to reject public resume. Because the
+ * session is already PAUSED when the disconnect lands, the native session
+ * never attempts the bounded-pause path that bumps routeDisconnectAppliedCount
+ * (session code only bumps it from PLAYING), so this scenario proves the
+ * disconnect landed via the sticky routingTerminalDisconnect flag transition
+ * rather than a count delta or a snapshot of lastEventTag/lastAction, which
+ * are last-writer-wins fields a later real OS ROUTE_CHANGED callback can
+ * overwrite before the polling loop observes them.
  */
 class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private val context: Context,
@@ -87,6 +115,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_" +
                 "sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_" +
                 "noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_" +
+                "production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_" +
+                "route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_" +
+                "focus_gain_after_route_disconnect_no_auto_resume_" +
                 "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
 
@@ -97,6 +128,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_REPEATED_FORWARD_SEEK = "SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS"
         const val SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY = "SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY"
         const val SCENARIO_FOCUS_PERMANENT_LOSS = "SCENARIO_FOCUS_PERMANENT_LOSS"
+        const val SCENARIO_ROUTE_CHANGE_OBSERVATION = "SCENARIO_ROUTE_CHANGE_OBSERVATION"
+        const val SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE = "SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE"
+        const val SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED = "SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED"
 
         const val DEFAULT_PAUSE_HOLD_MS = 400L
         const val DEFAULT_STOP_AFTER_MS = 300L
@@ -158,6 +192,12 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_FOCUS_NOISY_TERMINAL_PAUSE = "focusNoisyTerminalPauseOk"
         const val LANE_FOCUS_PERMANENT_LOSS_PAUSE = "focusPermanentLossPauseOk"
         const val LANE_FOCUS_MONITOR_TEARDOWN = "focusMonitorTeardownOk"
+        // Y12 lanes, evaluated by the route-change/disconnect scenario.
+        const val LANE_ROUTING_SETUP = "routingSetupOk"
+        const val LANE_ROUTE_CHANGE_OBSERVATION = "routeChangeObservationOk"
+        const val LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE = "routeDisconnectTerminalPauseOk"
+        const val LANE_ROUTE_DISCONNECT_RESUME_BLOCKED = "routeDisconnectResumeBlockedOk"
+        const val LANE_ROUTING_MONITOR_TEARDOWN = "routingMonitorTeardownOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -174,6 +214,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_REPEATED_SEEK_COMMAND, LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING, LANE_REPEATED_SEEK_THIRD_REJECT,
             LANE_FOCUS_SETUP, LANE_FOCUS_DUCK_RESTORE, LANE_FOCUS_TRANSIENT_PAUSE_RESUME,
             LANE_FOCUS_NOISY_TERMINAL_PAUSE, LANE_FOCUS_PERMANENT_LOSS_PAUSE, LANE_FOCUS_MONITOR_TEARDOWN,
+            LANE_ROUTING_SETUP, LANE_ROUTE_CHANGE_OBSERVATION, LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE,
+            LANE_ROUTE_DISCONNECT_RESUME_BLOCKED, LANE_ROUTING_MONITOR_TEARDOWN,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -190,6 +232,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "becoming_noisy_receiver", "sink_thread_gain_duck_restore_request_ack",
             "transient_pause_auto_resume_user_intent_gated", "noisy_terminal_pause_no_auto_resume",
             "permanent_loss_pause_no_auto_resume",
+            "production_route_change_response", "routing_monitor_single_consumer",
+            "audiotrack_routing_listener_attach_detach",
+            "route_change_observed_no_transport_mutation",
+            "route_disconnect_terminal_pause_no_resume",
+            "focus_gain_after_route_disconnect_no_auto_resume",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache", "no_cpp", "no_jni",
@@ -307,7 +354,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxSeekHoldMs" to config.maxSeekHoldMs,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(7)
+        val outcomes = ArrayList<ScenarioOutcome>(10)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
@@ -385,6 +432,44 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         ) { session, outcome ->
             focusPermanentLossScenario(session, config, outcome)
         }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y12: route change observation only, independently bounded by its own deadline budget.
+        outcomes += runScenario(
+            SCENARIO_ROUTE_CHANGE_OBSERVATION,
+            config,
+            injectAfterFrames = 0L,
+            enableAudioFocusResponse = true,
+            duckGain = config.duckGain,
+            enableAudioRoutingResponse = true,
+        ) { session, outcome ->
+            routeChangeObservationScenario(session, config, outcome)
+        }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y12: route disconnect terminal pause / public resume blocked / routing teardown,
+        // independently bounded by its own deadline budget (fresh session, never shares
+        // the observation scenario's wait window).
+        outcomes += runScenario(
+            SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,
+            config,
+            injectAfterFrames = 0L,
+            enableAudioFocusResponse = true,
+            duckGain = config.duckGain,
+            enableAudioRoutingResponse = true,
+        ) { session, outcome ->
+            routeDisconnectTerminalPauseScenario(session, config, outcome)
+        }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y12: route disconnect while paused by focus policy: focus auto-resume blocked and public resume rejected.
+        outcomes += runScenario(
+            SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,
+            config,
+            injectAfterFrames = 0L,
+            enableAudioFocusResponse = true,
+            duckGain = config.duckGain,
+            enableAudioRoutingResponse = true,
+        ) { session, outcome ->
+            routeDisconnectFocusGainBlockedScenario(session, config, outcome)
+        }
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
         val firstFailure = outcomes.firstOrNull { it.failureReason.isNotBlank() }?.let { "${it.name}:${it.failureReason}" } ?: ""
@@ -401,6 +486,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         secondSeekTargetSec: Double = 0.0,
         enableAudioFocusResponse: Boolean = false,
         duckGain: Float = DEFAULT_DUCK_GAIN,
+        enableAudioRoutingResponse: Boolean = false,
         body: (VanguardRealtimeAudioPlaybackSession, ScenarioOutcome) -> Unit,
     ): ScenarioOutcome {
         val outcome = ScenarioOutcome(name)
@@ -419,9 +505,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 preSeekHoldWindows = config.preSeekHoldWindows,
                 maxSeekHoldMs = config.maxSeekHoldMs,
                 context = if (enableAudioFocusResponse) context else null,
-                mainHandler = if (enableAudioFocusResponse) mainHandler else null,
+                mainHandler = if (enableAudioFocusResponse || enableAudioRoutingResponse) mainHandler else null,
                 enableAudioFocusResponse = enableAudioFocusResponse,
                 duckGain = duckGain,
+                enableAudioRoutingResponse = enableAudioRoutingResponse,
             ),
         )
         outcome.metrics["deadObjectInjectAfterFrames"] = injectAfterFrames
@@ -429,6 +516,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         outcome.metrics["secondSeekTargetSecArmed"] = secondSeekTargetSec
         outcome.metrics["enableAudioFocusResponse"] = enableAudioFocusResponse
         outcome.metrics["duckGainArmed"] = duckGain.toDouble()
+        outcome.metrics["enableAudioRoutingResponse"] = enableAudioRoutingResponse
         activeSession = session
         val wallStart = SystemClock.elapsedRealtime()
         try {
@@ -759,6 +847,239 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         throw FailClosed(timeoutReason)
     }
 
+    // ── Scenario 8 (Y12): route change observation only, independently bounded ─────────
+    //    Never posts a disconnect, so it cannot starve (or be starved by) the terminal
+    //    pause proof's own deadline budget in Scenario 9.
+
+    private fun routeChangeObservationScenario(
+        session: VanguardRealtimeAudioPlaybackSession,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        startAndAwaitAudio(session)
+        val afterStart = session.snapshot()
+
+        // postSyntheticRouteChanged and await routeChangedAppliedCount increasing by at
+        // least 1 from baseline (monotonic, robust to a real OS ROUTE_CHANGED racing the
+        // synthetic one and skipping past an exact-equality check) while state/transport
+        // remain PLAYING, routingTerminalDisconnect stays false and
+        // routeDisconnectAppliedCount stays unchanged (no disconnect ever posted here).
+        val routeChangedBaseline = afterStart.routing.routeChangedAppliedCount
+        val routeDisconnectBaseline = afterStart.routing.routeDisconnectAppliedCount
+        require(session.postSyntheticRouteChanged(), "post_route_changed_failed")
+        val afterRouteChange = awaitRoutingSnapshot(
+            session,
+            config.deadlineMs,
+            "route_change_not_applied",
+        ) { snap ->
+            snap.routing.routeChangedAppliedCount >= routeChangedBaseline + 1L &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PLAYING &&
+                !snap.routing.routingTerminalDisconnect &&
+                snap.routing.routeDisconnectAppliedCount == routeDisconnectBaseline
+        }
+
+        // Stop/dispose cleanly.
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRouteChangeObservation(
+            final = final,
+            afterStart = afterStart,
+            afterRouteChange = afterRouteChange,
+            config = config,
+            out = out,
+            coordinatorThreadId = Thread.currentThread().id,
+        )
+    }
+
+    // ── Scenario 9 (Y12): route disconnect terminal pause -> public resume rejected ->
+    //    routing teardown, independently bounded ─────────────────────────────────────
+
+    private fun routeDisconnectTerminalPauseScenario(
+        session: VanguardRealtimeAudioPlaybackSession,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        startAndAwaitAudio(session)
+        val afterStart = session.snapshot()
+
+        // postSyntheticRouteDisconnect (session is PLAYING, so the native session takes
+        // the bounded-pause path and bumps routeDisconnectAppliedCount) and await
+        // routingTerminalDisconnect=true, routingPausedByPolicy=true,
+        // routeDisconnectAppliedCount increasing by at least 1 from baseline (monotonic,
+        // same robustness rationale as the observation scenario above), state/transport
+        // PAUSED, sink playStateAtPark PAUSED, no failure.
+        val routeDisconnectBaseline = afterStart.routing.routeDisconnectAppliedCount
+        require(session.postSyntheticRouteDisconnect(), "post_route_disconnect_failed")
+        val afterDisconnect = awaitRoutingSnapshot(
+            session,
+            config.deadlineMs,
+            "route_disconnect_not_applied",
+        ) { snap ->
+            val s = snap.sink
+            snap.routing.routingTerminalDisconnect &&
+                snap.routing.routingPausedByPolicy &&
+                snap.routing.routeDisconnectAppliedCount >= routeDisconnectBaseline + 1L &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED &&
+                s != null &&
+                s.playStateAtPark == AudioTrack.PLAYSTATE_PAUSED &&
+                snap.failureReason.isBlank()
+        }
+
+        // call session.resume() and require accepted=false, reason routing_terminal_disconnect, state PAUSED.
+        val resumeRes = session.resume()
+        require(
+            !resumeRes.accepted &&
+                resumeRes.reason == "routing_terminal_disconnect" &&
+                resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED,
+            "resume_after_disconnect_not_rejected:${resumeRes.accepted}:${resumeRes.reason}:${resumeRes.state}",
+        )
+        val afterRejectedResume = session.snapshot()
+        require(afterRejectedResume.failureReason.isBlank(), "failure_after_rejected_resume:${afterRejectedResume.failureReason}")
+        require(afterRejectedResume.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED, "state_mutated_after_rejected_resume:${afterRejectedResume.state}")
+        require(afterRejectedResume.routing.routingTerminalDisconnect, "routing_terminal_disconnect_cleared_after_rejected_resume")
+
+        // stop/dispose cleanly.
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRouteDisconnectTerminalPause(
+            final = final,
+            afterStart = afterStart,
+            afterDisconnect = afterDisconnect,
+            afterRejectedResume = afterRejectedResume,
+            resumeRes = resumeRes,
+            config = config,
+            out = out,
+            coordinatorThreadId = Thread.currentThread().id,
+        )
+    }
+
+    // ── Scenario 10 (Y12): route disconnect while paused by focus policy ->
+    //    focus auto-resume blocked -> public resume rejected ────────────────────────────
+
+    private fun routeDisconnectFocusGainBlockedScenario(
+        session: VanguardRealtimeAudioPlaybackSession,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        startAndAwaitAudio(session)
+        val afterStart = session.snapshot()
+
+        // 1. post AUDIOFOCUS_LOSS_TRANSIENT and await focusPausedByPolicy=true,
+        //    state/transport PAUSED, autoResumeAppliedCount==0.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT), "post_focus_transient_loss_failed")
+        val afterTransientPause = awaitFocusSnapshot(
+            session,
+            config.deadlineMs,
+            "focus_transient_pause_not_applied",
+        ) { snap ->
+            snap.focus.pauseTransientAppliedCount == 1L &&
+                snap.focus.focusPausedByPolicy &&
+                snap.focus.autoResumeAppliedCount == 0L &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        }
+
+        // 2. postSyntheticRouteDisconnect while still PAUSED and await
+        //    routingTerminalDisconnect=true, state/transport still PAUSED. The session
+        //    was already PAUSED (by focus policy) before the disconnect, so the native
+        //    session's bounded-pause path never runs and routeDisconnectAppliedCount
+        //    never bumps (session code only bumps it from PLAYING); the sticky
+        //    routingTerminalDisconnect flag is therefore the only reliable proof signal
+        //    here. lastEventTag/lastAction are last-writer-wins fields a later real OS
+        //    ROUTE_CHANGED callback can overwrite before this poll observes them, so they
+        //    are deliberately not part of this wait condition.
+        require(session.postSyntheticRouteDisconnect(), "post_route_disconnect_failed")
+        val afterDisconnect = awaitRoutingSnapshot(
+            session,
+            config.deadlineMs,
+            "route_disconnect_while_paused_not_applied",
+        ) { snap ->
+            snap.routing.routingTerminalDisconnect &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED &&
+                snap.failureReason.isBlank()
+        }
+
+        // 3. post AUDIOFOCUS_GAIN and await focus event drained/gain restored but
+        //    focusAutoResumeAppliedCount remains 0, focusPausedByPolicy remains true,
+        //    routingTerminalDisconnect remains true, state/transport remain PAUSED.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_GAIN), "post_focus_gain_after_disconnect_failed")
+        val afterIgnoredGain = awaitRoutingSnapshot(
+            session,
+            config.deadlineMs,
+            "focus_gain_after_disconnect_not_consumed_or_auto_resumed",
+        ) { snap ->
+            snap.focus.eventsDrained >= afterDisconnect.focus.eventsDrained + 1L &&
+                snap.focus.gainRestoreAppliedCount >= 1L &&
+                snap.focus.autoResumeAppliedCount == 0L &&
+                snap.focus.focusPausedByPolicy &&
+                snap.routing.routingTerminalDisconnect &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        }
+
+        // 4. public resume still rejects routing_terminal_disconnect.
+        val resumeRes = session.resume()
+        require(
+            !resumeRes.accepted &&
+                resumeRes.reason == "routing_terminal_disconnect" &&
+                resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED,
+            "resume_after_disconnect_not_rejected:${resumeRes.accepted}:${resumeRes.reason}:${resumeRes.state}",
+        )
+        val afterRejectedResume = session.snapshot()
+        require(afterRejectedResume.failureReason.isBlank(), "failure_after_rejected_resume:${afterRejectedResume.failureReason}")
+        require(afterRejectedResume.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED, "state_mutated_after_rejected_resume:${afterRejectedResume.state}")
+        require(afterRejectedResume.routing.routingTerminalDisconnect, "routing_terminal_disconnect_cleared_after_rejected_resume")
+
+        // 5. stop/dispose cleanly.
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRouteDisconnectFocusGainBlocked(
+            final = final,
+            afterStart = afterStart,
+            afterTransientPause = afterTransientPause,
+            afterDisconnect = afterDisconnect,
+            afterIgnoredGain = afterIgnoredGain,
+            afterRejectedResume = afterRejectedResume,
+            resumeRes = resumeRes,
+            config = config,
+            out = out,
+            coordinatorThreadId = Thread.currentThread().id,
+        )
+    }
+
+    private fun awaitRoutingSnapshot(
+        session: VanguardRealtimeAudioPlaybackSession,
+        timeoutMs: Long,
+        timeoutReason: String,
+        condition: (VanguardRealtimeAudioPlaybackSession.Snapshot) -> Boolean,
+    ): VanguardRealtimeAudioPlaybackSession.Snapshot {
+        val start = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - start < timeoutMs) {
+            val snap = session.snapshot()
+            require(snap.failureReason.isBlank(), "failure_before_routing_event:${snap.failureReason}")
+            if (condition(snap)) {
+                return snap
+            }
+            SystemClock.sleep(WAIT_SLICE_MS)
+        }
+        throw FailClosed(timeoutReason)
+    }
+
     // ── Scenario 2: load/start -> stop/dispose before EOS ──────────────────
 
     private fun stopDisposeScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
@@ -1038,6 +1359,31 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         m["focusLastEventSource"] = f.lastEventSource
         m["focusLastAction"] = f.lastAction
         m["focusLastReason"] = f.lastReason
+        val rt = s.routing
+        m["routingEnabled"] = rt.enabled
+        m["routingControllerAttached"] = rt.controllerAttached
+        m["routingControllerReleased"] = rt.controllerReleased
+        m["routingAttachCount"] = rt.attachCount
+        m["routingDetachCount"] = rt.detachCount
+        m["routingLastAttachError"] = rt.lastAttachError
+        m["routingLastDetachError"] = rt.lastDetachError
+        m["routingMonitorStarted"] = rt.monitorStarted
+        m["routingMonitorExited"] = rt.monitorExited
+        m["routingMonitorJoined"] = rt.monitorJoined
+        m["routingMonitorThreadId"] = rt.monitorThreadId
+        m["routingEventsEnqueued"] = rt.eventsEnqueued
+        m["routingEventsDrained"] = rt.eventsDrained
+        m["routingEventsDropped"] = rt.eventsDropped
+        m["routingEventsPending"] = rt.eventsPending
+        m["routeChangedAppliedCount"] = rt.routeChangedAppliedCount
+        m["routeDisconnectAppliedCount"] = rt.routeDisconnectAppliedCount
+        m["routingTerminalDisconnect"] = rt.routingTerminalDisconnect
+        m["routingPausedByPolicy"] = rt.routingPausedByPolicy
+        m["routingLastEventTag"] = rt.lastEventTag
+        m["routingLastEventSeq"] = rt.lastEventSeq
+        m["routingLastEventSource"] = rt.lastEventSource
+        m["routingLastAction"] = rt.lastAction
+        m["routingLastReason"] = rt.lastReason
         return m
     }
 
@@ -1066,7 +1412,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y11b realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,
