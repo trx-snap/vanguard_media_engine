@@ -1218,6 +1218,53 @@ class VanguardNativeBridge(
         beautyIntensity: Float,
     ): String
 
+    // ── P5-OVERLAYS-TRANS Route-A N7: cropped solo frame + overlay render seam ──
+    // Same cropped/rotated/dest-fit/colorMatrix contract as
+    // renderAndroidTimelineVulkanExportFrameCropped above, plus zero or more
+    // already-placed overlay layers composited on top in the same render.
+    // Native owns all overlay placement math -- this call never takes a UV
+    // row, scissor rect, imageView, or sampler from Kotlin; only a
+    // backend-owned overlay texture handle (see
+    // uploadAndroidTimelineVulkanExportOverlayTexture) and its per-overlay
+    // geometry. No beauty params on this route.
+    // [overlayTextureHandles] is a LongArray of [overlayCount] handles.
+    // [overlayGeometry] is a DoubleArray of [overlayCount] * 7 values, 7 per
+    // overlay in the caller's draw order (already sorted back-to-front by
+    // zIndex/id): x, y, width, height, rotationRadians, scale, opacity, all
+    // in output-canvas pixels. Both arrays are ignored (may be null or
+    // empty) when [overlayCount] == 0; native fails closed with
+    // "invalid_overlay_texture_handles_len" / "invalid_overlay_geometry_len"
+    // on a length mismatch when [overlayCount] > 0, and with
+    // "invalid_overlay_count" when [overlayCount] is negative or exceeds the
+    // native-enforced per-call maximum. A per-overlay handle/descriptor/
+    // placement failure fails the whole call closed with a machine-readable
+    // "overlay_texture_unknown:index=N" / "invalid_overlay_texture_handle:
+    // index=N" / "overlay_descriptor_invalid:index=N:reason=<err>" /
+    // "overlay_placement_failed:index=N" reason; a validated-but-not-visible
+    // overlay is silently skipped, not an error. "status=OK;..." additionally
+    // reports overlayCount and visibleOverlayCount.
+    external fun renderAndroidTimelineVulkanExportFrameCroppedWithOverlays(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        cropLeft: Int,
+        cropTop: Int,
+        cropRight: Int,
+        cropBottom: Int,
+        rotationDegrees: Int,
+        destFitX: Int,
+        destFitY: Int,
+        destFitWidth: Int,
+        destFitHeight: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+        colorMatrix: FloatArray?,
+        overlayTextureHandles: LongArray?,
+        overlayGeometry: DoubleArray?,
+        overlayCount: Int,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS: production transition frame render seam ────────
     // Renders ONE output frame of a compositor-owned clip overlap transition
     // from TWO decoder HardwareBuffers (outgoing "from" clip, incoming "to"
