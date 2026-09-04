@@ -1,6 +1,6 @@
 // vg_timeline_overlay_export_smoke.dart
 // vanguard_media_engine -- P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A:
-// Android production `exportTimeline` static sticker overlay smoke proof model.
+// Android production `exportTimeline` static sticker and text overlay smoke proof model.
 //
 // Pure Dart typed model + lane runner over the REAL production
 // `exportTimeline` MethodChannel route (the same route
@@ -16,15 +16,16 @@
 //   - Structured JSON prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_JSON:`;
 //   - Structured lane prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_LANE:`;
 //   - Claims production routing/fail-closed behavior on Android for static sticker
-//     overlays in Route-A, including dynamic keyframed spatial transforms
-//     (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), overlay compositing on Vulkan dissolve
-//     and representative non-dissolve (slideLeft, wipeRight) transition overlap
-//     frames (P5-OVERLAYS-TRANSITION-COMP-N3, P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A),
-//     and overlays alongside clip-level Beauty V2 on both transition-overlap
-//     frames (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
+//     and text overlays in Route-A (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT), including
+//     dynamic keyframed spatial transforms (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT),
+//     overlay compositing on Vulkan dissolve and representative non-dissolve
+//     (slideLeft, wipeRight) transition overlap frames (P5-OVERLAYS-TRANSITION-COMP-N3,
+//     P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A), and overlays alongside clip-level
+//     Beauty V2 on both transition-overlap frames
+//     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
 //     (P5-OVERLAYS-BEAUTY-SOLO), but does not claim every transition direction
 //     (proves representative non-dissolve overlay transition support for
-//     slideLeft and wipeRight only), text/emoji overlays, GLES,
+//     slideLeft and wipeRight only), emoji overlays (fail-closed only), GLES,
 //     app/editor/iOS/streaming/cache, fleet coverage, playback, or pixel quality;
 //   - Validates success lanes: `success == true`, output file exists,
 //     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (transition-aware:
@@ -71,7 +72,7 @@ const String invalidArgCode = 'INVALID_ARG';
 /// The production MethodChannel error code for an unreadable file asset.
 const String fileUnreadableCode = 'FILE_UNREADABLE';
 
-/// Fail-closed token for unsupported text overlays in Route-A.
+/// Message-substring token identifying text overlay content in Route-A.
 const String textOverlayToken = 'text';
 
 /// Fail-closed token for unsupported emoji overlays in Route-A.
@@ -90,7 +91,7 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'time_interval_gating_success',
   'hard_cut_multiclip_success',
   'single_clip_dynamic_keyframe_success',
-  'fail_closed_text_overlay',
+  'text_overlay_success',
   'fail_closed_emoji_overlay',
   'fail_closed_malformed_keyframes',
   'overlays_with_transition_dissolve_success',
@@ -893,13 +894,13 @@ class VGTimelineOverlayExportSmokeRunner {
   }
 }
 
-/// Builds the default suite of 14 Route-A static sticker overlay smoke requests:
+/// Builds the default suite of 14 Route-A static sticker and text overlay smoke requests:
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
 /// 4. `hard_cut_multiclip_success`
 /// 5. `single_clip_dynamic_keyframe_success`
-/// 6. `fail_closed_text_overlay`
+/// 6. `text_overlay_success`
 /// 7. `fail_closed_emoji_overlay`
 /// 8. `fail_closed_malformed_keyframes`
 /// 9. `overlays_with_transition_dissolve_success`
@@ -1135,9 +1136,9 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 6: fail_closed_text_overlay
+    // Lane 6: text_overlay_success
     VGTimelineOverlayExportSmokeRequest(
-      laneId: 'fail_closed_text_overlay',
+      laneId: 'text_overlay_success',
       clips: <VGTimelineOverlayExportSmokeClip>[
         VGTimelineOverlayExportSmokeClip(
           id: 'clip-1',
@@ -1149,7 +1150,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       overlays: const <VGTimelineOverlayExportSmokeOverlay>[
         VGTimelineOverlayExportSmokeOverlay(
           id: 'text-1',
-          textContent: 'unsupported text overlay',
+          textContent: 'Route-A text overlay',
           startTimeSeconds: 0.0,
           durationSeconds: 2.0,
           translationX: 100.0,
@@ -1163,10 +1164,10 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
           type: 'text',
         ),
       ],
-      outputPath: outputPath('fail_closed_text_overlay'),
-      expectation: const VGTimelineOverlayExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: textOverlayToken,
+      outputPath: outputPath('text_overlay_success'),
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedRenderedOverlayFrameCount: 55,
       ),
     ),
 

@@ -12,10 +12,13 @@ import java.io.File
 // definitions before render execution; it makes no production rendering claim.
 // Native rendering (Vulkan overlay compositor) is implemented in subsequent slices.
 //
-// Closed supported type set: sticker only. Text, emoji, or unknown types fail
-// closed with UNSUPPORTED_EXPORT_FEATURE. Dynamic keyframes on sticker overlays
-// are supported (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT); malformed keyframes fail
-// closed with INVALID_ARG, unsupported interpolation with UNSUPPORTED_EXPORT_FEATURE.
+// Closed supported type set: sticker and text (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT).
+// Emoji and unknown types fail closed with UNSUPPORTED_EXPORT_FEATURE. Text
+// overlays require a non-blank `textContent` string (trimmed); missing or
+// blank textContent fails closed with INVALID_ARG. Dynamic keyframes on
+// sticker overlays are supported (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT);
+// malformed keyframes fail closed with INVALID_ARG, unsupported interpolation
+// with UNSUPPORTED_EXPORT_FEATURE.
 // Remote (http/https) or non-absolute asset paths fail with UNSUPPORTED_EXPORT_FEATURE;
 // missing or unreadable asset files fail with CODE_FILE_UNREADABLE.
 data class AndroidTimelineOverlayDescriptor(
@@ -32,6 +35,7 @@ data class AndroidTimelineOverlayDescriptor(
     val opacity: Double,
     val zIndex: Int,
     val assetPath: String? = null,
+    val textContent: String? = null,
     val keyframes: List<AndroidTimelineOverlayKeyframe> = emptyList(),
 ) {
     /** Wire id alias matching Dart/wire descriptor conventions. */
@@ -51,7 +55,8 @@ data class AndroidTimelineOverlayDescriptor(
     fun isActiveAtPTS(ptsSeconds: Double): Boolean = isActiveAtTime(ptsSeconds)
 
     /**
-     * Overlay kind. Route-A accepts [STICKER] only.
+     * Overlay kind. Route-A accepts [STICKER] and [TEXT]. [EMOJI] fails
+     * closed with UNSUPPORTED_EXPORT_FEATURE.
      */
     enum class Type(val wireNames: List<String>) {
         STICKER(listOf("sticker")),
@@ -119,38 +124,52 @@ data class AndroidTimelineOverlayDescriptor(
                         "exportTimeline: overlay '$overlayId' type required",
                     )
                 val type = Type.fromWireName(rawType)
-                if (type != Type.STICKER) {
+                if (type == null || type == Type.EMOJI) {
                     return ParseResult.Failure(
                         CODE_UNSUPPORTED_EXPORT_FEATURE,
-                        "exportTimeline: overlay '$overlayId' type '$rawType' is not supported (only 'sticker' is supported in Route-A)",
+                        "exportTimeline: overlay '$overlayId' type '$rawType' is not supported (only 'sticker' and 'text' are supported in Route-A)",
                     )
                 }
 
-                val assetPath = (map["assetPath"] as? String)?.trim()
-                if (assetPath.isNullOrEmpty()) {
-                    return ParseResult.Failure(
-                        CODE_INVALID_ARG,
-                        "exportTimeline: sticker overlay '$overlayId' requires non-blank assetPath",
-                    )
-                }
-                if (assetPath.startsWith("http://") || assetPath.startsWith("https://")) {
-                    return ParseResult.Failure(
-                        CODE_UNSUPPORTED_EXPORT_FEATURE,
-                        "exportTimeline: remote overlay sticker asset sources are not supported: '$assetPath'",
-                    )
-                }
-                if (!assetPath.startsWith("/")) {
-                    return ParseResult.Failure(
-                        CODE_UNSUPPORTED_EXPORT_FEATURE,
-                        "exportTimeline: non-absolute overlay sticker asset path is not supported: '$assetPath'",
-                    )
-                }
-                val assetFile = File(assetPath)
-                if (!assetFile.exists() || !assetFile.canRead()) {
-                    return ParseResult.Failure(
-                        CODE_FILE_UNREADABLE,
-                        "exportTimeline: cannot read overlay sticker asset file: $assetPath",
-                    )
+                var assetPath: String? = null
+                var textContent: String? = null
+
+                if (type == Type.STICKER) {
+                    assetPath = (map["assetPath"] as? String)?.trim()
+                    if (assetPath.isNullOrEmpty()) {
+                        return ParseResult.Failure(
+                            CODE_INVALID_ARG,
+                            "exportTimeline: sticker overlay '$overlayId' requires non-blank assetPath",
+                        )
+                    }
+                    if (assetPath.startsWith("http://") || assetPath.startsWith("https://")) {
+                        return ParseResult.Failure(
+                            CODE_UNSUPPORTED_EXPORT_FEATURE,
+                            "exportTimeline: remote overlay sticker asset sources are not supported: '$assetPath'",
+                        )
+                    }
+                    if (!assetPath.startsWith("/")) {
+                        return ParseResult.Failure(
+                            CODE_UNSUPPORTED_EXPORT_FEATURE,
+                            "exportTimeline: non-absolute overlay sticker asset path is not supported: '$assetPath'",
+                        )
+                    }
+                    val assetFile = File(assetPath)
+                    if (!assetFile.exists() || !assetFile.canRead()) {
+                        return ParseResult.Failure(
+                            CODE_FILE_UNREADABLE,
+                            "exportTimeline: cannot read overlay sticker asset file: $assetPath",
+                        )
+                    }
+                } else {
+                    val rawTextContent = (map["textContent"] as? String)?.trim()
+                    if (rawTextContent.isNullOrEmpty()) {
+                        return ParseResult.Failure(
+                            CODE_INVALID_ARG,
+                            "exportTimeline: text overlay '$overlayId' requires non-blank textContent",
+                        )
+                    }
+                    textContent = rawTextContent
                 }
 
                 val rawStart = map["startTimeSeconds"] as? Number
@@ -400,6 +419,7 @@ data class AndroidTimelineOverlayDescriptor(
                         opacity = opacity,
                         zIndex = zIndex,
                         assetPath = assetPath,
+                        textContent = textContent,
                         keyframes = keyframes,
                     ),
                 )

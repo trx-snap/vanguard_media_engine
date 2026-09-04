@@ -1,14 +1,19 @@
 package com.connects.vanguard_media_engine.export
 
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Android True-DAG V4.3 Phase 5 P5-OVERLAYS-TRANS (Route-A N8 helper).
  *
- * Standalone session helper that prepares validated sticker overlays for the
- * native Vulkan overlay render seam
+ * Standalone session helper that prepares validated sticker and text overlays
+ * for the native Vulkan overlay render seam
  * ([VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays]).
+ * Sticker overlays are decoded via [AndroidTimelineOverlayAssetDecoder]; text
+ * overlays are rasterized via [AndroidTimelineOverlayTextRasterizer]
+ * (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT). Emoji overlays are rejected defensively
+ * (unreachable after [AndroidTimelineOverlayDescriptor] admission).
  *
  * Helper-only: this class does not wire encoder/export admission, does not
  * mutate native/JNI, and does not unblock overlay export.
@@ -193,15 +198,16 @@ internal class AndroidTimelineOverlayRenderSession internal constructor(
         const val OVERLAY_SESSION_CLOSED: String = CODE_OVERLAY_SESSION_CLOSED
 
         /**
-         * Prepares and uploads all sticker overlay textures for [sessionId].
+         * Prepares and uploads all sticker and text overlay textures for [sessionId].
          *
-         * Decodes each overlay via [AndroidTimelineOverlayAssetDecoder.decodeStaticSticker]
-         * and uploads it to the backend-owned Vulkan overlay texture store via
-         * [VanguardNativeBridge.uploadAndroidTimelineVulkanExportOverlayTexture].
+         * Sticker overlays are decoded via [AndroidTimelineOverlayAssetDecoder.decodeStaticSticker];
+         * text overlays are rasterized via [AndroidTimelineOverlayTextRasterizer.rasterizeText].
+         * Each resulting RGBA buffer is uploaded to the backend-owned Vulkan overlay
+         * texture store via [VanguardNativeBridge.uploadAndroidTimelineVulkanExportOverlayTexture].
          *
-         * On any decode, upload, or parsing failure, rolls back by clearing native
-         * texture state if any prior upload succeeded, and returns [PrepareResult.Failure].
-         * Never keeps direct ByteBuffer references after upload.
+         * On any decode, rasterize, upload, or parsing failure, rolls back by clearing
+         * native texture state if any prior upload succeeded, and returns
+         * [PrepareResult.Failure]. Never keeps direct ByteBuffer references after upload.
          */
         fun prepare(
             sessionId: String,
@@ -231,49 +237,99 @@ internal class AndroidTimelineOverlayRenderSession internal constructor(
 
             try {
                 for ((index, overlay) in overlays.withIndex()) {
-                    when (val decodeResult = AndroidTimelineOverlayAssetDecoder.decodeStaticSticker(overlay)) {
-                        is AndroidTimelineOverlayAssetDecoder.DecodeResult.Failure -> {
+                    val rgbaBuffer: ByteBuffer
+                    val pixelWidth: Int
+                    val pixelHeight: Int
+                    val rowStrideBytes: Int
+
+                    when (overlay.type) {
+                        AndroidTimelineOverlayDescriptor.Type.STICKER -> {
+                            when (val decodeResult = AndroidTimelineOverlayAssetDecoder.decodeStaticSticker(overlay)) {
+                                is AndroidTimelineOverlayAssetDecoder.DecodeResult.Failure -> {
+                                    if (anyUploadSucceeded) {
+                                        quietlyClearNativeTextures(nativeBridge, sessionId)
+                                    }
+                                    return PrepareResult.Failure(
+                                        code = decodeResult.code,
+                                        message = "Failed to decode overlay '${overlay.overlayId}': ${decodeResult.message}",
+                                    )
+                                }
+                                is AndroidTimelineOverlayAssetDecoder.DecodeResult.Success -> {
+                                    rgbaBuffer = decodeResult.rgbaBuffer
+                                    pixelWidth = decodeResult.width
+                                    pixelHeight = decodeResult.height
+                                    rowStrideBytes = decodeResult.rowStrideBytes
+                                }
+                            }
+                        }
+                        AndroidTimelineOverlayDescriptor.Type.TEXT -> {
+                            when (
+                                val rasterizeResult = AndroidTimelineOverlayTextRasterizer.rasterizeText(
+                                    overlay.overlayId,
+                                    overlay.textContent ?: "",
+                                    overlay.width,
+                                    overlay.height,
+                                    drawBackground = true,
+                                )
+                            ) {
+                                is AndroidTimelineOverlayTextRasterizer.RasterizeResult.Failure -> {
+                                    if (anyUploadSucceeded) {
+                                        quietlyClearNativeTextures(nativeBridge, sessionId)
+                                    }
+                                    return PrepareResult.Failure(
+                                        code = rasterizeResult.code,
+                                        message = "Failed to rasterize text overlay '${overlay.overlayId}': ${rasterizeResult.message}",
+                                    )
+                                }
+                                is AndroidTimelineOverlayTextRasterizer.RasterizeResult.Success -> {
+                                    rgbaBuffer = rasterizeResult.rgbaBuffer
+                                    pixelWidth = rasterizeResult.width
+                                    pixelHeight = rasterizeResult.height
+                                    rowStrideBytes = rasterizeResult.rowStrideBytes
+                                }
+                            }
+                        }
+                        AndroidTimelineOverlayDescriptor.Type.EMOJI -> {
                             if (anyUploadSucceeded) {
                                 quietlyClearNativeTextures(nativeBridge, sessionId)
                             }
                             return PrepareResult.Failure(
-                                code = decodeResult.code,
-                                message = "Failed to decode overlay '${overlay.overlayId}': ${decodeResult.message}",
+                                code = INVALID_ARG,
+                                message = "Unsupported overlay type 'emoji' reached render session for overlay '${overlay.overlayId}'",
                             )
-                        }
-                        is AndroidTimelineOverlayAssetDecoder.DecodeResult.Success -> {
-                            val uploadStatus = nativeBridge.uploadAndroidTimelineVulkanExportOverlayTexture(
-                                sessionId = sessionId,
-                                rgbaBuffer = decodeResult.rgbaBuffer,
-                                width = decodeResult.width,
-                                height = decodeResult.height,
-                                rowStrideBytes = decodeResult.rowStrideBytes,
-                            )
-                            val textureHandle = parseTextureHandle(uploadStatus)
-                            if (textureHandle == null || textureHandle <= 0L) {
-                                if (anyUploadSucceeded) {
-                                    quietlyClearNativeTextures(nativeBridge, sessionId)
-                                }
-                                val boundedStatus = if (uploadStatus.length > 200) {
-                                    uploadStatus.take(200) + "..."
-                                } else {
-                                    uploadStatus
-                                }
-                                return PrepareResult.Failure(
-                                    code = OVERLAY_UPLOAD_FAILED,
-                                    message = "Failed to upload overlay texture '${overlay.overlayId}': status='$boundedStatus'",
-                                )
-                            }
-                            uploadedList.add(
-                                UploadedOverlay(
-                                    descriptor = overlay,
-                                    textureHandle = textureHandle,
-                                    inputIndex = index,
-                                ),
-                            )
-                            anyUploadSucceeded = true
                         }
                     }
+
+                    val uploadStatus = nativeBridge.uploadAndroidTimelineVulkanExportOverlayTexture(
+                        sessionId = sessionId,
+                        rgbaBuffer = rgbaBuffer,
+                        width = pixelWidth,
+                        height = pixelHeight,
+                        rowStrideBytes = rowStrideBytes,
+                    )
+                    val textureHandle = parseTextureHandle(uploadStatus)
+                    if (textureHandle == null || textureHandle <= 0L) {
+                        if (anyUploadSucceeded) {
+                            quietlyClearNativeTextures(nativeBridge, sessionId)
+                        }
+                        val boundedStatus = if (uploadStatus.length > 200) {
+                            uploadStatus.take(200) + "..."
+                        } else {
+                            uploadStatus
+                        }
+                        return PrepareResult.Failure(
+                            code = OVERLAY_UPLOAD_FAILED,
+                            message = "Failed to upload overlay texture '${overlay.overlayId}': status='$boundedStatus'",
+                        )
+                    }
+                    uploadedList.add(
+                        UploadedOverlay(
+                            descriptor = overlay,
+                            textureHandle = textureHandle,
+                            inputIndex = index,
+                        ),
+                    )
+                    anyUploadSucceeded = true
                 }
             } catch (t: Throwable) {
                 if (anyUploadSucceeded) {

@@ -155,7 +155,7 @@ void main() {
         'time_interval_gating_success',
         'hard_cut_multiclip_success',
         'single_clip_dynamic_keyframe_success',
-        'fail_closed_text_overlay',
+        'text_overlay_success',
         'fail_closed_emoji_overlay',
         'fail_closed_malformed_keyframes',
         'overlays_with_transition_dissolve_success',
@@ -1249,8 +1249,8 @@ void main() {
         final successLanes = suite.where((r) => r.expectation.expectsSuccess);
         final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(10));
-        expect(failureLanes, hasLength(4));
+        expect(successLanes, hasLength(11));
+        expect(failureLanes, hasLength(3));
 
         // Lane 1: single_clip_static_sticker_success
         final lane1 = suite[0];
@@ -1298,12 +1298,15 @@ void main() {
         expect(lane5.expectation.expectedRenderedOverlayFrameCount, 55);
         expect(lane5.expectedDurationSeconds, 2.0);
 
-        // Lane 6: fail_closed_text_overlay
+        // Lane 6: text_overlay_success
         final lane6 = suite[5];
-        expect(lane6.laneId, 'fail_closed_text_overlay');
+        expect(lane6.laneId, 'text_overlay_success');
         expect(lane6.overlays.single.type, 'text');
-        expect(lane6.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane6.expectation.messageContains, textOverlayToken);
+        expect(lane6.overlays.single.textContent, isNotNull);
+        expect(lane6.overlays.single.textContent, isNotEmpty);
+        expect(lane6.expectation.expectsSuccess, isTrue);
+        expect(lane6.expectation.expectedOverlayCount, 1);
+        expect(lane6.expectation.expectedRenderedOverlayFrameCount, 55);
 
         // Lane 7: fail_closed_emoji_overlay
         final lane7 = suite[6];

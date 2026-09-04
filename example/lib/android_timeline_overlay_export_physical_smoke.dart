@@ -1,6 +1,6 @@
 // android_timeline_overlay_export_physical_smoke.dart
 // Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A:
-// Android production `exportTimeline` static sticker overlay smoke physical proof.
+// Android production `exportTimeline` static sticker and text overlay smoke physical proof.
 //
 // Proof boundary: production_exportTimeline_vulkan_static_sticker_overlay_route_a
 //
@@ -11,12 +11,13 @@
 // (P5-OVERLAYS-TRANSITION-COMP-N3, P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A),
 // AND overlays alongside clip-level Beauty V2 on both transition overlap
 // frames (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
-// (P5-OVERLAYS-BEAUTY-SOLO).
+// (P5-OVERLAYS-BEAUTY-SOLO), AND text overlay production export via
+// rasterized RGBA texture upload (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT).
 //
 // Strict non-claims:
 //   - Proves representative non-dissolve overlay transition support for slideLeft
 //     and wipeRight only; does not claim every transition direction;
-//   - No text/emoji overlay support beyond fail-closed lanes;
+//   - No emoji overlay support beyond the fail-closed lane;
 //   - No GLES overlay route;
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;
 //   - No fleet coverage beyond attached device;
