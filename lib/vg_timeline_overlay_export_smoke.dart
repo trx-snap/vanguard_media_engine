@@ -16,9 +16,10 @@
 //   - Structured JSON prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_JSON:`;
 //   - Structured lane prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_LANE:`;
 //   - Claims production routing/fail-closed behavior on Android for static sticker
-//     overlays in Route-A, including overlay compositing on Vulkan dissolve transition
+//     overlays in Route-A, including dynamic keyframed spatial transforms
+//     (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT) and overlay compositing on Vulkan dissolve transition
 //     overlap frames (P5-OVERLAYS-TRANSITION-COMP-N3), but does not claim text/emoji
-//     overlays, animated keyframes, overlay beauty filter composition, non-dissolve
+//     overlays, overlay beauty filter composition, non-dissolve
 //     transition types combined with overlays, pixel quality, fleet coverage, playback,
 //     GLES overlays, app/editor UI, iOS, or streaming/cache;
 //   - Validates success lanes: `success == true`, output file exists,
@@ -84,9 +85,10 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'multi_layer_z_order_success',
   'time_interval_gating_success',
   'hard_cut_multiclip_success',
+  'single_clip_dynamic_keyframe_success',
   'fail_closed_text_overlay',
   'fail_closed_emoji_overlay',
-  'fail_closed_keyframes',
+  'fail_closed_malformed_keyframes',
   'overlays_with_transition_dissolve_success',
   'fail_closed_overlays_with_beauty',
   'fail_closed_unreadable_asset',
@@ -822,17 +824,18 @@ class VGTimelineOverlayExportSmokeRunner {
   }
 }
 
-/// Builds the default suite of 10 Route-A static sticker overlay smoke requests:
+/// Builds the default suite of 11 Route-A static sticker overlay smoke requests:
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
 /// 4. `hard_cut_multiclip_success`
-/// 5. `fail_closed_text_overlay`
-/// 6. `fail_closed_emoji_overlay`
-/// 7. `fail_closed_keyframes`
-/// 8. `overlays_with_transition_dissolve_success`
-/// 9. `fail_closed_overlays_with_beauty`
-/// 10. `fail_closed_unreadable_asset`
+/// 5. `single_clip_dynamic_keyframe_success`
+/// 6. `fail_closed_text_overlay`
+/// 7. `fail_closed_emoji_overlay`
+/// 8. `fail_closed_malformed_keyframes`
+/// 9. `overlays_with_transition_dissolve_success`
+/// 10. `fail_closed_overlays_with_beauty`
+/// 11. `fail_closed_unreadable_asset`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
   String clipPathB = '/data/local/tmp/clip_b.mov',
@@ -1001,7 +1004,66 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 5: fail_closed_text_overlay
+    // Lane 5: single_clip_dynamic_keyframe_success
+    VGTimelineOverlayExportSmokeRequest(
+      laneId: 'single_clip_dynamic_keyframe_success',
+      clips: <VGTimelineOverlayExportSmokeClip>[
+        VGTimelineOverlayExportSmokeClip(
+          id: 'clip-1',
+          sourcePath: clipPathA,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.0,
+        ),
+      ],
+      overlays: <VGTimelineOverlayExportSmokeOverlay>[
+        VGTimelineOverlayExportSmokeOverlay(
+          id: 'sticker-dynamic-kf',
+          assetPath: stickerAssetPath,
+          startTimeSeconds: 0.0,
+          durationSeconds: 2.0,
+          translationX: 100.0,
+          translationY: 100.0,
+          width: 200.0,
+          height: 200.0,
+          rotation: 0.0,
+          scale: 1.0,
+          opacity: 0.2,
+          zIndex: 0,
+          type: 'sticker',
+          keyframes: const <Object?>[
+            <String, Object?>{
+              'timeSeconds': 0.0,
+              'translationX': 100.0,
+              'translationY': 100.0,
+              'width': 200.0,
+              'height': 200.0,
+              'rotation': 0.0,
+              'scale': 1.0,
+              'opacity': 0.2,
+              'interpolation': 'easeInOut',
+            },
+            <String, Object?>{
+              'timeSeconds': 2.0,
+              'translationX': 300.0,
+              'translationY': 300.0,
+              'width': 240.0,
+              'height': 240.0,
+              'rotation': 0.0,
+              'scale': 2.0,
+              'opacity': 1.0,
+              'interpolation': 'linear',
+            },
+          ],
+        ),
+      ],
+      outputPath: outputPath('single_clip_dynamic_keyframe_success'),
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedRenderedOverlayFrameCount: 55,
+      ),
+    ),
+
+    // Lane 6: fail_closed_text_overlay
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'fail_closed_text_overlay',
       clips: <VGTimelineOverlayExportSmokeClip>[
@@ -1036,7 +1098,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 6: fail_closed_emoji_overlay
+    // Lane 7: fail_closed_emoji_overlay
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'fail_closed_emoji_overlay',
       clips: <VGTimelineOverlayExportSmokeClip>[
@@ -1071,9 +1133,9 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 7: fail_closed_keyframes
+    // Lane 8: fail_closed_malformed_keyframes
     VGTimelineOverlayExportSmokeRequest(
-      laneId: 'fail_closed_keyframes',
+      laneId: 'fail_closed_malformed_keyframes',
       clips: <VGTimelineOverlayExportSmokeClip>[
         VGTimelineOverlayExportSmokeClip(
           id: 'clip-1',
@@ -1084,7 +1146,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ],
       overlays: <VGTimelineOverlayExportSmokeOverlay>[
         VGTimelineOverlayExportSmokeOverlay(
-          id: 'sticker-kf',
+          id: 'sticker-bad-kf',
           assetPath: stickerAssetPath,
           startTimeSeconds: 0.0,
           durationSeconds: 2.0,
@@ -1098,19 +1160,35 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
           zIndex: 0,
           type: 'sticker',
           keyframes: const <Object?>[
-            <String, Object?>{'time': 0.0, 'scale': 1.0},
-            <String, Object?>{'time': 1.0, 'scale': 1.5},
+            <String, Object?>{
+              'timeSeconds': 1.0,
+              'translationX': 100.0,
+              'translationY': 100.0,
+              'width': 200.0,
+              'height': 200.0,
+              'scale': 1.0,
+              'opacity': 1.0,
+            },
+            <String, Object?>{
+              'timeSeconds': 0.5,
+              'translationX': 150.0,
+              'translationY': 150.0,
+              'width': 200.0,
+              'height': 200.0,
+              'scale': 1.0,
+              'opacity': 1.0,
+            },
           ],
         ),
       ],
-      outputPath: outputPath('fail_closed_keyframes'),
+      outputPath: outputPath('fail_closed_malformed_keyframes'),
       expectation: const VGTimelineOverlayExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
+        errorCode: invalidArgCode,
         messageContains: keyframesToken,
       ),
     ),
 
-    // Lane 8: overlays_with_transition_dissolve_success
+    // Lane 9: overlays_with_transition_dissolve_success
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'overlays_with_transition_dissolve_success',
       clips: <VGTimelineOverlayExportSmokeClip>[
@@ -1171,7 +1249,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 9: fail_closed_overlays_with_beauty
+    // Lane 10: fail_closed_overlays_with_beauty
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'fail_closed_overlays_with_beauty',
       clips: <VGTimelineOverlayExportSmokeClip>[
@@ -1207,7 +1285,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 10: fail_closed_unreadable_asset
+    // Lane 11: fail_closed_unreadable_asset
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'fail_closed_unreadable_asset',
       clips: <VGTimelineOverlayExportSmokeClip>[

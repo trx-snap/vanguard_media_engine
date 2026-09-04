@@ -4,16 +4,18 @@
 //
 // Proof boundary: production_exportTimeline_vulkan_static_sticker_overlay_route_a
 //
-// Claims (P5-OVERLAYS-TRANSITION-COMP-N3): static sticker overlay compositing
-// on solo frames, AND on Vulkan dissolve transition overlap frames.
+// Claims: dynamic keyframed static sticker overlay export
+// (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), static sticker overlay compositing
+// on solo frames, AND on Vulkan dissolve transition overlap frames
+// (P5-OVERLAYS-TRANSITION-COMP-N3).
 //
 // Strict non-claims:
 //   - No pixel quality claim;
-//   - No text/emoji/keyframed overlay support beyond fail-closed lanes;
+//   - No text/emoji overlay support beyond fail-closed lanes;
 //   - No overlay+beauty filter composition;
 //   - No non-dissolve transition types combined with overlays;
 //   - No GLES overlay route;
-//   - No playback, app/editor UI, iOS, or streaming/cache;
+//   - No playback, app/editor UI, product, iOS, or streaming/cache;
 //   - No fleet coverage beyond attached device.
 //
 // Drives the REAL production `exportTimeline` MethodChannel route (no

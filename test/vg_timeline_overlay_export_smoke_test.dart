@@ -149,7 +149,7 @@ void main() {
       expect(overlaysWithBeautyToken, 'beauty');
       expect(unreadableAssetToken, 'asset');
 
-      expect(defaultOverlaySmokeLaneIds, hasLength(10));
+      expect(defaultOverlaySmokeLaneIds, hasLength(11));
       expect(
         defaultOverlaySmokeLaneIds,
         contains('single_clip_static_sticker_success'),
@@ -166,9 +166,16 @@ void main() {
         defaultOverlaySmokeLaneIds,
         contains('hard_cut_multiclip_success'),
       );
+      expect(
+        defaultOverlaySmokeLaneIds,
+        contains('single_clip_dynamic_keyframe_success'),
+      );
       expect(defaultOverlaySmokeLaneIds, contains('fail_closed_text_overlay'));
       expect(defaultOverlaySmokeLaneIds, contains('fail_closed_emoji_overlay'));
-      expect(defaultOverlaySmokeLaneIds, contains('fail_closed_keyframes'));
+      expect(
+        defaultOverlaySmokeLaneIds,
+        contains('fail_closed_malformed_keyframes'),
+      );
       expect(
         defaultOverlaySmokeLaneIds,
         contains('overlays_with_transition_dissolve_success'),
@@ -226,11 +233,50 @@ void main() {
       'toMap includes keyframes when explicitly provided for negative lanes',
       () {
         final kfList = <Object?>[
-          <String, Object?>{'time': 0.0, 'scale': 1.0},
-          <String, Object?>{'time': 1.0, 'scale': 1.5},
+          <String, Object?>{'timeSeconds': 1.0, 'scale': 1.0},
+          <String, Object?>{'timeSeconds': 0.5, 'scale': 1.5},
         ];
         final overlay = VGTimelineOverlayExportSmokeOverlay(
           id: 'kf-overlay',
+          assetPath: '/tmp/kf.png',
+          keyframes: kfList,
+        );
+
+        final map = overlay.toMap();
+        expect(map.containsKey('keyframes'), isTrue);
+        expect(map['keyframes'], kfList);
+      },
+    );
+
+    test(
+      'toMap includes keyframes when explicitly provided for dynamic keyframe lanes',
+      () {
+        final kfList = <Object?>[
+          <String, Object?>{
+            'timeSeconds': 0.0,
+            'translationX': 100.0,
+            'translationY': 100.0,
+            'width': 200.0,
+            'height': 200.0,
+            'rotation': 0.0,
+            'scale': 1.0,
+            'opacity': 0.2,
+            'interpolation': 'easeInOut',
+          },
+          <String, Object?>{
+            'timeSeconds': 2.0,
+            'translationX': 300.0,
+            'translationY': 300.0,
+            'width': 240.0,
+            'height': 240.0,
+            'rotation': 0.0,
+            'scale': 2.0,
+            'opacity': 1.0,
+            'interpolation': 'linear',
+          },
+        ];
+        final overlay = VGTimelineOverlayExportSmokeOverlay(
+          id: 'kf-overlay-dynamic',
           assetPath: '/tmp/kf.png',
           keyframes: kfList,
         );
@@ -696,6 +742,32 @@ void main() {
       expect(report.failureReason, isEmpty);
     });
 
+    test(
+      'passes when fail_closed_malformed_keyframes matches INVALID_ARG and keyframe token',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromPlatformException(
+          _request(
+            laneId: 'fail_closed_malformed_keyframes',
+            expectation:
+                const VGTimelineOverlayExportSmokeExpectation.failClosed(
+                  errorCode: invalidArgCode,
+                  messageContains: keyframesToken,
+                ),
+          ),
+          PlatformException(
+            code: invalidArgCode,
+            message:
+                'exportTimeline: overlay sticker keyframe at index 1 has duplicate or non-monotonic timestamps',
+          ),
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.status, 'PASS');
+        expect(report.errorCode, invalidArgCode);
+        expect(report.failureReason, isEmpty);
+      },
+    );
+
     test('fails when error code does not match', () {
       final report =
           VGTimelineOverlayExportSmokeLaneReport.fromPlatformException(
@@ -1031,18 +1103,18 @@ void main() {
 
   group('default suite construction', () {
     test(
-      'buildDefaultOverlayExportSmokeSuite builds all 10 required lanes',
+      'buildDefaultOverlayExportSmokeSuite builds all 11 required lanes',
       () {
         final suite = buildDefaultOverlayExportSmokeSuite();
 
-        expect(suite, hasLength(10));
+        expect(suite, hasLength(11));
         final laneIds = suite.map((r) => r.laneId).toList();
         expect(laneIds, defaultOverlaySmokeLaneIds);
 
         final successLanes = suite.where((r) => r.expectation.expectsSuccess);
         final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(5));
+        expect(successLanes, hasLength(6));
         expect(failureLanes, hasLength(5));
 
         // Lane 1: single_clip_static_sticker_success
@@ -1075,53 +1147,69 @@ void main() {
         expect(lane4.transitions, isEmpty);
         expect(lane4.expectedDurationSeconds, 4.0);
 
-        // Lane 5: fail_closed_text_overlay
+        // Lane 5: single_clip_dynamic_keyframe_success
         final lane5 = suite[4];
-        expect(lane5.laneId, 'fail_closed_text_overlay');
-        expect(lane5.overlays.single.type, 'text');
-        expect(lane5.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane5.expectation.messageContains, textOverlayToken);
+        expect(lane5.laneId, 'single_clip_dynamic_keyframe_success');
+        expect(lane5.clips, hasLength(1));
+        expect(lane5.clips.single.durationSeconds, 2.0);
+        expect(lane5.overlays, hasLength(1));
+        expect(lane5.overlays.single.type, 'sticker');
+        expect(lane5.overlays.single.startTimeSeconds, 0.0);
+        expect(lane5.overlays.single.durationSeconds, 2.0);
+        expect(lane5.overlays.single.keyframes, isA<List<Object?>>());
+        expect((lane5.overlays.single.keyframes as List), hasLength(2));
+        expect(lane5.expectation.expectsSuccess, isTrue);
+        expect(lane5.expectation.expectedOverlayCount, 1);
+        expect(lane5.expectation.expectedRenderedOverlayFrameCount, 55);
+        expect(lane5.expectedDurationSeconds, 2.0);
 
-        // Lane 6: fail_closed_emoji_overlay
+        // Lane 6: fail_closed_text_overlay
         final lane6 = suite[5];
-        expect(lane6.laneId, 'fail_closed_emoji_overlay');
-        expect(lane6.overlays.single.type, 'emoji');
+        expect(lane6.laneId, 'fail_closed_text_overlay');
+        expect(lane6.overlays.single.type, 'text');
         expect(lane6.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane6.expectation.messageContains, emojiOverlayToken);
+        expect(lane6.expectation.messageContains, textOverlayToken);
 
-        // Lane 7: fail_closed_keyframes
+        // Lane 7: fail_closed_emoji_overlay
         final lane7 = suite[6];
-        expect(lane7.laneId, 'fail_closed_keyframes');
-        expect(lane7.overlays.single.keyframes, isNotNull);
+        expect(lane7.laneId, 'fail_closed_emoji_overlay');
+        expect(lane7.overlays.single.type, 'emoji');
         expect(lane7.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane7.expectation.messageContains, keyframesToken);
+        expect(lane7.expectation.messageContains, emojiOverlayToken);
 
-        // Lane 8: overlays_with_transition_dissolve_success
+        // Lane 8: fail_closed_malformed_keyframes
         final lane8 = suite[7];
-        expect(lane8.laneId, 'overlays_with_transition_dissolve_success');
-        expect(lane8.clips, hasLength(2));
-        expect(lane8.transitions, hasLength(1));
-        expect(lane8.transitions.single.type, 'dissolve');
-        expect(lane8.overlays, hasLength(1));
-        expect(lane8.expectation.expectsSuccess, isTrue);
-        expect(lane8.expectation.expectedTransitionCount, 1);
-        expect(lane8.expectation.expectedRenderedOverlayFrameCount, 10);
-        // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
-        expect(lane8.expectedDurationSeconds, closeTo(3.5, 1e-9));
-        expect(lane8.expectedTransitionCount, 1);
+        expect(lane8.laneId, 'fail_closed_malformed_keyframes');
+        expect(lane8.overlays.single.keyframes, isNotNull);
+        expect(lane8.expectation.errorCode, invalidArgCode);
+        expect(lane8.expectation.messageContains, keyframesToken);
 
-        // Lane 9: fail_closed_overlays_with_beauty
+        // Lane 9: overlays_with_transition_dissolve_success
         final lane9 = suite[8];
-        expect(lane9.laneId, 'fail_closed_overlays_with_beauty');
-        expect(lane9.clips.single.hasBeauty, isTrue);
-        expect(lane9.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane9.expectation.messageContains, overlaysWithBeautyToken);
+        expect(lane9.laneId, 'overlays_with_transition_dissolve_success');
+        expect(lane9.clips, hasLength(2));
+        expect(lane9.transitions, hasLength(1));
+        expect(lane9.transitions.single.type, 'dissolve');
+        expect(lane9.overlays, hasLength(1));
+        expect(lane9.expectation.expectsSuccess, isTrue);
+        expect(lane9.expectation.expectedTransitionCount, 1);
+        expect(lane9.expectation.expectedRenderedOverlayFrameCount, 10);
+        // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
+        expect(lane9.expectedDurationSeconds, closeTo(3.5, 1e-9));
+        expect(lane9.expectedTransitionCount, 1);
 
-        // Lane 10: fail_closed_unreadable_asset
+        // Lane 10: fail_closed_overlays_with_beauty
         final lane10 = suite[9];
-        expect(lane10.laneId, 'fail_closed_unreadable_asset');
-        expect(lane10.expectation.errorCode, fileUnreadableCode);
-        expect(lane10.expectation.messageContains, unreadableAssetToken);
+        expect(lane10.laneId, 'fail_closed_overlays_with_beauty');
+        expect(lane10.clips.single.hasBeauty, isTrue);
+        expect(lane10.expectation.errorCode, unsupportedExportFeatureCode);
+        expect(lane10.expectation.messageContains, overlaysWithBeautyToken);
+
+        // Lane 11: fail_closed_unreadable_asset
+        final lane11 = suite[10];
+        expect(lane11.laneId, 'fail_closed_unreadable_asset');
+        expect(lane11.expectation.errorCode, fileUnreadableCode);
+        expect(lane11.expectation.messageContains, unreadableAssetToken);
       },
     );
   });

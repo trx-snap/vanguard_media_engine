@@ -137,13 +137,24 @@ internal class AndroidTimelineOverlayRenderSession internal constructor(
             textureHandles[i] = active.textureHandle
             val desc = active.descriptor
             val base = i * 7
-            geometry[base] = desc.translationX
-            geometry[base + 1] = desc.translationY
-            geometry[base + 2] = desc.width
-            geometry[base + 3] = desc.height
-            geometry[base + 4] = desc.rotation
-            geometry[base + 5] = desc.scale
-            geometry[base + 6] = desc.opacity
+            if (desc.keyframes.isNotEmpty()) {
+                val eval = AndroidTimelineOverlayTransformEvaluator.evaluate(desc, ptsSeconds)
+                geometry[base] = eval.translationX
+                geometry[base + 1] = eval.translationY
+                geometry[base + 2] = eval.width
+                geometry[base + 3] = eval.height
+                geometry[base + 4] = eval.rotation
+                geometry[base + 5] = eval.scale
+                geometry[base + 6] = eval.opacity
+            } else {
+                geometry[base] = desc.translationX
+                geometry[base + 1] = desc.translationY
+                geometry[base + 2] = desc.width
+                geometry[base + 3] = desc.height
+                geometry[base + 4] = desc.rotation
+                geometry[base + 5] = desc.scale
+                geometry[base + 6] = desc.opacity
+            }
         }
 
         return FramePayloadResult.Success(
