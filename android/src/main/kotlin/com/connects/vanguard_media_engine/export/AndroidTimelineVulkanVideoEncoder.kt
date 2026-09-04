@@ -220,6 +220,16 @@ class AndroidTimelineVulkanVideoEncoder(
         onProgress: ((Double) -> Unit)?,
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
+        // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: this Vulkan-first pass-1 route
+        // has no reversed-clip render support -- AndroidExportRenderBackendSelector
+        // already steers a plain reversed scope to the GLES encoder instead,
+        // but this defensive check fails closed here too rather than relying
+        // on that routing decision alone, since AndroidTimelineExportSession
+        // constructs this encoder directly whenever the selector resolves
+        // Vulkan.
+        if (clips.any { it.isReversed }) {
+            return failResult("vulkan_reverse_not_supported")
+        }
         val nonHardCutTransitions = transitions.filter { !it.isHardCut }
         val plan = buildSegmentPlan(clips, nonHardCutTransitions)
         totalExpectedSamples = plan.expectedSamples

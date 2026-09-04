@@ -37,7 +37,20 @@ import kotlin.math.floor
 // Phase 10 with per-clip colorMatrix parity):
 //   - video-only clips, speed == 1.0, no canvas
 //     contentMode other than "fit", no per-clip transform/crop/freeze/
-//     reverse/time-remap/dual-camera.
+//     time-remap/dual-camera.
+//   - P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: a narrow reversed-video export
+//     route. A hard-cut clip (forward or reversed) with isReversed=true is
+//     accepted when it is a local video clip with zero rotation metadata;
+//     it is rendered exclusively via AndroidTimelineVideoEncoder's GLES
+//     fallback (renderReversedClipIntoEncoder) -- reversed clips never
+//     route through Vulkan (AndroidExportRenderBackendSelector /
+//     AndroidTimelineVulkanVideoEncoder both fail closed for them). A
+//     reversed clip alongside a transition, an overlay, clip-level Beauty
+//     V2, or an audioSidecar track fails closed with
+//     UNSUPPORTED_EXPORT_FEATURE before pass-1; isReversed=true on a
+//     non-video clip fails closed with INVALID_ARG. This route never reads
+//     AndroidReverseSidecarCoordinator/Transcoder output -- those sidecars
+//     remain preview/playback-only.
 //   - P5-COMPOSITOR-TRANS: compositor-owned clip overlap transitions
 //     (AndroidTimelineTransitionDescriptor: dissolve/crossfade, slide*,
 //     wipe*) between adjacent video clips, rendered ONLY by
@@ -131,6 +144,11 @@ class AndroidTimelineExportSession(private val context: Context) {
         val mediaKind: String,
         val colorMatrix: FloatArray? = null,
         val beautyIntensity: Double? = null,
+        // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: true when this clip must be
+        // rendered walking its trim window backwards. See the admission gate
+        // and guardrails around isReversed below for the narrow scope this
+        // slice accepts.
+        val isReversed: Boolean = false,
     )
 
     private data class ClipContext(
@@ -144,6 +162,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
         val colorMatrix: FloatArray? = null,
         val beautyIntensity: Double? = null,
+        val isReversed: Boolean = false,
     )
 
     private fun run(
@@ -250,9 +269,22 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.speed != 1.0 is not supported")
                 return
             }
+            // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips are accepted
+            // for local video clips only -- a reversed clip on a still image
+            // has no defined semantics here and fails closed with a
+            // malformed-argument code rather than UNSUPPORTED_EXPORT_FEATURE.
+            // The remaining reversed-clip guardrails (transitions/overlays/
+            // Beauty V2/audio tracks/rotation) depend on context not yet
+            // known at this point in per-clip parsing and are enforced
+            // further below, once every clip has been parsed (and, for
+            // rotation, probed).
             val isReversed = map["isReversed"] as? Boolean ?: false
-            if (isReversed) {
-                onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.isReversed is not supported")
+            if (isReversed && mediaKind != "video") {
+                onError(
+                    "INVALID_ARG",
+                    "exportTimeline: clip.isReversed is only supported for video clips " +
+                        "(mediaKind '$mediaKind' with isReversed=true)",
+                )
                 return
             }
             for (unsupportedKey in UNSUPPORTED_CLIP_KEYS) {
@@ -346,8 +378,52 @@ class AndroidTimelineExportSession(private val context: Context) {
                     mediaKind = mediaKind,
                     colorMatrix = colorMatrix,
                     beautyIntensity = beautyIntensity,
+                    isReversed = isReversed,
                 ),
             )
+        }
+
+        // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips are a narrow,
+        // GLES-only production route (see AndroidTimelineVideoEncoder /
+        // AndroidExportRenderBackendSelector) -- any scope that mixes a
+        // reversed clip with a feature that has no reversed-clip support yet
+        // (transitions, overlays, clip-level Beauty V2, audio tracks) fails
+        // closed here, before transitions/overlays are even parsed, rather
+        // than silently producing wrong output. Rotation metadata on a
+        // reversed clip is checked further below (step 3), once each video
+        // clip has been probed.
+        val anyReversed = parsedClips.any { it.isReversed }
+        if (anyReversed) {
+            if (rawTransitions.isNotEmpty()) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: reversed clips with transitions are not supported",
+                )
+                return
+            }
+            if (overlays.isNotEmpty()) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: reversed clips with overlays are not supported",
+                )
+                return
+            }
+            if (parsedClips.any { it.beautyIntensity != null }) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: reversed clips with Beauty V2 are not supported",
+                )
+                return
+            }
+            val reversedSidecarTracks = ((draftMap["audioSidecar"] as? Map<*, *>)?.get("tracks") as? List<*>)
+                ?: emptyList<Any?>()
+            if (reversedSidecarTracks.isNotEmpty()) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: reversed clips with audio tracks are not supported",
+                )
+                return
+            }
         }
 
         // ── 2b. Transitions: parse + bind to adjacent clips (P5-COMPOSITOR-TRANS) ──
@@ -415,6 +491,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                         exifOrientation = imageProbe.exifOrientation,
                         colorMatrix = clip.colorMatrix,
                         beautyIntensity = clip.beautyIntensity,
+                        isReversed = clip.isReversed,
                     ),
                 )
                 continue
@@ -435,6 +512,19 @@ class AndroidTimelineExportSession(private val context: Context) {
                 )
                 return
             }
+            // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: this slice's reversed-clip
+            // render route (AndroidTimelineVideoEncoder.renderReversedClipIntoEncoder)
+            // does not apply clip rotation metadata -- avoiding reliance on
+            // platform bitmap autorotation semantics -- so a reversed clip
+            // with non-zero normalized rotation fails closed rather than
+            // silently ignoring its rotation.
+            if (clip.isReversed && normalizedRotation != 0) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: reversed clips with rotation metadata are not supported",
+                )
+                return
+            }
             clipContexts.add(
                 ClipContext(
                     sourcePath = clip.sourcePath,
@@ -446,6 +536,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     mediaKind = clip.mediaKind,
                     colorMatrix = clip.colorMatrix,
                     beautyIntensity = clip.beautyIntensity,
+                    isReversed = clip.isReversed,
                 ),
             )
         }
@@ -553,6 +644,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     exifOrientation = ctx.exifOrientation,
                     colorMatrix = ctx.colorMatrix,
                     beautyIntensity = ctx.beautyIntensity,
+                    isReversed = ctx.isReversed,
                 ),
             )
         }

@@ -240,6 +240,14 @@ class AndroidExportRenderBackendSelector {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "vulkan_scope_not_supported"
         if (scope.clips.isEmpty()) return "vulkan_scope_not_supported"
         if (scope.requestedWidth <= 0 || scope.requestedHeight <= 0) return "vulkan_scope_not_supported"
+        // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips have no native
+        // Vulkan render route in this slice -- a reversed clip always
+        // resolves this specific reason rather than the generic
+        // "vulkan_scope_not_supported", so both AndroidTimelineExportSession's
+        // GLES-fallback decision and any UNAVAILABLE reason string (when the
+        // scope also independently requires Vulkan for a transition/overlay/
+        // beauty reason) report the precise cause.
+        if (scope.clips.any { it.isReversed }) return "reverse_unsupported_by_vulkan"
         val allSafe = scope.clips.all { clip ->
             if (clip.mediaKind != "video") return@all false
             if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return@all false

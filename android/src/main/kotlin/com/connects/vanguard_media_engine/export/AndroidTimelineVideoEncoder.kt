@@ -7,6 +7,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -68,6 +69,15 @@ import kotlin.math.sin
 // left unrotated; SurfaceTexture's own transform matrix (uSTMatrix) remains
 // the only texture-space transform. Vertex geometry is recomputed once per
 // clip, not per frame.
+//
+// P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: a clip with [ClipInput.isReversed] set
+// is rendered by [renderReversedClipIntoEncoder] instead of
+// [decodeClipIntoEncoder] -- MediaMetadataRetriever.getFrameAtTime walks the
+// clip's trim window backwards, and each Bitmap is uploaded as a plain 2D
+// texture and drawn through the same still-image 2D program
+// ([drawAndSubmitFrame2D]) a still-image clip uses, rather than the OES
+// SurfaceTexture decode path. This is the only reversed-clip render route:
+// AndroidTimelineVulkanVideoEncoder fails closed if it ever receives one.
 class AndroidTimelineVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -92,6 +102,12 @@ class AndroidTimelineVideoEncoder(
         // (AndroidTimelineVulkanVideoEncoder) for solo/hard-cut-adjacent
         // video frames -- this GLES encoder never reads this field.
         val beautyIntensity: Double? = null,
+        // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: true when this (video) clip
+        // must be rendered walking its trim window backwards -- see
+        // [renderReversedClipIntoEncoder]. The Vulkan-only production route
+        // (AndroidTimelineVulkanVideoEncoder) has no render support for this
+        // and fails closed defensively if it ever receives one.
+        val isReversed: Boolean = false,
     )
 
     data class EncodeResult(
@@ -195,6 +211,8 @@ class AndroidTimelineVideoEncoder(
                 if (cancelRequested) break
                 val failureReason = if (clip.mediaKind == "image") {
                     renderStillClipIntoEncoder(clip)
+                } else if (clip.isReversed) {
+                    renderReversedClipIntoEncoder(clip)
                 } else {
                     decodeClipIntoEncoder(clip)
                 }
@@ -888,6 +906,92 @@ class AndroidTimelineVideoEncoder(
             if (textureId != 0) {
                 try { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) } catch (_: Throwable) {}
             }
+        }
+    }
+
+    /// Renders a time-reversed frame sequence for [clip] (mediaKind ==
+    /// "video", [ClipInput.isReversed] == true) via MediaMetadataRetriever
+    /// bitmap extraction -- the reversed-video analogue of
+    /// [decodeClipIntoEncoder], sharing [renderStillClipIntoEncoder]'s plain
+    /// 2D texture upload + [drawAndSubmitFrame2D] draw path (so
+    /// [ClipInput.colorMatrix] applies identically). Expected frame count
+    /// matches the forward video formula: ceil((trimEnd - trimStart) *
+    /// fps).coerceAtLeast(1). Frame i samples source timestamp
+    /// trimEndExclusiveUs - (i + 1) * frameDurationUs -- walking the source
+    /// backwards -- clamped into [trimStartUs, latestSourceUs] so
+    /// ceil-derived overshoot never samples at/before trimStart or at/after
+    /// the exclusive trimEnd. trimEndExclusiveUs is floored up to
+    /// trimStartUs + 1 so a microsecond-scale trim that truncates trimStart
+    /// and trimEnd to the same microsecond still yields a valid clamp range
+    /// instead of throwing. A null
+    /// Bitmap for any frame fails the whole clip immediately -- this backend
+    /// must never duplicate a frame to paper over a decode gap. Returns null
+    /// on success (including an early-cancelled loop), or a machine-readable
+    /// failure reason string.
+    private fun renderReversedClipIntoEncoder(clip: ClipInput): String? {
+        val retriever = MediaMetadataRetriever()
+        var textureId = 0
+        var bitmapToRecycle: Bitmap? = null
+        try {
+            retriever.setDataSource(clip.sourcePath)
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+            val geometryFailure = updateClipGeometry(clip)
+            if (geometryFailure != null) return geometryFailure
+
+            val trimStartUs = (clip.trimStartSeconds * 1_000_000L).toLong()
+            val trimEndExclusiveUs = (clip.trimEndSeconds * 1_000_000L).toLong()
+                .coerceAtLeast(trimStartUs + 1L)
+            val expectedFrames = ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps)
+                .toInt().coerceAtLeast(1)
+
+            val textures = IntArray(1)
+            GLES20.glGenTextures(1, textures, 0)
+            textureId = textures[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+            var framesRendered = 0
+            for (i in 0 until expectedFrames) {
+                if (cancelRequested) break
+                val idxUs = (i + 1).toLong() * frameDurationUs
+                val latestSourceUs = trimEndExclusiveUs - 1L
+                val sourceUs = (trimEndExclusiveUs - idxUs).coerceIn(trimStartUs, latestSourceUs)
+
+                val frame = retriever.getFrameAtTime(sourceUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: return "reverse_frame_decode_failed:frame=$i:sourceUs=$sourceUs:${clip.sourcePath}"
+                bitmapToRecycle = frame
+
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, frame, 0)
+                val texUploadError = GLES20.glGetError()
+                frame.recycle()
+                bitmapToRecycle = null
+                if (texUploadError != GLES20.GL_NO_ERROR) {
+                    return "reverse_texture_upload_failed:$texUploadError:frame=$i:${clip.sourcePath}"
+                }
+
+                drawAndSubmitFrame2D(textureId, clip.colorMatrix)
+                drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+                framesRendered++
+            }
+
+            if (framesRendered == 0 && !cancelRequested) {
+                return "no_frames_in_reversed_clip:${clip.sourcePath}"
+            }
+            return null
+        } catch (t: Throwable) {
+            Log.e(TAG, "renderReversedClipIntoEncoder failed for ${clip.sourcePath}: $t", t)
+            return "reversed_clip_render_exception:${t.javaClass.simpleName}:${clip.sourcePath}"
+        } finally {
+            try { bitmapToRecycle?.recycle() } catch (_: Throwable) {}
+            if (textureId != 0) {
+                try { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) } catch (_: Throwable) {}
+            }
+            try { retriever.release() } catch (_: Throwable) {}
         }
     }
 
