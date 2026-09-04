@@ -144,6 +144,8 @@ export 'vg_realtime_audio_playback_production_types.dart';
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.
 export 'vg_camera2_thermal_load_shedding_monitor.dart';
+// P3-CAM-THERMAL-ACT-FPS-REQUEST-ACTION: Android Camera2 repeating-request AE target FPS range mutation smoke foundation.
+export 'vg_camera2_thermal_fps_action_smoke.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';

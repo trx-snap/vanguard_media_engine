@@ -10,6 +10,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2ImageReaderFrameS
 import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderFrameSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderLoopSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHarness
+import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalFpsActionSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalListenerSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxCapabilityProbe
@@ -81,6 +82,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke",
             "runAndroidDagPhase1AVGlesEvalRenderSmoke",
             "runAndroidDagPhase3UnitTThermalListenerSmoke",
+            "runAndroidDagPhase3ThermalFpsActionSmoke",
             "runAndroidVulkanExportNativeSeamSmoke",
             "runAndroidVulkanExportProductionWiringSmoke",
             "runAndroidGlesExportFitGeometrySmoke",
@@ -147,6 +149,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke" -> runPhase1ATGlesMixedTextureCompositorSmoke(args, result)
             "runAndroidDagPhase1AVGlesEvalRenderSmoke" -> runPhase1AVGlesEvalRenderSmoke(args, result)
             "runAndroidDagPhase3UnitTThermalListenerSmoke" -> runPhase3UnitTThermalListenerSmoke(result)
+            "runAndroidDagPhase3ThermalFpsActionSmoke" -> runPhase3ThermalFpsActionSmoke(args, result)
             "runAndroidVulkanExportNativeSeamSmoke" -> runAndroidVulkanExportNativeSeamSmoke(args, result)
             "runAndroidVulkanExportProductionWiringSmoke" -> runAndroidVulkanExportProductionWiringSmoke(args, result)
             "runAndroidGlesExportFitGeometrySmoke" -> runAndroidGlesExportFitGeometrySmoke(args, result)
@@ -1135,6 +1138,27 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "THERMAL_LISTENER_SMOKE_FAILED",
                         "runAndroidDagPhase3UnitTThermalListenerSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── P3-CAM-THERMAL-ACT-FPS-REQUEST-ACTION: Android Camera2 repeating-request AE FPS range mutation smoke ──
+    private fun runPhase3ThermalFpsActionSmoke(
+        args: Map<*, *>?,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                val smokeResult = AndroidCamera2ThermalFpsActionSmokeHarness(context).run(args)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "THERMAL_FPS_ACTION_SMOKE_FAILED",
+                        "runAndroidDagPhase3ThermalFpsActionSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
