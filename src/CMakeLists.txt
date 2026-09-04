@@ -203,6 +203,13 @@ if (ANDROID)
     # spatial render/readback, combining the descriptor-bridge parsing
     # pattern above with the OES spatial render route above it.
     "platform/android/src/android_phase3_multicam_dynamic_descriptor_spatial_render_jni.cpp"
+    # P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER: one real
+    # Camera2 ImageReader(YUV_420_888) buffer-queue frame + one synthetic
+    # RGBA_8888 HardwareBuffer, laid out via the same ComputeMultiCamLayout()
+    # descriptor pipeline as the route above and rendered by the same GLES/
+    # OES spatial compositor. Camera buffer is always the OES primary;
+    # synthetic buffer is always the 2D secondary.
+    "platform/android/src/android_phase3_multicam_single_cam_ingest_spatial_render_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"

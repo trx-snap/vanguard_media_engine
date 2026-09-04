@@ -2169,6 +2169,38 @@ class VanguardNativeBridge(
         splitRatio: Double,
     ): String
 
+    // -- P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER: one --
+    // real Camera2 ImageReader(YUV_420_888) buffer-queue frame (imported as
+    // GL_TEXTURE_EXTERNAL_OES, always the primary) plus one synthetic
+    // RGBA_8888 HardwareBuffer (native-filled solid opaque blue, imported as
+    // GL_TEXTURE_2D, always the secondary), laid out by the same
+    // layoutMode/pipAnchor/splitDirection strict-resolution + already-
+    // verified ComputeMultiCamLayout() pipeline as the dynamic-descriptor
+    // route above, rendered/read-back/presented via the same GlesBackend
+    // spatial compositor seams. Unlike that route, primary/secondary texture
+    // assignment never depends on layoutMode. Camera-side readback
+    // assertions are structural only (resolved OES target, render/readback
+    // success) -- never hue/luma/content, since the real camera frame's
+    // pixel content is unconstrained; the synthetic secondary additionally
+    // asserts deterministic solid blue. No concurrent/dual camera, no
+    // Vulkan, no recording/export, no product UI.
+    external fun runAndroidDagPhase3SingleCamIngestSpatialRenderSmoke(
+        surface: Surface,
+        cameraYuvBuffer: HardwareBuffer,
+        syntheticRgbaBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        layoutMode: String,
+        pipAnchor: String,
+        pipCenterX: Double,
+        pipCenterY: Double,
+        pipWidthFraction: Double,
+        pipAspectRatio: Double,
+        pipMarginFraction: Double,
+        splitDirection: String,
+        splitRatio: Double,
+    ): String
+
     // ── P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): VulkanMultiCamSpatialCompositor ──
     // two-texture spatial layout raster + readback proof diagnostic. Native
     // creates its own temporary VkInstance/VkDevice/VkQueue/VkCommandPool,

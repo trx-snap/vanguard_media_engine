@@ -17,6 +17,7 @@ import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractio
 import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoordinator
 import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSmokeCoordinator
+import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestSpatialSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalActuationRouter
@@ -115,6 +116,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── Phase 3-Unit M: Camera2 texture native-render loop smoke coordinator ──
     private var camera2TextureSmokeCoordinator: AndroidCamera2TextureSmokeCoordinator? = null
+
+    // -- P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER: single- --
+    // camera ingest + dynamic-descriptor GLES/OES spatial render smoke coordinator.
+    private var camera2SingleCamIngestSpatialSmokeCoordinator: AndroidCamera2SingleCamIngestSpatialSmokeCoordinator? = null
 
     // ── Phase 4C1D1: DAG streaming playback coordinator ───────────────────────
     private var dagStreamingPlaybackCoordinator: AndroidDagStreamingPlaybackCoordinator? = null
@@ -551,6 +556,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             channel         = channel,
             mainHandler     = mainHandler,
         )
+        camera2SingleCamIngestSpatialSmokeCoordinator = AndroidCamera2SingleCamIngestSpatialSmokeCoordinator(
+            context         = binding.applicationContext,
+            textureRegistry = binding.textureRegistry,
+            channel         = channel,
+            mainHandler     = mainHandler,
+        )
         dagStreamingPlaybackCoordinator = AndroidDagStreamingPlaybackCoordinator(
             context         = binding.applicationContext,
             textureRegistry = binding.textureRegistry,
@@ -821,6 +832,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android Camera2 texture smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidCamera2SingleCamIngestSpatialSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = camera2SingleCamIngestSpatialSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android Camera2 single-cam ingest spatial smoke coordinator unavailable", null)
             }
             return
         }
@@ -2824,6 +2845,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Tear down Phase 3-Unit M active camera texture smoke runs and release their producers.
         camera2TextureSmokeCoordinator?.disposeAll()
         camera2TextureSmokeCoordinator = null
+        // Tear down P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER active runs.
+        camera2SingleCamIngestSpatialSmokeCoordinator?.disposeAll()
+        camera2SingleCamIngestSpatialSmokeCoordinator = null
         // Tear down Phase 4C1D1 active streaming sessions.
         dagStreamingPlaybackCoordinator?.disposeAll()
         dagStreamingPlaybackCoordinator = null
