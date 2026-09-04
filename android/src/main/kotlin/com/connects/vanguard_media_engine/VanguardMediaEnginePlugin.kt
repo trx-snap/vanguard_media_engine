@@ -19,6 +19,7 @@ import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingC
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
+import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalActuationRouter
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAaudioNodeOwnedSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAsyncRuntimeQueueAudioTrackSinkSmokeCoordinator
@@ -506,6 +507,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var cameraSource: VanguardCameraSource? = null
     private var cameraTexture: TextureRegistry.SurfaceTextureEntry? = null
 
+    // -- P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: CameraX thermal FPS router ----
+    private var cameraXThermalActuationRouter: AndroidCameraXThermalActuationRouter? = null
+
     // ── Image texture loaders (B3: keyed by textureId) ────────────────────────
     private val imageLoaders = mutableMapOf<Long, VanguardImageTextureLoader>()
 
@@ -566,6 +570,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         cameraGraphTransactionCoordinator = AndroidCameraGraphTransactionCoordinator(
             hasActiveCameraProvider = { cameraSource != null },
+        )
+        cameraXThermalActuationRouter = AndroidCameraXThermalActuationRouter(
+            cameraSourceProvider = { cameraSource },
         )
         dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
             context       = binding.applicationContext,
@@ -854,6 +861,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android DAG diagnostics coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidCameraXThermalActuationRouter.ownsMethod(call.method)) {
+            val router = cameraXThermalActuationRouter
+            if (router != null) {
+                router.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android CameraX thermal actuation router unavailable", null)
             }
             return
         }
@@ -3113,6 +3130,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Camera graph transaction coordinator is stateless (no native
         // resources) -- just drop the reference, no disposeAll() to call.
         cameraGraphTransactionCoordinator = null
+        // CameraX thermal actuation router is a stateless dispatch shim over
+        // cameraSource (already stopped/nulled above) -- just drop the
+        // reference, no disposeAll() to call.
+        cameraXThermalActuationRouter = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

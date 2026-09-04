@@ -323,6 +323,7 @@ export 'vg_streaming_compatibility_decision_client.dart';
 export 'vg_streaming_preflight_composite_evaluator.dart';
 // P1-GPU-BLACKLIST: GPU driver blacklist rule evaluator.
 export 'src/diagnostics/vg_gpu_driver_blacklist.dart';
+export 'vg_camerax_thermal_fps_bridge.dart';
 
 const String _libName = 'vanguard_media_engine';
 

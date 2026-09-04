@@ -36,9 +36,11 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.net.Uri
 import android.util.Log
+import android.util.Range
 import android.view.Surface
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -65,6 +67,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalFpsActuator
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.concurrent.Executor
@@ -92,6 +95,21 @@ class VanguardCameraSource(
 
     companion object {
         private const val TAG = "VanguardCameraSource"
+
+        // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: proof-boundary telemetry
+        // constants shared by the thermal FPS apply-result and diagnostics maps.
+        private const val THERMAL_FPS_PROOF_BOUNDARY =
+            "camerax_repeating_request_ae_fps_mutation_synthetic_thermal_no_rebind_no_forced_heat_no_product"
+        private val THERMAL_FPS_NON_CLAIMS: Map<String, Boolean> = mapOf(
+            "midRecordingActuationProven" to false,
+            "osThermalListenerWired" to false,
+            "resolutionReconfigured" to false,
+            "secondaryCameraTouched" to false,
+            "realForcedOverheat" to false,
+            "encoderTouched" to false,
+            "rendererTouched" to false,
+            "productUiWired" to false,
+        )
     }
 
     // ── Fake lifecycle owner ─────────────────────────────────────────────────
@@ -154,6 +172,46 @@ class VanguardCameraSource(
 
     // ── Main-thread executor (callbacks from CameraX → plugin) ───────────────
     private val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
+
+    // -- P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: thermal FPS actuation seam ----
+    // bindGeneration/bindCount increment on every bindUseCases() call (start()
+    // and switchCamera()); the thermal FPS actuator is recreated per bind and
+    // any pending actuation whose captured generation no longer matches is a
+    // stale no-op. surfaceRequestCount increments on every provideSurface()
+    // call -- it must stay unchanged across a thermal FPS apply, proving no
+    // rebind occurred. completedCaptureCount / observed*/applied*/consecutive*
+    // are updated from the Camera2Interop session capture callback below.
+    @Volatile private var bindGeneration = 0
+    @Volatile private var bindCount = 0
+    @Volatile private var surfaceRequestCount = 0
+    @Volatile private var completedCaptureCount = 0
+    @Volatile private var observedAeTargetFpsLower: Int? = null
+    @Volatile private var observedAeTargetFpsUpper: Int? = null
+    @Volatile private var appliedAeTargetFpsLower: Int? = null
+    @Volatile private var appliedAeTargetFpsUpper: Int? = null
+    @Volatile private var consecutiveAppliedRangeCompletedCaptures = 0
+    private var thermalFpsActuator: AndroidCameraXThermalFpsActuator? = null
+
+    // Telemetry from the most recent applyThermalTargetFps() attempt (any
+    // outcome -- applied, rejected, or stale). Reset to null on every fresh
+    // bind. Surfaced read-only via thermalFpsDiagnostics().
+    private data class ThermalFpsApplyTelemetry(
+        val outcome: String,
+        val reasons: List<String>,
+        val selectedLower: Int?,
+        val selectedUpper: Int?,
+        val observedBeforeLower: Int?,
+        val observedBeforeUpper: Int?,
+        val observedAfterLower: Int?,
+        val observedAfterUpper: Int?,
+        val availableRanges: List<Range<Int>>,
+        val bindGeneration: Int,
+        val recordingActiveAtApply: Boolean,
+        val isRecordingAtApply: Boolean,
+        val completedCaptureCountBefore: Int,
+        val completedCaptureCountAfter: Int,
+    )
+    @Volatile private var lastThermalFpsApplyTelemetry: ThermalFpsApplyTelemetry? = null
 
     // ─────────────────────────────────────────────────────────────────────────
     // start()
@@ -231,6 +289,28 @@ class VanguardCameraSource(
         // Tear down any previously bound use-cases first.
         provider.unbindAll()
 
+        // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: a fresh bind invalidates any
+        // previously-observed/applied AE FPS state and the actuator bound to
+        // the prior Camera instance. bindGeneration/bindCount/surfaceRequestCount
+        // are proof counters for callers -- they always advance, never reset.
+        bindGeneration += 1
+        bindCount += 1
+        surfaceRequestCount = 0
+        completedCaptureCount = 0
+        observedAeTargetFpsLower = null
+        observedAeTargetFpsUpper = null
+        appliedAeTargetFpsLower = null
+        appliedAeTargetFpsUpper = null
+        consecutiveAppliedRangeCompletedCaptures = 0
+        lastThermalFpsApplyTelemetry = null
+        // Deliberately do NOT cancel a still-in-flight apply on the previous
+        // actuator instance here -- that would suppress its caller's
+        // MethodChannel result. Just drop this source's reference to it; the
+        // orphaned instance's own future/timeout keeps running independently
+        // and reaches applyThermalTargetFps()'s stale-generation branch below,
+        // which still replies exactly once (STALE_APPLY).
+        thermalFpsActuator = null
+
         // ── Camera selector ───────────────────────────────────────────────────
         val selector = CameraSelector.Builder()
             .requireLensFacing(lensFacing)
@@ -265,6 +345,28 @@ class VanguardCameraSource(
                     result: TotalCaptureResult,
                 ) {
                     cameraReadyFlag = true
+
+                    // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: observe the AE
+                    // target FPS range actually in effect for this completed
+                    // capture and track consecutive captures matching the
+                    // most recently applied thermal FPS range. Fires off the
+                    // main thread -- see cameraReadyFlag comment above.
+                    completedCaptureCount += 1
+                    val range = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)
+                    if (range != null) {
+                        observedAeTargetFpsLower = range.lower
+                        observedAeTargetFpsUpper = range.upper
+                        val appliedLower = appliedAeTargetFpsLower
+                        val appliedUpper = appliedAeTargetFpsUpper
+                        consecutiveAppliedRangeCompletedCaptures =
+                            if (appliedLower != null && appliedUpper != null &&
+                                range.lower == appliedLower && range.upper == appliedUpper
+                            ) {
+                                consecutiveAppliedRangeCompletedCaptures + 1
+                            } else {
+                                0
+                            }
+                    }
                 }
             })
 
@@ -302,13 +404,18 @@ class VanguardCameraSource(
         // CameraX manages the camera session lifecycle internally.
         // All three use-cases are bound in one call to avoid USB-headset-rotation
         // race conditions that can occur when use-cases are added incrementally.
-        camera = provider.bindToLifecycle(
+        val boundCamera = provider.bindToLifecycle(
             lifecycleOwner,
             selector,
             previewUseCase,
             imageCaptureUseCase,
             videoCaptureUseCase,
         )
+        camera = boundCamera
+
+        // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: recreate the actuator against
+        // the freshly-bound Camera instance for this bind generation.
+        thermalFpsActuator = AndroidCameraXThermalFpsActuator(boundCamera, mainExecutor)
 
         Log.d(TAG, "bindUseCases() — bound Preview + ImageCapture + VideoCapture")
     }
@@ -316,6 +423,10 @@ class VanguardCameraSource(
     // ── SurfaceProvider — bridges CameraX Preview → Flutter SurfaceTexture ───
 
     private fun provideSurface(request: SurfaceRequest) {
+        // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: proof counter -- must stay
+        // unchanged across a thermal FPS apply (no-rebind proof).
+        surfaceRequestCount += 1
+
         // Prepare the Flutter SurfaceTexture to receive camera frames at the
         // resolution CameraX actually negotiated (16:9-family, via the
         // ResolutionSelector set on Preview.Builder — see bindUseCases()).
@@ -384,6 +495,14 @@ class VanguardCameraSource(
         cameraProvider = null
         isRunning     = false
         cameraReadyFlag = false
+
+        // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: deliberately do NOT cancel a
+        // still-in-flight thermal FPS actuation here -- that would suppress
+        // its caller's MethodChannel result. Just drop this source's
+        // reference; the orphaned actuator's own future/timeout keeps running
+        // and reaches applyThermalTargetFps()'s stopped-check branch below,
+        // which still replies exactly once (STOPPED).
+        thermalFpsActuator = null
 
         Log.d(TAG, "stop() — complete")
     }
@@ -714,6 +833,298 @@ class VanguardCameraSource(
 
         cam.cameraControl.startFocusAndMetering(action)
         Log.d(TAG, "setFocusPoint: ($x, $y)")
+    }
+
+    // ----------------------------------------------------------------------
+    // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: thermal FPS actuation
+    // ----------------------------------------------------------------------
+
+    private fun thermalFpsRangeMap(lower: Int?, upper: Int?): Map<String, Int>? =
+        if (lower == null || upper == null) null else mapOf("lower" to lower, "upper" to upper)
+
+    private fun thermalFpsAvailableRangesMap(ranges: List<Range<Int>>): List<Map<String, Int>> =
+        ranges.map { mapOf("lower" to it.lower, "upper" to it.upper) }
+
+    /**
+     * Records telemetry for an applyThermalTargetFps() attempt rejected before
+     * a candidate range could be selected (no active session/device/actuator).
+     * No observed/applied range changed as a result, so before == after.
+     */
+    private fun recordThermalFpsEarlyRejection(
+        reason: String,
+        generation: Int,
+        recordingActiveAtApply: Boolean,
+        isRecordingAtApply: Boolean,
+        completedCaptureCountAtCall: Int,
+    ) {
+        lastThermalFpsApplyTelemetry = ThermalFpsApplyTelemetry(
+            outcome = "REJECTED",
+            reasons = listOf(reason),
+            selectedLower = null,
+            selectedUpper = null,
+            observedBeforeLower = observedAeTargetFpsLower,
+            observedBeforeUpper = observedAeTargetFpsUpper,
+            observedAfterLower = observedAeTargetFpsLower,
+            observedAfterUpper = observedAeTargetFpsUpper,
+            availableRanges = emptyList(),
+            bindGeneration = generation,
+            recordingActiveAtApply = recordingActiveAtApply,
+            isRecordingAtApply = isRecordingAtApply,
+            completedCaptureCountBefore = completedCaptureCountAtCall,
+            completedCaptureCountAfter = completedCaptureCountAtCall,
+        )
+    }
+
+    /**
+     * Applies a Dart-planner-derived [targetFps] as a reduced CameraX
+     * repeating-request AE target FPS range, via
+     * [AndroidCameraXThermalFpsActuator]. FPS-only -- never rebinds, never
+     * reconfigures resolution, never touches recording/encoder/renderer state.
+     *
+     * Rejects with a typed `(code, message)` via [onError] when the session
+     * is not running/stopping, no camera device is bound, no actuator is
+     * available, the actuator itself rejects the requested [targetFps]
+     * (see [AndroidCameraXThermalFpsActuator.selectTargetFpsRange]), or an
+     * earlier apply is still in flight (`APPLY_IN_PROGRESS` -- the earlier
+     * attempt's own future/timeout and callback are left untouched).
+     *
+     * [onResult] / [onError] are guarded against stale completions: if the
+     * bind generation has advanced (a rebind/switchCamera happened mid-flight)
+     * or the session has since stopped, [onError] is still called exactly once
+     * with a typed `STOPPED` / `STALE_APPLY` code -- the callback is never
+     * silently dropped, and hardware state is never mutated for a stale result.
+     */
+    fun applyThermalTargetFps(
+        targetFps: Int,
+        onResult: (Map<String, Any?>) -> Unit,
+        onError: (code: String, message: String) -> Unit,
+    ) {
+        val callRecordingActive = isRecordingActive
+        val callIsRecording = isRecording
+        val callCompletedCaptureCount = completedCaptureCount
+        val requestGeneration = bindGeneration
+
+        if (!isRunning) {
+            recordThermalFpsEarlyRejection(
+                "NOT_RUNNING", requestGeneration, callRecordingActive, callIsRecording, callCompletedCaptureCount,
+            )
+            onError("NOT_RUNNING", "applyThermalTargetFps: camera session not running")
+            return
+        }
+        if (stopRequested) {
+            recordThermalFpsEarlyRejection(
+                "STOPPED", requestGeneration, callRecordingActive, callIsRecording, callCompletedCaptureCount,
+            )
+            onError("STOPPED", "applyThermalTargetFps: camera session is stopping")
+            return
+        }
+        if (camera == null) {
+            recordThermalFpsEarlyRejection(
+                "NO_CAMERA_DEVICE", requestGeneration, callRecordingActive, callIsRecording, callCompletedCaptureCount,
+            )
+            onError("NO_CAMERA_DEVICE", "applyThermalTargetFps: no bound camera device")
+            return
+        }
+        val actuator = thermalFpsActuator
+        if (actuator == null) {
+            recordThermalFpsEarlyRejection(
+                "NO_ACTUATOR", requestGeneration, callRecordingActive, callIsRecording, callCompletedCaptureCount,
+            )
+            onError("NO_ACTUATOR", "applyThermalTargetFps: thermal FPS actuator not available")
+            return
+        }
+
+        val observedBeforeLower = observedAeTargetFpsLower
+        val observedBeforeUpper = observedAeTargetFpsUpper
+
+        when (val outcome = actuator.selectTargetFpsRange(
+            targetFps,
+            observedBeforeLower,
+            observedBeforeUpper,
+        )) {
+            is AndroidCameraXThermalFpsActuator.SelectionOutcome.Rejected -> {
+                lastThermalFpsApplyTelemetry = ThermalFpsApplyTelemetry(
+                    outcome = "REJECTED",
+                    reasons = listOf(outcome.reason),
+                    selectedLower = null,
+                    selectedUpper = null,
+                    observedBeforeLower = observedBeforeLower,
+                    observedBeforeUpper = observedBeforeUpper,
+                    observedAfterLower = observedAeTargetFpsLower,
+                    observedAfterUpper = observedAeTargetFpsUpper,
+                    availableRanges = outcome.availableRanges,
+                    bindGeneration = requestGeneration,
+                    recordingActiveAtApply = callRecordingActive,
+                    isRecordingAtApply = callIsRecording,
+                    completedCaptureCountBefore = callCompletedCaptureCount,
+                    completedCaptureCountAfter = completedCaptureCount,
+                )
+                onError(outcome.reason, outcome.message)
+            }
+            is AndroidCameraXThermalFpsActuator.SelectionOutcome.Selected -> {
+                val selection = outcome.result
+                val started = actuator.applySelectedRange(
+                    selected = selection,
+                    onApplied = {
+                        val stopped = !isRunning || stopRequested
+                        val staleGeneration = requestGeneration != bindGeneration
+                        if (stopped || staleGeneration) {
+                            // Do not mutate applied-range bookkeeping or claim
+                            // hardware effect for a stale/post-stop completion --
+                            // but still reply exactly once so the MethodChannel
+                            // result never hangs.
+                            val code = if (stopped) "STOPPED" else "STALE_APPLY"
+                            val message = if (stopped) {
+                                "applyThermalTargetFps: camera session stopped before apply completed"
+                            } else {
+                                "applyThermalTargetFps: bind generation advanced before apply completed"
+                            }
+                            Log.w(TAG, "applyThermalTargetFps: stale apply completion ($code) -- replying with typed error")
+                            onError(code, message)
+                        } else {
+                            appliedAeTargetFpsLower = selection.selectedLower
+                            appliedAeTargetFpsUpper = selection.selectedUpper
+                            consecutiveAppliedRangeCompletedCaptures = 0
+                            lastThermalFpsApplyTelemetry = ThermalFpsApplyTelemetry(
+                                outcome = "APPLIED",
+                                reasons = listOf("APPLIED"),
+                                selectedLower = selection.selectedLower,
+                                selectedUpper = selection.selectedUpper,
+                                observedBeforeLower = observedBeforeLower,
+                                observedBeforeUpper = observedBeforeUpper,
+                                observedAfterLower = observedAeTargetFpsLower,
+                                observedAfterUpper = observedAeTargetFpsUpper,
+                                availableRanges = selection.availableRanges,
+                                bindGeneration = requestGeneration,
+                                recordingActiveAtApply = callRecordingActive,
+                                isRecordingAtApply = callIsRecording,
+                                completedCaptureCountBefore = callCompletedCaptureCount,
+                                completedCaptureCountAfter = completedCaptureCount,
+                            )
+                            onResult(
+                                mapOf(
+                                    "requestedTargetFps" to selection.requestedTargetFps,
+                                    "observedCurrentLower" to selection.observedCurrentLower,
+                                    "observedCurrentUpper" to selection.observedCurrentUpper,
+                                    "selectedLower" to selection.selectedLower,
+                                    "selectedUpper" to selection.selectedUpper,
+                                    "selectedRange" to thermalFpsRangeMap(selection.selectedLower, selection.selectedUpper),
+                                    "observedRangeBefore" to thermalFpsRangeMap(observedBeforeLower, observedBeforeUpper),
+                                    "observedRangeAfter" to thermalFpsRangeMap(observedAeTargetFpsLower, observedAeTargetFpsUpper),
+                                    "availableRanges" to thermalFpsAvailableRangesMap(selection.availableRanges),
+                                    "bindGeneration" to requestGeneration,
+                                    "recordingActiveAtApply" to callRecordingActive,
+                                    "isRecordingAtApply" to callIsRecording,
+                                    "completedCaptureCountBefore" to callCompletedCaptureCount,
+                                    "completedCaptureCountAfter" to completedCaptureCount,
+                                    "outcome" to "APPLIED",
+                                    "reasons" to listOf("APPLIED"),
+                                    "proofBoundary" to THERMAL_FPS_PROOF_BOUNDARY,
+                                    "nonClaims" to THERMAL_FPS_NON_CLAIMS,
+                                ),
+                            )
+                        }
+                    },
+                    onError = { e ->
+                        val stopped = !isRunning || stopRequested
+                        val staleGeneration = requestGeneration != bindGeneration
+                        if (stopped || staleGeneration) {
+                            val code = if (stopped) "STOPPED" else "STALE_APPLY"
+                            val message = if (stopped) {
+                                "applyThermalTargetFps: camera session stopped before apply error resolved"
+                            } else {
+                                "applyThermalTargetFps: bind generation advanced before apply error resolved"
+                            }
+                            Log.w(TAG, "applyThermalTargetFps: stale apply error ($code) -- replying with typed error: ${e.message}")
+                            onError(code, message)
+                        } else {
+                            lastThermalFpsApplyTelemetry = ThermalFpsApplyTelemetry(
+                                outcome = "REJECTED",
+                                reasons = listOf("APPLY_FAILED"),
+                                selectedLower = null,
+                                selectedUpper = null,
+                                observedBeforeLower = observedBeforeLower,
+                                observedBeforeUpper = observedBeforeUpper,
+                                observedAfterLower = observedAeTargetFpsLower,
+                                observedAfterUpper = observedAeTargetFpsUpper,
+                                availableRanges = selection.availableRanges,
+                                bindGeneration = requestGeneration,
+                                recordingActiveAtApply = callRecordingActive,
+                                isRecordingAtApply = callIsRecording,
+                                completedCaptureCountBefore = callCompletedCaptureCount,
+                                completedCaptureCountAfter = completedCaptureCount,
+                            )
+                            onError("APPLY_FAILED", e.message ?: "applyThermalTargetFps: setCaptureRequestOptions failed")
+                        }
+                    },
+                )
+                if (!started) {
+                    // An earlier apply is still in flight on this actuator --
+                    // its future/timeout and eventual callback are left
+                    // completely untouched. Reject this second call
+                    // immediately without any hardware bookkeeping.
+                    lastThermalFpsApplyTelemetry = ThermalFpsApplyTelemetry(
+                        outcome = "REJECTED",
+                        reasons = listOf("APPLY_IN_PROGRESS"),
+                        selectedLower = null,
+                        selectedUpper = null,
+                        observedBeforeLower = observedBeforeLower,
+                        observedBeforeUpper = observedBeforeUpper,
+                        observedAfterLower = observedAeTargetFpsLower,
+                        observedAfterUpper = observedAeTargetFpsUpper,
+                        availableRanges = selection.availableRanges,
+                        bindGeneration = requestGeneration,
+                        recordingActiveAtApply = callRecordingActive,
+                        isRecordingAtApply = callIsRecording,
+                        completedCaptureCountBefore = callCompletedCaptureCount,
+                        completedCaptureCountAfter = completedCaptureCount,
+                    )
+                    onError("APPLY_IN_PROGRESS", "applyThermalTargetFps: another apply is already in flight")
+                }
+            }
+        }
+    }
+
+    /**
+     * Snapshot diagnostics for the thermal FPS actuation seam -- bind/surface
+     * proof counters, observed and applied AE target FPS ranges, the
+     * consecutive-completed-capture confirmation counter, and telemetry from
+     * the most recent applyThermalTargetFps() attempt (if any). Read-only;
+     * safe to call at any time, including before [start] or after [stop] --
+     * on Android this always returns a populated map when a camera session
+     * object exists; callers with no active session at all receive a native
+     * `NO_CAMERA` error from the owning router, not this map.
+     */
+    fun thermalFpsDiagnostics(): Map<String, Any?> {
+        val telemetry = lastThermalFpsApplyTelemetry
+        return mapOf(
+            "running" to isRunning,
+            "textureId" to textureEntry.id(),
+            "bindGeneration" to bindGeneration,
+            "bindCount" to bindCount,
+            "surfaceRequestCount" to surfaceRequestCount,
+            "cameraProviderIdentity" to cameraProvider?.let { System.identityHashCode(it) },
+            "completedCaptureCount" to completedCaptureCount,
+            "observedAeTargetFpsLower" to observedAeTargetFpsLower,
+            "observedAeTargetFpsUpper" to observedAeTargetFpsUpper,
+            "appliedAeTargetFpsLower" to appliedAeTargetFpsLower,
+            "appliedAeTargetFpsUpper" to appliedAeTargetFpsUpper,
+            "appliedRange" to thermalFpsRangeMap(appliedAeTargetFpsLower, appliedAeTargetFpsUpper),
+            "consecutiveAppliedRangeCompletedCaptures" to consecutiveAppliedRangeCompletedCaptures,
+            "isRecording" to isRecording,
+            "isRecordingActive" to isRecordingActive,
+            "outcome" to (telemetry?.outcome ?: "NONE"),
+            "reasons" to (telemetry?.reasons ?: emptyList<String>()),
+            "observedRangeBefore" to thermalFpsRangeMap(telemetry?.observedBeforeLower, telemetry?.observedBeforeUpper),
+            "observedRangeAfter" to thermalFpsRangeMap(telemetry?.observedAfterLower, telemetry?.observedAfterUpper),
+            "availableRanges" to thermalFpsAvailableRangesMap(telemetry?.availableRanges ?: emptyList()),
+            "recordingActiveAtApply" to (telemetry?.recordingActiveAtApply ?: false),
+            "isRecordingAtApply" to (telemetry?.isRecordingAtApply ?: false),
+            "completedCaptureCountBefore" to (telemetry?.completedCaptureCountBefore ?: 0),
+            "completedCaptureCountAfter" to (telemetry?.completedCaptureCountAfter ?: 0),
+            "proofBoundary" to THERMAL_FPS_PROOF_BOUNDARY,
+            "nonClaims" to THERMAL_FPS_NON_CLAIMS,
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────────────
