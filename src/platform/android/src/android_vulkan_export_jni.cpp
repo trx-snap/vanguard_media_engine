@@ -23,6 +23,10 @@
 //   renderAndroidTimelineVulkanExportTransitionFrame  -> jstring (P5-COMPOSITOR-TRANS: two imported AHardwareBuffers,
 //                                                                  per-layer 9-int geometry + optional colorMatrix,
 //                                                                  compositor-owned transition type code + progress)
+//   renderAndroidTimelineVulkanExportTransitionFrameWithOverlays -> jstring (P5-OVERLAYS-TRANSITION-COMP-N2: same
+//                                                                  transition contract as above, plus native-owned
+//                                                                  overlay placement/draw seam composited after the
+//                                                                  transition layers in the same final render pass)
 //   uploadAndroidTimelineVulkanExportOverlayTexture   -> jstring (P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5:
 //                                                                  direct RGBA8888 ByteBuffer upload into the
 //                                                                  backend-owned overlay texture store)
@@ -1876,6 +1880,637 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         toGeometry.destFitX, toGeometry.destFitY, toGeometry.destFitWidth, toGeometry.destFitHeight,
         hasFromColorMatrix ? 1 : 0, hasToColorMatrix ? 1 : 0,
         hasFromBeauty ? 1 : 0, hasToBeauty ? 1 : 0);
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: renderAndroidTimelineVulkanExportTransitionFrameWithOverlays
+// (P5-OVERLAYS-TRANSITION-COMP-N2)
+// ---------------------------------------------------------------------------
+// Same production compositor-owned clip overlap transition as
+// renderAndroidTimelineVulkanExportTransitionFrame above (same session/
+// swapchain/activeRenderCount lifecycle, same transitionTypeCode/progress/
+// per-layer 9-int geometry/optional colorMatrix/optional per-layer Beauty V2
+// contract), plus zero or more already-placed overlay layers composited
+// AFTER the transition's from/to layers in the SAME final render pass, via
+// VulkanBackend::renderTransitionFrame's overlay-aware overload
+// (P5-OVERLAYS-TRANSITION-COMP-N1). Native owns all overlay placement math
+// exactly like renderAndroidTimelineVulkanExportFrameCroppedWithOverlays
+// above (ValidateVulkanOverlayLayerDescriptor / ComputeVulkanOverlayPlacement);
+// [overlayTextureHandles] / [overlayGeometry] / [overlayCount] follow that
+// same solo-overlay-seam layout: a LongArray of [overlayCount] backend-owned
+// texture handles and a DoubleArray of [overlayCount] * 7 values (x, y,
+// width, height, rotationRadians, scale, opacity per overlay, in
+// output-canvas pixels), both ignored when [overlayCount] == 0. Both arrays
+// are copied out with GetLongArrayRegion/GetDoubleArrayRegion (never
+// GetPrimitiveArrayCritical) before the session is even looked up.
+//
+// Inside the same single backendLaneMutex critical section as the solo
+// transition route (import from -> import to -> crop check -> base
+// transform/transition geometry -> optional per-layer Beauty V2 ramp ->
+// overlay placement -> render -> release both), the overlay loop runs after
+// both buffers are imported and the beauty ramp (if any) has been computed,
+// and before the render call: a non-positive handle fails closed with
+// "invalid_overlay_texture_handle:index=N"; an unknown handle
+// (getOverlayTextureInfo returns false) fails closed with
+// "overlay_texture_unknown:index=N"; a ValidateVulkanOverlayLayerDescriptor
+// failure fails closed with "overlay_descriptor_invalid:index=N:reason=<err>";
+// a ComputeVulkanOverlayPlacement failure fails closed with
+// "overlay_placement_failed:index=N". A validated-but-not-visible overlay
+// (placement.visible == false) is silently skipped, not an error. The
+// placement canvas is always session->width/height (already cross-checked
+// against the Kotlin-supplied width/height above). Every failure past a
+// successful "from" import still releases both imported HardwareBuffers and
+// closes both release fence fds, exactly like the solo transition route;
+// overlay-specific failure reasons additionally report both release results.
+// "status=OK;..." additionally reports overlayCount and visibleOverlayCount
+// alongside renderedFrames and both release results.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportTransitionFrameWithOverlays(
+    JNIEnv*      env,
+    jobject      /* this */,
+    jstring      sessionIdJ,
+    jint         width,
+    jint         height,
+    jint         transitionTypeCode,
+    jdouble      progress,
+    jobject      fromHardwareBufferJ,
+    jintArray    fromLayerGeometryJ,
+    jfloatArray  fromColorMatrixJ,
+    jboolean     fromBeautyEnabled,
+    jfloat       fromBeautyIntensity,
+    jobject      toHardwareBufferJ,
+    jintArray    toLayerGeometryJ,
+    jfloatArray  toColorMatrixJ,
+    jboolean     toBeautyEnabled,
+    jfloat       toBeautyIntensity,
+    jlong        timelinePtsUs,
+    jint         frameIndex,
+    jlongArray   overlayTextureHandlesJ,
+    jdoubleArray overlayGeometryJ,
+    jint         overlayCount) {
+
+    char status[1024];
+    const char* typeName = "unknown";
+    vanguard::compositors::TransitionType type = vanguard::compositors::TransitionType::kNone;
+    const double progressValue = static_cast<double>(progress);
+
+    if (!TransitionTypeFromCode(transitionTypeCode, &type, &typeName)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=transition_type_unsupported:code=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(transitionTypeCode), typeName, progressValue,
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!sessionIdJ || !fromHardwareBufferJ || !toHardwareBufferJ || width <= 0 || height <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=invalid_args;transitionType=%s;progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!std::isfinite(progressValue) || progressValue < 0.0 || progressValue > 1.0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=transition_progress_invalid;transitionType=%s;progress=%.4f;"
+            "frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    // Same per-layer optional Beauty V2 defense-in-depth check as the solo
+    // transition route.
+    const bool hasFromBeauty = fromBeautyEnabled == JNI_TRUE;
+    const bool hasToBeauty = toBeautyEnabled == JNI_TRUE;
+    if (hasFromBeauty &&
+        (!std::isfinite(fromBeautyIntensity) || fromBeautyIntensity < 0.0f || fromBeautyIntensity > 1.0f)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=beauty_v2_invalid_intensity:layer=from;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (hasToBeauty &&
+        (!std::isfinite(toBeautyIntensity) || toBeautyIntensity < 0.0f || toBeautyIntensity > 1.0f)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=beauty_v2_invalid_intensity:layer=to;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    LayerGeometryArgs fromGeometry;
+    LayerGeometryArgs toGeometry;
+    jsize geometryLen = 0;
+    if (!ReadLayerGeometry(env, fromLayerGeometryJ, &fromGeometry, &geometryLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=layer_geometry_invalid:layer=from:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(geometryLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (!ReadLayerGeometry(env, toLayerGeometryJ, &toGeometry, &geometryLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=layer_geometry_invalid:layer=to:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(geometryLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (const char* reason = ValidateLayerGeometry(fromGeometry, width, height)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=%s:layer=from;transitionType=%s;progress=%.4f;frameIndex=%d",
+            reason, typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (const char* reason = ValidateLayerGeometry(toGeometry, width, height)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=%s:layer=to;transitionType=%s;progress=%.4f;frameIndex=%d",
+            reason, typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    float fromColorMatrix[20];
+    float toColorMatrix[20];
+    bool hasFromColorMatrix = false;
+    bool hasToColorMatrix = false;
+    jsize colorMatrixLen = 0;
+    if (!ReadOptionalColorMatrix(env, fromColorMatrixJ, fromColorMatrix, &hasFromColorMatrix, &colorMatrixLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_color_matrix_invalid:layer=from:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(colorMatrixLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (!ReadOptionalColorMatrix(env, toColorMatrixJ, toColorMatrix, &hasToColorMatrix, &colorMatrixLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_color_matrix_invalid:layer=to:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(colorMatrixLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    // Same overlayCount / overlay array length / copy-out / pre-reserve
+    // contract as renderAndroidTimelineVulkanExportFrameCroppedWithOverlays,
+    // performed entirely before the session is looked up or either buffer is
+    // imported.
+    if (overlayCount < 0 || overlayCount > kMaxOverlayCount) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=invalid_overlay_count:count=%d;transitionType=%s;progress=%.4f;"
+            "frameIndex=%d",
+            static_cast<int>(overlayCount), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    std::vector<jlong> overlayHandles;
+    std::vector<jdouble> overlayGeometryValues;
+    if (overlayCount > 0) {
+        const jsize expectedHandlesLen = static_cast<jsize>(overlayCount);
+        const jsize actualHandlesLen =
+            overlayTextureHandlesJ ? env->GetArrayLength(overlayTextureHandlesJ) : -1;
+        if (actualHandlesLen != expectedHandlesLen) {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;reason=invalid_overlay_texture_handles_len:expected=%d:actual=%d;"
+                "transitionType=%s;progress=%.4f;frameIndex=%d",
+                static_cast<int>(expectedHandlesLen), static_cast<int>(actualHandlesLen),
+                typeName, progressValue, static_cast<int>(frameIndex));
+            return env->NewStringUTF(status);
+        }
+
+        const jsize expectedGeometryLen =
+            static_cast<jsize>(overlayCount) * kOverlayGeometryLength;
+        const jsize actualGeometryLen =
+            overlayGeometryJ ? env->GetArrayLength(overlayGeometryJ) : -1;
+        if (actualGeometryLen != expectedGeometryLen) {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;reason=invalid_overlay_geometry_len:expected=%d:actual=%d;"
+                "transitionType=%s;progress=%.4f;frameIndex=%d",
+                static_cast<int>(expectedGeometryLen), static_cast<int>(actualGeometryLen),
+                typeName, progressValue, static_cast<int>(frameIndex));
+            return env->NewStringUTF(status);
+        }
+
+        overlayHandles.resize(static_cast<size_t>(overlayCount));
+        env->GetLongArrayRegion(overlayTextureHandlesJ, 0, expectedHandlesLen, overlayHandles.data());
+        overlayGeometryValues.resize(static_cast<size_t>(expectedGeometryLen));
+        env->GetDoubleArrayRegion(overlayGeometryJ, 0, expectedGeometryLen, overlayGeometryValues.data());
+    }
+
+    // Reserved up front (before the session is looked up / either buffer is
+    // imported) so the post-import overlay loop below can never allocate --
+    // and therefore can never throw std::bad_alloc out from under two
+    // already-imported HardwareBuffers.
+    std::vector<vanguard::render::VulkanOverlayFrameDraw> visibleDraws;
+    try {
+        visibleDraws.reserve(static_cast<size_t>(overlayCount));
+    } catch (const std::bad_alloc&) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=overlay_allocation_failed;transitionType=%s;progress=%.4f;"
+            "frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    VulkanExportSession* session = nullptr;
+    {
+        // Same claim / erase-and-wait lifetime protocol as the solo routes.
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=session_not_found;sessionId=%s;transitionType=%s;progress=%.4f;"
+            "frameIndex=%d",
+            sid.c_str(), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=session_not_ready;transitionType=%s;progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (width != session->width || height != session->height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_output_geometry_mismatch:"
+            "sessionW=%d:sessionH=%d:outW=%d:outH=%d;transitionType=%s;progress=%.4f;frameIndex=%d",
+            session->width, session->height, static_cast<int>(width), static_cast<int>(height),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    AHardwareBuffer* fromAhwb = ResolveAHardwareBufferFromJObject(env, fromHardwareBufferJ);
+    AHardwareBuffer* toAhwb = ResolveAHardwareBufferFromJObject(env, toHardwareBufferJ);
+    if (!fromAhwb || !toAhwb) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=ahardwarebuffer_resolve_failed:layer=%s;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            fromAhwb ? "to" : "from", typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    using vanguard::render::HardwareBufferImportResult;
+    vanguard::render::HardwareBufferHandle fromHandle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferHandle toHandle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor fromDescriptor{};
+    vanguard::render::HardwareBufferDescriptor toDescriptor{};
+    HardwareBufferImportResult fromImportResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult toImportResult = HardwareBufferImportResult::kUnknownHandle;
+    bool fromCropOk = false;
+    bool toCropOk = false;
+    vanguard::render::RenderFrameResult renderResult =
+        vanguard::render::RenderFrameResult::kInvalidBufferHandle;
+    bool renderOk = false;
+    const char* renderFailureReason = "render_failed";
+    char beautyFailureReasonBuf[96];
+    // Set false on the first invalid overlay; overlayFailureReason then
+    // carries the machine-readable token reported to the caller instead of
+    // the generic render_failed reason. Only ever consulted when the beauty
+    // ramp (if any) succeeded, since the overlay loop itself only runs in
+    // that case below.
+    bool overlayOk = true;
+    std::string overlayFailureReason;
+    uint32_t visibleOverlayCount = 0;
+    HardwareBufferImportResult fromReleaseResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult toReleaseResult = HardwareBufferImportResult::kUnknownHandle;
+
+    {
+        // One uninterrupted critical section: both imports, the conditional
+        // crop check / base transform / beauty ramp / overlay placement /
+        // render, and both releases all happen while holding
+        // backendLaneMutex so no other call can interleave its own backend
+        // use with this transition frame's.
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+
+        fromImportResult = session->backend.importHardwareBuffer(
+            fromAhwb, -1, &fromHandle, &fromDescriptor);
+
+        if (fromImportResult == HardwareBufferImportResult::kSuccess) {
+            toImportResult = session->backend.importHardwareBuffer(
+                toAhwb, -1, &toHandle, &toDescriptor);
+
+            if (toImportResult != HardwareBufferImportResult::kSuccess) {
+                // Exactly-once release of the already imported "from" layer.
+                int fromReleaseFenceFd = -1;
+                fromReleaseResult =
+                    session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
+                if (fromReleaseFenceFd >= 0) {
+                    ::close(fromReleaseFenceFd);
+                }
+            } else {
+                // Both imported: from here every path releases both handles
+                // below.
+                fromCropOk = CropWithinDescriptor(fromGeometry, fromDescriptor);
+                toCropOk = CropWithinDescriptor(toGeometry, toDescriptor);
+
+                if (fromCropOk && toCropOk) {
+                    vanguard::render::VideoTransitionFrameTransform transition{};
+                    ApplyLayerTransform(fromGeometry, fromDescriptor,
+                                        hasFromColorMatrix ? fromColorMatrix : nullptr, &transition.from);
+                    ApplyLayerTransform(toGeometry, toDescriptor,
+                                        hasToColorMatrix ? toColorMatrix : nullptr, &transition.to);
+                    const vanguard::compositors::TimelineTransitionProgress geometry =
+                        vanguard::compositors::ComputeTransitionGeometry(type, progressValue);
+                    transition.progress = geometry.progress;
+                    transition.blendWeightFrom = geometry.blendWeightFrom;
+                    transition.blendWeightTo = geometry.blendWeightTo;
+                    transition.fromViewport = ToRenderRect(geometry.fromViewport);
+                    transition.toViewport = ToRenderRect(geometry.toViewport);
+                    transition.fromCrop = ToRenderRect(geometry.fromCrop);
+                    transition.toCrop = ToRenderRect(geometry.toCrop);
+
+                    // Same per-layer Beauty V2 ramp expansion as the solo
+                    // transition route, using each layer's own CROPPED
+                    // SOURCE extent (never the output extent).
+                    vanguard::render::VideoBeautyV2RenderParams fromBeautyParams{};
+                    vanguard::render::VideoBeautyV2RenderParams toBeautyParams{};
+                    bool beautyRampOk = true;
+                    const char* beautyRampFailLayer = nullptr;
+                    if (hasFromBeauty) {
+                        const uint32_t cropWidth = static_cast<uint32_t>(fromGeometry.cropRight - fromGeometry.cropLeft);
+                        const uint32_t cropHeight = static_cast<uint32_t>(fromGeometry.cropBottom - fromGeometry.cropTop);
+                        vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+                        std::string beautyRampErr;
+                        if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                                fromBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
+                            beautyRampOk = false;
+                            beautyRampFailLayer = "from";
+                        } else {
+                            fromBeautyParams.enabled = true;
+                            fromBeautyParams.radius = vkBeautyParams.radius;
+                            fromBeautyParams.sigma = vkBeautyParams.sigma;
+                            fromBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                            fromBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                            fromBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                            fromBeautyParams.theta = vkBeautyParams.theta;
+                            fromBeautyParams.detailDamping = vkBeautyParams.detailDamping;
+                            fromBeautyParams.toneStrength = vkBeautyParams.toneStrength;
+                            fromBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                            fromBeautyParams.cropWidth = cropWidth;
+                            fromBeautyParams.cropHeight = cropHeight;
+                        }
+                    }
+                    if (beautyRampOk && hasToBeauty) {
+                        const uint32_t cropWidth = static_cast<uint32_t>(toGeometry.cropRight - toGeometry.cropLeft);
+                        const uint32_t cropHeight = static_cast<uint32_t>(toGeometry.cropBottom - toGeometry.cropTop);
+                        vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+                        std::string beautyRampErr;
+                        if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                                toBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
+                            beautyRampOk = false;
+                            beautyRampFailLayer = "to";
+                        } else {
+                            toBeautyParams.enabled = true;
+                            toBeautyParams.radius = vkBeautyParams.radius;
+                            toBeautyParams.sigma = vkBeautyParams.sigma;
+                            toBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                            toBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                            toBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                            toBeautyParams.theta = vkBeautyParams.theta;
+                            toBeautyParams.detailDamping = vkBeautyParams.detailDamping;
+                            toBeautyParams.toneStrength = vkBeautyParams.toneStrength;
+                            toBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                            toBeautyParams.cropWidth = cropWidth;
+                            toBeautyParams.cropHeight = cropHeight;
+                        }
+                    }
+
+                    if (!beautyRampOk) {
+                        // Defensive-only, matching the solo transition
+                        // route: still fails closed, both buffers are
+                        // released below exactly like every other failure
+                        // path.
+                        renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
+                        renderOk = false;
+                        std::snprintf(beautyFailureReasonBuf, sizeof(beautyFailureReasonBuf),
+                            "beauty_v2_requires_vulkan:ramp_failed:layer=%s", beautyRampFailLayer);
+                        renderFailureReason = beautyFailureReasonBuf;
+                    } else {
+                        // P5-OVERLAYS-TRANSITION-COMP-N2: resolve and place
+                        // every overlay against the session's own output
+                        // canvas extent, exactly like the solo overlay route
+                        // above. Runs after both imports/the beauty ramp and
+                        // before the render call.
+                        const uint32_t canvasWidth = static_cast<uint32_t>(session->width);
+                        const uint32_t canvasHeight = static_cast<uint32_t>(session->height);
+
+                        for (int32_t i = 0; i < overlayCount; ++i) {
+                            const int64_t textureHandle =
+                                static_cast<int64_t>(overlayHandles[static_cast<size_t>(i)]);
+                            if (textureHandle <= 0) {
+                                overlayOk = false;
+                                overlayFailureReason =
+                                    "invalid_overlay_texture_handle:index=" + std::to_string(i);
+                                break;
+                            }
+
+                            vanguard::render::VulkanOverlayTextureInfo info{};
+                            const bool infoOk = session->backend.getOverlayTextureInfo(
+                                static_cast<vanguard::render::VulkanOverlayTextureHandle>(textureHandle),
+                                &info);
+                            if (!infoOk) {
+                                overlayOk = false;
+                                overlayFailureReason =
+                                    "overlay_texture_unknown:index=" + std::to_string(i);
+                                break;
+                            }
+
+                            const size_t base = static_cast<size_t>(i) * kOverlayGeometryLength;
+                            vanguard::render::VulkanOverlayLayerDescriptor layer;
+                            layer.imageView = ToImageView(info.imageViewHandle);
+                            layer.sampler = ToSampler(info.samplerHandle);
+                            layer.x = static_cast<double>(overlayGeometryValues[base + 0]);
+                            layer.y = static_cast<double>(overlayGeometryValues[base + 1]);
+                            layer.width = static_cast<double>(overlayGeometryValues[base + 2]);
+                            layer.height = static_cast<double>(overlayGeometryValues[base + 3]);
+                            layer.rotation = static_cast<double>(overlayGeometryValues[base + 4]);
+                            layer.scale = static_cast<double>(overlayGeometryValues[base + 5]);
+                            layer.opacity = static_cast<double>(overlayGeometryValues[base + 6]);
+                            layer.zIndex = i;
+
+                            std::string descriptorErr;
+                            if (!vanguard::render::ValidateVulkanOverlayLayerDescriptor(
+                                    layer, canvasWidth, canvasHeight, &descriptorErr)) {
+                                overlayOk = false;
+                                overlayFailureReason =
+                                    "overlay_descriptor_invalid:index=" + std::to_string(i) +
+                                    ":reason=" + descriptorErr;
+                                break;
+                            }
+
+                            vanguard::render::VulkanOverlayLayerPlacement placement;
+                            const bool placedOk = vanguard::render::ComputeVulkanOverlayPlacement(
+                                layer, canvasWidth, canvasHeight, &placement);
+                            if (!placedOk) {
+                                overlayOk = false;
+                                overlayFailureReason =
+                                    "overlay_placement_failed:index=" + std::to_string(i);
+                                break;
+                            }
+
+                            if (!placement.visible) {
+                                continue;
+                            }
+
+                            vanguard::render::VulkanOverlayFrameDraw draw;
+                            draw.imageViewHandle = info.imageViewHandle;
+                            draw.samplerHandle = info.samplerHandle;
+                            draw.uvRow0[0] = placement.uvRow0[0];
+                            draw.uvRow0[1] = placement.uvRow0[1];
+                            draw.uvRow0[2] = placement.uvRow0[2];
+                            draw.uvRow0[3] = placement.uvRow0[3];
+                            draw.uvRow1[0] = placement.uvRow1[0];
+                            draw.uvRow1[1] = placement.uvRow1[1];
+                            draw.uvRow1[2] = placement.uvRow1[2];
+                            draw.uvRow1[3] = placement.uvRow1[3];
+                            draw.scissorX = placement.scissorX;
+                            draw.scissorY = placement.scissorY;
+                            draw.scissorWidth = placement.scissorWidth;
+                            draw.scissorHeight = placement.scissorHeight;
+                            draw.opacity = static_cast<float>(layer.opacity);
+                            visibleDraws.push_back(draw);
+                        }
+
+                        if (overlayOk) {
+                            visibleOverlayCount = static_cast<uint32_t>(visibleDraws.size());
+                            renderResult = session->backend.renderTransitionFrame(
+                                fromHandle, toHandle, transition,
+                                visibleDraws.empty() ? nullptr : visibleDraws.data(),
+                                visibleOverlayCount, fromBeautyParams, toBeautyParams);
+                            renderOk =
+                                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+                            if (!renderOk && (hasFromBeauty || hasToBeauty)) {
+                                renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+                            }
+                        }
+                    }
+                }
+
+                int fromReleaseFenceFd = -1;
+                fromReleaseResult =
+                    session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
+                if (fromReleaseFenceFd >= 0) {
+                    ::close(fromReleaseFenceFd);
+                    fromReleaseFenceFd = -1;
+                }
+                int toReleaseFenceFd = -1;
+                toReleaseResult =
+                    session->backend.releaseHardwareBuffer(toHandle, &toReleaseFenceFd);
+                if (toReleaseFenceFd >= 0) {
+                    ::close(toReleaseFenceFd);
+                    toReleaseFenceFd = -1;
+                }
+            }
+        }
+    }
+
+    if (fromImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=import_failed:layer=from;importResult=%s;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            HwBufResultName(fromImportResult), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (toImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=import_failed:layer=to;importResult=%s;fromReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            HwBufResultName(toImportResult), HwBufResultName(fromReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!fromCropOk || !toCropOk) {
+        const LayerGeometryArgs& g = fromCropOk ? toGeometry : fromGeometry;
+        const vanguard::render::HardwareBufferDescriptor& d = fromCropOk ? toDescriptor : fromDescriptor;
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_decoder_crop_unsupported:layer=%s:"
+            "crop=%d,%d-%d,%d:descW=%u:descH=%u;fromReleaseResult=%s;toReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            fromCropOk ? "to" : "from",
+            g.cropLeft, g.cropTop, g.cropRight, g.cropBottom, d.width, d.height,
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!overlayOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=%s;fromReleaseResult=%s;toReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            overlayFailureReason.c_str(),
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!renderOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=%s;renderResult=%s;fromReleaseResult=%s;"
+            "toReleaseResult=%s;transitionType=%s;progress=%.4f;frameIndex=%d",
+            renderFailureReason,
+            RenderResultName(renderResult),
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (fromReleaseResult != HardwareBufferImportResult::kSuccess ||
+        toReleaseResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=release_failed;fromReleaseResult=%s;toReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    session->renderedFrames++;
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;transitionType=%s;"
+        "progress=%.4f;renderResult=%s;fromReleaseResult=%s;toReleaseResult=%s;"
+        "fromDescW=%u;fromDescH=%u;toDescW=%u;toDescH=%u;"
+        "fromDestFit=%d,%d-%dx%d;toDestFit=%d,%d-%dx%d;fromColorMatrix=%d;toColorMatrix=%d;"
+        "fromBeauty=%d;toBeauty=%d;overlayCount=%d;visibleOverlayCount=%u",
+        static_cast<int>(frameIndex),
+        static_cast<long long>(timelinePtsUs),
+        session->renderedFrames,
+        typeName,
+        progressValue,
+        RenderResultName(renderResult),
+        HwBufResultName(fromReleaseResult),
+        HwBufResultName(toReleaseResult),
+        fromDescriptor.width, fromDescriptor.height,
+        toDescriptor.width, toDescriptor.height,
+        fromGeometry.destFitX, fromGeometry.destFitY, fromGeometry.destFitWidth, fromGeometry.destFitHeight,
+        toGeometry.destFitX, toGeometry.destFitY, toGeometry.destFitWidth, toGeometry.destFitHeight,
+        hasFromColorMatrix ? 1 : 0, hasToColorMatrix ? 1 : 0,
+        hasFromBeauty ? 1 : 0, hasToBeauty ? 1 : 0,
+        static_cast<int>(overlayCount), visibleOverlayCount);
     return env->NewStringUTF(status);
 }
 

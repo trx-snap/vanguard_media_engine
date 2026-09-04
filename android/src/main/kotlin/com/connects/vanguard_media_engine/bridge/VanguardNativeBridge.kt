@@ -1315,6 +1315,66 @@ class VanguardNativeBridge(
         frameIndex: Int,
     ): String
 
+    // ── P5-OVERLAYS-TRANSITION-COMP-N2: transition frame + overlays render seam ──
+    // Same two-source clip overlap transition contract as
+    // renderAndroidTimelineVulkanExportTransitionFrame above -- same session/
+    // swapchain/activeRenderCount lifecycle, the same transitionTypeCode/
+    // progress/per-layer 9-int geometry/optional colorMatrix/optional
+    // per-layer Beauty V2 validation -- plus zero or more already-placed
+    // overlay layers composited AFTER the transition's from/to layers in the
+    // SAME final render pass, via VulkanBackend's overlay-aware
+    // renderTransitionFrame overload. Native owns all overlay placement math,
+    // exactly like renderAndroidTimelineVulkanExportFrameCroppedWithOverlays
+    // below -- this call never takes a UV row, scissor rect, imageView, or
+    // sampler from Kotlin, only a backend-owned overlay texture handle (see
+    // uploadAndroidTimelineVulkanExportOverlayTexture) and its per-overlay
+    // geometry.
+    // [overlayTextureHandles] / [overlayGeometry] / [overlayCount] follow the
+    // exact same layout as the solo overlay seam
+    // (renderAndroidTimelineVulkanExportFrameCroppedWithOverlays):
+    // [overlayTextureHandles] is a LongArray of [overlayCount] handles;
+    // [overlayGeometry] is a DoubleArray of [overlayCount] * 7 values, 7 per
+    // overlay in the caller's draw order (already sorted back-to-front by
+    // zIndex/id): x, y, width, height, rotationRadians, scale, opacity, all
+    // in output-canvas pixels. Both arrays are ignored (may be null or
+    // empty) when [overlayCount] == 0; native fails closed with
+    // "invalid_overlay_texture_handles_len" / "invalid_overlay_geometry_len"
+    // on a length mismatch when [overlayCount] > 0, and with
+    // "invalid_overlay_count" when [overlayCount] is negative or exceeds the
+    // native-enforced per-call maximum. A per-overlay handle/descriptor/
+    // placement failure fails the whole call closed with a machine-readable
+    // "overlay_texture_unknown:index=N" / "invalid_overlay_texture_handle:
+    // index=N" / "overlay_descriptor_invalid:index=N:reason=<err>" /
+    // "overlay_placement_failed:index=N" reason; a validated-but-not-visible
+    // overlay is silently skipped, not an error.
+    // Native imports both buffers and releases BOTH imports (closing both
+    // release fence fds) on every path after import, exactly like the solo
+    // transition route above. "status=OK;..." additionally reports
+    // overlayCount and visibleOverlayCount alongside renderedFrames and both
+    // release results.
+    external fun renderAndroidTimelineVulkanExportTransitionFrameWithOverlays(
+        sessionId: String,
+        width: Int,
+        height: Int,
+        transitionTypeCode: Int,
+        progress: Double,
+        fromHardwareBuffer: HardwareBuffer,
+        fromLayerGeometry: IntArray,
+        fromColorMatrix: FloatArray?,
+        fromBeautyEnabled: Boolean,
+        fromBeautyIntensity: Float,
+        toHardwareBuffer: HardwareBuffer,
+        toLayerGeometry: IntArray,
+        toColorMatrix: FloatArray?,
+        toBeautyEnabled: Boolean,
+        toBeautyIntensity: Float,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+        overlayTextureHandles: LongArray?,
+        overlayGeometry: DoubleArray?,
+        overlayCount: Int,
+    ): String
+
     // ── P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5: backend-owned overlay ──
     // texture store JNI bridge. Direct RGBA8888 ByteBuffer upload/release/clear
     // only -- no asset file/Bitmap decode. Upload is intended for session setup
