@@ -42,6 +42,11 @@ import kotlin.math.roundToLong
  * Bounds enforcement (max duration/frame count/dimensions) is the caller's
  * responsibility -- this class trusts [Params] and only fails closed on
  * genuine decode/encode errors.
+ *
+ * [Params.isCancelled] is polled cooperatively (before expensive setup,
+ * every frame-loop iteration, and inside the encoder drain loop) so a
+ * generation-aware caller can bound how long an in-flight transcode keeps
+ * running after it becomes stale, without any thread interruption.
  */
 class AndroidReverseSidecarTranscoder {
 
@@ -53,6 +58,11 @@ class AndroidReverseSidecarTranscoder {
         val frameCount: Int,
         val targetWidth: Int,
         val targetHeight: Int,
+        /// Cooperative cancellation poll, checked before expensive stages,
+        /// inside the per-frame loop, and while draining the encoder. Caller
+        /// (coordinator) supplies a generation-aware check; defaults to
+        /// never-cancelled for any other caller.
+        val isCancelled: () -> Boolean = { false },
     )
 
     data class TranscodeResult(
@@ -89,6 +99,9 @@ class AndroidReverseSidecarTranscoder {
             if (params.frameCount <= 0) {
                 return TranscodeResult(false, CODE_OUTPUT_EMPTY, 0)
             }
+            if (params.isCancelled()) {
+                return TranscodeResult(false, CODE_CANCELLED, 0)
+            }
 
             // ── 1. Probe for a video track ──────────────────────────────────
             val probeExtractor = MediaExtractor()
@@ -110,6 +123,9 @@ class AndroidReverseSidecarTranscoder {
             extractor = null
             if (!hasVideoTrack) {
                 return TranscodeResult(false, CODE_NO_VIDEO_TRACK, 0)
+            }
+            if (params.isCancelled()) {
+                return TranscodeResult(false, CODE_CANCELLED, 0)
             }
 
             // ── 2. Open the frame-at-time retriever ─────────────────────────
@@ -152,6 +168,7 @@ class AndroidReverseSidecarTranscoder {
                 var draining = true
                 var eosObserved = false
                 while (draining) {
+                    if (params.isCancelled()) break
                     if (endOfStream && System.currentTimeMillis() > deadline) break
                     val outIdx = enc.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
                     when {
@@ -251,6 +268,9 @@ class AndroidReverseSidecarTranscoder {
             var framesRendered = 0
 
             for (i in 0 until params.frameCount) {
+                if (params.isCancelled()) {
+                    return TranscodeResult(false, CODE_CANCELLED, writtenVideoSamples)
+                }
                 val sourceSeconds = (params.trimEndSeconds - frameStepSeconds * (i + 0.5))
                     .coerceIn(params.trimStartSeconds, params.trimEndSeconds)
                 val sourceUs = (sourceSeconds * 1_000_000.0).roundToLong().coerceAtLeast(0L)
@@ -306,6 +326,9 @@ class AndroidReverseSidecarTranscoder {
 
             enc.signalEndOfInputStream()
             val eosObserved = drainOnce(endOfStream = true, deadlineMs = ENCODE_EOS_DEADLINE_MS)
+            if (params.isCancelled()) {
+                return TranscodeResult(false, CODE_CANCELLED, writtenVideoSamples)
+            }
             if (!eosObserved) {
                 return TranscodeResult(false, CODE_ENCODE_FAILED, writtenVideoSamples)
             }
@@ -456,5 +479,6 @@ class AndroidReverseSidecarTranscoder {
         const val CODE_NO_VIDEO_TRACK = "SIDECAR_NO_VIDEO_TRACK"
         const val CODE_ENCODE_FAILED = "SIDECAR_ENCODE_FAILED"
         const val CODE_OUTPUT_EMPTY = "SIDECAR_OUTPUT_EMPTY"
+        const val CODE_CANCELLED = "SIDECAR_CANCELLED"
     }
 }

@@ -64,16 +64,25 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
 
     File? fixtureFile;
     VGEditorController? controllerLane2;
+    VGEditorController? controllerLaneCancel;
+    VGEditorController? controllerLaneCancelRecovery;
     String? readySidecarPath;
+    String? recoverySidecarPath;
 
     var lane1Pass = false;
     var lane2Pass = false;
     var orderingProbePass = false;
     var lane3Pass = false;
     var lane4Pass = false;
+    var lane5Pass = false;
     var readySidecarExists = false;
     var readySidecarHasFtyp = false;
     var cleanupDeletedReadySidecar = false;
+    var cancelInvalidatedObserved = false;
+    var cancelStatusIdleAfterCleanup = false;
+    var cancelNoStalePathPublished = false;
+    var cancelNoOwnedCacheResidue = false;
+    var cancelRecoveryPass = false;
     var globalHonestyPass = false;
 
     final Map<String, dynamic> lane1Map = <String, dynamic>{};
@@ -81,6 +90,7 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
     final Map<String, dynamic> probeMap = <String, dynamic>{};
     final Map<String, dynamic> lane3Map = <String, dynamic>{};
     final Map<String, dynamic> lane4Map = <String, dynamic>{};
+    final Map<String, dynamic> lane5Map = <String, dynamic>{};
     Map<String, dynamic>? probeReport;
 
     final List<Map<String, dynamic>> allStatusesObserved = [];
@@ -477,6 +487,185 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
       print('ANDROID_REVERSE_SIDECAR_UNIT_Q_LANE4_PASS: $lane4Pass');
 
       // ------------------------------------------------------------------------
+      // Lane 5: Cooperative cancellation / generation-aware invalidation.
+      // Starts a bounded prepare without awaiting it, waits a short
+      // deterministic delay so the native transcode is in flight, then races
+      // cleanupReverseSidecars against it. Asserts the returned status is
+      // invalidated (never ready/path), settles to idle, and that a fresh
+      // prepare for the same clipId (proving retry) still reaches ready.
+      // ------------------------------------------------------------------------
+      print('ANDROID_REVERSE_SIDECAR_UNIT_Q_LANE5: START');
+      final clipLaneCancel = VGClipDescriptor(
+        id: 'unit-q-clip-cancel',
+        mediaKind: VGMediaKind.video,
+        sourcePath: sourcePath,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        isReversed: true,
+      );
+      final draftLaneCancel = VGEditorDraft(
+        id: 'draft-unit-q-cancel',
+        clips: [clipLaneCancel],
+        canvasWidth: 960,
+        canvasHeight: 540,
+        fps: 30,
+      );
+      controllerLaneCancel = VGEditorController(initialDraft: draftLaneCancel);
+
+      final cancelFuture = controllerLaneCancel.prepareReverseSidecars();
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      final cancelCleanupResult = await channel
+          .invokeMapMethod<String, dynamic>('cleanupReverseSidecars');
+      lane5Map['midFlightCleanupResult'] = cancelCleanupResult;
+      if (cancelCleanupResult?['ok'] != true) {
+        throw Exception(
+          'Lane 5 failed: mid-flight cleanupReverseSidecars did not return ok: true ($cancelCleanupResult)',
+        );
+      }
+
+      final cancelStatuses = await cancelFuture;
+      if (cancelStatuses.length != 1) {
+        throw Exception(
+          'Lane 5 failed: expected 1 status from in-flight prepare, got ${cancelStatuses.length}',
+        );
+      }
+      final cancelStatus = cancelStatuses.first;
+      lane5Map['cancelStatus'] = _statusToMap(cancelStatus);
+      allStatusesObserved.add(_statusToMap(cancelStatus));
+
+      cancelNoStalePathPublished = cancelStatus.sidecarPath == null;
+      cancelInvalidatedObserved =
+          cancelStatus.clipId == 'unit-q-clip-cancel' &&
+          cancelStatus.state == VGReverseSidecarState.invalidated &&
+          cancelNoStalePathPublished &&
+          cancelStatus.errorMessage == null;
+
+      if (!cancelInvalidatedObserved) {
+        throw Exception(
+          'Lane 5 failed: expected invalidated status with no path/error after '
+          'mid-flight cleanup, got ${_statusToMap(cancelStatus)}',
+        );
+      }
+
+      final cancelStatusAfter = await controllerLaneCancel.getSidecarStatus(
+        clipId: 'unit-q-clip-cancel',
+      );
+      lane5Map['statusAfterCancel'] = _statusToMap(cancelStatusAfter);
+      allStatusesObserved.add(_statusToMap(cancelStatusAfter));
+      cancelStatusIdleAfterCleanup =
+          cancelStatusAfter.state == VGReverseSidecarState.idle &&
+          cancelStatusAfter.sidecarPath == null &&
+          cancelStatusAfter.errorMessage == null;
+      if (!cancelStatusIdleAfterCleanup) {
+        throw Exception(
+          'Lane 5 failed: status after mid-flight cleanup is not idle: '
+          '${_statusToMap(cancelStatusAfter)}',
+        );
+      }
+
+      // Residue proof: scan the native sidecar cache directory (derived from
+      // Lane 2's ready path) for any leftover temp/final files belonging to
+      // the cancelled clip's id/hash/generation, before starting recovery.
+      final sidecarCacheDir = Directory(File(readySidecarPath!).parent.path);
+      final cancelResidueMatches = <String>[];
+      if (await sidecarCacheDir.exists()) {
+        await for (final entity in sidecarCacheDir.list()) {
+          if (entity is! File) continue;
+          final entityPath = entity.path;
+          final baseName = entityPath.substring(
+            entityPath.lastIndexOf('/') + 1,
+          );
+          if (baseName.contains('unit-q-clip-cancel')) {
+            cancelResidueMatches.add(entityPath);
+          }
+        }
+      }
+      lane5Map['sidecarCacheDir'] = sidecarCacheDir.path;
+      lane5Map['cancelResidueMatches'] = cancelResidueMatches;
+      cancelNoOwnedCacheResidue = cancelResidueMatches.isEmpty;
+      if (!cancelNoOwnedCacheResidue) {
+        throw Exception(
+          'Lane 5 failed: found owned sidecar cache residue for cancelled '
+          'clip in $sidecarCacheDir: $cancelResidueMatches',
+        );
+      }
+
+      await controllerLaneCancel.disposeAsync();
+      controllerLaneCancel.dispose();
+      controllerLaneCancel = null;
+
+      // Recovery: a fresh prepare for the same clipId (retry after
+      // invalidated, per the invalidated=>idle=>retryable contract) must
+      // still reach ready normally.
+      final clipLaneCancelRecovery = VGClipDescriptor(
+        id: 'unit-q-clip-cancel',
+        mediaKind: VGMediaKind.video,
+        sourcePath: sourcePath,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 1.0,
+        isReversed: true,
+      );
+      final draftLaneCancelRecovery = VGEditorDraft(
+        id: 'draft-unit-q-cancel-recovery',
+        clips: [clipLaneCancelRecovery],
+        canvasWidth: 320,
+        canvasHeight: 180,
+        fps: 30,
+      );
+      controllerLaneCancelRecovery = VGEditorController(
+        initialDraft: draftLaneCancelRecovery,
+      );
+      final recoveryStatuses = await controllerLaneCancelRecovery
+          .prepareReverseSidecars();
+      if (recoveryStatuses.length != 1) {
+        throw Exception(
+          'Lane 5 failed: expected 1 status from recovery prepare, got ${recoveryStatuses.length}',
+        );
+      }
+      final recoveryStatus = recoveryStatuses.first;
+      lane5Map['recoveryStatus'] = _statusToMap(recoveryStatus);
+      allStatusesObserved.add(_statusToMap(recoveryStatus));
+
+      final recoveryReadyPass =
+          recoveryStatus.clipId == 'unit-q-clip-cancel' &&
+          recoveryStatus.state == VGReverseSidecarState.ready &&
+          recoveryStatus.progress == 1.0 &&
+          recoveryStatus.sidecarPath != null &&
+          recoveryStatus.errorMessage == null;
+      if (!recoveryReadyPass) {
+        throw Exception(
+          'Lane 5 failed: recovery prepare after cancellation did not reach ready: ${_statusToMap(recoveryStatus)}',
+        );
+      }
+
+      recoverySidecarPath = recoveryStatus.sidecarPath;
+      final recoveryFile = File(recoverySidecarPath!);
+      final recoveryExists = await recoveryFile.exists();
+      final recoveryLength = recoveryExists ? await recoveryFile.length() : 0;
+      lane5Map['recoverySidecarExists'] = recoveryExists;
+      lane5Map['recoverySidecarLength'] = recoveryLength;
+      cancelRecoveryPass = recoveryExists && recoveryLength > 0;
+      if (!cancelRecoveryPass) {
+        throw Exception(
+          'Lane 5 failed: recovery sidecar file missing or empty at $recoverySidecarPath',
+        );
+      }
+
+      await controllerLaneCancelRecovery.disposeAsync();
+      controllerLaneCancelRecovery.dispose();
+      controllerLaneCancelRecovery = null;
+
+      lane5Pass =
+          cancelInvalidatedObserved &&
+          cancelStatusIdleAfterCleanup &&
+          cancelNoStalePathPublished &&
+          cancelNoOwnedCacheResidue &&
+          cancelRecoveryPass;
+      print('ANDROID_REVERSE_SIDECAR_UNIT_Q_LANE5_PASS: $lane5Pass');
+
+      // ------------------------------------------------------------------------
       // Global honesty:
       // - At least one ready observed
       // - No SIDECAR_UNSUPPORTED_ANDROID observed
@@ -511,7 +700,12 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
           readySidecarExists &&
           readySidecarHasFtyp &&
           cleanupDeletedReadySidecar &&
-          orderingProbePass;
+          orderingProbePass &&
+          cancelInvalidatedObserved &&
+          cancelStatusIdleAfterCleanup &&
+          cancelNoStalePathPublished &&
+          cancelNoOwnedCacheResidue &&
+          cancelRecoveryPass;
 
       if (!globalHonestyPass) {
         throw Exception(
@@ -521,7 +715,12 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
           'readySidecarExists=$readySidecarExists, '
           'readySidecarHasFtyp=$readySidecarHasFtyp, '
           'cleanupDeletedReadySidecar=$cleanupDeletedReadySidecar, '
-          'orderingProbePass=$orderingProbePass',
+          'orderingProbePass=$orderingProbePass, '
+          'cancelInvalidatedObserved=$cancelInvalidatedObserved, '
+          'cancelStatusIdleAfterCleanup=$cancelStatusIdleAfterCleanup, '
+          'cancelNoStalePathPublished=$cancelNoStalePathPublished, '
+          'cancelNoOwnedCacheResidue=$cancelNoOwnedCacheResidue, '
+          'cancelRecoveryPass=$cancelRecoveryPass',
         );
       }
       print(
@@ -535,6 +734,18 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
         try {
           await controllerLane2.disposeAsync();
           controllerLane2.dispose();
+        } catch (_) {}
+      }
+      if (controllerLaneCancel != null) {
+        try {
+          await controllerLaneCancel.disposeAsync();
+          controllerLaneCancel.dispose();
+        } catch (_) {}
+      }
+      if (controllerLaneCancelRecovery != null) {
+        try {
+          await controllerLaneCancelRecovery.disposeAsync();
+          controllerLaneCancelRecovery.dispose();
         } catch (_) {}
       }
       if (fixtureFile != null) {
@@ -552,6 +763,14 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
           }
         } catch (_) {}
       }
+      if (recoverySidecarPath != null) {
+        try {
+          final f = File(recoverySidecarPath!);
+          if (await f.exists()) {
+            await f.delete();
+          }
+        } catch (_) {}
+      }
     }
 
     final allPass =
@@ -560,6 +779,7 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
         orderingProbePass &&
         lane3Pass &&
         lane4Pass &&
+        lane5Pass &&
         globalHonestyPass &&
         (topLevelError == null);
 
@@ -573,12 +793,18 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
         'lane2b_reverse_ordering_probe': probeMap,
         'lane3_invalid_and_missing_source': lane3Map,
         'lane4_cleanup_ownership': lane4Map,
+        'lane5_cancel_generation_invalidation': lane5Map,
       },
       'observedStatusCount': allStatusesObserved.length,
       'readySidecarExists': readySidecarExists,
       'readySidecarHasFtyp': readySidecarHasFtyp,
       'cleanupDeletedReadySidecar': cleanupDeletedReadySidecar,
       'reverseOrderingProven': orderingProbePass,
+      'cancelInvalidatedObserved': cancelInvalidatedObserved,
+      'cancelStatusIdleAfterCleanup': cancelStatusIdleAfterCleanup,
+      'cancelNoStalePathPublished': cancelNoStalePathPublished,
+      'cancelNoOwnedCacheResidue': cancelNoOwnedCacheResidue,
+      'cancelRecoveryPass': cancelRecoveryPass,
       'probeReport': probeReport,
       'globalHonestyPass': globalHonestyPass,
       'error': topLevelError,

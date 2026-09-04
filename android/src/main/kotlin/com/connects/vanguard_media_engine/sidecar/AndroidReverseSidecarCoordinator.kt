@@ -35,6 +35,10 @@ import kotlin.math.roundToInt
  * finishes after the generation has moved on deletes its own owned temp/final
  * files and never writes a record into [records] -- a stale background
  * transcode can never resurrect state a concurrent cleanup already wiped.
+ * The same generation check is also handed to the transcoder as a cooperative
+ * cancellation poll ([AndroidReverseSidecarTranscoder.Params.isCancelled]), so
+ * an in-flight job bails out boundedly instead of running to completion after
+ * it is already stale; either way it always resolves to `state=invalidated`.
  */
 class AndroidReverseSidecarCoordinator(
     private val context: Context,
@@ -63,6 +67,7 @@ class AndroidReverseSidecarCoordinator(
         private const val CODE_TRIM_WINDOW_TOO_LONG = "SIDECAR_TRIM_WINDOW_TOO_LONG"
         private const val CODE_ENCODE_FAILED = AndroidReverseSidecarTranscoder.CODE_ENCODE_FAILED
         private const val CODE_OUTPUT_EMPTY = AndroidReverseSidecarTranscoder.CODE_OUTPUT_EMPTY
+        private const val CODE_CANCELLED = AndroidReverseSidecarTranscoder.CODE_CANCELLED
 
         private val OWNED_METHODS = setOf(
             "prepareReverseSidecars",
@@ -310,6 +315,11 @@ class AndroidReverseSidecarCoordinator(
                     frameCount = job.frameCount,
                     targetWidth = job.targetWidth,
                     targetHeight = job.targetHeight,
+                    // Cooperative cancellation: a concurrent cleanup/dispose bumps
+                    // [generation], and this poll lets the transcoder bail out of
+                    // its own in-flight work boundedly instead of racing to
+                    // publish/overwrite state a cleanup already wiped.
+                    isCancelled = { synchronized(lock) { generation != capturedGeneration } },
                 ),
             )
         } catch (t: Throwable) {
@@ -328,7 +338,11 @@ class AndroidReverseSidecarCoordinator(
         if (failureCode != null) {
             deleteIfContained(cacheDir, tempFile)
             val stillCurrent = synchronized(lock) { generation == capturedGeneration }
-            if (!stillCurrent) {
+            // A cancellation only ever fires once generation has moved on, so
+            // it always maps to invalidated, never failed -- regardless of
+            // [stillCurrent] (defensive; stillCurrent is already guaranteed
+            // false whenever failureCode is CODE_CANCELLED).
+            if (failureCode == CODE_CANCELLED || !stillCurrent) {
                 return invalidatedStatusMap(job.clipId)
             }
             storeFailedRecord(job.clipId, job.sourceHash, failureCode)
