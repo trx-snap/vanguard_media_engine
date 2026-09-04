@@ -12,8 +12,8 @@ import java.io.File
 // definitions before render execution; it makes no production rendering claim.
 // Native rendering (Vulkan overlay compositor) is implemented in subsequent slices.
 //
-// Closed supported type set: sticker and text (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT).
-// Emoji and unknown types fail closed with UNSUPPORTED_EXPORT_FEATURE. Text
+// Closed supported type set: sticker, text, and emoji (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT).
+// Unknown types fail closed with UNSUPPORTED_EXPORT_FEATURE. Text and emoji
 // overlays require a non-blank `textContent` string (trimmed); missing or
 // blank textContent fails closed with INVALID_ARG. Dynamic keyframes on
 // sticker overlays are supported (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT);
@@ -55,8 +55,7 @@ data class AndroidTimelineOverlayDescriptor(
     fun isActiveAtPTS(ptsSeconds: Double): Boolean = isActiveAtTime(ptsSeconds)
 
     /**
-     * Overlay kind. Route-A accepts [STICKER] and [TEXT]. [EMOJI] fails
-     * closed with UNSUPPORTED_EXPORT_FEATURE.
+     * Overlay kind. Route-A accepts [STICKER], [TEXT], and [EMOJI].
      */
     enum class Type(val wireNames: List<String>) {
         STICKER(listOf("sticker")),
@@ -124,10 +123,10 @@ data class AndroidTimelineOverlayDescriptor(
                         "exportTimeline: overlay '$overlayId' type required",
                     )
                 val type = Type.fromWireName(rawType)
-                if (type == null || type == Type.EMOJI) {
+                if (type == null) {
                     return ParseResult.Failure(
                         CODE_UNSUPPORTED_EXPORT_FEATURE,
-                        "exportTimeline: overlay '$overlayId' type '$rawType' is not supported (only 'sticker' and 'text' are supported in Route-A)",
+                        "exportTimeline: overlay '$overlayId' type '$rawType' is not supported (only 'sticker', 'text', and 'emoji' are supported in Route-A)",
                     )
                 }
 
@@ -164,9 +163,10 @@ data class AndroidTimelineOverlayDescriptor(
                 } else {
                     val rawTextContent = (map["textContent"] as? String)?.trim()
                     if (rawTextContent.isNullOrEmpty()) {
+                        val kindName = if (type == Type.EMOJI) "emoji" else "text"
                         return ParseResult.Failure(
                             CODE_INVALID_ARG,
-                            "exportTimeline: text overlay '$overlayId' requires non-blank textContent",
+                            "exportTimeline: $kindName overlay '$overlayId' requires non-blank textContent",
                         )
                     }
                     textContent = rawTextContent

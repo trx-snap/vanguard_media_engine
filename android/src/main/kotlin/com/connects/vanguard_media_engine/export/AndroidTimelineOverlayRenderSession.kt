@@ -7,13 +7,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Android True-DAG V4.3 Phase 5 P5-OVERLAYS-TRANS (Route-A N8 helper).
  *
- * Standalone session helper that prepares validated sticker and text overlays
- * for the native Vulkan overlay render seam
+ * Standalone session helper that prepares validated sticker, text, and emoji
+ * overlays for the native Vulkan overlay render seam
  * ([VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays]).
  * Sticker overlays are decoded via [AndroidTimelineOverlayAssetDecoder]; text
- * overlays are rasterized via [AndroidTimelineOverlayTextRasterizer]
- * (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT). Emoji overlays are rejected defensively
- * (unreachable after [AndroidTimelineOverlayDescriptor] admission).
+ * and emoji overlays are rasterized via [AndroidTimelineOverlayTextRasterizer]
+ * (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT, P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT).
  *
  * Helper-only: this class does not wire encoder/export admission, does not
  * mutate native/JNI, and does not unblock overlay export.
@@ -262,7 +261,9 @@ internal class AndroidTimelineOverlayRenderSession internal constructor(
                                 }
                             }
                         }
-                        AndroidTimelineOverlayDescriptor.Type.TEXT -> {
+                        AndroidTimelineOverlayDescriptor.Type.TEXT,
+                        AndroidTimelineOverlayDescriptor.Type.EMOJI -> {
+                            val kindName = if (overlay.type == AndroidTimelineOverlayDescriptor.Type.EMOJI) "emoji" else "text"
                             when (
                                 val rasterizeResult = AndroidTimelineOverlayTextRasterizer.rasterizeText(
                                     overlay.overlayId,
@@ -278,7 +279,7 @@ internal class AndroidTimelineOverlayRenderSession internal constructor(
                                     }
                                     return PrepareResult.Failure(
                                         code = rasterizeResult.code,
-                                        message = "Failed to rasterize text overlay '${overlay.overlayId}': ${rasterizeResult.message}",
+                                        message = "Failed to rasterize $kindName overlay '${overlay.overlayId}': ${rasterizeResult.message}",
                                     )
                                 }
                                 is AndroidTimelineOverlayTextRasterizer.RasterizeResult.Success -> {
@@ -288,15 +289,6 @@ internal class AndroidTimelineOverlayRenderSession internal constructor(
                                     rowStrideBytes = rasterizeResult.rowStrideBytes
                                 }
                             }
-                        }
-                        AndroidTimelineOverlayDescriptor.Type.EMOJI -> {
-                            if (anyUploadSucceeded) {
-                                quietlyClearNativeTextures(nativeBridge, sessionId)
-                            }
-                            return PrepareResult.Failure(
-                                code = INVALID_ARG,
-                                message = "Unsupported overlay type 'emoji' reached render session for overlay '${overlay.overlayId}'",
-                            )
                         }
                     }
 

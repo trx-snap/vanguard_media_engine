@@ -16,14 +16,10 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 // -- AndroidTimelineOverlayTextRasterizer (P5-OVERLAYS-TEXT-RASTERIZER-HELPER
-// sub-slice of P5-OVERLAYS-TRANS) --
+// and P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT under P5-OVERLAYS-TRANS) --
 //
-// Rasterizes text overlay content into a direct tightly packed RGBA8888
-// ByteBuffer, in preparation for a later text-overlay export slice.
-// Helper-only: this slice does not wire text overlays into the export
-// pipeline and does not change export admission. AndroidTimelineOverlayDescriptor
-// still fails closed with UNSUPPORTED_EXPORT_FEATURE for any non-sticker
-// overlay type, including text.
+// Rasterizes text and emoji overlay content into a direct tightly packed RGBA8888
+// ByteBuffer for Route-A Vulkan overlay export.
 //
 // Uses Bitmap.getPixels (non-premultiplied ARGB Color ints) and explicitly
 // repacks to RGBA byte order, matching AndroidTimelineOverlayAssetDecoder --

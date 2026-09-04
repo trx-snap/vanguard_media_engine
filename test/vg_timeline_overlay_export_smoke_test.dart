@@ -156,7 +156,7 @@ void main() {
         'hard_cut_multiclip_success',
         'single_clip_dynamic_keyframe_success',
         'text_overlay_success',
-        'fail_closed_emoji_overlay',
+        'emoji_overlay_success',
         'fail_closed_malformed_keyframes',
         'overlays_with_transition_dissolve_success',
         'overlays_with_transition_slide_left_success',
@@ -898,15 +898,15 @@ void main() {
       final report =
           VGTimelineOverlayExportSmokeLaneReport.fromPlatformException(
             _request(
-              laneId: 'fail_closed_emoji_overlay',
+              laneId: 'fail_closed_unreadable_asset',
               expectation:
                   const VGTimelineOverlayExportSmokeExpectation.failClosed(
-                    errorCode: unsupportedExportFeatureCode,
-                    messageContains: emojiOverlayToken,
+                    errorCode: fileUnreadableCode,
+                    messageContains: unreadableAssetToken,
                   ),
             ),
             PlatformException(
-              code: unsupportedExportFeatureCode,
+              code: fileUnreadableCode,
               message: 'exportTimeline: unspecified error',
             ),
           );
@@ -1249,8 +1249,8 @@ void main() {
         final successLanes = suite.where((r) => r.expectation.expectsSuccess);
         final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(11));
-        expect(failureLanes, hasLength(3));
+        expect(successLanes, hasLength(12));
+        expect(failureLanes, hasLength(2));
 
         // Lane 1: single_clip_static_sticker_success
         final lane1 = suite[0];
@@ -1308,12 +1308,15 @@ void main() {
         expect(lane6.expectation.expectedOverlayCount, 1);
         expect(lane6.expectation.expectedRenderedOverlayFrameCount, 55);
 
-        // Lane 7: fail_closed_emoji_overlay
+        // Lane 7: emoji_overlay_success
         final lane7 = suite[6];
-        expect(lane7.laneId, 'fail_closed_emoji_overlay');
+        expect(lane7.laneId, 'emoji_overlay_success');
         expect(lane7.overlays.single.type, 'emoji');
-        expect(lane7.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane7.expectation.messageContains, emojiOverlayToken);
+        expect(lane7.overlays.single.textContent, isNotNull);
+        expect(lane7.overlays.single.textContent, isNotEmpty);
+        expect(lane7.expectation.expectsSuccess, isTrue);
+        expect(lane7.expectation.expectedOverlayCount, 1);
+        expect(lane7.expectation.expectedRenderedOverlayFrameCount, 55);
 
         // Lane 8: fail_closed_malformed_keyframes
         final lane8 = suite[7];
