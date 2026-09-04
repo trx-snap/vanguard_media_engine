@@ -146,7 +146,6 @@ void main() {
       expect(textOverlayToken, 'text');
       expect(emojiOverlayToken, 'emoji');
       expect(keyframesToken, 'keyframe');
-      expect(overlaysWithBeautyToken, 'beauty');
       expect(unreadableAssetToken, 'asset');
 
       expect(defaultOverlaySmokeLaneIds, hasLength(14));
@@ -163,7 +162,7 @@ void main() {
         'overlays_with_transition_slide_left_success',
         'overlays_with_transition_wipe_right_success',
         'overlays_with_beauty_transition_overlap_success',
-        'fail_closed_solo_overlays_with_beauty',
+        'overlays_with_beauty_solo_success',
         'fail_closed_unreadable_asset',
       ]);
     });
@@ -1250,8 +1249,8 @@ void main() {
         final successLanes = suite.where((r) => r.expectation.expectsSuccess);
         final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(9));
-        expect(failureLanes, hasLength(5));
+        expect(successLanes, hasLength(10));
+        expect(failureLanes, hasLength(4));
 
         // Lane 1: single_clip_static_sticker_success
         final lane1 = suite[0];
@@ -1399,15 +1398,23 @@ void main() {
         // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
         expect(lane12.expectedDurationSeconds, closeTo(3.5, 1e-9));
 
-        // Lane 13: fail_closed_solo_overlays_with_beauty
+        // Lane 13: overlays_with_beauty_solo_success
         final lane13 = suite[12];
-        expect(lane13.laneId, 'fail_closed_solo_overlays_with_beauty');
+        expect(lane13.laneId, 'overlays_with_beauty_solo_success');
+        expect(lane13.clips, hasLength(1));
         expect(lane13.clips.single.hasBeauty, isTrue);
+        expect(lane13.clips.single.durationSeconds, 2.0);
         expect(lane13.transitions, isEmpty);
+        expect(lane13.overlays, hasLength(1));
         expect(lane13.overlays.single.startTimeSeconds, 0.0);
         expect(lane13.overlays.single.durationSeconds, 2.0);
-        expect(lane13.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane13.expectation.messageContains, overlaysWithBeautyToken);
+        expect(lane13.expectation.expectsSuccess, isTrue);
+        expect(lane13.expectation.expectedOverlayCount, 1);
+        expect(lane13.expectation.expectedTransitionCount, 0);
+        expect(lane13.expectation.expectedRenderedOverlayFrameCount, 55);
+        expect(lane13.expectation.expectedBeautyClipCount, 1);
+        expect(lane13.expectation.expectedBeautyFrameCountMin, 55);
+        expect(lane13.expectedDurationSeconds, closeTo(2.0, 1e-9));
 
         // Lane 14: fail_closed_unreadable_asset
         final lane14 = suite[13];

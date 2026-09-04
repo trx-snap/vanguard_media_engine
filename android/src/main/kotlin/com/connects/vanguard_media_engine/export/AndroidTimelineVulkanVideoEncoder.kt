@@ -68,19 +68,18 @@ import kotlin.math.min
 // on transition overlap frames -- [renderTransitionPair] routes through
 // VanguardNativeBridge.renderAndroidTimelineVulkanExportTransitionFrameWithOverlays.
 //
-// P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY: clip-level Beauty V2 alongside
-// overlays is rendered through that same transition-overlap overlay seam --
-// unlike the solo overlay seam, it accepts per-layer Beauty V2 params and
-// applies Beauty before overlay placement -- so [renderTransitionPair] now
-// passes each layer's actual beautyIntensity through instead of forcing it
-// off. AndroidTimelineExportSession's own admission gate only allows
-// overlays alongside beauty when every overlay's active interval is safely
-// inside a transition's inset OUTPUT overlap window, so a beauty clip's
-// solo frames in that shape never actually carry an active overlay in
-// practice; [renderSoloLayer] still carries a defensive
-// `overlay_beauty_solo_unsupported` backstop for the solo overlay seam
-// (which takes no beauty params) in case a frame payload unexpectedly
-// reports an active overlay there anyway.
+// P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY / P5-OVERLAYS-BEAUTY-SOLO:
+// clip-level Beauty V2 alongside overlays is rendered through that same
+// transition-overlap overlay seam -- unlike the (pre-P5-OVERLAYS-BEAUTY-SOLO)
+// solo overlay seam, it accepts per-layer Beauty V2 params and applies Beauty
+// before overlay placement -- so [renderTransitionPair] now passes each
+// layer's actual beautyIntensity through instead of forcing it off. A solo
+// (non-transition-overlap) active overlay alongside clip-level Beauty V2 is
+// ALSO a supported production shape: [renderSoloLayer] routes that frame
+// through the combined
+// VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty
+// seam instead, which applies Beauty before overlay placement exactly like
+// the transition-overlap seam.
 //
 // PTS mechanism (must stay compatible with AndroidTimelineVideoEncoder's
 // frozen fixed frame clock, since a mid-export fallback re-runs the same
@@ -203,20 +202,16 @@ class AndroidTimelineVulkanVideoEncoder(
     /// Encodes [clips] with the validated [transitions] and the validated,
     /// static-sticker [overlays] (AndroidTimelineOverlayDescriptor.parseList
     /// output; P5-OVERLAYS-TRANS Route-A N9, extended by
-    /// P5-OVERLAYS-TRANSITION-COMP-N3 and
-    /// P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY). Overlays are rendered on
-    /// solo frames through the native
-    /// renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam, and
-    /// on transition overlap frames through
-    /// renderAndroidTimelineVulkanExportTransitionFrameWithOverlays (see
-    /// [renderTransitionPair]) -- a non-empty overlay list combined with a
-    /// non-hard-cut transition is a supported production shape as of N3,
-    /// including when a clip also carries Beauty V2, since the transition
-    /// seam accepts per-layer Beauty V2 params. A solo (no non-hard-cut
-    /// transition) shape combining overlays with a clip carrying Beauty V2
-    /// is still rejected defensively here (the solo overlay seam does not
-    /// accept beauty params) even though AndroidTimelineExportSession
-    /// already fails closed before this call for that shape.
+    /// P5-OVERLAYS-TRANSITION-COMP-N3 and P5-OVERLAYS-BEAUTY-SOLO). Overlays
+    /// are rendered on solo frames through the native
+    /// renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam (or,
+    /// when the clip also carries Beauty V2, the combined
+    /// renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty
+    /// seam -- see [renderSoloLayer]), and on transition overlap frames
+    /// through renderAndroidTimelineVulkanExportTransitionFrameWithOverlays
+    /// (see [renderTransitionPair]) -- overlays alongside clip-level Beauty
+    /// V2 are a supported production shape on both the solo and
+    /// transition-overlap routes.
     /// Returns a structured result; never throws.
     override fun encode(
         clips: List<AndroidTimelineVideoEncoder.ClipInput>,
@@ -226,24 +221,6 @@ class AndroidTimelineVulkanVideoEncoder(
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
         val nonHardCutTransitions = transitions.filter { !it.isHardCut }
-        // P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY: a solo (no non-hard-cut
-        // transition) shape carrying both overlays and clip-level Beauty V2
-        // has no safe route -- the solo overlay render seam
-        // (renderAndroidTimelineVulkanExportFrameCroppedWithOverlays) takes
-        // no beauty params. This backstop still rejects that solo shape
-        // defensively even though AndroidTimelineExportSession's own
-        // admission gate should already have failed closed before this
-        // encoder ever ran. When a non-hard-cut transition is present,
-        // overlays + beauty are provably safe only for overlay intervals
-        // inside the transition's inset overlap window (also enforced by
-        // that same upstream admission gate) -- [renderSoloLayer] and
-        // [renderTransitionPair] carry their own narrower, per-frame
-        // backstops for that shape instead of rejecting it here.
-        if (overlays.isNotEmpty() && clips.any { it.beautyIntensity != null } &&
-            nonHardCutTransitions.isEmpty()
-        ) {
-            return failResult("overlay_beauty_unsupported")
-        }
         val plan = buildSegmentPlan(clips, nonHardCutTransitions)
         totalExpectedSamples = plan.expectedSamples
         if (plan.failureReason != null) {
@@ -892,30 +869,51 @@ class AndroidTimelineVulkanVideoEncoder(
                 beautyIntensity = (beautyIntensity ?: 0.0).toFloat(),
             )
         } else {
-            // P5-OVERLAYS-TRANS Route-A N9 / P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY:
-            // this branch renders both plain solo segments and the unpaired
-            // solo edge frames a transition overlap segment falls back to
-            // (see [encodeOverlapSegment]). The solo overlay render seam
-            // (renderAndroidTimelineVulkanExportFrameCroppedWithOverlays)
-            // takes no beauty params, so a beauty clip's solo frame only
-            // renders safely through this branch when it has zero active
-            // overlays -- AndroidTimelineExportSession's admission gate
-            // only allows overlays alongside beauty when every overlay's
-            // active interval is safely inside a transition's inset OUTPUT
-            // overlap window, so a beauty clip's solo frame in that shape
-            // never actually carries an active overlay in practice; a
-            // payload reporting one anyway is treated as a defensive
-            // backstop failure rather than silently dropping the beauty
-            // effect or the overlay.
+            // P5-OVERLAYS-TRANS Route-A N9 / P5-OVERLAYS-BEAUTY-SOLO: this
+            // branch renders both plain solo segments and the unpaired solo
+            // edge frames a transition overlap segment falls back to (see
+            // [encodeOverlapSegment]). A beauty clip's solo frame carrying
+            // one or more active overlays renders through the combined
+            // renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty
+            // seam, which applies Beauty V2 before overlay placement; a
+            // beauty clip's solo frame with zero active overlays still
+            // renders through the plain cropped seam (byte-identical to the
+            // pre-existing beauty-only behavior), and a non-beauty solo
+            // frame still renders through the overlay-only cropped seam
+            // (byte-identical to the pre-existing overlay-only behavior).
             val payload = when (val payloadResult = session.buildFramePayload(timelinePtsUs)) {
                 is AndroidTimelineOverlayRenderSession.FramePayloadResult.Failure ->
                     return "overlay_payload_failed:${payloadResult.code}:${payloadResult.message.take(120)}"
                 is AndroidTimelineOverlayRenderSession.FramePayloadResult.Success -> payloadResult.payload
             }
             if (beautyIntensity != null && payload.overlayCount > 0) {
-                return "overlay_beauty_solo_unsupported"
-            }
-            if (beautyIntensity != null) {
+                renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty(
+                    sessionId = nativeSessionId!!,
+                    hardwareBuffer = hwBuf,
+                    width = width,
+                    height = height,
+                    cropLeft = g[0],
+                    cropTop = g[1],
+                    cropRight = g[2],
+                    cropBottom = g[3],
+                    rotationDegrees = g[4],
+                    destFitX = g[5],
+                    destFitY = g[6],
+                    destFitWidth = g[7],
+                    destFitHeight = g[8],
+                    timelinePtsUs = timelinePtsUs,
+                    frameIndex = renderedFrames,
+                    colorMatrix = colorMatrix,
+                    overlayTextureHandles = payload.overlayTextureHandles,
+                    overlayGeometry = payload.overlayGeometry,
+                    overlayCount = payload.overlayCount,
+                    beautyEnabled = true,
+                    beautyIntensity = beautyIntensity.toFloat(),
+                )
+                if (renderStr.startsWith("status=OK;")) {
+                    overlayFrameCounted = true
+                }
+            } else if (beautyIntensity != null) {
                 renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
                     sessionId = nativeSessionId!!,
                     hardwareBuffer = hwBuf,
@@ -1135,13 +1133,13 @@ class AndroidTimelineVulkanVideoEncoder(
     /// is set, this builds that session's frame payload for [timelinePtsUs]
     /// (the same continuous output-frame clock solo frames use -- see the
     /// class doc's PTS mechanism note) and renders through the overlay-aware
-    /// transition seam instead. Unlike the solo overlay seam, this
-    /// transition-overlap overlay seam DOES accept per-layer Beauty V2
-    /// params and applies Beauty before overlay placement, so [fromClip]'s
-    /// and [toClip]'s actual beautyIntensity values are passed through
-    /// rather than forced off. A payload build failure returns a
-    /// machine-readable `overlay_payload_failed:<code>:<message>` reason
-    /// instead of throwing.
+    /// transition seam instead. Like [renderSoloLayer]'s own combined
+    /// beauty+overlay seam (P5-OVERLAYS-BEAUTY-SOLO), this transition-overlap
+    /// overlay seam accepts per-layer Beauty V2 params and applies Beauty
+    /// before overlay placement, so [fromClip]'s and [toClip]'s actual
+    /// beautyIntensity values are passed through rather than forced off. A
+    /// payload build failure returns a machine-readable
+    /// `overlay_payload_failed:<code>:<message>` reason instead of throwing.
     private fun renderTransitionPair(
         fromFrame: AndroidTimelineTransitionOverlapDecoder.Frame,
         toFrame: AndroidTimelineTransitionOverlapDecoder.Frame,

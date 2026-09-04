@@ -1265,6 +1265,45 @@ class VanguardNativeBridge(
         overlayCount: Int,
     ): String
 
+    // ── P5-OVERLAYS-BEAUTY-SOLO: cropped solo frame + overlay + beauty render seam ──
+    // Same cropped/rotated/dest-fit/colorMatrix/overlay contract as
+    // renderAndroidTimelineVulkanExportFrameCroppedWithOverlays above, PLUS
+    // the beautyEnabled/beautyIntensity contract from
+    // renderAndroidTimelineVulkanExportFrameCropped -- for a solo frame
+    // carrying both clip-level Beauty V2 and static sticker overlays at
+    // once. When [beautyEnabled] is true, [beautyIntensity] must be finite
+    // and in [0.0, 1.0] -- native fails closed with
+    // "beauty_v2_invalid_intensity" on any other value. Native expands the
+    // intensity into the full Beauty V2 ramp from the CROPPED SOURCE extent
+    // and composites the overlays on top of the beautified base frame; a
+    // render failure while [beautyEnabled] is reported with reason
+    // "beauty_v2_requires_vulkan:vulkan_render_failed" instead of the
+    // generic "render_failed". "status=OK;..." additionally reports
+    // overlayCount, visibleOverlayCount, and beauty=1/0.
+    external fun renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        cropLeft: Int,
+        cropTop: Int,
+        cropRight: Int,
+        cropBottom: Int,
+        rotationDegrees: Int,
+        destFitX: Int,
+        destFitY: Int,
+        destFitWidth: Int,
+        destFitHeight: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+        colorMatrix: FloatArray?,
+        overlayTextureHandles: LongArray?,
+        overlayGeometry: DoubleArray?,
+        overlayCount: Int,
+        beautyEnabled: Boolean,
+        beautyIntensity: Float,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS: production transition frame render seam ────────
     // Renders ONE output frame of a compositor-owned clip overlap transition
     // from TWO decoder HardwareBuffers (outgoing "from" clip, incoming "to"

@@ -12,7 +12,6 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.io.File
 import java.util.UUID
 import kotlin.math.floor
-import kotlin.math.max
 
 // ── AndroidTimelineExportSession (Export Unit C) ──────────────────────────────
 //
@@ -50,7 +49,7 @@ import kotlin.math.max
 //     timelines carrying audioSidecar tracks fail closed too: this route
 //     does not overlap-adjust serialized audio timings.
 //   - P5-OVERLAYS-TRANS Route-A N9, extended by P5-OVERLAYS-TRANSITION-COMP-N3
-//     and P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY: static sticker overlays
+//     and P5-OVERLAYS-BEAUTY-SOLO: static sticker overlays
 //     (AndroidTimelineOverlayDescriptor, up to 128 per export) composited by
 //     AndroidTimelineVulkanVideoEncoder via the native
 //     renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam on solo
@@ -60,13 +59,14 @@ import kotlin.math.max
 //     so overlays require the requested output to match the draft canvas
 //     exactly; more than 128 overlays always fail closed with
 //     UNSUPPORTED_EXPORT_FEATURE before pass-1 -- overlays have no GLES
-//     fallback either way. Overlays alongside clip-level Beauty V2 are
-//     supported ONLY when every overlay's active interval is fully
-//     contained, with a margin, inside a non-hard-cut transition's OUTPUT
-//     overlap window -- only that transition-overlap overlay render seam
-//     accepts per-layer Beauty V2 params; the solo overlay seam does not, so
-//     a solo-active overlay alongside beauty still fails closed (see
-//     [isOverlayBeautyWithinTransitionOverlap]).
+//     fallback either way. Overlays alongside clip-level Beauty V2 are a
+//     supported production shape on both solo and transition-overlap
+//     frames: a solo frame carrying an active overlay on a beauty clip
+//     renders through the combined
+//     renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty
+//     seam, and a transition-overlap frame renders through
+//     renderAndroidTimelineVulkanExportTransitionFrameWithOverlays's own
+//     per-layer Beauty V2 params.
 //   - Per-clip colorMatrix is accepted and
 //     applied for both decoded video frames and still-image frames by
 //     whichever backend renders the clip (Vulkan-native color-matrix push
@@ -569,33 +569,16 @@ class AndroidTimelineExportSession(private val context: Context) {
         // composites overlays on both solo frames and transition overlap
         // frames (see [renderTransitionPair]).
         //
-        // P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY: overlays alongside
-        // clip-level Beauty V2 are supported ONLY when every overlay's
-        // active interval is provably safe -- fully contained, with a
-        // margin, inside a non-hard-cut transition's OUTPUT overlap window
-        // (renderAndroidTimelineVulkanExportTransitionFrameWithOverlays
-        // already accepts per-layer Beauty V2 params and applies Beauty
-        // before overlay placement on that seam). The SOLO overlay render
-        // seam (renderAndroidTimelineVulkanExportFrameCroppedWithOverlays)
-        // still takes no beauty params, so a solo-active overlay alongside
-        // beauty is not provable safe and [isOverlayBeautyWithinTransitionOverlap]
-        // fails closed for it, and for any other shape it cannot prove safe.
-        // Fail closed here, before backend selection, with a precise
-        // UNSUPPORTED_EXPORT_FEATURE rather than surfacing an UNAVAILABLE
-        // backend-selection reason for a shape this route never supports.
-        if (overlays.isNotEmpty() && hasBeautyClip &&
-            !isOverlayBeautyWithinTransitionOverlap(clipInputs, transitions, overlays, requestFps)
-        ) {
-            deleteOwnedTemps()
-            logTerminal("overlay_route_unsupported", backend = null)
-            onError(
-                "UNSUPPORTED_EXPORT_FEATURE",
-                "exportTimeline: overlays alongside clip-level beauty are only supported " +
-                    "when every overlay's active interval is safely inside a transition " +
-                    "overlap window",
-            )
-            return
-        }
+        // P5-OVERLAYS-BEAUTY-SOLO: overlays alongside clip-level Beauty V2
+        // are a supported production shape on every frame kind -- a solo
+        // frame on a beauty clip carrying an active overlay renders through
+        // the combined
+        // renderAndroidTimelineVulkanExportFrameCroppedWithOverlaysAndBeauty
+        // seam (see [renderSoloLayer]), and a transition-overlap frame
+        // renders through renderAndroidTimelineVulkanExportTransitionFrameWithOverlays's
+        // own per-layer Beauty V2 params (see [renderTransitionPair]). There
+        // is no longer an admission gate here restricting overlays alongside
+        // beauty to transition-overlap windows.
         if (overlays.size > MAX_OVERLAY_COUNT) {
             deleteOwnedTemps()
             logTerminal("overlay_route_unsupported", backend = null)
@@ -904,95 +887,6 @@ class AndroidTimelineExportSession(private val context: Context) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY admission
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// True only when [overlays] alongside clip-level Beauty V2 is a provably
-    /// safe shape: at least one non-hard-cut entry in [transitions] exists,
-    /// and every overlay's active interval
-    /// `[startTimeSeconds, startTimeSeconds + durationSeconds)` is fully
-    /// contained in some transition's OUTPUT-timeline overlap window, inset
-    /// on both ends by `max(2.0 / requestFps, 0.05)` seconds. The inset
-    /// margin keeps an admitted overlay interval a comfortable number of
-    /// frames away from the solo/overlap segment boundary, where a rendered
-    /// frame could otherwise land just outside the overlap window (and thus
-    /// on the beauty-free solo overlay seam) depending on decoder frame
-    /// timing.
-    ///
-    /// Walks [clipInputs] once in clip order, mirroring
-    /// AndroidTimelineVulkanVideoEncoder.buildSegmentPlan's own solo/overlap
-    /// windowing, to compute each transition's OUTPUT-timeline overlap
-    /// window without duplicating that encoder's segment plan: a clip's
-    /// solo contribution is its trim-window duration minus any incoming and
-    /// outgoing transition overlap it lends, and each outgoing transition's
-    /// overlap window starts immediately after that running cumulative
-    /// output position.
-    ///
-    /// Fails closed (returns false) for every unexpected shape --
-    /// no non-hard-cut transition, a non-adjacent/duplicate transition
-    /// boundary, a transition overlap exceeding its clip, or an overlay
-    /// interval not fully contained in an inset overlap window -- rather
-    /// than guessing at a shape this helper cannot prove safe.
-    private fun isOverlayBeautyWithinTransitionOverlap(
-        clipInputs: List<AndroidTimelineVideoEncoder.ClipInput>,
-        transitions: List<AndroidTimelineTransitionDescriptor>,
-        overlays: List<AndroidTimelineOverlayDescriptor>,
-        requestFps: Int,
-    ): Boolean {
-        val nonHardCutTransitions = transitions.filter { !it.isHardCut }
-        if (nonHardCutTransitions.isEmpty()) return false
-
-        val outgoingByClip = HashMap<Int, AndroidTimelineTransitionDescriptor>()
-        val incomingByClip = HashMap<Int, AndroidTimelineTransitionDescriptor>()
-        for (t in nonHardCutTransitions) {
-            if (t.fromClipIndex < 0 || t.toClipIndex >= clipInputs.size ||
-                t.toClipIndex != t.fromClipIndex + 1
-            ) {
-                return false
-            }
-            if (!t.durationSeconds.isFinite() || t.durationSeconds <= 0.0) return false
-            if (outgoingByClip.put(t.fromClipIndex, t) != null) return false
-            if (incomingByClip.put(t.toClipIndex, t) != null) return false
-        }
-
-        val margin = max(2.0 / requestFps.coerceAtLeast(1), 0.05)
-        val insetOverlapWindows = mutableListOf<Pair<Double, Double>>()
-        var outputCursor = 0.0
-        for (index in clipInputs.indices) {
-            val clip = clipInputs[index]
-            val clipDurationSeconds = clip.trimEndSeconds - clip.trimStartSeconds
-            val incomingDuration = incomingByClip[index]?.durationSeconds ?: 0.0
-            val outgoing = outgoingByClip[index]
-            val outgoingDuration = outgoing?.durationSeconds ?: 0.0
-            val soloDuration = clipDurationSeconds - incomingDuration - outgoingDuration
-            if (soloDuration < -OVERLAY_BEAUTY_OVERLAP_EPSILON_SECONDS) return false
-            outputCursor += soloDuration.coerceAtLeast(0.0)
-            if (outgoing != null) {
-                val overlapStart = outputCursor
-                val overlapEnd = outputCursor + outgoingDuration
-                val insetStart = overlapStart + margin
-                val insetEnd = overlapEnd - margin
-                if (insetEnd > insetStart) {
-                    insetOverlapWindows.add(insetStart to insetEnd)
-                }
-                outputCursor = overlapEnd
-            }
-        }
-        if (insetOverlapWindows.isEmpty()) return false
-
-        for (overlay in overlays) {
-            if (overlay.durationSeconds <= 0.0) continue
-            val activeStart = overlay.startTimeSeconds
-            val activeEnd = overlay.startTimeSeconds + overlay.durationSeconds
-            val contained = insetOverlapWindows.any { (start, end) ->
-                activeStart >= start && activeEnd <= end
-            }
-            if (!contained) return false
-        }
-        return true
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Probing helpers
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1061,11 +955,6 @@ class AndroidTimelineExportSession(private val context: Context) {
         /// P5-OVERLAYS-TRANS Route-A N9: per-export overlay count limit --
         /// mirrors the native overlay texture store's own enforced maximum.
         private const val MAX_OVERLAY_COUNT = 128
-
-        /// Tolerance for the overlap arithmetic in
-        /// [isOverlayBeautyWithinTransitionOverlap], mirroring
-        /// AndroidTimelineVulkanVideoEncoder's own OVERLAP_EPSILON_SECONDS.
-        private const val OVERLAY_BEAUTY_OVERLAP_EPSILON_SECONDS = 1e-9
 
         // Progress checkpoints (frozen — see [start] doc comment). PASS1_PROGRESS_WEIGHT is
         // the exact value emitted as the pass-1-complete checkpoint (after the post-pass-1

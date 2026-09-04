@@ -197,6 +197,64 @@ public:
         std::string* outFailureReason);
 #endif
 
+    // P5-OVERLAYS-BEAUTY-SOLO: mirrors [recordBeauty] exactly (crop -> blur H
+    // -> blur V -> composite -> placement, see the file header) EXCEPT the
+    // placement pass's render pass -- targeting the SAME caller swapchain
+    // `finalRenderPass`/`finalFramebuffer` -- is left OPEN on success instead
+    // of being ended, so a caller can append further draws (overlays) into
+    // that same render pass before ending it itself. The caller owns
+    // `vkCmdEndRenderPass` on success. Unlike [prepareTransitionLayer] this
+    // records the full 5-pass sequence including placement, not just passes
+    // 1-4 -- there is exactly one layer on the solo path, so there is no
+    // multi-layer draw-list to defer to the caller.
+    //
+    // Every failure path here (invalid arguments, geometry/pipeline
+    // preparation failure, an invalid destination rect) is validated BEFORE
+    // `vkCmdBeginRenderPass` is ever called, exactly like [recordBeauty]'s
+    // own pass-5 validation order -- so a false return here always means no
+    // render pass was opened; the caller must NOT call vkCmdEndRenderPass on
+    // that path (see abandonRecordingCommandBuffer in
+    // vulkan_frame_renderer.cpp), only close the still-recording command
+    // buffer. Returns true on success (render pass left open); false with
+    // `*outFailureReason` set to a "beauty_v2_*" token otherwise.
+#if defined(__ANDROID__)
+    bool recordBeautyKeepOpen(
+        VkDevice device,
+        VkPhysicalDevice physicalDevice,
+        VkCommandBuffer commandBuffer,
+        uint32_t frameSlotIndex,
+        uint32_t frameCount,
+        const VulkanHardwareBufferImage& srcImage,
+        VkImageLayout srcCurrentLayout,
+        VkShaderModule vertexModule,
+        VkShaderModule fragmentModule,
+        const VideoFrameTransform& placementTransform,
+        const VideoBeautyV2RenderParams& beauty,
+        VkRenderPass finalRenderPass,
+        VkFramebuffer finalFramebuffer,
+        uint32_t finalExtentWidth,
+        uint32_t finalExtentHeight,
+        std::string* outFailureReason);
+#else
+    bool recordBeautyKeepOpen(
+        void* device,
+        void* physicalDevice,
+        void* commandBuffer,
+        uint32_t frameSlotIndex,
+        uint32_t frameCount,
+        const VulkanHardwareBufferImage& srcImage,
+        uint32_t srcCurrentLayout,
+        void* vertexModule,
+        void* fragmentModule,
+        const VideoFrameTransform& placementTransform,
+        const VideoBeautyV2RenderParams& beauty,
+        void* finalRenderPass,
+        void* finalFramebuffer,
+        uint32_t finalExtentWidth,
+        uint32_t finalExtentHeight,
+        std::string* outFailureReason);
+#endif
+
     // P5-BEAUTY-V2-TRANSITION-COMP: reusable seam for the transition-frame
     // draw path. Records ONLY passes 1-4 (crop -> blurH -> blurV -> composite,
     // see the file header) into `commandBuffer` -- which must already be in

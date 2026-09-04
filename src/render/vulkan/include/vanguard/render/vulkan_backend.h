@@ -97,6 +97,21 @@ public:
                                   const VideoFrameTransform& transform,
                                   const VideoBeautyV2RenderParams& beauty) override;
 
+    // P5-OVERLAYS-BEAUTY-SOLO: renderFrame with BOTH an optional Beauty V2
+    // pre-composite AND an optional set of already-resolved overlay draws,
+    // for a solo (non-transition) frame carrying both features at once. Not
+    // part of the shared RenderBackend interface, so this is a concrete
+    // VulkanBackend-only addition (no `override`), mirroring the overlay-only
+    // and beauty-only concrete overloads above. When beauty.enabled is false
+    // this is byte-identical to the overlay-only overload above; when
+    // overlayCount == 0 this is byte-identical to the beauty-only overload
+    // above. overlayDraws may be null only when overlayCount is 0.
+    RenderFrameResult renderFrame(HardwareBufferHandle handle,
+                                  const VideoFrameTransform& transform,
+                                  const VideoBeautyV2RenderParams& beauty,
+                                  const VulkanOverlayFrameDraw* overlayDraws,
+                                  uint32_t overlayCount);
+
     // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame through
     // the same swapchain acquire/submit/present lifecycle as renderFrame.
     // P5-BEAUTY-V2-TRANSITION-COMP: optional per-layer Beauty V2 params;

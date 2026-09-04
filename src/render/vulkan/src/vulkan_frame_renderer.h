@@ -121,6 +121,36 @@ public:
         const VideoFrameTransform& transform,
         const VideoBeautyV2RenderParams& beauty);
 
+    // P5-OVERLAYS-BEAUTY-SOLO: renderFrame with BOTH an optional Vulkan-only
+    // Beauty V2 pre-composite AND an optional set of already-resolved overlay
+    // draws, for a solo (non-transition) frame carrying both features at
+    // once. When beauty.enabled is false this delegates directly to the
+    // overlay-aware overload above with zero additional Vulkan calls --
+    // byte-identical to the existing overlay-only behavior. When
+    // overlayCount == 0 this delegates directly to the beauty-aware overload
+    // above with zero additional Vulkan calls -- byte-identical to the
+    // existing beauty-only behavior. When both are active, the beauty
+    // pre-composite's placement pass
+    // (VulkanBeautyFrameRenderer::recordBeautyKeepOpen) is recorded into the
+    // caller's swapchain render pass and left OPEN so the overlay draws
+    // (VulkanOverlayFrameRenderer::recordOverlayDraws) can be appended into
+    // the SAME render pass immediately afterward -- overlays always
+    // composite on top of the beautified base frame -- before this method
+    // itself ends the render pass and the command buffer. overlayDraws may
+    // be null only when overlayCount is 0. On any record failure the whole
+    // frame fails closed -- no partial present.
+    RenderFrameResult renderFrame(
+        void* queueHandle,
+        void* physicalDeviceHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle handle,
+        const VideoFrameTransform& transform,
+        const VideoBeautyV2RenderParams& beauty,
+        const VulkanOverlayFrameDraw* overlayDraws,
+        uint32_t overlayCount);
+
     // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame. Same
     // acquire / frame fence / imageAvailable + presentReady semaphore /
     // pending AHB acquire semaphore wait / release-fence export / present

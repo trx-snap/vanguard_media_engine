@@ -20,12 +20,11 @@
 //     (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), overlay compositing on Vulkan dissolve
 //     and representative non-dissolve (slideLeft, wipeRight) transition overlap
 //     frames (P5-OVERLAYS-TRANSITION-COMP-N3, P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A),
-//     and overlays alongside clip-level Beauty V2 ONLY when every overlay's active
-//     interval is safely inside a transition overlap window
-//     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY), but does not claim every
-//     transition direction (proves representative non-dissolve overlay transition
-//     support for slideLeft and wipeRight only), text/emoji overlays, GLES,
-//     a solo (non-transition-overlap) active overlay alongside clip-level Beauty V2,
+//     and overlays alongside clip-level Beauty V2 on both transition-overlap
+//     frames (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
+//     (P5-OVERLAYS-BEAUTY-SOLO), but does not claim every transition direction
+//     (proves representative non-dissolve overlay transition support for
+//     slideLeft and wipeRight only), text/emoji overlays, GLES,
 //     app/editor/iOS/streaming/cache, fleet coverage, playback, or pixel quality;
 //   - Validates success lanes: `success == true`, output file exists,
 //     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (transition-aware:
@@ -81,12 +80,6 @@ const String emojiOverlayToken = 'emoji';
 /// Fail-closed token for unsupported animated keyframe overlays in Route-A.
 const String keyframesToken = 'keyframe';
 
-/// Fail-closed token for a solo (non-transition-overlap) active overlay
-/// alongside clip-level Beauty V2 -- the only shape combining overlays and
-/// Beauty V2 that remains unsupported (see
-/// P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY).
-const String overlaysWithBeautyToken = 'beauty';
-
 /// Fail-closed token for unreadable sticker assets.
 const String unreadableAssetToken = 'asset';
 
@@ -104,7 +97,7 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'overlays_with_transition_slide_left_success',
   'overlays_with_transition_wipe_right_success',
   'overlays_with_beauty_transition_overlap_success',
-  'fail_closed_solo_overlays_with_beauty',
+  'overlays_with_beauty_solo_success',
   'fail_closed_unreadable_asset',
 ];
 
@@ -913,7 +906,7 @@ class VGTimelineOverlayExportSmokeRunner {
 /// 10. `overlays_with_transition_slide_left_success`
 /// 11. `overlays_with_transition_wipe_right_success`
 /// 12. `overlays_with_beauty_transition_overlap_success`
-/// 13. `fail_closed_solo_overlays_with_beauty`
+/// 13. `overlays_with_beauty_solo_success`
 /// 14. `fail_closed_unreadable_asset`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
@@ -1506,9 +1499,9 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 13: fail_closed_solo_overlays_with_beauty
+    // Lane 13: overlays_with_beauty_solo_success
     VGTimelineOverlayExportSmokeRequest(
-      laneId: 'fail_closed_solo_overlays_with_beauty',
+      laneId: 'overlays_with_beauty_solo_success',
       clips: <VGTimelineOverlayExportSmokeClip>[
         VGTimelineOverlayExportSmokeClip(
           id: 'clip-1',
@@ -1522,11 +1515,10 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
         VGTimelineOverlayExportSmokeOverlay(
           id: 'sticker-solo-beauty',
           assetPath: stickerAssetPath,
-          // Active on a plain solo (no transition anywhere in this
-          // timeline) frame -- this shape has no safe route since the solo
-          // overlay render seam takes no beauty params, so it must remain
-          // fail-closed even though the transition-overlap shape (lane 12)
-          // is now supported.
+          // Active on a solo clip carrying clip-level Beauty V2 without
+          // transitions (P5-OVERLAYS-BEAUTY-SOLO). Proves static sticker
+          // overlay compositing alongside clip-level Beauty V2 on solo
+          // frames via the combined Vulkan export render seam.
           startTimeSeconds: 0.0,
           durationSeconds: 2.0,
           translationX: 100.0,
@@ -1540,10 +1532,13 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
           type: 'sticker',
         ),
       ],
-      outputPath: outputPath('fail_closed_solo_overlays_with_beauty'),
-      expectation: const VGTimelineOverlayExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: overlaysWithBeautyToken,
+      outputPath: outputPath('overlays_with_beauty_solo_success'),
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedTransitionCount: 0,
+        expectedRenderedOverlayFrameCount: 55,
+        expectedBeautyClipCount: 1,
+        expectedBeautyFrameCountMin: 55,
       ),
     ),
 

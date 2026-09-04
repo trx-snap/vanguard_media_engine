@@ -9,18 +9,15 @@
 // on solo frames, AND on Vulkan dissolve and representative non-dissolve
 // (slideLeft, wipeRight) transition overlap frames
 // (P5-OVERLAYS-TRANSITION-COMP-N3, P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A),
-// AND overlays alongside clip-level Beauty V2 ONLY when every overlay's
-// active interval is safely inside a transition overlap window
-// (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY).
+// AND overlays alongside clip-level Beauty V2 on both transition overlap
+// frames (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
+// (P5-OVERLAYS-BEAUTY-SOLO).
 //
 // Strict non-claims:
 //   - Proves representative non-dissolve overlay transition support for slideLeft
 //     and wipeRight only; does not claim every transition direction;
 //   - No text/emoji overlay support beyond fail-closed lanes;
 //   - No GLES overlay route;
-//   - No overlay+beauty composition outside a transition overlap window (a
-//     solo, non-transition-overlap active overlay alongside clip-level
-//     Beauty V2 remains fail-closed);
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;
 //   - No fleet coverage beyond attached device;
 //   - No pixel quality claim.

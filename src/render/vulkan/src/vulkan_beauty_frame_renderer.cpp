@@ -1248,6 +1248,111 @@ bool VulkanBeautyFrameRenderer::recordBeauty(
     return true;
 }
 
+bool VulkanBeautyFrameRenderer::recordBeautyKeepOpen(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    VkCommandBuffer commandBuffer,
+    uint32_t frameSlotIndex,
+    uint32_t frameCount,
+    const VulkanHardwareBufferImage& srcImage,
+    VkImageLayout srcCurrentLayout,
+    VkShaderModule vertexModule,
+    VkShaderModule fragmentModule,
+    const VideoFrameTransform& placementTransform,
+    const VideoBeautyV2RenderParams& beauty,
+    VkRenderPass finalRenderPass,
+    VkFramebuffer finalFramebuffer,
+    uint32_t finalExtentWidth,
+    uint32_t finalExtentHeight,
+    std::string* outFailureReason) {
+    if (outFailureReason) outFailureReason->clear();
+
+    if (device == VK_NULL_HANDLE || physicalDevice == VK_NULL_HANDLE ||
+        commandBuffer == VK_NULL_HANDLE || vertexModule == VK_NULL_HANDLE ||
+        fragmentModule == VK_NULL_HANDLE || finalRenderPass == VK_NULL_HANDLE ||
+        finalFramebuffer == VK_NULL_HANDLE || finalExtentWidth == 0 || finalExtentHeight == 0 ||
+        srcImage.image == VK_NULL_HANDLE ||
+        srcImage.descriptorResources.pipelineLayout == VK_NULL_HANDLE ||
+        srcImage.descriptorResources.descriptorSet == VK_NULL_HANDLE) {
+        SetErr(outFailureReason, kErrInvalidArguments);
+        return false;
+    }
+    VulkanBeautyV2Parameters params{};
+    Impl::GeometryResources* geom = impl_->prepareCommon(
+        device, physicalDevice, vertexModule, fragmentModule, beauty,
+        frameSlotIndex, frameCount, srcImage.descriptorResources.pipelineLayout,
+        finalRenderPass, &params, outFailureReason);
+    if (geom == nullptr) {
+        return false;
+    }
+    Impl::SlotResources& slot = geom->slots[frameSlotIndex];
+
+    impl_->recordPasses1To4(commandBuffer, srcImage, srcCurrentLayout, placementTransform,
+                            beauty, params, frameSlotIndex, slot);
+
+    // ── Pass 5: placement — slot.beautified -> caller's swapchain framebuffer.
+    //    Render pass intentionally left OPEN for the caller's overlay draws. ──
+    VideoFrameTransform placementOnly = placementTransform;
+    placementOnly.cropScaleU = 1.0f;
+    placementOnly.cropScaleV = 1.0f;
+    placementOnly.cropBiasU = 0.0f;
+    placementOnly.cropBiasV = 0.0f;
+    const VideoTransformFullPushConstants pc = makeVideoTransformFullPushConstants(placementOnly);
+
+    const bool hasDestinationRect = !placementTransform.destinationRect.isDefault();
+    const int32_t destX = hasDestinationRect ? placementTransform.destinationRect.x : 0;
+    const int32_t destY = hasDestinationRect ? placementTransform.destinationRect.y : 0;
+    const uint32_t destWidth = hasDestinationRect
+        ? static_cast<uint32_t>(placementTransform.destinationRect.width)
+        : finalExtentWidth;
+    const uint32_t destHeight = hasDestinationRect
+        ? static_cast<uint32_t>(placementTransform.destinationRect.height)
+        : finalExtentHeight;
+    if (destWidth == 0 || destHeight == 0 ||
+        static_cast<uint64_t>(destX) + destWidth > finalExtentWidth ||
+        static_cast<uint64_t>(destY) + destHeight > finalExtentHeight) {
+        SetErr(outFailureReason, kErrInvalidDimensions);
+        return false;
+    }
+
+    VkClearValue clearValue{};
+    clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    VkRenderPassBeginInfo rpBegin{};
+    rpBegin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpBegin.renderPass        = finalRenderPass;
+    rpBegin.framebuffer       = finalFramebuffer;
+    rpBegin.renderArea.offset = {0, 0};
+    rpBegin.renderArea.extent = {finalExtentWidth, finalExtentHeight};
+    rpBegin.clearValueCount   = 1;
+    rpBegin.pClearValues      = &clearValue;
+    vkCmdBeginRenderPass(commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(destX);
+    viewport.y = static_cast<float>(destY);
+    viewport.width = static_cast<float>(destWidth);
+    viewport.height = static_cast<float>(destHeight);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.offset = {destX, destY};
+    scissor.extent = {destWidth, destHeight};
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      impl_->placementPipelineSlots[frameSlotIndex].pipeline.get());
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->placementPipelineLayout,
+                            0, 1, &slot.placementSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, impl_->placementPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    // Render pass intentionally left open for the caller to append overlay draws.
+
+    return true;
+}
+
 bool VulkanBeautyFrameRenderer::prepareTransitionLayer(
     VkDevice device,
     VkPhysicalDevice physicalDevice,
@@ -1332,6 +1437,27 @@ VulkanBeautyFrameRenderer::VulkanBeautyFrameRenderer() : impl_(std::make_unique<
 VulkanBeautyFrameRenderer::~VulkanBeautyFrameRenderer() = default;
 
 bool VulkanBeautyFrameRenderer::recordBeauty(
+    void* /*device*/,
+    void* /*physicalDevice*/,
+    void* /*commandBuffer*/,
+    uint32_t /*frameSlotIndex*/,
+    uint32_t /*frameCount*/,
+    const VulkanHardwareBufferImage& /*srcImage*/,
+    uint32_t /*srcCurrentLayout*/,
+    void* /*vertexModule*/,
+    void* /*fragmentModule*/,
+    const VideoFrameTransform& /*placementTransform*/,
+    const VideoBeautyV2RenderParams& /*beauty*/,
+    void* /*finalRenderPass*/,
+    void* /*finalFramebuffer*/,
+    uint32_t /*finalExtentWidth*/,
+    uint32_t /*finalExtentHeight*/,
+    std::string* outFailureReason) {
+    if (outFailureReason) *outFailureReason = "beauty_v2_unavailable_on_host";
+    return false;
+}
+
+bool VulkanBeautyFrameRenderer::recordBeautyKeepOpen(
     void* /*device*/,
     void* /*physicalDevice*/,
     void* /*commandBuffer*/,

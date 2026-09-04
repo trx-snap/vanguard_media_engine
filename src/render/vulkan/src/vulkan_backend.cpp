@@ -200,6 +200,19 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
 }
 
 // ---------------------------------------------------------------------------
+// P5-OVERLAYS-BEAUTY-SOLO: renderFrame with beauty + overlay draws stub -
+// host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
+                                             const VideoFrameTransform& /*transform*/,
+                                             const VideoBeautyV2RenderParams& /*beauty*/,
+                                             const VulkanOverlayFrameDraw* /*overlayDraws*/,
+                                             uint32_t /*overlayCount*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
 // P5-COMPOSITOR-TRANS: renderTransitionFrame stub - host build.
 // ---------------------------------------------------------------------------
 
@@ -1016,6 +1029,45 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
         handle,
         transform,
         beauty);
+}
+
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-BEAUTY-SOLO: renderFrame with both beauty and overlay draws -
+// Android. Delegates to the frame renderer's combined overload, which itself
+// delegates straight back to the overlay-only or beauty-only overload above
+// whenever beauty.enabled is false or overlayCount == 0 respectively -- so
+// this seam never changes either existing single-feature path.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
+                                             const VideoFrameTransform& transform,
+                                             const VideoBeautyV2RenderParams& beauty,
+                                             const VulkanOverlayFrameDraw* overlayDraws,
+                                             uint32_t overlayCount) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || !hasHardwareBuffer(handle) || s.ahbImports->getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderFrame(
+        static_cast<void*>(s.queue),
+        static_cast<void*>(s.physDev),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        handle,
+        transform,
+        beauty,
+        overlayDraws,
+        overlayCount);
 }
 
 // ---------------------------------------------------------------------------
