@@ -35,7 +35,7 @@ import kotlin.math.floor
 // Scope (minimal hard-cut, sequential, local-video export -- Unit C, extended
 // by Unit G with rotation metadata + canvas scaling normalization, and by
 // Phase 10 with per-clip colorMatrix parity):
-//   - video-only clips, speed == 1.0, no overlays, no canvas
+//   - video-only clips, speed == 1.0, no canvas
 //     contentMode other than "fit", no per-clip transform/crop/freeze/
 //     reverse/time-remap/dual-camera.
 //   - P5-COMPOSITOR-TRANS: compositor-owned clip overlap transitions
@@ -48,6 +48,16 @@ import kotlin.math.floor
 //     any other unsupported type fail closed at parse time. Transition
 //     timelines carrying audioSidecar tracks fail closed too: this route
 //     does not overlap-adjust serialized audio timings.
+//   - P5-OVERLAYS-TRANS Route-A N9: static sticker overlays
+//     (AndroidTimelineOverlayDescriptor, up to 128 per export) composited by
+//     AndroidTimelineVulkanVideoEncoder via the native
+//     renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam. Overlay
+//     geometry is draft-canvas pixel space, so overlays require the
+//     requested output to match the draft canvas exactly; overlays alongside
+//     a transition timeline or clip-level Beauty V2, or more than 128
+//     overlays, fail closed with UNSUPPORTED_EXPORT_FEATURE before pass-1 --
+//     overlays are not rendered on transition overlap frames and have no
+//     GLES fallback.
 //   - Per-clip colorMatrix is accepted and
 //     applied for both decoded video frames and still-image frames by
 //     whichever backend renders the clip (Vulkan-native color-matrix push
@@ -160,9 +170,11 @@ class AndroidTimelineExportSession(private val context: Context) {
         // are known.
         val rawTransitions = draftMap["transitions"] as? List<*> ?: emptyList<Any?>()
 
-        // P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: overlay preflight parser and
-        // admission gate. Static sticker overlays are validated; non-empty
-        // parsed overlays fail closed here until Route-A native rendering lands.
+        // P5-OVERLAYS-TRANS Route-A N9: overlay preflight parser and admission
+        // gate. Static sticker overlays are validated here; feature-shape
+        // gates that depend on request/canvas geometry, transitions, or
+        // Beauty V2 run further below once that context is known (see the
+        // "owned temps from here on" section and the post-clipInputs gates).
         val rawOverlays = draftMap["overlays"] as? List<*> ?: emptyList<Any?>()
         val overlays: List<AndroidTimelineOverlayDescriptor> =
             when (val parse = AndroidTimelineOverlayDescriptor.parseList(rawOverlays)) {
@@ -172,14 +184,6 @@ class AndroidTimelineExportSession(private val context: Context) {
                 }
                 is AndroidTimelineOverlayDescriptor.ParseResult.Success -> parse.overlays
             }
-        if (overlays.isNotEmpty()) {
-            onError(
-                "UNSUPPORTED_EXPORT_FEATURE",
-                "exportTimeline: overlays_require_vulkan:native_overlay_route_not_implemented " +
-                    "(static sticker overlay Route-A native renderer is not implemented yet)",
-            )
-            return
-        }
 
         val rawCanvas = draftMap["canvas"] as? Map<*, *>
         if (rawCanvas != null) {
@@ -490,6 +494,28 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
+        // P5-OVERLAYS-TRANS Route-A N9: overlay descriptor geometry
+        // (translationX/Y, width, height) is expressed in draft-canvas pixel
+        // space, but the native overlay render seam
+        // (renderAndroidTimelineVulkanExportFrameCroppedWithOverlays)
+        // composites that geometry directly in the requested output's pixel
+        // space. When the requested output differs from the draft canvas,
+        // that geometry would silently land in the wrong place -- fail
+        // closed instead of producing wrong output.
+        if (overlays.isNotEmpty() &&
+            (requestWidth != draftCanvasWidth || requestHeight != draftCanvasHeight)
+        ) {
+            deleteOwnedTemps()
+            logTerminal("overlay_route_unsupported", backend = null)
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: overlay export requires the requested output " +
+                    "(${requestWidth}x$requestHeight) to match the draft canvas " +
+                    "(${draftCanvasWidth}x$draftCanvasHeight) for Route-A",
+            )
+            return
+        }
+
         val clipInputs = mutableListOf<AndroidTimelineVideoEncoder.ClipInput>()
         for (ctx in clipContexts) {
             var stillFrameCount = 0
@@ -529,6 +555,45 @@ class AndroidTimelineExportSession(private val context: Context) {
         // per-layer Beauty V2 on both solo and transition-overlap frames.
         val hasBeautyClip = clipInputs.any { it.beautyIntensity != null }
 
+        // P5-OVERLAYS-TRANS Route-A N9: overlays are not supported alongside
+        // a transition timeline -- AndroidTimelineVulkanVideoEncoder does not
+        // render overlays on transition overlap frames (solo-frame route
+        // only) -- or alongside clip-level Beauty V2, since the native
+        // overlay render seam is a beauty-free route (see
+        // VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays).
+        // Fail closed here, before backend selection, with a precise
+        // UNSUPPORTED_EXPORT_FEATURE rather than surfacing an UNAVAILABLE
+        // backend-selection reason for a shape this route never supports.
+        // ([transitions] is already the non-hard-cut-only list -- see
+        // AndroidTimelineTransitionDescriptor.parseList.)
+        if (overlays.isNotEmpty() && transitions.isNotEmpty()) {
+            deleteOwnedTemps()
+            logTerminal("overlay_route_unsupported", backend = null)
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: overlays are not supported alongside a transition timeline",
+            )
+            return
+        }
+        if (overlays.isNotEmpty() && hasBeautyClip) {
+            deleteOwnedTemps()
+            logTerminal("overlay_route_unsupported", backend = null)
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: overlays are not supported alongside clip-level beauty",
+            )
+            return
+        }
+        if (overlays.size > MAX_OVERLAY_COUNT) {
+            deleteOwnedTemps()
+            logTerminal("overlay_route_unsupported", backend = null)
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: overlay count ${overlays.size} exceeds the Route-A limit of $MAX_OVERLAY_COUNT overlays",
+            )
+            return
+        }
+
         // Session-owned diagnostics/lifecycle/native-bridge triple for this
         // export run -- reused for backend selection and, when Vulkan is
         // selected, for AndroidTimelineVulkanVideoEncoder, instead of each
@@ -543,21 +608,31 @@ class AndroidTimelineExportSession(private val context: Context) {
                 requestedWidth = requestWidth,
                 requestedHeight = requestHeight,
                 transitions = transitions,
+                overlays = overlays,
             ),
             nativeBridge = sessionNativeBridge,
         )
-        // P5-COMPOSITOR-TRANS: a transition timeline that cannot be routed to
-        // Vulkan fails closed here -- there is no GLES transition route and a
-        // hard-cut re-encode would be wrong output.
+        // P5-COMPOSITOR-TRANS / P5-OVERLAYS-TRANS: a transition timeline or
+        // overlay list that cannot be routed to Vulkan fails closed here --
+        // there is no GLES transition or overlay route and re-encoding either
+        // as plain hard cuts would be wrong output. The branch below mirrors
+        // AndroidExportRenderBackendSelector.requiresVulkanReasonPrefix's own
+        // priority (transitions, then beauty, then overlays).
         if (backendDecision.actualBackend == ExportRenderBackend.UNAVAILABLE) {
             deleteOwnedTemps()
             logTerminal("backend_unavailable", backendDecision.actualBackend)
-            val errorMessage = if (hasBeautyClip && transitions.isEmpty()) {
-                "exportTimeline: Beauty V2 requires the Vulkan export backend " +
-                    "(${backendDecision.reason})"
-            } else {
-                "exportTimeline: transitions require the Vulkan export backend " +
-                    "(${backendDecision.reason})"
+            val errorMessage = when {
+                backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.TRANSITIONS_REQUIRE_VULKAN_REASON) ->
+                    "exportTimeline: transitions require the Vulkan export backend " +
+                        "(${backendDecision.reason})"
+                backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.BEAUTY_REQUIRE_VULKAN_REASON) ->
+                    "exportTimeline: Beauty V2 requires the Vulkan export backend " +
+                        "(${backendDecision.reason})"
+                backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.OVERLAYS_REQUIRE_VULKAN_REASON) ->
+                    "exportTimeline: overlay export requires the Vulkan export backend " +
+                        "(${backendDecision.reason})"
+                else ->
+                    "exportTimeline: export backend unavailable (${backendDecision.reason})"
             }
             onError(
                 "UNSUPPORTED_EXPORT_FEATURE",
@@ -612,7 +687,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         fun encodeWithActiveTracking(enc: AndroidTimelineVideoPassEncoder): AndroidTimelineVideoEncoder.EncodeResult {
             activeEncoder = enc
             try {
-                return enc.encode(clipInputs, transitions) { p -> emitPass1Progress(p) }
+                return enc.encode(clipInputs, transitions, overlays) { p -> emitPass1Progress(p) }
             } finally {
                 activeEncoder = null
             }
@@ -648,7 +723,26 @@ class AndroidTimelineExportSession(private val context: Context) {
             encodeResult = encodeResult.copy(reason = beautyReason)
         }
         if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
-            transitions.isEmpty() && !hasBeautyClip && !cancelRequested && encodeResult.reason != "cancelled"
+            overlays.isNotEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
+        ) {
+            // P5-OVERLAYS-TRANS Route-A N9: overlay compositing is a
+            // Vulkan-only production route with no GLES fallback (mirrors
+            // the transition/beauty blocks above) -- a failed Vulkan attempt
+            // never falls back to GLES here either. The surfaced reason is
+            // prefixed with OVERLAYS_REQUIRE_VULKAN_REASON unless the
+            // underlying reason is already a precise overlay_*/overlays_*
+            // reason from the native render path.
+            val underlyingReason = encodeResult.reason
+            val overlayReason = if (underlyingReason.startsWith("overlay_") || underlyingReason.startsWith("overlays_")) {
+                underlyingReason
+            } else {
+                "${AndroidExportRenderBackendSelector.OVERLAYS_REQUIRE_VULKAN_REASON}:$underlyingReason"
+            }
+            Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK_BLOCKED from=vulkan reason=$overlayReason overlays=${overlays.size}")
+            encodeResult = encodeResult.copy(reason = overlayReason)
+        }
+        if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
+            transitions.isEmpty() && !hasBeautyClip && overlays.isEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
         ) {
             Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK from=vulkan to=gles reason=${encodeResult.reason}")
             try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
@@ -771,6 +865,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "transitionCount" to transitions.size,
                 "beautyClipCount" to clipInputs.count { it.beautyIntensity != null },
                 "beautyFrameCount" to encodeResult.beautyFrameCount,
+                "overlayCount" to overlays.size,
             ),
         )
     }
@@ -851,6 +946,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         private const val TAG = "VGTimelineExportSession"
         private const val DEFAULT_BITRATE_BPS = 4_000_000
         private const val MAX_STILL_FRAME_COUNT = 36_000
+
+        /// P5-OVERLAYS-TRANS Route-A N9: per-export overlay count limit --
+        /// mirrors the native overlay texture store's own enforced maximum.
+        private const val MAX_OVERLAY_COUNT = 128
 
         // Progress checkpoints (frozen — see [start] doc comment). PASS1_PROGRESS_WEIGHT is
         // the exact value emitted as the pass-1-complete checkpoint (after the post-pass-1

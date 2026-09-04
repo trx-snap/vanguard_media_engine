@@ -59,6 +59,15 @@ import kotlin.math.min
 // progress (j + 1) / (N + 1). Output is therefore overlap-shortened: the
 // muxed duration is the clip-duration sum minus the transition durations.
 //
+// P5-OVERLAYS-TRANS Route-A N9: the overlay-aware [encode] overload prepares
+// validated static sticker overlays (AndroidTimelineOverlayRenderSession.prepare)
+// once the native session exists, then renders every SOLO frame through
+// VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays
+// instead of the plain cropped seam. Overlays are NOT composited on
+// transition overlap frames in N9 -- overlays combined with any non-hard-cut
+// transition, or with clip-level Beauty V2 (the overlay seam takes no beauty
+// params), are rejected before a native session is even created.
+//
 // PTS mechanism (must stay compatible with AndroidTimelineVideoEncoder's
 // frozen fixed frame clock, since a mid-export fallback re-runs the same
 // clips through the GLES encoder from sample 0): both the native-render
@@ -110,6 +119,14 @@ class AndroidTimelineVulkanVideoEncoder(
     private var beautyFramesRendered = 0
     private var nativeSessionId: String? = null
 
+    // P5-OVERLAYS-TRANS Route-A N9: non-null only when this encode call
+    // carries non-empty overlays and AndroidTimelineOverlayRenderSession.prepare
+    // succeeded -- see [setupEncoderMuxerAndSession]. Solo frames go through
+    // the overlay-aware native render seam when this is set (see
+    // [renderSoloLayer]); overlays are never rendered on transition overlap
+    // frames in N9 (overlays + transitions is rejected before this point).
+    private var overlayRenderSession: AndroidTimelineOverlayRenderSession? = null
+
     // ─── Pass-1 sample-ratio progress ─────────────────────────────────────────
     private var totalExpectedSamples = 0
     private var onProgress: ((Double) -> Unit)? = null
@@ -148,7 +165,7 @@ class AndroidTimelineVulkanVideoEncoder(
     override fun encode(
         clips: List<AndroidTimelineVideoEncoder.ClipInput>,
         onProgress: ((Double) -> Unit)?,
-    ): AndroidTimelineVideoEncoder.EncodeResult = encode(clips, emptyList(), onProgress)
+    ): AndroidTimelineVideoEncoder.EncodeResult = encode(clips, emptyList(), emptyList(), onProgress)
 
     /// Encodes [clips] with the validated, index-bound [transitions]
     /// (AndroidTimelineTransitionDescriptor.parseList output). An empty /
@@ -159,9 +176,35 @@ class AndroidTimelineVulkanVideoEncoder(
         clips: List<AndroidTimelineVideoEncoder.ClipInput>,
         transitions: List<AndroidTimelineTransitionDescriptor>,
         onProgress: ((Double) -> Unit)?,
+    ): AndroidTimelineVideoEncoder.EncodeResult =
+        encode(clips, transitions, emptyList<AndroidTimelineOverlayDescriptor>(), onProgress)
+
+    /// Encodes [clips] with the validated [transitions] and the validated,
+    /// static-sticker [overlays] (AndroidTimelineOverlayDescriptor.parseList
+    /// output; P5-OVERLAYS-TRANS Route-A N9). Overlays are rendered on solo
+    /// frames only through the native
+    /// renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam -- N9
+    /// does not composite overlays on transition overlap frames, so a
+    /// non-empty overlay list combined with a non-hard-cut transition (or a
+    /// clip carrying Beauty V2, which the overlay seam does not accept) is
+    /// rejected defensively here even though
+    /// AndroidTimelineExportSession already fails closed before this call.
+    /// Returns a structured result; never throws.
+    override fun encode(
+        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
+        transitions: List<AndroidTimelineTransitionDescriptor>,
+        overlays: List<AndroidTimelineOverlayDescriptor>,
+        onProgress: ((Double) -> Unit)?,
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
-        val plan = buildSegmentPlan(clips, transitions.filter { !it.isHardCut })
+        val nonHardCutTransitions = transitions.filter { !it.isHardCut }
+        if (overlays.isNotEmpty() && nonHardCutTransitions.isNotEmpty()) {
+            return failResult("overlay_transition_unsupported")
+        }
+        if (overlays.isNotEmpty() && clips.any { it.beautyIntensity != null }) {
+            return failResult("overlay_beauty_unsupported")
+        }
+        val plan = buildSegmentPlan(clips, nonHardCutTransitions)
         totalExpectedSamples = plan.expectedSamples
         if (plan.failureReason != null) {
             return failResult(plan.failureReason)
@@ -175,7 +218,11 @@ class AndroidTimelineVulkanVideoEncoder(
         var muxerStoppedCleanly = false
         var reason = "not_run"
         try {
-            setupEncoderMuxerAndSession()
+            val setupFailure = setupEncoderMuxerAndSession(overlays)
+            if (setupFailure != null) {
+                reason = setupFailure
+                return failResult(reason)
+            }
 
             for (segment in plan.segments) {
                 if (cancelRequested) break
@@ -362,7 +409,19 @@ class AndroidTimelineVulkanVideoEncoder(
     // Setup
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun setupEncoderMuxerAndSession() {
+    /// Sets up the encoder/muxer/native Vulkan session exactly as before, then
+    /// -- once [nativeSessionId] is known -- prepares [overlays] (P5-OVERLAYS-
+    /// TRANS Route-A N9) if non-empty. Encoder/muxer/session-creation failures
+    /// are still reported by throwing, matching the pre-N9 behaviour (caught
+    /// by [encode]'s outer try/catch, which still runs [releaseAll] via its
+    /// `finally`). An overlay prepare failure is different: it is reported by
+    /// returning a machine-readable failure reason (never null on failure)
+    /// instead of throwing, so [encode] can return a structured
+    /// `overlay_prepare_failed:...` [AndroidTimelineVideoEncoder.EncodeResult]
+    /// rather than a generic `exception:...` one -- [encode]'s `finally` still
+    /// runs [releaseAll] for this path too, since the early return happens
+    /// inside its outer try block. Returns null on full success.
+    private fun setupEncoderMuxerAndSession(overlays: List<AndroidTimelineOverlayDescriptor>): String? {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
@@ -382,8 +441,19 @@ class AndroidTimelineVulkanVideoEncoder(
         if (!createResult.startsWith("status=OK;")) {
             throw IllegalStateException("vulkan_session_create_failed:${createResult.take(120)}")
         }
-        nativeSessionId = createResult.substringAfter("sessionId=").substringBefore(";").ifEmpty { null }
+        val sessionId = createResult.substringAfter("sessionId=").substringBefore(";").ifEmpty { null }
             ?: throw IllegalStateException("vulkan_session_id_parse_failed")
+        nativeSessionId = sessionId
+
+        if (overlays.isNotEmpty()) {
+            when (val prepareResult = AndroidTimelineOverlayRenderSession.prepare(sessionId, overlays, nativeBridge)) {
+                is AndroidTimelineOverlayRenderSession.PrepareResult.Failure ->
+                    return "overlay_prepare_failed:${prepareResult.code}:${prepareResult.message.take(120)}"
+                is AndroidTimelineOverlayRenderSession.PrepareResult.Success ->
+                    overlayRenderSession = prepareResult.session
+            }
+        }
+        return null
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -755,26 +825,62 @@ class AndroidTimelineVulkanVideoEncoder(
         val g = geometry.values ?: return geometry.failure ?: "vulkan_layer_geometry_unresolved"
 
         val timelinePtsUs = renderedFrames * frameDurationUs
-        val renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
-            sessionId = nativeSessionId!!,
-            hardwareBuffer = hwBuf,
-            width = width,
-            height = height,
-            cropLeft = g[0],
-            cropTop = g[1],
-            cropRight = g[2],
-            cropBottom = g[3],
-            rotationDegrees = g[4],
-            destFitX = g[5],
-            destFitY = g[6],
-            destFitWidth = g[7],
-            destFitHeight = g[8],
-            timelinePtsUs = timelinePtsUs,
-            frameIndex = renderedFrames,
-            colorMatrix = colorMatrix,
-            beautyEnabled = beautyIntensity != null,
-            beautyIntensity = (beautyIntensity ?: 0.0).toFloat(),
-        )
+        val session = overlayRenderSession
+        val renderStr: String
+        if (session == null) {
+            renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
+                sessionId = nativeSessionId!!,
+                hardwareBuffer = hwBuf,
+                width = width,
+                height = height,
+                cropLeft = g[0],
+                cropTop = g[1],
+                cropRight = g[2],
+                cropBottom = g[3],
+                rotationDegrees = g[4],
+                destFitX = g[5],
+                destFitY = g[6],
+                destFitWidth = g[7],
+                destFitHeight = g[8],
+                timelinePtsUs = timelinePtsUs,
+                frameIndex = renderedFrames,
+                colorMatrix = colorMatrix,
+                beautyEnabled = beautyIntensity != null,
+                beautyIntensity = (beautyIntensity ?: 0.0).toFloat(),
+            )
+        } else {
+            // P5-OVERLAYS-TRANS Route-A N9: overlays are not supported for
+            // transition overlap frames -- this branch is only ever reached
+            // for a solo frame, since overlays + transitions and overlays +
+            // beauty are both rejected before an overlay render session is
+            // ever created. No beauty params on this route.
+            val payload = when (val payloadResult = session.buildFramePayload(timelinePtsUs)) {
+                is AndroidTimelineOverlayRenderSession.FramePayloadResult.Failure ->
+                    return "overlay_payload_failed:${payloadResult.code}:${payloadResult.message.take(120)}"
+                is AndroidTimelineOverlayRenderSession.FramePayloadResult.Success -> payloadResult.payload
+            }
+            renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays(
+                sessionId = nativeSessionId!!,
+                hardwareBuffer = hwBuf,
+                width = width,
+                height = height,
+                cropLeft = g[0],
+                cropTop = g[1],
+                cropRight = g[2],
+                cropBottom = g[3],
+                rotationDegrees = g[4],
+                destFitX = g[5],
+                destFitY = g[6],
+                destFitWidth = g[7],
+                destFitHeight = g[8],
+                timelinePtsUs = timelinePtsUs,
+                frameIndex = renderedFrames,
+                colorMatrix = colorMatrix,
+                overlayTextureHandles = payload.overlayTextureHandles,
+                overlayGeometry = payload.overlayGeometry,
+                overlayCount = payload.overlayCount,
+            )
+        }
         if (!renderStr.startsWith("status=OK;")) {
             return "vulkan_render_failed:${renderStr.take(120)}"
         }
@@ -1123,9 +1229,15 @@ class AndroidTimelineVulkanVideoEncoder(
     // Cleanup
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Destroys the native Vulkan session before releasing the encoder's own
-    /// surface/codec/muxer, per the required cleanup ordering.
+    /// Closes the overlay render session (P5-OVERLAYS-TRANS Route-A N9, if
+    /// any overlays were prepared) before destroying the native Vulkan
+    /// session, then releases the encoder's own surface/codec/muxer, per the
+    /// required cleanup ordering. [AndroidTimelineOverlayRenderSession.close]
+    /// never throws, but is still guarded defensively like every other
+    /// cleanup step here.
     private fun releaseAll() {
+        try { overlayRenderSession?.close() } catch (_: Throwable) {}
+        overlayRenderSession = null
         val sid = nativeSessionId
         if (sid != null) {
             try { nativeBridge.destroyAndroidTimelineVulkanExportSession(sid) } catch (_: Throwable) {}
