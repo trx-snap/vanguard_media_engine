@@ -11,7 +11,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(vanguard_core STATIC "core/src/status.cpp")
 target_include_directories(vanguard_core PUBLIC "core/include")
 
-add_library(vanguard_graph STATIC "graph/src/graph.cpp")
+add_library(vanguard_graph STATIC
+    "graph/src/graph.cpp"
+    "graph/src/graph_execution_plan.cpp"
+)
 target_include_directories(vanguard_graph PUBLIC "graph/include")
 target_link_libraries(vanguard_graph PRIVATE vanguard_core)
 
@@ -210,6 +213,13 @@ if (ANDROID)
     # precedent).
     "platform/android/src/android_phase5_beauty_v2_vulkan_render_probe.cpp"
     "platform/android/src/android_phase5_beauty_v2_vulkan_render_jni.cpp"
+    # P1-DAG-MULTINODE-CORE-EXEC-PLAN: bounded engine-only
+    # GraphExecutionPlanner diagnostic (deep chain, diamond fan-out/
+    # reconvergence, multi-sink, orphan culling, missing-input fail-closed,
+    # stale-generation precedence, N>=3-source fan-in, no-active-sink fail-
+    # closed, unchanged Graph cycle rejection). Diagnostic-only; no
+    # production timeline playback wiring.
+    "platform/android/src/android_phase1_dag_multinode_execution_plan_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

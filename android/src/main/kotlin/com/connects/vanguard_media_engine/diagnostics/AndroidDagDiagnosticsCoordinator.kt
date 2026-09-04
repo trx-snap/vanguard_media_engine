@@ -41,6 +41,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2O2B4MultiFrameSmoke",
             "runAndroidDagPhase2QCapabilityProbe",
             "runAndroidDagPhase1GpuBlacklistNativeSmoke",
+            "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -98,6 +99,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2O2B4MultiFrameSmoke" -> runPhase2O2B4MultiFrameSmoke(args, result)
             "runAndroidDagPhase2QCapabilityProbe" -> runPhase2QCapabilityProbe(result)
             "runAndroidDagPhase1GpuBlacklistNativeSmoke" -> runPhase1GpuBlacklistNativeSmoke(result)
+            "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke" -> runPhase1DagMultinodeExecutionPlanSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -211,6 +213,47 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GPU_BLACKLIST_NATIVE_SMOKE_FAILED",
                         "runAndroidDagPhase1GpuBlacklistNativeSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-DAG-MULTINODE-CORE-EXEC-PLAN: bounded engine-only
+    // GraphExecutionPlanner diagnostic. Runs synthetic native lanes only,
+    // driving vanguard::graph::BuildGraphExecutionPlan() over TU-local
+    // synthetic DAGs, including no-active-sink fail-closed and unchanged
+    // Graph cycle rejection. Proof boundary: diagnostic-only engine
+    // execution plan - no production timeline playback, no product/editor/
+    // app/ConnectsApp wiring, no SurfaceProducer production path.
+    private fun runPhase1DagMultinodeExecutionPlanSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1DagMultinodeExecutionPlanSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "diagnostic_only_engine_execution_plan_no_production_timeline_playback_" +
+                        "no_product_editor_app_connectsapp_wiring_no_surfaceproducer_production_path",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "DAG_MULTINODE_EXECUTION_PLAN_SMOKE_FAILED",
+                        "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

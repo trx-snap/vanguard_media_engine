@@ -1052,6 +1052,17 @@ class VanguardNativeBridge(
     // production (zero-entry) rule table beyond confirming its size.
     external fun runAndroidDagPhase1GpuBlacklistNativeSmoke(): String
 
+    // -- P1-DAG-MULTINODE-CORE-EXEC-PLAN: bounded engine-only
+    // GraphExecutionPlanner diagnostic. Runs synthetic native lanes (deep
+    // chain, diamond fan-out/reconvergence, multi-sink, orphan culling,
+    // missing-input fail-closed, stale-generation precedence, N>=3-source
+    // fan-in, no-active-sink fail-closed, unchanged Graph cycle rejection)
+    // against vanguard::graph::BuildGraphExecutionPlan() using TU-local
+    // synthetic DAG nodes only. Diagnostic-only: no production timeline
+    // playback, no product/editor/app/ConnectsApp wiring, no
+    // SurfaceProducer production path.
+    external fun runAndroidDagPhase1DagMultinodeExecutionPlanSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,
