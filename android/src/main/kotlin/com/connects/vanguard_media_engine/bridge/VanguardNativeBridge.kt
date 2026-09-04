@@ -2133,6 +2133,42 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // -- P3-MULTICAM-NODE-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: combines the --
+    // Dart-descriptor-bridge parsing pattern above with the OES spatial
+    // render route above it. Native is the sole layout authority: it maps
+    // layoutMode/pipAnchor/splitDirection strictly to the matching
+    // MultiCam* enum (unrecognized values FAIL CLOSED before any
+    // AHardwareBuffer import or GLES work -- no default fallback, unlike
+    // runAndroidDagPhase3MultiCamDescriptorBridgeSmoke above), builds a
+    // MultiCamLayout (cornerRadiusFractionOfCanvasWidth/opacity hard-set to
+    // 0.0/1.0; this route accepts no cornerRadius/opacity parameter at
+    // all), calls the already-verified ComputeMultiCamLayout(), converts
+    // both normalized rects to GLES pixel viewport rects, then renders:
+    // layoutMode "pip" draws rgbaBufferA (deterministic solid red) as
+    // primary and ycbcrBufferB (never CPU-filled) as OES secondary;
+    // "splitScreen" draws ycbcrBufferA as OES primary and rgbaBufferB
+    // (deterministic solid blue) as secondary. Readback sample points are
+    // derived from the computed pixel rects, never hardcoded. No camera
+    // open, no Vulkan, no recording/export, no product UI.
+    external fun runAndroidDagPhase3MultiCamDynamicDescriptorSpatialRenderSmoke(
+        surface: Surface,
+        rgbaBufferA: HardwareBuffer,
+        rgbaBufferB: HardwareBuffer,
+        ycbcrBufferA: HardwareBuffer,
+        ycbcrBufferB: HardwareBuffer,
+        width: Int,
+        height: Int,
+        layoutMode: String,
+        pipAnchor: String,
+        pipCenterX: Double,
+        pipCenterY: Double,
+        pipWidthFraction: Double,
+        pipAspectRatio: Double,
+        pipMarginFraction: Double,
+        splitDirection: String,
+        splitRatio: Double,
+    ): String
+
     // ── P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): VulkanMultiCamSpatialCompositor ──
     // two-texture spatial layout raster + readback proof diagnostic. Native
     // creates its own temporary VkInstance/VkDevice/VkQueue/VkCommandPool,

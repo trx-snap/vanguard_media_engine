@@ -198,6 +198,11 @@ if (ANDROID)
     # RGBA-only spatial route above with GL_TEXTURE_EXTERNAL_OES lane
     # permutations (2D+OES, OES+2D, OES+OES) over YCBCR_420_888 imports.
     "platform/android/src/android_phase3_multicam_spatial_oes_render_jni.cpp"
+    # P3-MULTICAM-NODE-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: caller-supplied
+    # Dart layout descriptor -> native ComputeMultiCamLayout() -> GLES/OES
+    # spatial render/readback, combining the descriptor-bridge parsing
+    # pattern above with the OES spatial render route above it.
+    "platform/android/src/android_phase3_multicam_dynamic_descriptor_spatial_render_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
