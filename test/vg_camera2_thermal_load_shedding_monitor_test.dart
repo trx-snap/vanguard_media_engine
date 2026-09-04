@@ -249,6 +249,7 @@ void main() {
 
       final evalSerious = monitor.evaluateOnce(VGThermalState.serious);
       expect(evalSerious.isReducingFrameRate, isTrue);
+      expect(evalSerious.isReducingResolution, isFalse);
       expect(evalSerious.isMaintaining, isFalse);
       expect(evalSerious.isMonitoring, isFalse);
       expect(evalSerious.isDroppingSecondaryCamera, isFalse);
@@ -294,6 +295,46 @@ void main() {
         expect(nonClaims['rendererTouched'], isFalse);
         expect(nonClaims['encoderTouched'], isFalse);
         expect(nonClaims['realForcedOverheat'], isFalse);
+        expect(nonClaims['resolutionReconfigured'], isFalse);
+      },
+    );
+
+    test(
+      'evaluates resolution step when allowResolutionStep is true and fps floor is exhausted',
+      () {
+        final monitor = VGCamera2ThermalLoadSheddingMonitor(
+          planner: const VGCamera2ThermalLoadSheddingPlanner(
+            allowResolutionStep: true,
+          ),
+        );
+        monitor.updateSessionState(
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 15,
+          currentResolutionScale: 1.0,
+        );
+
+        final eval = monitor.evaluateOnce(VGThermalState.serious);
+
+        expect(
+          eval.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceResolution),
+        );
+        expect(eval.isReducingResolution, isTrue);
+        expect(eval.isReducingFrameRate, isFalse);
+        expect(eval.targetFps, equals(15));
+        expect(eval.targetResolutionScale, equals(0.5));
+        expect(eval.preservesEncoderContract, isFalse);
+        expect(eval.requiresSafeGraphBoundary, isTrue);
+        expect(eval.advisoryOnly, isTrue);
+        expect(eval.cameraSessionMutated, isFalse);
+        expect(eval.captureRequestUpdated, isFalse);
+        expect(eval.reasons, contains('thermal_serious_reduce_resolution'));
+        expect(eval.reasons, contains('fps_floor_exhausted'));
+        expect(
+          eval.reasons,
+          contains('resolution_step_breaks_encoder_dimensions'),
+        );
       },
     );
   });

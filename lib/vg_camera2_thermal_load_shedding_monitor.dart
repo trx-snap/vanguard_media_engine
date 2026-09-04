@@ -282,6 +282,7 @@ class VGCamera2ThermalLoadSheddingEvaluation {
   bool get isReducingFrameRate => plan.isReducingFrameRate;
   bool get isDroppingSecondaryCamera => plan.isDroppingSecondaryCamera;
   bool get isStoppingRecording => plan.isStoppingRecording;
+  bool get isReducingResolution => plan.isReducingResolution;
 
   int get targetFps => plan.targetFps;
   double get targetResolutionScale => plan.targetResolutionScale;
@@ -430,6 +431,7 @@ final class VGCamera2ThermalLoadSheddingMonitor {
     'rendererTouched': false,
     'encoderTouched': false,
     'realForcedOverheat': false,
+    'resolutionReconfigured': false,
   };
 
   final Stream<VGThermalState> _thermalStates;

@@ -20,9 +20,10 @@ void main() {
           VGCamera2ThermalLoadSheddingDecision.reduceFrameRate,
           VGCamera2ThermalLoadSheddingDecision.dropSecondaryCamera,
           VGCamera2ThermalLoadSheddingDecision.stopRecording,
+          VGCamera2ThermalLoadSheddingDecision.reduceResolution,
         ]),
       );
-      expect(VGCamera2ThermalLoadSheddingDecision.values.length, equals(5));
+      expect(VGCamera2ThermalLoadSheddingDecision.values.length, equals(6));
     });
 
     test('VGCamera2ThermalLoadSheddingPlan boolean getters', () {
@@ -34,6 +35,7 @@ void main() {
       expect(planMaintain.isReducingFrameRate, isFalse);
       expect(planMaintain.isDroppingSecondaryCamera, isFalse);
       expect(planMaintain.isStoppingRecording, isFalse);
+      expect(planMaintain.isReducingResolution, isFalse);
 
       final planMonitor = planner.evaluate(thermalState: VGThermalState.fair);
       expect(planMonitor.isMaintaining, isFalse);
@@ -41,6 +43,7 @@ void main() {
       expect(planMonitor.isReducingFrameRate, isFalse);
       expect(planMonitor.isDroppingSecondaryCamera, isFalse);
       expect(planMonitor.isStoppingRecording, isFalse);
+      expect(planMonitor.isReducingResolution, isFalse);
 
       final planFps = planner.evaluate(
         thermalState: VGThermalState.serious,
@@ -52,6 +55,7 @@ void main() {
       expect(planFps.isReducingFrameRate, isTrue);
       expect(planFps.isDroppingSecondaryCamera, isFalse);
       expect(planFps.isStoppingRecording, isFalse);
+      expect(planFps.isReducingResolution, isFalse);
 
       final planDrop = planner.evaluate(
         thermalState: VGThermalState.serious,
@@ -63,6 +67,7 @@ void main() {
       expect(planDrop.isReducingFrameRate, isFalse);
       expect(planDrop.isDroppingSecondaryCamera, isTrue);
       expect(planDrop.isStoppingRecording, isFalse);
+      expect(planDrop.isReducingResolution, isFalse);
 
       final planStop = planner.evaluate(
         thermalState: VGThermalState.critical,
@@ -74,6 +79,7 @@ void main() {
       expect(planStop.isReducingFrameRate, isFalse);
       expect(planStop.isDroppingSecondaryCamera, isFalse);
       expect(planStop.isStoppingRecording, isTrue);
+      expect(planStop.isReducingResolution, isFalse);
     });
   });
 
@@ -367,6 +373,130 @@ void main() {
     });
   });
 
+  group('Phase 3-Unit U: Resolution Step-Down Policy (Opt-In)', () {
+    test(
+      'default planner with currentFps <= minFpsFloor still returns reduceFrameRate and targetFps behavior unchanged',
+      () {
+        final plan15 = planner.evaluate(
+          thermalState: VGThermalState.serious,
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 15,
+          currentResolutionScale: 1.0,
+        );
+        expect(
+          plan15.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceFrameRate),
+        );
+        expect(plan15.isReducingFrameRate, isTrue);
+        expect(plan15.isReducingResolution, isFalse);
+        expect(plan15.targetFps, equals(14));
+        expect(plan15.targetResolutionScale, equals(1.0));
+        expect(plan15.reasons, contains('thermal_serious_reduce_fps'));
+
+        final plan10 = planner.evaluate(
+          thermalState: VGThermalState.serious,
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 10,
+          currentResolutionScale: 1.0,
+        );
+        expect(
+          plan10.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceFrameRate),
+        );
+        expect(plan10.targetFps, equals(9));
+      },
+    );
+
+    test(
+      'opt-in planner with serious recording/no-secondary/currentFps=15/currentResolutionScale=1.0 returns reduceResolution',
+      () {
+        const optInPlanner = VGCamera2ThermalLoadSheddingPlanner(
+          allowResolutionStep: true,
+        );
+        final plan = optInPlanner.evaluate(
+          thermalState: VGThermalState.serious,
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 15,
+          currentResolutionScale: 1.0,
+        );
+
+        expect(
+          plan.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceResolution),
+        );
+        expect(plan.isReducingResolution, isTrue);
+        expect(plan.targetFps, equals(15));
+        expect(plan.targetResolutionScale, equals(0.5));
+        expect(plan.preservesEncoderContract, isFalse);
+        expect(plan.notifyDart, isTrue);
+        expect(plan.requiresSafeGraphBoundary, isTrue);
+        expect(plan.shouldDropSecondaryCamera, isFalse);
+        expect(plan.shouldStopRecording, isFalse);
+        expect(
+          plan.reasons,
+          containsAll(<String>[
+            'thermal_serious_reduce_resolution',
+            'fps_floor_exhausted',
+            'resolution_step_breaks_encoder_dimensions',
+          ]),
+        );
+        expect(plan.diagnostics['allowResolutionStep'], isTrue);
+        expect(plan.diagnostics['minResolutionScale'], equals(0.5));
+      },
+    );
+
+    test(
+      'opt-in clamp test with currentResolutionScale=0.75 returns 0.5 and non-positive normalizes to 0.5',
+      () {
+        const optInPlanner = VGCamera2ThermalLoadSheddingPlanner(
+          allowResolutionStep: true,
+        );
+
+        final plan075 = optInPlanner.evaluate(
+          thermalState: VGThermalState.serious,
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 15,
+          currentResolutionScale: 0.75,
+        );
+        expect(
+          plan075.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceResolution),
+        );
+        expect(plan075.targetResolutionScale, equals(0.5));
+
+        final planZero = optInPlanner.evaluate(
+          thermalState: VGThermalState.serious,
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 15,
+          currentResolutionScale: 0.0,
+        );
+        expect(
+          planZero.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceResolution),
+        );
+        expect(planZero.targetResolutionScale, equals(0.5));
+
+        final planNegative = optInPlanner.evaluate(
+          thermalState: VGThermalState.serious,
+          wasRecording: true,
+          hadSecondaryCamera: false,
+          currentFps: 15,
+          currentResolutionScale: -0.5,
+        );
+        expect(
+          planNegative.decision,
+          equals(VGCamera2ThermalLoadSheddingDecision.reduceResolution),
+        );
+        expect(planNegative.targetResolutionScale, equals(0.5));
+      },
+    );
+  });
+
   group('Phase 3-Unit U: Diagnostics & Non-Claims Contract', () {
     test(
       'All non-claims are false and proofBoundary matches expected string',
@@ -387,6 +517,8 @@ void main() {
         expect(diag['thermalState'], equals('serious'));
         expect(diag['wasRecording'], isTrue);
         expect(diag['hadSecondaryCamera'], isTrue);
+        expect(diag['allowResolutionStep'], isFalse);
+        expect(diag['minResolutionScale'], equals(0.5));
 
         final nonClaims = Map<String, Object?>.from(
           diag['nonClaims'] as Map<dynamic, dynamic>,
@@ -397,6 +529,7 @@ void main() {
         expect(nonClaims['rendererTouched'], isFalse);
         expect(nonClaims['encoderTouched'], isFalse);
         expect(nonClaims['realForcedOverheat'], isFalse);
+        expect(nonClaims['resolutionReconfigured'], isFalse);
       },
     );
   });

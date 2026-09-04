@@ -30,6 +30,9 @@ enum VGCamera2ThermalLoadSheddingDecision {
   /// Stop active recording at the next safe graph boundary to avoid data corruption
   /// or hardware thermal shutdown.
   stopRecording,
+
+  /// Reduce capture and session resolution to shed thermal load.
+  reduceResolution,
 }
 
 /// Immutable input configuration for thermal load-shedding evaluation.
@@ -184,6 +187,9 @@ class VGCamera2ThermalLoadSheddingPlan {
   bool get isStoppingRecording =>
       decision == VGCamera2ThermalLoadSheddingDecision.stopRecording;
 
+  bool get isReducingResolution =>
+      decision == VGCamera2ThermalLoadSheddingDecision.reduceResolution;
+
   Map<String, Object?> toMap() {
     return <String, Object?>{
       'decision': decision.name,
@@ -320,10 +326,20 @@ class VGCamera2ThermalLoadSheddingPlan {
 /// Evaluates input thermal states and recording context deterministically to produce
 /// a [VGCamera2ThermalLoadSheddingPlan].
 final class VGCamera2ThermalLoadSheddingPlanner {
-  const VGCamera2ThermalLoadSheddingPlanner({this.minFpsFloor = 15});
+  const VGCamera2ThermalLoadSheddingPlanner({
+    this.minFpsFloor = 15,
+    this.allowResolutionStep = false,
+    this.minResolutionScale = 0.5,
+  });
 
   /// The minimum frame rate target floor for FPS reduction.
   final int minFpsFloor;
+
+  /// Whether resolution down-stepping is allowed when FPS floor has been reached.
+  final bool allowResolutionStep;
+
+  /// The minimum allowed resolution scale floor for resolution reduction.
+  final double minResolutionScale;
 
   static const String proofBoundary =
       'thermal_load_shedding_policy_advisory_no_camera_session_mutation';
@@ -335,6 +351,7 @@ final class VGCamera2ThermalLoadSheddingPlanner {
     'rendererTouched': false,
     'encoderTouched': false,
     'realForcedOverheat': false,
+    'resolutionReconfigured': false,
   };
 
   /// Evaluates thermal load-shedding policy using an explicit input object.
@@ -405,6 +422,26 @@ final class VGCamera2ThermalLoadSheddingPlanner {
             shouldStopRecording = false;
             targetFps = currentFps;
             targetResolutionScale = currentResolutionScale;
+          } else if (allowResolutionStep && currentFps <= minFpsFloor) {
+            decision = VGCamera2ThermalLoadSheddingDecision.reduceResolution;
+            reasons.add('thermal_serious_reduce_resolution');
+            reasons.add('fps_floor_exhausted');
+            reasons.add('resolution_step_breaks_encoder_dimensions');
+            preservesEncoderContract = false;
+            shouldDropSecondaryCamera = false;
+            shouldStopRecording = false;
+            targetFps = currentFps;
+            final normalizedScale = currentResolutionScale > 0.0
+                ? currentResolutionScale
+                : 1.0;
+            var targetScale = normalizedScale * 0.5;
+            if (targetScale < minResolutionScale) {
+              targetScale = minResolutionScale;
+            }
+            if (targetScale > normalizedScale) {
+              targetScale = normalizedScale;
+            }
+            targetResolutionScale = targetScale;
           } else {
             decision = VGCamera2ThermalLoadSheddingDecision.reduceFrameRate;
             reasons.add('thermal_serious_reduce_fps');
@@ -477,6 +514,8 @@ final class VGCamera2ThermalLoadSheddingPlanner {
       'currentResolutionScale': currentResolutionScale,
       'targetResolutionScale': targetResolutionScale,
       'canPreserveEncoderContract': canPreserveEncoderContract,
+      'allowResolutionStep': allowResolutionStep,
+      'minResolutionScale': minResolutionScale,
       'nonClaims': Map<String, bool>.from(nonClaims),
     };
 
