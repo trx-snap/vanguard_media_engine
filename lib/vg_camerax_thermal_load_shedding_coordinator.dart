@@ -22,7 +22,8 @@ import 'package:flutter/services.dart';
 
 import 'vg_camera2_thermal_load_shedding_monitor.dart';
 import 'vg_camerax_thermal_fps_bridge.dart';
-import 'vanguard_media_engine.dart' show VGThermalMonitor, VGThermalState;
+import 'vanguard_media_engine.dart'
+    show VanguardEngine, VGThermalMonitor, VGThermalState;
 
 /// Immutable outcome snapshot for a single thermal event processed by
 /// [VGCameraXThermalLoadSheddingCoordinator].
@@ -42,6 +43,11 @@ class VGCameraXThermalLoadSheddingCoordinatorReport {
     this.reason,
     this.errorCode,
     this.errorMessage,
+    this.stoppedRecording = false,
+    this.stopRecordingResult,
+    this.filePath,
+    this.totalFrames,
+    this.dropRate,
   });
 
   /// Proof-boundary identifier for this slice's Dart-callback-to-actuator
@@ -57,6 +63,22 @@ class VGCameraXThermalLoadSheddingCoordinatorReport {
     'resolutionReconfigured': false,
     'secondaryCameraDisabled': false,
     'productUiWired': false,
+  };
+
+  /// Proof-boundary identifier for the P3-CAM-THERMAL-ACT-CAMERAX-CRITICAL-
+  /// STOP-RECORDING slice's synthetic critical-stop-recording claim.
+  static const String criticalStopProofBoundary =
+      'dart_thermal_callback_critical_stop_recording_mid_recording_synthetic_no_forced_heat_no_rebind_no_product';
+
+  /// Explicit non-claims for the critical-stop-recording slice (all `false`).
+  static const Map<String, bool> criticalStopNonClaims = <String, bool>{
+    'realForcedOverheat': false,
+    'osThermalListenerDeliveryProven': false,
+    'powerManagerThermalStateMutated': false,
+    'resolutionReconfigured': false,
+    'secondaryCameraDisabled': false,
+    'productUiWired': false,
+    'fleetProofBeyondSmA566b': false,
   };
 
   /// Instance accessor for [proofBoundary].
@@ -99,6 +121,25 @@ class VGCameraXThermalLoadSheddingCoordinatorReport {
   /// Human-readable error message when diagnostics/apply failed.
   final String? errorMessage;
 
+  /// Whether this event's critical-stop path successfully invoked and
+  /// completed [VGCameraXThermalLoadSheddingCoordinator]'s stop-recording
+  /// action.
+  final bool stoppedRecording;
+
+  /// The raw stop-recording action result, present only when
+  /// [stoppedRecording] is `true`.
+  final Map<String, dynamic>? stopRecordingResult;
+
+  /// The finalized recording file path, present only when [stoppedRecording]
+  /// is `true`.
+  final String? filePath;
+
+  /// Total frames presented, present only when [stoppedRecording] is `true`.
+  final int? totalFrames;
+
+  /// Dropped-frame ratio, present only when [stoppedRecording] is `true`.
+  final double? dropRate;
+
   Map<String, Object?> toMap() => <String, Object?>{
     'thermalState': thermalState.name,
     'evaluation': evaluation?.toMap(),
@@ -110,6 +151,11 @@ class VGCameraXThermalLoadSheddingCoordinatorReport {
     'reason': reason,
     'errorCode': errorCode,
     'errorMessage': errorMessage,
+    'stoppedRecording': stoppedRecording,
+    'stopRecordingResult': stopRecordingResult,
+    'filePath': filePath,
+    'totalFrames': totalFrames,
+    'dropRate': dropRate,
     'proofBoundary': proofBoundary,
     'nonClaims': nonClaims,
   };
@@ -123,6 +169,8 @@ class VGCameraXThermalLoadSheddingCoordinatorReport {
       'reason: $reason, '
       'errorCode: $errorCode, '
       'errorMessage: $errorMessage, '
+      'stoppedRecording: $stoppedRecording, '
+      'filePath: $filePath, '
       'proofBoundary: $proofBoundary)';
 }
 
@@ -140,10 +188,12 @@ final class VGCameraXThermalLoadSheddingCoordinator {
     Future<VGCameraXThermalFpsDiagnostics> Function()? getDiagnostics,
     Future<VGCameraXThermalFpsApplyResult> Function(int targetFps)?
     applyTargetFps,
+    Future<Map<String, dynamic>> Function()? stopRecordingAction,
     VGCamera2ThermalLoadSheddingPlanner? planner,
     VGCamera2ThermalLoadSheddingMonitor? monitor,
     VGCamera2ThermalLoadSheddingMonitorConfig? config,
     this.applyTimeout = const Duration(seconds: 10),
+    this.stopRecordingTimeout = const Duration(seconds: 15),
   }) : _thermalStates = thermalStates ?? VGThermalMonitor.onThermalStateChanged,
        _getDiagnostics =
            getDiagnostics ??
@@ -151,6 +201,8 @@ final class VGCameraXThermalLoadSheddingCoordinator {
        _applyTargetFps =
            applyTargetFps ??
            VGCameraXThermalFpsBridge().applyAndroidCameraXThermalTargetFps,
+       _stopRecordingAction =
+           stopRecordingAction ?? VanguardEngine.stopRecording,
        _monitor =
            monitor ??
            VGCamera2ThermalLoadSheddingMonitor(
@@ -169,16 +221,26 @@ final class VGCameraXThermalLoadSheddingCoordinator {
   static const String reasonNoReduction = 'no_reduction';
 
   /// Skip reason: the planner decided a mitigation this coordinator does not
-  /// actuate (`dropSecondaryCamera`, `stopRecording`, `reduceResolution`).
+  /// actuate (`dropSecondaryCamera`, `reduceResolution`).
   static const String reasonUnsupportedDecision = 'unsupported_decision';
+
+  /// Skip reason: a critical thermal event arrived but the stop-recording
+  /// action was already invoked for this critical episode, or there is no
+  /// active recording to stop.
+  static const String reasonRecordingAlreadyStopped =
+      'recording_already_stopped';
 
   /// Timeout applied to each `getDiagnostics`/`applyTargetFps` call.
   final Duration applyTimeout;
+
+  /// Timeout applied to each `stopRecordingAction` call.
+  final Duration stopRecordingTimeout;
 
   final Stream<VGThermalState> _thermalStates;
   final Future<VGCameraXThermalFpsDiagnostics> Function() _getDiagnostics;
   final Future<VGCameraXThermalFpsApplyResult> Function(int targetFps)
   _applyTargetFps;
+  final Future<Map<String, dynamic>> Function() _stopRecordingAction;
   final VGCamera2ThermalLoadSheddingMonitor _monitor;
 
   final StreamController<VGCameraXThermalLoadSheddingCoordinatorReport>
@@ -192,6 +254,15 @@ final class VGCameraXThermalLoadSheddingCoordinator {
   bool _isDisposed = false;
   int _generation = 0;
   VGCameraXThermalLoadSheddingCoordinatorReport? _latestReport;
+
+  /// Whether the stop-recording action has already been invoked for the
+  /// current critical thermal episode. Reset when a non-critical event is
+  /// processed.
+  bool _stopInvoked = false;
+
+  /// Set when a critical event arrives while another event is in flight;
+  /// processed once the in-flight event completes.
+  bool _pendingCriticalStopLatch = false;
 
   /// Broadcast stream of per-event outcome reports.
   Stream<VGCameraXThermalLoadSheddingCoordinatorReport> get reports =>
@@ -227,6 +298,7 @@ final class VGCameraXThermalLoadSheddingCoordinator {
   /// Idempotent. Invalidates any in-flight event processing so its
   /// completion neither emits a report nor calls apply.
   void stop() {
+    _pendingCriticalStopLatch = false;
     if (_subscription == null) return;
     _subscription!.cancel();
     _subscription = null;
@@ -260,6 +332,9 @@ final class VGCameraXThermalLoadSheddingCoordinator {
     if (_isDisposed) return;
     final generation = _generation;
     if (_busy) {
+      if (state == VGThermalState.critical) {
+        _pendingCriticalStopLatch = true;
+      }
       _emit(
         generation,
         VGCameraXThermalLoadSheddingCoordinatorReport(
@@ -271,6 +346,10 @@ final class VGCameraXThermalLoadSheddingCoordinator {
       );
       return;
     }
+    _runEvent(state, generation);
+  }
+
+  void _runEvent(VGThermalState state, int generation) {
     _busy = true;
     unawaited(
       _processEvent(state, generation)
@@ -288,11 +367,21 @@ final class VGCameraXThermalLoadSheddingCoordinator {
           })
           .whenComplete(() {
             _busy = false;
+            if (_pendingCriticalStopLatch &&
+                _isCurrentGeneration(generation) &&
+                isRunning) {
+              _pendingCriticalStopLatch = false;
+              _runEvent(VGThermalState.critical, _generation);
+            }
           }),
     );
   }
 
   Future<void> _processEvent(VGThermalState state, int generation) async {
+    if (state != VGThermalState.critical) {
+      _stopInvoked = false;
+    }
+
     VGCameraXThermalFpsDiagnostics diagnosticsBefore;
     try {
       diagnosticsBefore = await _getDiagnostics().timeout(applyTimeout);
@@ -337,6 +426,16 @@ final class VGCameraXThermalLoadSheddingCoordinator {
 
     final evaluation = _monitor.evaluateOnce(state);
     final plan = evaluation.plan;
+
+    if (state == VGThermalState.critical) {
+      await _processCriticalEvent(
+        state,
+        generation,
+        evaluation,
+        diagnosticsBefore,
+      );
+      return;
+    }
 
     final canApply =
         plan.decision == VGCamera2ThermalLoadSheddingDecision.reduceFrameRate &&
@@ -417,6 +516,95 @@ final class VGCameraXThermalLoadSheddingCoordinator {
     );
   }
 
+  /// Handles a `critical` thermal event: invokes [_stopRecordingAction] at
+  /// most once per critical episode, gated by [_stopInvoked]. Never runs
+  /// concurrently with an FPS apply -- both flow through the same
+  /// `_busy`-serialized [_runEvent] path.
+  Future<void> _processCriticalEvent(
+    VGThermalState state,
+    int generation,
+    VGCamera2ThermalLoadSheddingEvaluation evaluation,
+    VGCameraXThermalFpsDiagnostics diagnosticsBefore,
+  ) async {
+    final hasActiveRecording =
+        diagnosticsBefore.isRecordingActive || diagnosticsBefore.isRecording;
+
+    if (!hasActiveRecording || _stopInvoked) {
+      _emit(
+        generation,
+        VGCameraXThermalLoadSheddingCoordinatorReport(
+          thermalState: state,
+          evaluation: evaluation,
+          diagnosticsBefore: diagnosticsBefore,
+          applied: false,
+          skipped: true,
+          reason: reasonRecordingAlreadyStopped,
+        ),
+      );
+      return;
+    }
+
+    _stopInvoked = true;
+
+    Map<String, dynamic> result;
+    try {
+      result = await _stopRecordingAction().timeout(stopRecordingTimeout);
+    } on TimeoutException catch (e) {
+      _emit(
+        generation,
+        VGCameraXThermalLoadSheddingCoordinatorReport(
+          thermalState: state,
+          evaluation: evaluation,
+          diagnosticsBefore: diagnosticsBefore,
+          applied: false,
+          skipped: false,
+          stoppedRecording: false,
+          errorCode: 'TIMEOUT',
+          errorMessage: e.toString(),
+        ),
+      );
+      return;
+    } catch (e) {
+      _emit(
+        generation,
+        VGCameraXThermalLoadSheddingCoordinatorReport(
+          thermalState: state,
+          evaluation: evaluation,
+          diagnosticsBefore: diagnosticsBefore,
+          applied: false,
+          skipped: false,
+          stoppedRecording: false,
+          errorCode: _errorCodeOf(e),
+          errorMessage: _errorMessageOf(e),
+        ),
+      );
+      return;
+    }
+
+    if (!_isCurrentGeneration(generation)) return;
+
+    final filePath = result['filePath'] as String?;
+    final totalFrames = result['totalFrames'] as int?;
+    final dropRateRaw = result['dropRate'];
+    final dropRate = dropRateRaw is num ? dropRateRaw.toDouble() : null;
+
+    _emit(
+      generation,
+      VGCameraXThermalLoadSheddingCoordinatorReport(
+        thermalState: state,
+        evaluation: evaluation,
+        diagnosticsBefore: diagnosticsBefore,
+        applied: false,
+        skipped: false,
+        stoppedRecording: true,
+        stopRecordingResult: result,
+        filePath: filePath,
+        totalFrames: totalFrames,
+        dropRate: dropRate,
+      ),
+    );
+  }
+
   String _skipReasonFor(VGCamera2ThermalLoadSheddingPlan plan) {
     switch (plan.decision) {
       case VGCamera2ThermalLoadSheddingDecision.maintain:
@@ -424,8 +612,9 @@ final class VGCameraXThermalLoadSheddingCoordinator {
         return reasonNoAction;
       case VGCamera2ThermalLoadSheddingDecision.reduceFrameRate:
         return reasonNoReduction;
-      case VGCamera2ThermalLoadSheddingDecision.dropSecondaryCamera:
       case VGCamera2ThermalLoadSheddingDecision.stopRecording:
+        return reasonRecordingAlreadyStopped;
+      case VGCamera2ThermalLoadSheddingDecision.dropSecondaryCamera:
       case VGCamera2ThermalLoadSheddingDecision.reduceResolution:
         return reasonUnsupportedDecision;
     }
