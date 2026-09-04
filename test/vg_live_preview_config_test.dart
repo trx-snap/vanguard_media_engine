@@ -21,16 +21,23 @@ void main() {
       expect(config.pipLayout.marginFraction, 0.018);
       expect(config.pipLayout.cornerRadius, 24.0);
       expect(config.pipLayout.opacity, 1.0);
+      expect(config.pipLayout.centerX, 0.5);
+      expect(config.pipLayout.centerY, 0.5);
+      expect(config.pipLayout.aspectRatio, 9.0 / 16.0);
 
       // Default splitLayout matches VGSplitScreenLayoutDescriptor() defaults.
       expect(config.splitLayout.splitRatio, 0.5);
+      expect(config.splitLayout.direction, VGSplitScreenDirection.topBottom);
     });
 
     // ─── 2. copyWith preserves untouched fields ───────────────────────────────
     test('2. copyWith preserves untouched fields', () {
       const original = VGLivePreviewConfig(
         layoutMode: VGDualCameraLayoutMode.splitScreen,
-        pipLayout: VGPiPLayoutDescriptor(anchor: VGPiPAnchor.topLeft, widthFraction: 0.4),
+        pipLayout: VGPiPLayoutDescriptor(
+          anchor: VGPiPAnchor.topLeft,
+          widthFraction: 0.4,
+        ),
         splitLayout: VGSplitScreenLayoutDescriptor(splitRatio: 0.6),
       );
 
@@ -74,8 +81,14 @@ void main() {
           marginFraction: 0.018,
           cornerRadius: 24.0,
           opacity: 1.0,
+          centerX: 0.5,
+          centerY: 0.5,
+          aspectRatio: 9.0 / 16.0,
         ),
-        splitLayout: VGSplitScreenLayoutDescriptor(splitRatio: 0.5),
+        splitLayout: VGSplitScreenLayoutDescriptor(
+          splitRatio: 0.5,
+          direction: VGSplitScreenDirection.topBottom,
+        ),
       );
 
       final map = config.toMap();
@@ -88,9 +101,13 @@ void main() {
       expect(pip['marginFraction'], 0.018);
       expect(pip['cornerRadius'], 24.0);
       expect(pip['opacity'], 1.0);
+      expect(pip['centerX'], 0.5);
+      expect(pip['centerY'], 0.5);
+      expect(pip['aspectRatio'], 9.0 / 16.0);
 
       final split = map['splitLayout'] as Map<String, Object?>;
       expect(split['splitRatio'], 0.5);
+      expect(split['direction'], 'topBottom');
     });
 
     // ─── 5. toMap does not contain clip or session fields ─────────────────────
@@ -220,6 +237,77 @@ void main() {
       // Confirm none of the offline-only keys leaked in.
       expect(liveKeys.contains('primaryClip'), isFalse);
       expect(liveKeys.contains('secondaryClip'), isFalse);
+    });
+
+    // 14. carries freeFloating, center geometry, and leftRight split without clip/session leakage
+    test(
+      '14. carries freeFloating, center geometry, and leftRight split without clip/session leakage',
+      () {
+        const config = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.pip,
+          pipLayout: VGPiPLayoutDescriptor(
+            anchor: VGPiPAnchor.freeFloating,
+            centerX: 0.35,
+            centerY: 0.65,
+            aspectRatio: 1.0,
+          ),
+          splitLayout: VGSplitScreenLayoutDescriptor(
+            splitRatio: 0.45,
+            direction: VGSplitScreenDirection.leftRight,
+          ),
+        );
+
+        final map = config.toMap();
+        final str = map.toString();
+
+        // No clip/session leakage
+        expect(map.containsKey('primaryClip'), isFalse);
+        expect(map.containsKey('secondaryClip'), isFalse);
+        expect(str.contains('primaryClip'), isFalse);
+        expect(str.contains('secondaryClip'), isFalse);
+        expect(str.contains('MultiCam'), isFalse);
+        expect(str.contains('session'), isFalse);
+
+        final restored = VGLivePreviewConfig.fromMap(map);
+        expect(restored, config);
+        expect(restored.pipLayout.anchor, VGPiPAnchor.freeFloating);
+        expect(restored.pipLayout.centerX, 0.35);
+        expect(restored.pipLayout.centerY, 0.65);
+        expect(restored.pipLayout.aspectRatio, 1.0);
+        expect(restored.splitLayout.splitRatio, 0.45);
+        expect(
+          restored.splitLayout.direction,
+          VGSplitScreenDirection.leftRight,
+        );
+      },
+    );
+
+    // 15. invalid centerX or aspectRatio falls back to default pipLayout
+    test(
+      '15. invalid centerX or aspectRatio falls back to default pipLayout',
+      () {
+        final badCenterX = VGLivePreviewConfig.fromMap({
+          'layoutMode': 'pip',
+          'pipLayout': {'centerX': 1.5},
+        });
+        expect(badCenterX.pipLayout, const VGPiPLayoutDescriptor());
+
+        final badAspectRatio = VGLivePreviewConfig.fromMap({
+          'layoutMode': 'pip',
+          'pipLayout': {'aspectRatio': -1.0},
+        });
+        expect(badAspectRatio.pipLayout, const VGPiPLayoutDescriptor());
+      },
+    );
+
+    // 16. invalid direction falls back to topBottom
+    test('16. unknown direction falls back to topBottom', () {
+      final config = VGLivePreviewConfig.fromMap({
+        'layoutMode': 'splitScreen',
+        'splitLayout': {'splitRatio': 0.6, 'direction': 'diagonalSplit'},
+      });
+      expect(config.splitLayout.splitRatio, 0.6);
+      expect(config.splitLayout.direction, VGSplitScreenDirection.topBottom);
     });
   });
 }

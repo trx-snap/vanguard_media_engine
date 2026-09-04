@@ -15,8 +15,8 @@
 //
 // It reuses the existing proven layout descriptors from vg_dual_camera_descriptor.dart:
 //   - VGDualCameraLayoutMode  (pip / splitScreen)
-//   - VGPiPLayoutDescriptor   (anchor, widthFraction, marginFraction, cornerRadius, opacity)
-//   - VGSplitScreenLayoutDescriptor (splitRatio)
+//   - VGPiPLayoutDescriptor   (anchor, widthFraction, marginFraction, cornerRadius, opacity, centerX, centerY, aspectRatio)
+//   - VGSplitScreenLayoutDescriptor (splitRatio, direction)
 //
 // This is the Dart-side layout contract that future live MultiCam preview (MC-4+)
 // will pass to the native compositor to position primary and secondary camera feeds.
@@ -24,8 +24,8 @@
 // Map shape (identical keys to VGDualCameraDescriptor layout subset):
 //   {
 //     'layoutMode':  'pip' | 'splitScreen',
-//     'pipLayout':   { 'anchor', 'widthFraction', 'marginFraction', 'cornerRadius', 'opacity' },
-//     'splitLayout': { 'splitRatio' },
+//     'pipLayout':   { 'anchor', 'widthFraction', 'marginFraction', 'cornerRadius', 'opacity', 'centerX', 'centerY', 'aspectRatio' },
+//     'splitLayout': { 'splitRatio', 'direction' },
 //   }
 //
 // ── CONSTRAINTS ──────────────────────────────────────────────────────────────
@@ -59,8 +59,8 @@ import 'vg_dual_camera_descriptor.dart';
 /// ## Defaults
 /// All fields have safe, non-null defaults:
 ///   - [layoutMode]:  [VGDualCameraLayoutMode.pip]
-///   - [pipLayout]:   [VGPiPLayoutDescriptor] (bottomRight, 0.35, 0.018, 24.0, 1.0)
-///   - [splitLayout]: [VGSplitScreenLayoutDescriptor] (splitRatio 0.5)
+///   - [pipLayout]:   [VGPiPLayoutDescriptor] (bottomRight, 0.35, 0.018, 24.0, 1.0, 0.5, 0.5, 9/16)
+///   - [splitLayout]: [VGSplitScreenLayoutDescriptor] (splitRatio 0.5, topBottom)
 @immutable
 class VGLivePreviewConfig {
   const VGLivePreviewConfig({
@@ -137,13 +137,14 @@ class VGLivePreviewConfig {
     // pipLayout — validation failure falls back to default.
     final pipLayoutMap = map['pipLayout'] as Map<Object?, Object?>?;
     final pipLayout =
-        VGPiPLayoutDescriptor.fromMap(pipLayoutMap) ?? const VGPiPLayoutDescriptor();
+        VGPiPLayoutDescriptor.fromMap(pipLayoutMap) ??
+        const VGPiPLayoutDescriptor();
 
     // splitLayout — validation failure falls back to default.
     final splitLayoutMap = map['splitLayout'] as Map<Object?, Object?>?;
     final splitLayout =
         VGSplitScreenLayoutDescriptor.fromMap(splitLayoutMap) ??
-            const VGSplitScreenLayoutDescriptor();
+        const VGSplitScreenLayoutDescriptor();
 
     return VGLivePreviewConfig(
       layoutMode: layoutMode,
