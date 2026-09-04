@@ -20,6 +20,9 @@ import java.util.concurrent.TimeUnit
  * @property lastRenderedPtsUs Updated last-rendered PTS (us); equals [seekRenderedPtsUs] on success.
  * @property seekRenderedPtsUs PTS (us) of the frame that was rendered; -1 if none was rendered.
  * @property failureReason     Non-null failure token when [pass] is false; null on success.
+ * @property nativeRenderStatus Raw status string from the native generation-aware render call
+ *                              made for the seek target frame, on both pass and fail; null when
+ *                              no render attempt was made (e.g. seek failed before reaching render).
  */
 data class AndroidDagSeekPrerollResult(
     val pass: Boolean,
@@ -28,6 +31,7 @@ data class AndroidDagSeekPrerollResult(
     val lastRenderedPtsUs: Long,
     val seekRenderedPtsUs: Long,
     val failureReason: String?,
+    val nativeRenderStatus: String? = null,
 )
 
 /**
@@ -103,6 +107,7 @@ class AndroidDagSeekPrerollEngine {
         var seekError: String? = null
         var renderedFrames = renderedFramesBefore
         var lastRenderedPtsUs = -1L
+        var nativeRenderStatus: String? = null
 
         while (System.currentTimeMillis() < deadlineMs && !seekSuccess && seekError == null) {
             // ── Cancellation check (e.g. surface lost during preroll) ─────────
@@ -218,6 +223,7 @@ class AndroidDagSeekPrerollEngine {
                             false,
                         )
 
+                        nativeRenderStatus = renderStr
                         if (renderStr.startsWith("status=PASS;")) {
                             renderedFrames++
                             lastRenderedPtsUs = framePts
@@ -243,6 +249,7 @@ class AndroidDagSeekPrerollEngine {
                 lastRenderedPtsUs = lastRenderedPtsUs,
                 seekRenderedPtsUs = seekRenderedPtsUs,
                 failureReason = null,
+                nativeRenderStatus = nativeRenderStatus,
             )
         } else {
             AndroidDagSeekPrerollResult(
@@ -252,6 +259,7 @@ class AndroidDagSeekPrerollEngine {
                 lastRenderedPtsUs = lastRenderedPtsUs,
                 seekRenderedPtsUs = seekRenderedPtsUs,
                 failureReason = seekError ?: "seek_timeout",
+                nativeRenderStatus = nativeRenderStatus,
             )
         }
     }

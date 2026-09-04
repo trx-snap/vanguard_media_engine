@@ -105,6 +105,17 @@ class AndroidDagTexturePlaybackControlSession(
     private var outputDone = false
     private var frameRenderError: String? = null
     /**
+     * Latest raw native render status string from a play/resume pump render call
+     * (pass or fail). Surfaced to callers under the "lastNativeRenderStatus" key
+     * so smoke/telemetry callers can verify the execution-planner ran on the frame.
+     */
+    private var lastNativeRenderStatus: String? = null
+    /**
+     * Latest raw native render status string from a seek-preroll render call
+     * (pass or fail). Surfaced to callers under the "seekNativeRenderStatus" key.
+     */
+    private var seekNativeRenderStatus: String? = null
+    /**
      * Video rotation from source metadata. Phase 4B2C: applied to display dimensions
      * and render transform. Normalised cardinal 0/90/180/270.
      */
@@ -354,6 +365,7 @@ class AndroidDagTexturePlaybackControlSession(
                     "state" to state.name,
                     "renderedFrames" to renderedFrames,
                     "lastPtsUs" to lastRenderedPtsUs,
+                    "lastNativeRenderStatus" to lastNativeRenderStatus,
                     "raw" to "status=OK;state=Playing;renderedFrames=$renderedFrames",
                 ))
             }
@@ -400,6 +412,9 @@ class AndroidDagTexturePlaybackControlSession(
                             renderedFrames = pumpResult.renderedFrames
                             lastRenderedPtsUs = pumpResult.lastRenderedPtsUs
                             frameRenderError = pumpResult.frameRenderError
+                            if (pumpResult.nativeRenderStatus != null) {
+                                lastNativeRenderStatus = pumpResult.nativeRenderStatus
+                            }
 
                             if (frameRenderError == null && pumpResult.renderedFrame) {
                                 onTimelineFrame?.invoke(surfaceProducer.id(), lastRenderedPtsUs / 1_000_000.0, currentGenerationId)
@@ -418,6 +433,7 @@ class AndroidDagTexturePlaybackControlSession(
                                     "state" to state.name,
                                     "renderedFrames" to renderedFrames,
                                     "lastPtsUs" to lastRenderedPtsUs,
+                                    "lastNativeRenderStatus" to lastNativeRenderStatus,
                                     "raw" to "status=OK;target_reached;renderedFrames=$renderedFrames",
                                 ))
                             } else if (pumpResult.playbackEndReached) {
@@ -448,6 +464,7 @@ class AndroidDagTexturePlaybackControlSession(
                                     "state" to state.name,
                                     "renderedFrames" to renderedFrames,
                                     "lastPtsUs" to lastRenderedPtsUs,
+                                    "lastNativeRenderStatus" to lastNativeRenderStatus,
                                     "raw" to raw,
                                 ))
                             } else if (outputDone && imageQueue.isEmpty()) {
@@ -471,6 +488,7 @@ class AndroidDagTexturePlaybackControlSession(
                                     "state" to state.name,
                                     "renderedFrames" to renderedFrames,
                                     "lastPtsUs" to lastRenderedPtsUs,
+                                    "lastNativeRenderStatus" to lastNativeRenderStatus,
                                     "raw" to raw,
                                 ))
                             } else if (frameRenderError != null) {
@@ -483,6 +501,7 @@ class AndroidDagTexturePlaybackControlSession(
                                     "pass" to false,
                                     "state" to state.name,
                                     "renderedFrames" to renderedFrames,
+                                    "lastNativeRenderStatus" to lastNativeRenderStatus,
                                     "raw" to frameRenderError!!,
                                 ))
                             } else {
@@ -665,6 +684,7 @@ class AndroidDagTexturePlaybackControlSession(
                 if (engineResult.lastRenderedPtsUs >= 0) {
                     lastRenderedPtsUs = engineResult.lastRenderedPtsUs
                 }
+                seekNativeRenderStatus = engineResult.nativeRenderStatus
 
                 // j. Resume or hold Paused
                 if (engineResult.pass) {
@@ -688,6 +708,7 @@ class AndroidDagTexturePlaybackControlSession(
                         "seekRenderedPtsUs" to engineResult.seekRenderedPtsUs,
                         "generationId" to engineResult.generationId,
                         "renderedFrames" to renderedFrames,
+                        "seekNativeRenderStatus" to seekNativeRenderStatus,
                         "raw" to "status=OK;state=${state.name};seekTargetUs=$targetPtsUs;seekRenderedPtsUs=${engineResult.seekRenderedPtsUs};generationId=${engineResult.generationId}",
                     ))
                 } else {
@@ -697,6 +718,7 @@ class AndroidDagTexturePlaybackControlSession(
                         "state" to state.name,
                         "seekTargetUs" to targetPtsUs,
                         "seekRenderedPtsUs" to engineResult.seekRenderedPtsUs,
+                        "seekNativeRenderStatus" to seekNativeRenderStatus,
                         "raw" to "status=FAIL;reason=${engineResult.failureReason}",
                     ))
                 }

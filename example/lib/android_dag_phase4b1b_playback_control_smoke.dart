@@ -66,6 +66,9 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
     var resumeRenderedFrames = 0;
     var totalRenderedFrames = 0;
     var disposePass = false;
+    String? play1NativeRenderStatus;
+    String? seekNativeRenderStatus;
+    String? resumeNativeRenderStatus;
     String raw = '';
 
     try {
@@ -115,6 +118,7 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
       final play1Map = Map<String, dynamic>.from(play1Response! as Map);
       play1Pass = play1Map['pass'] == true;
       play1RenderedFrames = (play1Map['renderedFrames'] as num?)?.toInt() ?? 0;
+      play1NativeRenderStatus = play1Map['lastNativeRenderStatus'] as String?;
       stateSequence.add(play1Map['state'] as String? ?? 'Playing');
 
       // 4. Pause playback
@@ -145,6 +149,7 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
       final seekMap = Map<String, dynamic>.from(seekResponse! as Map);
       seekPass = seekMap['pass'] == true;
       seekRenderedPtsUs = (seekMap['seekRenderedPtsUs'] as num?)?.toInt() ?? -1;
+      seekNativeRenderStatus = seekMap['seekNativeRenderStatus'] as String?;
       stateSequence.add(seekMap['state'] as String? ?? 'Paused');
 
       // 6. Resume / play 6 more frames
@@ -156,6 +161,7 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
       resumePass = resumeMap['pass'] == true;
       totalRenderedFrames = (resumeMap['renderedFrames'] as num?)?.toInt() ?? 0;
       resumeRenderedFrames = totalRenderedFrames - play1RenderedFrames;
+      resumeNativeRenderStatus = resumeMap['lastNativeRenderStatus'] as String?;
       stateSequence.add(resumeMap['state'] as String? ?? 'Playing');
 
       // 7. Dispose session
@@ -194,6 +200,19 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
 
     final seekPtsValid =
         seekTargetUs == 0 || (seekRenderedPtsUs >= seekTargetUs);
+
+    // Multinode DAG execution-plan telemetry: at least one native render status
+    // from play1/seek/resume must show the planner ran over the two-node
+    // playback presentation graph (one source + one sink).
+    bool hasMultinodePlanTelemetry(String? status) =>
+        status != null &&
+        status.contains('planNodeCount=2') &&
+        status.contains('planSinkCount=1');
+    final multinodePlanTelemetryPass =
+        hasMultinodePlanTelemetry(play1NativeRenderStatus) ||
+        hasMultinodePlanTelemetry(seekNativeRenderStatus) ||
+        hasMultinodePlanTelemetry(resumeNativeRenderStatus);
+
     final pass =
         createPass &&
         play1Pass &&
@@ -204,7 +223,8 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
         resumePass &&
         resumeRenderedFrames >= 6 &&
         totalRenderedFrames >= (play1RenderedFrames + 6) &&
-        disposePass;
+        disposePass &&
+        multinodePlanTelemetryPass;
 
     final payload = <String, dynamic>{
       'pass': pass,
@@ -219,6 +239,10 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
       'resumeRenderedFrames': resumeRenderedFrames,
       'totalRenderedFrames': totalRenderedFrames,
       'disposePass': disposePass,
+      'play1NativeRenderStatus': play1NativeRenderStatus,
+      'seekNativeRenderStatus': seekNativeRenderStatus,
+      'resumeNativeRenderStatus': resumeNativeRenderStatus,
+      'multinodePlanTelemetryPass': multinodePlanTelemetryPass,
       'raw': raw,
     };
 

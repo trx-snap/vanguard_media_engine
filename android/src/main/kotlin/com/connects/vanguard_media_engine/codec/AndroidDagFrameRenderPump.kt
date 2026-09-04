@@ -29,6 +29,12 @@ data class AndroidDagFrameRenderPumpResult(
      * dropped, since the caller is expected to terminate/dispose shortly after this fires.
      */
     val playbackEndReached: Boolean = false,
+    /**
+     * Raw status string returned by the native generation-aware render call for the frame
+     * rendered/attempted during this pumpOnce, on both pass and fail. Null when no render
+     * attempt was made (e.g. no image was due/queued).
+     */
+    val nativeRenderStatus: String? = null,
 )
 
 /**
@@ -93,6 +99,7 @@ class AndroidDagFrameRenderPump {
         var localLastRenderedPtsUs = lastRenderedPtsUs
         var localFrameRenderError: String? = null
         var localRenderedFrame = false
+        var localNativeRenderStatus: String? = null
 
         // Feed MediaCodec input buffers
         while (!localInputDone) {
@@ -213,6 +220,7 @@ class AndroidDagFrameRenderPump {
                             false,
                         )
 
+                        localNativeRenderStatus = renderStr
                         if (renderStr.startsWith("status=PASS;")) {
                             localRenderedFrames++
                             localRenderedFrame = true
@@ -236,6 +244,7 @@ class AndroidDagFrameRenderPump {
             frameRenderError = localFrameRenderError,
             renderedFrame = localRenderedFrame,
             playbackEndReached = hitPlaybackEnd,
+            nativeRenderStatus = localNativeRenderStatus,
         )
     }
 }

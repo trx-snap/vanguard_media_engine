@@ -29,6 +29,7 @@
 #include "vanguard/core/logging.h"
 #include "vanguard/graph/frame_request.h"
 #include "vanguard/graph/graph.h"
+#include "vanguard/graph/graph_execution_plan.h"
 #include "vanguard/render/vulkan_backend.h"
 #include "vanguard/render/render_transform.h"
 
@@ -332,18 +333,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     request.canvasWidth   = static_cast<uint32_t>(width);
     request.canvasHeight  = static_cast<uint32_t>(height);
 
-    vanguard::graph::FrameEvaluationResult evalResult;
-    const auto evalStatus = session->graph.evaluatePlayhead(request, evalResult);
+    vanguard::graph::GraphExecutionPlan plan;
+    const auto planStatus =
+        vanguard::graph::BuildGraphExecutionPlan(session->graph, request, plan);
 
-    if (!evalStatus.ok() || !evalResult.ok() ||
-        !evalResult.hasVideo ||
-        evalResult.activeNodes.empty()) {
+    if (!planStatus.ok() || plan.nodes.empty() || plan.sinkNodeIds.empty()) {
         int relFd = -1;
         session->backend.releaseHardwareBuffer(handle, &relFd);
         if (relFd >= 0) { ::close(relFd); }
         std::snprintf(status, sizeof(status),
-            "status=FAIL;frameIndex=%d;reason=evaluation_failed",
-            static_cast<int>(frameIndex));
+            "status=FAIL;frameIndex=%d;reason=execution_plan_failed;planStatus=%s",
+            static_cast<int>(frameIndex),
+            planStatus.message().c_str());
         return env->NewStringUTF(status);
     }
 
@@ -384,11 +385,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     std::snprintf(status, sizeof(status),
         "status=PASS;frameIndex=%d;renderedFrames=%d;"
-        "renderResult=%s;releaseResult=%s",
+        "renderResult=%s;releaseResult=%s;planNodeCount=%zu;planSinkCount=%zu",
         static_cast<int>(frameIndex),
         session->renderedFrames,
         RenderResultName(renderResult),
-        HwBufResultName(releaseResult));
+        HwBufResultName(releaseResult),
+        plan.nodes.size(),
+        plan.sinkNodeIds.size());
     return env->NewStringUTF(status);
 }
 
@@ -577,17 +580,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     request.canvasWidth   = static_cast<uint32_t>(width);
     request.canvasHeight  = static_cast<uint32_t>(height);
 
-    vanguard::graph::FrameEvaluationResult evalResult;
-    const auto evalStatus = session->graph.evaluatePlayhead(request, evalResult);
+    vanguard::graph::GraphExecutionPlan plan;
+    const auto planStatus =
+        vanguard::graph::BuildGraphExecutionPlan(session->graph, request, plan);
 
-    if (!evalStatus.ok() || !evalResult.ok() ||
-        !evalResult.hasVideo ||
-        evalResult.activeNodes.empty()) {
+    if (!planStatus.ok() || plan.nodes.empty() || plan.sinkNodeIds.empty()) {
         int relFd = -1;
         session->backend.releaseHardwareBuffer(handle, &relFd);
         if (relFd >= 0) { ::close(relFd); }
 
-        if (evalResult.statusCode == vanguard::graph::EvaluationStatusCode::kStaleGeneration) {
+        const bool isStaleGeneration =
+            planStatus.message().find("stale generation") != std::string::npos;
+        if (isStaleGeneration) {
             std::snprintf(status, sizeof(status),
                 "status=FAIL;frameIndex=%d;reason=stale_generation/evaluation_failed;generationId=%llu;currentGeneration=%llu",
                 static_cast<int>(frameIndex),
@@ -595,8 +599,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
                 static_cast<unsigned long long>(session->graph.generationId()));
         } else {
             std::snprintf(status, sizeof(status),
-                "status=FAIL;frameIndex=%d;reason=evaluation_failed",
-                static_cast<int>(frameIndex));
+                "status=FAIL;frameIndex=%d;reason=execution_plan_failed;planStatus=%s",
+                static_cast<int>(frameIndex),
+                planStatus.message().c_str());
         }
         return env->NewStringUTF(status);
     }
@@ -645,13 +650,16 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     std::snprintf(status, sizeof(status),
         "status=PASS;frameIndex=%d;renderedFrames=%d;generationId=%llu;"
-        "renderResult=%s;releaseResult=%s;rotationDegrees=%d;mirrorHorizontal=%s",
+        "renderResult=%s;releaseResult=%s;rotationDegrees=%d;mirrorHorizontal=%s;"
+        "planNodeCount=%zu;planSinkCount=%zu",
         static_cast<int>(frameIndex),
         session->renderedFrames,
         static_cast<unsigned long long>(generationIdJ),
         RenderResultName(renderResult),
         HwBufResultName(releaseResult),
         static_cast<int>(rotationDegrees),
-        (mirrorHorizontal == JNI_TRUE) ? "true" : "false");
+        (mirrorHorizontal == JNI_TRUE) ? "true" : "false",
+        plan.nodes.size(),
+        plan.sinkNodeIds.size());
     return env->NewStringUTF(status);
 }
