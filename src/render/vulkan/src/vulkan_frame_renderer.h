@@ -150,6 +150,39 @@ public:
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
 
+    // P5-OVERLAYS-TRANSITION-COMP-N1 native-only seam: renderTransitionFrame
+    // with an optional set of already-resolved overlay draws recorded via
+    // VulkanOverlayFrameRenderer::recordOverlayDraws immediately after the
+    // transition layer draws, inside the SAME final swapchain render pass
+    // (VulkanGraphicsCommandRecorder::recordTransitionPass /
+    // recordTransitionPassBody cannot be reused here since both end the
+    // render pass themselves before returning; see
+    // recordTransitionPassBodyKeepOpen in vulkan_graphics_command_recorder.h).
+    // overlayDraws/overlayCount carry no default so a caller must always be
+    // explicit about the overlay set; when overlayCount == 0 this delegates
+    // directly to the overload above with zero additional Vulkan calls --
+    // byte-identical to the pre-existing non-overlay transition behavior.
+    // overlayDraws may be null only when overlayCount is 0; a non-null
+    // overlayCount with a null overlayDraws fails closed with
+    // kVulkanFailure before any Vulkan mutation. On any overlay record
+    // failure the whole frame fails closed -- no partial present.
+    //
+    // N1 is native-only: no JNI/Kotlin route calls this yet, and this slice
+    // does not change export admission.
+    RenderFrameResult renderTransitionFrame(
+        void* queueHandle,
+        void* physicalDeviceHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle fromHandle,
+        HardwareBufferHandle toHandle,
+        const VideoTransitionFrameTransform& transition,
+        const VulkanOverlayFrameDraw* overlayDraws,
+        uint32_t overlayCount,
+        const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
+        const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

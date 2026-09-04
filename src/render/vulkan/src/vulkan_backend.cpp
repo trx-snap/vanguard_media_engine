@@ -213,6 +213,22 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
 }
 
 // ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANSITION-COMP-N1: renderTransitionFrame with overlay draws
+// stub - host build. Native-only: no JNI/Kotlin route calls this yet.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderTransitionFrame(
+    HardwareBufferHandle /*fromHandle*/,
+    HardwareBufferHandle /*toHandle*/,
+    const VideoTransitionFrameTransform& /*transition*/,
+    const VulkanOverlayFrameDraw* /*overlayDraws*/,
+    uint32_t /*overlayCount*/,
+    const VideoBeautyV2RenderParams& /*fromBeauty*/,
+    const VideoBeautyV2RenderParams& /*toBeauty*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
 // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
 // sub-slice N4: overlay texture store stubs - host build.
 // ---------------------------------------------------------------------------
@@ -1039,6 +1055,53 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
         fromHandle,
         toHandle,
         transition,
+        fromBeauty,
+        toBeauty);
+}
+
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANSITION-COMP-N1: renderTransitionFrame with overlay draws -
+// Android. Delegates to the frame renderer's overlay-aware transition
+// overload, which itself delegates straight back to the plain transition
+// overload whenever overlayCount == 0 -- so this seam never changes
+// non-overlay transition behavior. Native-only: no JNI/Kotlin route calls
+// this yet, and this slice does not change export admission.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderTransitionFrame(
+    HardwareBufferHandle fromHandle,
+    HardwareBufferHandle toHandle,
+    const VideoTransitionFrameTransform& transition,
+    const VulkanOverlayFrameDraw* overlayDraws,
+    uint32_t overlayCount,
+    const VideoBeautyV2RenderParams& fromBeauty,
+    const VideoBeautyV2RenderParams& toBeauty) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || fromHandle == toHandle ||
+        !hasHardwareBuffer(fromHandle) || s.ahbImports->getImage(fromHandle) == nullptr ||
+        !hasHardwareBuffer(toHandle) || s.ahbImports->getImage(toHandle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderTransitionFrame(
+        static_cast<void*>(s.queue),
+        static_cast<void*>(s.physDev),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        fromHandle,
+        toHandle,
+        transition,
+        overlayDraws,
+        overlayCount,
         fromBeauty,
         toBeauty);
 }

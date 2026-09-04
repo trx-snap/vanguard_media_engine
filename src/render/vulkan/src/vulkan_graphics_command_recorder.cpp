@@ -306,7 +306,14 @@ static void recordSourceLayoutTransition(VkCommandBuffer commandBuffer,
 // the full extent, and every layer draw in order. Assumes [params] has
 // already been validated by the caller and that commandBuffer is already in
 // the recording state; never begins/ends the command buffer itself.
-static void recordTransitionPassBodyUnchecked(const VulkanTransitionPassParams& params) {
+//
+// P5-OVERLAYS-TRANSITION-COMP-N1: [keepRenderPassOpen] lets
+// [recordTransitionPassBodyKeepOpen] reuse this exact body while leaving the
+// render pass open for the caller to append draws into; every existing
+// caller passes false, which vkCmdEndRenderPass's at the same point as
+// before this parameter was added, so their command streams are unchanged.
+static void recordTransitionPassBodyUnchecked(const VulkanTransitionPassParams& params,
+                                              bool keepRenderPassOpen) {
     if (params.transitionFromImage) {
         recordSourceLayoutTransition(params.commandBuffer, params.fromImage, params.fromOldLayout);
     }
@@ -371,7 +378,9 @@ static void recordTransitionPassBodyUnchecked(const VulkanTransitionPassParams& 
         vkCmdDraw(params.commandBuffer, 3, 1, 0, 0);
     }
 
-    vkCmdEndRenderPass(params.commandBuffer);
+    if (!keepRenderPassOpen) {
+        vkCmdEndRenderPass(params.commandBuffer);
+    }
 }
 
 } // anonymous namespace
@@ -395,7 +404,7 @@ bool VulkanGraphicsCommandRecorder::recordTransitionPass(
         return false;
     }
 
-    recordTransitionPassBodyUnchecked(params);
+    recordTransitionPassBodyUnchecked(params, /*keepRenderPassOpen=*/false);
 
     res = vkEndCommandBuffer(params.commandBuffer);
     if (res != VK_SUCCESS) {
@@ -410,7 +419,20 @@ bool VulkanGraphicsCommandRecorder::recordTransitionPassBody(
     if (!validateTransitionPassParams(params)) {
         return false;
     }
-    recordTransitionPassBodyUnchecked(params);
+    recordTransitionPassBodyUnchecked(params, /*keepRenderPassOpen=*/false);
+    return true;
+}
+
+// P5-OVERLAYS-TRANSITION-COMP-N1: same validation as recordTransitionPassBody
+// above, but the render pass is left open (see recordTransitionPassBodyUnchecked's
+// [keepRenderPassOpen] doc) so a caller can append overlay draws before
+// ending it itself. Native-only: no JNI/Kotlin route calls this yet.
+bool VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen(
+    const VulkanTransitionPassParams& params) {
+    if (!validateTransitionPassParams(params)) {
+        return false;
+    }
+    recordTransitionPassBodyUnchecked(params, /*keepRenderPassOpen=*/true);
     return true;
 }
 
@@ -444,6 +466,14 @@ bool VulkanGraphicsCommandRecorder::recordTransitionPass(
 }
 
 bool VulkanGraphicsCommandRecorder::recordTransitionPassBody(
+    const VulkanTransitionPassParams& params) {
+    (void)params;
+    return false;
+}
+
+// P5-OVERLAYS-TRANSITION-COMP-N1: host-build stub, mirrors the other
+// transition stubs above. Native-only: no JNI/Kotlin route calls this yet.
+bool VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen(
     const VulkanTransitionPassParams& params) {
     (void)params;
     return false;

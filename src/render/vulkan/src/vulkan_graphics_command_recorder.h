@@ -246,6 +246,22 @@ public:
     // layer draw in order -- WITHOUT beginning or ending the command buffer.
     // Returns false (recording nothing) on any invalid parameter.
     static bool recordTransitionPassBody(const VulkanTransitionPassParams& params);
+
+    // P5-OVERLAYS-TRANSITION-COMP-N1: validated body-only seam like
+    // [recordTransitionPassBody] above, but leaves the render pass OPEN after
+    // recording every transition layer draw instead of ending it, so a
+    // caller can append further draws (already-resolved overlay draws) into
+    // the SAME render pass before ending it itself -- [recordTransitionPass]
+    // and [recordTransitionPassBody] cannot be reused directly for that since
+    // both end the render pass before returning. commandBuffer must already
+    // be in the recording state (the caller already called
+    // vkBeginCommandBuffer); this never begins/ends the command buffer and
+    // never calls vkCmdEndRenderPass. Validates every handle / extent /
+    // scissor exactly like [recordTransitionPassBody]; returns false
+    // (recording nothing) on any invalid parameter.
+    //
+    // N1 is native-only: no JNI/Kotlin route calls this yet.
+    static bool recordTransitionPassBodyKeepOpen(const VulkanTransitionPassParams& params);
 };
 
 } // namespace render

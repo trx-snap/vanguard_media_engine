@@ -1985,6 +1985,565 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
 }
 
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANSITION-COMP-N1 native-only seam: renderTransitionFrame with
+// an optional set of already-resolved overlay draws recorded into the SAME
+// final swapchain render pass, immediately after the transition layer draws.
+// Mirrors renderTransitionFrame above's entire acquire / frame-fence /
+// pending-AHB-semaphore / release-fence-export / present protocol; the only
+// differences are (1) overlay caller-data validation right after placement
+// resolution and strictly before any Vulkan mutation, and (2) the command
+// buffer is always begun explicitly here (rather than via
+// VulkanGraphicsCommandRecorder::recordTransitionPass, which cannot leave
+// the render pass open for overlay draws) and closed via
+// recordTransitionPassBodyKeepOpen + VulkanOverlayFrameRenderer::
+// recordOverlayDraws + vkCmdEndRenderPass + vkEndCommandBuffer. When
+// overlayCount == 0 this delegates directly to the overload above with zero
+// additional Vulkan calls, so non-overlay transition behavior (including
+// that overload's exact command stream) is completely unaffected by this
+// overload's existence.
+//
+// N1 is native-only: no JNI/Kotlin route calls this yet.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
+    void* queueHandle,
+    void* physicalDeviceHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& coreShaders,
+    HardwareBufferHandle fromHandle,
+    HardwareBufferHandle toHandle,
+    const VideoTransitionFrameTransform& transition,
+    const VulkanOverlayFrameDraw* overlayDraws,
+    uint32_t overlayCount,
+    const VideoBeautyV2RenderParams& fromBeauty,
+    const VideoBeautyV2RenderParams& toBeauty) {
+    if (overlayCount == 0) {
+        return renderTransitionFrame(queueHandle, physicalDeviceHandle, swapchain, ahbImports,
+                                     coreShaders, fromHandle, toHandle, transition, fromBeauty,
+                                     toBeauty);
+    }
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
+        s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const bool anyBeauty = fromBeauty.enabled || toBeauty.enabled;
+    if (anyBeauty && physicalDeviceHandle == nullptr) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (fromHandle == toHandle) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    const VulkanHardwareBufferImage* fromImage = ahbImports.getImage(fromHandle);
+    const VulkanHardwareBufferImage* toImage = ahbImports.getImage(toHandle);
+    if (!ahbImports.hasBuffer(fromHandle) || fromImage == nullptr ||
+        !ahbImports.hasBuffer(toHandle) || toImage == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (fromImage->image == VK_NULL_HANDLE || toImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    VulkanTransitionDrawMode mode;
+    if (!ResolveVulkanTransitionDrawMode(transition, &mode)) {
+        VGLOG_VFR("renderTransitionFrame(overlay): non-finite weights/progress or non-identity "
+                  "crossfade geometry; failing closed");
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame =
+        s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    const VkPipelineLayout fromLayout = fromImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet fromSet = fromImage->descriptorResources.descriptorSet;
+    const VkPipelineLayout toLayout = toImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet toSet = toImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        fromLayout == VK_NULL_HANDLE || fromSet == VK_NULL_HANDLE ||
+        toLayout == VK_NULL_HANDLE || toSet == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass = u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    // Placement is pure math; resolve it before creating any pipeline.
+    VulkanTransitionLayerPlacement fromPlacement;
+    VulkanTransitionLayerPlacement toPlacement;
+    if (!ResolveVulkanTransitionLayerPlacement(transition.from, transition.fromViewport,
+                                               transition.fromCrop, extentWidth, extentHeight,
+                                               &fromPlacement) ||
+        !ResolveVulkanTransitionLayerPlacement(transition.to, transition.toViewport,
+                                               transition.toCrop, extentWidth, extentHeight,
+                                               &toPlacement)) {
+        VGLOG_VFR("renderTransitionFrame(overlay): invalid layer geometry; failing closed");
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // N1: validate overlay caller data now -- immediately after placement
+    // resolution and strictly before any Vulkan mutation below (device idle
+    // wait, pipeline (re)creation, fence wait, swapchain acquire) -- so
+    // invalid caller-supplied overlay data fails closed without ever
+    // touching Vulkan state.
+    if (overlayDraws == nullptr) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!overlayFrameDrawsValid(overlayDraws, overlayCount, extentWidth, extentHeight)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Pipelines are per import layout, so every transition frame rebuilds
+    // them. Any cached pipeline (solo or previous transition) may still be in
+    // flight on the other frame slot: idle the device before destroying.
+    if (vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    s.invalidatePipeline();
+
+    const bool needFrom = mode != VulkanTransitionDrawMode::kToOnly;
+    const bool needToOpaque =
+        mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver;
+    const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade;
+    // A beautified layer is drawn through its own VulkanBeautyFrameRenderer
+    // placement pipeline (built later, after prepareTransitionLayer runs),
+    // never through an AHB-import-layout pipeline built here.
+    if (needFrom && !fromBeauty.enabled) {
+        s.transitionFromPipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.transitionFromPipeline->create(s.device, fromLayout, renderPass,
+                                              coreShaders.vertex.get(),
+                                              coreShaders.fragment.get())) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+    if (needToOpaque && !toBeauty.enabled) {
+        s.transitionToOpaquePipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.transitionToOpaquePipeline->create(s.device, toLayout, renderPass,
+                                                  coreShaders.vertex.get(),
+                                                  coreShaders.fragment.get())) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+    if (needToBlend && !toBeauty.enabled) {
+        if (!CreateVulkanTransitionBlendPipeline(s.device, toLayout, renderPass,
+                                                 coreShaders.vertex.get(),
+                                                 coreShaders.fragment.get(),
+                                                 &s.transitionToBlendPipeline)) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore),
+        0,
+        &imageIndex,
+        UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle = swapchain.getFramebufferHandle(imageIndex);
+    if (framebufferHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer = u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VulkanTransitionPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    const VkImageLayout fromLayoutState =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(fromHandle));
+    const VkImageLayout toLayoutState =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(toHandle));
+    passParams.fromImage = fromImage;
+    passParams.fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // A beautified layer's own crop pass (run by prepareTransitionLayer
+    // below) already performs the AHB layout transition when its current
+    // layout is undefined, so this pass must not transition it again.
+    passParams.transitionFromImage =
+        fromBeauty.enabled ? false : (fromLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
+    passParams.toImage = toImage;
+    passParams.toOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionToImage =
+        toBeauty.enabled ? false : (toLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
+
+    // Unlike the non-overlay overload above (which uses
+    // VulkanGraphicsCommandRecorder::recordTransitionPass /
+    // recordTransitionPassBody to begin/end the command buffer itself), this
+    // overlay path always begins the command buffer explicitly so overlay
+    // draws can be appended into the same open render pass afterward.
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(frame->commandBuffer, &beginInfo) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VulkanTransitionLayerResources fromRes;
+    VulkanTransitionLayerResources toRes;
+
+    if (!anyBeauty) {
+        // Byte-identical construction to the pre-existing non-beauty
+        // transition path's fromRes/toRes.
+        fromRes.pipeline = s.transitionFromPipeline ? s.transitionFromPipeline->get() : VK_NULL_HANDLE;
+        fromRes.pipelineLayout = fromLayout;
+        fromRes.descriptorSet = fromSet;
+        fromRes.pushConstants = makeVideoTransformFullPushConstants(transition.from);
+
+        toRes.pipelineLayout = toLayout;
+        toRes.descriptorSet = toSet;
+        toRes.pushConstants = makeVideoTransformFullPushConstants(transition.to);
+        if (needToBlend) {
+            toRes.pipeline = s.transitionToBlendPipeline;
+            toRes.useBlendConstants = true;
+            toRes.blendConstant =
+                static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightTo)));
+        } else if (s.transitionToOpaquePipeline) {
+            toRes.pipeline = s.transitionToOpaquePipeline->get();
+        }
+    } else {
+        // Beauty transition path: vkBeginCommandBuffer already happened
+        // above; run the beauty prepasses and resource construction exactly
+        // as the existing beauty branch, including the blend pipeline built
+        // with Beauty's placement pipeline layout for a beautified "to"
+        // crossfade.
+        if (!s.beautyRendererFrom) {
+            s.beautyRendererFrom = std::make_unique<VulkanBeautyFrameRenderer>();
+        }
+        if (!s.beautyRendererTo) {
+            s.beautyRendererTo = std::make_unique<VulkanBeautyFrameRenderer>();
+        }
+
+        VulkanBeautyTransitionLayerResources fromBeautyRes;
+        VulkanBeautyTransitionLayerResources toBeautyRes;
+        std::string beautyFailureReason;
+        const auto physDev = static_cast<VkPhysicalDevice>(physicalDeviceHandle);
+
+        if (fromBeauty.enabled) {
+            if (!s.beautyRendererFrom->prepareTransitionLayer(
+                    s.device, physDev, frame->commandBuffer, s.currentFrameIndex, frameCount,
+                    *fromImage, fromLayoutState, coreShaders.vertex.get(), coreShaders.fragment.get(),
+                    transition.from, fromBeauty, renderPass, &fromBeautyRes, &beautyFailureReason)) {
+                VGLOG_VFR("transition overlay beauty prepareTransitionLayer(from) failed: %s",
+                          beautyFailureReason.c_str());
+                abandonRecordingCommandBuffer(frame->commandBuffer);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+        if (toBeauty.enabled) {
+            if (!s.beautyRendererTo->prepareTransitionLayer(
+                    s.device, physDev, frame->commandBuffer, s.currentFrameIndex, frameCount,
+                    *toImage, toLayoutState, coreShaders.vertex.get(), coreShaders.fragment.get(),
+                    transition.to, toBeauty, renderPass, &toBeautyRes, &beautyFailureReason)) {
+                VGLOG_VFR("transition overlay beauty prepareTransitionLayer(to) failed: %s",
+                          beautyFailureReason.c_str());
+                abandonRecordingCommandBuffer(frame->commandBuffer);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+
+        // Pipeline-layout correctness: a beautified "to" layer blended for
+        // crossfade needs a blend pipeline built with Beauty's placement
+        // pipeline layout, never the AHB import layout.
+        if (needToBlend && toBeauty.enabled) {
+            if (!CreateVulkanTransitionBlendPipeline(s.device, toBeautyRes.pipelineLayout, renderPass,
+                                                     coreShaders.vertex.get(), coreShaders.fragment.get(),
+                                                     &s.transitionToBlendPipeline)) {
+                abandonRecordingCommandBuffer(frame->commandBuffer);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+
+        if (fromBeauty.enabled) {
+            fromRes.pipeline = fromBeautyRes.pipeline;
+            fromRes.pipelineLayout = fromBeautyRes.pipelineLayout;
+            fromRes.descriptorSet = fromBeautyRes.descriptorSet;
+            fromRes.pushConstants = makeVideoTransformFullPushConstants(fromBeautyRes.placementTransform);
+        } else {
+            fromRes.pipeline = s.transitionFromPipeline ? s.transitionFromPipeline->get() : VK_NULL_HANDLE;
+            fromRes.pipelineLayout = fromLayout;
+            fromRes.descriptorSet = fromSet;
+            fromRes.pushConstants = makeVideoTransformFullPushConstants(transition.from);
+        }
+
+        if (toBeauty.enabled) {
+            toRes.pipelineLayout = toBeautyRes.pipelineLayout;
+            toRes.descriptorSet = toBeautyRes.descriptorSet;
+            toRes.pushConstants = makeVideoTransformFullPushConstants(toBeautyRes.placementTransform);
+        } else {
+            toRes.pipelineLayout = toLayout;
+            toRes.descriptorSet = toSet;
+            toRes.pushConstants = makeVideoTransformFullPushConstants(transition.to);
+        }
+        if (needToBlend) {
+            toRes.pipeline = s.transitionToBlendPipeline;
+            toRes.useBlendConstants = true;
+            toRes.blendConstant =
+                static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightTo)));
+        } else if (toBeauty.enabled) {
+            toRes.pipeline = toBeautyRes.pipeline;
+        } else if (s.transitionToOpaquePipeline) {
+            toRes.pipeline = s.transitionToOpaquePipeline->get();
+        }
+    }
+
+    // Shared transition mode plan switch: identical to the non-beauty and
+    // beauty branches above, appending each layer's draws to passParams.
+    bool planOk = true;
+    switch (mode) {
+        case VulkanTransitionDrawMode::kFromOnly:
+            planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false);
+            break;
+        case VulkanTransitionDrawMode::kToOnly:
+            planOk = AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+            break;
+        case VulkanTransitionDrawMode::kPaintOver:
+        case VulkanTransitionDrawMode::kCrossfade:
+            planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
+                     AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
+            break;
+    }
+    if (!planOk) {
+        // The command buffer is recording but no render pass has been opened
+        // yet: close it best-effort before failClosed, never
+        // vkCmdEndRenderPass on this path.
+        abandonRecordingCommandBuffer(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen(passParams)) {
+        // recordTransitionPassBodyKeepOpen validates its params BEFORE
+        // opening the render pass, so a false return here leaves the command
+        // buffer recording with no render pass ever opened.
+        abandonRecordingCommandBuffer(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.overlayRenderer) {
+        s.overlayRenderer = std::make_unique<VulkanOverlayFrameRenderer>();
+    }
+    std::string overlayFailureReason;
+    const bool overlayOk = s.overlayRenderer->recordOverlayDraws(
+        static_cast<void*>(s.device),
+        static_cast<void*>(frame->commandBuffer),
+        reinterpret_cast<void*>(coreShaders.vertex.get()),
+        reinterpret_cast<void*>(coreShaders.fragment.get()),
+        renderPassHandle,
+        extentWidth,
+        extentHeight,
+        overlayDraws,
+        overlayCount,
+        &overlayFailureReason);
+    if (!overlayOk) {
+        VGLOG_VFR("transition overlay recordOverlayDraws failed: %s", overlayFailureReason.c_str());
+        // recordTransitionPassBodyKeepOpen already opened the render pass
+        // above; overlayFrameDrawsValid() already ruled out invalid caller
+        // data before either happened, so this is a genuine resource
+        // failure. Close the open render pass / command buffer best-effort
+        // before failClosed -- never submit or present on this path.
+        abandonOpenRenderPass(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    vkCmdEndRenderPass(frame->commandBuffer);
+    if (vkEndCommandBuffer(frame->commandBuffer) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VkSemaphore waitSemaphores[3] = {
+        frame->imageAvailableSemaphore,
+        VK_NULL_HANDLE,
+        VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[3] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t fromPendingAcquire = ahbImports.getPendingAcquireSemaphoreHandle(fromHandle);
+    const uint64_t toPendingAcquire = ahbImports.getPendingAcquireSemaphoreHandle(toHandle);
+    if (fromPendingAcquire != 0) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(fromPendingAcquire);
+    }
+    if (toPendingAcquire != 0 && toPendingAcquire != fromPendingAcquire) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(toPendingAcquire);
+    }
+
+    const bool canExportRelease =
+        (frame->releaseFenceSemaphore != VK_NULL_HANDLE) && (s.pfnGetSemaphoreFd != nullptr);
+
+    VkSemaphore signalSemaphores[2] = {
+        presentReadySemaphore,
+        VK_NULL_HANDLE,
+    };
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+
+    const VkQueue queue = static_cast<VkQueue>(queueHandle);
+    const VkResult submitResult =
+        vkQueueSubmit(queue, 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        const RenderFrameResult result =
+            (submitResult == VK_ERROR_DEVICE_LOST)
+                ? RenderFrameResult::kDeviceLost
+                : RenderFrameResult::kVulkanFailure;
+        return s.failClosed(swapchain, ahbImports, result);
+    }
+
+    // Both imports were consumed by this submission: tag both records with
+    // the frame slot so their deferred retirement waits for this fence.
+    if (!ahbImports.markBufferSubmitted(fromHandle, s.currentFrameIndex) ||
+        !ahbImports.markBufferSubmitted(toHandle, s.currentFrameIndex)) {
+        VGLOG_VFR("transition overlay markBufferSubmitted failed for handles %" PRIu64 "/%" PRIu64
+                  "; failing closed",
+                  static_cast<uint64_t>(fromHandle), static_cast<uint64_t>(toHandle));
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // Release-fence export (see renderFrame): a sync-fd export has wait
+    // semantics on the semaphore payload, so export exactly once and hand the
+    // "to" record a dup() of the same fd (or -1 when no fd was produced).
+    {
+        if (canExportRelease) {
+            int exportedFd = -1;
+            VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+            semGetFdInfo.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+            semGetFdInfo.pNext      = nullptr;
+            semGetFdInfo.semaphore  = frame->releaseFenceSemaphore;
+            semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            const VkResult exportResult =
+                s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &exportedFd);
+            if (exportResult != VK_SUCCESS) {
+                VGLOG_VFR("transition overlay vkGetSemaphoreFdKHR failed: %d; clearing stored release fds",
+                          static_cast<int>(exportResult));
+                if (exportedFd >= 0) {
+                    ::close(exportedFd);
+                }
+                ahbImports.setLatestReleaseFenceFd(fromHandle, -1);
+                ahbImports.setLatestReleaseFenceFd(toHandle, -1);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+            int dupFd = -1;
+            if (exportedFd >= 0) {
+                dupFd = ::dup(exportedFd);
+                if (dupFd < 0) dupFd = -1;
+            }
+            ahbImports.setLatestReleaseFenceFd(fromHandle, exportedFd);
+            ahbImports.setLatestReleaseFenceFd(toHandle, dupFd);
+        } else {
+            ahbImports.setLatestReleaseFenceFd(fromHandle, -1);
+            ahbImports.setLatestReleaseFenceFd(toHandle, -1);
+        }
+    }
+
+    if ((fromPendingAcquire != 0 && !ahbImports.markAcquireSemaphoreSubmitted(fromHandle)) ||
+        (toPendingAcquire != 0 && !ahbImports.markAcquireSemaphoreSubmitted(toHandle))) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!ahbImports.setImageLayout(
+            fromHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) ||
+        !ahbImports.setImageLayout(
+            toHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle,
+        presentReadySemaphoreHandle,
+        imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal
+                : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+}
+
 } // namespace render
 } // namespace vanguard
 
@@ -2141,6 +2700,41 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
         !ahbImports.hasBuffer(fromHandle) || ahbImports.getImage(fromHandle) == nullptr ||
         !ahbImports.hasBuffer(toHandle) || ahbImports.getImage(toHandle) == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
+    }
+    return RenderFrameResult::kUnavailable;
+}
+
+// P5-OVERLAYS-TRANSITION-COMP-N1: host-build stub for the overlay-aware
+// transition frame overload, mirroring the overlay renderFrame host stub's
+// pattern: no Vulkan is available on host, so this always reports
+// unavailable once past the same argument validation as the two-source
+// transition stub above. Native-only: no JNI/Kotlin route calls this yet.
+RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
+    void* /*queueHandle*/,
+    void* /*physicalDeviceHandle*/,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& /*coreShaders*/,
+    HardwareBufferHandle fromHandle,
+    HardwareBufferHandle toHandle,
+    const VideoTransitionFrameTransform& /*transition*/,
+    const VulkanOverlayFrameDraw* overlayDraws,
+    uint32_t overlayCount,
+    const VideoBeautyV2RenderParams& /*fromBeauty*/,
+    const VideoBeautyV2RenderParams& /*toBeauty*/) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (fromHandle == toHandle ||
+        !ahbImports.hasBuffer(fromHandle) || ahbImports.getImage(fromHandle) == nullptr ||
+        !ahbImports.hasBuffer(toHandle) || ahbImports.getImage(toHandle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (overlayCount > 0 && overlayDraws == nullptr) {
+        return RenderFrameResult::kVulkanFailure;
     }
     return RenderFrameResult::kUnavailable;
 }

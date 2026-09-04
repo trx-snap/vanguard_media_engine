@@ -108,6 +108,26 @@ public:
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{}) override;
 
+    // P5-OVERLAYS-TRANSITION-COMP-N1 native-only seam: renderTransitionFrame
+    // with an optional set of already-resolved overlay draws composited
+    // after the transition layer draws in the SAME final swapchain render
+    // pass, mirroring the overlay renderFrame overload above and
+    // VulkanFrameRenderer's overlay-aware renderTransitionFrame overload.
+    // Not part of the shared RenderBackend interface, so this is a concrete
+    // VulkanBackend-only addition (no `override`); the RenderBackend
+    // override just above is unchanged. overlayDraws/overlayCount carry no
+    // default, so a caller must always be explicit about the overlay set;
+    // overlayDraws may be null only when overlayCount is 0. This slice does
+    // not add a JNI/Kotlin route or change export admission.
+    RenderFrameResult renderTransitionFrame(
+        HardwareBufferHandle fromHandle,
+        HardwareBufferHandle toHandle,
+        const VideoTransitionFrameTransform& transition,
+        const VulkanOverlayFrameDraw* overlayDraws,
+        uint32_t overlayCount,
+        const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
+        const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
+
     // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
     // sub-slice N4: backend-owned Vulkan overlay texture store for static
     // sticker RGBA pixels (see the private VulkanOverlayTextureStore
