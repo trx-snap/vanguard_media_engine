@@ -9,12 +9,21 @@
 // host builds. It is added via the Android-only target_sources block in
 // src/CMakeLists.txt.
 //
-// JNI entry point (matching VanguardNativeBridge.kt P3-MULTICAM-NODE
-// declaration):
+// JNI entry points (matching VanguardNativeBridge.kt P3-MULTICAM-NODE
+// declarations):
 //   runAndroidDagPhase3MultiCamCompositorSmoke -> jstring
+//   runAndroidDagPhase3MultiCamDescriptorBridgeSmoke -> jstring
+//
+// The second entry point is the P3-MULTICAM-NODE-DART-TO-NATIVE-LAYOUT-MAP-
+// BRIDGE diagnostic: it consumes the primitive fields already parsed out of a
+// Dart VGLivePreviewConfig/VGDualCameraDescriptor layout map by the Kotlin
+// coordinator and converts them into a native MultiCamLayout, proving Dart
+// layout-map consumption only. No camera open, no concurrent capture, no
+// render, no OES, no recording/export, no product/editor UI, no iOS.
 
 #include <jni.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -100,6 +109,57 @@ MultiCamLayout MakeSplitLayout(double canvasWidth, double canvasHeight, MultiCam
     layout.pip = MakePiP(MultiCamPiPAnchor::kFreeFloating, 0.5, 0.5, 0.35, 9.0 / 16.0, 0.05, 0.0, 1.0);
     layout.split = split;
     return layout;
+}
+
+// --- Dart layout-map -> native enum bridge helpers --------------------------
+
+std::string JStringToStdString(JNIEnv* env, jstring value) {
+    if (!value) return std::string();
+    const char* chars = env->GetStringUTFChars(value, nullptr);
+    if (!chars) return std::string();
+    std::string result(chars);
+    env->ReleaseStringUTFChars(value, chars);
+    return result;
+}
+
+// Mirrors VGDualCameraLayoutModeExtension.fromValue: unknown/missing -> pip.
+MultiCamLayoutMode ResolveLayoutMode(const std::string& raw) {
+    if (raw == "splitScreen") return MultiCamLayoutMode::kSplitScreen;
+    return MultiCamLayoutMode::kPictureInPicture;
+}
+
+const char* LayoutModeName(MultiCamLayoutMode mode) {
+    return mode == MultiCamLayoutMode::kSplitScreen ? "splitScreen" : "pip";
+}
+
+// Mirrors VGPiPAnchorExtension.fromValue: unknown/missing -> bottomRight.
+MultiCamPiPAnchor ResolveAnchor(const std::string& raw) {
+    if (raw == "topLeft") return MultiCamPiPAnchor::kTopLeft;
+    if (raw == "topRight") return MultiCamPiPAnchor::kTopRight;
+    if (raw == "bottomLeft") return MultiCamPiPAnchor::kBottomLeft;
+    if (raw == "freeFloating") return MultiCamPiPAnchor::kFreeFloating;
+    return MultiCamPiPAnchor::kBottomRight;
+}
+
+const char* AnchorName(MultiCamPiPAnchor anchor) {
+    switch (anchor) {
+        case MultiCamPiPAnchor::kTopLeft: return "topLeft";
+        case MultiCamPiPAnchor::kTopRight: return "topRight";
+        case MultiCamPiPAnchor::kBottomLeft: return "bottomLeft";
+        case MultiCamPiPAnchor::kBottomRight: return "bottomRight";
+        case MultiCamPiPAnchor::kFreeFloating: return "freeFloating";
+    }
+    return "bottomRight";
+}
+
+// Mirrors VGSplitScreenDirectionExtension.fromValue: unknown/missing -> topBottom.
+MultiCamSplitDirection ResolveSplitDirection(const std::string& raw) {
+    if (raw == "leftRight") return MultiCamSplitDirection::kLeftRight;
+    return MultiCamSplitDirection::kTopBottom;
+}
+
+const char* SplitDirectionName(MultiCamSplitDirection direction) {
+    return direction == MultiCamSplitDirection::kLeftRight ? "leftRight" : "topBottom";
 }
 
 } // namespace
@@ -294,6 +354,106 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     oss << "status=" << (allPass ? "PASS" : "FAIL") << ";"
         << detail.str()
         << "proofBoundary=native_multicam_compositor_node_topology_and_layout_math_only_no_render_no_camera_no_recording";
+
+    const std::string resultStr = oss.str();
+    return env->NewStringUTF(resultStr.c_str());
+}
+
+// P3-MULTICAM-NODE-DART-TO-NATIVE-LAYOUT-MAP-BRIDGE: consumes the primitive
+// fields the Kotlin coordinator already parsed out of a Dart layout map
+// (VGLivePreviewConfig / VGDualCameraDescriptor layout subset: layoutMode,
+// pipLayout.{anchor,centerX,centerY,widthFraction,aspectRatio,
+// marginFraction,cornerRadius,opacity}, splitLayout.{direction,splitRatio}),
+// maps each string field to the matching native MultiCam* enum with the same
+// unknown-value fallbacks as the Dart *Extension.fromValue helpers, builds a
+// MultiCamLayout on a fixed diagnostic canvas, and calls the already-verified
+// MultiCamCompositorNode::computeLayout(). Proves freeFloating PiP center
+// geometry consumption (secondary viewport center reproduces the input
+// centerX/centerY) and leftRight split consumption (primary/secondary
+// viewport widths reproduce splitRatio with no gap/overlap) when the caller's
+// mode/anchor/direction select those lanes. Diagnostic only: no camera open,
+// no concurrent capture, no render, no OES, no recording/export, no
+// product/editor UI, no iOS.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+    JNIEnv* env,
+    jobject /* this */,
+    jstring layoutModeJ,
+    jstring pipAnchorJ,
+    jdouble pipCenterX,
+    jdouble pipCenterY,
+    jdouble pipWidthFraction,
+    jdouble pipAspectRatio,
+    jdouble pipMarginFraction,
+    jdouble pipCornerRadius,
+    jdouble pipOpacity,
+    jstring splitDirectionJ,
+    jdouble splitRatio) {
+
+    const MultiCamLayoutMode layoutMode = ResolveLayoutMode(JStringToStdString(env, layoutModeJ));
+    const MultiCamPiPAnchor anchor = ResolveAnchor(JStringToStdString(env, pipAnchorJ));
+    const MultiCamSplitDirection direction = ResolveSplitDirection(JStringToStdString(env, splitDirectionJ));
+
+    constexpr double kBridgeCanvasWidth = 1920.0;
+    constexpr double kBridgeCanvasHeight = 1080.0;
+
+    MultiCamLayout layout{};
+    layout.mode = layoutMode;
+    layout.canvasWidth = kBridgeCanvasWidth;
+    layout.canvasHeight = kBridgeCanvasHeight;
+    layout.pip = MakePiP(anchor, pipCenterX, pipCenterY, pipWidthFraction, pipAspectRatio,
+                          pipMarginFraction, pipCornerRadius, pipOpacity);
+    layout.split = MakeSplit(direction, splitRatio);
+
+    const MultiCamLayoutResult result = MultiCamCompositorNode::computeLayout(layout);
+
+    const bool rectsFiniteInUnitOk =
+        RectIsFiniteInUnit(result.primaryViewport) &&
+        RectIsFiniteInUnit(result.secondaryViewport) &&
+        IsFiniteInUnit(result.secondaryOpacity) &&
+        IsFiniteInUnit(result.secondaryCornerRadiusFractionOfCanvasWidth);
+
+    const bool pipCenterApplicable =
+        layoutMode == MultiCamLayoutMode::kPictureInPicture &&
+        anchor == MultiCamPiPAnchor::kFreeFloating;
+    double secondaryCenterX = 0.0;
+    double secondaryCenterY = 0.0;
+    bool pipCenterOk = true;
+    if (pipCenterApplicable) {
+        secondaryCenterX = result.secondaryViewport.x + result.secondaryViewport.width / 2.0;
+        secondaryCenterY = result.secondaryViewport.y + result.secondaryViewport.height / 2.0;
+        pipCenterOk = NearlyEqual(secondaryCenterX, pipCenterX) && NearlyEqual(secondaryCenterY, pipCenterY);
+    }
+
+    const bool splitConsumptionApplicable =
+        layoutMode == MultiCamLayoutMode::kSplitScreen &&
+        direction == MultiCamSplitDirection::kLeftRight;
+    bool splitConsumptionOk = true;
+    if (splitConsumptionApplicable) {
+        splitConsumptionOk =
+            RectNearlyEquals(result.primaryViewport, 0.0, 0.0, splitRatio, 1.0) &&
+            RectNearlyEquals(result.secondaryViewport, splitRatio, 0.0, 1.0 - splitRatio, 1.0) &&
+            NearlyEqual(result.primaryViewport.x + result.primaryViewport.width, result.secondaryViewport.x) &&
+            NearlyEqual(result.primaryViewport.width + result.secondaryViewport.width, 1.0);
+    }
+
+    const bool allPass = rectsFiniteInUnitOk && pipCenterOk && splitConsumptionOk;
+
+    std::ostringstream oss;
+    oss << "status=" << (allPass ? "PASS" : "FAIL") << ";"
+        << "layoutModeResolved=" << LayoutModeName(layoutMode) << ";"
+        << "anchorResolved=" << AnchorName(anchor) << ";"
+        << "directionResolved=" << SplitDirectionName(direction) << ";"
+        << "rectsFiniteInUnitOk=" << (rectsFiniteInUnitOk ? "true" : "false") << ";"
+        << "pipCenterApplicable=" << (pipCenterApplicable ? "true" : "false") << ";"
+        << "pipCenterOk=" << (pipCenterOk ? "true" : "false") << ";"
+        << "pipSecondaryCenterX=" << secondaryCenterX << ";"
+        << "pipSecondaryCenterY=" << secondaryCenterY << ";"
+        << "splitConsumptionApplicable=" << (splitConsumptionApplicable ? "true" : "false") << ";"
+        << "splitConsumptionOk=" << (splitConsumptionOk ? "true" : "false") << ";"
+        << "splitPrimaryWidth=" << result.primaryViewport.width << ";"
+        << "splitSecondaryWidth=" << result.secondaryViewport.width << ";"
+        << "proofBoundary=dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product";
 
     const std::string resultStr = oss.str();
     return env->NewStringUTF(resultStr.c_str());

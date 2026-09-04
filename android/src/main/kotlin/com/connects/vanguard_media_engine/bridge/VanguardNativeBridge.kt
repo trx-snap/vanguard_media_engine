@@ -2069,6 +2069,33 @@ class VanguardNativeBridge(
     // no file IO, no recording/export claim.
     external fun runAndroidDagPhase3MultiCamCompositorSmoke(): String
 
+    // -- P3-MULTICAM-NODE-DART-TO-NATIVE-LAYOUT-MAP-BRIDGE: Dart layout-map --
+    // to native MultiCamLayout translation diagnostic. Consumes the primitive
+    // fields already parsed out of a Dart VGLivePreviewConfig/
+    // VGDualCameraDescriptor layout map (layoutMode, pipLayout.anchor/
+    // centerX/centerY/widthFraction/aspectRatio/marginFraction/cornerRadius/
+    // opacity, splitLayout.direction/splitRatio), maps each string field to
+    // the matching native MultiCam* enum (unknown layoutMode -> PiP, unknown
+    // anchor -> bottomRight, unknown split direction -> topBottom), builds a
+    // MultiCamLayout, and calls the already-verified
+    // MultiCamCompositorNode::computeLayout(). Diagnostic only: proves Dart
+    // layout-map consumption into native layout math. No camera open, no
+    // concurrent capture, no render, no OES, no recording/export, no
+    // product/editor UI, no iOS.
+    external fun runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+        layoutMode: String,
+        pipAnchor: String,
+        pipCenterX: Double,
+        pipCenterY: Double,
+        pipWidthFraction: Double,
+        pipAspectRatio: Double,
+        pipMarginFraction: Double,
+        pipCornerRadius: Double,
+        pipOpacity: Double,
+        splitDirection: String,
+        splitRatio: Double,
+    ): String
+
     // ── P3-MULTICAM-NODE: GLES-first spatial multi-texture diagnostic render ──
     // pass physical proof. Render-only: draws two already-imported textures
     // into two independent glViewport-scoped pixel rectangles derived from

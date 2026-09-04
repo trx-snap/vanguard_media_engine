@@ -36,6 +36,90 @@ VGMultiCamCompositorSmokeReport _createSampleReport([
   Map<String, Object?>? overrides,
 ]) => VGMultiCamCompositorSmokeReport.fromMap(_createSampleRawMap(overrides));
 
+Map<String, Object?> _createFreeFloatingBridgeRawMap([
+  Map<String, Object?>? overrides,
+]) => {
+  'pass': true,
+  'decision': 'pass',
+  'raw':
+      'status=PASS;'
+      'layoutModeResolved=pip;'
+      'anchorResolved=freeFloating;'
+      'directionResolved=topBottom;'
+      'rectsFiniteInUnitOk=true;'
+      'pipCenterApplicable=true;'
+      'pipCenterOk=true;'
+      'pipSecondaryCenterX=0.35;'
+      'pipSecondaryCenterY=0.65;'
+      'splitConsumptionApplicable=false;'
+      'splitConsumptionOk=true;'
+      'splitPrimaryWidth=0.5;'
+      'splitSecondaryWidth=0.5;'
+      'proofBoundary=dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+  'proofBoundary':
+      'dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+  'metrics': const <String, String>{
+    'status': 'PASS',
+    'layoutModeResolved': 'pip',
+    'anchorResolved': 'freeFloating',
+    'directionResolved': 'topBottom',
+    'rectsFiniteInUnitOk': 'true',
+    'pipCenterApplicable': 'true',
+    'pipCenterOk': 'true',
+    'pipSecondaryCenterX': '0.35',
+    'pipSecondaryCenterY': '0.65',
+    'splitConsumptionApplicable': 'false',
+    'splitConsumptionOk': 'true',
+    'splitPrimaryWidth': '0.5',
+    'splitSecondaryWidth': '0.5',
+    'proofBoundary':
+        'dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+  },
+  if (overrides != null) ...overrides,
+};
+
+Map<String, Object?> _createLeftRightBridgeRawMap([
+  Map<String, Object?>? overrides,
+]) => {
+  'pass': true,
+  'decision': 'pass',
+  'raw':
+      'status=PASS;'
+      'layoutModeResolved=splitScreen;'
+      'anchorResolved=bottomRight;'
+      'directionResolved=leftRight;'
+      'rectsFiniteInUnitOk=true;'
+      'pipCenterApplicable=false;'
+      'pipCenterOk=true;'
+      'pipSecondaryCenterX=0.0;'
+      'pipSecondaryCenterY=0.0;'
+      'splitConsumptionApplicable=true;'
+      'splitConsumptionOk=true;'
+      'splitPrimaryWidth=0.65;'
+      'splitSecondaryWidth=0.35;'
+      'proofBoundary=dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+  'proofBoundary':
+      'dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+  'metrics': const <String, String>{
+    'status': 'PASS',
+    'layoutModeResolved': 'splitScreen',
+    'anchorResolved': 'bottomRight',
+    'directionResolved': 'leftRight',
+    'rectsFiniteInUnitOk': 'true',
+    'pipCenterApplicable': 'false',
+    'pipCenterOk': 'true',
+    'pipSecondaryCenterX': '0.0',
+    'pipSecondaryCenterY': '0.0',
+    'splitConsumptionApplicable': 'true',
+    'splitConsumptionOk': 'true',
+    'splitPrimaryWidth': '0.65',
+    'splitSecondaryWidth': '0.35',
+    'proofBoundary':
+        'dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+  },
+  if (overrides != null) ...overrides,
+};
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -491,6 +575,367 @@ void main() {
 
         final report =
             await VGMultiCamCompositorSmokeReport.runAndroidDagPhase3MultiCamCompositorSmoke(
+              channel: channel,
+            );
+
+        expect(report.pass, isFalse);
+        expect(
+          report.decision,
+          equals(VGMultiCamCompositorSmokeDecision.harnessException),
+        );
+        expect(report.isHarnessException, isTrue);
+        expect(report.raw, contains('status=FAIL;reason='));
+        expect(report.allNativeLanesPass, isFalse);
+      },
+    );
+  });
+
+  group('VGMultiCamDescriptorBridgeSmokeReport fromMap and toMap', () {
+    test(
+      'freeFloating PiP report parses and round-trips all fields cleanly',
+      () {
+        final report = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+          _createFreeFloatingBridgeRawMap(),
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.decision, equals(VGMultiCamCompositorSmokeDecision.pass));
+        expect(report.isPass, isTrue);
+        expect(report.isFail, isFalse);
+        expect(report.isHarnessException, isFalse);
+
+        expect(report.layoutModeResolved, equals('pip'));
+        expect(report.anchorResolved, equals('freeFloating'));
+        expect(report.directionResolved, equals('topBottom'));
+        expect(report.rectsFiniteInUnitPass, isTrue);
+        expect(report.pipCenterApplicable, isTrue);
+        expect(report.pipCenterPass, isTrue);
+        expect(report.splitConsumptionApplicable, isFalse);
+        expect(report.allNativeLanesPass, isTrue);
+        expect(report.hasCanonicalProofBoundary, isTrue);
+        expect(
+          report.proofBoundary,
+          equals(VGMultiCamDescriptorBridgeSmokeReport.proofBoundaryConstant),
+        );
+        expect(report.metrics['pipSecondaryCenterX'], equals('0.35'));
+        expect(report.metrics['pipSecondaryCenterY'], equals('0.65'));
+
+        final serialized = report.toMap();
+        expect(serialized['pass'], isTrue);
+        expect(serialized['decision'], equals('pass'));
+        expect(serialized['raw'], equals(report.raw));
+        expect(serialized['proofBoundary'], equals(report.proofBoundary));
+        expect(serialized['metrics'], equals(report.metrics));
+
+        final roundTrip = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+          serialized,
+        );
+        expect(roundTrip, equals(report));
+      },
+    );
+
+    test(
+      'leftRight split report parses and round-trips all fields cleanly',
+      () {
+        final report = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+          _createLeftRightBridgeRawMap(),
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.layoutModeResolved, equals('splitScreen'));
+        expect(report.anchorResolved, equals('bottomRight'));
+        expect(report.directionResolved, equals('leftRight'));
+        expect(report.rectsFiniteInUnitPass, isTrue);
+        expect(report.pipCenterApplicable, isFalse);
+        expect(report.splitConsumptionApplicable, isTrue);
+        expect(report.splitConsumptionPass, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+        expect(report.hasCanonicalProofBoundary, isTrue);
+        expect(report.metrics['splitPrimaryWidth'], equals('0.65'));
+        expect(report.metrics['splitSecondaryWidth'], equals('0.35'));
+      },
+    );
+
+    test('allNativeLanesPass is false when the applicable lane fails', () {
+      final pipFail = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+        _createFreeFloatingBridgeRawMap({
+          'metrics': const <String, String>{
+            'pipCenterApplicable': 'true',
+            'pipCenterOk': 'false',
+            'rectsFiniteInUnitOk': 'true',
+            'splitConsumptionApplicable': 'false',
+            'splitConsumptionOk': 'true',
+          },
+        }),
+      );
+      expect(pipFail.pipCenterPass, isFalse);
+      expect(pipFail.allNativeLanesPass, isFalse);
+
+      final splitFail = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+        _createLeftRightBridgeRawMap({
+          'metrics': const <String, String>{
+            'pipCenterApplicable': 'false',
+            'pipCenterOk': 'true',
+            'rectsFiniteInUnitOk': 'true',
+            'splitConsumptionApplicable': 'true',
+            'splitConsumptionOk': 'false',
+          },
+        }),
+      );
+      expect(splitFail.splitConsumptionPass, isFalse);
+      expect(splitFail.allNativeLanesPass, isFalse);
+
+      final rectsFail = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+        _createFreeFloatingBridgeRawMap({
+          'metrics': const <String, String>{
+            'pipCenterApplicable': 'false',
+            'splitConsumptionApplicable': 'false',
+            'rectsFiniteInUnitOk': 'false',
+          },
+        }),
+      );
+      expect(rectsFail.rectsFiniteInUnitPass, isFalse);
+      expect(rectsFail.allNativeLanesPass, isFalse);
+    });
+
+    test('fromMap handles malformed non-map inputs defensively', () {
+      for (final invalid in [
+        null,
+        'not_a_map',
+        12345,
+        3.14,
+        <Object?>['a', 'b'],
+      ]) {
+        final report = VGMultiCamDescriptorBridgeSmokeReport.fromMap(invalid);
+        expect(report.pass, isFalse);
+        expect(
+          report.decision,
+          equals(VGMultiCamCompositorSmokeDecision.harnessException),
+        );
+        expect(report.isHarnessException, isTrue);
+        expect(report.proofBoundary, isEmpty);
+        expect(
+          report.metrics,
+          equals(const <String, String>{'reason': 'native_result_not_a_map'}),
+        );
+        expect(report.allNativeLanesPass, isFalse);
+        expect(report.hasCanonicalProofBoundary, isFalse);
+      }
+    });
+
+    test('fromMap parses a malformed descriptor layout map failure (Kotlin '
+        'makeFailedMap fail-closed shape) with metrics status=FAIL', () {
+      // Mirrors AndroidMultiCamCompositorSmokeCoordinator.makeFailedMap's
+      // output for the malformed_descriptor_layout_map fail-closed branch.
+      final report = VGMultiCamDescriptorBridgeSmokeReport.fromMap(const {
+        'pass': false,
+        'raw': 'status=FAIL;reason=malformed_descriptor_layout_map',
+        'decision': 'fail',
+        'proofBoundary':
+            'dart_layout_map_to_native_multicam_layout_diagnostic_only_no_camera_no_render_no_recording_no_product',
+        'metrics': <String, String>{
+          'status': 'FAIL',
+          'reason': 'malformed_descriptor_layout_map',
+        },
+      });
+
+      expect(report.pass, isFalse);
+      expect(report.decision, equals(VGMultiCamCompositorSmokeDecision.fail));
+      expect(report.isFail, isTrue);
+      expect(report.isPass, isFalse);
+      expect(report.isHarnessException, isFalse);
+      expect(report.metrics['status'], equals('FAIL'));
+      expect(
+        report.metrics['reason'],
+        equals('malformed_descriptor_layout_map'),
+      );
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(
+        report.proofBoundary,
+        equals(VGMultiCamDescriptorBridgeSmokeReport.proofBoundaryConstant),
+      );
+    });
+
+    test('value semantics: equality and stable metrics hash', () {
+      final a = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+        _createFreeFloatingBridgeRawMap(),
+      );
+      final b = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+        _createFreeFloatingBridgeRawMap(),
+      );
+      expect(identical(a, a), isTrue);
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+      expect(a.toString(), contains('VGMultiCamDescriptorBridgeSmokeReport('));
+
+      final different = VGMultiCamDescriptorBridgeSmokeReport.fromMap(
+        _createFreeFloatingBridgeRawMap({'pass': false}),
+      );
+      expect(a, isNot(equals(different)));
+    });
+  });
+
+  group('MethodChannel runAndroidDagPhase3MultiCamDescriptorBridgeSmoke', () {
+    VGLivePreviewConfig freeFloatingConfig() => const VGLivePreviewConfig(
+      layoutMode: VGDualCameraLayoutMode.pip,
+      pipLayout: VGPiPLayoutDescriptor(
+        anchor: VGPiPAnchor.freeFloating,
+        centerX: 0.35,
+        centerY: 0.65,
+        aspectRatio: 1.0,
+      ),
+    );
+
+    VGLivePreviewConfig leftRightConfig() => const VGLivePreviewConfig(
+      layoutMode: VGDualCameraLayoutMode.splitScreen,
+      splitLayout: VGSplitScreenLayoutDescriptor(
+        splitRatio: 0.65,
+        direction: VGSplitScreenDirection.leftRight,
+      ),
+    );
+
+    test(
+      'invokes runAndroidDagPhase3MultiCamDescriptorBridgeSmoke with config.toMap() as the argument',
+      () async {
+        MethodCall? capturedCall;
+        const channel = MethodChannel('test_multicam_bridge_smoke_channel');
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          capturedCall = call;
+          return _createFreeFloatingBridgeRawMap();
+        });
+
+        final config = freeFloatingConfig();
+        final report =
+            await VGMultiCamDescriptorBridgeSmokeReport.runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+              config: config,
+              channel: channel,
+            );
+
+        expect(capturedCall, isNotNull);
+        expect(
+          capturedCall!.method,
+          equals('runAndroidDagPhase3MultiCamDescriptorBridgeSmoke'),
+        );
+        expect(capturedCall!.arguments, equals(config.toMap()));
+        expect(report.pass, isTrue);
+        expect(report.pipCenterApplicable, isTrue);
+        expect(report.pipCenterPass, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test('invokes with leftRight split config.toMap() as the argument', () async {
+      MethodCall? capturedCall;
+      const channel = MethodChannel('test_multicam_bridge_smoke_split_channel');
+      binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+        capturedCall = call;
+        return _createLeftRightBridgeRawMap();
+      });
+
+      final config = leftRightConfig();
+      final report =
+          await VGMultiCamDescriptorBridgeSmokeReport.runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+            config: config,
+            channel: channel,
+          );
+
+      expect(capturedCall, isNotNull);
+      expect(capturedCall!.arguments, equals(config.toMap()));
+      expect(report.splitConsumptionApplicable, isTrue);
+      expect(report.splitConsumptionPass, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('uses default vanguard_media_engine channel when omitted', () async {
+      MethodCall? capturedCall;
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedCall = call;
+        return _createFreeFloatingBridgeRawMap();
+      });
+
+      final report =
+          await VGMultiCamDescriptorBridgeSmokeReport.runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+            config: freeFloatingConfig(),
+          );
+
+      expect(capturedCall, isNotNull);
+      expect(
+        capturedCall!.method,
+        equals('runAndroidDagPhase3MultiCamDescriptorBridgeSmoke'),
+      );
+      expect(report.pass, isTrue);
+    });
+
+    test(
+      'handles PlatformException safely returning harnessException report',
+      () async {
+        const channel = MethodChannel(
+          'test_multicam_bridge_smoke_platform_exception',
+        );
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          throw PlatformException(
+            code: 'NATIVE_CRASH',
+            message: 'Simulated JNI error',
+          );
+        });
+
+        final report =
+            await VGMultiCamDescriptorBridgeSmokeReport.runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+              config: freeFloatingConfig(),
+              channel: channel,
+            );
+
+        expect(report.pass, isFalse);
+        expect(
+          report.decision,
+          equals(VGMultiCamCompositorSmokeDecision.harnessException),
+        );
+        expect(report.isHarnessException, isTrue);
+        expect(report.raw, contains('platform_exception:NATIVE_CRASH'));
+        expect(report.metrics['code'], equals('NATIVE_CRASH'));
+        expect(report.metrics['message'], equals('Simulated JNI error'));
+        expect(report.allNativeLanesPass, isFalse);
+      },
+    );
+
+    test('handles timeout safely returning harnessException report', () async {
+      const channel = MethodChannel('test_multicam_bridge_smoke_timeout');
+      binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        return _createFreeFloatingBridgeRawMap();
+      });
+
+      final report =
+          await VGMultiCamDescriptorBridgeSmokeReport.runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+            config: freeFloatingConfig(),
+            timeout: const Duration(milliseconds: 20),
+            channel: channel,
+          );
+
+      expect(report.pass, isFalse);
+      expect(
+        report.decision,
+        equals(VGMultiCamCompositorSmokeDecision.harnessException),
+      );
+      expect(report.isHarnessException, isTrue);
+      expect(report.raw, contains('status=FAIL;reason=timeout'));
+      expect(report.metrics['reason'], equals('timeout'));
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'handles generic exception safely returning harnessException report',
+      () async {
+        const channel = MethodChannel(
+          'test_multicam_bridge_smoke_generic_exception',
+        );
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          throw StateError('Generic unexpected error');
+        });
+
+        final report =
+            await VGMultiCamDescriptorBridgeSmokeReport.runAndroidDagPhase3MultiCamDescriptorBridgeSmoke(
+              config: freeFloatingConfig(),
               channel: channel,
             );
 
