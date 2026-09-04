@@ -12,6 +12,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderLoopS
 import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalFpsActionSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalListenerSmokeHarness
+import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalResolutionReconfigureSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxCapabilityProbe
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSampleIntegritySmokeHarness
@@ -83,6 +84,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AVGlesEvalRenderSmoke",
             "runAndroidDagPhase3UnitTThermalListenerSmoke",
             "runAndroidDagPhase3ThermalFpsActionSmoke",
+            "runAndroidDagPhase3ThermalResolutionReconfigureSmoke",
             "runAndroidVulkanExportNativeSeamSmoke",
             "runAndroidVulkanExportProductionWiringSmoke",
             "runAndroidGlesExportFitGeometrySmoke",
@@ -150,6 +152,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AVGlesEvalRenderSmoke" -> runPhase1AVGlesEvalRenderSmoke(args, result)
             "runAndroidDagPhase3UnitTThermalListenerSmoke" -> runPhase3UnitTThermalListenerSmoke(result)
             "runAndroidDagPhase3ThermalFpsActionSmoke" -> runPhase3ThermalFpsActionSmoke(args, result)
+            "runAndroidDagPhase3ThermalResolutionReconfigureSmoke" ->
+                runPhase3ThermalResolutionReconfigureSmoke(args, result)
             "runAndroidVulkanExportNativeSeamSmoke" -> runAndroidVulkanExportNativeSeamSmoke(args, result)
             "runAndroidVulkanExportProductionWiringSmoke" -> runAndroidVulkanExportProductionWiringSmoke(args, result)
             "runAndroidGlesExportFitGeometrySmoke" -> runAndroidGlesExportFitGeometrySmoke(args, result)
@@ -1159,6 +1163,27 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "THERMAL_FPS_ACTION_SMOKE_FAILED",
                         "runAndroidDagPhase3ThermalFpsActionSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P3-CAM-THERMAL-ACT-RESOLUTION-RECONFIG-DIAGNOSTIC: Android Camera2 single-camera resolution session reconfigure smoke --
+    private fun runPhase3ThermalResolutionReconfigureSmoke(
+        args: Map<*, *>?,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                val smokeResult = AndroidCamera2ThermalResolutionReconfigureSmokeHarness(context).run(args)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "THERMAL_RESOLUTION_RECONFIGURE_SMOKE_FAILED",
+                        "runAndroidDagPhase3ThermalResolutionReconfigureSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

@@ -146,6 +146,8 @@ export 'vg_camera2_thermal_load_shedding_policy.dart';
 export 'vg_camera2_thermal_load_shedding_monitor.dart';
 // P3-CAM-THERMAL-ACT-FPS-REQUEST-ACTION: Android Camera2 repeating-request AE target FPS range mutation smoke foundation.
 export 'vg_camera2_thermal_fps_action_smoke.dart';
+// P3-CAM-THERMAL-ACT-RESOLUTION-RECONFIG-DIAGNOSTIC: Android Camera2 single-camera session resolution reconfiguration smoke foundation.
+export 'vg_camera2_thermal_resolution_reconfigure_smoke.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
