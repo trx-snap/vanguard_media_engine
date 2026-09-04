@@ -69,6 +69,10 @@ Map<String, Object?> _successResult({
   String backend = 'vulkan',
   double duration = 2.0,
   int overlayCount = 1,
+  int transitionCount = 0,
+  int? renderedOverlayFrameCount,
+  int beautyClipCount = 0,
+  int beautyFrameCount = 0,
   String path = '/data/local/tmp/out_single_clip_static_sticker_success.mp4',
 }) => <String, Object?>{
   'success': true,
@@ -79,7 +83,11 @@ Map<String, Object?> _successResult({
   'fps': 30,
   'renderBackend': backend,
   'overlayCount': overlayCount,
-  'transitionCount': 0,
+  'transitionCount': transitionCount,
+  if (renderedOverlayFrameCount != null)
+    'renderedOverlayFrameCount': renderedOverlayFrameCount,
+  'beautyClipCount': beautyClipCount,
+  'beautyFrameCount': beautyFrameCount,
 };
 
 void _setMockHandler(
@@ -138,7 +146,6 @@ void main() {
       expect(textOverlayToken, 'text');
       expect(emojiOverlayToken, 'emoji');
       expect(keyframesToken, 'keyframe');
-      expect(overlaysWithTransitionToken, 'transition');
       expect(overlaysWithBeautyToken, 'beauty');
       expect(unreadableAssetToken, 'asset');
 
@@ -164,7 +171,7 @@ void main() {
       expect(defaultOverlaySmokeLaneIds, contains('fail_closed_keyframes'));
       expect(
         defaultOverlaySmokeLaneIds,
-        contains('fail_closed_overlays_with_transition'),
+        contains('overlays_with_transition_dissolve_success'),
       );
       expect(
         defaultOverlaySmokeLaneIds,
@@ -373,6 +380,58 @@ void main() {
     });
 
     test(
+      'expected duration subtracts non-hard-cut transition overlap durations',
+      () {
+        final request = VGTimelineOverlayExportSmokeRequest(
+          laneId: 'transition_duration_test',
+          clips: <VGTimelineOverlayExportSmokeClip>[
+            _clip('clip-1', end: 2.0),
+            _clip('clip-2', end: 2.0),
+          ],
+          transitions: const <VGTimelineOverlayExportSmokeTransition>[
+            VGTimelineOverlayExportSmokeTransition(
+              id: 'tr-1',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'clip-1',
+              toClipId: 'clip-2',
+            ),
+          ],
+          outputPath: '/tmp/out.mp4',
+          expectation: const VGTimelineOverlayExportSmokeExpectation.success(),
+        );
+
+        // 2.0 + 2.0 clip seconds minus the 0.5s dissolve overlap == 3.5.
+        expect(request.expectedDurationSeconds, closeTo(3.5, 1e-9));
+        expect(request.expectedTransitionCount, 1);
+      },
+    );
+
+    test('hard-cut ("none") transition entries subtract zero duration', () {
+      final request = VGTimelineOverlayExportSmokeRequest(
+        laneId: 'hard_cut_duration_test',
+        clips: <VGTimelineOverlayExportSmokeClip>[
+          _clip('clip-1', end: 2.0),
+          _clip('clip-2', end: 2.0),
+        ],
+        transitions: const <VGTimelineOverlayExportSmokeTransition>[
+          VGTimelineOverlayExportSmokeTransition(
+            id: 'tr-1',
+            type: 'none',
+            durationSeconds: 0.5,
+            fromClipId: 'clip-1',
+            toClipId: 'clip-2',
+          ),
+        ],
+        outputPath: '/tmp/out.mp4',
+        expectation: const VGTimelineOverlayExportSmokeExpectation.success(),
+      );
+
+      expect(request.expectedDurationSeconds, closeTo(4.0, 1e-9));
+      expect(request.expectedTransitionCount, 0);
+    });
+
+    test(
       'z-order list in request remains caller order, sortedOverlays sorts zIndex asc then id asc',
       () {
         final o1 = _sticker('z-high', zIndex: 5);
@@ -479,6 +538,77 @@ void main() {
 
       expect(report.pass, isFalse);
       expect(report.failureReason, startsWith('overlay_count_mismatch'));
+    });
+
+    test('fails when transitionCount mismatches expectation', () {
+      final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+        _request(
+          transitions: const <VGTimelineOverlayExportSmokeTransition>[
+            VGTimelineOverlayExportSmokeTransition(
+              id: 'tr-1',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'clip-1',
+              toClipId: 'clip-2',
+            ),
+          ],
+        ),
+        _successResult(duration: 1.5, transitionCount: 0),
+        outputExists: true,
+      );
+
+      expect(report.pass, isFalse);
+      expect(report.failureReason, startsWith('transition_count_mismatch'));
+    });
+
+    test(
+      'passes when renderedOverlayFrameCount meets the expected minimum',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+              expectedRenderedOverlayFrameCount: 10,
+            ),
+          ),
+          _successResult(renderedOverlayFrameCount: 15),
+          outputExists: true,
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.renderedOverlayFrameCount, 15);
+      },
+    );
+
+    test(
+      'fails when renderedOverlayFrameCount is below the expected minimum',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+              expectedRenderedOverlayFrameCount: 10,
+            ),
+          ),
+          _successResult(renderedOverlayFrameCount: 3),
+          outputExists: true,
+        );
+
+        expect(report.pass, isFalse);
+        expect(
+          report.failureReason,
+          startsWith('rendered_overlay_frame_count_too_low'),
+        );
+      },
+    );
+
+    test('fails when a success lane reports a nonzero beautyClipCount', () {
+      final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+        _request(),
+        _successResult(beautyClipCount: 1),
+        outputExists: true,
+      );
+
+      expect(report.pass, isFalse);
+      expect(report.failureReason, startsWith('beauty_clip_count_not_zero'));
     });
 
     test(
@@ -715,8 +845,28 @@ void main() {
     test('toMap and fromMap roundtrip preserves report structure', () {
       final positiveLane =
           VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
-            _request(),
-            _successResult(),
+            _request(
+              laneId: 'overlays_with_transition_dissolve_success',
+              transitions: const <VGTimelineOverlayExportSmokeTransition>[
+                VGTimelineOverlayExportSmokeTransition(
+                  id: 'tr-1',
+                  type: 'dissolve',
+                  durationSeconds: 0.5,
+                  fromClipId: 'clip-1',
+                  toClipId: 'clip-2',
+                ),
+              ],
+              expectation:
+                  const VGTimelineOverlayExportSmokeExpectation.success(
+                    expectedTransitionCount: 1,
+                    expectedRenderedOverlayFrameCount: 10,
+                  ),
+            ),
+            _successResult(
+              duration: 1.5,
+              transitionCount: 1,
+              renderedOverlayFrameCount: 12,
+            ),
             outputExists: true,
           );
 
@@ -734,9 +884,18 @@ void main() {
       expect(parsed.pass, isTrue);
       expect(parsed.marker, overlayPassMarker);
       expect(parsed.lanes, hasLength(1));
-      expect(parsed.lanes.single.laneId, 'single_clip_static_sticker_success');
+      expect(
+        parsed.lanes.single.laneId,
+        'overlays_with_transition_dissolve_success',
+      );
       expect(parsed.lanes.single.renderBackend, 'vulkan');
       expect(parsed.lanes.single.overlayCount, 1);
+      expect(parsed.lanes.single.transitionCount, 1);
+      expect(parsed.lanes.single.expectedTransitionCount, 1);
+      expect(parsed.lanes.single.renderedOverlayFrameCount, 12);
+      expect(parsed.lanes.single.expectedRenderedOverlayFrameCount, 10);
+      expect(parsed.lanes.single.beautyClipCount, 0);
+      expect(parsed.lanes.single.beautyFrameCount, 0);
     });
   });
 
@@ -883,8 +1042,8 @@ void main() {
         final successLanes = suite.where((r) => r.expectation.expectsSuccess);
         final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(4));
-        expect(failureLanes, hasLength(6));
+        expect(successLanes, hasLength(5));
+        expect(failureLanes, hasLength(5));
 
         // Lane 1: single_clip_static_sticker_success
         final lane1 = suite[0];
@@ -937,12 +1096,19 @@ void main() {
         expect(lane7.expectation.errorCode, unsupportedExportFeatureCode);
         expect(lane7.expectation.messageContains, keyframesToken);
 
-        // Lane 8: fail_closed_overlays_with_transition
+        // Lane 8: overlays_with_transition_dissolve_success
         final lane8 = suite[7];
-        expect(lane8.laneId, 'fail_closed_overlays_with_transition');
+        expect(lane8.laneId, 'overlays_with_transition_dissolve_success');
+        expect(lane8.clips, hasLength(2));
         expect(lane8.transitions, hasLength(1));
-        expect(lane8.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane8.expectation.messageContains, overlaysWithTransitionToken);
+        expect(lane8.transitions.single.type, 'dissolve');
+        expect(lane8.overlays, hasLength(1));
+        expect(lane8.expectation.expectsSuccess, isTrue);
+        expect(lane8.expectation.expectedTransitionCount, 1);
+        expect(lane8.expectation.expectedRenderedOverlayFrameCount, 10);
+        // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
+        expect(lane8.expectedDurationSeconds, closeTo(3.5, 1e-9));
+        expect(lane8.expectedTransitionCount, 1);
 
         // Lane 9: fail_closed_overlays_with_beauty
         final lane9 = suite[8];

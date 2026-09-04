@@ -16,13 +16,17 @@
 //   - Structured JSON prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_JSON:`;
 //   - Structured lane prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_LANE:`;
 //   - Claims production routing/fail-closed behavior on Android for static sticker
-//     overlays in Route-A, but does not claim text/emoji overlays, animated keyframes,
-//     overlay transitions, overlay beauty filter composition, pixel quality, fleet coverage,
-//     playback, GLES overlays, app/editor UI, iOS, or streaming/cache;
+//     overlays in Route-A, including overlay compositing on Vulkan dissolve transition
+//     overlap frames (P5-OVERLAYS-TRANSITION-COMP-N3), but does not claim text/emoji
+//     overlays, animated keyframes, overlay beauty filter composition, non-dissolve
+//     transition types combined with overlays, pixel quality, fleet coverage, playback,
+//     GLES overlays, app/editor UI, iOS, or streaming/cache;
 //   - Validates success lanes: `success == true`, output file exists,
-//     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (hard-cut sum of clip
-//     trim windows, unaffected by overlay intervals), and `overlayCount` matching
-//     expectation when present;
+//     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (transition-aware:
+//     clip trim-window sum minus non-hard-cut transition overlap durations, unaffected
+//     by overlay intervals), `overlayCount`/`transitionCount` matching expectation when
+//     present, and `renderedOverlayFrameCount` meeting a lane's minimum when specified
+//     (proves overlay compositing during transition overlap frames);
 //   - Fail-closed lanes validate PlatformException code and message substrings;
 //   - Whole report requires at least one positive lane and all lanes pass.
 
@@ -68,9 +72,6 @@ const String emojiOverlayToken = 'emoji';
 /// Fail-closed token for unsupported animated keyframe overlays in Route-A.
 const String keyframesToken = 'keyframe';
 
-/// Fail-closed token for overlays with transition composition.
-const String overlaysWithTransitionToken = 'transition';
-
 /// Fail-closed token for overlays with beauty filter composition.
 const String overlaysWithBeautyToken = 'beauty';
 
@@ -86,7 +87,7 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'fail_closed_text_overlay',
   'fail_closed_emoji_overlay',
   'fail_closed_keyframes',
-  'fail_closed_overlays_with_transition',
+  'overlays_with_transition_dissolve_success',
   'fail_closed_overlays_with_beauty',
   'fail_closed_unreadable_asset',
 ];
@@ -274,6 +275,8 @@ class VGTimelineOverlayExportSmokeOverlay {
 class VGTimelineOverlayExportSmokeExpectation {
   const VGTimelineOverlayExportSmokeExpectation.success({
     this.expectedOverlayCount,
+    this.expectedTransitionCount,
+    this.expectedRenderedOverlayFrameCount,
   }) : expectsSuccess = true,
        errorCode = null,
        messageContains = null;
@@ -282,7 +285,9 @@ class VGTimelineOverlayExportSmokeExpectation {
     required String this.errorCode,
     this.messageContains,
   }) : expectsSuccess = false,
-       expectedOverlayCount = null;
+       expectedOverlayCount = null,
+       expectedTransitionCount = null,
+       expectedRenderedOverlayFrameCount = null;
 
   /// True when the lane must produce a successful export output file.
   final bool expectsSuccess;
@@ -290,6 +295,17 @@ class VGTimelineOverlayExportSmokeExpectation {
   /// Optional override for expected overlayCount. If null on success,
   /// the request derives it from the number of overlays in the request.
   final int? expectedOverlayCount;
+
+  /// Optional override for expected transitionCount. If null on success,
+  /// the request derives it from the number of non-hard-cut transitions in
+  /// the request.
+  final int? expectedTransitionCount;
+
+  /// Minimum acceptable `renderedOverlayFrameCount` for a positive lane that
+  /// proves static sticker overlays render during Vulkan transition overlap
+  /// frames (P5-OVERLAYS-TRANSITION-COMP-N3). Null means no lower-bound
+  /// check -- most lanes carry no transition and do not need this proof.
+  final int? expectedRenderedOverlayFrameCount;
 
   /// Required PlatformException code for a fail-closed lane.
   final String? errorCode;
@@ -325,18 +341,36 @@ class VGTimelineOverlayExportSmokeRequest {
   final int fps;
   final int bitrateBps;
 
-  /// Expected duration is the hard-cut sum of clip trim windows.
-  /// Overlay intervals do not affect timeline duration.
+  /// Expected duration is the clip trim-window sum minus the overlap
+  /// durations of any non-hard-cut transitions -- hard-cut/`none` transition
+  /// entries subtract nothing. Mirrors
+  /// AndroidTimelineTransitionDescriptor.timelineDurationSeconds. Overlay
+  /// intervals never affect timeline duration.
   double get expectedDurationSeconds {
-    return clips
-        .fold<double>(0.0, (sum, c) => sum + c.durationSeconds)
-        .clamp(0.0, double.infinity);
+    final clipSeconds = clips.fold<double>(
+      0.0,
+      (sum, c) => sum + c.durationSeconds,
+    );
+    final overlapSeconds = transitions
+        .where((t) => t.type != 'none')
+        .fold<double>(0.0, (sum, t) => sum + t.durationSeconds);
+    return (clipSeconds - overlapSeconds).clamp(0.0, double.infinity);
   }
 
   /// Expected overlay count: expectation override or overlays list length on success.
   int? get expectedOverlayCount =>
       expectation.expectedOverlayCount ??
       (expectation.expectsSuccess ? overlays.length : null);
+
+  /// Expected transition count: expectation override or the number of
+  /// non-hard-cut transitions in the request on success -- mirrors the
+  /// production `transitionCount` result field, which already excludes
+  /// hard-cut (`none`) entries (AndroidTimelineTransitionDescriptor.parseList).
+  int? get expectedTransitionCount =>
+      expectation.expectedTransitionCount ??
+      (expectation.expectsSuccess
+          ? transitions.where((t) => t.type != 'none').length
+          : null);
 
   /// Helper: returns overlays sorted by [zIndex] ascending, breaking ties by [id] ascending.
   ///
@@ -387,6 +421,12 @@ class VGTimelineOverlayExportSmokeLaneReport {
     this.durationSeconds,
     this.overlayCount,
     this.expectedOverlayCount,
+    this.transitionCount,
+    this.expectedTransitionCount,
+    this.renderedOverlayFrameCount,
+    this.expectedRenderedOverlayFrameCount,
+    this.beautyClipCount,
+    this.beautyFrameCount,
     this.errorCode,
     this.errorMessage,
   });
@@ -405,6 +445,16 @@ class VGTimelineOverlayExportSmokeLaneReport {
   final double? durationSeconds;
   final int? overlayCount;
   final int? expectedOverlayCount;
+  final int? transitionCount;
+  final int? expectedTransitionCount;
+
+  /// Count of rendered frames (solo or transition-overlap) that composited
+  /// at least one active overlay -- production `renderedOverlayFrameCount`
+  /// result field (P5-OVERLAYS-TRANSITION-COMP-N3).
+  final int? renderedOverlayFrameCount;
+  final int? expectedRenderedOverlayFrameCount;
+  final int? beautyClipCount;
+  final int? beautyFrameCount;
   final String? errorCode;
   final String? errorMessage;
 
@@ -424,6 +474,9 @@ class VGTimelineOverlayExportSmokeLaneReport {
   }) {
     final expectedDuration = request.expectedDurationSeconds;
     final expectedOverlays = request.expectedOverlayCount;
+    final expectedTransitions = request.expectedTransitionCount;
+    final expectedRenderedOverlayFrames =
+        request.expectation.expectedRenderedOverlayFrameCount;
 
     if (result == null) {
       return VGTimelineOverlayExportSmokeLaneReport(
@@ -434,6 +487,8 @@ class VGTimelineOverlayExportSmokeLaneReport {
         expectedSuccess: request.expectation.expectsSuccess,
         expectedDurationSeconds: expectedDuration,
         expectedOverlayCount: expectedOverlays,
+        expectedTransitionCount: expectedTransitions,
+        expectedRenderedOverlayFrameCount: expectedRenderedOverlayFrames,
       );
     }
     final success = result['success'] == true;
@@ -441,6 +496,11 @@ class VGTimelineOverlayExportSmokeLaneReport {
     final duration = (result['durationSeconds'] as num?)?.toDouble();
     final backend = result['renderBackend'] as String?;
     final overlayCount = (result['overlayCount'] as num?)?.toInt();
+    final transitionCount = (result['transitionCount'] as num?)?.toInt();
+    final renderedOverlayFrameCount =
+        (result['renderedOverlayFrameCount'] as num?)?.toInt();
+    final beautyClipCount = (result['beautyClipCount'] as num?)?.toInt();
+    final beautyFrameCount = (result['beautyFrameCount'] as num?)?.toInt();
 
     String? failure;
     if (!request.expectation.expectsSuccess) {
@@ -469,6 +529,24 @@ class VGTimelineOverlayExportSmokeLaneReport {
     } else if (request.expectation.expectedOverlayCount != null &&
         overlayCount == null) {
       failure = 'result_overlay_count_missing';
+    } else if (transitionCount != null &&
+        expectedTransitions != null &&
+        transitionCount != expectedTransitions) {
+      failure =
+          'transition_count_mismatch:reported=$transitionCount:'
+          'expected=$expectedTransitions';
+    } else if (expectedTransitions != null && transitionCount == null) {
+      failure = 'result_transition_count_missing';
+    } else if (expectedRenderedOverlayFrames != null &&
+        (renderedOverlayFrameCount == null ||
+            renderedOverlayFrameCount < expectedRenderedOverlayFrames)) {
+      failure =
+          'rendered_overlay_frame_count_too_low:reported=${renderedOverlayFrameCount ?? 'null'}:'
+          'expectedAtLeast=$expectedRenderedOverlayFrames';
+    } else if (beautyClipCount != null && beautyClipCount != 0) {
+      failure = 'beauty_clip_count_not_zero:reported=$beautyClipCount';
+    } else if (beautyFrameCount != null && beautyFrameCount != 0) {
+      failure = 'beauty_frame_count_not_zero:reported=$beautyFrameCount';
     }
 
     final pass = failure == null;
@@ -485,6 +563,12 @@ class VGTimelineOverlayExportSmokeLaneReport {
       durationSeconds: duration,
       overlayCount: overlayCount,
       expectedOverlayCount: expectedOverlays,
+      transitionCount: transitionCount,
+      expectedTransitionCount: expectedTransitions,
+      renderedOverlayFrameCount: renderedOverlayFrameCount,
+      expectedRenderedOverlayFrameCount: expectedRenderedOverlayFrames,
+      beautyClipCount: beautyClipCount,
+      beautyFrameCount: beautyFrameCount,
     );
   }
 
@@ -516,6 +600,9 @@ class VGTimelineOverlayExportSmokeLaneReport {
       expectedSuccess: expectation.expectsSuccess,
       expectedDurationSeconds: request.expectedDurationSeconds,
       expectedOverlayCount: request.expectedOverlayCount,
+      expectedTransitionCount: request.expectedTransitionCount,
+      expectedRenderedOverlayFrameCount:
+          expectation.expectedRenderedOverlayFrameCount,
       errorCode: exception.code,
       errorMessage: exception.message,
     );
@@ -533,6 +620,9 @@ class VGTimelineOverlayExportSmokeLaneReport {
     expectedSuccess: request.expectation.expectsSuccess,
     expectedDurationSeconds: request.expectedDurationSeconds,
     expectedOverlayCount: request.expectedOverlayCount,
+    expectedTransitionCount: request.expectedTransitionCount,
+    expectedRenderedOverlayFrameCount:
+        request.expectation.expectedRenderedOverlayFrameCount,
   );
 
   Map<String, Object?> toMap() => <String, Object?>{
@@ -549,6 +639,12 @@ class VGTimelineOverlayExportSmokeLaneReport {
     'durationDeltaSeconds': durationDeltaSeconds,
     'overlayCount': overlayCount,
     'expectedOverlayCount': expectedOverlayCount,
+    'transitionCount': transitionCount,
+    'expectedTransitionCount': expectedTransitionCount,
+    'renderedOverlayFrameCount': renderedOverlayFrameCount,
+    'expectedRenderedOverlayFrameCount': expectedRenderedOverlayFrameCount,
+    'beautyClipCount': beautyClipCount,
+    'beautyFrameCount': beautyFrameCount,
     'errorCode': errorCode,
     'errorMessage': errorMessage,
   };
@@ -571,6 +667,15 @@ class VGTimelineOverlayExportSmokeLaneReport {
       durationSeconds: (map['durationSeconds'] as num?)?.toDouble(),
       overlayCount: (map['overlayCount'] as num?)?.toInt(),
       expectedOverlayCount: (map['expectedOverlayCount'] as num?)?.toInt(),
+      transitionCount: (map['transitionCount'] as num?)?.toInt(),
+      expectedTransitionCount: (map['expectedTransitionCount'] as num?)
+          ?.toInt(),
+      renderedOverlayFrameCount: (map['renderedOverlayFrameCount'] as num?)
+          ?.toInt(),
+      expectedRenderedOverlayFrameCount:
+          (map['expectedRenderedOverlayFrameCount'] as num?)?.toInt(),
+      beautyClipCount: (map['beautyClipCount'] as num?)?.toInt(),
+      beautyFrameCount: (map['beautyFrameCount'] as num?)?.toInt(),
       errorCode: map['errorCode'] as String?,
       errorMessage: map['errorMessage'] as String?,
     );
@@ -725,7 +830,7 @@ class VGTimelineOverlayExportSmokeRunner {
 /// 5. `fail_closed_text_overlay`
 /// 6. `fail_closed_emoji_overlay`
 /// 7. `fail_closed_keyframes`
-/// 8. `fail_closed_overlays_with_transition`
+/// 8. `overlays_with_transition_dissolve_success`
 /// 9. `fail_closed_overlays_with_beauty`
 /// 10. `fail_closed_unreadable_asset`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
@@ -1005,9 +1110,9 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 8: fail_closed_overlays_with_transition
+    // Lane 8: overlays_with_transition_dissolve_success
     VGTimelineOverlayExportSmokeRequest(
-      laneId: 'fail_closed_overlays_with_transition',
+      laneId: 'overlays_with_transition_dissolve_success',
       clips: <VGTimelineOverlayExportSmokeClip>[
         VGTimelineOverlayExportSmokeClip(
           id: 'clip-1',
@@ -1033,10 +1138,20 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ],
       overlays: <VGTimelineOverlayExportSmokeOverlay>[
         VGTimelineOverlayExportSmokeOverlay(
-          id: 'sticker-1',
+          id: 'sticker-overlap',
           assetPath: stickerAssetPath,
-          startTimeSeconds: 0.0,
-          durationSeconds: 2.0,
+          // Active strictly within the dissolve's output-timeline overlap
+          // window: clip-1's 2.0s trim window lends its last 0.5s to the
+          // transition, so on the overlap-shortened OUTPUT timeline (see
+          // VGTimelineOverlayExportSmokeRequest.expectedDurationSeconds)
+          // the overlap occupies [1.5s, 2.0s) -- an overlay gated to
+          // exactly that window can only render if
+          // AndroidTimelineVulkanVideoEncoder composites overlays on
+          // transition-overlap frames using the same continuous output
+          // pts clock solo frames use, proving overlay-during-overlap
+          // rendering and the output (not per-source-clip) time base.
+          startTimeSeconds: 1.5,
+          durationSeconds: 0.5,
           translationX: 100.0,
           translationY: 100.0,
           width: 200.0,
@@ -1048,10 +1163,11 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
           type: 'sticker',
         ),
       ],
-      outputPath: outputPath('fail_closed_overlays_with_transition'),
-      expectation: const VGTimelineOverlayExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: overlaysWithTransitionToken,
+      outputPath: outputPath('overlays_with_transition_dissolve_success'),
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedTransitionCount: 1,
+        expectedRenderedOverlayFrameCount: 10,
       ),
     ),
 

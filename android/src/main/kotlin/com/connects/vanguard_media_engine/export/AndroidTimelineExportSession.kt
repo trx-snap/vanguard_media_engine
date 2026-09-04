@@ -48,16 +48,17 @@ import kotlin.math.floor
 //     any other unsupported type fail closed at parse time. Transition
 //     timelines carrying audioSidecar tracks fail closed too: this route
 //     does not overlap-adjust serialized audio timings.
-//   - P5-OVERLAYS-TRANS Route-A N9: static sticker overlays
-//     (AndroidTimelineOverlayDescriptor, up to 128 per export) composited by
-//     AndroidTimelineVulkanVideoEncoder via the native
-//     renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam. Overlay
-//     geometry is draft-canvas pixel space, so overlays require the
-//     requested output to match the draft canvas exactly; overlays alongside
-//     a transition timeline or clip-level Beauty V2, or more than 128
+//   - P5-OVERLAYS-TRANS Route-A N9, extended by P5-OVERLAYS-TRANSITION-COMP-N3:
+//     static sticker overlays (AndroidTimelineOverlayDescriptor, up to 128 per
+//     export) composited by AndroidTimelineVulkanVideoEncoder via the native
+//     renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam on solo
+//     frames, and via renderAndroidTimelineVulkanExportTransitionFrameWithOverlays
+//     on transition overlap frames when the timeline also carries a
+//     compositor transition. Overlay geometry is draft-canvas pixel space,
+//     so overlays require the requested output to match the draft canvas
+//     exactly; overlays alongside clip-level Beauty V2, or more than 128
 //     overlays, fail closed with UNSUPPORTED_EXPORT_FEATURE before pass-1 --
-//     overlays are not rendered on transition overlap frames and have no
-//     GLES fallback.
+//     overlays have no GLES fallback either way.
 //   - Per-clip colorMatrix is accepted and
 //     applied for both decoded video frames and still-image frames by
 //     whichever backend renders the clip (Vulkan-native color-matrix push
@@ -555,26 +556,17 @@ class AndroidTimelineExportSession(private val context: Context) {
         // per-layer Beauty V2 on both solo and transition-overlap frames.
         val hasBeautyClip = clipInputs.any { it.beautyIntensity != null }
 
-        // P5-OVERLAYS-TRANS Route-A N9: overlays are not supported alongside
-        // a transition timeline -- AndroidTimelineVulkanVideoEncoder does not
-        // render overlays on transition overlap frames (solo-frame route
-        // only) -- or alongside clip-level Beauty V2, since the native
-        // overlay render seam is a beauty-free route (see
-        // VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays).
+        // P5-OVERLAYS-TRANSITION-COMP-N3: overlays alongside a transition
+        // timeline are a supported production shape -- AndroidTimelineVulkanVideoEncoder
+        // composites overlays on both solo frames and transition overlap
+        // frames (see [renderTransitionPair]). Overlays alongside clip-level
+        // Beauty V2 remain unsupported, since the native overlay render
+        // seams are beauty-free routes (see
+        // VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays
+        // and renderAndroidTimelineVulkanExportTransitionFrameWithOverlays).
         // Fail closed here, before backend selection, with a precise
         // UNSUPPORTED_EXPORT_FEATURE rather than surfacing an UNAVAILABLE
         // backend-selection reason for a shape this route never supports.
-        // ([transitions] is already the non-hard-cut-only list -- see
-        // AndroidTimelineTransitionDescriptor.parseList.)
-        if (overlays.isNotEmpty() && transitions.isNotEmpty()) {
-            deleteOwnedTemps()
-            logTerminal("overlay_route_unsupported", backend = null)
-            onError(
-                "UNSUPPORTED_EXPORT_FEATURE",
-                "exportTimeline: overlays are not supported alongside a transition timeline",
-            )
-            return
-        }
         if (overlays.isNotEmpty() && hasBeautyClip) {
             deleteOwnedTemps()
             logTerminal("overlay_route_unsupported", backend = null)
@@ -723,7 +715,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             encodeResult = encodeResult.copy(reason = beautyReason)
         }
         if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
-            overlays.isNotEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
+            overlays.isNotEmpty() && transitions.isEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
         ) {
             // P5-OVERLAYS-TRANS Route-A N9: overlay compositing is a
             // Vulkan-only production route with no GLES fallback (mirrors
@@ -732,6 +724,15 @@ class AndroidTimelineExportSession(private val context: Context) {
             // prefixed with OVERLAYS_REQUIRE_VULKAN_REASON unless the
             // underlying reason is already a precise overlay_*/overlays_*
             // reason from the native render path.
+            //
+            // Gated on transitions.isEmpty() (P5-OVERLAYS-TRANSITION-COMP-N3):
+            // when a Vulkan failure carries transitions, the transitions
+            // block above already emitted the single VG_EXPORT_BACKEND_FALLBACK_BLOCKED
+            // row for this run -- this block must not also rewrite
+            // encodeResult.reason (which could stomp a vulkan_transition_*
+            // reason) or log a second row. Any overlay_*/overlays_* reason
+            // the encoder itself raised on a transitions-carrying run still
+            // passes through unprefixed via encodeResult.reason as-is.
             val underlyingReason = encodeResult.reason
             val overlayReason = if (underlyingReason.startsWith("overlay_") || underlyingReason.startsWith("overlays_")) {
                 underlyingReason
@@ -866,6 +867,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "beautyClipCount" to clipInputs.count { it.beautyIntensity != null },
                 "beautyFrameCount" to encodeResult.beautyFrameCount,
                 "overlayCount" to overlays.size,
+                "renderedOverlayFrameCount" to encodeResult.overlayFrameCount,
             ),
         )
     }

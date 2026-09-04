@@ -59,14 +59,18 @@ import kotlin.math.min
 // progress (j + 1) / (N + 1). Output is therefore overlap-shortened: the
 // muxed duration is the clip-duration sum minus the transition durations.
 //
-// P5-OVERLAYS-TRANS Route-A N9: the overlay-aware [encode] overload prepares
-// validated static sticker overlays (AndroidTimelineOverlayRenderSession.prepare)
-// once the native session exists, then renders every SOLO frame through
+// P5-OVERLAYS-TRANS Route-A N9 / P5-OVERLAYS-TRANSITION-COMP-N3: the
+// overlay-aware [encode] overload prepares validated static sticker overlays
+// (AndroidTimelineOverlayRenderSession.prepare) once the native session
+// exists, then renders every SOLO frame through
 // VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCroppedWithOverlays
-// instead of the plain cropped seam. Overlays are NOT composited on
-// transition overlap frames in N9 -- overlays combined with any non-hard-cut
-// transition, or with clip-level Beauty V2 (the overlay seam takes no beauty
-// params), are rejected before a native session is even created.
+// instead of the plain cropped seam. As of N3, overlays are ALSO composited
+// on transition overlap frames -- [renderTransitionPair] routes through
+// VanguardNativeBridge.renderAndroidTimelineVulkanExportTransitionFrameWithOverlays
+// with beauty forced off on that call, since overlays combined with
+// clip-level Beauty V2 (the overlay seams take no beauty params on the
+// overlay-aware calls) are still rejected before a native session is ever
+// created.
 //
 // PTS mechanism (must stay compatible with AndroidTimelineVideoEncoder's
 // frozen fixed frame clock, since a mid-export fallback re-runs the same
@@ -119,13 +123,20 @@ class AndroidTimelineVulkanVideoEncoder(
     private var beautyFramesRendered = 0
     private var nativeSessionId: String? = null
 
-    // P5-OVERLAYS-TRANS Route-A N9: non-null only when this encode call
-    // carries non-empty overlays and AndroidTimelineOverlayRenderSession.prepare
-    // succeeded -- see [setupEncoderMuxerAndSession]. Solo frames go through
-    // the overlay-aware native render seam when this is set (see
-    // [renderSoloLayer]); overlays are never rendered on transition overlap
-    // frames in N9 (overlays + transitions is rejected before this point).
+    // P5-OVERLAYS-TRANS Route-A N9 / P5-OVERLAYS-TRANSITION-COMP-N3: non-null
+    // only when this encode call carries non-empty overlays and
+    // AndroidTimelineOverlayRenderSession.prepare succeeded -- see
+    // [setupEncoderMuxerAndSession]. Both solo frames ([renderSoloLayer]) and
+    // transition-overlap pairs ([renderTransitionPair]) go through their
+    // overlay-aware native render seam when this is set.
     private var overlayRenderSession: AndroidTimelineOverlayRenderSession? = null
+
+    // P5-OVERLAYS-TRANSITION-COMP-N3: count of rendered frames (solo or
+    // transition-overlap) that composited at least one active overlay --
+    // i.e. [overlayRenderSession] was set and its built frame payload
+    // reported overlayCount > 0. Distinct from [renderedFrames]/
+    // [writtenVideoSamples], which count every frame regardless of overlays.
+    private var overlayFramesRendered = 0
 
     // ─── Pass-1 sample-ratio progress ─────────────────────────────────────────
     private var totalExpectedSamples = 0
@@ -181,13 +192,15 @@ class AndroidTimelineVulkanVideoEncoder(
 
     /// Encodes [clips] with the validated [transitions] and the validated,
     /// static-sticker [overlays] (AndroidTimelineOverlayDescriptor.parseList
-    /// output; P5-OVERLAYS-TRANS Route-A N9). Overlays are rendered on solo
-    /// frames only through the native
-    /// renderAndroidTimelineVulkanExportFrameCroppedWithOverlays seam -- N9
-    /// does not composite overlays on transition overlap frames, so a
-    /// non-empty overlay list combined with a non-hard-cut transition (or a
-    /// clip carrying Beauty V2, which the overlay seam does not accept) is
-    /// rejected defensively here even though
+    /// output; P5-OVERLAYS-TRANS Route-A N9, extended by
+    /// P5-OVERLAYS-TRANSITION-COMP-N3). Overlays are rendered on solo frames
+    /// through the native renderAndroidTimelineVulkanExportFrameCroppedWithOverlays
+    /// seam, and on transition overlap frames through
+    /// renderAndroidTimelineVulkanExportTransitionFrameWithOverlays (see
+    /// [renderTransitionPair]) -- a non-empty overlay list combined with a
+    /// non-hard-cut transition is a supported production shape as of N3. A
+    /// clip carrying Beauty V2 is still rejected defensively here (the
+    /// overlay seams do not accept beauty params) even though
     /// AndroidTimelineExportSession already fails closed before this call.
     /// Returns a structured result; never throws.
     override fun encode(
@@ -198,9 +211,6 @@ class AndroidTimelineVulkanVideoEncoder(
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
         val nonHardCutTransitions = transitions.filter { !it.isHardCut }
-        if (overlays.isNotEmpty() && nonHardCutTransitions.isNotEmpty()) {
-            return failResult("overlay_transition_unsupported")
-        }
         if (overlays.isNotEmpty() && clips.any { it.beautyIntensity != null }) {
             return failResult("overlay_beauty_unsupported")
         }
@@ -280,7 +290,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 "VG_VULKAN_ENCODE_RESULT status=success rendered=$renderedFrames " +
                     "written=$writtenVideoSamples outputSize=$outSize " +
                     "transitions=${plan.segments.count { it is Segment.Overlap }} " +
-                    "beautyFrames=$beautyFramesRendered",
+                    "beautyFrames=$beautyFramesRendered overlayFrames=$overlayFramesRendered",
             )
             return AndroidTimelineVideoEncoder.EncodeResult(
                 true,
@@ -288,6 +298,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 writtenVideoSamples,
                 outSize,
                 beautyFrameCount = beautyFramesRendered,
+                overlayFrameCount = overlayFramesRendered,
             )
         } catch (t: Throwable) {
             reason = "exception:${t.javaClass.simpleName}"
@@ -311,7 +322,7 @@ class AndroidTimelineVulkanVideoEncoder(
         Log.w(
             TAG,
             "VG_VULKAN_ENCODE_RESULT status=fail reason=$reason rendered=$renderedFrames " +
-                "written=$writtenVideoSamples beautyFrames=$beautyFramesRendered",
+                "written=$writtenVideoSamples beautyFrames=$beautyFramesRendered overlayFrames=$overlayFramesRendered",
         )
         return AndroidTimelineVideoEncoder.EncodeResult(
             false,
@@ -319,6 +330,7 @@ class AndroidTimelineVulkanVideoEncoder(
             writtenVideoSamples,
             0L,
             beautyFrameCount = beautyFramesRendered,
+            overlayFrameCount = overlayFramesRendered,
         )
     }
 
@@ -827,6 +839,7 @@ class AndroidTimelineVulkanVideoEncoder(
         val timelinePtsUs = renderedFrames * frameDurationUs
         val session = overlayRenderSession
         val renderStr: String
+        var overlayFrameCounted = false
         if (session == null) {
             renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
                 sessionId = nativeSessionId!!,
@@ -849,11 +862,11 @@ class AndroidTimelineVulkanVideoEncoder(
                 beautyIntensity = (beautyIntensity ?: 0.0).toFloat(),
             )
         } else {
-            // P5-OVERLAYS-TRANS Route-A N9: overlays are not supported for
-            // transition overlap frames -- this branch is only ever reached
-            // for a solo frame, since overlays + transitions and overlays +
-            // beauty are both rejected before an overlay render session is
-            // ever created. No beauty params on this route.
+            // P5-OVERLAYS-TRANS Route-A N9: this branch renders both plain
+            // solo segments and the unpaired solo edge frames a transition
+            // overlap segment falls back to (see [encodeOverlapSegment]) --
+            // overlays + beauty is still rejected before an overlay render
+            // session is ever created, so no beauty params on this route.
             val payload = when (val payloadResult = session.buildFramePayload(timelinePtsUs)) {
                 is AndroidTimelineOverlayRenderSession.FramePayloadResult.Failure ->
                     return "overlay_payload_failed:${payloadResult.code}:${payloadResult.message.take(120)}"
@@ -880,11 +893,17 @@ class AndroidTimelineVulkanVideoEncoder(
                 overlayGeometry = payload.overlayGeometry,
                 overlayCount = payload.overlayCount,
             )
+            if (renderStr.startsWith("status=OK;") && payload.overlayCount > 0) {
+                overlayFrameCounted = true
+            }
         }
         if (!renderStr.startsWith("status=OK;")) {
             return "vulkan_render_failed:${renderStr.take(120)}"
         }
         renderedFrames++
+        if (overlayFrameCounted) {
+            overlayFramesRendered++
+        }
         if (beautyIntensity != null) {
             beautyFramesRendered++
         }
@@ -953,6 +972,12 @@ class AndroidTimelineVulkanVideoEncoder(
         var pairsRendered = 0
         var soloFromRendered = 0
         var soloToRendered = 0
+        // P5-OVERLAYS-TRANSITION-COMP-N3: segment-local overlay-frame proof --
+        // the class-wide [overlayFramesRendered] counter before/after this
+        // segment's render loop, so the VG_VULKAN_TRANSITION_SEGMENT row below
+        // can report how many of THIS segment's frames (pair or unpaired-solo
+        // edge) actually composited an active overlay.
+        val overlayFramesRenderedBeforeSegment = overlayFramesRendered
         try {
             val openFailure = decoder.open()
             if (openFailure != null) {
@@ -1016,12 +1041,14 @@ class AndroidTimelineVulkanVideoEncoder(
             if (framesRendered == 0 && !cancelRequested) {
                 return "no_frames_in_transition_window:${transition.transitionId}"
             }
+            val segmentOverlayFramesRendered = overlayFramesRendered - overlayFramesRenderedBeforeSegment
             Log.i(
                 TAG,
                 "VG_VULKAN_TRANSITION_SEGMENT transition=${transition.transitionId} " +
                     "type=${transition.type.wireName} pairs=$pairsRendered expected=$expectedOverlapFrames " +
                     "soloFrom=$soloFromRendered soloTo=$soloToRendered " +
-                    "fromDecoded=${decoder.fromFramesProduced} toDecoded=${decoder.toFramesProduced}",
+                    "fromDecoded=${decoder.fromFramesProduced} toDecoded=${decoder.toFramesProduced} " +
+                    "overlayFramesRendered=$segmentOverlayFramesRendered",
             )
             return null
         } catch (t: Throwable) {
@@ -1036,6 +1063,17 @@ class AndroidTimelineVulkanVideoEncoder(
     /// seam, then drains the encoder. Does NOT close either frame; the caller
     /// owns them. Both layers pass the same per-frame geometry guard as solo
     /// frames.
+    ///
+    /// P5-OVERLAYS-TRANSITION-COMP-N3: when [overlayRenderSession] is set,
+    /// this builds that session's frame payload for [timelinePtsUs] (the
+    /// same continuous output-frame clock solo frames use -- see the class
+    /// doc's PTS mechanism note) and renders through the overlay-aware
+    /// transition seam instead, with beauty forced off on that call (the
+    /// overlay seams take no beauty params; overlays + a beauty clip is
+    /// already rejected before an overlay render session is ever created,
+    /// so [fromClip]/[toClip] never actually carry beauty on this path
+    /// anyway). A payload build failure returns a machine-readable
+    /// `overlay_payload_failed:<code>:<message>` reason instead of throwing.
     private fun renderTransitionPair(
         fromFrame: AndroidTimelineTransitionOverlapDecoder.Frame,
         toFrame: AndroidTimelineTransitionOverlapDecoder.Frame,
@@ -1060,32 +1098,72 @@ class AndroidTimelineVulkanVideoEncoder(
             ?: return "vulkan_transition_layer_geometry:layer=to:${toGeometry.failure}"
 
         val timelinePtsUs = renderedFrames * frameDurationUs
-        val renderStr = nativeBridge.renderAndroidTimelineVulkanExportTransitionFrame(
-            sessionId = nativeSessionId!!,
-            width = width,
-            height = height,
-            transitionTypeCode = transition.type.nativeCode,
-            progress = progress,
-            fromHardwareBuffer = fromFrame.hardwareBuffer,
-            fromLayerGeometry = fromValues,
-            fromColorMatrix = fromClip.colorMatrix,
-            fromBeautyEnabled = fromClip.beautyIntensity != null,
-            fromBeautyIntensity = (fromClip.beautyIntensity ?: 0.0).toFloat(),
-            toHardwareBuffer = toFrame.hardwareBuffer,
-            toLayerGeometry = toValues,
-            toColorMatrix = toClip.colorMatrix,
-            toBeautyEnabled = toClip.beautyIntensity != null,
-            toBeautyIntensity = (toClip.beautyIntensity ?: 0.0).toFloat(),
-            timelinePtsUs = timelinePtsUs,
-            frameIndex = renderedFrames,
-        )
+        val session = overlayRenderSession
+        val renderStr: String
+        var overlayFrameCounted = false
+        if (session == null) {
+            renderStr = nativeBridge.renderAndroidTimelineVulkanExportTransitionFrame(
+                sessionId = nativeSessionId!!,
+                width = width,
+                height = height,
+                transitionTypeCode = transition.type.nativeCode,
+                progress = progress,
+                fromHardwareBuffer = fromFrame.hardwareBuffer,
+                fromLayerGeometry = fromValues,
+                fromColorMatrix = fromClip.colorMatrix,
+                fromBeautyEnabled = fromClip.beautyIntensity != null,
+                fromBeautyIntensity = (fromClip.beautyIntensity ?: 0.0).toFloat(),
+                toHardwareBuffer = toFrame.hardwareBuffer,
+                toLayerGeometry = toValues,
+                toColorMatrix = toClip.colorMatrix,
+                toBeautyEnabled = toClip.beautyIntensity != null,
+                toBeautyIntensity = (toClip.beautyIntensity ?: 0.0).toFloat(),
+                timelinePtsUs = timelinePtsUs,
+                frameIndex = renderedFrames,
+            )
+        } else {
+            val payload = when (val payloadResult = session.buildFramePayload(timelinePtsUs)) {
+                is AndroidTimelineOverlayRenderSession.FramePayloadResult.Failure ->
+                    return "overlay_payload_failed:${payloadResult.code}:${payloadResult.message.take(120)}"
+                is AndroidTimelineOverlayRenderSession.FramePayloadResult.Success -> payloadResult.payload
+            }
+            renderStr = nativeBridge.renderAndroidTimelineVulkanExportTransitionFrameWithOverlays(
+                sessionId = nativeSessionId!!,
+                width = width,
+                height = height,
+                transitionTypeCode = transition.type.nativeCode,
+                progress = progress,
+                fromHardwareBuffer = fromFrame.hardwareBuffer,
+                fromLayerGeometry = fromValues,
+                fromColorMatrix = fromClip.colorMatrix,
+                fromBeautyEnabled = false,
+                fromBeautyIntensity = 0.0f,
+                toHardwareBuffer = toFrame.hardwareBuffer,
+                toLayerGeometry = toValues,
+                toColorMatrix = toClip.colorMatrix,
+                toBeautyEnabled = false,
+                toBeautyIntensity = 0.0f,
+                timelinePtsUs = timelinePtsUs,
+                frameIndex = renderedFrames,
+                overlayTextureHandles = payload.overlayTextureHandles,
+                overlayGeometry = payload.overlayGeometry,
+                overlayCount = payload.overlayCount,
+            )
+            if (renderStr.startsWith("status=OK;") && payload.overlayCount > 0) {
+                overlayFrameCounted = true
+            }
+        }
         if (!renderStr.startsWith("status=OK;")) {
             return "vulkan_transition_render_failed:${renderStr.take(120)}"
         }
         renderedFrames++
+        if (overlayFrameCounted) {
+            overlayFramesRendered++
+        }
         // P5-BEAUTY-V2-TRANSITION-COMP: counted once per rendered transition
         // frame when either layer carries beauty, mirroring the solo path's
-        // per-frame beautyFramesRendered accounting.
+        // per-frame beautyFramesRendered accounting. Never true on the
+        // overlay-aware branch above (overlays + beauty is rejected earlier).
         if (fromClip.beautyIntensity != null || toClip.beautyIntensity != null) {
             beautyFramesRendered++
         }

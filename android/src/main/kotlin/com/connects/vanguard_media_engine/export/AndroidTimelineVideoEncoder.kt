@@ -100,6 +100,10 @@ class AndroidTimelineVideoEncoder(
         val writtenVideoSamples: Int,
         val outputSizeBytes: Long,
         val beautyFrameCount: Int = 0,
+        // P5-OVERLAYS-TRANSITION-COMP-N3: count of rendered frames (solo or
+        // transition-overlap) that composited at least one active overlay.
+        // Defaulted so pre-N3 callers/constructors remain valid.
+        val overlayFrameCount: Int = 0,
     )
 
     @Volatile private var cancelRequested = false
