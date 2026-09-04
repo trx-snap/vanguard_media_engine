@@ -205,6 +205,8 @@ export 'src/overlay/vg_overlay_transform_evaluator.dart';
 export 'vg_timeline_overlay_gles_render_smoke.dart';
 // P5-OVERLAYS-VULKAN-RENDER: Android True-DAG VulkanOverlayCompositor multi-layer shader/raster smoke foundation.
 export 'vg_timeline_overlay_vulkan_render_smoke.dart';
+// P5-OVERLAYS-TEXT-RASTERIZER-DIAGNOSTIC: Android True-DAG AndroidTimelineOverlayTextRasterizer diagnostic smoke foundation.
+export 'vg_timeline_overlay_text_rasterizer_smoke.dart';
 // P5-BEAUTY-V2-GLES-RENDER: Android True-DAG GlesBeautyV2Compositor shader/raster smoke foundation.
 export 'vg_beauty_v2_gles_render_smoke.dart';
 // P5-BEAUTY-V2-VULKAN-RENDER: Android True-DAG VulkanBeautyV2Compositor shader/raster smoke foundation.
