@@ -47,6 +47,11 @@ class _AndroidDagPhase2QCapabilityProbeSmokeAppState
         'deviceId': 0,
         'apiVersion': 0,
         'vulkanDriverVersion': 0,
+        'decodedFramePreferredPath': 'unknown',
+        'glesDecodedSurfaceTextureOesSupported': false,
+        'glesPrivateAhbImportSupported': false,
+        'glesPrivateAhbImportStatus': 'probe_exception',
+        'glesDecodedFallbackPolicy': 'probe_exception',
       };
     }
 

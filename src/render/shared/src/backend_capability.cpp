@@ -18,6 +18,11 @@ BackendCapability ProbeBackendCapability() {
     cap.vulkanDriverVersion  = 0;
     cap.profileGateStatus    = "unverified";
     cap.blacklistStatus      = "not_evaluated";
+    cap.decodedFramePreferredPath              = "unknown";
+    cap.glesDecodedSurfaceTextureOesSupported  = false;
+    cap.glesPrivateAhbImportSupported          = false;
+    cap.glesPrivateAhbImportStatus             = "unverified";
+    cap.glesDecodedFallbackPolicy              = "unverified";
     return cap;
 }
 

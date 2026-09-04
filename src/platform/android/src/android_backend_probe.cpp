@@ -235,6 +235,23 @@ DeviceTelemetry CaptureDeviceTelemetry(const VkPhysicalDeviceProperties& props) 
 }
 
 // ---------------------------------------------------------------------------
+// P1-GLES-DECODED-ROUTE-CAPABILITY-REALIGNMENT: decoded-frame GLES route
+// capability constants. Capability/reporting only: this does not change
+// production rendering and does not retry ImageReader.PRIVATE AHB import.
+//
+// Known hard technical stop: GLES ImageReader.PRIVATE AHB import failed on
+// SM-A566B with ahb_import_unsupported_format. The verified fallback/proof
+// route is MediaCodec -> SurfaceTexture -> GL_TEXTURE_EXTERNAL_OES -> native
+// GLES DAG render/present, without private AHB import.
+// ---------------------------------------------------------------------------
+static const char* kGlesPrivateAhbImportStatus =
+    "deferred_ahb_import_unsupported_format";
+static const char* kGlesDecodedFallbackPolicy =
+    "surface_texture_oes_without_private_ahb_import";
+static const char* kDecodedFramePreferredPathGles = "gles_surface_texture_oes";
+static const char* kDecodedFramePreferredPathVulkan = "vulkan_primary";
+
+// ---------------------------------------------------------------------------
 // GLES fallback builder
 // ---------------------------------------------------------------------------
 render::BackendCapability GlesFallback(
@@ -249,6 +266,11 @@ render::BackendCapability GlesFallback(
     cap.fallbackReason    = fallbackReason;
     cap.profileGateStatus = profileGateStatus;
     cap.blacklistStatus   = blacklistStatus;
+    cap.decodedFramePreferredPath             = kDecodedFramePreferredPathGles;
+    cap.glesDecodedSurfaceTextureOesSupported = true;
+    cap.glesPrivateAhbImportSupported         = false;
+    cap.glesPrivateAhbImportStatus            = kGlesPrivateAhbImportStatus;
+    cap.glesDecodedFallbackPolicy             = kGlesDecodedFallbackPolicy;
     if (tel.populated) {
         cap.gpuVendor           = tel.vendorString;
         cap.gpuRenderer         = tel.deviceName;
@@ -609,6 +631,14 @@ render::BackendCapability AndroidProbeBackendCapability() {
     cap.deviceId            = chosenTel.deviceId;
     cap.apiVersion          = chosenTel.apiVersion;
     cap.vulkanDriverVersion = chosenTel.driverVersion;
+    // Vulkan is primary when selected; the verified decoded GLES fallback
+    // route (SurfaceTexture/OES, no private AHB import) remains reported
+    // alongside it for visibility, without altering the selected backend.
+    cap.decodedFramePreferredPath             = kDecodedFramePreferredPathVulkan;
+    cap.glesDecodedSurfaceTextureOesSupported = true;
+    cap.glesPrivateAhbImportSupported         = false;
+    cap.glesPrivateAhbImportStatus            = kGlesPrivateAhbImportStatus;
+    cap.glesDecodedFallbackPolicy             = kGlesDecodedFallbackPolicy;
     return cap;
 }
 

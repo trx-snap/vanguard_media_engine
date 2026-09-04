@@ -15,7 +15,12 @@ class VanguardDiagnostics {
             " api=${report.apiVersion}" +
             " driver=${report.vulkanDriverVersion}" +
             " profile=${report.profileGateStatus}" +
-            " blacklist=${report.blacklistStatus}")
+            " blacklist=${report.blacklistStatus}" +
+            " decodedFramePreferredPath=${report.decodedFramePreferredPath}" +
+            " glesDecodedSurfaceTextureOesSupported=${report.glesDecodedSurfaceTextureOesSupported}" +
+            " glesPrivateAhbImportSupported=${report.glesPrivateAhbImportSupported}" +
+            " glesPrivateAhbImportStatus=${report.glesPrivateAhbImportStatus}" +
+            " glesDecodedFallbackPolicy=${report.glesDecodedFallbackPolicy}")
     }
 
     fun logEvent(message: String) {

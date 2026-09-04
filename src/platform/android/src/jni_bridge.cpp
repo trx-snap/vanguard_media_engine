@@ -251,9 +251,15 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     //   vulkanDriverVersion: Long -> J
     //   profileGateStatus: String -> Ljava/lang/String;
     //   blacklistStatus: String   -> Ljava/lang/String;
+    //   decodedFramePreferredPath: String                -> Ljava/lang/String;
+    //   glesDecodedSurfaceTextureOesSupported: Boolean    -> Z
+    //   glesPrivateAhbImportSupported: Boolean            -> Z
+    //   glesPrivateAhbImportStatus: String                -> Ljava/lang/String;
+    //   glesDecodedFallbackPolicy: String                 -> Ljava/lang/String;
     jmethodID ctor = env->GetMethodID(
         reportClass, "<init>",
-        "(ZZILjava/lang/String;Ljava/lang/String;Ljava/lang/String;JJJJLjava/lang/String;Ljava/lang/String;)V");
+        "(ZZILjava/lang/String;Ljava/lang/String;Ljava/lang/String;JJJJLjava/lang/String;Ljava/lang/String;"
+        "Ljava/lang/String;ZZLjava/lang/String;Ljava/lang/String;)V");
     if (!ctor) return nullptr;
 
     int selectedInt = (caps.selected == vanguard::render::RenderBackendType::kVulkan) ? 0 :
@@ -264,6 +270,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     jstring gpuRendererStr       = env->NewStringUTF(caps.gpuRenderer.c_str());
     jstring profileGateStatusStr = env->NewStringUTF(caps.profileGateStatus.c_str());
     jstring blacklistStatusStr   = env->NewStringUTF(caps.blacklistStatus.c_str());
+    jstring decodedFramePreferredPathStr =
+        env->NewStringUTF(caps.decodedFramePreferredPath.c_str());
+    jstring glesPrivateAhbImportStatusStr =
+        env->NewStringUTF(caps.glesPrivateAhbImportStatus.c_str());
+    jstring glesDecodedFallbackPolicyStr =
+        env->NewStringUTF(caps.glesDecodedFallbackPolicy.c_str());
 
     jobject report = env->NewObject(
         reportClass, ctor,
@@ -278,7 +290,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
         static_cast<jlong>(caps.apiVersion),
         static_cast<jlong>(caps.vulkanDriverVersion),
         profileGateStatusStr,
-        blacklistStatusStr);
+        blacklistStatusStr,
+        decodedFramePreferredPathStr,
+        static_cast<jboolean>(caps.glesDecodedSurfaceTextureOesSupported),
+        static_cast<jboolean>(caps.glesPrivateAhbImportSupported),
+        glesPrivateAhbImportStatusStr,
+        glesDecodedFallbackPolicyStr);
 
     // Release local string refs now that the object is constructed.
     env->DeleteLocalRef(fallbackReasonStr);
@@ -286,6 +303,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     env->DeleteLocalRef(gpuRendererStr);
     env->DeleteLocalRef(profileGateStatusStr);
     env->DeleteLocalRef(blacklistStatusStr);
+    env->DeleteLocalRef(decodedFramePreferredPathStr);
+    env->DeleteLocalRef(glesPrivateAhbImportStatusStr);
+    env->DeleteLocalRef(glesDecodedFallbackPolicyStr);
 
     return report;
 }

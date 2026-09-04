@@ -291,7 +291,15 @@ object AndroidDagRenderSmokeHarness {
                 report.vendorId != 0L &&
                 report.deviceId != 0L &&
                 report.apiVersion != 0L &&
-                report.vulkanDriverVersion != 0L
+                report.vulkanDriverVersion != 0L &&
+                // P1-GLES-DECODED-ROUTE-CAPABILITY-REALIGNMENT: decoded GLES
+                // route capability/reporting requirements. Vulkan remains
+                // primary; this does not retry private AHB import.
+                report.decodedFramePreferredPath == "vulkan_primary" &&
+                report.glesDecodedSurfaceTextureOesSupported &&
+                !report.glesPrivateAhbImportSupported &&
+                report.glesPrivateAhbImportStatus == "deferred_ahb_import_unsupported_format" &&
+                report.glesDecodedFallbackPolicy == "surface_texture_oes_without_private_ahb_import"
 
             val result = mapOf<String, Any?>(
                 "pass" to pass,
@@ -307,6 +315,11 @@ object AndroidDagRenderSmokeHarness {
                 "vulkanDriverVersion" to report.vulkanDriverVersion,
                 "profileGateStatus" to report.profileGateStatus,
                 "blacklistStatus" to report.blacklistStatus,
+                "decodedFramePreferredPath" to report.decodedFramePreferredPath,
+                "glesDecodedSurfaceTextureOesSupported" to report.glesDecodedSurfaceTextureOesSupported,
+                "glesPrivateAhbImportSupported" to report.glesPrivateAhbImportSupported,
+                "glesPrivateAhbImportStatus" to report.glesPrivateAhbImportStatus,
+                "glesDecodedFallbackPolicy" to report.glesDecodedFallbackPolicy,
             )
             Log.i(TAG, "$RESULT_MARKER_PHASE2Q pass=$pass $report")
             result
@@ -326,6 +339,11 @@ object AndroidDagRenderSmokeHarness {
                 "vulkanDriverVersion" to 0L,
                 "profileGateStatus" to "probe_exception",
                 "blacklistStatus" to "not_evaluated",
+                "decodedFramePreferredPath" to "unknown",
+                "glesDecodedSurfaceTextureOesSupported" to false,
+                "glesPrivateAhbImportSupported" to false,
+                "glesPrivateAhbImportStatus" to "probe_exception",
+                "glesDecodedFallbackPolicy" to "probe_exception",
             )
             Log.e(TAG, "$RESULT_MARKER_PHASE2Q exception=$simpleName", throwable)
             result
