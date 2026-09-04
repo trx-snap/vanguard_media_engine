@@ -211,6 +211,11 @@ if (ANDROID)
     # synthetic buffer is always the 2D secondary.
     "platform/android/src/android_phase3_multicam_single_cam_ingest_spatial_render_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_vulkan_render_jni.cpp"
+    # P3-MULTICAM-NODE-VULKAN-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: caller-
+    # supplied Dart layout descriptor primitives -> native Vulkan spatial
+    # render/readback, combining the strict descriptor-parser policy above
+    # with the static Vulkan two-texture spatial route above it.
+    "platform/android/src/android_phase3_multicam_dynamic_descriptor_spatial_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_overlay_gles_render_jni.cpp"

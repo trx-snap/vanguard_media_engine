@@ -58,6 +58,8 @@ export 'vg_multicam_spatial_gles_oes_render_smoke.dart';
 export 'vg_multicam_spatial_vulkan_render_smoke.dart';
 // P3-MULTICAM-NODE-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: Android True-DAG Phase 3 Dart layout descriptor -> native GLES/OES spatial render smoke foundation.
 export 'vg_multicam_dynamic_descriptor_spatial_render_smoke.dart';
+// P3-MULTICAM-NODE-VULKAN-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: Android True-DAG Phase 3 Dart layout descriptor -> native Vulkan spatial render smoke foundation.
+export 'vg_multicam_dynamic_descriptor_spatial_vulkan_render_smoke.dart';
 // P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER: Android True-DAG Phase 3 real Camera2 YUV_420_888 ingest + Dart layout descriptor -> native GLES/OES spatial render smoke foundation.
 export 'vg_single_cam_ingest_spatial_render_smoke.dart';
 // P4-AUDIO-MIXBUS: Android True-DAG Phase 4 AudioMixBusNode PCM16 mix-math diagnostic smoke foundation.

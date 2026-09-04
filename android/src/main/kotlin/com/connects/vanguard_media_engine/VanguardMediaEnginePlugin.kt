@@ -49,6 +49,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmo
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidMulticamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMulticamSpatialVulkanRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioGraphPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioTrackPlaybackSinkCoordinator
@@ -393,6 +394,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var multicamSpatialVulkanRenderSmokeCoordinator:
         AndroidMulticamSpatialVulkanRenderSmokeCoordinator? = null
 
+    // -- P3-MULTICAM-NODE-VULKAN-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: caller- --
+    // supplied Dart layout descriptor primitives -> native Vulkan spatial
+    // render/readback smoke coordinator.
+    private var multicamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator:
+        AndroidMulticamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator? = null
+
     // ── P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): VGTimelineCompositorNode ──
     // native topology + transition math smoke coordinator.
     private var timelineCompositorSmokeCoordinator: AndroidTimelineCompositorSmokeCoordinator? = null
@@ -735,6 +742,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         multicamSpatialVulkanRenderSmokeCoordinator = AndroidMulticamSpatialVulkanRenderSmokeCoordinator(
             mainHandler = mainHandler,
         )
+        multicamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator =
+            AndroidMulticamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator(
+                mainHandler = mainHandler,
+            )
         timelineCompositorSmokeCoordinator = AndroidTimelineCompositorSmokeCoordinator(
             mainHandler = mainHandler,
         )
@@ -1434,6 +1445,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android multi-cam spatial Vulkan render smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidMulticamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = multicamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android multi-cam dynamic-descriptor spatial Vulkan render smoke coordinator unavailable",
                     null,
                 )
             }
@@ -3065,6 +3090,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // them in the native call before returning.
         multicamSpatialVulkanRenderSmokeCoordinator?.disposeAll()
         multicamSpatialVulkanRenderSmokeCoordinator = null
+        // P3-MULTICAM-NODE-VULKAN-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: release the
+        // smoke executor. An in-flight run owns its VkDevice/images on its own
+        // thread and destroys them in the native call before returning.
+        multicamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator?.disposeAll()
+        multicamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator = null
         // P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): release the smoke executor.
         timelineCompositorSmokeCoordinator?.disposeAll()
         timelineCompositorSmokeCoordinator = null

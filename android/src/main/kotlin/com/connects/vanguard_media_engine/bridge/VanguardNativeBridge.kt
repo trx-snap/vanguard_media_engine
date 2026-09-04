@@ -2218,6 +2218,40 @@ class VanguardNativeBridge(
     // recording/export, no production VulkanBackend mutation, no product UI.
     external fun runAndroidDagPhase3MultiCamSpatialVulkanRenderSmoke(): String
 
+    // -- P3-MULTICAM-NODE-VULKAN-DYNAMIC-DESCRIPTOR-SPATIAL-RENDER: proves --
+    // that a caller-supplied Dart layout descriptor's primitive fields drive
+    // native Vulkan spatial rendering via ComputeMultiCamLayout(), combining
+    // the strict layoutMode/pipAnchor/splitDirection descriptor-string
+    // resolution policy from the GLES dynamic-descriptor route above with
+    // the static Vulkan two-texture spatial route above it. Synchronous,
+    // single JSON result per call, exactly like
+    // runAndroidDagPhase3MultiCamSpatialVulkanRenderSmoke: native creates
+    // its own temporary VkInstance/VkDevice/VkQueue/VkCommandPool and
+    // synthetic solid red/blue RGBA8 sampled images for this one call, then
+    // strictly resolves layoutMode/pipAnchor/splitDirection (an unrecognized
+    // value is rejected before any Vulkan object is created), builds a
+    // MultiCamLayout from the caller's primitives
+    // (cornerRadiusFractionOfCanvasWidth/opacity hard-set to 0.0/1.0; this
+    // route accepts no cornerRadius/opacity parameter at all), evaluates the
+    // already-verified ComputeMultiCamLayout(), converts both viewports to
+    // Vulkan pixel rects, and renders (red primary, blue secondary) before
+    // destroying everything and returning. Reports status "UNSUPPORTED"
+    // (never crashes) when no usable Vulkan device exists. No GLES, no
+    // camera open, no OES/AHardwareBuffer import, no opacity, no corner
+    // radius, no recording/export, no production VulkanBackend mutation, no
+    // product UI.
+    external fun runAndroidDagPhase3MultiCamDynamicDescriptorSpatialVulkanRenderSmoke(
+        layoutMode: String,
+        pipAnchor: String,
+        pipCenterX: Double,
+        pipCenterY: Double,
+        pipWidthFraction: Double,
+        pipAspectRatio: Double,
+        pipMarginFraction: Double,
+        splitDirection: String,
+        splitRatio: Double,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): VGTimelineCompositorNode ──
     // native topology + timeline clip overlap / transition progress math
     // foundation diagnostic. Pure in-memory C++ math only: builds
