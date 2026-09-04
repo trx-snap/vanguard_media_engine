@@ -2113,6 +2113,26 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // -- P3-MULTICAM-NODE-GLES-OES-SPATIAL-RENDER: bounded OES extension of --
+    // the RGBA-only spatial route above. Native fills rgbaBufferA solid
+    // opaque red and rgbaBufferB solid opaque blue (caller allocates both
+    // uninitialized); ycbcrBufferA/ycbcrBufferB are never CPU-filled and are
+    // imported as GL_TEXTURE_EXTERNAL_OES (0x8D65). Exercises 2D+OES,
+    // OES+2D, and OES+OES spatial composite lane permutations via the same
+    // GlesBackend diagnostic readback/present seams; OES lanes assert
+    // render/readback success and resolved texture target only, never
+    // deterministic color content. No camera open, no Vulkan, no
+    // recording/export, no product UI.
+    external fun runAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke(
+        surface: Surface,
+        rgbaBufferA: HardwareBuffer,
+        rgbaBufferB: HardwareBuffer,
+        ycbcrBufferA: HardwareBuffer,
+        ycbcrBufferB: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     // ── P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): VulkanMultiCamSpatialCompositor ──
     // two-texture spatial layout raster + readback proof diagnostic. Native
     // creates its own temporary VkInstance/VkDevice/VkQueue/VkCommandPool,

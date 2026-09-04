@@ -194,6 +194,10 @@ if (ANDROID)
     "platform/android/src/android_phase4_realtime_playback_graph_session_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
+    # P3-MULTICAM-NODE-GLES-OES-SPATIAL-RENDER: bounded extension of the
+    # RGBA-only spatial route above with GL_TEXTURE_EXTERNAL_OES lane
+    # permutations (2D+OES, OES+2D, OES+OES) over YCBCR_420_888 imports.
+    "platform/android/src/android_phase3_multicam_spatial_oes_render_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"

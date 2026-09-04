@@ -57,6 +57,13 @@ class AndroidGlesTextureSmokeCoordinator(
         private const val SPATIAL_PROOF_BOUNDARY =
             "native_multicam_spatial_gles_two_texture_layout_render_readback_only_no_vulkan_no_camera_no_oes_proof_no_opacity_no_corner_radius_no_recording_no_product"
 
+        // P3-MULTICAM-NODE-GLES-OES-SPATIAL-RENDER: bounded OES extension of
+        // the spatial route above. Allocation/execution/parsing lives in
+        // [AndroidMultiCamSpatialGlesOesSmokeHarness]; this coordinator only
+        // owns SurfaceProducer creation/threading/dispose bookkeeping.
+        private const val OES_COMPLETE_METHOD = "onAndroidDagPhase3MultiCamSpatialGlesOesRenderSmokeComplete"
+        private const val OES_DEFAULT_DIMENSION = 128
+
         private val OWNED_METHODS = setOf(
             "startAndroidDagPhase1AXGlesTextureRenderSmoke",
             "disposeAndroidDagPhase1AXGlesTextureRenderSmoke",
@@ -68,6 +75,8 @@ class AndroidGlesTextureSmokeCoordinator(
             "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke",
             "startAndroidDagPhase3MultiCamSpatialGlesRenderSmoke",
             "disposeAndroidDagPhase3MultiCamSpatialGlesRenderSmoke",
+            "startAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke",
+            "disposeAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -138,6 +147,18 @@ class AndroidGlesTextureSmokeCoordinator(
 
     private val spatialActiveEntries = mutableMapOf<Long, SpatialActiveEntry>()
 
+    // P3-MULTICAM-NODE-GLES-OES-SPATIAL-RENDER: kept separate from all
+    // entries above so no texture id ownership can ever collide, even
+    // though all are keyed by SurfaceProducer id.
+    private data class OesActiveEntry(
+        val surfaceProducer: TextureRegistry.SurfaceProducer,
+        val released: AtomicBoolean = AtomicBoolean(false),
+        val runCompleted: AtomicBoolean = AtomicBoolean(false),
+        val disposeRequested: AtomicBoolean = AtomicBoolean(false),
+    )
+
+    private val oesActiveEntries = mutableMapOf<Long, OesActiveEntry>()
+
     fun handleMethodCall(method: String, args: Map<*, *>?, result: MethodChannel.Result): Boolean {
         when (method) {
             "startAndroidDagPhase1AXGlesTextureRenderSmoke" -> start(args, result)
@@ -150,6 +171,8 @@ class AndroidGlesTextureSmokeCoordinator(
             "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke" -> disposeAwOes(args, result)
             "startAndroidDagPhase3MultiCamSpatialGlesRenderSmoke" -> startSpatial(args, result)
             "disposeAndroidDagPhase3MultiCamSpatialGlesRenderSmoke" -> disposeSpatial(args, result)
+            "startAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke" -> startOes(args, result)
+            "disposeAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke" -> disposeOes(args, result)
             else -> return false
         }
         return true
@@ -317,6 +340,21 @@ class AndroidGlesTextureSmokeCoordinator(
             synchronized(entry) {
                 if (entry.runCompleted.get()) {
                     releaseOnceSpatial(entry)
+                } else {
+                    entry.disposeRequested.set(true)
+                }
+            }
+        }
+
+        val oesEntriesToDispose = synchronized(oesActiveEntries) {
+            val list = oesActiveEntries.values.toList()
+            oesActiveEntries.clear()
+            list
+        }
+        oesEntriesToDispose.forEach { entry ->
+            synchronized(entry) {
+                if (entry.runCompleted.get()) {
+                    releaseOnceOes(entry)
                 } else {
                     entry.disposeRequested.set(true)
                 }
@@ -1058,4 +1096,159 @@ class AndroidGlesTextureSmokeCoordinator(
         "detach=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
         "proofBoundary=$SPATIAL_PROOF_BOUNDARY;" +
         "lastError=$reason"
+
+    // -- P3-MULTICAM-NODE-GLES-OES-SPATIAL-RENDER: bounded OES extension --
+
+    private fun startOes(args: Map<*, *>?, result: MethodChannel.Result) {
+        val widthArg = (args?.get("width") as? Number)?.toInt()
+        val heightArg = (args?.get("height") as? Number)?.toInt()
+        if (widthArg != null && widthArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke: width must be positive", null)
+            return
+        }
+        if (heightArg != null && heightArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke: height must be positive", null)
+            return
+        }
+        val width = widthArg ?: OES_DEFAULT_DIMENSION
+        val height = heightArg ?: OES_DEFAULT_DIMENSION
+
+        val surfaceProducer = textureRegistry.createSurfaceProducer()
+        val textureId = surfaceProducer.id()
+        val entry = OesActiveEntry(surfaceProducer)
+        synchronized(oesActiveEntries) {
+            oesActiveEntries[textureId] = entry
+        }
+
+        Thread {
+            var producerSurface: Surface? = null
+            var harnessResult: Map<String, Any?> = emptyMap()
+            try {
+                surfaceProducer.setSize(width, height)
+                val surface = surfaceProducer.getSurface()
+                producerSurface = surface
+                harnessResult = AndroidMultiCamSpatialGlesOesSmokeHarness.runGlesOesSpatialSmokeForSurface(
+                    surface,
+                    width,
+                    height,
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "P3-MULTICAM-NODE-GLES-OES-SPATIAL-RENDER harness execution error", t)
+                harnessResult = mapOf(
+                    "pass" to false,
+                    "raw" to "status=FAIL;lastError=exception:${t.javaClass.simpleName.ifEmpty { "unknown_exception" }}",
+                    "proofBoundary" to AndroidMultiCamSpatialGlesOesSmokeHarness.PROOF_BOUNDARY,
+                    "metrics" to emptyMap<String, Any?>(),
+                    "lastError" to "exception:${t.javaClass.simpleName.ifEmpty { "unknown_exception" }}",
+                )
+            } finally {
+                // The Surface obtained from the SurfaceProducer is owned by
+                // this coordinator, not the harness (which never releases a
+                // caller-provided Surface) -- release it once the harness
+                // finishes. The SurfaceProducer itself is released only via
+                // releaseOnceOes()'s dispose-driven lifecycle below.
+                try {
+                    producerSurface?.release()
+                } catch (_: Throwable) {
+                }
+            }
+
+            entry.runCompleted.set(true)
+            // Same ownership rule as AX/BB/AW-OES/Spatial: the producer is
+            // released here only if a dispose() arrived while still
+            // running; a normal completion with no prior dispose leaves it
+            // alive for Dart to display via a Texture widget.
+            var released = false
+            synchronized(entry) {
+                if (entry.disposeRequested.get()) {
+                    released = releaseOnceOes(entry)
+                }
+            }
+            if (released) {
+                synchronized(oesActiveEntries) { oesActiveEntries.remove(textureId) }
+            }
+
+            val finalResult = harnessResult + mapOf(
+                "textureId" to textureId,
+                "surfaceProducerReleased" to released,
+                "width" to width,
+                "height" to height,
+            )
+            mainHandler.post {
+                channel.invokeMethod(OES_COMPLETE_METHOD, finalResult)
+            }
+        }.start()
+
+        result.success(mapOf(
+            "started" to true,
+            "textureId" to textureId,
+        ))
+    }
+
+    private fun disposeOes(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "disposeAndroidDagPhase3MultiCamSpatialGlesOesRenderSmoke: textureId required", null)
+            return
+        }
+        val entry = synchronized(oesActiveEntries) { oesActiveEntries[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to true,
+                "textureId" to textureId,
+                "surfaceProducerReleased" to false,
+                "raw" to "status=OK;already_disposed_or_not_found;textureId=$textureId",
+            ))
+            return
+        }
+
+        // Same ownership rule as AX/BB/AW-OES/Spatial's dispose(): never
+        // release the producer while the worker thread may still be
+        // rendering into it.
+        var released = false
+        var completedNow = false
+        synchronized(entry) {
+            if (entry.runCompleted.get()) {
+                released = releaseOnceOes(entry)
+                completedNow = true
+            } else {
+                entry.disposeRequested.set(true)
+            }
+        }
+        if (completedNow) {
+            synchronized(oesActiveEntries) { oesActiveEntries.remove(textureId) }
+        }
+        result.success(mapOf(
+            "pass" to true,
+            "textureId" to textureId,
+            "surfaceProducerReleased" to released,
+            "raw" to if (completedNow) {
+                "status=OK;disposed=true;textureId=$textureId"
+            } else {
+                "status=OK;dispose_requested_pending_completion;textureId=$textureId"
+            },
+        ))
+    }
+
+    private fun releaseOnceOes(entry: OesActiveEntry): Boolean {
+        if (!entry.released.compareAndSet(false, true)) {
+            return false
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                entry.surfaceProducer.release()
+            } catch (t: Throwable) {
+                Log.w(TAG, "OES surfaceProducer.release() failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        } else {
+            mainHandler.post {
+                try {
+                    entry.surfaceProducer.release()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "OES surfaceProducer.release() on mainHandler failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
+        }
+        return true
+    }
 }
