@@ -6,9 +6,10 @@
 //
 // Claims: dynamic keyframed static sticker overlay export
 // (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), static sticker overlay compositing
-// on solo frames, AND on Vulkan dissolve and representative non-dissolve
-// (slideLeft, wipeRight) transition overlap frames
-// (P5-OVERLAYS-TRANSITION-COMP-N3, P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A),
+// on solo frames, AND on all supported Vulkan transition overlap frames
+// (dissolve, crossfade, slideLeft, slideRight, slideUp, slideDown,
+// wipeLeft, wipeRight, wipeUp, wipeDown) under
+// P5-OVERLAYS-ALL-SUPPORTED-TRANSITION-DIRECTIONS-PROOF / P5-OVERLAYS-TRANS,
 // AND overlays alongside clip-level Beauty V2 on both transition overlap
 // frames (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
 // (P5-OVERLAYS-BEAUTY-SOLO), text overlay production export via
@@ -17,9 +18,8 @@
 // (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT).
 //
 // Strict non-claims:
-//   - Proves representative non-dissolve overlay transition support for slideLeft
-//     and wipeRight only; does not claim every transition direction (unproved
-//     transition directions/types remain non-claims);
+//   - All supported Vulkan transition wire types with overlays are physically
+//     proved on SM-A566B; unsupported transitions (e.g. fade) fail closed elsewhere;
 //   - No GLES overlay route;
 //   - No realtime playback overlay compositing;
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;

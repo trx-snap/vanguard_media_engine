@@ -19,17 +19,18 @@
 //     text, and emoji overlays in Route-A (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT,
 //     P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT), including
 //     dynamic keyframed spatial transforms (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT),
-//     overlay compositing on Vulkan dissolve and representative non-dissolve
-//     (slideLeft, wipeRight) transition overlap frames (P5-OVERLAYS-TRANSITION-COMP-N3,
-//     P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A), and overlays alongside clip-level
-//     Beauty V2 on both transition-overlap frames
+//     overlay compositing on all supported Vulkan transition overlap frames
+//     (dissolve, crossfade, slideLeft, slideRight, slideUp, slideDown,
+//     wipeLeft, wipeRight, wipeUp, wipeDown) under P5-OVERLAYS-ALL-SUPPORTED-TRANSITION-DIRECTIONS-PROOF
+//     (closing unproved transition directions/types under P5-OVERLAYS-TRANS), and
+//     overlays alongside clip-level Beauty V2 on both transition-overlap frames
 //     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
-//     (P5-OVERLAYS-BEAUTY-SOLO), but does not claim every transition direction
-//     (proves representative non-dissolve overlay transition support for
-//     slideLeft and wipeRight only), GLES overlay route, realtime playback
-//     overlay compositing, unproved transition directions/types,
-//     app/editor/product/iOS/streaming-cache, fleet coverage, or pixel-quality
-//     typography/emoji glyph guarantee;
+//     (P5-OVERLAYS-BEAUTY-SOLO);
+//   - Unsupported transition types (e.g. fade) fail closed elsewhere because
+//     fade-through-black semantics are unsupported;
+//   - Strict non-claims: GLES overlay export, realtime playback overlay compositing,
+//     app/editor/product/iOS/streaming-cache, fleet coverage beyond tested device,
+//     or pixel-quality typography/emoji glyph guarantees;
 //   - Validates success lanes: `success == true`, output file exists,
 //     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (transition-aware:
 //     clip trim-window sum minus non-hard-cut transition overlap durations, unaffected
@@ -100,6 +101,13 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'overlays_with_transition_dissolve_success',
   'overlays_with_transition_slide_left_success',
   'overlays_with_transition_wipe_right_success',
+  'overlays_with_transition_crossfade_success',
+  'overlays_with_transition_slide_right_success',
+  'overlays_with_transition_slide_up_success',
+  'overlays_with_transition_slide_down_success',
+  'overlays_with_transition_wipe_left_success',
+  'overlays_with_transition_wipe_up_success',
+  'overlays_with_transition_wipe_down_success',
   'overlays_with_beauty_transition_overlap_success',
   'overlays_with_beauty_solo_success',
   'fail_closed_unreadable_asset',
@@ -897,7 +905,70 @@ class VGTimelineOverlayExportSmokeRunner {
   }
 }
 
-/// Builds the default suite of 14 Route-A static sticker, text, and emoji overlay smoke requests:
+/// Private helper to build a 2-clip, 0.5s transition overlay smoke lane with
+/// a static sticker active strictly inside the transition overlap window [1.5s, 2.0s).
+VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
+  required String laneId,
+  required String transitionType,
+  required String clipPathA,
+  required String clipPathB,
+  required String stickerAssetPath,
+  required String Function(String) outputPath,
+}) {
+  return VGTimelineOverlayExportSmokeRequest(
+    laneId: laneId,
+    clips: <VGTimelineOverlayExportSmokeClip>[
+      VGTimelineOverlayExportSmokeClip(
+        id: 'clip-1',
+        sourcePath: clipPathA,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 2.0,
+      ),
+      VGTimelineOverlayExportSmokeClip(
+        id: 'clip-2',
+        sourcePath: clipPathB,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 2.0,
+      ),
+    ],
+    transitions: <VGTimelineOverlayExportSmokeTransition>[
+      VGTimelineOverlayExportSmokeTransition(
+        id: 'tr-1',
+        type: transitionType,
+        durationSeconds: 0.5,
+        fromClipId: 'clip-1',
+        toClipId: 'clip-2',
+      ),
+    ],
+    overlays: <VGTimelineOverlayExportSmokeOverlay>[
+      VGTimelineOverlayExportSmokeOverlay(
+        id: 'sticker-overlap',
+        assetPath: stickerAssetPath,
+        startTimeSeconds: 1.5,
+        durationSeconds: 0.5,
+        translationX: 100.0,
+        translationY: 100.0,
+        width: 200.0,
+        height: 200.0,
+        rotation: 0.0,
+        scale: 1.0,
+        opacity: 1.0,
+        zIndex: 0,
+        type: 'sticker',
+      ),
+    ],
+    outputPath: outputPath(laneId),
+    expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+      expectedOverlayCount: 1,
+      expectedTransitionCount: 1,
+      expectedRenderedOverlayFrameCount: 10,
+      expectedBeautyClipCount: 0,
+      expectedBeautyFrameCountMin: 0,
+    ),
+  );
+}
+
+/// Builds the default suite of 21 Route-A static sticker, text, and emoji overlay smoke requests:
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
@@ -909,9 +980,16 @@ class VGTimelineOverlayExportSmokeRunner {
 /// 9. `overlays_with_transition_dissolve_success`
 /// 10. `overlays_with_transition_slide_left_success`
 /// 11. `overlays_with_transition_wipe_right_success`
-/// 12. `overlays_with_beauty_transition_overlap_success`
-/// 13. `overlays_with_beauty_solo_success`
-/// 14. `fail_closed_unreadable_asset`
+/// 12. `overlays_with_transition_crossfade_success`
+/// 13. `overlays_with_transition_slide_right_success`
+/// 14. `overlays_with_transition_slide_up_success`
+/// 15. `overlays_with_transition_slide_down_success`
+/// 16. `overlays_with_transition_wipe_left_success`
+/// 17. `overlays_with_transition_wipe_up_success`
+/// 18. `overlays_with_transition_wipe_down_success`
+/// 19. `overlays_with_beauty_transition_overlap_success`
+/// 20. `overlays_with_beauty_solo_success`
+/// 21. `fail_closed_unreadable_asset`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
   String clipPathB = '/data/local/tmp/clip_b.mov',
@@ -1265,179 +1343,106 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
     ),
 
     // Lane 9: overlays_with_transition_dissolve_success
-    VGTimelineOverlayExportSmokeRequest(
+    _buildOverlayTransitionLane(
       laneId: 'overlays_with_transition_dissolve_success',
-      clips: <VGTimelineOverlayExportSmokeClip>[
-        VGTimelineOverlayExportSmokeClip(
-          id: 'clip-1',
-          sourcePath: clipPathA,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 2.0,
-        ),
-        VGTimelineOverlayExportSmokeClip(
-          id: 'clip-2',
-          sourcePath: clipPathB,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 2.0,
-        ),
-      ],
-      transitions: const <VGTimelineOverlayExportSmokeTransition>[
-        VGTimelineOverlayExportSmokeTransition(
-          id: 'tr-1',
-          type: 'dissolve',
-          durationSeconds: 0.5,
-          fromClipId: 'clip-1',
-          toClipId: 'clip-2',
-        ),
-      ],
-      overlays: <VGTimelineOverlayExportSmokeOverlay>[
-        VGTimelineOverlayExportSmokeOverlay(
-          id: 'sticker-overlap',
-          assetPath: stickerAssetPath,
-          // Active strictly within the dissolve's output-timeline overlap
-          // window: clip-1's 2.0s trim window lends its last 0.5s to the
-          // transition, so on the overlap-shortened OUTPUT timeline (see
-          // VGTimelineOverlayExportSmokeRequest.expectedDurationSeconds)
-          // the overlap occupies [1.5s, 2.0s) -- an overlay gated to
-          // exactly that window can only render if
-          // AndroidTimelineVulkanVideoEncoder composites overlays on
-          // transition-overlap frames using the same continuous output
-          // pts clock solo frames use, proving overlay-during-overlap
-          // rendering and the output (not per-source-clip) time base.
-          startTimeSeconds: 1.5,
-          durationSeconds: 0.5,
-          translationX: 100.0,
-          translationY: 100.0,
-          width: 200.0,
-          height: 200.0,
-          rotation: 0.0,
-          scale: 1.0,
-          opacity: 1.0,
-          zIndex: 0,
-          type: 'sticker',
-        ),
-      ],
-      outputPath: outputPath('overlays_with_transition_dissolve_success'),
-      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
-        expectedOverlayCount: 1,
-        expectedTransitionCount: 1,
-        expectedRenderedOverlayFrameCount: 10,
-      ),
+      transitionType: 'dissolve',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
     ),
 
     // Lane 10: overlays_with_transition_slide_left_success
-    VGTimelineOverlayExportSmokeRequest(
+    _buildOverlayTransitionLane(
       laneId: 'overlays_with_transition_slide_left_success',
-      clips: <VGTimelineOverlayExportSmokeClip>[
-        VGTimelineOverlayExportSmokeClip(
-          id: 'clip-1',
-          sourcePath: clipPathA,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 2.0,
-        ),
-        VGTimelineOverlayExportSmokeClip(
-          id: 'clip-2',
-          sourcePath: clipPathB,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 2.0,
-        ),
-      ],
-      transitions: const <VGTimelineOverlayExportSmokeTransition>[
-        VGTimelineOverlayExportSmokeTransition(
-          id: 'tr-1',
-          type: 'slideLeft',
-          durationSeconds: 0.5,
-          fromClipId: 'clip-1',
-          toClipId: 'clip-2',
-        ),
-      ],
-      overlays: <VGTimelineOverlayExportSmokeOverlay>[
-        VGTimelineOverlayExportSmokeOverlay(
-          id: 'sticker-overlap',
-          assetPath: stickerAssetPath,
-          // Active strictly within the slideLeft transition's output-timeline
-          // overlap window [1.5s, 2.0s). Proves representative non-dissolve
-          // slideLeft overlay transition support.
-          startTimeSeconds: 1.5,
-          durationSeconds: 0.5,
-          translationX: 100.0,
-          translationY: 100.0,
-          width: 200.0,
-          height: 200.0,
-          rotation: 0.0,
-          scale: 1.0,
-          opacity: 1.0,
-          zIndex: 0,
-          type: 'sticker',
-        ),
-      ],
-      outputPath: outputPath('overlays_with_transition_slide_left_success'),
-      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
-        expectedOverlayCount: 1,
-        expectedTransitionCount: 1,
-        expectedRenderedOverlayFrameCount: 10,
-        expectedBeautyClipCount: 0,
-        expectedBeautyFrameCountMin: 0,
-      ),
+      transitionType: 'slideLeft',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
     ),
 
     // Lane 11: overlays_with_transition_wipe_right_success
-    VGTimelineOverlayExportSmokeRequest(
+    _buildOverlayTransitionLane(
       laneId: 'overlays_with_transition_wipe_right_success',
-      clips: <VGTimelineOverlayExportSmokeClip>[
-        VGTimelineOverlayExportSmokeClip(
-          id: 'clip-1',
-          sourcePath: clipPathA,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 2.0,
-        ),
-        VGTimelineOverlayExportSmokeClip(
-          id: 'clip-2',
-          sourcePath: clipPathB,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 2.0,
-        ),
-      ],
-      transitions: const <VGTimelineOverlayExportSmokeTransition>[
-        VGTimelineOverlayExportSmokeTransition(
-          id: 'tr-1',
-          type: 'wipeRight',
-          durationSeconds: 0.5,
-          fromClipId: 'clip-1',
-          toClipId: 'clip-2',
-        ),
-      ],
-      overlays: <VGTimelineOverlayExportSmokeOverlay>[
-        VGTimelineOverlayExportSmokeOverlay(
-          id: 'sticker-overlap',
-          assetPath: stickerAssetPath,
-          // Active strictly within the wipeRight transition's output-timeline
-          // overlap window [1.5s, 2.0s). Proves representative non-dissolve
-          // wipeRight overlay transition support.
-          startTimeSeconds: 1.5,
-          durationSeconds: 0.5,
-          translationX: 100.0,
-          translationY: 100.0,
-          width: 200.0,
-          height: 200.0,
-          rotation: 0.0,
-          scale: 1.0,
-          opacity: 1.0,
-          zIndex: 0,
-          type: 'sticker',
-        ),
-      ],
-      outputPath: outputPath('overlays_with_transition_wipe_right_success'),
-      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
-        expectedOverlayCount: 1,
-        expectedTransitionCount: 1,
-        expectedRenderedOverlayFrameCount: 10,
-        expectedBeautyClipCount: 0,
-        expectedBeautyFrameCountMin: 0,
-      ),
+      transitionType: 'wipeRight',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
     ),
 
-    // Lane 12: overlays_with_beauty_transition_overlap_success
+    // Lane 12: overlays_with_transition_crossfade_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_crossfade_success',
+      transitionType: 'crossfade',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 13: overlays_with_transition_slide_right_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_slide_right_success',
+      transitionType: 'slideRight',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 14: overlays_with_transition_slide_up_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_slide_up_success',
+      transitionType: 'slideUp',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 15: overlays_with_transition_slide_down_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_slide_down_success',
+      transitionType: 'slideDown',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 16: overlays_with_transition_wipe_left_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_wipe_left_success',
+      transitionType: 'wipeLeft',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 17: overlays_with_transition_wipe_up_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_wipe_up_success',
+      transitionType: 'wipeUp',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 18: overlays_with_transition_wipe_down_success
+    _buildOverlayTransitionLane(
+      laneId: 'overlays_with_transition_wipe_down_success',
+      transitionType: 'wipeDown',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+    ),
+
+    // Lane 19: overlays_with_beauty_transition_overlap_success
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'overlays_with_beauty_transition_overlap_success',
       clips: <VGTimelineOverlayExportSmokeClip>[
@@ -1503,7 +1508,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 13: overlays_with_beauty_solo_success
+    // Lane 20: overlays_with_beauty_solo_success
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'overlays_with_beauty_solo_success',
       clips: <VGTimelineOverlayExportSmokeClip>[
@@ -1546,7 +1551,7 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 14: fail_closed_unreadable_asset
+    // Lane 21: fail_closed_unreadable_asset
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'fail_closed_unreadable_asset',
       clips: <VGTimelineOverlayExportSmokeClip>[

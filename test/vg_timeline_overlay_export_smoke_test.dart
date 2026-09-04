@@ -148,7 +148,7 @@ void main() {
       expect(keyframesToken, 'keyframe');
       expect(unreadableAssetToken, 'asset');
 
-      expect(defaultOverlaySmokeLaneIds, hasLength(14));
+      expect(defaultOverlaySmokeLaneIds, hasLength(21));
       expect(defaultOverlaySmokeLaneIds, <String>[
         'single_clip_static_sticker_success',
         'multi_layer_z_order_success',
@@ -161,6 +161,13 @@ void main() {
         'overlays_with_transition_dissolve_success',
         'overlays_with_transition_slide_left_success',
         'overlays_with_transition_wipe_right_success',
+        'overlays_with_transition_crossfade_success',
+        'overlays_with_transition_slide_right_success',
+        'overlays_with_transition_slide_up_success',
+        'overlays_with_transition_slide_down_success',
+        'overlays_with_transition_wipe_left_success',
+        'overlays_with_transition_wipe_up_success',
+        'overlays_with_transition_wipe_down_success',
         'overlays_with_beauty_transition_overlap_success',
         'overlays_with_beauty_solo_success',
         'fail_closed_unreadable_asset',
@@ -1237,197 +1244,172 @@ void main() {
   });
 
   group('default suite construction', () {
-    test(
-      'buildDefaultOverlayExportSmokeSuite builds all 14 required lanes',
-      () {
-        final suite = buildDefaultOverlayExportSmokeSuite();
+    test('buildDefaultOverlayExportSmokeSuite builds all 21 required lanes', () {
+      final suite = buildDefaultOverlayExportSmokeSuite();
 
-        expect(suite, hasLength(14));
-        final laneIds = suite.map((r) => r.laneId).toList();
-        expect(laneIds, defaultOverlaySmokeLaneIds);
+      expect(suite, hasLength(21));
+      final laneIds = suite.map((r) => r.laneId).toList();
+      expect(laneIds, defaultOverlaySmokeLaneIds);
 
-        final successLanes = suite.where((r) => r.expectation.expectsSuccess);
-        final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
+      final successLanes = suite.where((r) => r.expectation.expectsSuccess);
+      final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(12));
-        expect(failureLanes, hasLength(2));
+      expect(successLanes, hasLength(19));
+      expect(failureLanes, hasLength(2));
 
-        // Lane 1: single_clip_static_sticker_success
-        final lane1 = suite[0];
-        expect(lane1.laneId, 'single_clip_static_sticker_success');
-        expect(lane1.clips, hasLength(1));
-        expect(lane1.overlays, hasLength(1));
-        expect(lane1.overlays.single.type, 'sticker');
-        expect(lane1.expectation.expectsSuccess, isTrue);
+      // Lane 1: single_clip_static_sticker_success
+      final lane1 = suite[0];
+      expect(lane1.laneId, 'single_clip_static_sticker_success');
+      expect(lane1.clips, hasLength(1));
+      expect(lane1.overlays, hasLength(1));
+      expect(lane1.overlays.single.type, 'sticker');
+      expect(lane1.expectation.expectsSuccess, isTrue);
 
-        // Lane 2: multi_layer_z_order_success
-        final lane2 = suite[1];
-        expect(lane2.laneId, 'multi_layer_z_order_success');
-        expect(lane2.overlays, hasLength(2));
-        expect(lane2.overlays[0].zIndex, 0);
-        expect(lane2.overlays[1].zIndex, 1);
-        expect(lane2.expectation.expectedOverlayCount, 2);
+      // Lane 2: multi_layer_z_order_success
+      final lane2 = suite[1];
+      expect(lane2.laneId, 'multi_layer_z_order_success');
+      expect(lane2.overlays, hasLength(2));
+      expect(lane2.overlays[0].zIndex, 0);
+      expect(lane2.overlays[1].zIndex, 1);
+      expect(lane2.expectation.expectedOverlayCount, 2);
 
-        // Lane 3: time_interval_gating_success
-        final lane3 = suite[2];
-        expect(lane3.laneId, 'time_interval_gating_success');
-        expect(lane3.overlays.single.startTimeSeconds, 1.0);
-        expect(lane3.overlays.single.durationSeconds, 1.5);
-        expect(lane3.clips.single.durationSeconds, 4.0);
+      // Lane 3: time_interval_gating_success
+      final lane3 = suite[2];
+      expect(lane3.laneId, 'time_interval_gating_success');
+      expect(lane3.overlays.single.startTimeSeconds, 1.0);
+      expect(lane3.overlays.single.durationSeconds, 1.5);
 
-        // Lane 4: hard_cut_multiclip_success
-        final lane4 = suite[3];
-        expect(lane4.laneId, 'hard_cut_multiclip_success');
-        expect(lane4.clips, hasLength(2));
-        expect(lane4.transitions, isEmpty);
-        expect(lane4.expectedDurationSeconds, 4.0);
+      // Lane 4: hard_cut_multiclip_success
+      final lane4 = suite[3];
+      expect(lane4.laneId, 'hard_cut_multiclip_success');
+      expect(lane4.clips, hasLength(2));
+      expect(lane4.transitions, isEmpty);
+      expect(lane4.expectedDurationSeconds, 4.0);
 
-        // Lane 5: single_clip_dynamic_keyframe_success
-        final lane5 = suite[4];
-        expect(lane5.laneId, 'single_clip_dynamic_keyframe_success');
-        expect(lane5.clips, hasLength(1));
-        expect(lane5.clips.single.durationSeconds, 2.0);
-        expect(lane5.overlays, hasLength(1));
-        expect(lane5.overlays.single.type, 'sticker');
-        expect(lane5.overlays.single.startTimeSeconds, 0.0);
-        expect(lane5.overlays.single.durationSeconds, 2.0);
-        expect(lane5.overlays.single.keyframes, isA<List<Object?>>());
-        expect((lane5.overlays.single.keyframes as List), hasLength(2));
-        expect(lane5.expectation.expectsSuccess, isTrue);
-        expect(lane5.expectation.expectedOverlayCount, 1);
-        expect(lane5.expectation.expectedRenderedOverlayFrameCount, 55);
-        expect(lane5.expectedDurationSeconds, 2.0);
+      // Lane 5: single_clip_dynamic_keyframe_success
+      final lane5 = suite[4];
+      expect(lane5.laneId, 'single_clip_dynamic_keyframe_success');
+      expect(lane5.clips, hasLength(1));
+      expect(lane5.clips.single.durationSeconds, 2.0);
+      expect(lane5.overlays, hasLength(1));
+      expect(lane5.overlays.single.type, 'sticker');
+      expect(lane5.overlays.single.startTimeSeconds, 0.0);
+      expect(lane5.overlays.single.durationSeconds, 2.0);
+      expect(lane5.overlays.single.keyframes, isA<List<Object?>>());
+      expect((lane5.overlays.single.keyframes as List), hasLength(2));
+      expect(lane5.expectation.expectsSuccess, isTrue);
+      expect(lane5.expectation.expectedOverlayCount, 1);
+      expect(lane5.expectation.expectedRenderedOverlayFrameCount, 55);
+      expect(lane5.expectedDurationSeconds, 2.0);
 
-        // Lane 6: text_overlay_success
-        final lane6 = suite[5];
-        expect(lane6.laneId, 'text_overlay_success');
-        expect(lane6.overlays.single.type, 'text');
-        expect(lane6.overlays.single.textContent, isNotNull);
-        expect(lane6.overlays.single.textContent, isNotEmpty);
-        expect(lane6.expectation.expectsSuccess, isTrue);
-        expect(lane6.expectation.expectedOverlayCount, 1);
-        expect(lane6.expectation.expectedRenderedOverlayFrameCount, 55);
+      // Lane 6: text_overlay_success
+      final lane6 = suite[5];
+      expect(lane6.laneId, 'text_overlay_success');
+      expect(lane6.overlays.single.type, 'text');
+      expect(lane6.overlays.single.textContent, isNotNull);
+      expect(lane6.overlays.single.textContent, isNotEmpty);
+      expect(lane6.expectation.expectsSuccess, isTrue);
+      expect(lane6.expectation.expectedOverlayCount, 1);
+      expect(lane6.expectation.expectedRenderedOverlayFrameCount, 55);
 
-        // Lane 7: emoji_overlay_success
-        final lane7 = suite[6];
-        expect(lane7.laneId, 'emoji_overlay_success');
-        expect(lane7.overlays.single.type, 'emoji');
-        expect(lane7.overlays.single.textContent, isNotNull);
-        expect(lane7.overlays.single.textContent, isNotEmpty);
-        expect(lane7.expectation.expectsSuccess, isTrue);
-        expect(lane7.expectation.expectedOverlayCount, 1);
-        expect(lane7.expectation.expectedRenderedOverlayFrameCount, 55);
+      // Lane 7: emoji_overlay_success
+      final lane7 = suite[6];
+      expect(lane7.laneId, 'emoji_overlay_success');
+      expect(lane7.overlays.single.type, 'emoji');
+      expect(lane7.overlays.single.textContent, isNotNull);
+      expect(lane7.overlays.single.textContent, isNotEmpty);
+      expect(lane7.expectation.expectsSuccess, isTrue);
+      expect(lane7.expectation.expectedOverlayCount, 1);
+      expect(lane7.expectation.expectedRenderedOverlayFrameCount, 55);
 
-        // Lane 8: fail_closed_malformed_keyframes
-        final lane8 = suite[7];
-        expect(lane8.laneId, 'fail_closed_malformed_keyframes');
-        expect(lane8.overlays.single.keyframes, isNotNull);
-        expect(lane8.expectation.errorCode, invalidArgCode);
-        expect(lane8.expectation.messageContains, keyframesToken);
+      // Lane 8: fail_closed_malformed_keyframes
+      final lane8 = suite[7];
+      expect(lane8.laneId, 'fail_closed_malformed_keyframes');
+      expect(lane8.overlays.single.keyframes, isNotNull);
+      expect(lane8.expectation.errorCode, invalidArgCode);
+      expect(lane8.expectation.messageContains, keyframesToken);
 
-        // Lane 9: overlays_with_transition_dissolve_success
-        final lane9 = suite[8];
-        expect(lane9.laneId, 'overlays_with_transition_dissolve_success');
-        expect(lane9.clips, hasLength(2));
-        expect(lane9.transitions, hasLength(1));
-        expect(lane9.transitions.single.type, 'dissolve');
-        expect(lane9.overlays, hasLength(1));
-        expect(lane9.expectation.expectsSuccess, isTrue);
-        expect(lane9.expectation.expectedTransitionCount, 1);
-        expect(lane9.expectation.expectedRenderedOverlayFrameCount, 10);
-        // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
-        expect(lane9.expectedDurationSeconds, closeTo(3.5, 1e-9));
-        expect(lane9.expectedTransitionCount, 1);
+      // Lanes 9-18: all 10 supported transition types/directions with overlays
+      const expectedTransitions = <String, String>{
+        'overlays_with_transition_dissolve_success': 'dissolve',
+        'overlays_with_transition_slide_left_success': 'slideLeft',
+        'overlays_with_transition_wipe_right_success': 'wipeRight',
+        'overlays_with_transition_crossfade_success': 'crossfade',
+        'overlays_with_transition_slide_right_success': 'slideRight',
+        'overlays_with_transition_slide_up_success': 'slideUp',
+        'overlays_with_transition_slide_down_success': 'slideDown',
+        'overlays_with_transition_wipe_left_success': 'wipeLeft',
+        'overlays_with_transition_wipe_up_success': 'wipeUp',
+        'overlays_with_transition_wipe_down_success': 'wipeDown',
+      };
 
-        // Lane 10: overlays_with_transition_slide_left_success
-        final lane10 = suite[9];
-        expect(lane10.laneId, 'overlays_with_transition_slide_left_success');
-        expect(lane10.clips, hasLength(2));
-        expect(lane10.clips[0].durationSeconds, 2.0);
-        expect(lane10.clips[1].durationSeconds, 2.0);
-        expect(lane10.transitions, hasLength(1));
-        expect(lane10.transitions.single.type, 'slideLeft');
-        expect(lane10.transitions.single.durationSeconds, 0.5);
-        expect(lane10.overlays, hasLength(1));
-        expect(lane10.overlays.single.startTimeSeconds, 1.5);
-        expect(lane10.overlays.single.durationSeconds, 0.5);
-        expect(lane10.expectation.expectsSuccess, isTrue);
-        expect(lane10.expectation.expectedOverlayCount, 1);
-        expect(lane10.expectation.expectedTransitionCount, 1);
-        expect(lane10.expectation.expectedRenderedOverlayFrameCount, 10);
-        expect(lane10.expectation.expectedBeautyClipCount, 0);
-        expect(lane10.expectation.expectedBeautyFrameCountMin, 0);
-        expect(lane10.expectedDurationSeconds, closeTo(3.5, 1e-9));
-        expect(lane10.expectedTransitionCount, 1);
+      var transitionLaneIndex = 8;
+      expectedTransitions.forEach((expectedLaneId, expectedType) {
+        final lane = suite[transitionLaneIndex];
+        expect(lane.laneId, expectedLaneId);
+        expect(lane.clips, hasLength(2));
+        expect(lane.clips[0].durationSeconds, 2.0);
+        expect(lane.clips[1].durationSeconds, 2.0);
+        expect(lane.transitions, hasLength(1));
+        expect(lane.transitions.single.type, expectedType);
+        expect(lane.transitions.single.durationSeconds, 0.5);
+        expect(lane.overlays, hasLength(1));
+        expect(lane.overlays.single.startTimeSeconds, 1.5);
+        expect(lane.overlays.single.durationSeconds, 0.5);
+        expect(lane.expectation.expectsSuccess, isTrue);
+        expect(lane.expectation.expectedOverlayCount, 1);
+        expect(lane.expectation.expectedTransitionCount, 1);
+        expect(lane.expectation.expectedRenderedOverlayFrameCount, 10);
+        expect(lane.expectation.expectedBeautyClipCount, 0);
+        expect(lane.expectation.expectedBeautyFrameCountMin, 0);
+        expect(lane.expectedDurationSeconds, closeTo(3.5, 1e-9));
+        expect(lane.expectedTransitionCount, 1);
+        transitionLaneIndex++;
+      });
 
-        // Lane 11: overlays_with_transition_wipe_right_success
-        final lane11 = suite[10];
-        expect(lane11.laneId, 'overlays_with_transition_wipe_right_success');
-        expect(lane11.clips, hasLength(2));
-        expect(lane11.clips[0].durationSeconds, 2.0);
-        expect(lane11.clips[1].durationSeconds, 2.0);
-        expect(lane11.transitions, hasLength(1));
-        expect(lane11.transitions.single.type, 'wipeRight');
-        expect(lane11.transitions.single.durationSeconds, 0.5);
-        expect(lane11.overlays, hasLength(1));
-        expect(lane11.overlays.single.startTimeSeconds, 1.5);
-        expect(lane11.overlays.single.durationSeconds, 0.5);
-        expect(lane11.expectation.expectsSuccess, isTrue);
-        expect(lane11.expectation.expectedOverlayCount, 1);
-        expect(lane11.expectation.expectedTransitionCount, 1);
-        expect(lane11.expectation.expectedRenderedOverlayFrameCount, 10);
-        expect(lane11.expectation.expectedBeautyClipCount, 0);
-        expect(lane11.expectation.expectedBeautyFrameCountMin, 0);
-        expect(lane11.expectedDurationSeconds, closeTo(3.5, 1e-9));
-        expect(lane11.expectedTransitionCount, 1);
+      // Lane 19: overlays_with_beauty_transition_overlap_success
+      final lane19 = suite[18];
+      expect(lane19.laneId, 'overlays_with_beauty_transition_overlap_success');
+      expect(lane19.clips, hasLength(2));
+      expect(lane19.clips[0].hasBeauty, isTrue);
+      expect(lane19.clips[1].hasBeauty, isTrue);
+      expect(lane19.transitions, hasLength(1));
+      expect(lane19.transitions.single.type, 'dissolve');
+      expect(lane19.overlays, hasLength(1));
+      expect(lane19.overlays.single.startTimeSeconds, 1.6);
+      expect(lane19.overlays.single.durationSeconds, 0.3);
+      expect(lane19.expectation.expectsSuccess, isTrue);
+      expect(lane19.expectation.expectedOverlayCount, 1);
+      expect(lane19.expectation.expectedTransitionCount, 1);
+      expect(lane19.expectation.expectedRenderedOverlayFrameCount, 6);
+      expect(lane19.expectation.expectedBeautyClipCount, 2);
+      expect(lane19.expectation.expectedBeautyFrameCountMin, 100);
+      // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
+      expect(lane19.expectedDurationSeconds, closeTo(3.5, 1e-9));
 
-        // Lane 12: overlays_with_beauty_transition_overlap_success
-        final lane12 = suite[11];
-        expect(
-          lane12.laneId,
-          'overlays_with_beauty_transition_overlap_success',
-        );
-        expect(lane12.clips, hasLength(2));
-        expect(lane12.clips[0].hasBeauty, isTrue);
-        expect(lane12.clips[1].hasBeauty, isTrue);
-        expect(lane12.transitions, hasLength(1));
-        expect(lane12.transitions.single.type, 'dissolve');
-        expect(lane12.overlays, hasLength(1));
-        expect(lane12.overlays.single.startTimeSeconds, 1.6);
-        expect(lane12.overlays.single.durationSeconds, 0.3);
-        expect(lane12.expectation.expectsSuccess, isTrue);
-        expect(lane12.expectation.expectedOverlayCount, 1);
-        expect(lane12.expectation.expectedTransitionCount, 1);
-        expect(lane12.expectation.expectedRenderedOverlayFrameCount, 6);
-        expect(lane12.expectation.expectedBeautyClipCount, 2);
-        expect(lane12.expectation.expectedBeautyFrameCountMin, 100);
-        // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
-        expect(lane12.expectedDurationSeconds, closeTo(3.5, 1e-9));
+      // Lane 20: overlays_with_beauty_solo_success
+      final lane20 = suite[19];
+      expect(lane20.laneId, 'overlays_with_beauty_solo_success');
+      expect(lane20.clips, hasLength(1));
+      expect(lane20.clips.single.hasBeauty, isTrue);
+      expect(lane20.clips.single.durationSeconds, 2.0);
+      expect(lane20.transitions, isEmpty);
+      expect(lane20.overlays, hasLength(1));
+      expect(lane20.overlays.single.startTimeSeconds, 0.0);
+      expect(lane20.overlays.single.durationSeconds, 2.0);
+      expect(lane20.expectation.expectsSuccess, isTrue);
+      expect(lane20.expectation.expectedOverlayCount, 1);
+      expect(lane20.expectation.expectedTransitionCount, 0);
+      expect(lane20.expectation.expectedRenderedOverlayFrameCount, 55);
+      expect(lane20.expectation.expectedBeautyClipCount, 1);
+      expect(lane20.expectation.expectedBeautyFrameCountMin, 55);
+      expect(lane20.expectedDurationSeconds, closeTo(2.0, 1e-9));
 
-        // Lane 13: overlays_with_beauty_solo_success
-        final lane13 = suite[12];
-        expect(lane13.laneId, 'overlays_with_beauty_solo_success');
-        expect(lane13.clips, hasLength(1));
-        expect(lane13.clips.single.hasBeauty, isTrue);
-        expect(lane13.clips.single.durationSeconds, 2.0);
-        expect(lane13.transitions, isEmpty);
-        expect(lane13.overlays, hasLength(1));
-        expect(lane13.overlays.single.startTimeSeconds, 0.0);
-        expect(lane13.overlays.single.durationSeconds, 2.0);
-        expect(lane13.expectation.expectsSuccess, isTrue);
-        expect(lane13.expectation.expectedOverlayCount, 1);
-        expect(lane13.expectation.expectedTransitionCount, 0);
-        expect(lane13.expectation.expectedRenderedOverlayFrameCount, 55);
-        expect(lane13.expectation.expectedBeautyClipCount, 1);
-        expect(lane13.expectation.expectedBeautyFrameCountMin, 55);
-        expect(lane13.expectedDurationSeconds, closeTo(2.0, 1e-9));
-
-        // Lane 14: fail_closed_unreadable_asset
-        final lane14 = suite[13];
-        expect(lane14.laneId, 'fail_closed_unreadable_asset');
-        expect(lane14.expectation.errorCode, fileUnreadableCode);
-        expect(lane14.expectation.messageContains, unreadableAssetToken);
-      },
-    );
+      // Lane 21: fail_closed_unreadable_asset
+      final lane21 = suite[20];
+      expect(lane21.laneId, 'fail_closed_unreadable_asset');
+      expect(lane21.expectation.errorCode, fileUnreadableCode);
+      expect(lane21.expectation.messageContains, unreadableAssetToken);
+    });
   });
 }
