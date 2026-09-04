@@ -2,6 +2,7 @@ package com.connects.vanguard_media_engine.diagnostics
 
 import android.content.Context
 import android.os.Handler
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.camera.AndroidCamera2CapabilityProbe
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSessionValidator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2HardwareBufferFrameSmokeHarness
@@ -14,6 +15,7 @@ import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarn
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxCapabilityProbe
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSampleIntegritySmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSmokeHarness
+import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.plugin.common.MethodChannel
 
@@ -38,6 +40,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2O2B3PhysicalSmoke",
             "runAndroidDagPhase2O2B4MultiFrameSmoke",
             "runAndroidDagPhase2QCapabilityProbe",
+            "runAndroidDagPhase1GpuBlacklistNativeSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -94,6 +97,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2O2B3PhysicalSmoke" -> runPhase2O2B3PhysicalSmoke(args, result)
             "runAndroidDagPhase2O2B4MultiFrameSmoke" -> runPhase2O2B4MultiFrameSmoke(args, result)
             "runAndroidDagPhase2QCapabilityProbe" -> runPhase2QCapabilityProbe(result)
+            "runAndroidDagPhase1GpuBlacklistNativeSmoke" -> runPhase1GpuBlacklistNativeSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -175,6 +179,51 @@ class AndroidDagDiagnosticsCoordinator(
             val probeResult = AndroidDagRenderSmokeHarness.runCapabilityProbe()
             mainHandler.post { result.success(probeResult) }
         }.start()
+    }
+
+    // ── P1-GPU-BLACKLIST-NATIVE-RULE-PROOF: native GPU driver blacklist rule
+    // evaluator diagnostic. Runs synthetic native lanes only; does not read
+    // or mutate the production (zero-entry) rule table. Proof boundary:
+    // diagnostic native evaluator and probe-route semantics only — no fleet
+    // data, no product/app/editor wiring, no Vulkan/GLES lifecycle changes.
+    private fun runPhase1GpuBlacklistNativeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1GpuBlacklistNativeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "diagnostic_native_gpu_driver_blacklist_rule_evaluator_and_probe_route_semantics_only",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GPU_BLACKLIST_NATIVE_SMOKE_FAILED",
+                        "runAndroidDagPhase1GpuBlacklistNativeSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun parseIntField(raw: String, key: String): Int {
+        val idx = raw.indexOf(key)
+        if (idx < 0) return 0
+        val start = idx + key.length
+        val end = raw.indexOf(';', start).let { if (it < 0) raw.length else it }
+        return raw.substring(start, end).toIntOrNull() ?: 0
     }
 
     private fun runPhase3CEvalRenderSmoke(args: Map<*, *>?, result: MethodChannel.Result) {

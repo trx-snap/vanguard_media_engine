@@ -290,6 +290,27 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     return report;
 }
 
+// ── P1-GPU-BLACKLIST-NATIVE-RULE-PROOF: native rule evaluator diagnostic ────
+// Runs synthetic lanes against vanguard::platform::EvaluateGpuDriverBlacklist()
+// using locally constructed rule tables; never reads or mutates the
+// production (currently zero-entry) driver blacklist beyond confirming its
+// size stays zero. Diagnostic-only: no fleet data, no product/app/editor
+// wiring, no Vulkan/GLES lifecycle changes.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagPhase1GpuBlacklistNativeSmoke(
+    JNIEnv* env, jobject /* this */) {
+    const auto smoke = vanguard::platform::RunGpuDriverBlacklistNativeRuleSmoke();
+    char status[768];
+    std::snprintf(
+        status,
+        sizeof(status),
+        "status=%s;totalLanes=%d;passedLanes=%d;lanes=%s",
+        smoke.pass ? "PASS" : "FAIL",
+        smoke.totalLanes,
+        smoke.passedLanes,
+        smoke.laneSummary.c_str());
+    return env->NewStringUTF(status);
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagRenderSmoke(

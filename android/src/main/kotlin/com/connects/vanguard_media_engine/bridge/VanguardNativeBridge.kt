@@ -1045,6 +1045,13 @@ class VanguardNativeBridge(
 
     external fun probeCapabilities(): BackendCapabilityReport
 
+    // ── P1-GPU-BLACKLIST-NATIVE-RULE-PROOF: native GPU driver blacklist rule
+    // evaluator diagnostic. Runs synthetic native lanes against locally
+    // constructed rule tables via the reusable EvaluateGpuDriverBlacklist()
+    // evaluator (see android_backend_probe.h). Does not read or mutate the
+    // production (zero-entry) rule table beyond confirming its size.
+    external fun runAndroidDagPhase1GpuBlacklistNativeSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,

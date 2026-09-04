@@ -177,32 +177,21 @@ bool HasGraphicsComputeQueueFamily(VkPhysicalDevice device) {
 // ---------------------------------------------------------------------------
 // Static driver blacklist schema.
 // Zero active entries by default. Entries are added only with fleet evidence.
-// Schema: { vendorId, deviceId (0 = any device), driverVersionMin,
-//           driverVersionMax (0 = unbounded), label }
+// Rule evaluation semantics live in the reusable, header-exposed
+// vanguard::platform::EvaluateGpuDriverBlacklist() evaluator, which mirrors
+// the Dart VGGpuDriverBlacklistEvaluator exactly.
 // ---------------------------------------------------------------------------
-struct BlacklistEntry {
-    uint32_t    vendorId;
-    uint32_t    deviceId;         // 0 = match any device from this vendor
-    uint32_t    driverVersionMin; // inclusive
-    uint32_t    driverVersionMax; // inclusive; 0 = unbounded
-    const char* label;
-};
-
-static const std::array<BlacklistEntry, 0> kDriverBlacklist = {};
+static const std::array<GpuDriverBlacklistRule, 0> kDriverBlacklist = {};
 // Zero active entries. Add entries only with fleet evidence.
 // Example schema (NOT active):
 //   { 0x5143, 0x0000, 0x00000000, 0x00000000, "example_qcom_placeholder" },
 
 // Returns the matching label, or nullptr if not blacklisted.
 const char* CheckBlacklist(uint32_t vendorId, uint32_t deviceId, uint32_t driverVersion) {
-    for (const BlacklistEntry& e : kDriverBlacklist) {
-        if (e.vendorId != vendorId) continue;
-        if (e.deviceId != 0 && e.deviceId != deviceId) continue;
-        if (driverVersion < e.driverVersionMin) continue;
-        if (e.driverVersionMax != 0 && driverVersion > e.driverVersionMax) continue;
-        return e.label;
-    }
-    return nullptr;
+    const GpuDriverBlacklistMatch match = EvaluateGpuDriverBlacklist(
+        kDriverBlacklist.data(), kDriverBlacklist.size(),
+        vendorId, deviceId, driverVersion);
+    return match.matched ? match.label : nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +261,160 @@ render::BackendCapability GlesFallback(
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// P1-GPU-BLACKLIST-NATIVE-RULE-PROOF: reusable native rule evaluator.
+// ---------------------------------------------------------------------------
+GpuDriverBlacklistMatch EvaluateGpuDriverBlacklist(
+        const GpuDriverBlacklistRule* rules,
+        std::size_t                   ruleCount,
+        uint32_t                      vendorId,
+        uint32_t                      deviceId,
+        uint32_t                      driverVersion) {
+    GpuDriverBlacklistMatch match;
+    for (std::size_t i = 0; i < ruleCount; ++i) {
+        match.evaluationCount++;
+        const GpuDriverBlacklistRule& rule = rules[i];
+        if (rule.vendorId != vendorId) continue;
+        if (rule.deviceId != 0 && rule.deviceId != deviceId) continue;
+        if (driverVersion < rule.driverVersionMin) continue;
+        if (rule.driverVersionMax != 0 && driverVersion > rule.driverVersionMax) continue;
+        match.matched          = true;
+        match.matchedRuleIndex = static_cast<int>(i);
+        match.label            = rule.label;
+        match.result           = "blacklisted_match";
+        return match;
+    }
+    return match; // matched=false, matchedRuleIndex=-1, label="not_blacklisted"
+}
+
+std::size_t ProductionGpuDriverBlacklistRuleCount() {
+    return kDriverBlacklist.size();
+}
+
+GpuDriverBlacklistNativeSmokeResult RunGpuDriverBlacklistNativeRuleSmoke() {
+    struct Lane {
+        const char* name;
+        bool        pass;
+    };
+    std::vector<Lane> lanes;
+
+    // Lane 1: empty table clean, evaluationCount 0.
+    {
+        const auto m = EvaluateGpuDriverBlacklist(nullptr, 0, 0x5143, 0x0540, 100);
+        const bool pass = !m.matched && m.matchedRuleIndex == -1 &&
+                           m.evaluationCount == 0 &&
+                           std::strcmp(m.label, "not_blacklisted") == 0;
+        lanes.push_back({"lane_empty_table_clean", pass});
+    }
+
+    // Lane 2: exact vendor+device match vs. device mismatch.
+    {
+        const GpuDriverBlacklistRule rules[] = {
+            {0x5143, 0x0540, 0, 0, "adreno_540"},
+        };
+        const auto matchRes    = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0x0540, 50);
+        const auto mismatchRes = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0x0630, 50);
+        const bool pass = matchRes.matched &&
+                           matchRes.matchedRuleIndex == 0 &&
+                           std::strcmp(matchRes.label, "adreno_540") == 0 &&
+                           !mismatchRes.matched &&
+                           mismatchRes.matchedRuleIndex == -1;
+        lanes.push_back({"lane_exact_match", pass});
+    }
+
+    // Lane 3: vendor mismatch.
+    {
+        const GpuDriverBlacklistRule rules[] = {
+            {0x5143, 0, 0, 0, "qcom_only"},
+        };
+        const auto res = EvaluateGpuDriverBlacklist(rules, 1, 0x13B5, 0x0100, 50);
+        const bool pass = !res.matched &&
+                           res.evaluationCount == 1 &&
+                           res.matchedRuleIndex == -1;
+        lanes.push_back({"lane_vendor_mismatch", pass});
+    }
+
+    // Lane 4: deviceId 0 wildcard matches any device for the vendor.
+    {
+        const GpuDriverBlacklistRule rules[] = {
+            {0x5143, 0, 0, 0, "qcom_wildcard"},
+        };
+        const auto resA = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0x0540, 1);
+        const auto resB = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0x0630, 1);
+        const bool pass = resA.matched && resB.matched;
+        lanes.push_back({"lane_device_wildcard", pass});
+    }
+
+    // Lane 5: bounded driverVersionMin/Max inclusive range, and above-max exclusion.
+    {
+        const GpuDriverBlacklistRule rules[] = {
+            {0x5143, 0, 100, 200, "bounded"},
+        };
+        const auto belowMin = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0, 99);
+        const auto exactMin = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0, 100);
+        const auto mid      = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0, 150);
+        const auto exactMax = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0, 200);
+        const auto aboveMax = EvaluateGpuDriverBlacklist(rules, 1, 0x5143, 0, 201);
+        const bool pass = !belowMin.matched && exactMin.matched && mid.matched &&
+                           exactMax.matched && !aboveMax.matched;
+        lanes.push_back({"lane_bounded_min_max", pass});
+    }
+
+    // Lane 6: driverVersionMax == 0 is unbounded.
+    {
+        const GpuDriverBlacklistRule rules[] = {
+            {0x13B5, 0, 100, 0, "unbounded"},
+        };
+        const auto res = EvaluateGpuDriverBlacklist(rules, 1, 0x13B5, 0, 999999);
+        const bool pass = res.matched && std::strcmp(res.label, "unbounded") == 0;
+        lanes.push_back({"lane_unbounded_max", pass});
+    }
+
+    // Lane 7: deterministic ordered first-match precedence.
+    {
+        const GpuDriverBlacklistRule rules[] = {
+            {0x5143, 0x0540, 0, 0, "specific_rule"},
+            {0x5143, 0,      0, 0, "wildcard_rule"},
+        };
+        const auto resSpecific = EvaluateGpuDriverBlacklist(rules, 2, 0x5143, 0x0540, 0);
+        const auto resWildcard = EvaluateGpuDriverBlacklist(rules, 2, 0x5143, 0x0630, 0);
+        const bool pass = resSpecific.matched &&
+                           resSpecific.matchedRuleIndex == 0 &&
+                           resSpecific.evaluationCount == 1 &&
+                           std::strcmp(resSpecific.label, "specific_rule") == 0 &&
+                           resWildcard.matched &&
+                           resWildcard.matchedRuleIndex == 1 &&
+                           resWildcard.evaluationCount == 2 &&
+                           std::strcmp(resWildcard.label, "wildcard_rule") == 0;
+        lanes.push_back({"lane_rule_precedence", pass});
+    }
+
+    // Lane 8: production table remains zero-entry and is not mutated by this smoke.
+    {
+        const std::size_t countBefore = ProductionGpuDriverBlacklistRuleCount();
+        const std::size_t countAfter  = ProductionGpuDriverBlacklistRuleCount();
+        const bool pass = countBefore == 0 && countAfter == 0;
+        lanes.push_back({"lane_production_table_unmutated", pass});
+    }
+
+    GpuDriverBlacklistNativeSmokeResult out;
+    int passedLanes = 0;
+    std::string summary;
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        if (lanes[i].pass) passedLanes++;
+        if (i > 0) summary += "|";
+        summary += lanes[i].name;
+        summary += "=";
+        summary += lanes[i].pass ? "true" : "false";
+    }
+
+    out.totalLanes  = static_cast<int>(lanes.size());
+    out.passedLanes = passedLanes;
+    out.pass        = (out.totalLanes == 8) && (passedLanes == out.totalLanes);
+    out.laneSummary = summary;
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // Main probe entry point

@@ -12,7 +12,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+// P1-GPU-BLACKLIST-NATIVE-RULE-PROOF: shared Vanguard native diagnostic
+// MethodChannel. Native-lane call only; zero production/app/editor wiring.
+const MethodChannel _nativeChannel = MethodChannel('vanguard_media_engine');
 
 void main() {
   runApp(const AndroidGpuDriverBlacklistPhysicalSmokeApp());
@@ -325,9 +330,27 @@ class _AndroidGpuDriverBlacklistPhysicalSmokeAppState
       results['lane_8_serialization_roundtrip'] = false;
     }
 
+    // Lane 9: native GPU driver blacklist rule evaluator route (Android
+    // diagnostic MethodChannel -> Kotlin coordinator -> JNI -> native
+    // EvaluateGpuDriverBlacklist()). Proof boundary: diagnostic native
+    // evaluator and probe-route semantics only; no fleet data, no
+    // product/app/editor wiring, no Vulkan/GLES lifecycle changes.
+    String? nativeRaw;
+    try {
+      final nativeResult = await _nativeChannel
+          .invokeMethod<Map<dynamic, dynamic>>(
+            'runAndroidDagPhase1GpuBlacklistNativeSmoke',
+          );
+      nativeRaw = nativeResult?['raw'] as String?;
+      results['lane_9_native_rule_evaluator_route'] =
+          nativeResult?['pass'] == true;
+    } catch (e) {
+      results['lane_9_native_rule_evaluator_route'] = false;
+    }
+
     final passedCount = results.values.where((v) => v).length;
     final totalCount = results.length;
-    final allPass = totalCount == 8 && passedCount == 8;
+    final allPass = totalCount == 9 && passedCount == 9;
 
     print(
       'ANDROID_DAG_PHASE1_GPU_BLACKLIST_RULE_EVALUATOR_JSON:${jsonEncode(<String, Object?>{'totalLanes': totalCount, 'passedLanes': passedCount, 'allPass': allPass, 'results': results})}',
@@ -341,6 +364,19 @@ class _AndroidGpuDriverBlacklistPhysicalSmokeAppState
       allPass
           ? 'ANDROID_DAG_PHASE1_GPU_BLACKLIST_RULE_EVALUATOR_PHYSICAL_SMOKE_PASS'
           : 'ANDROID_DAG_PHASE1_GPU_BLACKLIST_RULE_EVALUATOR_PHYSICAL_SMOKE_FAIL',
+    );
+
+    // P1-GPU-BLACKLIST-NATIVE-RULE-PROOF: combined Dart-evaluator + native
+    // route proof markers. Final PASS requires all 8 Dart evaluator lanes
+    // AND the native route lane.
+    print(
+      'ANDROID_DAG_PHASE1_GPU_BLACKLIST_NATIVE_RULE_PROOF_JSON:${jsonEncode(<String, Object?>{'totalLanes': totalCount, 'passedLanes': passedCount, 'allPass': allPass, 'nativeRaw': nativeRaw, 'results': results})}',
+    );
+
+    print(
+      allPass
+          ? 'ANDROID_DAG_PHASE1_GPU_BLACKLIST_NATIVE_RULE_PROOF_PASS'
+          : 'ANDROID_DAG_PHASE1_GPU_BLACKLIST_NATIVE_RULE_PROOF_FAIL',
     );
 
     if (mounted) {
