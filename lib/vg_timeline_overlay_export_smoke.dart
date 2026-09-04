@@ -17,17 +17,23 @@
 //   - Structured lane prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_LANE:`;
 //   - Claims production routing/fail-closed behavior on Android for static sticker
 //     overlays in Route-A, including dynamic keyframed spatial transforms
-//     (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT) and overlay compositing on Vulkan dissolve transition
-//     overlap frames (P5-OVERLAYS-TRANSITION-COMP-N3), but does not claim text/emoji
-//     overlays, overlay beauty filter composition, non-dissolve
-//     transition types combined with overlays, pixel quality, fleet coverage, playback,
-//     GLES overlays, app/editor UI, iOS, or streaming/cache;
+//     (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), overlay compositing on Vulkan dissolve
+//     transition overlap frames (P5-OVERLAYS-TRANSITION-COMP-N3), and overlays
+//     alongside clip-level Beauty V2 ONLY when every overlay's active interval is
+//     safely inside a transition overlap window
+//     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY), but does not claim text/emoji
+//     overlays, a solo (non-transition-overlap) active overlay alongside clip-level
+//     Beauty V2, non-dissolve transition types combined with overlays, pixel quality,
+//     fleet coverage, playback, GLES overlays, app/editor UI, iOS, or streaming/cache;
 //   - Validates success lanes: `success == true`, output file exists,
 //     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (transition-aware:
 //     clip trim-window sum minus non-hard-cut transition overlap durations, unaffected
 //     by overlay intervals), `overlayCount`/`transitionCount` matching expectation when
-//     present, and `renderedOverlayFrameCount` meeting a lane's minimum when specified
-//     (proves overlay compositing during transition overlap frames);
+//     present, `renderedOverlayFrameCount` meeting a lane's minimum when specified
+//     (proves overlay compositing during transition overlap frames), and
+//     `beautyClipCount`/`beautyFrameCount` matching a lane's expectation (an exact
+//     match on clip count, zero by default; a lower bound on frame count for a lane
+//     that expects clip-level Beauty V2);
 //   - Fail-closed lanes validate PlatformException code and message substrings;
 //   - Whole report requires at least one positive lane and all lanes pass.
 
@@ -73,7 +79,10 @@ const String emojiOverlayToken = 'emoji';
 /// Fail-closed token for unsupported animated keyframe overlays in Route-A.
 const String keyframesToken = 'keyframe';
 
-/// Fail-closed token for overlays with beauty filter composition.
+/// Fail-closed token for a solo (non-transition-overlap) active overlay
+/// alongside clip-level Beauty V2 -- the only shape combining overlays and
+/// Beauty V2 that remains unsupported (see
+/// P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY).
 const String overlaysWithBeautyToken = 'beauty';
 
 /// Fail-closed token for unreadable sticker assets.
@@ -90,7 +99,8 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'fail_closed_emoji_overlay',
   'fail_closed_malformed_keyframes',
   'overlays_with_transition_dissolve_success',
-  'fail_closed_overlays_with_beauty',
+  'overlays_with_beauty_transition_overlap_success',
+  'fail_closed_solo_overlays_with_beauty',
   'fail_closed_unreadable_asset',
 ];
 
@@ -279,6 +289,8 @@ class VGTimelineOverlayExportSmokeExpectation {
     this.expectedOverlayCount,
     this.expectedTransitionCount,
     this.expectedRenderedOverlayFrameCount,
+    this.expectedBeautyClipCount = 0,
+    this.expectedBeautyFrameCountMin = 0,
   }) : expectsSuccess = true,
        errorCode = null,
        messageContains = null;
@@ -289,7 +301,9 @@ class VGTimelineOverlayExportSmokeExpectation {
   }) : expectsSuccess = false,
        expectedOverlayCount = null,
        expectedTransitionCount = null,
-       expectedRenderedOverlayFrameCount = null;
+       expectedRenderedOverlayFrameCount = null,
+       expectedBeautyClipCount = 0,
+       expectedBeautyFrameCountMin = 0;
 
   /// True when the lane must produce a successful export output file.
   final bool expectsSuccess;
@@ -308,6 +322,21 @@ class VGTimelineOverlayExportSmokeExpectation {
   /// frames (P5-OVERLAYS-TRANSITION-COMP-N3). Null means no lower-bound
   /// check -- most lanes carry no transition and do not need this proof.
   final int? expectedRenderedOverlayFrameCount;
+
+  /// Expected clip-level Beauty V2 clip count for a success lane -- an exact
+  /// match check against the production `beautyClipCount` result field.
+  /// Defaults to 0 so existing overlay-only success lanes still require
+  /// zero beauty clips (proving beauty never silently activates on a lane
+  /// that never requested it).
+  final int expectedBeautyClipCount;
+
+  /// Minimum acceptable production `beautyFrameCount` for a success lane
+  /// that expects [expectedBeautyClipCount] > 0 -- a lower-bound check, like
+  /// [expectedRenderedOverlayFrameCount], since the exact rendered beauty
+  /// frame count can vary with decoder/device timing. When
+  /// [expectedBeautyClipCount] is 0, an exact zero check is used instead and
+  /// this field is ignored. Defaults to 0.
+  final int expectedBeautyFrameCountMin;
 
   /// Required PlatformException code for a fail-closed lane.
   final String? errorCode;
@@ -429,6 +458,8 @@ class VGTimelineOverlayExportSmokeLaneReport {
     this.expectedRenderedOverlayFrameCount,
     this.beautyClipCount,
     this.beautyFrameCount,
+    this.expectedBeautyClipCount,
+    this.expectedBeautyFrameCountMin,
     this.errorCode,
     this.errorMessage,
   });
@@ -457,6 +488,14 @@ class VGTimelineOverlayExportSmokeLaneReport {
   final int? expectedRenderedOverlayFrameCount;
   final int? beautyClipCount;
   final int? beautyFrameCount;
+
+  /// Expected `beautyClipCount` for this lane -- mirrors
+  /// [VGTimelineOverlayExportSmokeExpectation.expectedBeautyClipCount].
+  final int? expectedBeautyClipCount;
+
+  /// Expected minimum `beautyFrameCount` for this lane -- mirrors
+  /// [VGTimelineOverlayExportSmokeExpectation.expectedBeautyFrameCountMin].
+  final int? expectedBeautyFrameCountMin;
   final String? errorCode;
   final String? errorMessage;
 
@@ -479,6 +518,9 @@ class VGTimelineOverlayExportSmokeLaneReport {
     final expectedTransitions = request.expectedTransitionCount;
     final expectedRenderedOverlayFrames =
         request.expectation.expectedRenderedOverlayFrameCount;
+    final expectedBeautyClipCount = request.expectation.expectedBeautyClipCount;
+    final expectedBeautyFrameCountMin =
+        request.expectation.expectedBeautyFrameCountMin;
 
     if (result == null) {
       return VGTimelineOverlayExportSmokeLaneReport(
@@ -491,6 +533,8 @@ class VGTimelineOverlayExportSmokeLaneReport {
         expectedOverlayCount: expectedOverlays,
         expectedTransitionCount: expectedTransitions,
         expectedRenderedOverlayFrameCount: expectedRenderedOverlayFrames,
+        expectedBeautyClipCount: expectedBeautyClipCount,
+        expectedBeautyFrameCountMin: expectedBeautyFrameCountMin,
       );
     }
     final success = result['success'] == true;
@@ -545,10 +589,25 @@ class VGTimelineOverlayExportSmokeLaneReport {
       failure =
           'rendered_overlay_frame_count_too_low:reported=${renderedOverlayFrameCount ?? 'null'}:'
           'expectedAtLeast=$expectedRenderedOverlayFrames';
-    } else if (beautyClipCount != null && beautyClipCount != 0) {
-      failure = 'beauty_clip_count_not_zero:reported=$beautyClipCount';
-    } else if (beautyFrameCount != null && beautyFrameCount != 0) {
+    } else if (expectedBeautyClipCount > 0 && beautyClipCount == null) {
+      failure = 'result_beauty_clip_count_missing';
+    } else if (beautyClipCount != null &&
+        beautyClipCount != expectedBeautyClipCount) {
+      failure =
+          'beauty_clip_count_mismatch:reported=$beautyClipCount:'
+          'expected=$expectedBeautyClipCount';
+    } else if (expectedBeautyClipCount > 0 && beautyFrameCount == null) {
+      failure = 'result_beauty_frame_count_missing';
+    } else if (beautyFrameCount != null &&
+        expectedBeautyClipCount == 0 &&
+        beautyFrameCount != 0) {
       failure = 'beauty_frame_count_not_zero:reported=$beautyFrameCount';
+    } else if (beautyFrameCount != null &&
+        expectedBeautyClipCount > 0 &&
+        beautyFrameCount < expectedBeautyFrameCountMin) {
+      failure =
+          'beauty_frame_count_too_low:reported=$beautyFrameCount:'
+          'expectedAtLeast=$expectedBeautyFrameCountMin';
     }
 
     final pass = failure == null;
@@ -571,6 +630,8 @@ class VGTimelineOverlayExportSmokeLaneReport {
       expectedRenderedOverlayFrameCount: expectedRenderedOverlayFrames,
       beautyClipCount: beautyClipCount,
       beautyFrameCount: beautyFrameCount,
+      expectedBeautyClipCount: expectedBeautyClipCount,
+      expectedBeautyFrameCountMin: expectedBeautyFrameCountMin,
     );
   }
 
@@ -605,6 +666,8 @@ class VGTimelineOverlayExportSmokeLaneReport {
       expectedTransitionCount: request.expectedTransitionCount,
       expectedRenderedOverlayFrameCount:
           expectation.expectedRenderedOverlayFrameCount,
+      expectedBeautyClipCount: expectation.expectedBeautyClipCount,
+      expectedBeautyFrameCountMin: expectation.expectedBeautyFrameCountMin,
       errorCode: exception.code,
       errorMessage: exception.message,
     );
@@ -625,6 +688,9 @@ class VGTimelineOverlayExportSmokeLaneReport {
     expectedTransitionCount: request.expectedTransitionCount,
     expectedRenderedOverlayFrameCount:
         request.expectation.expectedRenderedOverlayFrameCount,
+    expectedBeautyClipCount: request.expectation.expectedBeautyClipCount,
+    expectedBeautyFrameCountMin:
+        request.expectation.expectedBeautyFrameCountMin,
   );
 
   Map<String, Object?> toMap() => <String, Object?>{
@@ -647,6 +713,8 @@ class VGTimelineOverlayExportSmokeLaneReport {
     'expectedRenderedOverlayFrameCount': expectedRenderedOverlayFrameCount,
     'beautyClipCount': beautyClipCount,
     'beautyFrameCount': beautyFrameCount,
+    'expectedBeautyClipCount': expectedBeautyClipCount,
+    'expectedBeautyFrameCountMin': expectedBeautyFrameCountMin,
     'errorCode': errorCode,
     'errorMessage': errorMessage,
   };
@@ -678,6 +746,10 @@ class VGTimelineOverlayExportSmokeLaneReport {
           (map['expectedRenderedOverlayFrameCount'] as num?)?.toInt(),
       beautyClipCount: (map['beautyClipCount'] as num?)?.toInt(),
       beautyFrameCount: (map['beautyFrameCount'] as num?)?.toInt(),
+      expectedBeautyClipCount: (map['expectedBeautyClipCount'] as num?)
+          ?.toInt(),
+      expectedBeautyFrameCountMin: (map['expectedBeautyFrameCountMin'] as num?)
+          ?.toInt(),
       errorCode: map['errorCode'] as String?,
       errorMessage: map['errorMessage'] as String?,
     );
@@ -824,7 +896,7 @@ class VGTimelineOverlayExportSmokeRunner {
   }
 }
 
-/// Builds the default suite of 11 Route-A static sticker overlay smoke requests:
+/// Builds the default suite of 12 Route-A static sticker overlay smoke requests:
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
@@ -834,8 +906,9 @@ class VGTimelineOverlayExportSmokeRunner {
 /// 7. `fail_closed_emoji_overlay`
 /// 8. `fail_closed_malformed_keyframes`
 /// 9. `overlays_with_transition_dissolve_success`
-/// 10. `fail_closed_overlays_with_beauty`
-/// 11. `fail_closed_unreadable_asset`
+/// 10. `overlays_with_beauty_transition_overlap_success`
+/// 11. `fail_closed_solo_overlays_with_beauty`
+/// 12. `fail_closed_unreadable_asset`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
   String clipPathB = '/data/local/tmp/clip_b.mov',
@@ -1249,9 +1322,75 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ),
     ),
 
-    // Lane 10: fail_closed_overlays_with_beauty
+    // Lane 10: overlays_with_beauty_transition_overlap_success
     VGTimelineOverlayExportSmokeRequest(
-      laneId: 'fail_closed_overlays_with_beauty',
+      laneId: 'overlays_with_beauty_transition_overlap_success',
+      clips: <VGTimelineOverlayExportSmokeClip>[
+        VGTimelineOverlayExportSmokeClip(
+          id: 'clip-1',
+          sourcePath: clipPathA,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.0,
+          beautyIntensity: 0.5,
+        ),
+        VGTimelineOverlayExportSmokeClip(
+          id: 'clip-2',
+          sourcePath: clipPathB,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.0,
+          beautyIntensity: 0.5,
+        ),
+      ],
+      transitions: const <VGTimelineOverlayExportSmokeTransition>[
+        VGTimelineOverlayExportSmokeTransition(
+          id: 'tr-1',
+          type: 'dissolve',
+          durationSeconds: 0.5,
+          fromClipId: 'clip-1',
+          toClipId: 'clip-2',
+        ),
+      ],
+      overlays: <VGTimelineOverlayExportSmokeOverlay>[
+        VGTimelineOverlayExportSmokeOverlay(
+          id: 'sticker-beauty-overlap',
+          assetPath: stickerAssetPath,
+          // Active strictly within the dissolve's INSET output-timeline
+          // overlap window: the raw overlap is [1.5s, 2.0s) (see lane 9's
+          // comment), and AndroidTimelineExportSession's admission gate
+          // insets that window on both ends by max(2.0 / fps, 0.05)s --
+          // ~0.067s at this lane's default 30fps -- leaving a safely
+          // contained window of roughly [1.567s, 1.933s). An overlay gated
+          // to [1.6s, 1.9s), well inside that inset window, proves overlays
+          // alongside clip-level Beauty V2 render correctly through the
+          // transition-overlap overlay+beauty render seam
+          // (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) rather than being
+          // rejected or silently dropping the beauty/overlay effect.
+          startTimeSeconds: 1.6,
+          durationSeconds: 0.3,
+          translationX: 100.0,
+          translationY: 100.0,
+          width: 200.0,
+          height: 200.0,
+          rotation: 0.0,
+          scale: 1.0,
+          opacity: 1.0,
+          zIndex: 0,
+          type: 'sticker',
+        ),
+      ],
+      outputPath: outputPath('overlays_with_beauty_transition_overlap_success'),
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedTransitionCount: 1,
+        expectedRenderedOverlayFrameCount: 6,
+        expectedBeautyClipCount: 2,
+        expectedBeautyFrameCountMin: 100,
+      ),
+    ),
+
+    // Lane 11: fail_closed_solo_overlays_with_beauty
+    VGTimelineOverlayExportSmokeRequest(
+      laneId: 'fail_closed_solo_overlays_with_beauty',
       clips: <VGTimelineOverlayExportSmokeClip>[
         VGTimelineOverlayExportSmokeClip(
           id: 'clip-1',
@@ -1263,8 +1402,13 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       ],
       overlays: <VGTimelineOverlayExportSmokeOverlay>[
         VGTimelineOverlayExportSmokeOverlay(
-          id: 'sticker-1',
+          id: 'sticker-solo-beauty',
           assetPath: stickerAssetPath,
+          // Active on a plain solo (no transition anywhere in this
+          // timeline) frame -- this shape has no safe route since the solo
+          // overlay render seam takes no beauty params, so it must remain
+          // fail-closed even though the transition-overlap shape (lane 10)
+          // is now supported.
           startTimeSeconds: 0.0,
           durationSeconds: 2.0,
           translationX: 100.0,
@@ -1278,14 +1422,14 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
           type: 'sticker',
         ),
       ],
-      outputPath: outputPath('fail_closed_overlays_with_beauty'),
+      outputPath: outputPath('fail_closed_solo_overlays_with_beauty'),
       expectation: const VGTimelineOverlayExportSmokeExpectation.failClosed(
         errorCode: unsupportedExportFeatureCode,
         messageContains: overlaysWithBeautyToken,
       ),
     ),
 
-    // Lane 11: fail_closed_unreadable_asset
+    // Lane 12: fail_closed_unreadable_asset
     VGTimelineOverlayExportSmokeRequest(
       laneId: 'fail_closed_unreadable_asset',
       clips: <VGTimelineOverlayExportSmokeClip>[

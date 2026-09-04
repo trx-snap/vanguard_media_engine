@@ -149,7 +149,7 @@ void main() {
       expect(overlaysWithBeautyToken, 'beauty');
       expect(unreadableAssetToken, 'asset');
 
-      expect(defaultOverlaySmokeLaneIds, hasLength(11));
+      expect(defaultOverlaySmokeLaneIds, hasLength(12));
       expect(
         defaultOverlaySmokeLaneIds,
         contains('single_clip_static_sticker_success'),
@@ -182,7 +182,11 @@ void main() {
       );
       expect(
         defaultOverlaySmokeLaneIds,
-        contains('fail_closed_overlays_with_beauty'),
+        contains('overlays_with_beauty_transition_overlap_success'),
+      );
+      expect(
+        defaultOverlaySmokeLaneIds,
+        contains('fail_closed_solo_overlays_with_beauty'),
       );
       expect(
         defaultOverlaySmokeLaneIds,
@@ -654,8 +658,137 @@ void main() {
       );
 
       expect(report.pass, isFalse);
-      expect(report.failureReason, startsWith('beauty_clip_count_not_zero'));
+      expect(report.failureReason, startsWith('beauty_clip_count_mismatch'));
     });
+
+    test('fails when a success lane reports a nonzero beautyFrameCount', () {
+      final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+        _request(),
+        _successResult(beautyFrameCount: 3),
+        outputExists: true,
+      );
+
+      expect(report.pass, isFalse);
+      expect(report.failureReason, startsWith('beauty_frame_count_not_zero'));
+    });
+
+    test('fails when beautyClipCount does not match a nonzero expectation', () {
+      final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+        _request(
+          expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+            expectedBeautyClipCount: 2,
+            expectedBeautyFrameCountMin: 10,
+          ),
+        ),
+        _successResult(beautyClipCount: 1, beautyFrameCount: 20),
+        outputExists: true,
+      );
+
+      expect(report.pass, isFalse);
+      expect(report.failureReason, startsWith('beauty_clip_count_mismatch'));
+    });
+
+    test(
+      'fails when beautyFrameCount is below the expected minimum for a beauty lane',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+              expectedBeautyClipCount: 2,
+              expectedBeautyFrameCountMin: 10,
+            ),
+          ),
+          _successResult(beautyClipCount: 2, beautyFrameCount: 5),
+          outputExists: true,
+        );
+
+        expect(report.pass, isFalse);
+        expect(report.failureReason, startsWith('beauty_frame_count_too_low'));
+      },
+    );
+
+    test(
+      'passes when beautyClipCount matches and beautyFrameCount meets the expected minimum',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+              expectedBeautyClipCount: 2,
+              expectedBeautyFrameCountMin: 10,
+            ),
+          ),
+          _successResult(beautyClipCount: 2, beautyFrameCount: 15),
+          outputExists: true,
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.beautyClipCount, 2);
+        expect(report.beautyFrameCount, 15);
+      },
+    );
+
+    test(
+      'fails when beautyClipCount is missing on a positive beauty expectation',
+      () {
+        final result = _successResult(beautyFrameCount: 15)
+          ..remove('beautyClipCount');
+
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+              expectedBeautyClipCount: 2,
+              expectedBeautyFrameCountMin: 10,
+            ),
+          ),
+          result,
+          outputExists: true,
+        );
+
+        expect(report.pass, isFalse);
+        expect(report.failureReason, 'result_beauty_clip_count_missing');
+      },
+    );
+
+    test(
+      'fails when beautyFrameCount is missing on a positive beauty expectation',
+      () {
+        final result = _successResult(beautyClipCount: 2)
+          ..remove('beautyFrameCount');
+
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+              expectedBeautyClipCount: 2,
+              expectedBeautyFrameCountMin: 10,
+            ),
+          ),
+          result,
+          outputExists: true,
+        );
+
+        expect(report.pass, isFalse);
+        expect(report.failureReason, 'result_beauty_frame_count_missing');
+      },
+    );
+
+    test(
+      'passes when beauty counters are absent and expectedBeautyClipCount is zero',
+      () {
+        final result = _successResult()
+          ..remove('beautyClipCount')
+          ..remove('beautyFrameCount');
+
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(),
+          result,
+          outputExists: true,
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.beautyClipCount, isNull);
+        expect(report.beautyFrameCount, isNull);
+      },
+    );
 
     test(
       'fails when expected overlayCount is required but missing from result',
@@ -968,7 +1101,36 @@ void main() {
       expect(parsed.lanes.single.expectedRenderedOverlayFrameCount, 10);
       expect(parsed.lanes.single.beautyClipCount, 0);
       expect(parsed.lanes.single.beautyFrameCount, 0);
+      expect(parsed.lanes.single.expectedBeautyClipCount, 0);
+      expect(parsed.lanes.single.expectedBeautyFrameCountMin, 0);
     });
+
+    test(
+      'toMap and fromMap roundtrip preserves nonzero expected beauty fields',
+      () {
+        final beautyLane =
+            VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+              _request(
+                laneId: 'overlays_with_beauty_transition_overlap_success',
+                expectation:
+                    const VGTimelineOverlayExportSmokeExpectation.success(
+                      expectedBeautyClipCount: 2,
+                      expectedBeautyFrameCountMin: 100,
+                    ),
+              ),
+              _successResult(beautyClipCount: 2, beautyFrameCount: 105),
+              outputExists: true,
+            );
+
+        final map = beautyLane.toMap();
+        final parsed = VGTimelineOverlayExportSmokeLaneReport.fromMap(map);
+        expect(parsed.pass, isTrue);
+        expect(parsed.beautyClipCount, 2);
+        expect(parsed.beautyFrameCount, 105);
+        expect(parsed.expectedBeautyClipCount, 2);
+        expect(parsed.expectedBeautyFrameCountMin, 100);
+      },
+    );
   });
 
   group('runner over real exportTimeline MethodChannel', () {
@@ -1103,18 +1265,18 @@ void main() {
 
   group('default suite construction', () {
     test(
-      'buildDefaultOverlayExportSmokeSuite builds all 11 required lanes',
+      'buildDefaultOverlayExportSmokeSuite builds all 12 required lanes',
       () {
         final suite = buildDefaultOverlayExportSmokeSuite();
 
-        expect(suite, hasLength(11));
+        expect(suite, hasLength(12));
         final laneIds = suite.map((r) => r.laneId).toList();
         expect(laneIds, defaultOverlaySmokeLaneIds);
 
         final successLanes = suite.where((r) => r.expectation.expectsSuccess);
         final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-        expect(successLanes, hasLength(6));
+        expect(successLanes, hasLength(7));
         expect(failureLanes, hasLength(5));
 
         // Lane 1: single_clip_static_sticker_success
@@ -1198,18 +1360,44 @@ void main() {
         expect(lane9.expectedDurationSeconds, closeTo(3.5, 1e-9));
         expect(lane9.expectedTransitionCount, 1);
 
-        // Lane 10: fail_closed_overlays_with_beauty
+        // Lane 10: overlays_with_beauty_transition_overlap_success
         final lane10 = suite[9];
-        expect(lane10.laneId, 'fail_closed_overlays_with_beauty');
-        expect(lane10.clips.single.hasBeauty, isTrue);
-        expect(lane10.expectation.errorCode, unsupportedExportFeatureCode);
-        expect(lane10.expectation.messageContains, overlaysWithBeautyToken);
+        expect(
+          lane10.laneId,
+          'overlays_with_beauty_transition_overlap_success',
+        );
+        expect(lane10.clips, hasLength(2));
+        expect(lane10.clips[0].hasBeauty, isTrue);
+        expect(lane10.clips[1].hasBeauty, isTrue);
+        expect(lane10.transitions, hasLength(1));
+        expect(lane10.transitions.single.type, 'dissolve');
+        expect(lane10.overlays, hasLength(1));
+        expect(lane10.overlays.single.startTimeSeconds, 1.6);
+        expect(lane10.overlays.single.durationSeconds, 0.3);
+        expect(lane10.expectation.expectsSuccess, isTrue);
+        expect(lane10.expectation.expectedOverlayCount, 1);
+        expect(lane10.expectation.expectedTransitionCount, 1);
+        expect(lane10.expectation.expectedRenderedOverlayFrameCount, 6);
+        expect(lane10.expectation.expectedBeautyClipCount, 2);
+        expect(lane10.expectation.expectedBeautyFrameCountMin, 100);
+        // 2.0s + 2.0s clip seconds minus the 0.5s dissolve overlap == 3.5s.
+        expect(lane10.expectedDurationSeconds, closeTo(3.5, 1e-9));
 
-        // Lane 11: fail_closed_unreadable_asset
+        // Lane 11: fail_closed_solo_overlays_with_beauty
         final lane11 = suite[10];
-        expect(lane11.laneId, 'fail_closed_unreadable_asset');
-        expect(lane11.expectation.errorCode, fileUnreadableCode);
-        expect(lane11.expectation.messageContains, unreadableAssetToken);
+        expect(lane11.laneId, 'fail_closed_solo_overlays_with_beauty');
+        expect(lane11.clips.single.hasBeauty, isTrue);
+        expect(lane11.transitions, isEmpty);
+        expect(lane11.overlays.single.startTimeSeconds, 0.0);
+        expect(lane11.overlays.single.durationSeconds, 2.0);
+        expect(lane11.expectation.errorCode, unsupportedExportFeatureCode);
+        expect(lane11.expectation.messageContains, overlaysWithBeautyToken);
+
+        // Lane 12: fail_closed_unreadable_asset
+        final lane12 = suite[11];
+        expect(lane12.laneId, 'fail_closed_unreadable_asset');
+        expect(lane12.expectation.errorCode, fileUnreadableCode);
+        expect(lane12.expectation.messageContains, unreadableAssetToken);
       },
     );
   });

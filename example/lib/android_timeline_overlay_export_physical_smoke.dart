@@ -7,12 +7,16 @@
 // Claims: dynamic keyframed static sticker overlay export
 // (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), static sticker overlay compositing
 // on solo frames, AND on Vulkan dissolve transition overlap frames
-// (P5-OVERLAYS-TRANSITION-COMP-N3).
+// (P5-OVERLAYS-TRANSITION-COMP-N3), AND overlays alongside clip-level
+// Beauty V2 ONLY when every overlay's active interval is safely inside a
+// transition overlap window (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY).
 //
 // Strict non-claims:
 //   - No pixel quality claim;
 //   - No text/emoji overlay support beyond fail-closed lanes;
-//   - No overlay+beauty filter composition;
+//   - No overlay+beauty composition outside a transition overlap window (a
+//     solo, non-transition-overlap active overlay alongside clip-level
+//     Beauty V2 remains fail-closed);
 //   - No non-dissolve transition types combined with overlays;
 //   - No GLES overlay route;
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;
