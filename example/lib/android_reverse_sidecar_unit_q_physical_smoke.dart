@@ -68,6 +68,7 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
 
     var lane1Pass = false;
     var lane2Pass = false;
+    var orderingProbePass = false;
     var lane3Pass = false;
     var lane4Pass = false;
     var readySidecarExists = false;
@@ -77,8 +78,10 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
 
     final Map<String, dynamic> lane1Map = <String, dynamic>{};
     final Map<String, dynamic> lane2Map = <String, dynamic>{};
+    final Map<String, dynamic> probeMap = <String, dynamic>{};
     final Map<String, dynamic> lane3Map = <String, dynamic>{};
     final Map<String, dynamic> lane4Map = <String, dynamic>{};
+    Map<String, dynamic>? probeReport;
 
     final List<Map<String, dynamic>> allStatusesObserved = [];
 
@@ -232,6 +235,62 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
           'proves file creation/readiness, not frame ordering';
       lane2Pass = true;
       print('ANDROID_REVERSE_SIDECAR_UNIT_Q_LANE2_PASS: $lane2Pass');
+
+      // ------------------------------------------------------------------------
+      // Lane 2b: Diagnostic reverse frame-ordering probe
+      // Direct MethodChannel invoke probeReverseSidecarOrdering with Lane 2
+      // ready sidecar and source paths, trim 0..1, frameCount 30, fps 30.
+      // Assert:
+      //   - pass == true
+      //   - reverseWins >= 3
+      //   - sidecarPtsMonotonic == true
+      //   - sidecarSampleCount >= 30
+      // ------------------------------------------------------------------------
+      print('ANDROID_REVERSE_SIDECAR_UNIT_Q_PROBE: START');
+      final probeResult = await channel.invokeMapMethod<String, dynamic>(
+        'probeReverseSidecarOrdering',
+        <String, dynamic>{
+          'sourcePath': sourcePath,
+          'sidecarPath': readySidecarPath,
+          'trimStart': 0.0,
+          'trimEnd': 1.0,
+          'frameCount': 30,
+          'fps': 30,
+        },
+      );
+      probeMap['result'] = probeResult;
+      probeReport = probeResult;
+
+      if (probeResult == null) {
+        throw Exception('Ordering probe failed: returned null');
+      }
+      print('ANDROID_REVERSE_SIDECAR_UNIT_Q_PROBE_REPORT: $probeResult');
+
+      final probePass = probeResult['pass'] == true;
+      final reverseWins = (probeResult['reverseWins'] as num?)?.toInt() ?? 0;
+      final sidecarPtsMonotonic = probeResult['sidecarPtsMonotonic'] == true;
+      final sidecarSampleCount =
+          (probeResult['sidecarSampleCount'] as num?)?.toInt() ?? 0;
+
+      if (!probePass) {
+        throw Exception(
+          'Ordering probe failed: pass is false, reason: ${probeResult['reason']}',
+        );
+      }
+      if (reverseWins < 3) {
+        throw Exception('Ordering probe failed: reverseWins=$reverseWins < 3');
+      }
+      if (!sidecarPtsMonotonic) {
+        throw Exception('Ordering probe failed: sidecarPtsMonotonic is false');
+      }
+      if (sidecarSampleCount < 30) {
+        throw Exception(
+          'Ordering probe failed: sidecarSampleCount=$sidecarSampleCount < 30',
+        );
+      }
+
+      orderingProbePass = true;
+      print('ANDROID_REVERSE_SIDECAR_UNIT_Q_PROBE_PASS: $orderingProbePass');
 
       // ------------------------------------------------------------------------
       // Lane 3: Direct MethodChannel invalid/missing-source/bounds edge cases
@@ -423,7 +482,7 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
       // - No SIDECAR_UNSUPPORTED_ANDROID observed
       // - No non-ready status has a sidecarPath
       // - Include JSON booleans readySidecarExists, readySidecarHasFtyp,
-      //   cleanupDeletedReadySidecar, reverseOrderingProven=false
+      //   cleanupDeletedReadySidecar, reverseOrderingProven=orderingProbePass
       // ------------------------------------------------------------------------
       var readyObservedCount = 0;
       var unsupportedAndroidCount = 0;
@@ -451,7 +510,8 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
           nonReadyWithPathCount == 0 &&
           readySidecarExists &&
           readySidecarHasFtyp &&
-          cleanupDeletedReadySidecar;
+          cleanupDeletedReadySidecar &&
+          orderingProbePass;
 
       if (!globalHonestyPass) {
         throw Exception(
@@ -460,7 +520,8 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
           'nonReadyWithPathCount=$nonReadyWithPathCount, '
           'readySidecarExists=$readySidecarExists, '
           'readySidecarHasFtyp=$readySidecarHasFtyp, '
-          'cleanupDeletedReadySidecar=$cleanupDeletedReadySidecar',
+          'cleanupDeletedReadySidecar=$cleanupDeletedReadySidecar, '
+          'orderingProbePass=$orderingProbePass',
         );
       }
       print(
@@ -496,6 +557,7 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
     final allPass =
         lane1Pass &&
         lane2Pass &&
+        orderingProbePass &&
         lane3Pass &&
         lane4Pass &&
         globalHonestyPass &&
@@ -508,6 +570,7 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
       'lanes': <String, dynamic>{
         'lane1_empty_prepare': lane1Map,
         'lane2_valid_bounded_sidecar': lane2Map,
+        'lane2b_reverse_ordering_probe': probeMap,
         'lane3_invalid_and_missing_source': lane3Map,
         'lane4_cleanup_ownership': lane4Map,
       },
@@ -515,7 +578,8 @@ class _AndroidReverseSidecarUnitQPhysicalSmokeAppState
       'readySidecarExists': readySidecarExists,
       'readySidecarHasFtyp': readySidecarHasFtyp,
       'cleanupDeletedReadySidecar': cleanupDeletedReadySidecar,
-      'reverseOrderingProven': false,
+      'reverseOrderingProven': orderingProbePass,
+      'probeReport': probeReport,
       'globalHonestyPass': globalHonestyPass,
       'error': topLevelError,
     };

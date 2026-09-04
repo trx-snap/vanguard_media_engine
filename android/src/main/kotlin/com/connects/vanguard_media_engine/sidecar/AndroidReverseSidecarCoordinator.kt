@@ -68,6 +68,7 @@ class AndroidReverseSidecarCoordinator(
             "prepareReverseSidecars",
             "getSidecarStatus",
             "cleanupReverseSidecars",
+            "probeReverseSidecarOrdering",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -114,6 +115,7 @@ class AndroidReverseSidecarCoordinator(
             "prepareReverseSidecars" -> prepareReverseSidecars(args, result)
             "getSidecarStatus" -> getSidecarStatus(args, result)
             "cleanupReverseSidecars" -> cleanupReverseSidecars(result)
+            "probeReverseSidecarOrdering" -> probeReverseSidecarOrdering(args, result)
             else -> return false
         }
         return true
@@ -501,6 +503,52 @@ class AndroidReverseSidecarCoordinator(
         } catch (t: Throwable) {
             Log.w(TAG, "cleanupReverseSidecars: failed to start fallback cleanup thread", t)
             mainHandler.post { result.success(mapOf("ok" to true)) }
+        }
+    }
+
+    // ── probeReverseSidecarOrdering ─────────────────────────────────────────────
+
+    private fun probeReverseSidecarOrdering(args: Map<*, *>?, result: MethodChannel.Result) {
+        val sExecutor = synchronized(lock) { sidecarExecutor }
+        if (sExecutor != null && !sExecutor.isShutdown) {
+            try {
+                sExecutor.execute {
+                    val report = AndroidReverseSidecarOrderingProbe.probe(args)
+                    mainHandler.post { result.success(report) }
+                }
+                return
+            } catch (t: Throwable) {
+                Log.w(TAG, "probeReverseSidecarOrdering: executor rejected probe task, falling back to thread", t)
+            }
+        }
+
+        try {
+            Thread({
+                val report = AndroidReverseSidecarOrderingProbe.probe(args)
+                mainHandler.post { result.success(report) }
+            }, "VGReverseSidecarOrderingProbe").apply {
+                isDaemon = true
+                start()
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "probeReverseSidecarOrdering: failed to start probe thread", t)
+            mainHandler.post {
+                result.success(
+                    mapOf(
+                        "pass" to false,
+                        "reason" to (t.message ?: "probe_thread_start_failed"),
+                        "frameCount" to 0,
+                        "fps" to 0.0,
+                        "probeCount" to 0,
+                        "reverseWins" to 0,
+                        "avgReverseDistance" to 0.0,
+                        "avgForwardDistance" to 0.0,
+                        "sidecarSampleCount" to 0,
+                        "sidecarPtsMonotonic" to false,
+                        "proofBoundary" to "AndroidReverseSidecarOrderingProbe",
+                    )
+                )
+            }
         }
     }
 
