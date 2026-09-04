@@ -18,6 +18,7 @@ import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoo
 import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestSpatialSmokeCoordinator
+import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestVulkanSpatialSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalActuationRouter
@@ -121,6 +122,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // -- P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER: single- --
     // camera ingest + dynamic-descriptor GLES/OES spatial render smoke coordinator.
     private var camera2SingleCamIngestSpatialSmokeCoordinator: AndroidCamera2SingleCamIngestSpatialSmokeCoordinator? = null
+
+    // -- P3-MULTICAM-NODE-SINGLE-CAM-INGEST-VULKAN-SPATIAL-RENDER: real --
+    // Camera2 YUV_420_888 ingest + Vulkan spatial render smoke coordinator.
+    private var camera2SingleCamIngestVulkanSpatialSmokeCoordinator:
+        AndroidCamera2SingleCamIngestVulkanSpatialSmokeCoordinator? = null
 
     // ── Phase 4C1D1: DAG streaming playback coordinator ───────────────────────
     private var dagStreamingPlaybackCoordinator: AndroidDagStreamingPlaybackCoordinator? = null
@@ -569,6 +575,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             channel         = channel,
             mainHandler     = mainHandler,
         )
+        camera2SingleCamIngestVulkanSpatialSmokeCoordinator = AndroidCamera2SingleCamIngestVulkanSpatialSmokeCoordinator(
+            context     = binding.applicationContext,
+            channel     = channel,
+            mainHandler = mainHandler,
+        )
         dagStreamingPlaybackCoordinator = AndroidDagStreamingPlaybackCoordinator(
             context         = binding.applicationContext,
             textureRegistry = binding.textureRegistry,
@@ -853,6 +864,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android Camera2 single-cam ingest spatial smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidCamera2SingleCamIngestVulkanSpatialSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = camera2SingleCamIngestVulkanSpatialSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android Camera2 single-cam ingest Vulkan spatial smoke coordinator unavailable", null)
             }
             return
         }
@@ -2873,6 +2894,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Tear down P3-MULTICAM-NODE-SINGLE-CAM-INGEST-DESCRIPTOR-SPATIAL-RENDER active runs.
         camera2SingleCamIngestSpatialSmokeCoordinator?.disposeAll()
         camera2SingleCamIngestSpatialSmokeCoordinator = null
+        // P3-MULTICAM-NODE-SINGLE-CAM-INGEST-VULKAN-SPATIAL-RENDER: cancel any
+        // in-flight run. The harness owns and releases its own Camera2/Vulkan
+        // resources before returning regardless of cancellation.
+        camera2SingleCamIngestVulkanSpatialSmokeCoordinator?.disposeAll()
+        camera2SingleCamIngestVulkanSpatialSmokeCoordinator = null
         // Tear down Phase 4C1D1 active streaming sessions.
         dagStreamingPlaybackCoordinator?.disposeAll()
         dagStreamingPlaybackCoordinator = null

@@ -216,6 +216,13 @@ if (ANDROID)
     # render/readback, combining the strict descriptor-parser policy above
     # with the static Vulkan two-texture spatial route above it.
     "platform/android/src/android_phase3_multicam_dynamic_descriptor_spatial_vulkan_render_jni.cpp"
+    # P3-MULTICAM-NODE-SINGLE-CAM-INGEST-VULKAN-SPATIAL-RENDER: one real
+    # Camera2 ImageReader(YUV_420_888) buffer-queue frame imported/sampled
+    # through Vulkan (samplerYcbcrConversion), combined with a synthetic
+    # solid-blue Vulkan scratch image via the same ComputeMultiCamLayout()
+    # descriptor pipeline as the routes above and rendered by the same
+    # VulkanMultiCamSpatialCompositor as the Vulkan route above it.
+    "platform/android/src/android_phase3_multicam_single_cam_ingest_vulkan_spatial_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_overlay_gles_render_jni.cpp"
