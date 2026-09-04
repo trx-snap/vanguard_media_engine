@@ -6,21 +6,24 @@
 //
 // Claims: dynamic keyframed static sticker overlay export
 // (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), static sticker overlay compositing
-// on solo frames, AND on Vulkan dissolve transition overlap frames
-// (P5-OVERLAYS-TRANSITION-COMP-N3), AND overlays alongside clip-level
-// Beauty V2 ONLY when every overlay's active interval is safely inside a
-// transition overlap window (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY).
+// on solo frames, AND on Vulkan dissolve and representative non-dissolve
+// (slideLeft, wipeRight) transition overlap frames
+// (P5-OVERLAYS-TRANSITION-COMP-N3, P5-OVERLAYS-NONDISSOLVE-TRANSITION-PROOF-A),
+// AND overlays alongside clip-level Beauty V2 ONLY when every overlay's
+// active interval is safely inside a transition overlap window
+// (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY).
 //
 // Strict non-claims:
-//   - No pixel quality claim;
+//   - Proves representative non-dissolve overlay transition support for slideLeft
+//     and wipeRight only; does not claim every transition direction;
 //   - No text/emoji overlay support beyond fail-closed lanes;
+//   - No GLES overlay route;
 //   - No overlay+beauty composition outside a transition overlap window (a
 //     solo, non-transition-overlap active overlay alongside clip-level
 //     Beauty V2 remains fail-closed);
-//   - No non-dissolve transition types combined with overlays;
-//   - No GLES overlay route;
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;
-//   - No fleet coverage beyond attached device.
+//   - No fleet coverage beyond attached device;
+//   - No pixel quality claim.
 //
 // Drives the REAL production `exportTimeline` MethodChannel route (no
 // diagnostic native path) via VGTimelineOverlayExportSmokeRunner.
