@@ -1,6 +1,7 @@
 // vg_duet_camera_session.dart
-// vanguard_media_engine - P3-CAM-DUET-SESSION-ADMISSION-ROUTE: Duet/Dual Camera
-// session admission wrapper and launcher.
+// vanguard_media_engine - P3-CAM-DUET-SESSION-ADMISSION-ROUTE /
+// P3-CAM-DUET-DIAGNOSTIC-LAYOUT-SESSION: Duet/Dual Camera session admission
+// wrapper and launcher with layout metadata preservation.
 //
 // Routes Duet/Dual Camera session admission through
 // [VGDuetDualCameraCapabilityEvaluator] before ever touching the native
@@ -15,12 +16,13 @@
 // route observes the existing legacy/iOS-only `startMultiCamPreview` native
 // gap and fails closed (returns `null`) rather than synthesizing success.
 //
-// Boundary: duet_dual_camera_session_admission_gated_routing_single_cam_diagnostic_fallback_no_real_concurrent_hardware_proof.
+// Boundary: duet_diagnostic_layout_session_metadata_carried_single_camera_unsupported_hardware_no_real_concurrent_capture_no_render.
 
 import 'package:flutter/services.dart';
 
 import 'vg_camera_session.dart';
 import 'vg_dual_camera_capability_policy.dart';
+import 'vg_dual_camera_descriptor.dart';
 import 'vg_live_preview_config.dart';
 
 /// Immutable admission result of [VGDuetCameraSessionLauncher.startSession].
@@ -30,12 +32,16 @@ import 'vg_live_preview_config.dart';
 ///   - Diagnostic synthetic mode populates [singleCameraSession] only.
 ///   - Production real dual-camera mode populates [multiCamSession] only.
 ///
+/// Carries [layoutConfig] (PiP geometry or split-screen ratio) representing
+/// the requested preview layout intent.
+///
 /// Call [dispose] to release whichever underlying resource was acquired.
 final class VGDuetCameraSession {
   VGDuetCameraSession._({
     required this.sessionId,
     required this.textureId,
     required this.policy,
+    required this.layoutConfig,
     required this.isPhysicalDualCamera,
     required this.isProductionRealDualCamera,
     required this.isDiagnosticSyntheticMode,
@@ -52,6 +58,18 @@ final class VGDuetCameraSession {
 
   /// The capability policy this session was admitted under.
   final VGDuetDualCameraCapabilityPolicy policy;
+
+  /// Active layout configuration for this session (PiP or split-screen).
+  final VGLivePreviewConfig layoutConfig;
+
+  /// Convenience getter for the spatial layout mode.
+  VGDualCameraLayoutMode get layoutMode => layoutConfig.layoutMode;
+
+  /// Convenience getter for PiP geometry descriptor.
+  VGPiPLayoutDescriptor get pipLayout => layoutConfig.pipLayout;
+
+  /// Convenience getter for split-screen geometry descriptor.
+  VGSplitScreenLayoutDescriptor get splitLayout => layoutConfig.splitLayout;
 
   /// Whether verified physical dual-camera hardware capture backs this session.
   ///
@@ -100,6 +118,7 @@ final class VGDuetCameraSession {
   @override
   String toString() =>
       'VGDuetCameraSession(sessionId: $sessionId, textureId: $textureId, '
+      'layoutConfig: $layoutConfig, '
       'isPhysicalDualCamera: $isPhysicalDualCamera, '
       'isProductionRealDualCamera: $isProductionRealDualCamera, '
       'isDiagnosticSyntheticMode: $isDiagnosticSyntheticMode, '
@@ -162,7 +181,12 @@ final class VGDuetCameraSessionLauncher {
         return null;
 
       case VGDuetDualCameraCapabilityDecision.diagnosticSyntheticSingleCamera:
-        return _startDiagnosticSession(policy, position: position, fps: fps);
+        return _startDiagnosticSession(
+          policy,
+          position: position,
+          fps: fps,
+          config: config,
+        );
 
       case VGDuetDualCameraCapabilityDecision.productionRealDualCamera:
         return _startProductionRealDualSession(policy, config: config);
@@ -173,6 +197,7 @@ final class VGDuetCameraSessionLauncher {
     VGDuetDualCameraCapabilityPolicy policy, {
     required VGCameraPosition position,
     required int fps,
+    VGLivePreviewConfig? config,
   }) async {
     final VGCameraSession single;
     try {
@@ -189,6 +214,7 @@ final class VGDuetCameraSessionLauncher {
       sessionId: single.sessionId,
       textureId: single.textureId,
       policy: policy,
+      layoutConfig: config ?? const VGLivePreviewConfig(),
       isPhysicalDualCamera: false,
       isProductionRealDualCamera: false,
       isDiagnosticSyntheticMode: true,
@@ -222,6 +248,7 @@ final class VGDuetCameraSessionLauncher {
       sessionId: 'duet-${multi.textureId}',
       textureId: multi.textureId,
       policy: policy,
+      layoutConfig: config ?? const VGLivePreviewConfig(),
       isPhysicalDualCamera: true,
       isProductionRealDualCamera: true,
       isDiagnosticSyntheticMode: false,

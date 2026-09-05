@@ -343,4 +343,149 @@ void main() {
       },
     );
   });
+
+  group('VGDuetCameraSession layoutConfig preservation', () {
+    test(
+      'diagnostic mode preserves custom freeFloating PiP layout metadata',
+      () async {
+        _responses['startCamera'] = 7;
+        final launcher = VGDuetCameraSessionLauncher(
+          evaluator: _FixedPolicyEvaluator(_diagnosticPolicy),
+        );
+        const customConfig = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.pip,
+          pipLayout: VGPiPLayoutDescriptor(
+            anchor: VGPiPAnchor.freeFloating,
+            centerX: 0.72,
+            centerY: 0.28,
+            aspectRatio: 1.0,
+            widthFraction: 0.4,
+          ),
+        );
+
+        final session = await launcher.startSession(
+          allowDiagnosticSyntheticMode: true,
+          config: customConfig,
+        );
+
+        expect(session, isNotNull);
+        expect(_callCount('startCamera'), equals(1));
+        expect(_callCount('startMultiCamPreview'), equals(0));
+        expect(session!.isPhysicalDualCamera, isFalse);
+        expect(session.isProductionRealDualCamera, isFalse);
+        expect(session.isDiagnosticSyntheticMode, isTrue);
+        expect(session.layoutConfig, equals(customConfig));
+        expect(session.layoutMode, equals(VGDualCameraLayoutMode.pip));
+        expect(session.pipLayout.anchor, equals(VGPiPAnchor.freeFloating));
+        expect(session.pipLayout.centerX, equals(0.72));
+        expect(session.pipLayout.centerY, equals(0.28));
+        expect(session.pipLayout.aspectRatio, equals(1.0));
+        expect(session.pipLayout.widthFraction, equals(0.4));
+      },
+    );
+
+    test(
+      'diagnostic mode preserves custom splitScreen leftRight layout metadata',
+      () async {
+        _responses['startCamera'] = 8;
+        final launcher = VGDuetCameraSessionLauncher(
+          evaluator: _FixedPolicyEvaluator(_diagnosticPolicy),
+        );
+        const customConfig = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.splitScreen,
+          splitLayout: VGSplitScreenLayoutDescriptor(
+            splitRatio: 0.6,
+            direction: VGSplitScreenDirection.leftRight,
+          ),
+        );
+
+        final session = await launcher.startSession(
+          allowDiagnosticSyntheticMode: true,
+          config: customConfig,
+        );
+
+        expect(session, isNotNull);
+        expect(_callCount('startCamera'), equals(1));
+        expect(_callCount('startMultiCamPreview'), equals(0));
+        expect(session!.isPhysicalDualCamera, isFalse);
+        expect(session.isProductionRealDualCamera, isFalse);
+        expect(session.isDiagnosticSyntheticMode, isTrue);
+        expect(session.layoutConfig, equals(customConfig));
+        expect(session.layoutMode, equals(VGDualCameraLayoutMode.splitScreen));
+        expect(
+          session.splitLayout.direction,
+          equals(VGSplitScreenDirection.leftRight),
+        );
+        expect(session.splitLayout.splitRatio, equals(0.6));
+      },
+    );
+
+    test(
+      'diagnostic null config defaults to const VGLivePreviewConfig()',
+      () async {
+        _responses['startCamera'] = 9;
+        final launcher = VGDuetCameraSessionLauncher(
+          evaluator: _FixedPolicyEvaluator(_diagnosticPolicy),
+        );
+
+        final session = await launcher.startSession(
+          allowDiagnosticSyntheticMode: true,
+          config: null,
+        );
+
+        expect(session, isNotNull);
+        expect(_callCount('startCamera'), equals(1));
+        expect(_callCount('startMultiCamPreview'), equals(0));
+        expect(session!.isPhysicalDualCamera, isFalse);
+        expect(session.isProductionRealDualCamera, isFalse);
+        expect(session.isDiagnosticSyntheticMode, isTrue);
+        expect(session.layoutConfig, equals(const VGLivePreviewConfig()));
+        expect(session.layoutMode, equals(VGDualCameraLayoutMode.pip));
+        expect(session.pipLayout, equals(const VGPiPLayoutDescriptor()));
+        expect(
+          session.splitLayout,
+          equals(const VGSplitScreenLayoutDescriptor()),
+        );
+      },
+    );
+
+    test(
+      'production real wrapper with valid multiCam response preserves config too, while keeping real flags true',
+      () async {
+        _responses['startMultiCamPreview'] = <Object?, Object?>{
+          'textureId': 42,
+          'outputWidth': 1080,
+          'outputHeight': 1920,
+        };
+        final launcher = VGDuetCameraSessionLauncher(
+          evaluator: _FixedPolicyEvaluator(_productionRealPolicy),
+        );
+        const customConfig = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.splitScreen,
+          splitLayout: VGSplitScreenLayoutDescriptor(
+            splitRatio: 0.55,
+            direction: VGSplitScreenDirection.leftRight,
+          ),
+        );
+
+        final session = await launcher.startSession(config: customConfig);
+
+        expect(session, isNotNull);
+        expect(_callCount('startMultiCamPreview'), equals(1));
+        expect(_callCount('startCamera'), equals(0));
+        expect(session!.textureId, equals(42));
+        expect(session.isPhysicalDualCamera, isTrue);
+        expect(session.isProductionRealDualCamera, isTrue);
+        expect(session.isDiagnosticSyntheticMode, isFalse);
+        expect(session.layoutConfig, equals(customConfig));
+        expect(session.layoutMode, equals(VGDualCameraLayoutMode.splitScreen));
+        expect(
+          session.splitLayout.direction,
+          equals(VGSplitScreenDirection.leftRight),
+        );
+        expect(session.splitLayout.splitRatio, equals(0.55));
+        expect(session.toString(), contains('layoutConfig:'));
+      },
+    );
+  });
 }
