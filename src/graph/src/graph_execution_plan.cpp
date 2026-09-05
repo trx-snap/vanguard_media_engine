@@ -116,6 +116,7 @@ core::Status BuildGraphExecutionPlan(const Graph& graph,
         planNode.nodeKind = n->kind();
         planNode.nodeType = n->type();
         planNode.executionIndex = static_cast<uint32_t>(result.nodes.size());
+        planNode.outputPorts = n->outputPorts();
 
         auto detailIt = detailsById.find(n->id());
         if (detailIt != detailsById.end()) {

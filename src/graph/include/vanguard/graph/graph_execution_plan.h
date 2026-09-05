@@ -36,6 +36,10 @@ struct ExecutionPlanNode {
     float                              weight{1.0f};
     uint32_t                           executionIndex{0};
     std::vector<ExecutionInputBinding> inputs;
+    // Mirrors this node's Node::outputPorts() at plan-build time, so a
+    // graph-layer dispatcher can validate produced output tokens without
+    // holding a reference to the originating Graph/Node.
+    std::vector<PortDescriptor>        outputPorts;
 };
 
 // Deterministic dependency-ordered execution plan over the active subgraph

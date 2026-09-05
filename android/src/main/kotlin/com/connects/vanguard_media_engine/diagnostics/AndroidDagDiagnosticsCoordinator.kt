@@ -48,6 +48,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
+            "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -114,6 +115,8 @@ class AndroidDagDiagnosticsCoordinator(
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
                 runPhase1DagMultinodeGpuFrameTokenSmoke(result)
+            "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke" ->
+                runPhase1DagMultinodeExecutionDispatcherSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -439,6 +442,50 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "DAG_MULTINODE_GPU_FRAME_TOKEN_SMOKE_FAILED",
                         "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-DAG-MULTINODE-EXECUTION-DISPATCHER: bounded platform-neutral
+    // graph-layer execution dispatcher diagnostic. Runs synthetic native
+    // lanes only, driving vanguard::graph::GraphExecutionDispatcher over the
+    // same real four-node topology used by the routes above (two
+    // HardwareBufferSourceNode instances -> MultiCamCompositorNode ->
+    // PreviewSurfaceSinkNode, no TU-local Node subclasses except in the one
+    // lane that needs a mixed GPU/non-GPU input-binding shape). Proof
+    // boundary: platform-neutral DAG execution dispatcher - diagnostic-only,
+    // no Node::execute, no OS/GPU resource ownership, no rendering, no GPU
+    // transport, no product/app/editor wiring.
+    private fun runPhase1DagMultinodeExecutionDispatcherSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_dag_execution_dispatcher_diagnostic_only_no_node_execute_no_os_" +
+                        "resource_ownership_no_render_no_gpu_transport_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "DAG_MULTINODE_EXECUTION_DISPATCHER_SMOKE_FAILED",
+                        "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

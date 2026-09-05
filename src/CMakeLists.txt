@@ -15,6 +15,7 @@ add_library(vanguard_graph STATIC
     "graph/src/graph.cpp"
     "graph/src/graph_execution_plan.cpp"
     "graph/src/gpu_frame_token.cpp"
+    "graph/src/graph_execution_dispatcher.cpp"
 )
 target_include_directories(vanguard_graph PUBLIC "graph/include" "render/shared/include")
 target_link_libraries(vanguard_graph PRIVATE vanguard_core)
@@ -305,6 +306,16 @@ if (ANDROID)
     # ownership, no rendering, no GPU transport, no product/editor/app/
     # ConnectsApp wiring.
     "platform/android/src/android_phase1_dag_multinode_gpu_frame_token_jni.cpp"
+    # P1-DAG-MULTINODE-EXECUTION-DISPATCHER: bounded platform-neutral
+    # graph-layer execution dispatcher diagnostic (real four-node topology -
+    # two real HardwareBufferSourceNode instances -> MultiCamCompositorNode
+    # -> PreviewSurfaceSinkNode - proving GraphExecutionDispatcher's
+    # fail-closed pre-checks, per-node GPU input resolution/output
+    # publish-validation, non-GPU binding skipping, and no-rollback mid-plan
+    # failure behavior). Diagnostic-only: no Node::execute, no OS resource
+    # ownership, no rendering, no GPU transport, no product/editor/app
+    # wiring.
+    "platform/android/src/android_phase1_dag_multinode_execution_dispatcher_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

@@ -1112,6 +1112,19 @@ class VanguardNativeBridge(
     // transport, no product/editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke(): String
 
+    // -- P1-DAG-MULTINODE-EXECUTION-DISPATCHER: bounded platform-neutral
+    // graph-layer execution dispatcher diagnostic. Proves
+    // GraphExecutionDispatcher's fail-closed pre-checks (empty plan, stale
+    // session, executionIndex/position mismatch), per-node GPU-bearing
+    // input resolution and output-publish validation, non-GPU binding
+    // skipping, and no-rollback mid-plan failure behavior, over the same
+    // real four-node topology (two real HardwareBufferSourceNode instances
+    // -> real MultiCamCompositorNode -> real PreviewSurfaceSinkNode) used by
+    // the routes above. Runs synthetic native lanes only. Diagnostic-only:
+    // no Node::execute, no OS/GPU resource ownership, no rendering, no GPU
+    // transport, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,
