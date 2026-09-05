@@ -92,6 +92,19 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Scenario 11 (Y12) starts a routing- and focus-enabled session: proves route
  * disconnect while paused by focus policy blocks focus auto-resume on
  * subsequent focus gain and continues to reject public resume.
+ *
+ * Scenario 13 (Y18b, P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF) is
+ * the ONE isolated ring-transport proof: it constructs the PRODUCTION
+ * [VanguardRealtimeAudioPlaybackSinkBridge] with `frameSource` (and NO
+ * `stateMachine`) bound to the diagnostics-owned
+ * [AndroidRealtimeAudioPlaybackRingTransportFrameSource], which feeds the
+ * sink from the existing async-runtime multi-source native OUTPUT RING
+ * (synthetic two-track PCM, no MediaCodec, no [VanguardRealtimeAudioPlaybackSession]).
+ * Order: ring open (create + prefill) -> sink start/ready -> ring Start
+ * (single native command + start ack) -> sink allowDrain -> sink drains to
+ * the NATIVE eosDrained verdict -> ring close (final snapshot, destroy,
+ * join). It evaluates exactly one lane, [LANE_RING_FRAME_SOURCE], from the
+ * sink telemetry plus the ring telemetry; no other lane is touched.
  */
 class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private val context: Context,
@@ -128,6 +141,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "position_query_lifecycle_pause_seek_dead_object_teardown_" +
                 "native_clock_correlation_observation_no_feedback_" +
                 "native_clock_drift_sample_ownership_generation_pinned_no_feedback_" +
+                "ring_transport_frame_source_seam_" +
+                "production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_" +
+                "native_eos_drained_observed_by_sink_read_no_owner_pre_drain_" +
                 "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_" +
                 "no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_" +
@@ -146,6 +162,17 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE = "SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE"
         const val SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED = "SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED"
         const val SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE = "SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE"
+        // Y18b: the ONE isolated ring-transport frame-source scenario.
+        const val SCENARIO_RING_FRAME_SOURCE = "SCENARIO_RING_FRAME_SOURCE_TO_EOS"
+
+        // Y18b synthetic ring geometry: production sink format is fixed
+        // (no source file is decoded); rings keep the frozen X4 defaults.
+        const val RING_SAMPLE_RATE = 44_100
+        const val RING_CHANNEL_COUNT = 2
+        const val RING_SOURCE_RING_CAPACITY_FRAMES =
+            AndroidRealtimeAudioPlaybackRingTransportFrameSource.DEFAULT_SOURCE_RING_CAPACITY_FRAMES
+        const val RING_OUTPUT_RING_CAPACITY_FRAMES =
+            AndroidRealtimeAudioPlaybackRingTransportFrameSource.DEFAULT_OUTPUT_RING_CAPACITY_FRAMES
 
         const val DEFAULT_PAUSE_HOLD_MS = 400L
         const val DEFAULT_STOP_AFTER_MS = 300L
@@ -250,6 +277,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_DRIFT_SAMPLE_GENERATION_PINNED = "driftSampleGenerationPinnedOk"
         const val LANE_DRIFT_SAMPLE_NO_FEEDBACK = "driftSampleNoFeedbackOk"
         const val LANE_CLOCK_AUTHORITY_UNCHANGED = "clockAuthorityUnchangedOk"
+        // Y18b lane, evaluated by the ring frame-source scenario only.
+        const val LANE_RING_FRAME_SOURCE = "ringFrameSourceOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -288,6 +317,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_DRIFT_SAMPLE_GENERATION_PINNED,
             LANE_DRIFT_SAMPLE_NO_FEEDBACK,
             LANE_CLOCK_AUTHORITY_UNCHANGED,
+            LANE_RING_FRAME_SOURCE,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -316,6 +346,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "position_query_lifecycle_pause_seek_dead_object_teardown",
             "native_clock_correlation_observation_no_feedback",
             "native_clock_drift_sample_ownership_generation_pinned_no_feedback",
+            "ring_transport_frame_source_seam",
+            "production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine",
+            "native_eos_drained_observed_by_sink_read_no_owner_pre_drain",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache",
@@ -327,6 +360,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         private const val FAILURE_SOURCE_PATH_REQUIRED = "source_path_required"
         private const val FIRST_AUDIO_TIMEOUT_MS = 3_000L
         private const val WAIT_SLICE_MS = 5L
+        private const val RING_SINK_READY_TIMEOUT_MS = 5_000L
+        private const val RING_JOIN_TIMEOUT_MS = 3_000L
 
         fun ownsMethod(method: String): Boolean = method == METHOD_NAME
     }
@@ -341,6 +376,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
 
     @Volatile
     private var activeSession: VanguardRealtimeAudioPlaybackSession? = null
+
+    // Y18b: the ring scenario owns no session; its sink and ring are
+    // cancelled directly on disposeAll().
+    @Volatile
+    private var activeRingSink: VanguardRealtimeAudioPlaybackSinkBridge? = null
+
+    @Volatile
+    private var activeRing: AndroidRealtimeAudioPlaybackRingTransportFrameSource? = null
 
     fun ownsMethod(method: String): Boolean = Companion.ownsMethod(method)
 
@@ -397,6 +440,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             activeSession?.cancel()
         } catch (_: Throwable) {}
         activeSession = null
+        try {
+            activeRingSink?.cancel()
+        } catch (_: Throwable) {}
+        try {
+            activeRing?.cancel()
+        } catch (_: Throwable) {}
+        activeRingSink = null
+        activeRing = null
     }
 
     // ── Run ────────────────────────────────────────────────────────────────
@@ -438,7 +489,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxSeekHoldMs" to config.maxSeekHoldMs,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(12)
+        val outcomes = ArrayList<ScenarioOutcome>(13)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
@@ -570,6 +621,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         outcomes += runScenario(SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE, config, injectAfterFrames = 0L) { session, outcome ->
             presentationClockQuerySurfaceScenario(session, config, outcome)
         }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y18b: the ONE isolated ring-transport frame-source proof (production
+        // sink bridge fed from the async-runtime multi-source output ring;
+        // no session, no state machine, no decoder).
+        outcomes += ringFrameSourceScenario(config)
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
         val firstFailure = outcomes.firstOrNull { it.failureReason.isNotBlank() }?.let { "${it.name}:${it.failureReason}" } ?: ""
@@ -1562,6 +1618,165 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         )
     }
 
+    // ── Scenario 13 (Y18b): production sink bridge fed from the async-runtime
+    //    multi-source output ring through the Y18a frameSource seam -> EOS ──
+
+    private fun ringFrameSourceScenario(config: SmokeConfig): ScenarioOutcome {
+        val outcome = ScenarioOutcome(SCENARIO_RING_FRAME_SOURCE)
+        val wallStart = SystemClock.elapsedRealtime()
+        val coordinatorThreadId = Thread.currentThread().id
+        val window = config.maxFramesPerMix
+        val deadlineAtMs = wallStart + config.deadlineMs
+        var ring: AndroidRealtimeAudioPlaybackRingTransportFrameSource? = null
+        var sink: VanguardRealtimeAudioPlaybackSinkBridge? = null
+        var expectedFrames = 0L
+        var ringFrameSourceUsed = false
+        var stateMachineSourceUsed = false
+        var sinkReadyBeforeTransportStart = false
+        var drainAllowedAfterTransportStart = false
+        var sinkExited = false
+        var sinkJoined = false
+        var ringClosed = false
+        var ringOpenAtMs = -1L
+        var sinkReadyAtMs = -1L
+        var transportStartedAtMs = -1L
+        var drainAllowedAtMs = -1L
+        var sinkExitedAtMs = -1L
+        outcome.metrics["deadObjectInjectAfterFrames"] = 0L
+        outcome.metrics["seekTargetSecArmed"] = 0.0
+        outcome.metrics["enableAudioFocusResponse"] = false
+        outcome.metrics["enableAudioRoutingResponse"] = false
+        try {
+            if (disposed.get()) throw FailClosed("coordinator_disposed")
+            require(
+                window in 1..RING_OUTPUT_RING_CAPACITY_FRAMES && RING_OUTPUT_RING_CAPACITY_FRAMES % window == 0,
+                "ring_geometry_invalid:$window",
+            )
+            expectedFrames = ((config.maxDurationSec * RING_SAMPLE_RATE).toLong() / window) * window
+            require(expectedFrames >= 2L * RING_OUTPUT_RING_CAPACITY_FRAMES, "ring_timeline_too_short:$expectedFrames")
+            outcome.metrics["ringSampleRate"] = RING_SAMPLE_RATE
+            outcome.metrics["ringChannelCount"] = RING_CHANNEL_COUNT
+            outcome.metrics["ringMaxFramesPerMix"] = window
+            outcome.metrics["ringExpectedFrames"] = expectedFrames
+            outcome.metrics["ringSourceRingCapacityFrames"] = RING_SOURCE_RING_CAPACITY_FRAMES
+            outcome.metrics["ringOutputRingCapacityFrames"] = RING_OUTPUT_RING_CAPACITY_FRAMES
+
+            val r = AndroidRealtimeAudioPlaybackRingTransportFrameSource(
+                AndroidRealtimeAudioPlaybackRingTransportFrameSource.Config(
+                    sampleRate = RING_SAMPLE_RATE,
+                    channelCount = RING_CHANNEL_COUNT,
+                    maxFramesPerMix = window,
+                    expectedFrames = expectedFrames,
+                    sourceRingCapacityFrames = RING_SOURCE_RING_CAPACITY_FRAMES,
+                    outputRingCapacityFrames = RING_OUTPUT_RING_CAPACITY_FRAMES,
+                    deadlineAtMs = deadlineAtMs,
+                    threadName = "Y18bRingOwner",
+                ),
+            )
+            ring = r
+            activeRing = r
+            require(r.open(config.deadlineMs), "ring_open_failed:${r.currentFailureReason}:${r.currentStage}")
+            ringOpenAtMs = SystemClock.elapsedRealtime()
+
+            // The production sink is constructed with the ring frame source
+            // and NO state machine: the Y18a seam is the only route in.
+            val sinkConfig = VanguardRealtimeAudioPlaybackSinkBridge.Config(
+                stateMachine = null,
+                sampleRate = RING_SAMPLE_RATE,
+                channelCount = RING_CHANNEL_COUNT,
+                maxFramesPerMix = window,
+                declaredFrameCount = expectedFrames,
+                gain = config.gain,
+                deadlineAtMs = deadlineAtMs,
+                threadName = "Y18bRingSink",
+                externallyCancelled = { disposed.get() },
+                frameSource = r,
+            )
+            ringFrameSourceUsed = sinkConfig.frameSource === r
+            stateMachineSourceUsed = sinkConfig.stateMachine != null
+            val k = VanguardRealtimeAudioPlaybackSinkBridge(sinkConfig)
+            sink = k
+            activeRingSink = k
+            require(k.start(), "sink_start_rejected")
+            require(k.awaitReady(RING_SINK_READY_TIMEOUT_MS), "sink_not_ready:${k.currentExitReason}")
+            sinkReadyAtMs = SystemClock.elapsedRealtime()
+            sinkReadyBeforeTransportStart = k.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.READY
+
+            // ONE native Start command (owner thread) + start ack, then the
+            // sink may drain; the ring services every drain from here on.
+            require(r.startTransport(config.deadlineMs), "ring_start_failed:${r.currentFailureReason}:${r.currentStage}")
+            transportStartedAtMs = SystemClock.elapsedRealtime()
+            k.allowDrain()
+            drainAllowedAtMs = SystemClock.elapsedRealtime()
+            drainAllowedAfterTransportStart = drainAllowedAtMs >= transportStartedAtMs
+
+            sinkExited = k.awaitExit(config.deadlineMs)
+            sinkExitedAtMs = SystemClock.elapsedRealtime()
+            require(sinkExited, "sink_not_exited:${k.currentExitReason}")
+            sinkJoined = k.join(RING_JOIN_TIMEOUT_MS)
+            require(sinkJoined, "sink_not_joined:${k.currentExitReason}")
+            ringClosed = r.close(config.deadlineMs)
+            require(ringClosed, "ring_close_failed:${r.currentFailureReason}:${r.currentStage}")
+        } catch (f: FailClosed) {
+            outcome.failureReason = f.reason
+        } catch (t: Throwable) {
+            outcome.failureReason = "exception:${t.javaClass.simpleName}:${t.message}"
+        } finally {
+            val k = sink
+            val r = ring
+            try {
+                k?.cancel()
+                if (k != null && !sinkJoined) sinkJoined = k.join(RING_JOIN_TIMEOUT_MS)
+            } catch (_: Throwable) {}
+            try {
+                if (r != null && !ringClosed) ringClosed = r.close(RING_JOIN_TIMEOUT_MS)
+            } catch (_: Throwable) {}
+            if (activeRingSink === k) activeRingSink = null
+            if (activeRing === r) activeRing = null
+            val sinkTelemetry = k?.telemetry()
+            val ringTelemetry = r?.telemetry()
+            if (outcome.failureReason.isBlank() && ringTelemetry != null && ringTelemetry.failureReason.isNotBlank()) {
+                outcome.failureReason = "ring:${ringTelemetry.failureReason}"
+            }
+            if (outcome.failureReason.isBlank() && sinkTelemetry != null &&
+                sinkTelemetry.exitReason != VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS
+            ) {
+                outcome.failureReason = "sink_exit:${sinkTelemetry.exitReason}"
+            }
+            outcome.metrics["ringFrameSourceUsed"] = ringFrameSourceUsed
+            outcome.metrics["stateMachineSourceUsed"] = stateMachineSourceUsed
+            outcome.metrics["sinkReadyBeforeTransportStart"] = sinkReadyBeforeTransportStart
+            outcome.metrics["drainAllowedAfterTransportStart"] = drainAllowedAfterTransportStart
+            outcome.metrics["sinkExited"] = sinkExited
+            outcome.metrics["sinkJoined"] = sinkJoined
+            outcome.metrics["ringClosed"] = ringClosed
+            outcome.metrics["ringOpenWallMs"] = if (ringOpenAtMs >= 0L) ringOpenAtMs - wallStart else -1L
+            outcome.metrics["sinkReadyWallMs"] = if (sinkReadyAtMs >= 0L) sinkReadyAtMs - wallStart else -1L
+            outcome.metrics["transportStartedWallMs"] = if (transportStartedAtMs >= 0L) transportStartedAtMs - wallStart else -1L
+            outcome.metrics["drainAllowedWallMs"] = if (drainAllowedAtMs >= 0L) drainAllowedAtMs - wallStart else -1L
+            outcome.metrics["sinkExitedWallMs"] = if (sinkExitedAtMs >= 0L) sinkExitedAtMs - wallStart else -1L
+            outcome.metrics["coordinatorThreadId"] = coordinatorThreadId
+            AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRingFrameSource(
+                sink = sinkTelemetry,
+                ring = ringTelemetry,
+                sinkClock = k?.clockSnapshot(),
+                expectedFrames = expectedFrames,
+                ringFrameSourceUsed = ringFrameSourceUsed,
+                stateMachineSourceUsed = stateMachineSourceUsed,
+                sinkReadyBeforeTransportStart = sinkReadyBeforeTransportStart,
+                drainAllowedAfterTransportStart = drainAllowedAfterTransportStart,
+                sinkJoined = sinkJoined,
+                ringClosed = ringClosed,
+                coordinatorThreadId = coordinatorThreadId,
+                config = config,
+                out = outcome,
+            )
+            outcome.metrics["scenarioWallMs"] = SystemClock.elapsedRealtime() - wallStart
+            outcome.metrics["failureReason"] = outcome.failureReason
+        }
+        return outcome
+    }
+
     // ── Metrics ────────────────────────────────────────────────────────────
 
     private fun snapshotMetrics(s: VanguardRealtimeAudioPlaybackSession.Snapshot): LinkedHashMap<String, Any?> {
@@ -1882,7 +2097,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

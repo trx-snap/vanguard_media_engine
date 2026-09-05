@@ -1010,7 +1010,10 @@ class VanguardNativeBridge(
         // Owner-thread output-ring consumer: consumes a pending start/seek
         // ack first (reporting discarded frames), then pops mixed PCM16
         // into the direct ByteBuffer. maxFrames == 0 is a legal ack-only
-        // call.
+        // call. Y18b: the reply additionally carries eosPublished /
+        // timelineComplete / totalFramesPushed / expectedFrameCount /
+        // eosDrained so a ring-fed production sink consumer can observe
+        // EOS-drained natively without any owner-side pre-drain.
         external fun readAsyncRuntimeQueueMultiSourceRealtimeClockOutputPcm16(
             handle: Long,
             pcm: java.nio.ByteBuffer,

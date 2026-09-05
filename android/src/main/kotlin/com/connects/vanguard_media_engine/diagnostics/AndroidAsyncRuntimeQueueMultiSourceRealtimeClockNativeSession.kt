@@ -47,6 +47,18 @@ import java.nio.ByteOrder
 // allowed into the identity checksums: the driver completes the exact
 // expected timeline before setting the joint writer-local EOS, and this
 // wrapper fails closed if any per-track provider zero-fill is observed.
+//
+// Y18b (P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF) adds two
+// owner-thread entry points used by the ring transport frame-source adapter
+// [AndroidRealtimeAudioPlaybackRingTransportFrameSource] so a PRODUCTION
+// sink can consume this output ring through the Y18a seam: [readOutputInto]
+// (destructive read straight into a sink-owned direct buffer via the same
+// JNI read entry point, same deadline check, same totals/checksum fold,
+// same [OutputSink] accounting contract) and
+// [tryCompleteTimelineAndSetEosWithoutDrain] (joint EOS after the exact
+// timeline completed WITHOUT draining the output ring here, because the
+// sink is the sole consumer of those frames). Every X4..X15 entry point is
+// untouched.
 class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     private val deadlineElapsedRealtimeMs: Long,
     private val outputSink: OutputSink,
@@ -57,10 +69,27 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     // freshly read mixed PCM16 sits at byte offset 0 of the read buffer
     // supplied to [create]. The sink must fully consume (write + account)
     // the frames before returning, or throw; the session issues no further
-    // native call while staged frames remain unconsumed.
+    // native call while staged frames remain unconsumed. Y18b: for a
+    // [readOutputInto] read the frames sit at byte offset 0 of the
+    // caller-supplied `dst` instead (the production sink's own drain
+    // buffer, which it writes itself); the callback is then accounting
+    // only and must not touch the create-time read buffer.
     fun interface OutputSink {
         fun onOutputFramesRead(frames: Long)
     }
+
+    // Y18b: one destructive read into a sink-owned buffer.
+    data class SinkReadReply(
+        val framesRead: Long,
+        val bytesRead: Long,
+        val totalOutputFramesRead: Long,
+        val outputAvailableReadFrames: Long,
+        val nativeOutputReadChecksumHex: String,
+        val eosPublished: Boolean,
+        val timelineComplete: Boolean,
+        val totalFramesPushed: Long,
+        val eosDrained: Boolean,
+    )
 
     data class IngestReply(
         val framesAccepted: Long,
@@ -256,8 +285,19 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         private set
     var lastStatus = ""
         private set
+    // Y18b owner-side facts: sink-facing reads and the no-drain EOS set.
+    var sinkReadCalls = 0L
+        private set
+    var sinkReadFramesTotal = 0L
+        private set
+    var eosSetWithoutDrain = false
+        private set
+    var totalFramesPushedAtEos = -1L
+        private set
 
     val isCreated: Boolean get() = handle != 0L
+    val outputRingCapacityFrames: Long get() = outCap
+    val maxFramesPerMix: Long get() = mfpm
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -427,6 +467,55 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     // Ack-only read (maxFrames == 0): consumes a pending start/seek output
     // ack without popping frames, so the sink is never invoked.
     fun ackOnlyRead(): Map<String, String> = readOnce(0)
+
+    // Y18b (owner thread only): one destructive output read of up to
+    // [maxFrames] frames straight into the sink-owned direct buffer [dst]
+    // at byte offset 0, through the SAME JNI read entry point as
+    // [readOnce] with the same deadline check and the same owner-side
+    // totals/checksum fold; [outputSink.onOutputFramesRead] is invoked only
+    // for frames actually read (frames sit in `dst`, see [OutputSink]).
+    // No start/seek ack may be pending here: the adapter consumes the start
+    // ack through [startAndConsumeAck] before the sink is allowed to drain
+    // and this proof issues no seek, so an ack consumed inside a sink read
+    // is an ordering defect and fails closed (its frames would otherwise be
+    // silently discarded at the boundary).
+    fun readOutputInto(dst: ByteBuffer, maxFrames: Int): SinkReadReply {
+        checkDeadline()
+        if (handle == 0L) throw Failure("sink_read_before_create")
+        if (maxFrames <= 0 || maxFrames.toLong() > outCap) throw Failure("sink_read_invalid_max_frames")
+        if (!dst.isDirect) throw Failure("sink_read_dst_not_direct")
+        if (dst.order() != ByteOrder.LITTLE_ENDIAN) throw Failure("sink_read_dst_not_little_endian")
+        if (dst.capacity() < maxFrames * bytesPerFrame) throw Failure("sink_read_dst_too_small")
+        val kv = parseNative(
+            VanguardNativeBridge.readAsyncRuntimeQueueMultiSourceRealtimeClockOutputPcm16(
+                handle, dst, maxFrames,
+            )
+        )
+        if (kv["status"] != "ok") throw Failure("sink_read_status_${kv["status"]}")
+        if (kv["seekAckConsumed"] == "true") throw Failure("sink_read_consumed_unexpected_ack")
+        totalOutputFramesRead = longField(kv, "totalOutputFramesRead")
+        nativeOutputReadChecksumHex = kv["nativeOutputReadChecksumHex"] ?: ""
+        val framesRead = longField(kv, "framesRead")
+        val bytesRead = longField(kv, "bytesRead")
+        if (framesRead < 0L || framesRead > maxFrames.toLong()) throw Failure("sink_read_frames_out_of_range")
+        if (bytesRead != framesRead * bytesPerFrame) throw Failure("sink_read_bytes_mismatch")
+        sinkReadCalls += 1L
+        if (framesRead > 0L) {
+            sinkReadFramesTotal += framesRead
+            outputSink.onOutputFramesRead(framesRead)
+        }
+        return SinkReadReply(
+            framesRead = framesRead,
+            bytesRead = bytesRead,
+            totalOutputFramesRead = totalOutputFramesRead,
+            outputAvailableReadFrames = longField(kv, "outputAvailableReadFrames"),
+            nativeOutputReadChecksumHex = nativeOutputReadChecksumHex,
+            eosPublished = kv["eosPublished"] == "true",
+            timelineComplete = kv["timelineComplete"] == "true",
+            totalFramesPushed = kv["totalFramesPushed"]?.toLongOrNull() ?: -1L,
+            eosDrained = kv["eosDrained"] == "true",
+        )
+    }
 
     fun drainAvailableOutput(): Long =
         longField(readOnce(outCap.toInt()), "framesRead")
@@ -653,6 +742,42 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         ) {
             throw Failure("zero_fill_leaked_into_identity")
         }
+    }
+
+    // Y18b (owner thread only, non-blocking poll): takes ONE snapshot and,
+    // if the worker has completed the exact expected timeline
+    // (timelineComplete with totalFramesPushed == expectedFrames), sets the
+    // JOINT writer-local EOS exactly once and returns true. Unlike
+    // [completeTimelineAndSetEos] it never reads the output ring: the
+    // production sink is the sole consumer of those frames (observing
+    // eosDrained through [readOutputInto]). Zero-fill is impossible after
+    // timeline completion (no window remains to dispatch) and is asserted
+    // from the same snapshot to keep the identity checksums pure. Returns
+    // false when the timeline is still running; every command must have
+    // succeeded so far, otherwise fails closed.
+    fun tryCompleteTimelineAndSetEosWithoutDrain(): Boolean {
+        if (eosSetWithoutDrain) return true
+        val snap = snapshot()
+        if (longField(snap, "commandErrors") != 0L) throw Failure("eos_poll_command_errors")
+        if (snap["timelineComplete"] != "true" ||
+            longField(snap, "totalFramesPushed") != expectedFrames
+        ) {
+            return false
+        }
+        if (longField(snap, "providerFramesZeroFilledTrack0") != 0L ||
+            longField(snap, "providerFramesZeroFilledTrack1") != 0L
+        ) {
+            throw Failure("zero_fill_leaked_into_identity")
+        }
+        val kv = parseNative(
+            VanguardNativeBridge.setAsyncRuntimeQueueMultiSourceRealtimeClockEos(handle)
+        )
+        if (kv["status"] != "ok" || kv["eosTrack0"] != "true" || kv["eosTrack1"] != "true") {
+            throw Failure("eos_set_failed_${kv["status"]}")
+        }
+        totalFramesPushedAtEos = longField(snap, "totalFramesPushed")
+        eosSetWithoutDrain = true
+        return true
     }
 
     // ── Snapshot / lifecycle verdicts ───────────────────────────────────────

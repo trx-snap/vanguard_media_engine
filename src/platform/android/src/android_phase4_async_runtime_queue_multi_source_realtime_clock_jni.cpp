@@ -1654,6 +1654,16 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
 // output ack first (reporting frames discarded at the boundary), then pops
 // mixed PCM16 into the caller's direct ByteBuffer at byte offset 0.
 // maxFrames == 0 is a legal ack-only call.
+//
+// Y18b (P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF): the reply
+// additionally publishes the EOS observation a ring-fed production sink
+// consumer needs WITHOUT any owner-side pre-drain: eosPublished (the joint
+// writer EOS was set), timelineComplete / totalFramesPushed (worker mirror,
+// copied under the TU-local mutex) and eosDrained, which is true exactly
+// when the joint EOS is published, the worker completed the whole
+// expected timeline, and this reader has popped every pushed frame (ring
+// empty). Purely additive keys; no owner/worker role, no ring, no clock
+// and no command behavior changes.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_readAsyncRuntimeQueueMultiSourceRealtimeClockOutputPcm16(
@@ -1663,7 +1673,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     jobject pcmBufferJ,
     jint maxFrames) {
 
-    char status[640];
+    char status[768];
 
     auto replyReject = [&](const char* token) -> jstring {
         std::snprintf(status, sizeof(status),
@@ -1719,21 +1729,46 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     }
     session->totalOutputFramesRead += framesRead;
 
+    // Y18b EOS observation for a ring-fed sink consumer (see the entry
+    // point comment). The worker mirror is copied under the TU-local mutex
+    // exactly like the snapshot entry point does; the ring facts are read
+    // after the pop above on this consumer thread.
+    const bool eosPublished = session->eosPublished.load(std::memory_order_acquire);
+    bool    timelineComplete  = false;
+    int64_t totalFramesPushed = 0;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex_);
+        timelineComplete  = session->published_.timelineComplete;
+        totalFramesPushed = session->published_.totalFramesPushed;
+    }
+    const int64_t outputAvailableAfterRead = session->outputRing.availableReadFrames();
+    const bool eosDrained = eosPublished && timelineComplete &&
+                            totalFramesPushed == session->expectedFrames &&
+                            session->totalOutputFramesRead == totalFramesPushed &&
+                            outputAvailableAfterRead == 0;
+
     std::snprintf(status, sizeof(status),
         "status=ok;framesRequested=%d;framesRead=%lld;bytesRead=%lld;"
         "channelCount=%d;outputAvailableReadFrames=%lld;"
         "nativeOutputReadChecksumHex=%016llx;totalOutputFramesRead=%lld;"
-        "seekAckConsumed=%s;discardedFramesOnSeek=%lld;newStartFrame=%lld",
+        "seekAckConsumed=%s;discardedFramesOnSeek=%lld;newStartFrame=%lld;"
+        "eosPublished=%s;timelineComplete=%s;totalFramesPushed=%lld;"
+        "expectedFrameCount=%lld;eosDrained=%s",
         static_cast<int>(maxFrames),
         static_cast<long long>(framesRead),
         static_cast<long long>(framesRead * bytesPerFrame),
         static_cast<int>(session->channelCount),
-        static_cast<long long>(session->outputRing.availableReadFrames()),
+        static_cast<long long>(outputAvailableAfterRead),
         static_cast<unsigned long long>(session->nativeOutputReadChecksum),
         static_cast<long long>(session->totalOutputFramesRead),
         seekAckConsumed ? "true" : "false",
         static_cast<long long>(discardedFramesOnSeek),
-        static_cast<long long>(newStartFrame));
+        static_cast<long long>(newStartFrame),
+        eosPublished ? "true" : "false",
+        timelineComplete ? "true" : "false",
+        static_cast<long long>(totalFramesPushed),
+        static_cast<long long>(session->expectedFrames),
+        eosDrained ? "true" : "false");
     return env->NewStringUTF(status);
 }
 

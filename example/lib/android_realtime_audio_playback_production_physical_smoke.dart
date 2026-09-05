@@ -344,6 +344,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [LANE] clockAuthorityUnchangedOk: ${activeReport.clockAuthorityUnchangedOk}',
     );
+    print('  [LANE] ringFrameSourceOk: ${activeReport.ringFrameSourceOk}');
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -371,6 +372,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED';
     const presentationClockQuerySurfaceScenarioKey =
         'SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE';
+    const ringFrameSourceScenarioKey = 'SCENARIO_RING_FRAME_SOURCE_TO_EOS';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -408,6 +410,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final presentationClockQuerySurfaceMetrics = asStringKeyedMap(
       topMetrics[presentationClockQuerySurfaceScenarioKey],
+    );
+    final ringFrameSourceMetrics = asStringKeyedMap(
+      topMetrics[ringFrameSourceScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -1165,6 +1170,52 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       presentationClockCompactKeys,
     );
 
+    const ringFrameSourceCompactKeys = <String>[
+      'ringSampleRate',
+      'ringChannelCount',
+      'ringMaxFramesPerMix',
+      'ringExpectedFrames',
+      'ringSourceRingCapacityFrames',
+      'ringOutputRingCapacityFrames',
+      'ringFrameSourceUsed',
+      'stateMachineSourceUsed',
+      'sinkReadyBeforeTransportStart',
+      'drainAllowedAfterTransportStart',
+      'sinkExited',
+      'sinkJoined',
+      'ringClosed',
+      'sinkFramesReadFromTransport',
+      'sinkFramesWrittenToSink',
+      'sinkEosDrainedObserved',
+      'sinkChecksumHex',
+      'ringFramesReadBySink',
+      'ringTotalOutputFramesRead',
+      'ringNativeOutputReadChecksumHex',
+      'ringKotlinReferenceMixChecksumHex',
+      'ringEosSetWithoutDrain',
+      'ringEosDrainedObservedByRing',
+      'ringTotalFramesPushedAtEos',
+      'ringLaneRouteOk',
+      'ringLaneSinkLifecycleOk',
+      'ringLaneThreadOk',
+      'ringLaneRingDrainOk',
+      'ringLaneFrameAccountingOk',
+      'ringLaneEosOk',
+      'ringLaneChecksumOk',
+      'ringLaneRingCloseOk',
+      'ringLaneNativeOk',
+      'ringLaneNoSeekPauseResumeOk',
+      'ringLaneNoFeedbackOk',
+      'ringLaneProofBoundaryOk',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRingFrameSource = extractCompactScenario(
+      ringFrameSourceMetrics,
+      ringFrameSourceCompactKeys,
+    );
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -1471,6 +1522,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [SCENARIO] $presentationClockQuerySurfaceScenarioKey: $compactPresentationClock',
     );
+    print('  [SCENARIO] $ringFrameSourceScenarioKey: $compactRingFrameSource');
 
     // 5. Verification evaluation.
     final pass =
@@ -1495,13 +1547,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       routeDisconnectFocusGainBlockedScenarioKey:
           compactRouteDisconnectFocusGainBlocked,
       presentationClockQuerySurfaceScenarioKey: compactPresentationClock,
+      ringFrameSourceScenarioKey: compactRingFrameSource,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK',
-      'subSlice': 'Y17',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF',
+      'subSlice': 'Y18b',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
