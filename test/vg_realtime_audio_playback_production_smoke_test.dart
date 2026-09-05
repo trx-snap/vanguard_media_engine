@@ -13,7 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -57,6 +57,19 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'repeatedSeekCommandOk': true,
     'repeatedSeekCumulativeAccountingOk': true,
     'repeatedSeekThirdRejectOk': true,
+    'backwardSeekAdmissionOk': true,
+    'backwardSeekQuiesceAccountingOk': true,
+    'backwardSinkFlushAtSeekOk': true,
+    'backwardSeekCommandOk': true,
+    'backwardDecoderReanchorOk': true,
+    'backwardStaleGenerationRejectedOk': true,
+    'backwardSeekClockEpochRebaseOk': true,
+    'backwardPositionQueryRebaseOk': true,
+    'backwardDriftSampleBoundedOk': true,
+    'backwardClockCorrelationOk': true,
+    'backwardPostSeekFrameAccountingOk': true,
+    'backwardSeekRepeatedRejectOk': true,
+    'backwardNoFeedbackOk': true,
     'focusSetupOk': true,
     'focusDuckRestoreOk': true,
     'focusTransientPauseResumeOk': true,
@@ -161,6 +174,14 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'decoderStaleProbeRejected': true,
     'expectedTotalFrames': 84864,
     'postSeekExpectedFrames': 48000,
+    'seekBackward': true,
+    'seekDeclaredBackward': true,
+    'sinkClockDeclaredBackwardOpenCalls': 1,
+    'sinkSeekDeclaredBackward': true,
+    'seekClockDeclaredBackwardBaseCountAfterUnpark': 1,
+    'seekClockLastDeclaredBackwardFramesAfterUnpark': 4096,
+    'decoderMaxPreTargetDiscardFrames': 2048,
+    'decoderSeekBackward': true,
     'coordinatorThreadId': 100,
     'preRollFrames': 4096,
     'pauseHoldObservedMs': 402,
@@ -372,11 +393,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(60),
+        equals(73),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(61),
+        equals(74),
       );
 
       final expectedLanes = <String>[
@@ -411,6 +432,19 @@ void main() {
         'repeatedSeekCommandOk',
         'repeatedSeekCumulativeAccountingOk',
         'repeatedSeekThirdRejectOk',
+        'backwardSeekAdmissionOk',
+        'backwardSeekQuiesceAccountingOk',
+        'backwardSinkFlushAtSeekOk',
+        'backwardSeekCommandOk',
+        'backwardDecoderReanchorOk',
+        'backwardStaleGenerationRejectedOk',
+        'backwardSeekClockEpochRebaseOk',
+        'backwardPositionQueryRebaseOk',
+        'backwardDriftSampleBoundedOk',
+        'backwardClockCorrelationOk',
+        'backwardPostSeekFrameAccountingOk',
+        'backwardSeekRepeatedRejectOk',
+        'backwardNoFeedbackOk',
         'focusSetupOk',
         'focusDuckRestoreOk',
         'focusTransientPauseResumeOk',
@@ -825,6 +859,44 @@ void main() {
         'repeatedSeekCommandOk',
         'repeatedSeekCumulativeAccountingOk',
         'repeatedSeekThirdRejectOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test('missing one new required Y17 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'backwardSeekAdmissionOk',
+        'backwardSeekQuiesceAccountingOk',
+        'backwardSinkFlushAtSeekOk',
+        'backwardSeekCommandOk',
+        'backwardDecoderReanchorOk',
+        'backwardStaleGenerationRejectedOk',
+        'backwardSeekClockEpochRebaseOk',
+        'backwardPositionQueryRebaseOk',
+        'backwardDriftSampleBoundedOk',
+        'backwardClockCorrelationOk',
+        'backwardPostSeekFrameAccountingOk',
+        'backwardSeekRepeatedRejectOk',
+        'backwardNoFeedbackOk',
       ]) {
         final raw = _createSampleRawMap();
         final lanes = Map<String, Object?>.from(raw['lanes'] as Map);

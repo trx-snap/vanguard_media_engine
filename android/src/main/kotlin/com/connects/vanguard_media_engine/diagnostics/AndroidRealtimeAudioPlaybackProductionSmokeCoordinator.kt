@@ -21,13 +21,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
- * P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16):
+ * P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16) +
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK (Y17):
  * production-component diagnostic smoke coordinator.
  *
  * Owns the [METHOD_NAME] MethodChannel route only. It drives the PRODUCTION
  * [VanguardRealtimeAudioPlaybackSession] (real MediaExtractor/MediaCodec ->
  * Y5a external ingest -> Y1 transport -> sink-thread-owned non-zero-gain
- * AudioTrack + presentation clock) through ten scenarios on a worker
+ * AudioTrack + presentation clock) through twelve scenarios on a worker
  * thread, evaluates proof lanes from the session's snapshots, posts the
  * payload on the main handler and logs the START / JSON / PASS / FAIL
  * markers. Every lifecycle decision lives in the session; this class only
@@ -57,39 +58,40 @@ import java.util.concurrent.atomic.AtomicBoolean
  * stop/dispose, and evaluates lanes.
  * Seek metric flattening lives in [AndroidRealtimeAudioPlaybackProductionSeekMetrics].
  *
- * Scenario 6 (Y11b) starts a focus-enabled session (duckGain default 0.1f):
+ * Scenario 6 (Y17) arms the session's ONE backward mid-stream seek while paused
+ * to [SmokeConfig.backwardSeekTargetSec] with seekBackward=true: snapshots armed seek,
+ * requires arm.armed/admissionOk/holdPinned/arm.backward=true and target >= 0 and
+ * target < holdFrame, calls session.seek(arm.targetFrame), requires accepted PLAYING,
+ * captures currentPositionFrames/currentPositionUs and after-seek snapshot, attempts
+ * a second backward seek and verifies rejection with reason seek_repeated while PLAYING,
+ * awaits EOS, stop, dispose twice, and evaluates common + backward lanes.
+ *
+ * Scenario 7 (Y11b) starts a focus-enabled session (duckGain default 0.1f):
  * proves transient duck gain change, full gain restore, transient loss pause,
  * user-intent-gated auto-resume on gain, becoming-noisy terminal pause, and
  * verified rejection of auto-resume after noisy loss.
  *
- * Scenario 7 (Y11b) starts a focus-enabled session: proves permanent loss pause
+ * Scenario 8 (Y11b) starts a focus-enabled session: proves permanent loss pause
  * and verified rejection of auto-resume on subsequent gain.
  *
- * Scenario 8 (Y12) starts a fresh routing- and focus-enabled session: proves
+ * Scenario 9 (Y12) starts a fresh routing- and focus-enabled session: proves
  * observation of route change without transport mutation using a monotonic
  * baseline increase on routeChangedAppliedCount (robust to real OS
  * ROUTE_CHANGED callbacks racing the synthetic one), then stops/disposes.
  * This scenario never posts a disconnect, so it carries its own independent
- * [SmokeConfig.deadlineMs] budget separate from Scenario 9's.
+ * [SmokeConfig.deadlineMs] budget separate from Scenario 10's.
  *
- * Scenario 9 (Y12) starts a second fresh routing- and focus-enabled session:
+ * Scenario 10 (Y12) starts a second fresh routing- and focus-enabled session:
  * proves terminal fail-closed pause on route disconnect (from PLAYING) with
  * AudioTrack paused at park and routeDisconnectAppliedCount increased by a
  * monotonic baseline, rejection of public resume, and routing teardown. It
  * carries its own independent [SmokeConfig.deadlineMs] budget separate from
- * Scenario 8's, so a slow/racy route-change observation can never starve the
+ * Scenario 9's, so a slow/racy route-change observation can never starve the
  * disconnect proof (or vice versa).
  *
- * Scenario 10 (Y12) starts a routing- and focus-enabled session: proves route
+ * Scenario 11 (Y12) starts a routing- and focus-enabled session: proves route
  * disconnect while paused by focus policy blocks focus auto-resume on
- * subsequent focus gain and continues to reject public resume. Because the
- * session is already PAUSED when the disconnect lands, the native session
- * never attempts the bounded-pause path that bumps routeDisconnectAppliedCount
- * (session code only bumps it from PLAYING), so this scenario proves the
- * disconnect landed via the sticky routingTerminalDisconnect flag transition
- * rather than a count delta or a snapshot of lastEventTag/lastAction, which
- * are last-writer-wins fields a later real OS ROUTE_CHANGED callback can
- * overwrite before the polling loop observes them.
+ * subsequent focus gain and continues to reject public resume.
  */
 class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private val context: Context,
@@ -114,6 +116,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "audiotrack_flush_once_on_sink_thread_before_transport_seek_" +
                 "seek_clock_epoch_based_at_target_deliberate_discontinuity_" +
                 "stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_" +
+                "one_backward_seek_while_paused_declared_to_decoder_sink_clock_" +
                 "production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_" +
                 "sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_" +
                 "noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_" +
@@ -136,6 +139,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_DEAD_OBJECT_RECOVERY = "SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS"
         const val SCENARIO_FORWARD_SEEK = "SCENARIO_FORWARD_SEEK_TO_EOS"
         const val SCENARIO_REPEATED_FORWARD_SEEK = "SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS"
+        const val SCENARIO_BACKWARD_SEEK_TO_EOS = "SCENARIO_BACKWARD_SEEK_TO_EOS"
         const val SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY = "SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY"
         const val SCENARIO_FOCUS_PERMANENT_LOSS = "SCENARIO_FOCUS_PERMANENT_LOSS"
         const val SCENARIO_ROUTE_CHANGE_OBSERVATION = "SCENARIO_ROUTE_CHANGE_OBSERVATION"
@@ -149,6 +153,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // hold frame is preSeekHoldWindows windows past the pre-roll.
         const val DEFAULT_SEEK_TARGET_SEC = 1.0
         const val DEFAULT_SECOND_SEEK_TARGET_SEC = 2.0
+        const val DEFAULT_BACKWARD_SEEK_TARGET_SEC = 0.0
         const val DEFAULT_PRE_SEEK_HOLD_WINDOWS = VanguardRealtimeAudioPlaybackSession.DEFAULT_PRE_SEEK_HOLD_WINDOWS
         // Frames written before the ONE synthetic dead object is armed
         // (~186 ms at 44.1 kHz); must stay below the clip's declared frames.
@@ -196,6 +201,20 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_REPEATED_SEEK_COMMAND = "repeatedSeekCommandOk"
         const val LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING = "repeatedSeekCumulativeAccountingOk"
         const val LANE_REPEATED_SEEK_THIRD_REJECT = "repeatedSeekThirdRejectOk"
+        // Y17 lanes, evaluated by the backward-seek scenario only.
+        const val LANE_BACKWARD_SEEK_ADMISSION = "backwardSeekAdmissionOk"
+        const val LANE_BACKWARD_SEEK_QUIESCE_ACCOUNTING = "backwardSeekQuiesceAccountingOk"
+        const val LANE_BACKWARD_SINK_FLUSH_AT_SEEK = "backwardSinkFlushAtSeekOk"
+        const val LANE_BACKWARD_SEEK_COMMAND = "backwardSeekCommandOk"
+        const val LANE_BACKWARD_DECODER_REANCHOR = "backwardDecoderReanchorOk"
+        const val LANE_BACKWARD_STALE_GENERATION_REJECTED = "backwardStaleGenerationRejectedOk"
+        const val LANE_BACKWARD_SEEK_CLOCK_EPOCH_REBASE = "backwardSeekClockEpochRebaseOk"
+        const val LANE_BACKWARD_POSITION_QUERY_REBASE = "backwardPositionQueryRebaseOk"
+        const val LANE_BACKWARD_DRIFT_SAMPLE_BOUNDED = "backwardDriftSampleBoundedOk"
+        const val LANE_BACKWARD_CLOCK_CORRELATION = "backwardClockCorrelationOk"
+        const val LANE_BACKWARD_POST_SEEK_FRAME_ACCOUNTING = "backwardPostSeekFrameAccountingOk"
+        const val LANE_BACKWARD_SEEK_REPEATED_REJECT = "backwardSeekRepeatedRejectOk"
+        const val LANE_BACKWARD_NO_FEEDBACK = "backwardNoFeedbackOk"
         // Y11b lanes, evaluated by the focus-response scenarios.
         const val LANE_FOCUS_SETUP = "focusSetupOk"
         const val LANE_FOCUS_DUCK_RESTORE = "focusDuckRestoreOk"
@@ -245,6 +264,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_DECODER_SEEK_REANCHOR, LANE_STALE_GENERATION_REJECTED, LANE_SEEK_CLOCK_EPOCH,
             LANE_POST_SEEK_DRAIN,
             LANE_REPEATED_SEEK_COMMAND, LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING, LANE_REPEATED_SEEK_THIRD_REJECT,
+            LANE_BACKWARD_SEEK_ADMISSION, LANE_BACKWARD_SEEK_QUIESCE_ACCOUNTING,
+            LANE_BACKWARD_SINK_FLUSH_AT_SEEK, LANE_BACKWARD_SEEK_COMMAND,
+            LANE_BACKWARD_DECODER_REANCHOR, LANE_BACKWARD_STALE_GENERATION_REJECTED,
+            LANE_BACKWARD_SEEK_CLOCK_EPOCH_REBASE, LANE_BACKWARD_POSITION_QUERY_REBASE,
+            LANE_BACKWARD_DRIFT_SAMPLE_BOUNDED, LANE_BACKWARD_CLOCK_CORRELATION,
+            LANE_BACKWARD_POST_SEEK_FRAME_ACCOUNTING, LANE_BACKWARD_SEEK_REPEATED_REJECT,
+            LANE_BACKWARD_NO_FEEDBACK,
             LANE_FOCUS_SETUP, LANE_FOCUS_DUCK_RESTORE, LANE_FOCUS_TRANSIENT_PAUSE_RESUME,
             LANE_FOCUS_NOISY_TERMINAL_PAUSE, LANE_FOCUS_PERMANENT_LOSS_PAUSE, LANE_FOCUS_MONITOR_TEARDOWN,
             LANE_ROUTING_SETUP, LANE_ROUTE_CHANGE_OBSERVATION, LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE,
@@ -274,6 +300,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "audiotrack_flush_once_on_sink_thread_before_transport_seek",
             "seek_clock_epoch_based_at_target_deliberate_discontinuity",
             "stale_generation_rejected_before_jni", "two_ordered_forward_seeks_and_third_rejected_without_teardown",
+            "one_backward_seek_while_paused_declared_to_decoder_sink_clock",
             "production_focus_response", "focus_monitor_single_consumer", "audiomanager_focus_request",
             "becoming_noisy_receiver", "sink_thread_gain_duck_restore_request_ack",
             "transient_pause_auto_resume_user_intent_gated", "noisy_terminal_pause_no_auto_resume",
@@ -353,6 +380,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 ?: DEFAULT_DEAD_OBJECT_INJECT_AFTER_FRAMES,
             seekTargetSec = (args["seekTargetSec"] as? Number)?.toDouble() ?: DEFAULT_SEEK_TARGET_SEC,
             secondSeekTargetSec = (args["secondSeekTargetSec"] as? Number)?.toDouble() ?: DEFAULT_SECOND_SEEK_TARGET_SEC,
+            seekBackward = (args["seekBackward"] as? Boolean) ?: false,
+            backwardSeekTargetSec = (args["backwardSeekTargetSec"] as? Number)?.toDouble() ?: DEFAULT_BACKWARD_SEEK_TARGET_SEC,
             preSeekHoldWindows = (args["preSeekHoldWindows"] as? Number)?.toInt() ?: DEFAULT_PRE_SEEK_HOLD_WINDOWS,
             maxSeekHoldMs = (args["maxSeekHoldMs"] as? Number)?.toLong()
                 ?: VanguardRealtimeAudioPlaybackSession.DEFAULT_MAX_SEEK_HOLD_MS,
@@ -409,7 +438,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxSeekHoldMs" to config.maxSeekHoldMs,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(11)
+        val outcomes = ArrayList<ScenarioOutcome>(12)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
@@ -464,6 +493,17 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             secondSeekTargetSec = config.secondSeekTargetSec,
         ) { session, outcome ->
             repeatedForwardSeekScenario(session, config, outcome)
+        }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y17: the ONE backward seek to T is armed for this scenario only (dead-object seam off).
+        outcomes += runScenario(
+            SCENARIO_BACKWARD_SEEK_TO_EOS,
+            config,
+            injectAfterFrames = 0L,
+            seekTargetSec = config.backwardSeekTargetSec,
+            seekBackward = true,
+        ) { session, outcome ->
+            backwardSeekScenario(session, config, outcome)
         }
         if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
         // Y11b: focus duck / transient pause / auto-resume / noisy terminal pause (seams off).
@@ -544,6 +584,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         injectAfterFrames: Long,
         seekTargetSec: Double = 0.0,
         secondSeekTargetSec: Double = 0.0,
+        seekBackward: Boolean = false,
         enableAudioFocusResponse: Boolean = false,
         duckGain: Float = DEFAULT_DUCK_GAIN,
         enableAudioRoutingResponse: Boolean = false,
@@ -562,6 +603,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 syntheticDeadObjectInjectAfterFrames = injectAfterFrames,
                 seekTargetSec = seekTargetSec,
                 secondSeekTargetSec = secondSeekTargetSec,
+                seekBackward = seekBackward,
                 preSeekHoldWindows = config.preSeekHoldWindows,
                 maxSeekHoldMs = config.maxSeekHoldMs,
                 context = if (enableAudioFocusResponse) context else null,
@@ -574,6 +616,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         outcome.metrics["deadObjectInjectAfterFrames"] = injectAfterFrames
         outcome.metrics["seekTargetSecArmed"] = seekTargetSec
         outcome.metrics["secondSeekTargetSecArmed"] = secondSeekTargetSec
+        outcome.metrics["seekBackwardArmed"] = seekBackward
         outcome.metrics["enableAudioFocusResponse"] = enableAudioFocusResponse
         outcome.metrics["duckGainArmed"] = duckGain.toDouble()
         outcome.metrics["enableAudioRoutingResponse"] = enableAudioRoutingResponse
@@ -911,7 +954,70 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         )
     }
 
-    // ── Scenario 6 (Y11b): focus duck -> gain restore -> transient pause ->
+    // ── Scenario 6 (Y17): load/start (backward seek armed) -> ONE backward
+    //    seek to T executed by the session -> second seek(T) rejected
+    //    (seek_repeated) -> EOS ───────────────────────────────────────────
+
+    private fun backwardSeekScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
+        startAndAwaitAudio(session)
+        var armedSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterRepeatedSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterSeekFrames = -1L
+        var afterSeekUs = -1L
+        var completionReached = false
+
+        val pollerMetrics = runWithPositionPoller(session, "Y14BackwardSeekPositionPoller") {
+            val armed = session.snapshot()
+            armedSnap = armed
+            val arm = armed.seek
+            require(
+                arm.armed && arm.admissionOk && arm.holdPinned && arm.backward && arm.targetFrame >= 0L && arm.targetFrame < arm.holdFrame,
+                "backward_seek_not_armed:${arm.armed}:${arm.admissionOk}:${arm.holdPinned}:${arm.backward}:${arm.targetFrame}:${arm.holdFrame}",
+            )
+            val seekRes = session.seek(arm.targetFrame)
+            require(seekRes.accepted && seekRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "backward_seek_rejected:${seekRes.reason}")
+            afterSeekFrames = session.currentPositionFrames()
+            afterSeekUs = session.currentPositionUs()
+            val afterSeek = session.snapshot()
+            afterSeekSnap = afterSeek
+            require(afterSeek.failureReason.isBlank(), "failure_after_backward_seek:${afterSeek.failureReason}")
+
+            // ONE backward seek is the proof lane; a second attempt at the
+            // same target must be rejected without teardown or mutation.
+            val repeatedRes = session.seek(arm.targetFrame)
+            require(
+                !repeatedRes.accepted && repeatedRes.reason == "seek_repeated" && repeatedRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING,
+                "repeated_backward_seek_not_rejected:${repeatedRes.accepted}:${repeatedRes.reason}:${repeatedRes.state}",
+            )
+            val afterRepeated = session.snapshot()
+            afterRepeatedSnap = afterRepeated
+            require(afterRepeated.failureReason.isBlank(), "failure_after_repeated_backward_seek:${afterRepeated.failureReason}")
+            require(
+                afterRepeated.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING,
+                "state_mutated_after_repeated_backward_seek:${afterRepeated.state}",
+            )
+
+            completionReached = session.awaitCompletion(config.deadlineMs)
+        }
+        require(completionReached, "completion_not_reached:${session.failureReason}")
+        val armed = armedSnap ?: throw FailClosed("armed_missing")
+        val afterSeek = afterSeekSnap ?: throw FailClosed("after_seek_missing")
+        val afterRepeated = afterRepeatedSnap ?: throw FailClosed("after_repeated_missing")
+        val stateAtCompletion = session.currentState
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, Thread.currentThread().id)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateBackwardSeek(
+            final, armed, afterSeek, afterRepeated, stateAtCompletion, config, out,
+            afterSeekFrames, afterSeekUs, pollerMetrics,
+        )
+    }
+
+    // ── Scenario 7 (Y11b): focus duck -> gain restore -> transient pause ->
     //    auto-resume -> noisy terminal pause -> ignored gain ─────────────
 
     private fun focusDuckTransientNoisyScenario(
@@ -1005,7 +1111,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         )
     }
 
-    // ── Scenario 7 (Y11b): permanent focus loss -> no auto-resume on gain ───
+    // ── Scenario 8 (Y11b): permanent focus loss -> no auto-resume on gain ───
 
     private fun focusPermanentLossScenario(
         session: VanguardRealtimeAudioPlaybackSession,
@@ -1075,7 +1181,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         throw FailClosed(timeoutReason)
     }
 
-    // ── Scenario 8 (Y12): route change observation only, independently bounded ─────────
+    // ── Scenario 9 (Y12): route change observation only, independently bounded ─────────
     //    Never posts a disconnect, so it cannot starve (or be starved by) the terminal
     //    pause proof's own deadline budget in Scenario 9.
 
@@ -1124,7 +1230,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         )
     }
 
-    // ── Scenario 9 (Y12): route disconnect terminal pause -> public resume rejected ->
+    // ── Scenario 10 (Y12): route disconnect terminal pause -> public resume rejected ->
     //    routing teardown, independently bounded ─────────────────────────────────────
 
     private fun routeDisconnectTerminalPauseScenario(
@@ -1191,7 +1297,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         )
     }
 
-    // ── Scenario 10 (Y12): route disconnect while paused by focus policy ->
+    // ── Scenario 11 (Y12): route disconnect while paused by focus policy ->
     //    focus auto-resume blocked -> public resume rejected ────────────────────────────
 
     private fun routeDisconnectFocusGainBlockedScenario(
@@ -1776,7 +1882,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

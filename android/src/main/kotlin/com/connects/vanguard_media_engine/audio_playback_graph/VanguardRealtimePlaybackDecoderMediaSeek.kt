@@ -19,8 +19,21 @@ class VanguardRealtimePlaybackDecoderMediaSeek(private val sourcePath: String) {
     class FailClosed(val reason: String) : Exception(reason)
 
     // Re-seats `extractor` at `targetUs` (PREVIOUS_SYNC); landed sample time, or -1 on EOS landing.
+    //
+    // Y17 frame-zero backward seek: for a non-positive target some
+    // extractors (observed on Samsung SM-A566B / Android 16) answer a
+    // PREVIOUS_SYNC seek at 0 with an EOS landing (-1) even on a freshly
+    // reopened track, because no sync sample precedes the first sample.
+    // In that one case the seat falls back to a start-of-track NEXT_SYNC
+    // seek at 0 so the extractor lands on the first audio sample. Positive
+    // targets keep the exact PREVIOUS_SYNC behavior and their EOS landing
+    // still surfaces as -1 so the feed's reopen/fail-closed policy is
+    // unchanged for them.
     fun seatExtractor(extractor: MediaExtractor, targetUs: Long): Long {
         extractor.seekTo(targetUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        val landedUs = extractor.sampleTime
+        if (landedUs >= 0L || targetUs > 0L) return landedUs
+        extractor.seekTo(0L, MediaExtractor.SEEK_TO_NEXT_SYNC)
         return extractor.sampleTime
     }
 

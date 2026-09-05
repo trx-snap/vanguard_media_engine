@@ -4,8 +4,8 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeA
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkTelemetry
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession
 
-// Y9 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK) + Y10b repeated-seek metric mapping
-// of the production smoke: flattens the session's seek observation (with the decoder
+// Y9 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK) + Y10b repeated-seek + Y17 backward-seek
+// metric mapping of the production smoke: flattens the session's seek observation (with the decoder
 // seek telemetry it carries) and the sink's seek park / flush / seek-epoch
 // telemetry into a scenario metric map. Pure key mapping: lane logic lives in
 // [AndroidRealtimeAudioPlaybackProductionLaneEvaluator], sequencing in
@@ -39,6 +39,8 @@ object AndroidRealtimeAudioPlaybackProductionSeekMetrics {
         m["sinkEpochRawOriginAtUnpark"] = k.epochRawOriginAtUnpark
         m["playbackHeadAtSeekUnpark"] = k.playbackHeadAtSeekUnpark
         m["sinkPostSeekFramesWritten"] = k.postSeekFramesWritten
+        m["sinkClockDeclaredBackwardOpenCalls"] = k.clockDeclaredBackwardOpenCalls
+        m["sinkSeekDeclaredBackward"] = k.seekDeclaredBackward
     }
 
     fun putSessionSeekMetrics(m: LinkedHashMap<String, Any?>, q: VanguardRealtimeAudioPlaybackSeekObservation) {
@@ -47,6 +49,8 @@ object AndroidRealtimeAudioPlaybackProductionSeekMetrics {
         m["preSeekHoldFrame"] = q.holdFrame
         m["seekAdmissionOk"] = q.admissionOk
         m["seekHoldPinned"] = q.holdPinned
+        m["seekBackward"] = q.backward
+        m["seekDeclaredBackward"] = q.declaredBackward
         m["seekCount"] = q.seekCount
         m["seekAccepted"] = q.seekAccepted
         m["seekStaleGeneration"] = q.staleGeneration
@@ -98,6 +102,8 @@ object AndroidRealtimeAudioPlaybackProductionSeekMetrics {
             m["seekClockBaseClampCountAfterUnpark"] = it.baseClampCount
             m["seekClockBaseAdvanceCountAfterUnpark"] = it.baseAdvanceCount
             m["seekClockLastBaseAdvanceFramesAfterUnpark"] = it.lastBaseAdvanceFrames
+            m["seekClockDeclaredBackwardBaseCountAfterUnpark"] = it.declaredBackwardBaseCount
+            m["seekClockLastDeclaredBackwardFramesAfterUnpark"] = it.lastDeclaredBackwardFrames
             m["seekClockProvenanceAfterUnpark"] = it.provenance.name
         }
         val d = q.decoder ?: return
@@ -133,6 +139,8 @@ object AndroidRealtimeAudioPlaybackProductionSeekMetrics {
         m["decoderGapPaddedFrames"] = d.gapPaddedFrames
         m["decoderMaxSeekGapFrames"] = d.maxSeekGapFrames
         m["decoderDiscardedPreTargetFrames"] = d.discardedPreTargetFrames
+        m["decoderMaxPreTargetDiscardFrames"] = d.maxPreTargetDiscardFrames
+        m["decoderSeekBackward"] = d.seekBackward
         m["decoderDiscardedFrames"] = d.discardedFrames
         m["decoderTruncatedFrames"] = d.truncatedFrames
         m["decoderStaleGenerationRetries"] = d.staleGenerationRetries

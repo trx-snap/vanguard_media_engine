@@ -92,6 +92,19 @@ import java.util.concurrent.atomic.AtomicReference
 // completion or its OWN post-seek pre-roll; the post-seek pre-roll counter
 // resets to zero at every re-anchor so a second seek proves its own paused
 // pre-roll instead of inheriting the first seek's already-accumulated frames.
+//
+// Y17 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK), additive: a
+// [VanguardRealtimePlaybackDecoderSeekRequest] may declare itself `backward`
+// (0 <= T < H, the run's final seek). The re-anchor runs the SAME decode-
+// thread sequence (extractor SEEK_TO_PREVIOUS_SYNC at T, codec flush, EOS
+// flags reset, PTS-origin timeline, anchor/generation re-pinned, stale probe
+// rejected before JNI); only the target-direction validation is direction-
+// aware. Pre-target decoded PCM (the PREVIOUS_SYNC landing before T) is
+// discarded through the existing alignment path under an explicit per-seek
+// budget, [MAX_PRE_TARGET_DISCARD_SEC]: exceeding it fails closed for every
+// seek direction (a forward seek's landing is always within one sync
+// interval of T, far below the budget). Whole-run frame accounting stays
+// H + (declared - T).
 class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
 
     data class Config(
@@ -130,6 +143,9 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         const val HARD_MAX_DURATION_SEC = 20.0
         // Y9: max post-seek decoded-start gap that is silence-padded, not failed (Y5b).
         const val MAX_SEEK_GAP_SEC = 0.25
+        // Y17: per-seek fail-closed budget on pre-target decoded frames discarded
+        // after a PREVIOUS_SYNC landing (class comment).
+        const val MAX_PRE_TARGET_DISCARD_SEC = 1.0
         const val MAX_EOS_DRIFT_SEC = 1.0
         private const val MAX_INGEST_FRAMES = VanguardRealtimePlaybackNativeSession.MAX_INGEST_FRAMES
         private const val DEQUEUE_TIMEOUT_US = 10_000L
@@ -334,8 +350,12 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         private set
     @Volatile var discardedPreTargetFrames: Long = 0L
         private set
+    // Y17: direction of the last completed reanchor (false = forward / none).
+    @Volatile var seekBackward: Boolean = false
+        private set
 
     val maxSeekGapFrames: Long get() = (MAX_SEEK_GAP_SEC * (format?.sampleRate ?: 0)).toLong()
+    val maxPreTargetDiscardFrames: Long get() = (MAX_PRE_TARGET_DISCARD_SEC * (format?.sampleRate ?: 0)).toLong()
 
     // Real (non-padded) post-seek decoded frames accepted by native.
     val postSeekDecodedAcceptedFrames: Long
@@ -543,6 +563,8 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         paddedFrames = paddedFrames,
         staleGenerationRetries = staleGenerationRetries,
         transientRejects = transientRejects,
+        seekBackward = seekBackward,
+        maxPreTargetDiscardFrames = maxPreTargetDiscardFrames,
     )
 
     // ── Decode thread body ─────────────────────────────────────────────────
@@ -896,13 +918,22 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     // Executes the seek request while held at H: anchor and pinned generation
     // move to the post-seek values, the decoder re-seeks, then one deliberately
     // stale post is proven rejected before JNI. Never touches JNI itself.
+    // Y17: the target must lie on the side of the anchor the request declared
+    // (forward: H < T; backward: 0 <= T < H) and a backward request is always
+    // the run's final seek; everything after the validation is direction-agnostic.
     private fun performReanchor(req: VanguardRealtimePlaybackDecoderSeekRequest, sm: VanguardRealtimePlaybackTransportStateMachine) {
         val startMs = SystemClock.elapsedRealtime()
         reanchorExecutedOnDecodeThread = Thread.currentThread().id == threadId
         reanchorTransportStatePaused = sm.currentState == State.PAUSED
         if (!reanchorTransportStatePaused) throw FailClosed("reanchor_transport_not_paused:${sm.currentState.name.lowercase()}")
         if (anchor != req.preSeekAnchorFrame) throw FailClosed("reanchor_anchor_mismatch:$anchor:${req.preSeekAnchorFrame}")
-        if (req.targetFrame <= anchor || req.targetFrame >= declaredFrameCount) {
+        if (req.targetFrame < 0L || req.targetFrame >= declaredFrameCount) {
+            throw FailClosed("reanchor_target_invalid:${req.targetFrame}:$anchor:$declaredFrameCount")
+        }
+        if (req.backward) {
+            if (req.targetFrame >= anchor) throw FailClosed("reanchor_backward_target_not_below_anchor:${req.targetFrame}:$anchor")
+            if (req.nextHoldFrame != Long.MAX_VALUE) throw FailClosed("reanchor_backward_next_hold_unsupported:${req.nextHoldFrame}")
+        } else if (req.targetFrame <= anchor) {
             throw FailClosed("reanchor_target_invalid:${req.targetFrame}:$anchor:$declaredFrameCount")
         }
         if (req.newGeneration == req.staleGeneration) throw FailClosed("reanchor_generation_not_advanced")
@@ -921,6 +952,7 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         // Long.MAX_VALUE (no further hold) when `req` is the run's final seek.
         holdLimitFrame = req.nextHoldFrame
         heldAtHoldFrame = false
+        seekBackward = req.backward
         seekTargetFrame = req.targetFrame
         seekTargetUs = (req.targetFrame * 1_000_000L + sampleRate - 1) / sampleRate
         seekLandedUs = reseekDecoder(seekTargetUs)
@@ -1057,7 +1089,9 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     // Aligns the staged chunk with the anchor. Stream-start origin: a gap fails
     // closed, an early start is dropped. Y9 PTS origin: a gap <= MAX_SEEK_GAP_SEC
     // stays staged for [feedStep] to pad, a larger one fails closed; pre-target
-    // PCM is discarded.
+    // PCM is discarded, Y17: under the explicit per-seek budget
+    // [MAX_PRE_TARGET_DISCARD_SEC] (discardedPreTargetFrames resets at every
+    // re-anchor), exceeding it fails closed.
     private fun alignStagedToAnchor() {
         if (stagedFrames <= 0) return
         val start = stagedStartFrame
@@ -1072,7 +1106,15 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         }
         if (start < anchor) {
             val drop = minOf(anchor - start, stagedFrames.toLong()).toInt()
-            if (originIsStreamStart) discardedFrames += drop else discardedPreTargetFrames += drop
+            if (originIsStreamStart) {
+                discardedFrames += drop
+            } else {
+                discardedPreTargetFrames += drop
+                val budget = (MAX_PRE_TARGET_DISCARD_SEC * sampleRate).toLong()
+                if (discardedPreTargetFrames > budget) {
+                    throw FailClosed("pre_target_discard_exceeded:$discardedPreTargetFrames:$budget:$start:$anchor")
+                }
+            }
             consumeStaged(drop)
         }
     }

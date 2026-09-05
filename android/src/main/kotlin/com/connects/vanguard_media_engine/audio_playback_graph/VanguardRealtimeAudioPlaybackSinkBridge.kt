@@ -82,8 +82,18 @@ import kotlin.concurrent.withLock
 // instance frame position (C4). Unpark of a seek park is rejected until the
 // flush was acked, so epoch+1 opens on a flushed instance at baseFrame = T:
 // a deliberate discontinuity of T - positionAtPark frames, published as
-// telemetry. T >= positionAtPark always holds (positionAtPark <= written ==
-// H < T), so the clock never clamps the base.
+// telemetry. For a forward seek T >= positionAtPark always holds
+// (positionAtPark <= written == H < T), so the clock never clamps the base.
+// Y17 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK): a requestFlush
+// may DECLARE its seek backward (T < written-at-flush == H); the unpark then
+// opens epoch+1 at T through the clock writer's declared-backward entry
+// point, the only path that may publish a base below the last published
+// position (counted as a declared backward base, never as a clamp). The
+// clock-domain step T - positionAtPark may still be zero or forward because
+// the published position lags the written count by up to the output
+// buffer; only the content-domain claim T < H is asserted here. Everything
+// else (park, single flush, read budget H + declared - T, unpark order,
+// no-feedback rule) is direction-agnostic.
 //
 // Dead object (Y8b, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT),
 // default off: with [Config.syntheticDeadObjectInjectAfterFrames] > 0 the
@@ -312,6 +322,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     @Volatile private var seekUnwrapResetAtFlush = false
     @Volatile private var epochRawOriginAtUnpark = -1L
     @Volatile private var playbackHeadAtSeekUnpark = -1L
+    // Y17: set by requestFlush() under parkLock; read by the sink thread at unpark.
+    @Volatile private var seekDeclaredBackward = false
 
     // Y16 drift-sample ingestion telemetry (class comment). Sink thread
     // writes the post-side fields; the owner-thread callback (or an inline
@@ -402,8 +414,11 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     // Y9 / Y10b-1a, any thread: the PARKED seek-park sink thread flushes exactly
     // once per use, bounds further reads to `postSeekFrames` (C6) and opens the
     // next epoch at `targetFrame` on unpark. False unless PARKED on a seek park
-    // whose flush for this use has not run yet.
-    fun requestFlush(postSeekFrames: Long, targetFrame: Long): Boolean {
+    // whose flush for this use has not run yet. Y17: `declaredBackward` declares
+    // the seek backward in content frames (class comment); the unpark then
+    // asserts T < written-at-flush and opens the epoch through the clock's
+    // declared-backward entry point instead of the forward one.
+    fun requestFlush(postSeekFrames: Long, targetFrame: Long, declaredBackward: Boolean = false): Boolean {
         if (postSeekFrames <= 0L || targetFrame < 0L) return false
         parkLock.withLock {
             if (phaseRef.get() != Phase.PARKED) return false
@@ -415,6 +430,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             flushRequestedAtMs = SystemClock.elapsedRealtime()
             postSeekExpectedFrames = postSeekFrames
             seekTargetFrame = targetFrame
+            seekDeclaredBackward = declaredBackward
             flushRequestCount++
             parkCondition.signalAll()
         }
@@ -574,6 +590,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             clockSnapshotsAtPark = clockWriter.clockSnapshotsAtPark,
             rebasedClampCount = clockWriter.rebasedClampCount,
             currentEpoch = clockWriter.currentEpoch,
+            clockDeclaredBackwardOpenCalls = clockWriter.clockDeclaredBackwardOpenCalls,
         )
         val parkA = VanguardRealtimeAudioPlaybackSinkTelemetryParkA(
             parkCount = parkCount,
@@ -685,6 +702,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             epochRawOriginAtUnpark = epochRawOriginAtUnpark,
             playbackHeadAtSeekUnpark = playbackHeadAtSeekUnpark,
             postSeekFramesWritten = if (flushCount > 0) framesWrittenToSink - framesWrittenAtFlush else 0L,
+            seekDeclaredBackward = seekDeclaredBackward,
         )
         val presentationLagA = VanguardRealtimeAudioPlaybackSinkTelemetryPresentationLagA(
             epochBaseFrame = clockWriter.epochBaseFrame,
@@ -1359,10 +1377,21 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             if (flushCount != seekParkCount) throw FailClosed("seek_unpark_without_flush:$flushCount:$seekParkCount")
             val target = seekTargetFrame
             if (target < 0L) throw FailClosed("seek_unpark_without_target")
-            if (target < positionAtPark) throw FailClosed("seek_target_below_position_at_park:$target:$positionAtPark")
+            val backward = seekDeclaredBackward
+            if (backward) {
+                // Y17: the content-domain backward claim (class comment); the
+                // clock-domain step against positionAtPark may have either sign.
+                if (target >= framesWrittenAtFlush) throw FailClosed("backward_seek_target_not_below_written:$target:$framesWrittenAtFlush")
+            } else if (target < positionAtPark) {
+                throw FailClosed("seek_target_below_position_at_park:$target:$positionAtPark")
+            }
             playbackHeadAtSeekUnpark = playbackHeadAtUnpark
             clockWriter.setOrigin(0L)
-            val outcome = clockWriter.openEpoch(nextEpoch, target, framesWrittenToSink, framesReadFromTransport)
+            val outcome = if (backward) {
+                clockWriter.openEpochDeclaredBackward(nextEpoch, target, framesWrittenToSink, framesReadFromTransport)
+            } else {
+                clockWriter.openEpoch(nextEpoch, target, framesWrittenToSink, framesReadFromTransport)
+            }
             seekEpochOpenAccepted = outcome.accepted
             seekEpochOpenedAtUnpark = nextEpoch
             seekEpochBaseFrame = target

@@ -15,21 +15,22 @@
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
 // Diagnostic-only - drives the production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
-// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through eleven
+// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through twelve
 // scenarios:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
 //   3. Synthetic dead-object recovery to EOS.
 //   4. Forward mid-stream seek while paused to EOS.
 //   5. Repeated forward seek while paused (T1 then T2, third seek rejected) to EOS.
-//   6. Focus duck, restore, transient pause, auto-resume, and noisy terminal pause.
-//   7. Focus permanent loss terminal pause without auto-resume.
-//   8. Route change observation without transport mutation (independently bounded; no disconnect posted).
-//   9. Route disconnect terminal pause, public resume blocked, and routing teardown (independently bounded, fresh PLAYING session).
-//  10. Route disconnect while paused by focus policy: public resume blocked and focus auto-resume blocked.
-//  11. Presentation clock query surface with off-thread poller to EOS, clock correlation observation, and post-teardown latched read.
+//   6. Backward seek while paused (0 <= T <= H - 2 windows) declared to decoder/sink/clock to EOS, second seek rejected.
+//   7. Focus duck, restore, transient pause, auto-resume, and noisy terminal pause.
+//   8. Focus permanent loss terminal pause without auto-resume.
+//   9. Route change observation without transport mutation (independently bounded; no disconnect posted).
+//  10. Route disconnect terminal pause, public resume blocked, and routing teardown (independently bounded, fresh PLAYING session).
+//  11. Route disconnect while paused by focus policy: public resume blocked and focus auto-resume blocked.
+//  12. Presentation clock query surface with off-thread poller to EOS, clock correlation observation, and post-teardown latched read.
 //
-// Required proof lanes (60 native lanes plus canonical equals 61 total lanes):
+// Required proof lanes (73 native lanes plus canonical equals 74 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -61,39 +62,52 @@
 //  29. repeatedSeekCommandOk: repeated forward seek commands (T1 then T2) issued and accepted cleanly
 //  30. repeatedSeekCumulativeAccountingOk: cumulative frame accounting across repeated seeks equals expected total
 //  31. repeatedSeekThirdRejectOk: third repeated seek call rejected without teardown or state mutation
-//  32. focusSetupOk: focus request and noisy receiver registered, monitor started
-//  33. focusDuckRestoreOk: transient duck gain and full restore applied on sink thread
-//  34. focusTransientPauseResumeOk: transient loss pauses transport, subsequent gain auto-resumes
-//  35. focusNoisyTerminalPauseOk: noisy event triggers terminal pause, subsequent gain ignored
-//  36. focusPermanentLossPauseOk: permanent loss triggers terminal pause, subsequent gain ignored
-//  37. focusMonitorTeardownOk: focus monitor thread exited/joined and controller released cleanly
-//  38. routingSetupOk: routing controller attached and monitor thread started cleanly
-//  39. routeChangeObservationOk: route change observed without mutating transport state
-//  40. routeDisconnectTerminalPauseOk: route disconnect triggers terminal pause with AudioTrack paused at park
-//  41. routeDisconnectResumeBlockedOk: public resume rejected and subsequent focus gain does not auto-resume
-//  42. routingMonitorTeardownOk: routing controller released, monitor thread exited and joined cleanly
-//  43. currentPositionQuerySurfaceOk: currentPosition queried across thread boundaries without mutation
-//  44. currentPositionPollerMonotonicOk: off-thread poller position reads monotonic without regression
-//  45. currentPositionReadCounterIsolationOk: currentPosition read counters isolated between writer and other threads
-//  46. presentationLagTelemetryOk: presentation lag telemetry captured with valid bounds and samples
-//  47. presentationLagBoundedOk: presentation lag samples remain strictly within analytical bounds
-//  48. positionAtEosNoRunawayOk: position at EOS non-negative and bounded without runaway
-//  49. positionQueryPauseHoldFrozenOk: position query frozen and non-regressing during bounded pause hold
-//  50. positionQueryDeadObjectRebaseOk: position query rebased monotonically across dead-object recovery
-//  51. positionQuerySeekBaseAdvanceOk: position query advanced at or beyond target after forward seek
-//  52. positionQueryRepeatedSeekBaseAdvanceOk: position query advanced across repeated seeks without regression
-//  53. positionQueryPostTeardownLatchedOk: position query read post-stop/dispose latched cleanly
-//  54. nativeAudioClockSnapshotPublishedOk: native audio clock snapshot published with non-blank state and non-negative positions
-//  55. clockCorrelationTelemetryOk: presentation clock snapshot consistent and correlation offset telemetry present
-//  56. clockObservationNoFeedbackOk: clock correlation observation executed without feedback or transport mutation
-//  57. driftSampleWorkerOwnedOk: drift samples posted on sink worker thread and verified
-//  58. driftSampleGenerationPinnedOk: drift sample generation pinned and stale generation rejected
-//  59. driftSampleNoFeedbackOk: drift sample observation without feedback or pacing mutation
-//  60. clockAuthorityUnchangedOk: clock authority and query surface unchanged
+//  32. backwardSeekAdmissionOk: backward seek armed with target within [0, H - 2 windows]
+//  33. backwardSeekQuiesceAccountingOk: feed held at window-aligned anchor and quiescence accounted before backward seek
+//  34. backwardSinkFlushAtSeekOk: AudioTrack.flush executed once on sink thread at backward seek
+//  35. backwardSeekCommandOk: backward seek command issued while paused and generations advanced cleanly
+//  36. backwardDecoderReanchorOk: decoder reanchored backward to seek target cleanly on decode thread
+//  37. backwardStaleGenerationRejectedOk: deliberate stale generation probe rejected before JNI ingest on backward seek
+//  38. backwardSeekClockEpochRebaseOk: presentation clock epoch rebased backward at target as a declared discontinuity
+//  39. backwardPositionQueryRebaseOk: position query rebased to the backward target immediately after seek
+//  40. backwardDriftSampleBoundedOk: drift sample counters stayed bounded and consistent across the backward discontinuity
+//  41. backwardClockCorrelationOk: presentation clock stayed correlated and consistent with sink timestamps across the backward seek
+//  42. backwardPostSeekFrameAccountingOk: post-backward-seek playback drained cleanly to EOS with total frames accounting
+//  43. backwardSeekRepeatedRejectOk: second backward seek call rejected without teardown or state mutation
+//  44. backwardNoFeedbackOk: backward seek observation without feedback or pacing mutation
+//  45. focusSetupOk: focus request and noisy receiver registered, monitor started
+//  46. focusDuckRestoreOk: transient duck gain and full restore applied on sink thread
+//  47. focusTransientPauseResumeOk: transient loss pauses transport, subsequent gain auto-resumes
+//  48. focusNoisyTerminalPauseOk: noisy event triggers terminal pause, subsequent gain ignored
+//  49. focusPermanentLossPauseOk: permanent loss triggers terminal pause, subsequent gain ignored
+//  50. focusMonitorTeardownOk: focus monitor thread exited/joined and controller released cleanly
+//  51. routingSetupOk: routing controller attached and monitor thread started cleanly
+//  52. routeChangeObservationOk: route change observed without mutating transport state
+//  53. routeDisconnectTerminalPauseOk: route disconnect triggers terminal pause with AudioTrack paused at park
+//  54. routeDisconnectResumeBlockedOk: public resume rejected and subsequent focus gain does not auto-resume
+//  55. routingMonitorTeardownOk: routing controller released, monitor thread exited and joined cleanly
+//  56. currentPositionQuerySurfaceOk: currentPosition queried across thread boundaries without mutation
+//  57. currentPositionPollerMonotonicOk: off-thread poller position reads monotonic without regression
+//  58. currentPositionReadCounterIsolationOk: currentPosition read counters isolated between writer and other threads
+//  59. presentationLagTelemetryOk: presentation lag telemetry captured with valid bounds and samples
+//  60. presentationLagBoundedOk: presentation lag samples remain strictly within analytical bounds
+//  61. positionAtEosNoRunawayOk: position at EOS non-negative and bounded without runaway
+//  62. positionQueryPauseHoldFrozenOk: position query frozen and non-regressing during bounded pause hold
+//  63. positionQueryDeadObjectRebaseOk: position query rebased monotonically across dead-object recovery
+//  64. positionQuerySeekBaseAdvanceOk: position query advanced at or beyond target after forward seek
+//  65. positionQueryRepeatedSeekBaseAdvanceOk: position query advanced across repeated seeks without regression
+//  66. positionQueryPostTeardownLatchedOk: position query read post-stop/dispose latched cleanly
+//  67. nativeAudioClockSnapshotPublishedOk: native audio clock snapshot published with non-blank state and non-negative positions
+//  68. clockCorrelationTelemetryOk: presentation clock snapshot consistent and correlation offset telemetry present
+//  69. clockObservationNoFeedbackOk: clock correlation observation executed without feedback or transport mutation
+//  70. driftSampleWorkerOwnedOk: drift samples posted on sink worker thread and verified
+//  71. driftSampleGenerationPinnedOk: drift sample generation pinned and stale generation rejected
+//  72. driftSampleNoFeedbackOk: drift sample observation without feedback or pacing mutation
+//  73. clockAuthorityUnchangedOk: clock authority and query surface unchanged
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -103,6 +117,10 @@
 //   - Checksum identity is over frames handed to write, not frames audibly presented.
 //   - Forward seek exercises ONE forward seek while paused; repeated seek exercises
 //     two ordered forward seeks while paused and verifies third rejected without teardown.
+//   - Backward seek exercises ONE backward seek while paused (0 <= T <= H - 2 windows)
+//     declared backward to the decoder, sink, and presentation clock, and verifies a
+//     second seek call rejected without teardown; it carries no feedback, pacing,
+//     resampling, AV-sync, acoustic, or route-arbitration claim.
 //   - Audio focus proof operates on synthetic focus change / becoming noisy seams without
 //     requiring real OS phone calls or bluetooth events during headless diagnostic runs.
 //   - Route change and route disconnect proof operates on synthetic route change / disconnect seams without
@@ -164,6 +182,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.repeatedSeekCommandOk,
     required this.repeatedSeekCumulativeAccountingOk,
     required this.repeatedSeekThirdRejectOk,
+    required this.backwardSeekAdmissionOk,
+    required this.backwardSeekQuiesceAccountingOk,
+    required this.backwardSinkFlushAtSeekOk,
+    required this.backwardSeekCommandOk,
+    required this.backwardDecoderReanchorOk,
+    required this.backwardStaleGenerationRejectedOk,
+    required this.backwardSeekClockEpochRebaseOk,
+    required this.backwardPositionQueryRebaseOk,
+    required this.backwardDriftSampleBoundedOk,
+    required this.backwardClockCorrelationOk,
+    required this.backwardPostSeekFrameAccountingOk,
+    required this.backwardSeekRepeatedRejectOk,
+    required this.backwardNoFeedbackOk,
     required this.focusSetupOk,
     required this.focusDuckRestoreOk,
     required this.focusTransientPauseResumeOk,
@@ -221,7 +252,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -256,6 +287,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'repeatedSeekCommandOk',
     'repeatedSeekCumulativeAccountingOk',
     'repeatedSeekThirdRejectOk',
+    'backwardSeekAdmissionOk',
+    'backwardSeekQuiesceAccountingOk',
+    'backwardSinkFlushAtSeekOk',
+    'backwardSeekCommandOk',
+    'backwardDecoderReanchorOk',
+    'backwardStaleGenerationRejectedOk',
+    'backwardSeekClockEpochRebaseOk',
+    'backwardPositionQueryRebaseOk',
+    'backwardDriftSampleBoundedOk',
+    'backwardClockCorrelationOk',
+    'backwardPostSeekFrameAccountingOk',
+    'backwardSeekRepeatedRejectOk',
+    'backwardNoFeedbackOk',
     'focusSetupOk',
     'focusDuckRestoreOk',
     'focusTransientPauseResumeOk',
@@ -409,6 +453,45 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether third repeated seek was rejected without teardown or mutation.
   final bool repeatedSeekThirdRejectOk;
 
+  /// Whether the backward seek was armed with target within [0, H - 2 windows].
+  final bool backwardSeekAdmissionOk;
+
+  /// Whether feed was held at window-aligned anchor and quiescence accounted before the backward seek.
+  final bool backwardSeekQuiesceAccountingOk;
+
+  /// Whether AudioTrack.flush executed once on sink thread at the backward seek.
+  final bool backwardSinkFlushAtSeekOk;
+
+  /// Whether the backward seek command was issued while paused and generations advanced cleanly.
+  final bool backwardSeekCommandOk;
+
+  /// Whether the decoder reanchored backward to the seek target cleanly on decode thread.
+  final bool backwardDecoderReanchorOk;
+
+  /// Whether the deliberate stale generation probe was rejected before JNI ingest on the backward seek.
+  final bool backwardStaleGenerationRejectedOk;
+
+  /// Whether the presentation clock epoch was rebased backward at target as a declared discontinuity.
+  final bool backwardSeekClockEpochRebaseOk;
+
+  /// Whether the position query rebased to the backward target immediately after seek.
+  final bool backwardPositionQueryRebaseOk;
+
+  /// Whether drift sample counters stayed bounded and consistent across the backward discontinuity.
+  final bool backwardDriftSampleBoundedOk;
+
+  /// Whether the presentation clock stayed correlated and consistent with sink timestamps across the backward seek.
+  final bool backwardClockCorrelationOk;
+
+  /// Whether post-backward-seek playback drained cleanly to EOS with total frames accounting.
+  final bool backwardPostSeekFrameAccountingOk;
+
+  /// Whether the second backward seek call was rejected without teardown or mutation.
+  final bool backwardSeekRepeatedRejectOk;
+
+  /// Whether the backward seek observation operated without feedback or pacing mutation.
+  final bool backwardNoFeedbackOk;
+
   /// Whether audio focus and noisy monitor setup succeeded.
   final bool focusSetupOk;
 
@@ -558,6 +641,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       repeatedSeekCommandOk &&
       repeatedSeekCumulativeAccountingOk &&
       repeatedSeekThirdRejectOk &&
+      backwardSeekAdmissionOk &&
+      backwardSeekQuiesceAccountingOk &&
+      backwardSinkFlushAtSeekOk &&
+      backwardSeekCommandOk &&
+      backwardDecoderReanchorOk &&
+      backwardStaleGenerationRejectedOk &&
+      backwardSeekClockEpochRebaseOk &&
+      backwardPositionQueryRebaseOk &&
+      backwardDriftSampleBoundedOk &&
+      backwardClockCorrelationOk &&
+      backwardPostSeekFrameAccountingOk &&
+      backwardSeekRepeatedRejectOk &&
+      backwardNoFeedbackOk &&
       focusSetupOk &&
       focusDuckRestoreOk &&
       focusTransientPauseResumeOk &&
@@ -642,6 +738,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         repeatedSeekCommandOk: false,
         repeatedSeekCumulativeAccountingOk: false,
         repeatedSeekThirdRejectOk: false,
+        backwardSeekAdmissionOk: false,
+        backwardSeekQuiesceAccountingOk: false,
+        backwardSinkFlushAtSeekOk: false,
+        backwardSeekCommandOk: false,
+        backwardDecoderReanchorOk: false,
+        backwardStaleGenerationRejectedOk: false,
+        backwardSeekClockEpochRebaseOk: false,
+        backwardPositionQueryRebaseOk: false,
+        backwardDriftSampleBoundedOk: false,
+        backwardClockCorrelationOk: false,
+        backwardPostSeekFrameAccountingOk: false,
+        backwardSeekRepeatedRejectOk: false,
+        backwardNoFeedbackOk: false,
         focusSetupOk: false,
         focusDuckRestoreOk: false,
         focusTransientPauseResumeOk: false,
@@ -799,6 +908,33 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'repeatedSeekCumulativeAccountingOk',
     );
     final repeatedSeekThirdRejectOk = parseBool('repeatedSeekThirdRejectOk');
+    final backwardSeekAdmissionOk = parseBool('backwardSeekAdmissionOk');
+    final backwardSeekQuiesceAccountingOk = parseBool(
+      'backwardSeekQuiesceAccountingOk',
+    );
+    final backwardSinkFlushAtSeekOk = parseBool('backwardSinkFlushAtSeekOk');
+    final backwardSeekCommandOk = parseBool('backwardSeekCommandOk');
+    final backwardDecoderReanchorOk = parseBool('backwardDecoderReanchorOk');
+    final backwardStaleGenerationRejectedOk = parseBool(
+      'backwardStaleGenerationRejectedOk',
+    );
+    final backwardSeekClockEpochRebaseOk = parseBool(
+      'backwardSeekClockEpochRebaseOk',
+    );
+    final backwardPositionQueryRebaseOk = parseBool(
+      'backwardPositionQueryRebaseOk',
+    );
+    final backwardDriftSampleBoundedOk = parseBool(
+      'backwardDriftSampleBoundedOk',
+    );
+    final backwardClockCorrelationOk = parseBool('backwardClockCorrelationOk');
+    final backwardPostSeekFrameAccountingOk = parseBool(
+      'backwardPostSeekFrameAccountingOk',
+    );
+    final backwardSeekRepeatedRejectOk = parseBool(
+      'backwardSeekRepeatedRejectOk',
+    );
+    final backwardNoFeedbackOk = parseBool('backwardNoFeedbackOk');
     final focusSetupOk = parseBool('focusSetupOk');
     final focusDuckRestoreOk = parseBool('focusDuckRestoreOk');
     final focusTransientPauseResumeOk = parseBool(
@@ -898,6 +1034,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         repeatedSeekCommandOk &&
         repeatedSeekCumulativeAccountingOk &&
         repeatedSeekThirdRejectOk &&
+        backwardSeekAdmissionOk &&
+        backwardSeekQuiesceAccountingOk &&
+        backwardSinkFlushAtSeekOk &&
+        backwardSeekCommandOk &&
+        backwardDecoderReanchorOk &&
+        backwardStaleGenerationRejectedOk &&
+        backwardSeekClockEpochRebaseOk &&
+        backwardPositionQueryRebaseOk &&
+        backwardDriftSampleBoundedOk &&
+        backwardClockCorrelationOk &&
+        backwardPostSeekFrameAccountingOk &&
+        backwardSeekRepeatedRejectOk &&
+        backwardNoFeedbackOk &&
         focusSetupOk &&
         focusDuckRestoreOk &&
         focusTransientPauseResumeOk &&
@@ -1018,6 +1167,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'repeatedSeekCommandOk': repeatedSeekCommandOk,
       'repeatedSeekCumulativeAccountingOk': repeatedSeekCumulativeAccountingOk,
       'repeatedSeekThirdRejectOk': repeatedSeekThirdRejectOk,
+      'backwardSeekAdmissionOk': backwardSeekAdmissionOk,
+      'backwardSeekQuiesceAccountingOk': backwardSeekQuiesceAccountingOk,
+      'backwardSinkFlushAtSeekOk': backwardSinkFlushAtSeekOk,
+      'backwardSeekCommandOk': backwardSeekCommandOk,
+      'backwardDecoderReanchorOk': backwardDecoderReanchorOk,
+      'backwardStaleGenerationRejectedOk': backwardStaleGenerationRejectedOk,
+      'backwardSeekClockEpochRebaseOk': backwardSeekClockEpochRebaseOk,
+      'backwardPositionQueryRebaseOk': backwardPositionQueryRebaseOk,
+      'backwardDriftSampleBoundedOk': backwardDriftSampleBoundedOk,
+      'backwardClockCorrelationOk': backwardClockCorrelationOk,
+      'backwardPostSeekFrameAccountingOk': backwardPostSeekFrameAccountingOk,
+      'backwardSeekRepeatedRejectOk': backwardSeekRepeatedRejectOk,
+      'backwardNoFeedbackOk': backwardNoFeedbackOk,
       'focusSetupOk': focusSetupOk,
       'focusDuckRestoreOk': focusDuckRestoreOk,
       'focusTransientPauseResumeOk': focusTransientPauseResumeOk,
@@ -1093,6 +1255,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       repeatedSeekCommandOk: repeatedSeekCommandOk,
       repeatedSeekCumulativeAccountingOk: repeatedSeekCumulativeAccountingOk,
       repeatedSeekThirdRejectOk: repeatedSeekThirdRejectOk,
+      backwardSeekAdmissionOk: backwardSeekAdmissionOk,
+      backwardSeekQuiesceAccountingOk: backwardSeekQuiesceAccountingOk,
+      backwardSinkFlushAtSeekOk: backwardSinkFlushAtSeekOk,
+      backwardSeekCommandOk: backwardSeekCommandOk,
+      backwardDecoderReanchorOk: backwardDecoderReanchorOk,
+      backwardStaleGenerationRejectedOk: backwardStaleGenerationRejectedOk,
+      backwardSeekClockEpochRebaseOk: backwardSeekClockEpochRebaseOk,
+      backwardPositionQueryRebaseOk: backwardPositionQueryRebaseOk,
+      backwardDriftSampleBoundedOk: backwardDriftSampleBoundedOk,
+      backwardClockCorrelationOk: backwardClockCorrelationOk,
+      backwardPostSeekFrameAccountingOk: backwardPostSeekFrameAccountingOk,
+      backwardSeekRepeatedRejectOk: backwardSeekRepeatedRejectOk,
+      backwardNoFeedbackOk: backwardNoFeedbackOk,
       focusSetupOk: focusSetupOk,
       focusDuckRestoreOk: focusDuckRestoreOk,
       focusTransientPauseResumeOk: focusTransientPauseResumeOk,
@@ -1205,6 +1380,19 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       repeatedSeekCommandOk: false,
       repeatedSeekCumulativeAccountingOk: false,
       repeatedSeekThirdRejectOk: false,
+      backwardSeekAdmissionOk: false,
+      backwardSeekQuiesceAccountingOk: false,
+      backwardSinkFlushAtSeekOk: false,
+      backwardSeekCommandOk: false,
+      backwardDecoderReanchorOk: false,
+      backwardStaleGenerationRejectedOk: false,
+      backwardSeekClockEpochRebaseOk: false,
+      backwardPositionQueryRebaseOk: false,
+      backwardDriftSampleBoundedOk: false,
+      backwardClockCorrelationOk: false,
+      backwardPostSeekFrameAccountingOk: false,
+      backwardSeekRepeatedRejectOk: false,
+      backwardNoFeedbackOk: false,
       focusSetupOk: false,
       focusDuckRestoreOk: false,
       focusTransientPauseResumeOk: false,

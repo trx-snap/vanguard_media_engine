@@ -86,6 +86,8 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetryClockPollB(
     val clockSnapshotsAtPark: Long,
     val rebasedClampCount: Long,
     val currentEpoch: Int,
+    // Y17: epoch opens declared backward (a backward seek's unpark); 0 on every non-backward run.
+    val clockDeclaredBackwardOpenCalls: Int = 0,
 )
 
 data class VanguardRealtimeAudioPlaybackSinkTelemetryParkA(
@@ -215,7 +217,8 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushC(
 )
 
 data class VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushD(
-    // Deliberate discontinuity: seekEpochBaseFrame - positionAtPark (>= 0).
+    // Deliberate discontinuity: seekEpochBaseFrame - positionAtPark (>= 0 for
+    // a forward seek; Y17: may be negative for a declared backward seek).
     val seekDiscontinuityFrames: Long,
     val seekEpochOpenAccepted: Boolean,
     // True once the flush reset lastRaw32 / wrapOffset / epochRawOrigin.
@@ -226,6 +229,10 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushD(
     val playbackHeadAtSeekUnpark: Long,
     // framesWrittenToSink - framesWrittenAtFlush once flushed, else 0.
     val postSeekFramesWritten: Long,
+    // Y17: the last requestFlush declared its seek backward (T < written at
+    // flush); the unpark then opened the seek epoch through the clock's
+    // declared-backward entry point. False on every forward run.
+    val seekDeclaredBackward: Boolean = false,
 )
 
 // Y13 diagnostic production-clock query / epoch-relative lag (split A-C; 17
@@ -400,6 +407,7 @@ class VanguardRealtimeAudioPlaybackSinkTelemetry(
     val clockSnapshotsAtPark: Long get() = clockParkBundle.clockPollB.clockSnapshotsAtPark
     val rebasedClampCount: Long get() = clockParkBundle.clockPollB.rebasedClampCount
     val currentEpoch: Int get() = clockParkBundle.clockPollB.currentEpoch
+    val clockDeclaredBackwardOpenCalls: Int get() = clockParkBundle.clockPollB.clockDeclaredBackwardOpenCalls
 
     val parkCount: Int get() = clockParkBundle.parkA.parkCount
     val unparkCount: Int get() = clockParkBundle.parkA.unparkCount
@@ -499,6 +507,7 @@ class VanguardRealtimeAudioPlaybackSinkTelemetry(
     val epochRawOriginAtUnpark: Long get() = seekFlushBundle.seekFlushD.epochRawOriginAtUnpark
     val playbackHeadAtSeekUnpark: Long get() = seekFlushBundle.seekFlushD.playbackHeadAtSeekUnpark
     val postSeekFramesWritten: Long get() = seekFlushBundle.seekFlushD.postSeekFramesWritten
+    val seekDeclaredBackward: Boolean get() = seekFlushBundle.seekFlushD.seekDeclaredBackward
 
     val epochBaseFrame: Long get() = lagDriftBundle.presentationLagA.epochBaseFrame
     val framesWrittenAtEpochOpen: Long get() = lagDriftBundle.presentationLagA.framesWrittenAtEpochOpen

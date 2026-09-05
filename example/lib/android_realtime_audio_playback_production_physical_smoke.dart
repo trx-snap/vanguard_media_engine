@@ -16,7 +16,7 @@
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -359,6 +359,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     const deadObjectScenarioKey = 'SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS';
     const forwardSeekScenarioKey = 'SCENARIO_FORWARD_SEEK_TO_EOS';
     const repeatedSeekScenarioKey = 'SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS';
+    const backwardSeekScenarioKey = 'SCENARIO_BACKWARD_SEEK_TO_EOS';
     const focusDuckTransientNoisyScenarioKey =
         'SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY';
     const focusPermanentLossScenarioKey = 'SCENARIO_FOCUS_PERMANENT_LOSS';
@@ -386,6 +387,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final repeatedSeekMetrics = asStringKeyedMap(
       topMetrics[repeatedSeekScenarioKey],
+    );
+    final backwardSeekMetrics = asStringKeyedMap(
+      topMetrics[backwardSeekScenarioKey],
     );
     final focusDuckTransientNoisyMetrics = asStringKeyedMap(
       topMetrics[focusDuckTransientNoisyScenarioKey],
@@ -912,6 +916,41 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           'failureReason',
         ]);
 
+    final compactBackwardSeek =
+        extractCompactScenario(backwardSeekMetrics, const <String>[
+          'seekTargetSecArmed',
+          'seekBackwardArmed',
+          'seekTargetFrame',
+          'preSeekHoldFrame',
+          'seekBackward',
+          'seekDeclaredBackward',
+          'sinkSeekDeclaredBackward',
+          'sinkClockDeclaredBackwardOpenCalls',
+          'seekClockDeclaredBackwardBaseCountAfterUnpark',
+          'seekClockLastDeclaredBackwardFramesAfterUnpark',
+          'decoderSeekBackward',
+          'decoderSeekTargetUs',
+          'decoderSeekLandedUs',
+          'decoderFirstPostSeekPtsUs',
+          'decoderFirstPostSeekFrame',
+          'decoderGapObservedFrames',
+          'decoderGapPaddedFrames',
+          'decoderMaxSeekGapFrames',
+          'decoderDiscardedPreTargetFrames',
+          'decoderMaxPreTargetDiscardFrames',
+          'expectedTotalFrames',
+          'postSeekExpectedFrames',
+          'afterSeekQueryFrames',
+          'afterSeekState',
+          'afterRepeatedState',
+          'finalSeekCount',
+          'decoderLandingOk',
+          'decoderGapPolicyOk',
+          'stateAtCompletion',
+          'scenarioWallMs',
+          'failureReason',
+        ]);
+
     const focusCompactKeys = <String>[
       'focusEnabled',
       'focusControllerRequested',
@@ -1413,6 +1452,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print('  [SCENARIO] $deadObjectScenarioKey: $compactDeadObject');
     print('  [SCENARIO] $forwardSeekScenarioKey: $compactForwardSeek');
     print('  [SCENARIO] $repeatedSeekScenarioKey: $compactRepeatedSeek');
+    print('  [SCENARIO] $backwardSeekScenarioKey: $compactBackwardSeek');
     print(
       '  [SCENARIO] $focusDuckTransientNoisyScenarioKey: $compactFocusDuckTransientNoisy',
     );
@@ -1446,6 +1486,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       deadObjectScenarioKey: compactDeadObject,
       forwardSeekScenarioKey: compactForwardSeek,
       repeatedSeekScenarioKey: compactRepeatedSeek,
+      backwardSeekScenarioKey: compactBackwardSeek,
       focusDuckTransientNoisyScenarioKey: compactFocusDuckTransientNoisy,
       focusPermanentLossScenarioKey: compactFocusPermanentLoss,
       routeChangeObservationScenarioKey: compactRouteChangeObservation,
@@ -1459,8 +1500,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP',
-      'subSlice': 'Y16',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK',
+      'subSlice': 'Y17',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,

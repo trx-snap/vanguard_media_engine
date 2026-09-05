@@ -31,6 +31,11 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
         private set
     @Volatile var clockEpochCloseCalls = 0
         private set
+    // Y17: of [clockEpochOpenCalls], how many went through
+    // [openEpochDeclaredBackward] (a backward seek's unpark). Zero on every
+    // non-backward run.
+    @Volatile var clockDeclaredBackwardOpenCalls = 0
+        private set
     @Volatile var clockRejectedCount = 0L
         private set
     @Volatile var clockSnapshotsAtPark = 0L
@@ -230,10 +235,38 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
         baseFrame: Long,
         framesWrittenAtEpochOpen: Long,
         framesReadAtEpochOpen: Long,
+    ): VanguardRealtimePlaybackPresentationClock.Outcome =
+        openEpochInternal(epoch, baseFrame, framesWrittenAtEpochOpen, framesReadAtEpochOpen, declaredBackward = false)
+
+    // Y17: same anchoring as [openEpoch], but the base is a writer-declared
+    // backward discontinuity (a backward seek target on a flushed instance),
+    // forwarded to [VanguardRealtimePlaybackPresentationClock.
+    // epochOpenedDeclaredBackward]. The Y13 lag anchors are captured per
+    // epoch exactly as for a forward seek, so the backward base never leaks
+    // into the lag metric as cumulative drift.
+    fun openEpochDeclaredBackward(
+        epoch: Int,
+        baseFrame: Long,
+        framesWrittenAtEpochOpen: Long,
+        framesReadAtEpochOpen: Long,
+    ): VanguardRealtimePlaybackPresentationClock.Outcome =
+        openEpochInternal(epoch, baseFrame, framesWrittenAtEpochOpen, framesReadAtEpochOpen, declaredBackward = true)
+
+    private fun openEpochInternal(
+        epoch: Int,
+        baseFrame: Long,
+        framesWrittenAtEpochOpen: Long,
+        framesReadAtEpochOpen: Long,
+        declaredBackward: Boolean,
     ): VanguardRealtimePlaybackPresentationClock.Outcome {
         currentEpoch = epoch
         clockEpochOpenCalls++
-        val outcome = presentationClock.epochOpened(epoch, baseFrame, System.nanoTime())
+        val outcome = if (declaredBackward) {
+            clockDeclaredBackwardOpenCalls++
+            presentationClock.epochOpenedDeclaredBackward(epoch, baseFrame, System.nanoTime())
+        } else {
+            presentationClock.epochOpened(epoch, baseFrame, System.nanoTime())
+        }
         countClockOutcome(outcome)
         epochBaseFrame = baseFrame
         this.framesWrittenAtEpochOpen = framesWrittenAtEpochOpen

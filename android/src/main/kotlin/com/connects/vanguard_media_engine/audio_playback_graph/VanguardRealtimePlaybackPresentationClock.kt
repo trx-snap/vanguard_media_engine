@@ -23,15 +23,18 @@ import java.util.concurrent.atomic.AtomicLong
 //     epoch and reopens epoch+1 based at the last published position; Y9:
 //     one forward seek closes the epoch at the park, the writer flushes the
 //     instance and reopens epoch+1 based at the seek target, a deliberate
-//     base-offset discontinuity the writer publishes as telemetry). The
-//     clock itself has no seek/flush/reanchor API: every base comes from
-//     the writer through [epochOpened], and a base below the published
-//     position is still clamped and counted, never trusted. A base AHEAD
-//     of the published position is published immediately as the epoch's
-//     opening position (a deliberate, counted forward discontinuity: the
-//     writer declared that instance frame 0 of the new epoch maps to
-//     `base`, so the position can never be below it); a base equal to the
-//     published position (Y8a pause reopen) changes nothing.
+//     base-offset discontinuity the writer publishes as telemetry; Y17:
+//     one backward seek does the same through [epochOpenedDeclaredBackward],
+//     the only entry point that may publish a base BELOW the published
+//     position). The clock itself has no seek/flush/reanchor API: every
+//     base comes from the writer through [epochOpened] /
+//     [epochOpenedDeclaredBackward]. Through [epochOpened] a base below the
+//     published position is still clamped and counted, never trusted. A
+//     base AHEAD of the published position is published immediately as the
+//     epoch's opening position (a deliberate, counted forward
+//     discontinuity: the writer declared that instance frame 0 of the new
+//     epoch maps to `base`, so the position can never be below it); a base
+//     equal to the published position (Y8a pause reopen) changes nothing.
 //   - per epoch the unsigned-32 framePosition is unwrapped (one positive
 //     wrap tolerated, strict regression fails closed via
 //     [Outcome.REJECTED_FRAME_REGRESSION] and latches the FAULTED state).
@@ -43,9 +46,18 @@ import java.util.concurrent.atomic.AtomicLong
 //     with the caller-supplied System.nanoTime() value, bounded by
 //     [extrapolationHorizonNs]; past the horizon the clock publishes STALE
 //     and holds the last published position instead of fabricating one.
-//   - the published position never decreases (an anchor landing below an
-//     earlier extrapolation is clamped and counted, never published as a
-//     regression).
+//   - the published position never decreases WITHIN an epoch and never
+//     decreases across an [epochOpened] boundary (an anchor landing below
+//     an earlier extrapolation is clamped and counted, never published as
+//     a regression; an undeclared base below the published position is
+//     clamped and counted in baseClampCount). The ONE sanctioned decrease
+//     is a writer-declared backward epoch open (Y17,
+//     [epochOpenedDeclaredBackward]): the writer states that instance
+//     frame 0 of the new epoch maps to a base below the published
+//     position (a backward seek target), so that base is published at once
+//     and counted in declaredBackwardBaseCount. baseClampCount and
+//     monotonicViolationCount keep their meaning for UNDECLARED
+//     regressions and stay zero across a declared backward open.
 //   - positionUs = continuousFrames * 1_000_000 / sampleRate. No HAL /
 //     output latency, A/V sync, drift correction or availability SLA claim.
 class VanguardRealtimePlaybackPresentationClock(
@@ -139,6 +151,11 @@ class VanguardRealtimePlaybackPresentationClock(
         val snapshotCallsFromWriterThread: Long,
         val snapshotCallsFromOtherThreads: Long,
         val writerThreadId: Long,
+        // Y17: epoch opens through [epochOpenedDeclaredBackward] whose base
+        // was below the published position (published at once, never
+        // clamped); the size of the last such decrease in frames.
+        val declaredBackwardBaseCount: Long = 0L,
+        val lastDeclaredBackwardFrames: Long = 0L,
     )
 
     companion object {
@@ -191,6 +208,10 @@ class VanguardRealtimePlaybackPresentationClock(
     // Epoch opens whose base was ahead of the published position (Y9 seek).
     @Volatile private var baseAdvanceCount = 0L
     @Volatile private var lastBaseAdvanceFrames = 0L
+    // Y17: declared backward epoch opens whose base was below the published
+    // position (class comment). Never bumped by [epochOpened].
+    @Volatile private var declaredBackwardBaseCount = 0L
+    @Volatile private var lastDeclaredBackwardFrames = 0L
     @Volatile private var negativeAgeCount = 0L
     @Volatile private var nanoTimeNonMonotonicCount = 0L
     @Volatile private var maxExtrapolatedAgeNs = -1L
@@ -268,7 +289,25 @@ class VanguardRealtimePlaybackPresentationClock(
     // the writer-declared position (e.g. the Y9 seek target) before the
     // first anchor of the epoch lands. Provenance is RESET either way: the
     // opening position is declared by the writer, not measured.
-    fun epochOpened(epoch: Int, baseFrame: Long, nowNs: Long): Outcome {
+    fun epochOpened(epoch: Int, baseFrame: Long, nowNs: Long): Outcome =
+        openEpochInternal(epoch, baseFrame, nowNs, declaredBackward = false)
+
+    // Y17 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK): opens
+    // [epoch] exactly like [epochOpened] except that a base BELOW the last
+    // published position is a writer-DECLARED backward discontinuity (a
+    // backward seek target on a flushed instance): it is published at once
+    // as the epoch's opening position and counted in
+    // declaredBackwardBaseCount, never clamped and never counted in
+    // baseClampCount / monotonicViolationCount. A base at or ahead of the
+    // published position behaves exactly as in [epochOpened] (the writer
+    // declares the seek is backward in CONTENT frames; the published
+    // position may still lag the content by up to the output buffer, so
+    // the clock-domain step can be zero or forward). Provenance is RESET
+    // either way: the opening position is declared, not measured.
+    fun epochOpenedDeclaredBackward(epoch: Int, baseFrame: Long, nowNs: Long): Outcome =
+        openEpochInternal(epoch, baseFrame, nowNs, declaredBackward = true)
+
+    private fun openEpochInternal(epoch: Int, baseFrame: Long, nowNs: Long, declaredBackward: Boolean): Outcome {
         if (!onWriterThread()) return Outcome.REJECTED_OFF_WRITER_THREAD
         val s = beginPublish()
         if (faulted) return endPublish(s, Outcome.REJECTED_FAULTED)
@@ -279,8 +318,17 @@ class VanguardRealtimePlaybackPresentationClock(
         var base = baseFrame
         val current = positionFrames
         if (base < current) {
-            base = current
-            baseClampCount++
+            if (declaredBackward) {
+                // The ONE sanctioned decrease (class comment): direct
+                // publication, bypassing publishPosition's clamp so neither
+                // baseClampCount nor monotonicViolationCount moves.
+                declaredBackwardBaseCount++
+                lastDeclaredBackwardFrames = current - base
+                positionFrames = base
+            } else {
+                base = current
+                baseClampCount++
+            }
         } else if (base > current) {
             baseAdvanceCount++
             lastBaseAdvanceFrames = base - current
@@ -516,6 +564,8 @@ class VanguardRealtimePlaybackPresentationClock(
             snapshotCallsFromWriterThread = snapshotCallsFromWriterThread.get(),
             snapshotCallsFromOtherThreads = snapshotCallsFromOtherThreads.get(),
             writerThreadId = writerThreadId,
+            declaredBackwardBaseCount = declaredBackwardBaseCount,
+            lastDeclaredBackwardFrames = lastDeclaredBackwardFrames,
         )
     }
 }

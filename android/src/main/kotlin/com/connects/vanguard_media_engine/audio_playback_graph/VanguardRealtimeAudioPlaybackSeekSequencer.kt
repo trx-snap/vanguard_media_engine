@@ -35,6 +35,18 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeP
 // unpark) is counted cumulatively by its own bridge/feed across the whole
 // session, so this sequencer checks each one against `index + 1` rather
 // than a fixed 1.
+//
+// Y17 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-BACKWARD-SEEK), additive: [run]
+// takes `backward`; the step order, every wait, every native/transport
+// accounting check and the read-budget arithmetic (sink hold + declared - T)
+// are direction-agnostic, so a backward seek runs the SAME fixed sequence.
+// The direction is only DECLARED downstream -- to the sink's requestFlush
+// (which then opens the seek epoch through the clock's declared-backward
+// entry point at unpark) and to the feed's re-anchor request (which
+// validates 0 <= T < H) -- and echoed back through sink telemetry, which
+// this sequencer checks matches the declaration. No clock snapshot ever
+// gates a step here (no-feedback rule); the clock snapshots taken at park /
+// before / after unpark stay telemetry.
 class VanguardRealtimeAudioPlaybackSeekSequencer(
     private val config: Config,
     private val host: Host,
@@ -143,14 +155,19 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         private set
     @Volatile var seekClockAfterUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
         private set
+    // Y17: direction the last [run] declared to the sink/feed (false on every forward run).
+    @Volatile var seekDeclaredBackward = false
+        private set
 
     // Runs the fixed Y9 order once for ONE ordered seek (command-lock holder,
     // state SEEKING). `index` is 0 for the first of up to two ordered seeks,
     // 1 for the second; `nextContentHoldFrame` is the next content hold the
     // feed idles at after this seek's re-anchor (H2 for the first seek of a
-    // repeated run, else Long.MAX_VALUE for the run's final seek). Returns
-    // null on success (every step verified), else the failure reason (the
-    // session fails closed and tears down with it).
+    // repeated run, else Long.MAX_VALUE for the run's final seek). Y17:
+    // `backward` declares 0 <= T < contentHoldFrame (class comment); the
+    // session admits the direction, this only forwards and echoes it.
+    // Returns null on success (every step verified), else the failure reason
+    // (the session fails closed and tears down with it).
     fun run(
         s: VanguardRealtimeAudioPlaybackSinkBridge,
         f: VanguardRealtimePlaybackDecoderFeed,
@@ -161,8 +178,14 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         sinkHoldFrame: Long,
         targetFrame: Long,
         nextContentHoldFrame: Long,
+        backward: Boolean = false,
     ): String? = try {
         val seekStartedAt = SystemClock.elapsedRealtime()
+        seekDeclaredBackward = backward
+        if (backward && nextContentHoldFrame != Long.MAX_VALUE) throw FailClosed("backward_seek_next_hold_unsupported:$nextContentHoldFrame")
+        if (backward && (targetFrame < 0L || targetFrame >= contentHoldFrame)) {
+            throw FailClosed("backward_seek_target_not_below_hold:$targetFrame:$contentHoldFrame")
+        }
         // The pause below must not itself advance the generation (only
         // start/seek/stop do); this is the baseline it is checked against,
         // captured fresh per seek since a prior seek in the same run already
@@ -173,10 +196,10 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         parkForSeekLocked(s, index)
         verifyPreSeekQuiescenceLocked(f, s, machine, contentHoldFrame, sinkHoldFrame)
         pauseForSeekLocked(machine, sinkHoldFrame, entryGeneration)
-        flushSinkLocked(s, machine, declaredFrameCount, sinkHoldFrame, targetFrame, index)
+        flushSinkLocked(s, machine, declaredFrameCount, sinkHoldFrame, targetFrame, index, backward)
         seekTransportLocked(s, machine, sinkHoldFrame, targetFrame, index)
-        reanchorFeedLocked(f, machine, contentHoldFrame, sinkHoldFrame, targetFrame, index, nextContentHoldFrame)
-        unparkSinkLocked(s, machine, targetFrame, index)
+        reanchorFeedLocked(f, machine, contentHoldFrame, sinkHoldFrame, targetFrame, index, nextContentHoldFrame, backward)
+        unparkSinkLocked(s, machine, targetFrame, index, backward)
         resumeAfterSeekLocked(s, machine)
         seekWallMs = SystemClock.elapsedRealtime() - seekStartedAt
         null
@@ -357,7 +380,9 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
     // AudioTrack.flush() once on the sink thread while sink PARKED/PAUSED and
     // transport PAUSED; read budget becomes the cumulative sink hold +
     // (declared - T). Flush/park counts are cumulative across the whole
-    // session, so the expected count is this seek's 1-based ordinal.
+    // session, so the expected count is this seek's 1-based ordinal. Y17: the
+    // seek direction is declared to the sink here (with the flush request)
+    // and must be echoed back by its telemetry.
     private fun flushSinkLocked(
         s: VanguardRealtimeAudioPlaybackSinkBridge,
         machine: VanguardRealtimePlaybackTransportStateMachine,
@@ -365,6 +390,7 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         sinkHold: Long,
         targetFrame: Long,
         index: Int,
+        backward: Boolean,
     ) {
         val target = targetFrame
         val expectedCount = index + 1
@@ -372,7 +398,7 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         if (s.phase != VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED) throw FailClosed("flush_before_sink_park:${s.phase.name.lowercase()}")
         seekFlushRequestedWhilePaused = true
         val flushAt = SystemClock.elapsedRealtime()
-        if (!s.requestFlush(declared - target, target)) throw FailClosed("sink_flush_request_rejected:${s.phase.name.lowercase()}")
+        if (!s.requestFlush(declared - target, target, backward)) throw FailClosed("sink_flush_request_rejected:${s.phase.name.lowercase()}")
         val ackDeadline = flushAt + FLUSH_ACK_TIMEOUT_MS
         while (!s.awaitFlushed(WAIT_SLICE_MS, expectedCount)) {
             pollSeekWait()
@@ -385,13 +411,14 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
             k.playStateBeforeFlush == AudioTrack.PLAYSTATE_PAUSED && k.playStateAfterFlush == AudioTrack.PLAYSTATE_PAUSED &&
             k.framesWrittenAtFlush == sinkHold && k.framesReadAtFlush == sinkHold &&
             k.postSeekExpectedFrames == declared - target && k.readBudgetFrames == sinkHold + (declared - target) &&
-            k.seekTargetFrame == target && k.timestampPollsDuringFlush == 0L &&
+            k.seekTargetFrame == target && k.timestampPollsDuringFlush == 0L && k.seekDeclaredBackward == backward &&
             s.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED && machine.currentState == TransportState.PAUSED
         if (!ok) {
             throw FailClosed(
                 "sink_flush_verification:count=${k.flushCount}:requests=${k.flushRequestCount}:before=${k.playStateBeforeFlush}:" +
                     "after=${k.playStateAfterFlush}:written=${k.framesWrittenAtFlush}:read=${k.framesReadAtFlush}:" +
-                    "expected=${k.postSeekExpectedFrames}:budget=${k.readBudgetFrames}:sink=${s.phase.name.lowercase()}:want=$expectedCount",
+                    "expected=${k.postSeekExpectedFrames}:budget=${k.readBudgetFrames}:sink=${s.phase.name.lowercase()}:want=$expectedCount:" +
+                    "backward=${k.seekDeclaredBackward}:declared=$backward",
             )
         }
     }
@@ -448,6 +475,7 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         targetFrame: Long,
         index: Int,
         nextContentHoldFrame: Long,
+        backward: Boolean,
     ) {
         val hold = contentHold
         val target = targetFrame
@@ -461,6 +489,7 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
                 staleGeneration = seekStaleGeneration,
                 index = index,
                 nextHoldFrame = nextContentHoldFrame,
+                backward = backward,
             ),
         )
         if (!requested) throw FailClosed("feed_reanchor_request_rejected")
@@ -472,6 +501,7 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
         }
         seekReanchorWaitMs = SystemClock.elapsedRealtime() - reanchorAt
         if (!(f.reanchorOk && f.seekReanchorCount == expectedCount)) throw FailClosed("feed_reanchor_failed:${f.exitReason}")
+        if (f.seekBackward != backward) throw FailClosed("feed_reanchor_direction_mismatch:${f.seekBackward}:$backward")
         if (machine.currentState != TransportState.PAUSED) throw FailClosed("reanchor_state_moved:${machine.currentState.name.lowercase()}")
 
         val prerollAt = SystemClock.elapsedRealtime()
@@ -500,12 +530,16 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
     // Transport still PAUSED: the sink thread plays the flushed instance,
     // opens the seek epoch at T and publishes RUNNING before this returns.
     // Unpark count is cumulative across the whole session, so the expected
-    // count is this seek's 1-based ordinal.
+    // count is this seek's 1-based ordinal. Y17: the sink must have opened
+    // the epoch through the direction it was declared (its
+    // clockDeclaredBackwardOpenCalls is the 1-based ordinal only for a
+    // backward seek, else 0); the clock snapshots stay telemetry.
     private fun unparkSinkLocked(
         s: VanguardRealtimeAudioPlaybackSinkBridge,
         machine: VanguardRealtimePlaybackTransportStateMachine,
         targetFrame: Long,
         index: Int,
+        backward: Boolean,
     ) {
         val target = targetFrame
         val expectedCount = index + 1
@@ -531,6 +565,12 @@ class VanguardRealtimeAudioPlaybackSeekSequencer(
             k.seekEpochBaseFrame != target
         ) {
             throw FailClosed("seek_epoch_not_opened:${k.unparkCount}:${k.seekEpochOpenedAtUnpark}:${k.seekEpochBaseFrame}:$target:$expectedCount")
+        }
+        val expectedBackwardOpens = if (backward) 1 else 0
+        if (k.seekDeclaredBackward != backward || k.clockDeclaredBackwardOpenCalls != expectedBackwardOpens) {
+            throw FailClosed(
+                "seek_epoch_direction:${k.seekDeclaredBackward}:${k.clockDeclaredBackwardOpenCalls}:declared=$backward:want=$expectedBackwardOpens",
+            )
         }
     }
 

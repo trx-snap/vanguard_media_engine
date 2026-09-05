@@ -5,9 +5,9 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeP
 
 // ── VanguardRealtimeAudioPlaybackSeekObservation (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK, Y9) ─
 //
-// Any-thread immutable view of the ONE forward seek owned by
-// [VanguardRealtimeAudioPlaybackSession], published through
-// [VanguardRealtimeAudioPlaybackSession.Snapshot.seek]. The session's
+// Any-thread immutable view of the ONE forward seek (Y17: or the ONE
+// backward seek) owned by [VanguardRealtimeAudioPlaybackSession], published
+// through [VanguardRealtimeAudioPlaybackSession.Snapshot.seek]. The session's
 // command-lock holder writes the underlying fields in the fixed seek order
 // (see the session's class comment); defaults mean "seek not armed / not
 // issued". Pure data: no lifecycle decision lives here.
@@ -59,4 +59,9 @@ data class VanguardRealtimeAudioPlaybackSeekObservation(
     val clockBeforeUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot?,
     val clockAfterUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot?,
     val decoder: VanguardRealtimePlaybackDecoderSeekTelemetry?,
+    // Y17: the armed seek is a backward seek (0 <= T <= H - 2 windows);
+    // `declaredBackward` mirrors the direction the last issued seek was
+    // declared with to the sink/feed (false on every forward run).
+    val backward: Boolean = false,
+    val declaredBackward: Boolean = false,
 )

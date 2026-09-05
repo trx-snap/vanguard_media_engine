@@ -2,8 +2,9 @@ package com.connects.vanguard_media_engine.audio_playback_graph
 
 // ── VanguardRealtimePlaybackDecoderSeekTypes (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK, Y9) ─
 //
-// Value types of [VanguardRealtimePlaybackDecoderFeed]'s single forward seek.
-// Pure data: the feed's decode thread owns every state transition behind them.
+// Value types of [VanguardRealtimePlaybackDecoderFeed]'s single forward seek
+// (Y17: or its single backward seek). Pure data: the feed's decode thread
+// owns every state transition behind them.
 
 // Coordinator-issued seek re-anchor request: the feed moves its anchor from
 // `preSeekAnchorFrame` (the hold frame it is currently held at) to
@@ -13,7 +14,10 @@ package com.connects.vanguard_media_engine.audio_playback_graph
 // second); the feed only accepts a request whose `index` matches the count of
 // reanchors already completed. `nextHoldFrame` is the next hold frame the
 // feed idles at after this reanchor (Y10b-1a, default = no further hold, i.e.
-// this is the final seek of the run).
+// this is the final seek of the run). Y17: `backward` declares that
+// `targetFrame` lies BELOW `preSeekAnchorFrame` (0 <= T < H); the feed
+// validates the direction it was declared and a backward request must be the
+// run's final seek (no `nextHoldFrame`).
 data class VanguardRealtimePlaybackDecoderSeekRequest(
     val targetFrame: Long,
     val preSeekAnchorFrame: Long,
@@ -21,6 +25,7 @@ data class VanguardRealtimePlaybackDecoderSeekRequest(
     val staleGeneration: Long,
     val index: Int = 0,
     val nextHoldFrame: Long = Long.MAX_VALUE,
+    val backward: Boolean = false,
 )
 
 // Any-thread immutable view of the feed's seek telemetry (decode thread
@@ -65,4 +70,8 @@ data class VanguardRealtimePlaybackDecoderSeekTelemetry(
     val paddedFrames: Long,
     val staleGenerationRetries: Long,
     val transientRejects: Long,
+    // Y17: direction of the last completed reanchor (false = forward / none)
+    // and the per-seek fail-closed budget on discardedPreTargetFrames.
+    val seekBackward: Boolean = false,
+    val maxPreTargetDiscardFrames: Long = 0L,
 )
