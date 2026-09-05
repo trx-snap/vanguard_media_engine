@@ -213,6 +213,16 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
         hasMultinodePlanTelemetry(seekNativeRenderStatus) ||
         hasMultinodePlanTelemetry(resumeNativeRenderStatus);
 
+    bool hasDispatcherTelemetry(String? status) =>
+        status != null &&
+        status.contains('dispatcherNodeCount=2') &&
+        status.contains('dispatcherOutputCount=1') &&
+        status.contains('dispatcherTokenCount=1');
+    final dispatcherTelemetryPass =
+        hasDispatcherTelemetry(play1NativeRenderStatus) ||
+        hasDispatcherTelemetry(seekNativeRenderStatus) ||
+        hasDispatcherTelemetry(resumeNativeRenderStatus);
+
     final pass =
         createPass &&
         play1Pass &&
@@ -224,7 +234,8 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
         resumeRenderedFrames >= 6 &&
         totalRenderedFrames >= (play1RenderedFrames + 6) &&
         disposePass &&
-        multinodePlanTelemetryPass;
+        multinodePlanTelemetryPass &&
+        dispatcherTelemetryPass;
 
     final payload = <String, dynamic>{
       'pass': pass,
@@ -243,6 +254,7 @@ class _AndroidDagPhase4B1BPlaybackControlSmokeAppState
       'seekNativeRenderStatus': seekNativeRenderStatus,
       'resumeNativeRenderStatus': resumeNativeRenderStatus,
       'multinodePlanTelemetryPass': multinodePlanTelemetryPass,
+      'dispatcherTelemetryPass': dispatcherTelemetryPass,
       'raw': raw,
     };
 

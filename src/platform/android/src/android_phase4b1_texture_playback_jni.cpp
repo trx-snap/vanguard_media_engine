@@ -21,17 +21,23 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 #include "vanguard/core/logging.h"
+#include "vanguard/core/status.h"
 #include "vanguard/graph/frame_request.h"
 #include "vanguard/graph/graph.h"
+#include "vanguard/graph/graph_execution_dispatcher.h"
 #include "vanguard/graph/graph_execution_plan.h"
+#include "vanguard/graph/gpu_frame_token.h"
 #include "vanguard/render/vulkan_backend.h"
 #include "vanguard/render/render_transform.h"
+#include "vanguard/sinks/preview_surface_sink_node.h"
+#include "vanguard/sources/hardware_buffer_source_node.h"
 
 // ---------------------------------------------------------------------------
 // AHardwareBuffer_fromHardwareBuffer dynamic lookup
@@ -55,54 +61,74 @@ AHardwareBuffer* ResolveAHardwareBufferFromJObject(JNIEnv* env, jobject jHwBuf) 
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostic DAG node types for Phase 4B1A
+// Phase 4B1 dispatcher wiring: node ids/ports and shared callback plumbing
 // ---------------------------------------------------------------------------
 
-class Diag4B1HardwareBufferSourceNode final : public vanguard::graph::Node {
-public:
-    explicit Diag4B1HardwareBufferSourceNode(std::string id)
-        : id_(std::move(id)) {
-        outputPorts_ = {{ "kVideoFrame", vanguard::graph::PortDataType::kVideoFrame }};
-    }
+constexpr const char* kDiag4B1HwSrcNodeId      = "diag4b1_hw_src";
+constexpr const char* kDiag4B1PreviewSinkNodeId = "diag4b1_preview_sink";
+constexpr const char* kDiag4B1VideoOutputPort   = "kVideoFrame";
 
-    const std::string&                  id()          const override { return id_; }
-    vanguard::graph::NodeKind           kind()        const override { return vanguard::graph::NodeKind::kSource; }
-    vanguard::graph::NodeType           type()        const override { return vanguard::graph::NodeType::kHardwareBufferSource; }
-    const std::vector<vanguard::graph::PortDescriptor>& inputPorts()  const override { return inputPorts_; }
-    const std::vector<vanguard::graph::PortDescriptor>& outputPorts() const override { return outputPorts_; }
+// Converts an imported HardwareBufferDescriptor into a GpuFrameDescriptor.
+// The two structs mirror each other field-for-field by design (see
+// vanguard/graph/gpu_frame_token.h); there is no shared conversion helper
+// because gpu_frame_token.h must stay free of any backend-owning include.
+vanguard::graph::GpuFrameDescriptor ToGpuFrameDescriptor(
+    const vanguard::render::HardwareBufferDescriptor& hwDesc) {
+    vanguard::graph::GpuFrameDescriptor desc;
+    desc.width  = hwDesc.width;
+    desc.height = hwDesc.height;
+    desc.layers = hwDesc.layers;
+    desc.format = hwDesc.format;
+    desc.stride = hwDesc.stride;
+    desc.usage  = hwDesc.usage;
+    return desc;
+}
 
-    bool     isActiveAt(uint64_t) const override { return true; }
-    uint64_t mapTimelineToLocalPts(uint64_t pts) const override { return pts; }
-    float    blendWeightAt(uint64_t)  const override { return 1.0f; }
-
-private:
-    std::string id_;
-    std::vector<vanguard::graph::PortDescriptor> inputPorts_;
-    std::vector<vanguard::graph::PortDescriptor> outputPorts_;
-};
-
-class Diag4B1PreviewSurfaceSinkNode final : public vanguard::graph::Node {
-public:
-    explicit Diag4B1PreviewSurfaceSinkNode(std::string id)
-        : id_(std::move(id)) {
-        inputPorts_ = {{ "kVideoFrame", vanguard::graph::PortDataType::kVideoFrame }};
-    }
-
-    const std::string&                  id()          const override { return id_; }
-    vanguard::graph::NodeKind           kind()        const override { return vanguard::graph::NodeKind::kSink; }
-    vanguard::graph::NodeType           type()        const override { return vanguard::graph::NodeType::kPreviewSurfaceSink; }
-    const std::vector<vanguard::graph::PortDescriptor>& inputPorts()  const override { return inputPorts_; }
-    const std::vector<vanguard::graph::PortDescriptor>& outputPorts() const override { return outputPorts_; }
-
-    bool     isActiveAt(uint64_t) const override { return true; }
-    uint64_t mapTimelineToLocalPts(uint64_t pts) const override { return pts; }
-    float    blendWeightAt(uint64_t)  const override { return 1.0f; }
-
-private:
-    std::string id_;
-    std::vector<vanguard::graph::PortDescriptor> inputPorts_;
-    std::vector<vanguard::graph::PortDescriptor> outputPorts_;
-};
+// Builds the per-frame dispatcher callback for the two-node diagnostic
+// graph: the source node publishes exactly one GpuFrameToken derived from
+// the already-imported hardware buffer handle/descriptor; the sink node
+// resolves that one token and invokes the caller-supplied render function.
+// Any node id outside this fixed pair fails closed.
+vanguard::graph::GraphExecutionNodeCallback MakePhase4B1DispatchCallback(
+    vanguard::render::HardwareBufferHandle handle,
+    const vanguard::render::HardwareBufferDescriptor& hwDescriptor,
+    const vanguard::graph::GraphExecutionPlan& plan,
+    std::function<vanguard::render::RenderFrameResult(
+        vanguard::render::HardwareBufferHandle)> renderFn,
+    vanguard::render::RenderFrameResult* outRenderResult) {
+    return [handle, hwDescriptor, &plan, renderFn, outRenderResult](
+               const vanguard::graph::ExecutionPlanNode& node,
+               const std::vector<vanguard::graph::ResolvedGpuFrameInput>& resolvedInputs,
+               std::vector<vanguard::graph::GpuFrameToken>& outOutputs)
+               -> vanguard::core::Status {
+        if (node.nodeId == kDiag4B1HwSrcNodeId) {
+            vanguard::graph::GpuFrameToken token;
+            token.handle              = handle;
+            token.descriptor          = ToGpuFrameDescriptor(hwDescriptor);
+            token.producingNodeId     = node.nodeId;
+            token.outputPortId        = kDiag4B1VideoOutputPort;
+            token.evaluatedPtsUs      = plan.evaluatedPtsUs;
+            token.evaluatedGeneration = plan.evaluatedGeneration;
+            token.hasAcquireFence     = false;
+            token.hasReleaseFence     = false;
+            outOutputs.push_back(token);
+            return vanguard::core::Status::OK();
+        }
+        if (node.nodeId == kDiag4B1PreviewSinkNodeId) {
+            if (resolvedInputs.size() != 1 ||
+                resolvedInputs[0].binding.fromNodeId != kDiag4B1HwSrcNodeId) {
+                return vanguard::core::Status(
+                    vanguard::core::StatusCode::kError,
+                    "diag4b1_preview_sink_unresolved_or_unexpected_input");
+            }
+            *outRenderResult = renderFn(resolvedInputs[0].token.handle);
+            return vanguard::core::Status::OK();
+        }
+        return vanguard::core::Status(
+            vanguard::core::StatusCode::kError,
+            "unexpected_node_" + node.nodeId);
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Phase 4B1 session structure
@@ -225,14 +251,16 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_createAndr
     }
     session->surfaceAttached = true;
 
-    auto srcNode  = std::make_shared<Diag4B1HardwareBufferSourceNode>("diag4b1_hw_src");
-    auto sinkNode = std::make_shared<Diag4B1PreviewSurfaceSinkNode>("diag4b1_preview_sink");
+    auto srcNode  = std::make_shared<vanguard::sources::HardwareBufferSourceNode>(
+        kDiag4B1HwSrcNodeId, /*timelineStartPtsUs=*/0, /*durationUs=*/UINT64_MAX);
+    auto sinkNode = std::make_shared<vanguard::sinks::PreviewSurfaceSinkNode>(
+        kDiag4B1PreviewSinkNodeId);
 
     const auto addSrc  = session->graph.addNode(srcNode);
     const auto addSink = session->graph.addNode(sinkNode);
     const auto connect = session->graph.connect(
-        "diag4b1_hw_src",       "kVideoFrame",
-        "diag4b1_preview_sink", "kVideoFrame");
+        kDiag4B1HwSrcNodeId,       kDiag4B1VideoOutputPort,
+        kDiag4B1PreviewSinkNodeId, "video_in");
 
     if (!addSrc.ok() || !addSink.ok() || !connect.ok()) {
         session->backend.detachSurface();
@@ -348,10 +376,21 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         return env->NewStringUTF(status);
     }
 
-    const auto renderResult = session->backend.renderFrame(handle);
-    const bool renderOk =
-        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+    vanguard::graph::GpuFrameTokenSession tokenSession(
+        plan.evaluatedPtsUs, plan.evaluatedGeneration);
+    vanguard::render::RenderFrameResult renderResult =
+        vanguard::render::RenderFrameResult::kUnavailable;
+    const auto callback = MakePhase4B1DispatchCallback(
+        handle, descriptor, plan,
+        [session](vanguard::render::HardwareBufferHandle h) {
+            return session->backend.renderFrame(h);
+        },
+        &renderResult);
+
+    vanguard::graph::GraphExecutionDispatcher dispatcher;
+    vanguard::graph::GraphExecutionDispatchResult dispatchResult;
+    const auto dispatchStatus =
+        dispatcher.dispatch(plan, tokenSession, callback, dispatchResult);
 
     int releaseFenceFd = -1;
     const auto releaseResult =
@@ -360,6 +399,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         ::close(releaseFenceFd);
         releaseFenceFd = -1;
     }
+
+    if (!dispatchStatus.ok()) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=dispatcher_failed;dispatcherStatus=%s",
+            static_cast<int>(frameIndex),
+            dispatchStatus.message().c_str());
+        return env->NewStringUTF(status);
+    }
+
+    const bool renderOk =
+        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
 
     if (!renderOk) {
         std::snprintf(status, sizeof(status),
@@ -385,13 +436,17 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     std::snprintf(status, sizeof(status),
         "status=PASS;frameIndex=%d;renderedFrames=%d;"
-        "renderResult=%s;releaseResult=%s;planNodeCount=%zu;planSinkCount=%zu",
+        "renderResult=%s;releaseResult=%s;planNodeCount=%zu;planSinkCount=%zu;"
+        "dispatcherNodeCount=%u;dispatcherOutputCount=%u;dispatcherTokenCount=%zu",
         static_cast<int>(frameIndex),
         session->renderedFrames,
         RenderResultName(renderResult),
         HwBufResultName(releaseResult),
         plan.nodes.size(),
-        plan.sinkNodeIds.size());
+        plan.sinkNodeIds.size(),
+        dispatchResult.nodesDispatched,
+        dispatchResult.outputsPublished,
+        tokenSession.publishedCount());
     return env->NewStringUTF(status);
 }
 
@@ -613,10 +668,21 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     transform.rotationDegrees = static_cast<uint32_t>(rotationDegrees);
     transform.mirrorHorizontal = (mirrorHorizontal == JNI_TRUE);
 
-    const auto renderResult = session->backend.renderFrame(handle, transform);
-    const bool renderOk =
-        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+    vanguard::graph::GpuFrameTokenSession tokenSession(
+        plan.evaluatedPtsUs, plan.evaluatedGeneration);
+    vanguard::render::RenderFrameResult renderResult =
+        vanguard::render::RenderFrameResult::kUnavailable;
+    const auto callback = MakePhase4B1DispatchCallback(
+        handle, descriptor, plan,
+        [session, transform](vanguard::render::HardwareBufferHandle h) {
+            return session->backend.renderFrame(h, transform);
+        },
+        &renderResult);
+
+    vanguard::graph::GraphExecutionDispatcher dispatcher;
+    vanguard::graph::GraphExecutionDispatchResult dispatchResult;
+    const auto dispatchStatus =
+        dispatcher.dispatch(plan, tokenSession, callback, dispatchResult);
 
     int releaseFenceFd = -1;
     const auto releaseResult =
@@ -625,6 +691,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         ::close(releaseFenceFd);
         releaseFenceFd = -1;
     }
+
+    if (!dispatchStatus.ok()) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=dispatcher_failed;dispatcherStatus=%s",
+            static_cast<int>(frameIndex),
+            dispatchStatus.message().c_str());
+        return env->NewStringUTF(status);
+    }
+
+    const bool renderOk =
+        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
 
     if (!renderOk) {
         std::snprintf(status, sizeof(status),
@@ -651,7 +729,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     std::snprintf(status, sizeof(status),
         "status=PASS;frameIndex=%d;renderedFrames=%d;generationId=%llu;"
         "renderResult=%s;releaseResult=%s;rotationDegrees=%d;mirrorHorizontal=%s;"
-        "planNodeCount=%zu;planSinkCount=%zu",
+        "planNodeCount=%zu;planSinkCount=%zu;"
+        "dispatcherNodeCount=%u;dispatcherOutputCount=%u;dispatcherTokenCount=%zu",
         static_cast<int>(frameIndex),
         session->renderedFrames,
         static_cast<unsigned long long>(generationIdJ),
@@ -660,6 +739,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         static_cast<int>(rotationDegrees),
         (mirrorHorizontal == JNI_TRUE) ? "true" : "false",
         plan.nodes.size(),
-        plan.sinkNodeIds.size());
+        plan.sinkNodeIds.size(),
+        dispatchResult.nodesDispatched,
+        dispatchResult.outputsPublished,
+        tokenSession.publishedCount());
     return env->NewStringUTF(status);
 }
