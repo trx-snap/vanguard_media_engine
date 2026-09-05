@@ -57,19 +57,14 @@ internal object AndroidImageOptimizer {
         }
 
         val requestedFormat = (args.get("format") as? String)?.lowercase()?.trim()
-        val resolved = resolveFormat(requestedFormat)
-        if (resolved == null) {
+        val formatToken = normalizeFormatToken(requestedFormat)
+        if (formatToken == null) {
             replyError(
                 "UNSUPPORTED_FORMAT",
                 "optimizeImage: unsupported format: ${requestedFormat ?: "<null>"}",
             )
             return
         }
-        Log.i(
-            TAG,
-            "optimizeImage: format requested=${requestedFormat ?: "<default:jpeg>"} " +
-                "resolved=${resolved.wireName} reason=${resolved.reason}",
-        )
 
         val outputPathArg = (args.get("outputPath") as? String)?.takeIf { it.isNotBlank() }
         val maxWidth = (args.get("maxWidth") as? Number)?.toInt()
@@ -90,6 +85,15 @@ internal object AndroidImageOptimizer {
         args.get("destinationIntent")
 
         Thread {
+            // resolveFormat probes HEIC/HEVC codec capability for "heic" --
+            // deferred to this background thread so codec enumeration never
+            // blocks the platform thread the MethodChannel call arrived on.
+            val resolved = resolveFormat(formatToken)
+            Log.i(
+                TAG,
+                "optimizeImage: format requested=${requestedFormat ?: "<default:jpeg>"} " +
+                    "resolved=${resolved.wireName} reason=${resolved.reason}",
+            )
             runOptimization(
                 context = context,
                 sourceFile = sourceFile,
@@ -109,25 +113,51 @@ internal object AndroidImageOptimizer {
 
     // ── Format resolution ────────────────────────────────────────────────────
 
+    // Which Bitmap/encoder path an EncodeCandidate should use. HEIC has no
+    // Bitmap.CompressFormat member, so encoder choice is its own enum rather
+    // than a nullable CompressFormat.
+    private enum class EncoderKind { JPEG, PNG, HEIC }
+
     private class ResolvedFormat(
         val wireName: String,
-        val compressFormat: Bitmap.CompressFormat,
+        val encoderKind: EncoderKind,
         val defaultExtension: String,
         val reason: String,
     )
 
-    private fun resolveFormat(requested: String?): ResolvedFormat? {
+    // Cheap, device-independent token normalization. Runs on the calling
+    // (platform) thread before any background work starts, so it must never
+    // probe hardware/codec capability -- that happens in resolveFormat below,
+    // off the platform thread.
+    private fun normalizeFormatToken(requested: String?): String? {
         val token = requested ?: "jpeg"
         return when (token) {
-            "jpeg", "jpg" -> ResolvedFormat("jpeg", Bitmap.CompressFormat.JPEG, "jpg", "direct")
-            "png" -> ResolvedFormat("png", Bitmap.CompressFormat.PNG, "png", "direct")
-            "heic" -> ResolvedFormat(
-                "jpeg",
-                Bitmap.CompressFormat.JPEG,
-                "jpg",
-                "heic_unsupported_unit_e_fallback_jpeg",
-            )
+            "jpeg", "jpg" -> "jpeg"
+            "png" -> "png"
+            "heic" -> "heic"
             else -> null
+        }
+    }
+
+    // Resolves a normalized token to its concrete encoder. For "heic" this
+    // probes device HEIC/HEVC still-encode capability via
+    // AndroidHeicImageEncoder.isSupported(), so callers must invoke this off
+    // the platform thread (see the Thread block in optimize() below).
+    private fun resolveFormat(token: String): ResolvedFormat {
+        return when (token) {
+            "jpeg" -> ResolvedFormat("jpeg", EncoderKind.JPEG, "jpg", "direct")
+            "png" -> ResolvedFormat("png", EncoderKind.PNG, "png", "direct")
+            "heic" -> if (AndroidHeicImageEncoder.isSupported()) {
+                ResolvedFormat("heic", EncoderKind.HEIC, "heic", "direct")
+            } else {
+                ResolvedFormat(
+                    "jpeg",
+                    EncoderKind.JPEG,
+                    "jpg",
+                    "heic_unsupported_device_fallback_jpeg",
+                )
+            }
+            else -> throw IllegalStateException("resolveFormat: unreachable token=$token")
         }
     }
 
@@ -262,7 +292,7 @@ internal object AndroidImageOptimizer {
             if (!adaptiveEligible) {
                 candidates.add(
                     encodeCandidate(
-                        encodeSource, resolved.compressFormat, startQuality, parentDir, finalFile.name, candidateFiles,
+                        encodeSource, resolved.encoderKind, startQuality, parentDir, finalFile.name, candidateFiles,
                     ),
                 )
             } else {
@@ -270,7 +300,7 @@ internal object AndroidImageOptimizer {
                 val qualitySchedule = buildAdaptiveQualitySchedule(startQuality, ADAPTIVE_QUALITY_FLOOR)
                 for ((index, quality) in qualitySchedule.withIndex()) {
                     val candidate = encodeCandidate(
-                        encodeSource, resolved.compressFormat, quality, parentDir, finalFile.name, candidateFiles,
+                        encodeSource, resolved.encoderKind, quality, parentDir, finalFile.name, candidateFiles,
                     )
                     candidates.add(candidate)
                     if (index == 0 && candidate.sizeBytes <= targetBytes) {
@@ -400,7 +430,7 @@ internal object AndroidImageOptimizer {
 
     private fun encodeCandidate(
         encodeSource: Bitmap,
-        compressFormat: Bitmap.CompressFormat,
+        encoderKind: EncoderKind,
         quality: Double,
         parentDir: File?,
         finalFileName: String,
@@ -409,11 +439,27 @@ internal object AndroidImageOptimizer {
         val qualityInt = (quality * 100).roundToInt().coerceIn(0, 100)
         val candidateFile = File(parentDir, "$finalFileName.tmp-${UUID.randomUUID()}")
         candidateFiles.add(candidateFile)
-        FileOutputStream(candidateFile).use { out ->
-            val compressed = encodeSource.compress(compressFormat, qualityInt, out)
-            out.flush()
-            if (!compressed) {
-                throw EncodeAttemptFailure("bitmap compress failed")
+        when (encoderKind) {
+            EncoderKind.JPEG, EncoderKind.PNG -> {
+                val compressFormat = if (encoderKind == EncoderKind.JPEG) {
+                    Bitmap.CompressFormat.JPEG
+                } else {
+                    Bitmap.CompressFormat.PNG
+                }
+                FileOutputStream(candidateFile).use { out ->
+                    val compressed = encodeSource.compress(compressFormat, qualityInt, out)
+                    out.flush()
+                    if (!compressed) {
+                        throw EncodeAttemptFailure("bitmap compress failed")
+                    }
+                }
+            }
+            EncoderKind.HEIC -> {
+                try {
+                    AndroidHeicImageEncoder.encode(encodeSource, candidateFile, qualityInt)
+                } catch (e: AndroidHeicImageEncoder.HeicEncodeException) {
+                    throw EncodeAttemptFailure("heic encode failed: ${e.message}")
+                }
             }
         }
         val size = candidateFile.length()

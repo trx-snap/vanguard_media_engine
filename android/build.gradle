@@ -101,4 +101,13 @@ dependencies {
     // Both pinned to the same 1.11.0 stable line as all other media3 artifacts above.
     implementation("androidx.media3:media3-datasource:1.11.0")
     implementation("androidx.media3:media3-database:1.11.0")
+
+    // -- Phase 5 Unit G: native HEIC still-image encode (AndroidImageOptimizer) --
+    // Official stable AndroidX HeifWriter, wrapping android.media.HeifWriter
+    // (hidden framework class) with a public API. 1.0.0 is retained as the
+    // baseline AndroidX HeifWriter dependency; its manifest still declares
+    // minSdk 28, which is handled by the example app's targeted
+    // tools:overrideLibrary rather than by raising this plugin's minSdk 24.
+    // Runtime use of HeifWriter itself remains gated to API 28+.
+    implementation("androidx.heifwriter:heifwriter:1.0.0")
 }

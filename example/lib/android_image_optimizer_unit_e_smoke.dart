@@ -4,7 +4,7 @@
 // Proof lanes:
 //   Lane A: JPEG resize (maxLongEdge 500, quality 0.82, format jpeg).
 //   Lane B: PNG encode (maxWidth 256, maxHeight 300, quality 0.5, format png).
-//   Lane C: HEIC request fallback (maxLongEdge 384, format heic -> resolved jpeg).
+//   Lane C: HEIC encode or fallback (maxLongEdge 384, format heic -> resolved heic or fallback jpeg).
 //   Lane D: ROI unsupported-platform metadata (roi enabled -> roiApplied=false, unsupported_platform).
 //   Lane E: Unsupported format sentinel preservation (format webp -> UNSUPPORTED_FORMAT, sentinel unchanged).
 //   Lane F: Missing/blank source errors (FILE_UNREADABLE and MISSING_SOURCE_PATH).
@@ -77,6 +77,63 @@ class _AndroidImageOptimizerUnitESmokeAppState
     return true;
   }
 
+  Future<bool> _isIsoBmffHeicLike(File file) async {
+    if (!await file.exists()) return false;
+    final fileLength = await file.length();
+    if (fileLength < 8) return false;
+
+    final raf = await file.open(mode: FileMode.read);
+    try {
+      final header = await raf.read(8);
+      if (header.length < 8) return false;
+
+      final boxSize =
+          (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
+      final boxType = String.fromCharCodes(header.sublist(4, 8));
+      if (boxType != 'ftyp') return false;
+
+      // Determine valid box boundary without over-parsing beyond available bytes
+      final availableBoxBytes = (boxSize >= 8 && boxSize <= fileLength)
+          ? boxSize
+          : (boxSize == 0 ? fileLength : 0);
+      if (availableBoxBytes < 8) return false;
+
+      final remaining = availableBoxBytes - 8;
+      if (remaining < 4) return false;
+
+      final body = await raf.read(remaining);
+
+      const targetBrands = <String>{
+        'heic',
+        'heix',
+        'hevc',
+        'hevx',
+        'mif1',
+        'msf1',
+      };
+
+      // Check all 4-byte aligned brands in the ftyp box body.
+      // Standard ISOBMFF layout:
+      //   body[0..3]: major_brand (file bytes 8..11)
+      //   body[4..7]: minor_version (file bytes 12..15)
+      //   body[8..]: compatible_brands list (file bytes 16..)
+      for (var offset = 0; offset + 4 <= body.length; offset += 4) {
+        final brand = String.fromCharCodes(
+          body.sublist(offset, offset + 4),
+        ).toLowerCase();
+        if (targetBrands.contains(brand)) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      await raf.close();
+    }
+  }
+
   Future<void> _runSmoke() async {
     print('ANDROID_IMAGE_OPTIMIZER_UNIT_E_SMOKE: START');
     final runId = 'unit_e_${DateTime.now().millisecondsSinceEpoch}';
@@ -123,7 +180,7 @@ class _AndroidImageOptimizerUnitESmokeAppState
               results.laneAResults ?? {'pass': false, 'error': 'not run'},
           'laneB_pngEncode':
               results.laneBResults ?? {'pass': false, 'error': 'not run'},
-          'laneC_heicFallback':
+          'laneC_heicEncodeOrFallback':
               results.laneCResults ?? {'pass': false, 'error': 'not run'},
           'laneD_roiUnsupportedPlatform':
               results.laneDResults ?? {'pass': false, 'error': 'not run'},
@@ -309,7 +366,7 @@ class _AndroidImageOptimizerUnitESmokeAppState
       results.laneBPass = false;
     }
 
-    // ── Lane C: HEIC request fallback ─────────────────────────────────────
+    // ── Lane C: HEIC encode or fallback ───────────────────────────────────
     try {
       final laneCOutputPath = '${tempDir.path}/${runId}_lane_c.heic';
       final laneCOutputFile = File(laneCOutputPath);
@@ -325,35 +382,60 @@ class _AndroidImageOptimizerUnitESmokeAppState
         ),
       );
 
-      final existsC = await laneCOutputFile.exists();
-      final lengthC = existsC ? await laneCOutputFile.length() : 0;
-      final isJpegC = await _isJpeg(laneCOutputFile);
+      final actualOutputFileC = File(resultC.outputPath);
+      if (!tempFiles.any((f) => f.path == actualOutputFileC.path)) {
+        tempFiles.add(actualOutputFileC);
+      }
 
-      results.laneCPass =
+      final existsC = await actualOutputFileC.exists();
+      final lengthC = existsC ? await actualOutputFileC.length() : 0;
+      final isJpegC = await _isJpeg(actualOutputFileC);
+      final isHeicLikeC = await _isIsoBmffHeicLike(actualOutputFileC);
+
+      final isHeicPass =
+          resultC.format == 'heic' &&
           existsC &&
           lengthC > 0 &&
-          resultC.outputPath == laneCOutputPath &&
-          resultC.format == 'jpeg' &&
           resultC.width <= 384 &&
           resultC.height <= 384 &&
-          isJpegC &&
-          resultC.fileSizeBytes == lengthC;
+          resultC.fileSizeBytes == lengthC &&
+          isHeicLikeC;
+
+      final isFallbackPass =
+          resultC.format == 'jpeg' &&
+          existsC &&
+          lengthC > 0 &&
+          resultC.width <= 384 &&
+          resultC.height <= 384 &&
+          resultC.fileSizeBytes == lengthC &&
+          isJpegC;
+
+      final fallbackObservedC = resultC.format == 'jpeg';
+      final pathKindC = resultC.format == 'heic'
+          ? 'heic'
+          : (resultC.format == 'jpeg' ? 'fallback_jpeg' : resultC.format);
+
+      results.laneCPass = isHeicPass || isFallbackPass;
 
       results.laneCResults = <String, dynamic>{
         'pass': results.laneCPass,
         'outputPath': resultC.outputPath,
         'format': resultC.format,
+        'pathKind': pathKindC,
         'width': resultC.width,
         'height': resultC.height,
         'fileSizeBytes': resultC.fileSizeBytes,
         'actualFileLength': lengthC,
+        'isHeicLike': isHeicLikeC,
         'isJpegMagic': isJpegC,
+        'fallbackObserved': fallbackObservedC,
       };
 
       print(
         'ANDROID_IMAGE_OPTIMIZER_UNIT_E_SMOKE_LANE_C: pass=${results.laneCPass} '
-        'w=${resultC.width} h=${resultC.height} format=${resultC.format} '
-        'size=${resultC.fileSizeBytes} outputPath=${resultC.outputPath}',
+        'pathKind=$pathKindC w=${resultC.width} h=${resultC.height} format=${resultC.format} '
+        'size=${resultC.fileSizeBytes} isHeicLike=$isHeicLikeC isJpegMagic=$isJpegC '
+        'fallbackObserved=$fallbackObservedC outputPath=${resultC.outputPath}',
       );
     } catch (e, st) {
       print('ANDROID_IMAGE_OPTIMIZER_UNIT_E_SMOKE_LANE_C: ERROR $e\n$st');

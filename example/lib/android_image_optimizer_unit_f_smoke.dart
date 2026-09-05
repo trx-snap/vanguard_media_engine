@@ -7,7 +7,7 @@
 //   Lane C: Adaptive target-met (maxLongEdge 900, quality 0.90, target = baseline - 1, passCount in 2..4, chosenQuality < 0.90, size <= target).
 //   Lane D: Impossible soft target best-effort (fileSizeTargetBytes = 1, success, passCount in 2..4, chosenQuality <= Lane C quality or ~= 0.35, size > 1, no hard error).
 //   Lane E: PNG non-adaptive (format png, quality 0.5, fileSizeTargetBytes = 1, passCount == 1, format png, PNG magic).
-//   Lane F: HEIC request fallback participates as JPEG (format heic, maxLongEdge 700, quality 0.90, target = calibration - 1, resolved format jpeg, passCount in 2..4, chosenQuality < 0.90).
+//   Lane F: HEIC encode or adaptive fallback (format heic, maxLongEdge 700, quality 0.90; direct HEIC passCount == 1, or fallback JPEG adaptive multipass in 2..4).
 
 // ignore_for_file: avoid_print
 
@@ -69,6 +69,63 @@ class _AndroidImageOptimizerUnitFSmokeAppState
     }
   }
 
+  Future<bool> _isIsoBmffHeicLike(File file) async {
+    if (!await file.exists()) return false;
+    final fileLength = await file.length();
+    if (fileLength < 8) return false;
+
+    final raf = await file.open(mode: FileMode.read);
+    try {
+      final header = await raf.read(8);
+      if (header.length < 8) return false;
+
+      final boxSize =
+          (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
+      final boxType = String.fromCharCodes(header.sublist(4, 8));
+      if (boxType != 'ftyp') return false;
+
+      // Determine valid box boundary without over-parsing beyond available bytes
+      final availableBoxBytes = (boxSize >= 8 && boxSize <= fileLength)
+          ? boxSize
+          : (boxSize == 0 ? fileLength : 0);
+      if (availableBoxBytes < 8) return false;
+
+      final remaining = availableBoxBytes - 8;
+      if (remaining < 4) return false;
+
+      final body = await raf.read(remaining);
+
+      const targetBrands = <String>{
+        'heic',
+        'heix',
+        'hevc',
+        'hevx',
+        'mif1',
+        'msf1',
+      };
+
+      // Check all 4-byte aligned brands in the ftyp box body.
+      // Standard ISOBMFF layout:
+      //   body[0..3]: major_brand (file bytes 8..11)
+      //   body[4..7]: minor_version (file bytes 12..15)
+      //   body[8..]: compatible_brands list (file bytes 16..)
+      for (var offset = 0; offset + 4 <= body.length; offset += 4) {
+        final brand = String.fromCharCodes(
+          body.sublist(offset, offset + 4),
+        ).toLowerCase();
+        if (targetBrands.contains(brand)) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      await raf.close();
+    }
+  }
+
   Future<void> _runSmoke() async {
     print('ANDROID_IMAGE_OPTIMIZER_UNIT_F_SMOKE: START');
     final runId = 'unit_f_${DateTime.now().millisecondsSinceEpoch}';
@@ -121,7 +178,7 @@ class _AndroidImageOptimizerUnitFSmokeAppState
               results.laneDResults ?? {'pass': false, 'error': 'not run'},
           'laneE_pngNonAdaptive':
               results.laneEResults ?? {'pass': false, 'error': 'not run'},
-          'laneF_heicAdaptiveFallback':
+          'laneF_heicEncodeOrFallback':
               results.laneFResults ?? {'pass': false, 'error': 'not run'},
         },
         'error': topLevelError,
@@ -510,10 +567,10 @@ class _AndroidImageOptimizerUnitFSmokeAppState
       results.laneEPass = false;
     }
 
-    // ── Lane F: HEIC request fallback participates as JPEG ────────────────
+    // ── Lane F: HEIC direct encode or adaptive fallback ───────────────────
     try {
       // 1. Calibration baseline (no target)
-      final laneFCalibOutputPath = '${tempDir.path}/${runId}_lane_f_calib.jpg';
+      final laneFCalibOutputPath = '${tempDir.path}/${runId}_lane_f_calib.heic';
       final laneFCalibOutputFile = File(laneFCalibOutputPath);
       tempFiles.add(laneFCalibOutputFile);
 
@@ -526,6 +583,12 @@ class _AndroidImageOptimizerUnitFSmokeAppState
           format: 'heic',
         ),
       );
+
+      final actualCalibOutputFileF = File(calibResultF.outputPath);
+      if (!tempFiles.any((f) => f.path == actualCalibOutputFileF.path)) {
+        tempFiles.add(actualCalibOutputFileF);
+      }
+
       final calibSizeF = calibResultF.fileSizeBytes;
       final targetBytesF = calibSizeF > 1 ? calibSizeF - 1 : 1;
 
@@ -545,24 +608,51 @@ class _AndroidImageOptimizerUnitFSmokeAppState
         ),
       );
 
-      final existsF = await laneFOutputFile.exists();
-      final lengthF = existsF ? await laneFOutputFile.length() : 0;
-      final isJpegF = await _isJpeg(laneFOutputFile);
-      final passCountValidF = resultF.passCount >= 2 && resultF.passCount <= 4;
-      final qualityReducedF = resultF.chosenQuality < 0.90;
-      final targetMetF = resultF.fileSizeBytes <= targetBytesF;
+      final actualOutputFileF = File(resultF.outputPath);
+      if (!tempFiles.any((f) => f.path == actualOutputFileF.path)) {
+        tempFiles.add(actualOutputFileF);
+      }
 
-      results.laneFPass =
+      final existsF = await actualOutputFileF.exists();
+      final lengthF = existsF ? await actualOutputFileF.length() : 0;
+      final isJpegF = await _isJpeg(actualOutputFileF);
+      final isHeicF = await _isIsoBmffHeicLike(actualOutputFileF);
+
+      final targetMetF = resultF.fileSizeBytes <= targetBytesF;
+      final chosenQualityNear90 = (resultF.chosenQuality - 0.90).abs() < 0.02;
+      final passCountValidJpeg =
+          resultF.passCount >= 2 && resultF.passCount <= 4;
+      final qualityReducedJpeg = resultF.chosenQuality < 0.90;
+
+      final isDirectHeicPass =
+          resultF.format == 'heic' &&
           existsF &&
           lengthF > 0 &&
-          resultF.outputPath == laneFOutputPath &&
-          resultF.format == 'jpeg' &&
           resultF.width <= 700 &&
           resultF.height <= 700 &&
           resultF.fileSizeBytes == lengthF &&
-          passCountValidF &&
-          qualityReducedF &&
+          resultF.passCount == 1 &&
+          chosenQualityNear90 &&
+          isHeicF;
+
+      final isFallbackJpegPass =
+          resultF.format == 'jpeg' &&
+          existsF &&
+          lengthF > 0 &&
+          resultF.width <= 700 &&
+          resultF.height <= 700 &&
+          resultF.fileSizeBytes == lengthF &&
+          passCountValidJpeg &&
+          qualityReducedJpeg &&
           isJpegF;
+
+      final fallbackObservedF = resultF.format == 'jpeg';
+      final directHeicNoAdaptiveF = resultF.format == 'heic';
+      final pathKindF = resultF.format == 'heic'
+          ? 'heic'
+          : (resultF.format == 'jpeg' ? 'fallback_jpeg' : resultF.format);
+
+      results.laneFPass = isDirectHeicPass || isFallbackJpegPass;
 
       results.laneFResults = <String, dynamic>{
         'pass': results.laneFPass,
@@ -570,6 +660,7 @@ class _AndroidImageOptimizerUnitFSmokeAppState
         'targetBytes': targetBytesF,
         'outputPath': resultF.outputPath,
         'format': resultF.format,
+        'pathKind': pathKindF,
         'width': resultF.width,
         'height': resultF.height,
         'fileSizeBytes': resultF.fileSizeBytes,
@@ -578,12 +669,18 @@ class _AndroidImageOptimizerUnitFSmokeAppState
         'chosenQuality': resultF.chosenQuality,
         'targetMet': targetMetF,
         'isJpegMagic': isJpegF,
+        'isHeicLike': isHeicF,
+        'fallbackObserved': fallbackObservedF,
+        'directHeicNoAdaptive': directHeicNoAdaptiveF,
       };
 
       print(
         'ANDROID_IMAGE_OPTIMIZER_UNIT_F_SMOKE_LANE_F: pass=${results.laneFPass} '
-        'calibSize=$calibSizeF target=$targetBytesF actualSize=${resultF.fileSizeBytes} '
-        'passCount=${resultF.passCount} chosenQuality=${resultF.chosenQuality} targetMet=$targetMetF',
+        'pathKind=$pathKindF format=${resultF.format} calibSize=$calibSizeF '
+        'target=$targetBytesF actualSize=${resultF.fileSizeBytes} '
+        'passCount=${resultF.passCount} chosenQuality=${resultF.chosenQuality} '
+        'targetMet=$targetMetF isHeicLike=$isHeicF isJpegMagic=$isJpegF '
+        'fallbackObserved=$fallbackObservedF directHeicNoAdaptive=$directHeicNoAdaptiveF',
       );
     } catch (e, st) {
       print('ANDROID_IMAGE_OPTIMIZER_UNIT_F_SMOKE_LANE_F: ERROR $e\n$st');
