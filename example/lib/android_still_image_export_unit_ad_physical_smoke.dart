@@ -90,6 +90,60 @@ Future<ui.Image> decodeImageFromBytes(Uint8List bytes) async {
   return frameInfo.image;
 }
 
+/// Verifies [file] begins with an ISO-BMFF `ftyp` box whose major or
+/// compatible brand advertises an HEIC-family container (`heic`, `heix`,
+/// `hevc`, `hevx`, `mif1`, `msf1`).
+Future<bool> isIsoBmffHeicLike(File file) async {
+  if (!await file.exists()) return false;
+  final fileLength = await file.length();
+  if (fileLength < 8) return false;
+
+  final raf = await file.open(mode: FileMode.read);
+  try {
+    final header = await raf.read(8);
+    if (header.length < 8) return false;
+
+    final boxSize =
+        (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
+    final boxType = String.fromCharCodes(header.sublist(4, 8));
+    if (boxType != 'ftyp') return false;
+
+    final availableBoxBytes = (boxSize >= 8 && boxSize <= fileLength)
+        ? boxSize
+        : (boxSize == 0 ? fileLength : 0);
+    if (availableBoxBytes < 8) return false;
+
+    final remaining = availableBoxBytes - 8;
+    if (remaining < 4) return false;
+
+    final body = await raf.read(remaining);
+
+    const targetBrands = <String>{
+      'heic',
+      'heix',
+      'hevc',
+      'hevx',
+      'mif1',
+      'msf1',
+    };
+
+    for (var offset = 0; offset + 4 <= body.length; offset += 4) {
+      final brand = String.fromCharCodes(
+        body.sublist(offset, offset + 4),
+      ).toLowerCase();
+      if (targetBrands.contains(brand)) {
+        return true;
+      }
+    }
+
+    return false;
+  } catch (_) {
+    return false;
+  } finally {
+    await raf.close();
+  }
+}
+
 /// Renders a source [ui.Image] onto a canvas of size [targetWidth] x [targetHeight]
 /// and encodes the result to PNG bytes.
 Future<Uint8List> renderNonSquarePngBytes({
@@ -715,7 +769,7 @@ class _AndroidStillImageExportUnitADPhysicalSmokeAppState
       // Lane 6: Unsupported format & orientation policy rejection lane
       // ══════════════════════════════════════════════════════════════════════
       print(
-        'ANDROID_STILL_IMAGE_EXPORT_UNIT_AD_LANE6: START (unsupported format/policy)',
+        'ANDROID_STILL_IMAGE_EXPORT_UNIT_AD_LANE6: START (HEIC success + unsupported format/policy rejection)',
       );
       final lane6HeicPath = '${tempDir.path}/${runId}_lane6_out.heic';
       final lane6WebpPath = '${tempDir.path}/${runId}_lane6_out.webp';
@@ -735,22 +789,64 @@ class _AndroidStillImageExportUnitADPhysicalSmokeAppState
       filesToClean.add(lane6InvalidPolicyOutputFile);
 
       try {
-        // 6a: HEIC format
+        // 6a: HEIC format (supported on capable SM-A566B -- must succeed)
+        Map<String, dynamic>? heicResult;
         String? heicErrorCode;
         try {
-          await VanguardEngine.exportImage(
+          heicResult = await VanguardEngine.exportImage(
             sourcePath: pngSourcePath,
             outputPath: lane6HeicPath,
             format: 'heic',
+            quality: 0.85,
             orientationPolicy: 'preserve',
           );
         } on PlatformException catch (pe) {
           heicErrorCode = pe.code;
         }
         final heicFileExists = await lane6HeicOutputFile.exists();
-        final heicRejected =
-            heicErrorCode == 'EXPORT_IMAGE_UNSUPPORTED_FORMAT' &&
-            !heicFileExists;
+        final heicOutputBytes = heicFileExists
+            ? await lane6HeicOutputFile.length()
+            : 0;
+        final heicIsHeicLike = heicFileExists
+            ? await isIsoBmffHeicLike(lane6HeicOutputFile)
+            : false;
+        final heicResultWidth = (heicResult?['width'] as num?)?.toInt() ?? 0;
+        final heicResultHeight = (heicResult?['height'] as num?)?.toInt() ?? 0;
+        final heicFormatField = heicResult?['format'] as String?;
+
+        // Best-effort decode: some Skia builds cannot decode HEIC directly,
+        // so a decode failure does not fail the lane -- the ftyp brand check
+        // and the platform-reported result dimensions above remain the
+        // required proof.
+        int? heicDecodedWidth;
+        int? heicDecodedHeight;
+        if (heicFileExists && heicOutputBytes > 0) {
+          try {
+            final decodedHeicImage = await decodeImageFromBytes(
+              await lane6HeicOutputFile.readAsBytes(),
+            );
+            heicDecodedWidth = decodedHeicImage.width;
+            heicDecodedHeight = decodedHeicImage.height;
+          } catch (_) {
+            heicDecodedWidth = null;
+            heicDecodedHeight = null;
+          }
+        }
+        final heicDecodedDimensionsPositive =
+            heicDecodedWidth == null ||
+            heicDecodedHeight == null ||
+            (heicDecodedWidth > 0 && heicDecodedHeight > 0);
+
+        final heicPass =
+            heicErrorCode == null &&
+            heicResult?['success'] == true &&
+            heicFileExists &&
+            heicOutputBytes > 0 &&
+            heicIsHeicLike &&
+            heicResultWidth > 0 &&
+            heicResultHeight > 0 &&
+            heicDecodedDimensionsPositive &&
+            heicFormatField == 'heic';
 
         // 6b: WEBP format
         String? webpErrorCode;
@@ -805,16 +901,26 @@ class _AndroidStillImageExportUnitADPhysicalSmokeAppState
             !invalidPolicyFileExists;
 
         lane6Pass =
-            heicRejected &&
+            heicPass &&
             webpRejected &&
             applyRotateRejected &&
             invalidPolicyRejected;
 
         lane6Map = <String, dynamic>{
           'pass': lane6Pass,
+          'heicPass': heicPass,
           'heicErrorCode': heicErrorCode,
           'heicFileExists': heicFileExists,
-          'heicRejected': heicRejected,
+          'heicOutputBytes': heicOutputBytes,
+          'heicIsHeicLike': heicIsHeicLike,
+          'heicResultWidth': heicResultWidth,
+          'heicResultHeight': heicResultHeight,
+          'heicDecodedDimensions':
+              (heicDecodedWidth != null && heicDecodedHeight != null)
+              ? '${heicDecodedWidth}x$heicDecodedHeight'
+              : null,
+          'heicFormatField': heicFormatField,
+          'heicResult': heicResult,
           'webpErrorCode': webpErrorCode,
           'webpFileExists': webpFileExists,
           'webpRejected': webpRejected,
@@ -826,7 +932,7 @@ class _AndroidStillImageExportUnitADPhysicalSmokeAppState
           'invalidPolicyRejected': invalidPolicyRejected,
         };
         print(
-          'ANDROID_STILL_IMAGE_EXPORT_UNIT_AD_LANE6: DONE (pass=$lane6Pass, heic=$heicErrorCode, webp=$webpErrorCode, applyRotate=$applyRotateErrorCode, invalidPolicy=$invalidPolicyErrorCode)',
+          'ANDROID_STILL_IMAGE_EXPORT_UNIT_AD_LANE6: DONE (pass=$lane6Pass, heicPass=$heicPass, heicBytes=$heicOutputBytes, webp=$webpErrorCode, applyRotate=$applyRotateErrorCode, invalidPolicy=$invalidPolicyErrorCode)',
         );
       } catch (e, st) {
         print('ANDROID_STILL_IMAGE_EXPORT_UNIT_AD_LANE6: ERROR: $e\n$st');

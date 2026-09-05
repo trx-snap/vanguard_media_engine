@@ -1,7 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.os.Handler
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
@@ -23,10 +22,13 @@ import kotlin.math.roundToInt
 // orientation policy (baked EXIF pixels, not metadata -- reported dimensions
 // reflect the baked transform). "applyAndRotate" is a deferred shared-sink
 // policy on iOS too, so this reports EXPORT_IMAGE_FAILED rather than
-// claiming unsupported success. Supported encode formats: JPEG/JPG and PNG
-// only -- HEIC/HEIF/WEBP and unrecognized strings are
-// EXPORT_IMAGE_UNSUPPORTED_FORMAT. Enabled `transform`/`overlay` filters are
-// known-but-unimplemented and return EXPORT_IMAGE_UNSUPPORTED_FILTER.
+// claiming unsupported success. Supported encode formats: JPEG/JPG, PNG, and
+// HEIC/HEIF (device-capability-gated via AndroidHeicImageEncoder inside the
+// session's background executor; fails closed with
+// EXPORT_IMAGE_UNSUPPORTED_FORMAT when unsupported and never falls back to
+// JPEG) -- WEBP and unrecognized strings remain EXPORT_IMAGE_UNSUPPORTED_FORMAT.
+// Enabled `transform`/`overlay` filters are known-but-unimplemented and
+// return EXPORT_IMAGE_UNSUPPORTED_FILTER.
 class AndroidStillImageExportCoordinator(
     @Suppress("UNUSED_PARAMETER") context: Context,
     private val mainHandler: Handler,
@@ -128,9 +130,10 @@ class AndroidStillImageExportCoordinator(
             return
         }
 
-        val compressFormat = when (originalFormat.lowercase()) {
-            "jpeg", "jpg" -> Bitmap.CompressFormat.JPEG
-            "png" -> Bitmap.CompressFormat.PNG
+        val encodeFormat = when (originalFormat.lowercase()) {
+            "jpeg", "jpg" -> StillImageEncodeFormat.JPEG
+            "png" -> StillImageEncodeFormat.PNG
+            "heic", "heif" -> StillImageEncodeFormat.HEIC
             else -> {
                 reply.error("EXPORT_IMAGE_UNSUPPORTED_FORMAT", "Unsupported image format: $originalFormat")
                 return
@@ -163,7 +166,7 @@ class AndroidStillImageExportCoordinator(
                 val session = AndroidStillImageExportSession(
                     sourcePath = sourcePath,
                     outputPath = outputPath,
-                    compressFormat = compressFormat,
+                    encodeFormat = encodeFormat,
                     qualityPercent = qualityPercent,
                     bakeExifOrientation = bakeExifOrientation,
                     filterDicts = filterDicts,

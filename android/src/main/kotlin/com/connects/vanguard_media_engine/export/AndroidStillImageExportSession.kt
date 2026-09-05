@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import com.connects.vanguard_media_engine.image.AndroidHeicImageEncoder
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -28,6 +29,20 @@ sealed class AndroidStillImageExportResult {
     data class Failure(val code: String, val message: String) : AndroidStillImageExportResult()
 }
 
+// ── StillImageEncodeFormat ────────────────────────────────────────────────────
+//
+// Internal encode-target representation. Bitmap.CompressFormat has no HEIC
+// member, so this enum -- not a nullable CompressFormat -- is what the
+// coordinator resolves caller format tokens into and what the session
+// dispatches on to choose between Bitmap.compress and AndroidHeicImageEncoder.
+// "heic" and "heif" tokens both resolve to HEIC; the caller-visible `format`
+// string in the response map is the coordinator's original token, untouched.
+enum class StillImageEncodeFormat {
+    JPEG,
+    PNG,
+    HEIC,
+}
+
 // ── AndroidStillImageExportSession (Phase 5-Unit AD / Phase 10-C-3L) ─────────
 //
 // Runs entirely on AndroidStillImageExportCoordinator's single background
@@ -37,12 +52,14 @@ sealed class AndroidStillImageExportResult {
 // than silently no-op), decodes the source bitmap via
 // AndroidStillImageDecoder, bakes EXIF orientation into pixels when the
 // caller requested "preserve", applies the colorMatrix chain in order,
-// encodes to a unique sibling temp file, and commits it to [outputPath]
-// using the same backup/rename/rollback lifecycle as AndroidImageOptimizer.
+// probes HEIC/HEIF device capability when [encodeFormat] is HEIC (failing
+// closed with no JPEG fallback if unsupported), encodes to a unique sibling
+// temp file, and commits it to [outputPath] using the same backup/rename/
+// rollback lifecycle as AndroidImageOptimizer.
 class AndroidStillImageExportSession(
     private val sourcePath: String,
     private val outputPath: String,
-    private val compressFormat: Bitmap.CompressFormat,
+    private val encodeFormat: StillImageEncodeFormat,
     private val qualityPercent: Int,
     private val bakeExifOrientation: Boolean,
     private val filterDicts: List<Map<*, *>>,
@@ -84,6 +101,17 @@ class AndroidStillImageExportSession(
                     }
                     else -> continue
                 }
+            }
+
+            // HEIC/HEIF device-capability probe. Runs here (on this session's
+            // background executor thread, never the platform thread) and before
+            // any decode or output mutation -- if unsupported, fail closed with
+            // no fallback and no final output created.
+            if (encodeFormat == StillImageEncodeFormat.HEIC && !AndroidHeicImageEncoder.isSupported()) {
+                return AndroidStillImageExportResult.Failure(
+                    "EXPORT_IMAGE_UNSUPPORTED_FORMAT",
+                    "HEIC/HEIF still-image export is not supported on this device.",
+                )
             }
 
             AndroidStillImageDecoder.probeBounds(sourcePath)
@@ -132,14 +160,33 @@ class AndroidStillImageExportSession(
             // ── Encode to unique sibling temp file ────────────────────────────
             val temp = File(parentDir, "${finalFile.name}.tmp-${UUID.randomUUID()}")
             tempFile = temp
-            FileOutputStream(temp).use { out ->
-                val compressed = finalBitmap.compress(compressFormat, qualityPercent, out)
-                out.flush()
-                if (!compressed) {
-                    return AndroidStillImageExportResult.Failure(
-                        "EXPORT_IMAGE_FAILED",
-                        "Bitmap compress failed for: $outputPath",
-                    )
+            when (encodeFormat) {
+                StillImageEncodeFormat.JPEG, StillImageEncodeFormat.PNG -> {
+                    val compressFormat = if (encodeFormat == StillImageEncodeFormat.JPEG) {
+                        Bitmap.CompressFormat.JPEG
+                    } else {
+                        Bitmap.CompressFormat.PNG
+                    }
+                    FileOutputStream(temp).use { out ->
+                        val compressed = finalBitmap.compress(compressFormat, qualityPercent, out)
+                        out.flush()
+                        if (!compressed) {
+                            return AndroidStillImageExportResult.Failure(
+                                "EXPORT_IMAGE_FAILED",
+                                "Bitmap compress failed for: $outputPath",
+                            )
+                        }
+                    }
+                }
+                StillImageEncodeFormat.HEIC -> {
+                    try {
+                        AndroidHeicImageEncoder.encode(finalBitmap, temp, qualityPercent)
+                    } catch (e: AndroidHeicImageEncoder.HeicEncodeException) {
+                        return AndroidStillImageExportResult.Failure(
+                            "EXPORT_IMAGE_FAILED",
+                            "HEIC encode failed: ${e.message}",
+                        )
+                    }
                 }
             }
             if (temp.length() <= 0L) {
