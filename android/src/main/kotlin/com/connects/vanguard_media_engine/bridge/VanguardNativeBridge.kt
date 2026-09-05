@@ -2352,6 +2352,31 @@ class VanguardNativeBridge(
         surfaceHeight: Int,
     ): String
 
+    // ── P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A: production native overlay ──
+    // composite seam for the narrow GLES-overlay-eligible export route
+    // (AndroidTimelineVideoEncoder). Same array/count/surface validation
+    // contract, caller-current-context requirement, and private
+    // GlesOverlayCompositor::drawOverlays helper as the seam diagnostic
+    // above (drawAndroidDagPhase5GlesExportOverlaySeam): creates/destroys no
+    // EGL context and no caller texture, and forwards already-resolved
+    // GlesOverlayLayerDescriptor fields (7 doubles per layer, in order: x,
+    // y, width, height, rotation, scale, opacity) to the same helper.
+    // overlayCount == 0 is a legal no-op draw (every array argument may then
+    // be null). Unlike the diagnostic seam, this is the production route:
+    // it returns a compact "status=OK;overlayCount=N" /
+    // "status=FAIL;reason=<reason>" string (the same key=value convention
+    // as android_vulkan_export_jni.cpp's production routes), not a JSON
+    // object, and carries no diagnostic proofBoundary.
+    external fun drawAndroidTimelineGlesExportOverlays(
+        textureIds: IntArray?,
+        textureTargets: IntArray?,
+        geometry: DoubleArray?,
+        zIndices: IntArray?,
+        overlayCount: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+    ): String
+
     // ── P5-BEAUTY-V2-GLES-RENDER: GlesBeautyV2Compositor 3-pass bilateral ────
     // beauty smoothing shader/raster + CPU-reference-parity proof diagnostic.
     // Native creates its own temporary 64x64 EGL pbuffer context (OpenGL ES

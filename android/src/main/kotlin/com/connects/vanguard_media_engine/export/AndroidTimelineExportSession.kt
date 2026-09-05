@@ -822,6 +822,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     height = requestHeight,
                     fps = requestFps,
                     bitrateBps = requestBitrate,
+                    nativeBridge = sessionNativeBridge,
                 )
             }
         }

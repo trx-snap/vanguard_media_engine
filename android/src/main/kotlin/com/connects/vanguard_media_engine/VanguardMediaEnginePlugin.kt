@@ -48,6 +48,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioTransportCoord
 import com.connects.vanguard_media_engine.diagnostics.AndroidBeautyV2GlesRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidGlesExportOverlayProductionSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesExportOverlaySeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
@@ -427,6 +428,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var glesExportOverlaySeamSmokeCoordinator:
         AndroidGlesExportOverlaySeamSmokeCoordinator? = null
 
+    // ── P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A: diagnostic coordinator ──
+    // verifying production AndroidTimelineVideoEncoder routes overlays through GLES.
+    private var glesExportOverlayProductionSmokeCoordinator:
+        AndroidGlesExportOverlayProductionSmokeCoordinator? = null
+
     // ── P5-OVERLAYS-TEXT-RASTERIZER-DIAGNOSTIC: AndroidTimelineOverlayTextRasterizer
     // helper proof smoke coordinator.
     private var timelineOverlayTextRasterizerSmokeCoordinator:
@@ -774,6 +780,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         glesExportOverlaySeamSmokeCoordinator = AndroidGlesExportOverlaySeamSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        glesExportOverlayProductionSmokeCoordinator = AndroidGlesExportOverlayProductionSmokeCoordinator(
             mainHandler = mainHandler,
         )
         timelineOverlayTextRasterizerSmokeCoordinator = AndroidTimelineOverlayTextRasterizerSmokeCoordinator(
@@ -1542,6 +1551,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android GLES export overlay seam smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidGlesExportOverlayProductionSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = glesExportOverlayProductionSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android GLES export overlay production smoke coordinator unavailable",
                     null,
                 )
             }
@@ -3163,6 +3186,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // thread and tears them down in the harness before returning.
         glesExportOverlaySeamSmokeCoordinator?.disposeAll()
         glesExportOverlaySeamSmokeCoordinator = null
+        // P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A: release the smoke executor.
+        glesExportOverlayProductionSmokeCoordinator?.disposeAll()
+        glesExportOverlayProductionSmokeCoordinator = null
         // P5-OVERLAYS-TEXT-RASTERIZER-DIAGNOSTIC: release the smoke executor.
         timelineOverlayTextRasterizerSmokeCoordinator?.disposeAll()
         timelineOverlayTextRasterizerSmokeCoordinator = null

@@ -20,6 +20,7 @@ import android.opengl.GLES20
 import android.opengl.GLUtils
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -84,6 +85,13 @@ class AndroidTimelineVideoEncoder(
     private val height: Int,
     private val fps: Int,
     private val bitrateBps: Int,
+    // P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A: optional native bridge used
+    // ONLY to composite overlays (see [drawAndSubmitFrame] /
+    // AndroidTimelineGlesOverlayRenderSession) on the narrow
+    // AndroidExportRenderBackendSelector.glesOverlayEligible shape. Callers
+    // with no overlay-aware use of this encoder (existing constructor call
+    // sites) keep working unchanged via the default.
+    private val nativeBridge: VanguardNativeBridge? = null,
 ) : AndroidTimelineVideoPassEncoder {
     data class ClipInput(
         val sourcePath: String,
@@ -181,6 +189,56 @@ class AndroidTimelineVideoEncoder(
     private var frameAvailable = false
     private val stMatrix = FloatArray(16)
 
+    // ─── GLES overlay compositing state (P5-GLES-EXPORT-OVERLAY-PRODUCTION-
+    // ROUTE-A) -- populated only by the overlay-aware [encode] override
+    // below, before delegating to the plain hard-cut [encode]. ─────────────
+    private var pendingOverlays: List<AndroidTimelineOverlayDescriptor> = emptyList()
+    private var glesOverlaySession: AndroidTimelineGlesOverlayRenderSession? = null
+    private var overlayFramesRendered = 0
+
+    /// Overlay-aware entry point (see
+    /// [AndroidTimelineVideoPassEncoder.encode]'s three-arg overload). An
+    /// empty [overlays] delegates unchanged to the transition-aware
+    /// [encode]. A non-empty [overlays] is accepted only for the narrow
+    /// shape [AndroidExportRenderBackendSelector.ExportRenderScope
+    /// .glesOverlayEligible] also requires -- hard-cut-only [transitions],
+    /// no still-image clip, no reversed clip, no clip-level Beauty V2, and a
+    /// non-null [nativeBridge] -- rejecting anything wider with a precise
+    /// machine-readable reason rather than silently dropping the overlays.
+    /// Still-image + overlays stays unsupported by this GLES route.
+    override fun encode(
+        clips: List<ClipInput>,
+        transitions: List<AndroidTimelineTransitionDescriptor>,
+        overlays: List<AndroidTimelineOverlayDescriptor>,
+        onProgress: ((Double) -> Unit)?,
+    ): EncodeResult {
+        if (overlays.isEmpty()) {
+            return encode(clips, transitions, onProgress)
+        }
+        if (transitions.any { !it.isHardCut }) {
+            return EncodeResult(
+                false,
+                AndroidTimelineVideoPassEncoder.TRANSITIONS_UNSUPPORTED_BY_BACKEND_REASON,
+                0,
+                0L,
+            )
+        }
+        if (clips.any { it.mediaKind != "video" }) {
+            return EncodeResult(false, "overlays_still_image_unsupported", 0, 0L)
+        }
+        if (clips.any { it.isReversed }) {
+            return EncodeResult(false, "overlays_reversed_clip_unsupported", 0, 0L)
+        }
+        if (clips.any { it.beautyIntensity != null }) {
+            return EncodeResult(false, "overlays_beauty_unsupported", 0, 0L)
+        }
+        if (nativeBridge == null) {
+            return EncodeResult(false, "overlays_missing_native_bridge", 0, 0L)
+        }
+        pendingOverlays = overlays
+        return encode(clips, onProgress)
+    }
+
     /// Encodes [clips] sequentially (hard-cut concatenation) into [outputPath]
     /// as a video-only MP4. Returns a structured result; never throws.
     ///
@@ -206,6 +264,22 @@ class AndroidTimelineVideoEncoder(
         try {
             setupEncoderAndMuxer()
             setupGlAndDecodeSurface()
+
+            if (pendingOverlays.isNotEmpty()) {
+                when (
+                    val prepareResult = AndroidTimelineGlesOverlayRenderSession.prepare(
+                        pendingOverlays,
+                    ) { cancelRequested }
+                ) {
+                    is AndroidTimelineGlesOverlayRenderSession.PrepareResult.Failure -> {
+                        reason = "overlay_prepare_failed:${prepareResult.code}:${prepareResult.message}"
+                        return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                    }
+                    is AndroidTimelineGlesOverlayRenderSession.PrepareResult.Success -> {
+                        glesOverlaySession = prepareResult.session
+                    }
+                }
+            }
 
             for (clip in clips) {
                 if (cancelRequested) break
@@ -252,7 +326,10 @@ class AndroidTimelineVideoEncoder(
 
             succeeded = true
             reason = "success"
-            return EncodeResult(true, reason, writtenVideoSamples, outSize)
+            return EncodeResult(
+                true, reason, writtenVideoSamples, outSize,
+                overlayFrameCount = overlayFramesRendered,
+            )
         } catch (t: Throwable) {
             reason = "exception:${t.javaClass.simpleName}"
             Log.e(TAG, "encode failed: $t", t)
@@ -569,7 +646,8 @@ class AndroidTimelineVideoEncoder(
                                 // Real transfer failed to arrive — report honestly, never fake success.
                                 return "frame_transfer_timeout:${clip.sourcePath}"
                             }
-                            drawAndSubmitFrame(clip.colorMatrix)
+                            val drawFailure = drawAndSubmitFrame(clip.colorMatrix)
+                            if (drawFailure != null) return drawFailure
                             drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
                             renderedFramesInClip++
                         } else {
@@ -717,7 +795,15 @@ class AndroidTimelineVideoEncoder(
     /// row-major) filter, applied by the OES fragment shader for this frame
     /// only -- passed explicitly rather than held as encoder-wide mutable
     /// state, so per-clip filtering never leaks across a clip boundary.
-    private fun drawAndSubmitFrame(colorMatrix: FloatArray?) {
+    ///
+    /// When [glesOverlaySession] is non-null (P5-GLES-EXPORT-OVERLAY-
+    /// PRODUCTION-ROUTE-A), every overlay active at
+    /// `framesSubmitted * frameDurationUs` is composited after this base
+    /// draw and before presentation/swap (see [compositeActiveOverlaysIfPresent]).
+    /// Returns a machine-readable failure reason on any overlay
+    /// payload/draw/upload failure -- this frame is never submitted with a
+    /// silently-dropped overlay -- or null on success.
+    private fun drawAndSubmitFrame(colorMatrix: FloatArray?): String? {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
         decodeSurfaceTexture!!.getTransformMatrix(stMatrix)
 
@@ -751,9 +837,34 @@ class AndroidTimelineVideoEncoder(
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
 
+        val overlayFailure = compositeActiveOverlaysIfPresent()
+        if (overlayFailure != null) return overlayFailure
+
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, framesSubmitted * frameDurationUs * 1000L)
         framesSubmitted++
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        return null
+    }
+
+    /// Composites every overlay active at `framesSubmitted * frameDurationUs`
+    /// (this frame's timeline instant) via [glesOverlaySession], when one is
+    /// prepared -- a legal no-op when it is null (no overlays for this
+    /// encode) or when no overlay is active at this instant. Returns a
+    /// machine-readable failure reason on any failure, or null on success;
+    /// never called with a non-null [glesOverlaySession] and a null
+    /// [nativeBridge], since the overlay-aware [encode] override rejects
+    /// that combination before this method can run.
+    private fun compositeActiveOverlaysIfPresent(): String? {
+        val session = glesOverlaySession ?: return null
+        val bridge = nativeBridge ?: return "overlays_missing_native_bridge"
+        val timelinePtsUs = framesSubmitted.toLong() * frameDurationUs
+        return when (val result = session.drawActiveOverlays(bridge, timelinePtsUs, width, height)) {
+            is AndroidTimelineGlesOverlayRenderSession.DrawResult.Success -> {
+                if (result.activeOverlayCount > 0) overlayFramesRendered++
+                null
+            }
+            is AndroidTimelineGlesOverlayRenderSession.DrawResult.Failure -> "overlay_draw_failed:${result.reason}"
+        }
     }
 
     /// Uploads [colorMatrix] (20-element, 4x5 row-major -- R,G,B,A,offset per
@@ -1066,6 +1177,10 @@ class AndroidTimelineVideoEncoder(
         if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {
             try {
                 EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+                // Close before EGL teardown -- glesOverlaySession.close() deletes
+                // GL textures and requires this same context still current.
+                glesOverlaySession?.close()
+                glesOverlaySession = null
                 if (glProgram != 0) GLES20.glDeleteProgram(glProgram)
                 if (glProgram2D != 0) GLES20.glDeleteProgram(glProgram2D)
                 if (oesTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(oesTextureId), 0)

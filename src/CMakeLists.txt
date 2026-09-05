@@ -232,6 +232,13 @@ if (ANDROID)
     # into the private GlesOverlayCompositor::drawOverlays helper above. This
     # TU creates/destroys no EGL context and no caller texture.
     "platform/android/src/android_phase5_gles_export_overlay_seam_jni.cpp"
+    # P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A: production (non-diagnostic)
+    # native overlay composite seam for the narrow GLES-overlay-eligible
+    # export route (AndroidTimelineVideoEncoder). Same caller-current-context
+    # contract and the same private GlesOverlayCompositor::drawOverlays
+    # helper as the seam diagnostic above; returns a compact status string,
+    # no JSON, no proofBoundary.
+    "platform/android/src/android_phase5_gles_export_overlay_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_overlay_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_jni.cpp"
