@@ -120,10 +120,25 @@ import kotlin.concurrent.withLock
 // on attach failure). This bridge never polls, drains or reacts to a
 // routing event; the caller-owned monitor consuming the SAME controller's
 // queue is the only consumer (see [VanguardRealtimeAudioPlaybackSession]).
+//
+// Frame source seam (Y18a, P4-AUDIO-REALTIME-PLAYBACK-FRAME-SOURCE-SEAM):
+// the four touches above on the transport state machine (owner-thread
+// check, drain, drift-sample post, stall state label) go through ONE
+// [VanguardRealtimeAudioPlaybackFrameSource] resolved once at construction:
+// [Config.stateMachine] is wrapped in the 1:1
+// [VanguardRealtimePlaybackStateMachineFrameSource] (production route,
+// unchanged behavior); [Config.frameSource] is the explicit alternative for
+// a later ring transport (Y18b). Supplying neither fails closed with
+// `frame_source_missing`, both with `ambiguous_frame_source`, at sink setup
+// before any AudioTrack call. Nothing else changes: no feedback loop, no
+// clock authority, no pacing, no thread ownership, no lifecycle ordering.
 class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     data class Config(
-        val stateMachine: VanguardRealtimePlaybackTransportStateMachine,
+        // Production frame source (Y18a): wrapped once into a
+        // [VanguardRealtimePlaybackStateMachineFrameSource]. Exactly one of
+        // `stateMachine` / `frameSource` must be supplied (class comment).
+        val stateMachine: VanguardRealtimePlaybackTransportStateMachine? = null,
         val sampleRate: Int,
         val channelCount: Int,
         val maxFramesPerMix: Int,
@@ -149,6 +164,11 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         // OnRoutingChangedListener lifecycle (class comment); it never
         // consumes a routing event itself.
         val routingController: VanguardRealtimePlaybackRoutingController? = null,
+        // Y18a explicit frame source (future Y18b ring transport), default
+        // OFF (absent). Supplying it TOGETHER with `stateMachine` fails the
+        // sink closed with `ambiguous_frame_source`; supplying neither fails
+        // closed with `frame_source_missing` (class comment).
+        val frameSource: VanguardRealtimeAudioPlaybackFrameSource? = null,
     )
 
     enum class Phase { SETUP, READY, RUNNING, PARK_REQUESTED, PARKED, EXITED }
@@ -172,6 +192,9 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         const val EXIT_SEEK_HOLD_EXCEEDED = "bounded_seek_hold_exceeded"
         const val EXIT_DEAD_OBJECT = "audio_track_dead_object"
         const val EXIT_DEAD_OBJECT_REPEATED = "audio_track_dead_object_repeated"
+        // Y18a frame-source resolution failures (sink setup, before any AudioTrack call).
+        const val EXIT_FRAME_SOURCE_MISSING = "frame_source_missing"
+        const val EXIT_AMBIGUOUS_FRAME_SOURCE = "ambiguous_frame_source"
 
         private const val TRACK_BUFFER_MARGIN_WINDOWS = 4L
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
@@ -231,6 +254,23 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     // The owned clock's writer (Y10a extraction). Written by the sink thread
     // only; any thread snapshots.
     private val clockWriter = VanguardRealtimeAudioPlaybackSinkClockWriter(config.sampleRate)
+
+    // Y18a: the ONE effective frame source, resolved once here from
+    // [Config.stateMachine] / [Config.frameSource] (never both, never
+    // neither). The constructor never throws; an unresolvable config is
+    // carried as null plus its typed reason and fails the sink closed on
+    // the sink thread at setup, before the owner-thread check and before
+    // any AudioTrack call. Read on the sink thread only (drain, drift post).
+    private val frameSource: VanguardRealtimeAudioPlaybackFrameSource? = when {
+        config.stateMachine != null && config.frameSource != null -> null
+        config.frameSource != null -> config.frameSource
+        config.stateMachine != null -> VanguardRealtimePlaybackStateMachineFrameSource(config.stateMachine)
+        else -> null
+    }
+    private val frameSourceFailReason: String = when {
+        config.stateMachine != null && config.frameSource != null -> EXIT_AMBIGUOUS_FRAME_SOURCE
+        else -> EXIT_FRAME_SOURCE_MISSING
+    }
 
     // ── Published telemetry (sink thread writes) ───────────────────────────
 
@@ -802,7 +842,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         clockWriterBoundOnSinkThread = clockWriter.bindWriterThread() &&
             clockWriter.boundWriterThreadId == threadId
         try {
-            threadIsTransportOwner = config.stateMachine.isOwnerThread
+            val source = requireFrameSource()
+            threadIsTransportOwner = source.isOwnerThread
             if (threadIsTransportOwner) throw FailClosed("sink_thread_is_transport_owner")
             checkDeadlineAndCancel()
             validateConfig()
@@ -866,6 +907,11 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         noteTrackCall()
         return audioTrack ?: throw FailClosed("audio_track_missing")
     }
+
+    // Y18a: the resolved frame source, or the typed fail-closed reason
+    // (`frame_source_missing` / `ambiguous_frame_source`); never an NPE.
+    private fun requireFrameSource(): VanguardRealtimeAudioPlaybackFrameSource =
+        frameSource ?: throw FailClosed(frameSourceFailReason)
 
     // Builds one AudioTrack from the frozen config; returns the buffer request
     // so a Y8b replacement can be checked against the original geometry.
@@ -1211,13 +1257,13 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             driftSamplesDropped++
             return
         }
-        val machine = config.stateMachine
-        val generation = machine.currentGeneration
+        val source = requireFrameSource()
+        val generation = source.currentGeneration
         val postedAtNs = SystemClock.elapsedRealtimeNanos() // Kotlin-only queue latency diagnostic
         driftInFlight.incrementAndGet()
         driftLastPostedGeneration = generation
         driftSamplesPosted++
-        machine.postDriftSample(
+        source.postDriftSample(
             VanguardRealtimePlaybackTransportStateMachine.DriftSampleRequest(reportedPtsUs, reportedFrame),
             expectedGeneration = generation,
         ) { result ->
@@ -1417,6 +1463,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val bytesPerFrame = 2 * config.channelCount
         val drainFrames = config.maxFramesPerMix
         val drainBuffer = ByteBuffer.allocateDirect(drainFrames * bytesPerFrame).order(ByteOrder.nativeOrder())
+        val source = requireFrameSource()
         val maxProductiveDrains = (config.declaredFrameCount / drainFrames + 1L) * DRAIN_ITERATION_SLACK +
             DRAIN_ITERATION_MARGIN
         // C6: read budget = declared until a seek flush rebases it.
@@ -1430,7 +1477,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             clockWriter.resetPassCounter()
             if (drainFrames != config.maxFramesPerMix) drainRequestSizeChanges++
             if (firstDrainAtMs < 0L) firstDrainAtMs = SystemClock.elapsedRealtime()
-            val res = config.stateMachine.drain(drainBuffer, drainFrames)
+            val res = source.drain(drainBuffer, drainFrames)
             drainCalls++
             if (!res.accepted) throw FailClosed("drain_rejected:${res.reason}")
             val reply = res.reply ?: throw FailClosed("drain_null_reply")
@@ -1467,7 +1514,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                 }
                 emptyDrainCount++
                 if (SystemClock.elapsedRealtime() - lastProgressMs > DRAIN_STALL_TIMEOUT_MS) {
-                    throw FailClosed("drain_stalled:${config.stateMachine.currentState.name.lowercase()}")
+                    throw FailClosed("drain_stalled:${source.currentStateLabel}")
                 }
                 SystemClock.sleep(DRAIN_STALL_SLEEP_MS)
                 continue
