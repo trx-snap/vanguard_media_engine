@@ -2,6 +2,7 @@
 // vanguard_media_engine - P3-CAM-DUET-CAPABILITY-POLICY: Pure-Dart Duet dual-camera
 // capability policy tests.
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
@@ -928,6 +929,445 @@ void main() {
           policySingle.diagnostics['runtimeValidationCameraIdsMatch'],
           isFalse,
         );
+      },
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // 14. VGDuetDualCameraCapabilityEvaluator Async MethodChannel Tests
+  // -------------------------------------------------------------------------
+  group('VGDuetDualCameraCapabilityEvaluator async MethodChannel tests', () {
+    final binaryMessenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    const channel = MethodChannel('test_vanguard_duet_evaluator');
+    const evaluator = VGDuetDualCameraCapabilityEvaluator();
+
+    tearDown(() {
+      binaryMessenger.setMockMethodCallHandler(channel, null);
+    });
+
+    Map<String, Object?> makeRawCameraMap(String id, String lensFacing) {
+      return <String, Object?>{
+        'cameraId': id,
+        'lensFacing': lensFacing,
+        'hardwareLevel': 'full',
+        'isLogicalMultiCamera': false,
+        'physicalCameraIds': <String>[],
+        'capabilities': <String>['BACKWARD_COMPATIBLE'],
+        'previewSizes': <Map<String, Object?>>[
+          <String, Object?>{'width': 1920, 'height': 1080},
+        ],
+        'videoSizes': <Map<String, Object?>>[
+          <String, Object?>{'width': 1920, 'height': 1080},
+        ],
+        'jpegSizes': <Map<String, Object?>>[
+          <String, Object?>{'width': 1920, 'height': 1080},
+        ],
+        'yuv420Sizes': <Map<String, Object?>>[
+          <String, Object?>{'width': 1920, 'height': 1080},
+        ],
+        'fpsRanges': <Map<String, Object?>>[
+          <String, Object?>{'lower': 30, 'upper': 30},
+        ],
+        'flashAvailable': true,
+      };
+    }
+
+    test(
+      'Unsupported production hidden: allowDiagnosticSyntheticMode=false',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': false,
+              'concurrentCameraIdSets': <List<String>>[],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'single_camera_only',
+            };
+          }
+          return null;
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: false,
+          channel: channel,
+        );
+
+        expect(
+          policy.decision,
+          equals(
+            VGDuetDualCameraCapabilityDecision
+                .productionHiddenSingleCameraFallback,
+          ),
+        );
+        expect(policy.isProductionVisible, isFalse);
+        expect(policy.isProductionRealDualCamera, isFalse);
+        expect(policy.isDiagnosticSyntheticMode, isFalse);
+        expect(policy.isPhysicalDualCamera, isFalse);
+        expect(policy.selectedPrimaryCameraId, equals('0'));
+      },
+    );
+
+    test(
+      'Unsupported diagnostic synthetic: allowDiagnosticSyntheticMode=true',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': false,
+              'concurrentCameraIdSets': <List<String>>[],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'single_camera_only',
+            };
+          }
+          return null;
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: true,
+          channel: channel,
+        );
+
+        expect(
+          policy.decision,
+          equals(
+            VGDuetDualCameraCapabilityDecision.diagnosticSyntheticSingleCamera,
+          ),
+        );
+        expect(policy.isProductionVisible, isFalse);
+        expect(policy.isProductionRealDualCamera, isFalse);
+        expect(policy.isDiagnosticSyntheticMode, isTrue);
+        expect(policy.isPhysicalDualCamera, isFalse);
+        expect(policy.selectedPrimaryCameraId, equals('0'));
+        expect(
+          policy.reasons,
+          contains('diagnostic_synthetic_single_camera_enabled'),
+        );
+      },
+    );
+
+    test(
+      'Candidate without runtime validation stays hidden (no camera permission skips validator)',
+      () async {
+        var runtimeValidationAttempted = false;
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': false, // No permission
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': true,
+              'concurrentCameraIdSets': <List<String>>[
+                <String>['0', '1'],
+              ],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'concurrent_supported',
+            };
+          }
+          if (call.method ==
+              'runAndroidDagPhase3UnitFConcurrentSessionValidation') {
+            runtimeValidationAttempted = true;
+            return null;
+          }
+          return null;
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: false,
+          channel: channel,
+        );
+
+        expect(runtimeValidationAttempted, isFalse);
+        expect(
+          policy.decision,
+          equals(
+            VGDuetDualCameraCapabilityDecision
+                .productionHiddenSingleCameraFallback,
+          ),
+        );
+        expect(policy.isProductionVisible, isFalse);
+        expect(policy.isProductionRealDualCamera, isFalse);
+        expect(policy.isPhysicalDualCamera, isFalse);
+        expect(policy.reasons, contains('runtime_validation_required'));
+      },
+    );
+
+    test(
+      'Runtime supported + matching IDs exposes productionRealDualCamera',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': true,
+              'concurrentCameraIdSets': <List<String>>[
+                <String>['0', '1'],
+              ],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'concurrent_supported',
+            };
+          }
+          if (call.method ==
+              'runAndroidDagPhase3UnitFConcurrentSessionValidation') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'attemptedRuntimeValidation': true,
+              'supported': true,
+              'decision': 'supported',
+              'reasons': <String>['concurrent_session_supported'],
+              'selectedConcurrentCameraIds': <String>['0', '1'],
+              'surfacePlanCount': 4,
+              'diagnostics': <String, Object?>{'runtimeSessionSupported': true},
+            };
+          }
+          return null;
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: false,
+          channel: channel,
+        );
+
+        expect(
+          policy.decision,
+          equals(VGDuetDualCameraCapabilityDecision.productionRealDualCamera),
+        );
+        expect(policy.isProductionVisible, isTrue);
+        expect(policy.isProductionRealDualCamera, isTrue);
+        expect(policy.isPhysicalDualCamera, isTrue);
+        expect(policy.isDiagnosticSyntheticMode, isFalse);
+        expect(policy.selectedPrimaryCameraId, equals('0'));
+        expect(policy.selectedSecondaryCameraId, equals('1'));
+        expect(policy.diagnostics['runtimeValidationCameraIdsMatch'], isTrue);
+      },
+    );
+
+    test(
+      'Runtime validation supported but IDs mismatch keeps production hidden',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': true,
+              'concurrentCameraIdSets': <List<String>>[
+                <String>['0', '1'],
+              ],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'concurrent_supported',
+            };
+          }
+          if (call.method ==
+              'runAndroidDagPhase3UnitFConcurrentSessionValidation') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'attemptedRuntimeValidation': true,
+              'supported': true,
+              'decision': 'supported',
+              'reasons': <String>['concurrent_session_supported'],
+              'selectedConcurrentCameraIds': <String>['0', '2'], // Mismatch
+              'surfacePlanCount': 4,
+              'diagnostics': <String, Object?>{},
+            };
+          }
+          return null;
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: false,
+          channel: channel,
+        );
+
+        expect(
+          policy.decision,
+          equals(
+            VGDuetDualCameraCapabilityDecision
+                .productionHiddenSingleCameraFallback,
+          ),
+        );
+        expect(policy.isProductionVisible, isFalse);
+        expect(policy.isProductionRealDualCamera, isFalse);
+        expect(policy.isPhysicalDualCamera, isFalse);
+        expect(
+          policy.reasons,
+          contains('runtime_validation_camera_ids_mismatch'),
+        );
+      },
+    );
+
+    test(
+      'PlatformException on probe fails closed with probe_failed:<code>',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          throw PlatformException(
+            code: 'PROBE_FAILED',
+            message: 'native camera service dead',
+          );
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: false,
+          channel: channel,
+        );
+
+        expect(
+          policy.decision,
+          equals(VGDuetDualCameraCapabilityDecision.blocked),
+        );
+        expect(policy.isProductionVisible, isFalse);
+        expect(policy.isProductionRealDualCamera, isFalse);
+        expect(policy.isDiagnosticSyntheticMode, isFalse);
+        expect(policy.isPhysicalDualCamera, isFalse);
+        expect(policy.reasons, contains('probe_failed:PROBE_FAILED'));
+        expect(policy.diagnostics['errorCode'], equals('PROBE_FAILED'));
+      },
+    );
+
+    test(
+      'PlatformException on runtime validation fails closed with runtime_validation_failed:<code>',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': true,
+              'concurrentCameraIdSets': <List<String>>[
+                <String>['0', '1'],
+              ],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'concurrent_supported',
+            };
+          }
+          if (call.method ==
+              'runAndroidDagPhase3UnitFConcurrentSessionValidation') {
+            throw PlatformException(
+              code: 'VALIDATION_CRASH',
+              message: 'SessionConfiguration native crash',
+            );
+          }
+          return null;
+        });
+
+        final policy = await evaluator.evaluateDevicePolicy(
+          allowDiagnosticSyntheticMode: false,
+          channel: channel,
+        );
+
+        expect(
+          policy.decision,
+          equals(
+            VGDuetDualCameraCapabilityDecision
+                .productionHiddenSingleCameraFallback,
+          ),
+        );
+        expect(policy.isProductionVisible, isFalse);
+        expect(policy.isProductionRealDualCamera, isFalse);
+        expect(policy.isDiagnosticSyntheticMode, isFalse);
+        expect(policy.isPhysicalDualCamera, isFalse);
+        expect(
+          policy.reasons,
+          contains('runtime_validation_failed:VALIDATION_CRASH'),
+        );
+        expect(policy.diagnostics['errorCode'], equals('VALIDATION_CRASH'));
+      },
+    );
+
+    test(
+      'VGCameraSession.evaluateDuetCapability delegates to evaluator',
+      () async {
+        const defaultEngineChannel = MethodChannel('vanguard_media_engine');
+        binaryMessenger.setMockMethodCallHandler(defaultEngineChannel, (
+          call,
+        ) async {
+          if (call.method == 'runAndroidDagPhase3UnitACameraCapabilityProbe') {
+            return <String, Object?>{
+              'success': true,
+              'apiLevel': 34,
+              'hasCameraPermission': true,
+              'thermalStatus': 0,
+              'thermalStatusName': 'none',
+              'cameraCount': 2,
+              'supportsConcurrentCamera': false,
+              'concurrentCameraIdSets': <List<String>>[],
+              'cameras': <Map<String, Object?>>[
+                makeRawCameraMap('0', 'back'),
+                makeRawCameraMap('1', 'front'),
+              ],
+              'fallbackRecommendation': 'single_camera_only',
+            };
+          }
+          return null;
+        });
+
+        try {
+          final policy = await VGCameraSession.evaluateDuetCapability(
+            allowDiagnosticSyntheticMode: true,
+          );
+
+          expect(
+            policy.decision,
+            equals(
+              VGDuetDualCameraCapabilityDecision
+                  .diagnosticSyntheticSingleCamera,
+            ),
+          );
+          expect(policy.isProductionVisible, isFalse);
+          expect(policy.isDiagnosticSyntheticMode, isTrue);
+        } finally {
+          binaryMessenger.setMockMethodCallHandler(defaultEngineChannel, null);
+        }
       },
     );
   });

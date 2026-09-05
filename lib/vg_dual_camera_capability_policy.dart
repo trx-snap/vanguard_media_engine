@@ -2,13 +2,16 @@
 // vanguard_media_engine - P3-CAM-DUET-CAPABILITY-POLICY: Production Dual Camera/Duet
 // capability gating and unsupported-device synthetic diagnostic continuation policy.
 //
-// Pure Dart policy planner. Evaluates camera hardware capability, Camera2 readiness,
-// session configuration plan, and runtime concurrent validation reports to decide
-// whether production real dual camera is permitted, or whether a single-camera fallback
-// or diagnostic synthetic single-camera development mode should be used.
-// No MethodChannel, no camera open, no permission request, and no native calls.
+// Synchronous policy planning is pure Dart (evaluating camera hardware
+// capability, Camera2 readiness, session configuration plan, and runtime
+// concurrent validation reports to determine admission without native calls).
+// The asynchronous capability evaluator uses existing probe and validation
+// MethodChannel routes to query hardware capabilities and validate concurrent
+// configurations; it never opens cameras directly or allocates camera capture
+// pipelines.
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'vg_camera_hardware_capability_report.dart';
 import 'vg_camera2_concurrent_session_validation.dart';
@@ -375,5 +378,204 @@ final class VGDuetDualCameraCapabilityPlanner {
       selectedPrimaryCameraId: selectedPrimaryId,
       selectedSecondaryCameraId: selectedSecondaryId,
     );
+  }
+}
+
+/// Async orchestrator that probes Android Camera2 hardware capabilities,
+/// evaluates readiness and session plans, performs guarded runtime validation
+/// when eligible, and evaluates the final deterministic [VGDuetDualCameraCapabilityPolicy].
+class VGDuetDualCameraCapabilityEvaluator {
+  const VGDuetDualCameraCapabilityEvaluator({
+    this.readinessPlanner = const VGCamera2ReadinessPlanner(),
+    this.sessionConfigurationPlanner =
+        const VGCamera2SessionConfigurationPlanner(),
+    this.policyPlanner = const VGDuetDualCameraCapabilityPlanner(),
+  });
+
+  final VGCamera2ReadinessPlanner readinessPlanner;
+  final VGCamera2SessionConfigurationPlanner sessionConfigurationPlanner;
+  final VGDuetDualCameraCapabilityPlanner policyPlanner;
+
+  /// Evaluates device hardware, Camera2 readiness, session plan, and optional
+  /// runtime concurrent session validation to determine the production and
+  /// diagnostic capability policy.
+  ///
+  /// Fails closed on [PlatformException] or generic runtime failure, never
+  /// throwing and never exposing real dual camera without runtime validation.
+  Future<VGDuetDualCameraCapabilityPolicy> evaluateDevicePolicy({
+    bool allowDiagnosticSyntheticMode = false,
+    MethodChannel? channel,
+  }) async {
+    final VGCameraHardwareCapabilityReport report;
+    try {
+      report =
+          await VGCameraHardwareCapabilityReport.probeAndroidCamera2Capabilities(
+            channel: channel,
+          );
+    } on PlatformException catch (e) {
+      return VGDuetDualCameraCapabilityPolicy(
+        decision: VGDuetDualCameraCapabilityDecision.blocked,
+        reasons: <String>['probe_failed:${e.code}'],
+        diagnostics: <String, Object?>{
+          'stage': 'probe',
+          'error': e.toString(),
+          'errorCode': e.code,
+          'errorMessage': e.message,
+          'errorDetails': e.details,
+        },
+        isProductionVisible: false,
+        isProductionRealDualCamera: false,
+        isDiagnosticSyntheticMode: false,
+        isPhysicalDualCamera: false,
+      );
+    } catch (e) {
+      return VGDuetDualCameraCapabilityPolicy(
+        decision: VGDuetDualCameraCapabilityDecision.blocked,
+        reasons: const <String>['probe_failed:error'],
+        diagnostics: <String, Object?>{'stage': 'probe', 'error': e.toString()},
+        isProductionVisible: false,
+        isProductionRealDualCamera: false,
+        isDiagnosticSyntheticMode: false,
+        isPhysicalDualCamera: false,
+      );
+    }
+
+    try {
+      final readiness = readinessPlanner.evaluate(report);
+      final sessionPlan = sessionConfigurationPlanner.evaluate(
+        report: report,
+        readinessPlan: readiness,
+      );
+
+      VGCamera2ConcurrentSessionValidationReport? validationReport;
+      if (sessionPlan.isConcurrentValidationCandidate &&
+          report.hasCameraPermission) {
+        try {
+          validationReport =
+              await VGCamera2ConcurrentSessionValidationReport.validateAndroidCamera2ConcurrentSessionConfiguration(
+                plan: sessionPlan,
+                channel: channel,
+              );
+        } on PlatformException catch (e) {
+          final reasons = <String>[];
+          void addReason(String r) {
+            if (!reasons.contains(r)) reasons.add(r);
+          }
+
+          for (final r in readiness.reasons) {
+            addReason(r);
+          }
+          for (final r in sessionPlan.reasons) {
+            addReason(r);
+          }
+          addReason('runtime_validation_failed:${e.code}');
+
+          final selectedPrimaryId =
+              readiness.selectedPrimaryCameraId ??
+              (report.cameras.isNotEmpty
+                  ? report.cameras.first.cameraId
+                  : null);
+          final selectedSecondaryId = readiness.selectedSecondaryCameraId;
+
+          return VGDuetDualCameraCapabilityPolicy(
+            decision: VGDuetDualCameraCapabilityDecision
+                .productionHiddenSingleCameraFallback,
+            reasons: reasons,
+            diagnostics: <String, Object?>{
+              'stage': 'runtime_validation',
+              'cameraCount': report.cameraCount,
+              'supportsConcurrentCamera': report.supportsConcurrentCamera,
+              'readinessDecision': readiness.decision.name,
+              'sessionConfigurationDecision': sessionPlan.decision.name,
+              'requiresRuntimeSessionValidation':
+                  sessionPlan.requiresRuntimeSessionValidation,
+              'hasCameraPermission': report.hasCameraPermission,
+              'selectedPrimaryCameraId': selectedPrimaryId,
+              'selectedSecondaryCameraId': selectedSecondaryId,
+              'primaryCameraId': selectedPrimaryId,
+              'secondaryCameraId': selectedSecondaryId,
+              'error': e.toString(),
+              'errorCode': e.code,
+              'errorMessage': e.message,
+              'errorDetails': e.details,
+            },
+            isProductionVisible: false,
+            isProductionRealDualCamera: false,
+            isDiagnosticSyntheticMode: false,
+            isPhysicalDualCamera: false,
+            selectedPrimaryCameraId: selectedPrimaryId,
+            selectedSecondaryCameraId: selectedSecondaryId,
+          );
+        } catch (e) {
+          final reasons = <String>[];
+          void addReason(String r) {
+            if (!reasons.contains(r)) reasons.add(r);
+          }
+
+          for (final r in readiness.reasons) {
+            addReason(r);
+          }
+          for (final r in sessionPlan.reasons) {
+            addReason(r);
+          }
+          addReason('runtime_validation_failed:error');
+
+          final selectedPrimaryId =
+              readiness.selectedPrimaryCameraId ??
+              (report.cameras.isNotEmpty
+                  ? report.cameras.first.cameraId
+                  : null);
+          final selectedSecondaryId = readiness.selectedSecondaryCameraId;
+
+          return VGDuetDualCameraCapabilityPolicy(
+            decision: VGDuetDualCameraCapabilityDecision
+                .productionHiddenSingleCameraFallback,
+            reasons: reasons,
+            diagnostics: <String, Object?>{
+              'stage': 'runtime_validation',
+              'cameraCount': report.cameraCount,
+              'supportsConcurrentCamera': report.supportsConcurrentCamera,
+              'readinessDecision': readiness.decision.name,
+              'sessionConfigurationDecision': sessionPlan.decision.name,
+              'requiresRuntimeSessionValidation':
+                  sessionPlan.requiresRuntimeSessionValidation,
+              'hasCameraPermission': report.hasCameraPermission,
+              'selectedPrimaryCameraId': selectedPrimaryId,
+              'selectedSecondaryCameraId': selectedSecondaryId,
+              'primaryCameraId': selectedPrimaryId,
+              'secondaryCameraId': selectedSecondaryId,
+              'error': e.toString(),
+            },
+            isProductionVisible: false,
+            isProductionRealDualCamera: false,
+            isDiagnosticSyntheticMode: false,
+            isPhysicalDualCamera: false,
+            selectedPrimaryCameraId: selectedPrimaryId,
+            selectedSecondaryCameraId: selectedSecondaryId,
+          );
+        }
+      }
+
+      return policyPlanner.evaluate(
+        report: report,
+        readinessPlan: readiness,
+        sessionConfigurationPlan: sessionPlan,
+        runtimeValidationReport: validationReport,
+        allowDiagnosticSyntheticMode: allowDiagnosticSyntheticMode,
+      );
+    } catch (e) {
+      return VGDuetDualCameraCapabilityPolicy(
+        decision: VGDuetDualCameraCapabilityDecision.blocked,
+        reasons: const <String>['evaluator_failed:error'],
+        diagnostics: <String, Object?>{
+          'stage': 'evaluator',
+          'error': e.toString(),
+        },
+        isProductionVisible: false,
+        isProductionRealDualCamera: false,
+        isDiagnosticSyntheticMode: false,
+        isPhysicalDualCamera: false,
+      );
+    }
   }
 }

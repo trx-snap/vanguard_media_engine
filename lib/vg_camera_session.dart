@@ -30,6 +30,7 @@ import 'vg_graph_transaction.dart';
 import 'vg_live_preview_config.dart';
 import 'vg_recording_stats.dart';
 import 'vg_multicam_recording_stats.dart';
+import 'vg_dual_camera_capability_policy.dart';
 import 'vg_photo_capture_result.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1255,6 +1256,22 @@ final class VGCameraSession {
     } on PlatformException {
       return [];
     }
+  }
+
+  /// Evaluates device capability and gating policy for Duet / Dual Camera capture.
+  ///
+  /// Real production dual-camera capture is permitted only when Android hardware
+  /// advertises concurrent camera sets and runtime validation confirms the
+  /// selected concurrent session configuration. Unsupported hardware fails closed
+  /// and hides dual camera from production; diagnostic synthetic single-camera
+  /// mode is admitted only when [allowDiagnosticSyntheticMode] is true.
+  static Future<VGDuetDualCameraCapabilityPolicy> evaluateDuetCapability({
+    bool allowDiagnosticSyntheticMode = false,
+  }) {
+    return const VGDuetDualCameraCapabilityEvaluator().evaluateDevicePolicy(
+      channel: _channel,
+      allowDiagnosticSyntheticMode: allowDiagnosticSyntheticMode,
+    );
   }
 
   /// MC-3: Measures the ISP bandwidth cost of configuring an
