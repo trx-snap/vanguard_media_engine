@@ -92,12 +92,40 @@ import kotlin.concurrent.withLock
 // released exactly once on every path (at decoder EOS, or in the owner's
 // finally block).
 //
+// Y19 (P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME): exactly
+// ONE bounded pause/resume cycle, requested from any non-owner thread and
+// EXECUTED on the ring-owner thread through a control request/latch that
+// mirrors [DrainRequest] ([quiesceFeedForPause], [pauseTransport],
+// [assertPausedHoldFrozen], [resumeTransport]); the coordinator never
+// touches the native X15 entry points itself. Rules:
+//   - A pause is entered ONLY at a clean feed boundary: no staged slice
+//     (pendingSliceFrames == 0), no latched pump lockstep chunk, no
+//     dequeued codec output outstanding, and the timeline not yet fully
+//     ingested; anything else fails closed with a typed reason
+//     ([REASON_PAUSE_NOT_AT_CLEAN_BOUNDARY]).
+//   - Physics: in steady state the owner lives INSIDE the pump's make-room
+//     stall (source ring full) and only leaves it when a sink drain frees
+//     output room; once the sink is parked no clean boundary can be reached
+//     any more. [quiesceFeedForPause] therefore holds the feed at the NEXT
+//     clean boundary while the sink is still draining (drains keep being
+//     serviced, no decode/ingest, no EOS poll), so the scenario can park the
+//     sink first and then pause the ring at that already-clean boundary.
+//   - While ring-paused the owner loop runs NO feedStep and NO EOS poll: it
+//     services control requests, deadline/cancel, and rejects any drain
+//     inline ([REASON_DRAIN_WHILE_PAUSED], never a native read). The
+//     scenario parks the sink first, so zero drains are expected during the
+//     hold; any that arrive are counted as telemetry.
+//   - Native pause / hold-frozen / resume proofs are the X15 owner-thread
+//     entry points of the native session wrapper; their verdicts are folded
+//     into [PauseResumeTelemetry] together with the Kotlin-side frame /
+//     dispatch totals at pause, after the hold, and at resume.
+//
 // Honest non-claims: diagnostic real-decoder ring frame-source proof only.
 // No feedback control loop, no pacing correction, no resampling, no
 // currentPosition authority switch, no A/V sync closure, no seek, no
-// pause/resume, no product/editor/app/ConnectsApp/iOS/streaming/cache, no
-// fleet claim, no change to the sink, the seam, the production feed, the
-// session, the native session wrapper, or any X4..X15 entry point.
+// product/editor/app/ConnectsApp/iOS/streaming/cache, no fleet claim, no
+// change to the sink, the seam, the production feed, the session, the
+// native session wrapper, or any X4..X15 entry point.
 class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     private val config: Config,
 ) : VanguardRealtimeAudioPlaybackFrameSource {
@@ -120,7 +148,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
 
     enum class Stage {
         CREATED, OPENING, FORMAT_PROBE, GEOMETRY_FROZEN, SESSION_CREATED, PRE_ROLL, READY,
-        TRANSPORT_START, ACTIVE_DRAIN, DECODER_EOS, EOS_SET, CLOSING, CLOSED, FAILED,
+        TRANSPORT_START, ACTIVE_DRAIN, PAUSED, DECODER_EOS, EOS_SET, CLOSING, CLOSED, FAILED,
     }
 
     class FailClosed(val reason: String) : Exception(reason)
@@ -164,6 +192,86 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         val extractorReleaseCount: Int,
         val mediaReleaseClean: Boolean,
         val mediaReleasedAtDecoderEos: Boolean,
+    )
+
+    // Y19 pause/resume cycle facts (owner thread writes, requester-side
+    // counters are atomics). Every "AtPause" / "AfterHold" / "AtResume"
+    // total is captured on the owner thread right after the corresponding
+    // native proof returned; -1 / false means "never reached".
+    data class PauseResumeTelemetry(
+        // Requester-side control accounting (any thread).
+        val quiesceRequests: Long,
+        val pauseRequests: Long,
+        val holdAssertRequests: Long,
+        val resumeRequests: Long,
+        val controlRequestsOnOwnerThread: Long,
+        val controlOverlapRejects: Long,
+        val controlWaitTimeouts: Long,
+        val lastControlTimeoutKind: String,
+        val lastControlRejectReason: String,
+        // Pre-park feed quiesce (hold at the next clean boundary).
+        val quiesceAckOk: Boolean,
+        val quiesceExecutedOnOwnerThread: Boolean,
+        val quiesceWallMs: Long,
+        val feedStepsWhileQuiesced: Long,
+        // Pause (native Pause command + processed-snapshot proof).
+        val pauseAckOk: Boolean,
+        val pauseExecutedOnOwnerThread: Boolean,
+        val pauseQuiescedFirst: Boolean,
+        val pauseCleanBoundaryOk: Boolean,
+        val pausePendingSliceFramesAtRequest: Int,
+        val pausePumpPendingChunkAtRequest: Boolean,
+        val pauseCodecOutputHeldAtRequest: Boolean,
+        val pauseIngestCompleteAtRequest: Boolean,
+        val nativePauseProofOk: Boolean,
+        val pauseCommandSeq: Long,
+        val pauseWallMs: Long,
+        val dispatchCountAtPause: Long,
+        val totalFramesPushedAtPause: Long,
+        val nextDispatchFrameAtPause: Long,
+        val framesPendingAtPause: Long,
+        val pausedWaitsAtPause: Long,
+        val framesReadBySinkAtPause: Long,
+        val drainsServicedAtPause: Long,
+        val pumpFramesAcceptedAtPause: Long,
+        val framesAcceptedTrack0AtPause: Long,
+        val framesAcceptedTrack1AtPause: Long,
+        val framesDecodedAtPause: Long,
+        val stageBeforePause: String,
+        // Paused hold (snapshot-only frozen proof).
+        val holdAssertAckOk: Boolean,
+        val holdAssertExecutedOnOwnerThread: Boolean,
+        val nativeHoldFrozenProofOk: Boolean,
+        val holdAssertObservedNs: Long,
+        val dispatchCountAfterHold: Long,
+        val totalFramesPushedAfterHold: Long,
+        val pausedWaitsAfterHold: Long,
+        val framesReadBySinkAfterHold: Long,
+        val drainsServicedAfterHold: Long,
+        val pumpFramesAcceptedAfterHold: Long,
+        // Owner-loop activity while paused (all structurally zero).
+        val ownerLoopIterationsWhilePaused: Long,
+        val feedStepsWhilePaused: Long,
+        val eosPollsWhilePaused: Long,
+        val decodeStepsWhilePaused: Long,
+        val makeRoomCallbacksWhilePaused: Long,
+        val pausedDrainRejectsSinkThread: Long,
+        val pausedDrainRejectsOwnerThread: Long,
+        // Resume (native Resume command + processed-snapshot proof).
+        val resumeAckOk: Boolean,
+        val resumeExecutedOnOwnerThread: Boolean,
+        val nativeResumeProofOk: Boolean,
+        val resumeCommandSeq: Long,
+        val resumeWallMs: Long,
+        val dispatchCountAtResume: Long,
+        val totalFramesPushedAtResume: Long,
+        val nativeLastPausedIntervalNs: Long,
+        val nativeTotalPausedNs: Long,
+        val pauseHoldObservedNs: Long,
+        val pauseHoldObservedMs: Long,
+        val framesReadBySinkAtResume: Long,
+        val pumpFramesAcceptedAtResume: Long,
+        val stageAfterResume: String,
     )
 
     // Adapter-side facts (owner thread + sink thread counters). The folded
@@ -231,6 +339,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         val geometry: Geometry?,
         val decoder: DecoderTelemetry,
         val native: AndroidRealtimeAudioPlaybackRingTransportFrameSource.NativeTelemetry?,
+        val pauseResume: PauseResumeTelemetry,
     )
 
     companion object {
@@ -256,6 +365,18 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         const val REASON_EOS_PAD_BUDGET = "eos_pad_budget_exceeded"
         const val REASON_DRAIN_WAIT_TIMEOUT = "real_ring_drain_wait_timeout"
         const val REASON_DRAIN_BEFORE_START = "real_ring_drain_before_start"
+        // Y19 typed control / pause reasons.
+        const val REASON_DRAIN_WHILE_PAUSED = "real_ring_drain_while_paused"
+        const val REASON_CONTROL_BEFORE_START = "real_ring_control_before_start"
+        const val REASON_QUIESCE_AFTER_INGEST_COMPLETE = "real_ring_quiesce_after_ingest_complete"
+        const val REASON_PAUSE_NOT_AT_CLEAN_BOUNDARY = "real_ring_pause_not_at_clean_boundary:"
+        const val REASON_PAUSE_ALREADY_EXERCISED = "real_ring_pause_already_exercised"
+        const val REASON_HOLD_ASSERT_NOT_PAUSED = "real_ring_hold_assert_not_paused"
+        const val REASON_HOLD_ASSERT_ALREADY_EXERCISED = "real_ring_hold_assert_already_exercised"
+        const val REASON_RESUME_NOT_PAUSED = "real_ring_resume_not_paused"
+        const val REASON_RESUME_BEFORE_HOLD_ASSERT = "real_ring_resume_before_hold_assert"
+        const val REASON_RESUME_ALREADY_EXERCISED = "real_ring_resume_already_exercised"
+        const val REASON_CONTROL_CLOSED = "real_ring_control_closed"
 
         // Frozen X3/X4 decode dequeue timeout: the owner returns to drain work quickly.
         private const val DEQUEUE_TIMEOUT_US = 2_000L
@@ -274,6 +395,17 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         @Volatile var result: VanguardRealtimeAudioPlaybackFrameSource.DrainResult? = null
     }
 
+    // Y19 owner-executed control request (same request/latch shape as
+    // [DrainRequest]): at most one pending at a time, executed in order
+    // QUIESCE -> PAUSE -> HOLD_ASSERT -> RESUME, each at most once.
+    private enum class Control { QUIESCE, PAUSE, HOLD_ASSERT, RESUME }
+
+    private class ControlRequest(val kind: Control, val enqueuedAtMs: Long) {
+        val latch = CountDownLatch(1)
+        @Volatile var ok = false
+        @Volatile var reason = ""
+    }
+
     private enum class Feed { PROGRESSED, RETRY, STALLED, IDLE }
 
     // ── Cross-thread control ───────────────────────────────────────────────
@@ -289,6 +421,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     // Guarded by requestLock. acceptingRequests flips false exactly once, by
     // the owner thread in its finally block.
     private var pendingDrain: DrainRequest? = null
+    private var pendingControl: ControlRequest? = null
     private var acceptingRequests = true
     @Volatile private var ownerThread: Thread? = null
     @Volatile private var ownerThreadId = -1L
@@ -296,6 +429,91 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     @Volatile private var stageTrace = "created"
     @Volatile private var failureReason = ""
     @Volatile private var started = false
+    // Y19 owner-thread pause gate (volatile: the sink thread rejects drains
+    // inline while paused; the coordinator reads the flags for its ordering
+    // metrics). Written on the owner thread only.
+    @Volatile private var quiesced = false
+    @Volatile private var paused = false
+
+    // ── Y19 control-request telemetry (requester side: atomics) ───────────
+
+    private val quiesceRequests = AtomicLong(0L)
+    private val pauseRequests = AtomicLong(0L)
+    private val holdAssertRequests = AtomicLong(0L)
+    private val resumeRequests = AtomicLong(0L)
+    private val controlRequestsOnOwnerThread = AtomicLong(0L)
+    private val controlOverlapRejects = AtomicLong(0L)
+    private val controlWaitTimeouts = AtomicLong(0L)
+    private val pausedDrainRejectsSinkThread = AtomicLong(0L)
+    @Volatile private var lastControlTimeoutKind = ""
+    @Volatile private var lastControlRejectReason = ""
+
+    // ── Y19 pause/resume facts (owner thread writes) ───────────────────────
+
+    @Volatile private var quiesceAckOk = false
+    @Volatile private var quiesceExecutedOnOwnerThread = false
+    @Volatile private var quiesceWallMs = -1L
+    @Volatile private var feedStepsWhileQuiesced = 0L
+    @Volatile private var pauseExercised = false
+    @Volatile private var pauseAckOk = false
+    @Volatile private var pauseExecutedOnOwnerThread = false
+    @Volatile private var pauseQuiescedFirst = false
+    @Volatile private var pauseCleanBoundaryOk = false
+    @Volatile private var pausePendingSliceFramesAtRequest = -1
+    @Volatile private var pausePumpPendingChunkAtRequest = false
+    @Volatile private var pauseCodecOutputHeldAtRequest = false
+    @Volatile private var pauseIngestCompleteAtRequest = false
+    @Volatile private var nativePauseProofOk = false
+    @Volatile private var pauseCommandSeq = -1L
+    @Volatile private var pauseWallMs = -1L
+    @Volatile private var dispatchCountAtPause = -1L
+    @Volatile private var totalFramesPushedAtPause = -1L
+    @Volatile private var nextDispatchFrameAtPause = -1L
+    @Volatile private var framesPendingAtPause = -1L
+    @Volatile private var pausedWaitsAtPause = -1L
+    @Volatile private var framesReadBySinkAtPause = -1L
+    @Volatile private var drainsServicedAtPause = -1L
+    @Volatile private var pumpFramesAcceptedAtPause = -1L
+    @Volatile private var framesAcceptedTrack0AtPause = -1L
+    @Volatile private var framesAcceptedTrack1AtPause = -1L
+    @Volatile private var framesDecodedAtPause = -1L
+    @Volatile private var decodeStepsAtPause = -1L
+    @Volatile private var stageBeforePause: Stage? = null
+    private var pausedAtNs = -1L
+    @Volatile private var holdAssertExercised = false
+    @Volatile private var holdAssertAckOk = false
+    @Volatile private var holdAssertExecutedOnOwnerThread = false
+    @Volatile private var nativeHoldFrozenProofOk = false
+    @Volatile private var holdAssertObservedNs = -1L
+    @Volatile private var dispatchCountAfterHold = -1L
+    @Volatile private var totalFramesPushedAfterHold = -1L
+    @Volatile private var pausedWaitsAfterHold = -1L
+    @Volatile private var framesReadBySinkAfterHold = -1L
+    @Volatile private var drainsServicedAfterHold = -1L
+    @Volatile private var pumpFramesAcceptedAfterHold = -1L
+    @Volatile private var ownerLoopIterationsWhilePaused = 0L
+    @Volatile private var feedStepsWhilePaused = 0L
+    @Volatile private var eosPollsWhilePaused = 0L
+    @Volatile private var decodeStepsWhilePaused = -1L
+    @Volatile private var makeRoomCallbacksWhilePaused = 0L
+    @Volatile private var pausedDrainRejectsOwnerThread = 0L
+    @Volatile private var resumeExercised = false
+    @Volatile private var resumeAckOk = false
+    @Volatile private var resumeExecutedOnOwnerThread = false
+    @Volatile private var nativeResumeProofOk = false
+    @Volatile private var resumeCommandSeq = -1L
+    @Volatile private var resumeWallMs = -1L
+    @Volatile private var dispatchCountAtResume = -1L
+    @Volatile private var totalFramesPushedAtResume = -1L
+    @Volatile private var nativeLastPausedIntervalNs = -1L
+    @Volatile private var nativeTotalPausedNs = -1L
+    @Volatile private var pauseHoldObservedNs = -1L
+    @Volatile private var framesReadBySinkAtResume = -1L
+    @Volatile private var pumpFramesAcceptedAtResume = -1L
+    @Volatile private var stageAfterResume: Stage? = null
+    // True only between MediaCodec.getOutputBuffer and releaseOutputBuffer
+    // inside [decodeStep]; a clean boundary requires it false.
+    @Volatile private var codecOutputHeld = false
 
     // ── Sink-thread telemetry (atomics: written on the sink thread, read anywhere) ─
 
@@ -406,6 +624,13 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     // Frozen geometry, non-null once [open] returned true (stage READY).
     val frozenGeometry: Geometry? get() = geometry
 
+    // Y19 cheap any-thread observations for the scenario's ordering metrics
+    // (no allocation, unlike [telemetry]).
+    val ingestCompleteObserved: Boolean get() = ingestComplete
+    val isFeedQuiesced: Boolean get() = quiesced
+    val isTransportPaused: Boolean get() = paused
+    val framesReadBySinkObserved: Long get() = framesReadBySink
+
     // ── Seam (VanguardRealtimeAudioPlaybackFrameSource) ────────────────────
 
     override val isOwnerThread: Boolean
@@ -427,6 +652,12 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             return reject("real_ring_drain_on_owner_thread")
         }
         if (maxFrames <= 0) return reject("real_ring_drain_invalid_max_frames")
+        // Y19: while ring-paused no drain may reach the owner or native
+        // (the scenario parks the sink first, so this is telemetry only).
+        if (paused) {
+            pausedDrainRejectsSinkThread.incrementAndGet()
+            return reject(REASON_DRAIN_WHILE_PAUSED)
+        }
         when (stage) {
             Stage.CLOSING, Stage.CLOSED -> {
                 drainsAfterCloseRejected.incrementAndGet()
@@ -530,6 +761,89 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             false
         }
         return ok && started && stage != Stage.FAILED
+    }
+
+    // ── Y19 pause/resume cycle (any non-owner thread requests; owner executes) ─
+
+    // Holds the feed at the NEXT clean boundary (no staged slice, no latched
+    // lockstep chunk, no codec output held, timeline not fully ingested):
+    // from then on the owner services sink drains only, without decode /
+    // ingest / EOS poll, until the cycle resumes. Blocks up to timeoutMs
+    // (the owner may need a few sink drains to finish the in-flight slice).
+    // False on timeout, overlap, before Start, after close, or when called
+    // on the owner thread. Fails the owner closed (typed) if the timeline
+    // completes before a clean boundary is reached.
+    fun quiesceFeedForPause(timeoutMs: Long): Boolean = submitControl(Control.QUIESCE, timeoutMs)
+
+    // Enqueues the ONE native Pause command on the ring-owner thread and
+    // waits for its processed-snapshot proof. Executes only at a clean
+    // boundary (normally the quiesced one); otherwise the owner fails closed
+    // with [REASON_PAUSE_NOT_AT_CLEAN_BOUNDARY] and this returns false.
+    fun pauseTransport(timeoutMs: Long): Boolean = submitControl(Control.PAUSE, timeoutMs)
+
+    // Owner-thread, snapshot-only proof that the native dispatch stayed
+    // frozen during the caller's bounded hold (no command, no read).
+    fun assertPausedHoldFrozen(timeoutMs: Long): Boolean = submitControl(Control.HOLD_ASSERT, timeoutMs)
+
+    // Enqueues the ONE native Resume command on the ring-owner thread, waits
+    // for its processed-snapshot proof and releases the feed gate.
+    fun resumeTransport(timeoutMs: Long): Boolean = submitControl(Control.RESUME, timeoutMs)
+
+    private fun submitControl(kind: Control, timeoutMs: Long): Boolean {
+        when (kind) {
+            Control.QUIESCE -> quiesceRequests.incrementAndGet()
+            Control.PAUSE -> pauseRequests.incrementAndGet()
+            Control.HOLD_ASSERT -> holdAssertRequests.incrementAndGet()
+            Control.RESUME -> resumeRequests.incrementAndGet()
+        }
+        if (ownerThreadId > 0L && Thread.currentThread().id == ownerThreadId) {
+            controlRequestsOnOwnerThread.incrementAndGet()
+            lastControlRejectReason = "real_ring_control_on_owner_thread"
+            return false
+        }
+        if (!started) {
+            lastControlRejectReason = REASON_CONTROL_BEFORE_START
+            return false
+        }
+        when (stage) {
+            Stage.CLOSING, Stage.CLOSED, Stage.FAILED -> {
+                lastControlRejectReason = REASON_CONTROL_CLOSED
+                return false
+            }
+            else -> {}
+        }
+        val request = ControlRequest(kind, SystemClock.elapsedRealtime())
+        requestLock.withLock {
+            if (!acceptingRequests) {
+                lastControlRejectReason = REASON_CONTROL_CLOSED
+                return false
+            }
+            if (pendingControl != null) {
+                controlOverlapRejects.incrementAndGet()
+                lastControlRejectReason = "real_ring_control_overlap"
+                return false
+            }
+            pendingControl = request
+            requestCondition.signalAll()
+        }
+        val remainingMs = config.deadlineAtMs - request.enqueuedAtMs
+        val waitMs = minOf(timeoutMs, remainingMs).coerceAtLeast(1L)
+        val completed = try {
+            request.latch.await(waitMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!completed) {
+            // Withdraw if still pending; an already-taken request completes
+            // on the owner regardless, but the caller sees the timeout.
+            requestLock.withLock { if (pendingControl === request) pendingControl = null }
+            controlWaitTimeouts.incrementAndGet()
+            lastControlTimeoutKind = kind.name
+            return false
+        }
+        if (!request.ok) lastControlRejectReason = request.reason
+        return request.ok
     }
 
     // Any thread: asks the owner loop to stop (pending drains are rejected).
@@ -643,8 +957,79 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             geometry = geometry,
             decoder = decoder,
             native = finalNative,
+            pauseResume = pauseResumeTelemetry(),
         )
     }
+
+    private fun pauseResumeTelemetry(): PauseResumeTelemetry = PauseResumeTelemetry(
+        quiesceRequests = quiesceRequests.get(),
+        pauseRequests = pauseRequests.get(),
+        holdAssertRequests = holdAssertRequests.get(),
+        resumeRequests = resumeRequests.get(),
+        controlRequestsOnOwnerThread = controlRequestsOnOwnerThread.get(),
+        controlOverlapRejects = controlOverlapRejects.get(),
+        controlWaitTimeouts = controlWaitTimeouts.get(),
+        lastControlTimeoutKind = lastControlTimeoutKind,
+        lastControlRejectReason = lastControlRejectReason,
+        quiesceAckOk = quiesceAckOk,
+        quiesceExecutedOnOwnerThread = quiesceExecutedOnOwnerThread,
+        quiesceWallMs = quiesceWallMs,
+        feedStepsWhileQuiesced = feedStepsWhileQuiesced,
+        pauseAckOk = pauseAckOk,
+        pauseExecutedOnOwnerThread = pauseExecutedOnOwnerThread,
+        pauseQuiescedFirst = pauseQuiescedFirst,
+        pauseCleanBoundaryOk = pauseCleanBoundaryOk,
+        pausePendingSliceFramesAtRequest = pausePendingSliceFramesAtRequest,
+        pausePumpPendingChunkAtRequest = pausePumpPendingChunkAtRequest,
+        pauseCodecOutputHeldAtRequest = pauseCodecOutputHeldAtRequest,
+        pauseIngestCompleteAtRequest = pauseIngestCompleteAtRequest,
+        nativePauseProofOk = nativePauseProofOk,
+        pauseCommandSeq = pauseCommandSeq,
+        pauseWallMs = pauseWallMs,
+        dispatchCountAtPause = dispatchCountAtPause,
+        totalFramesPushedAtPause = totalFramesPushedAtPause,
+        nextDispatchFrameAtPause = nextDispatchFrameAtPause,
+        framesPendingAtPause = framesPendingAtPause,
+        pausedWaitsAtPause = pausedWaitsAtPause,
+        framesReadBySinkAtPause = framesReadBySinkAtPause,
+        drainsServicedAtPause = drainsServicedAtPause,
+        pumpFramesAcceptedAtPause = pumpFramesAcceptedAtPause,
+        framesAcceptedTrack0AtPause = framesAcceptedTrack0AtPause,
+        framesAcceptedTrack1AtPause = framesAcceptedTrack1AtPause,
+        framesDecodedAtPause = framesDecodedAtPause,
+        stageBeforePause = stageBeforePause?.name ?: "none",
+        holdAssertAckOk = holdAssertAckOk,
+        holdAssertExecutedOnOwnerThread = holdAssertExecutedOnOwnerThread,
+        nativeHoldFrozenProofOk = nativeHoldFrozenProofOk,
+        holdAssertObservedNs = holdAssertObservedNs,
+        dispatchCountAfterHold = dispatchCountAfterHold,
+        totalFramesPushedAfterHold = totalFramesPushedAfterHold,
+        pausedWaitsAfterHold = pausedWaitsAfterHold,
+        framesReadBySinkAfterHold = framesReadBySinkAfterHold,
+        drainsServicedAfterHold = drainsServicedAfterHold,
+        pumpFramesAcceptedAfterHold = pumpFramesAcceptedAfterHold,
+        ownerLoopIterationsWhilePaused = ownerLoopIterationsWhilePaused,
+        feedStepsWhilePaused = feedStepsWhilePaused,
+        eosPollsWhilePaused = eosPollsWhilePaused,
+        decodeStepsWhilePaused = decodeStepsWhilePaused,
+        makeRoomCallbacksWhilePaused = makeRoomCallbacksWhilePaused,
+        pausedDrainRejectsSinkThread = pausedDrainRejectsSinkThread.get(),
+        pausedDrainRejectsOwnerThread = pausedDrainRejectsOwnerThread,
+        resumeAckOk = resumeAckOk,
+        resumeExecutedOnOwnerThread = resumeExecutedOnOwnerThread,
+        nativeResumeProofOk = nativeResumeProofOk,
+        resumeCommandSeq = resumeCommandSeq,
+        resumeWallMs = resumeWallMs,
+        dispatchCountAtResume = dispatchCountAtResume,
+        totalFramesPushedAtResume = totalFramesPushedAtResume,
+        nativeLastPausedIntervalNs = nativeLastPausedIntervalNs,
+        nativeTotalPausedNs = nativeTotalPausedNs,
+        pauseHoldObservedNs = pauseHoldObservedNs,
+        pauseHoldObservedMs = if (pauseHoldObservedNs >= 0L) pauseHoldObservedNs / 1_000_000L else -1L,
+        framesReadBySinkAtResume = framesReadBySinkAtResume,
+        pumpFramesAcceptedAtResume = pumpFramesAcceptedAtResume,
+        stageAfterResume = stageAfterResume?.name ?: "none",
+    )
 
     // ── Ring-owner thread ──────────────────────────────────────────────────
 
@@ -685,6 +1070,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             if (stage != Stage.FAILED) setStage(Stage.CLOSING, "close_dispose")
             else trace("close_dispose")
             rejectPendingDrain()
+            rejectPendingControl()
             releaseMediaOnce()
             finalizeSession()
             if (stage != Stage.FAILED) setStage(Stage.CLOSED, "closed")
@@ -894,6 +1280,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     // pump sleeps on its own. Never a private read.
     private fun makeRoomByServicingSinkDrain(): Long {
         makeRoomCallbacks += 1L
+        if (paused) makeRoomCallbacksWhilePaused += 1L
         val read = serviceDrainRequest(fromMakeRoom = true)
         if (read < 0L) {
             makeRoomIdleReturns += 1L
@@ -930,6 +1317,10 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     // timeline is fully ingested and the decoder is at EOS.
     private fun feedStep(allowDrain: Boolean): Feed {
         val p = requirePump()
+        // Y19 evidence counters: the owner-loop gate never calls this while
+        // paused or quiesced, so both stay zero structurally.
+        if (paused) feedStepsWhilePaused += 1L
+        if (quiesced) feedStepsWhileQuiesced += 1L
         if (pendingSliceFrames == 0 && p.hasPendingChunk) {
             if (!allowDrain) return Feed.STALLED
             p.completePendingLockstep()
@@ -1057,12 +1448,17 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                             dec.releaseOutputBuffer(outIdx, false)
                             throw FailClosed(REASON_PREFIX_DECODER + "null_output_buffer")
                         }
-                        ensureSliceCapacity(size)
-                        outBuf.position(bufferInfo.offset)
-                        outBuf.limit(bufferInfo.offset + size)
-                        slice.clear()
-                        slice.put(outBuf)
-                        dec.releaseOutputBuffer(outIdx, false)
+                        codecOutputHeld = true
+                        try {
+                            ensureSliceCapacity(size)
+                            outBuf.position(bufferInfo.offset)
+                            outBuf.limit(bufferInfo.offset + size)
+                            slice.clear()
+                            slice.put(outBuf)
+                        } finally {
+                            dec.releaseOutputBuffer(outIdx, false)
+                            codecOutputHeld = false
+                        }
                         val frames = size / bytesPerFrame
                         pendingSliceFrames = frames
                         sliceIsPad = false
@@ -1113,14 +1509,17 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
 
     // ── Owner loop ─────────────────────────────────────────────────────────
 
-    // Services Start / drain requests with priority, runs one bounded feed
-    // step (draining before and after it), then polls (snapshot-only, no
-    // ring read) for timeline completion to set the joint EOS once; idles on
-    // the request condition otherwise.
+    // Services Start / drain / control requests with priority, runs one
+    // bounded feed step (draining before and after it), then polls
+    // (snapshot-only, no ring read) for timeline completion to set the joint
+    // EOS once; idles on the request condition otherwise. Y19 gate: while
+    // quiesced or paused NO feed step and NO EOS poll run; a quiesced owner
+    // still services drains, a paused owner rejects them.
     private fun ownerLoop() {
         val s = requireSession()
         while (!stopRequested.get()) {
             ownerLoopIterations += 1L
+            if (paused) ownerLoopIterationsWhilePaused += 1L
             if (SystemClock.elapsedRealtime() > config.deadlineAtMs) throw FailClosed(REASON_DEADLINE)
             var progressed = false
             if (!started && startRequested.get()) {
@@ -1135,7 +1534,8 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                 progressed = true
             }
             if (serviceDrainRequest(fromMakeRoom = false) >= 0L) progressed = true
-            if (started) {
+            if (serviceControlRequest(s)) progressed = true
+            if (started && !paused && !quiesced) {
                 if (!ingestComplete || !outputEos) {
                     when (feedStep(allowDrain = true)) {
                         Feed.PROGRESSED, Feed.RETRY -> progressed = true
@@ -1146,6 +1546,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                     val now = SystemClock.elapsedRealtime()
                     if (now >= nextEosPollAtMs) {
                         eosPollSnapshots += 1L
+                        if (paused) eosPollsWhilePaused += 1L
                         if (s.tryCompleteTimelineAndSetEosWithoutDrain()) {
                             setStage(Stage.EOS_SET, "eos_set_without_drain")
                             progressed = true
@@ -1157,7 +1558,9 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             }
             if (!progressed) {
                 requestLock.withLock {
-                    if (pendingDrain == null && !stopRequested.get() && !(startRequested.get() && !started)) {
+                    if (pendingDrain == null && pendingControl == null &&
+                        !stopRequested.get() && !(startRequested.get() && !started)
+                    ) {
                         try {
                             requestCondition.await(OWNER_IDLE_WAIT_MS, TimeUnit.MILLISECONDS)
                         } catch (_: InterruptedException) {
@@ -1168,6 +1571,211 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                 }
             }
         }
+    }
+
+    // ── Y19 owner-thread control execution ─────────────────────────────────
+
+    private fun atCleanBoundary(): Boolean =
+        pendingSliceFrames == 0 && !requirePump().hasPendingChunk && !codecOutputHeld && !ingestComplete
+
+    // Takes the request out of the slot; false when the requester already
+    // withdrew it (timeout), in which case nothing executes.
+    private fun takeControl(r: ControlRequest): Boolean = requestLock.withLock {
+        if (pendingControl === r) {
+            pendingControl = null
+            true
+        } else {
+            false
+        }
+    }
+
+    private fun completeControl(r: ControlRequest, ok: Boolean, reason: String) {
+        r.ok = ok
+        r.reason = reason
+        r.latch.countDown()
+    }
+
+    // Typed fail-closed on a control request: the requester is released
+    // with the reason first, then the owner loop fails closed.
+    private fun failControl(r: ControlRequest, reason: String): Nothing {
+        takeControl(r)
+        completeControl(r, false, reason)
+        throw FailClosed(reason)
+    }
+
+    // Peeks the pending control; a QUIESCE stays pending (feed continues)
+    // until the clean boundary is reached, every other kind is taken and
+    // executed at once. True when a request completed this iteration.
+    private fun serviceControlRequest(s: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession): Boolean {
+        val r = requestLock.withLock { pendingControl } ?: return false
+        if (!started) failControl(r, REASON_CONTROL_BEFORE_START)
+        return when (r.kind) {
+            Control.QUIESCE -> serviceQuiesce(r)
+            Control.PAUSE -> {
+                if (!takeControl(r)) return false
+                executePause(s, r)
+                true
+            }
+            Control.HOLD_ASSERT -> {
+                if (!takeControl(r)) return false
+                executeHoldAssert(s, r)
+                true
+            }
+            Control.RESUME -> {
+                if (!takeControl(r)) return false
+                executeResume(s, r)
+                true
+            }
+        }
+    }
+
+    private fun serviceQuiesce(r: ControlRequest): Boolean {
+        if (quiesced || paused) {
+            takeControl(r)
+            completeControl(r, false, "real_ring_quiesce_already_held")
+            return true
+        }
+        if (ingestComplete) failControl(r, REASON_QUIESCE_AFTER_INGEST_COMPLETE)
+        if (!atCleanBoundary()) return false
+        if (!takeControl(r)) return false
+        quiesced = true
+        quiesceAckOk = true
+        quiesceExecutedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        quiesceWallMs = SystemClock.elapsedRealtime() - r.enqueuedAtMs
+        trace("feed_quiesced")
+        completeControl(r, true, REASON_OK)
+        return true
+    }
+
+    private fun executePause(s: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession, r: ControlRequest) {
+        if (pauseExercised) failControl(r, REASON_PAUSE_ALREADY_EXERCISED)
+        val p = requirePump()
+        pausePendingSliceFramesAtRequest = pendingSliceFrames
+        pausePumpPendingChunkAtRequest = p.hasPendingChunk
+        pauseCodecOutputHeldAtRequest = codecOutputHeld
+        pauseIngestCompleteAtRequest = ingestComplete
+        pauseCleanBoundaryOk = atCleanBoundary()
+        if (!pauseCleanBoundaryOk) {
+            failControl(
+                r,
+                "$REASON_PAUSE_NOT_AT_CLEAN_BOUNDARY$pendingSliceFrames:${p.hasPendingChunk}:$codecOutputHeld:$ingestComplete",
+            )
+        }
+        pauseExercised = true
+        pauseQuiescedFirst = quiesced
+        pauseExecutedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        val at = SystemClock.elapsedRealtime()
+        transportCommandsIssued += 1L
+        try {
+            s.pauseAndAwaitProof()
+        } catch (t: Throwable) {
+            completeControl(r, false, describe(t))
+            throw t
+        }
+        pauseWallMs = SystemClock.elapsedRealtime() - at
+        nativePauseProofOk = s.pauseProofNativePauseOk
+        pauseCommandSeq = s.pauseProofCommandSeq
+        dispatchCountAtPause = s.pauseProofDispatchCountAtPause
+        totalFramesPushedAtPause = s.pauseProofTotalFramesPushedAtPause
+        nextDispatchFrameAtPause = s.pauseProofNextDispatchFrameAtPause
+        framesPendingAtPause = s.pauseProofFramesPendingAtPause
+        pausedWaitsAtPause = s.pauseProofPausedWaitsAtPause
+        framesReadBySinkAtPause = framesReadBySink
+        drainsServicedAtPause = drainsServiced
+        pumpFramesAcceptedAtPause = p.kotlinFramesAccepted
+        framesAcceptedTrack0AtPause = s.totalFramesAcceptedTrack0
+        framesAcceptedTrack1AtPause = s.totalFramesAcceptedTrack1
+        framesDecodedAtPause = framesDecoded
+        decodeStepsAtPause = decodeSteps
+        stageBeforePause = stage
+        pausedAtNs = System.nanoTime()
+        // Gate first (sink-thread drains reject from here on), then stage.
+        paused = true
+        setStage(Stage.PAUSED, "paused")
+        pauseAckOk = nativePauseProofOk
+        completeControl(r, pauseAckOk, if (pauseAckOk) REASON_OK else "real_ring_native_pause_proof_missing")
+    }
+
+    private fun executeHoldAssert(s: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession, r: ControlRequest) {
+        if (!paused) failControl(r, REASON_HOLD_ASSERT_NOT_PAUSED)
+        if (holdAssertExercised) failControl(r, REASON_HOLD_ASSERT_ALREADY_EXERCISED)
+        holdAssertExercised = true
+        holdAssertExecutedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        try {
+            s.assertPausedHoldFrozen()
+        } catch (t: Throwable) {
+            completeControl(r, false, describe(t))
+            throw t
+        }
+        holdAssertObservedNs = System.nanoTime() - pausedAtNs
+        nativeHoldFrozenProofOk = s.pauseProofHoldFrozenOk
+        dispatchCountAfterHold = s.pauseProofDispatchCountAfterHold
+        totalFramesPushedAfterHold = s.pauseProofTotalFramesPushedAfterHold
+        pausedWaitsAfterHold = s.pauseProofPausedWaitsAfterHold
+        framesReadBySinkAfterHold = framesReadBySink
+        drainsServicedAfterHold = drainsServiced
+        pumpFramesAcceptedAfterHold = requirePump().kotlinFramesAccepted
+        trace("paused_hold_frozen")
+        holdAssertAckOk = nativeHoldFrozenProofOk
+        completeControl(r, holdAssertAckOk, if (holdAssertAckOk) REASON_OK else "real_ring_native_hold_proof_missing")
+    }
+
+    private fun executeResume(s: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession, r: ControlRequest) {
+        if (!paused) failControl(r, REASON_RESUME_NOT_PAUSED)
+        if (!holdAssertExercised) failControl(r, REASON_RESUME_BEFORE_HOLD_ASSERT)
+        if (resumeExercised) failControl(r, REASON_RESUME_ALREADY_EXERCISED)
+        resumeExercised = true
+        resumeExecutedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        val at = SystemClock.elapsedRealtime()
+        transportCommandsIssued += 1L
+        val snap = try {
+            s.resumeAndAwaitProof()
+        } catch (t: Throwable) {
+            completeControl(r, false, describe(t))
+            throw t
+        }
+        resumeWallMs = SystemClock.elapsedRealtime() - at
+        pauseHoldObservedNs = System.nanoTime() - pausedAtNs
+        nativeResumeProofOk = s.pauseProofNativeResumeOk
+        resumeCommandSeq = s.resumeProofCommandSeq
+        dispatchCountAtResume = snap["dispatchCountAtResume"]?.toLongOrNull() ?: -1L
+        totalFramesPushedAtResume = snap["totalFramesPushedAtResume"]?.toLongOrNull() ?: -1L
+        nativeLastPausedIntervalNs = snap["lastPausedIntervalNs"]?.toLongOrNull() ?: -1L
+        nativeTotalPausedNs = snap["totalPausedNs"]?.toLongOrNull() ?: -1L
+        framesReadBySinkAtResume = framesReadBySink
+        pumpFramesAcceptedAtResume = requirePump().kotlinFramesAccepted
+        decodeStepsWhilePaused = decodeSteps - decodeStepsAtPause
+        // Release the gate: feed resumes at the SAME clean boundary it held.
+        paused = false
+        quiesced = false
+        val restored = stageBeforePause ?: Stage.ACTIVE_DRAIN
+        setStage(restored, "resumed")
+        stageAfterResume = restored
+        nextEosPollAtMs = 0L
+        resumeAckOk = nativeResumeProofOk
+        completeControl(r, resumeAckOk, if (resumeAckOk) REASON_OK else "real_ring_native_resume_proof_missing")
+    }
+
+    private fun describe(t: Throwable): String = when (t) {
+        is AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession.Failure -> REASON_PREFIX_NATIVE + t.reason
+        is FailClosed -> t.reason
+        else -> "exception:${t.javaClass.simpleName}:${t.message}"
+    }
+
+    // Owner thread, finally block (after the drain gate closed): the one
+    // control request that may still be pending is released with the
+    // terminal reason so no requester waits for its timeout.
+    private fun rejectPendingControl() {
+        val r = requestLock.withLock {
+            val c = pendingControl
+            pendingControl = null
+            c
+        } ?: return
+        completeControl(
+            r,
+            false,
+            if (stage == Stage.FAILED) "real_ring_owner_failed:${failureReason.ifBlank { "unknown" }}" else REASON_CONTROL_CLOSED,
+        )
     }
 
     // One pending sink drain: destructive read straight into the sink's
@@ -1188,6 +1796,13 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             if (!started) {
                 drainsBeforeStartRejected += 1L
                 request.result = reject(REASON_DRAIN_BEFORE_START)
+                return 0L
+            }
+            // Y19: a drain that raced the pause gate is rejected here without
+            // any native read (the output ring is never touched while paused).
+            if (paused) {
+                pausedDrainRejectsOwnerThread += 1L
+                request.result = reject(REASON_DRAIN_WHILE_PAUSED)
                 return 0L
             }
             val s = requireSession()

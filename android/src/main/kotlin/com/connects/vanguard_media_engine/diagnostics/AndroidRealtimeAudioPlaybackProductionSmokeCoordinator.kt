@@ -171,7 +171,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_" +
                 "no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_" +
                 "no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_" +
-                "no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback"
+                "no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback_" +
+                "real_decoder_ring_pause_resume_proof_only_" +
+                "one_owner_thread_executed_native_pause_resume_cycle_" +
+                "feed_quiesced_at_clean_boundary_before_sink_park_sink_parked_before_ring_pause_" +
+                "no_feedstep_no_eos_poll_no_native_read_while_paused_" +
+                "resume_drains_to_eos_with_checksum_identity_" +
+                "no_seek_no_flush_no_dead_object_no_feedback_no_pacing_no_resampling_" +
+                "no_current_position_authority_switch_no_av_sync_closure_no_fleet_claim_no_app_no_editor_claim"
 
         const val SCENARIO_PLAYTHROUGH = "PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS"
         const val SCENARIO_STOP_DISPOSE = "STOP_DISPOSE_MID_PLAYBACK"
@@ -189,6 +196,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_RING_FRAME_SOURCE = "SCENARIO_RING_FRAME_SOURCE_TO_EOS"
         // Y18c: the ONE isolated REAL-decoder ring-transport frame-source scenario.
         const val SCENARIO_REAL_DECODER_RING_FRAME_SOURCE = "SCENARIO_REAL_DECODER_RING_FRAME_SOURCE_TO_EOS"
+        // Y19: the ONE isolated REAL-decoder ring pause/resume scenario.
+        const val SCENARIO_REAL_DECODER_RING_PAUSE_RESUME_TO_EOS = "SCENARIO_REAL_DECODER_RING_PAUSE_RESUME_TO_EOS"
 
         // Y18c real-decoder ring: the sink-thread per-drain wait bound (well
         // below the sink's own drain-stall budget) and the negative probe's
@@ -316,6 +325,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_RING_FRAME_SOURCE = "ringFrameSourceOk"
         // Y18c lane, evaluated by the real-decoder ring frame-source scenario only.
         const val LANE_REAL_DECODER_RING_FRAME_SOURCE = "realDecoderRingFrameSourceOk"
+        // Y19 lanes, evaluated by the real-decoder ring pause/resume scenario only.
+        const val LANE_REAL_RING_PAUSE_ACK = "realRingPauseAckOk"
+        const val LANE_REAL_RING_PAUSE_HOLD_FROZEN = "realRingPauseHoldFrozenOk"
+        const val LANE_REAL_RING_RESUME_ACK = "realRingResumeAckOk"
+        const val LANE_REAL_RING_POST_RESUME_CHECKSUM = "realRingPostResumeChecksumOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -356,6 +370,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_CLOCK_AUTHORITY_UNCHANGED,
             LANE_RING_FRAME_SOURCE,
             LANE_REAL_DECODER_RING_FRAME_SOURCE,
+            LANE_REAL_RING_PAUSE_ACK, LANE_REAL_RING_PAUSE_HOLD_FROZEN,
+            LANE_REAL_RING_RESUME_ACK, LANE_REAL_RING_POST_RESUME_CHECKSUM,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -399,6 +415,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "no_feedback_control_loop", "no_pacing_correction", "no_resampling", "no_av_sync_closure",
             "no_real_os_call_bt_route_arbitration", "no_acoustic_loudness_snr_claim",
             "no_audio_clock_mutator_changes", "no_clock_feedback_no_pacing_feedback",
+            "real_decoder_ring_pause_resume_proof_only",
+            "one_owner_thread_executed_native_pause_resume_cycle",
+            "feed_quiesced_at_clean_boundary_before_sink_park", "sink_parked_before_ring_pause",
+            "no_feedstep_no_eos_poll_no_native_read_while_paused",
+            "resume_drains_to_eos_with_checksum_identity",
+            "no_seek_no_flush_no_dead_object_no_feedback_no_pacing_no_resampling",
+            "no_current_position_authority_switch_no_av_sync_closure_no_fleet_claim_no_app_no_editor_claim",
         )
 
         private const val FAILURE_SOURCE_PATH_REQUIRED = "source_path_required"
@@ -686,6 +709,18 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // no session, no state machine, no production decoder feed). The
         // Y18b synthetic scenario above stays untouched and green.
         outcomes += realDecoderRingFrameSourceScenario(config)
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y19: the ONE isolated REAL-decoder ring PAUSE/RESUME proof (same
+        // route as Y18c; one owner-thread-executed native pause/resume cycle
+        // with the sink parked first). Y18b/Y18c above stay untouched.
+        outcomes += AndroidRealtimeAudioPlaybackRealDecoderRingPauseResumeScenario(
+            config = config,
+            isDisposed = { disposed.get() },
+            bindActive = { sink, ring ->
+                activeRingSink = sink
+                activeRealDecoderRing = ring
+            },
+        ).run()
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
         val firstFailure = outcomes.firstOrNull { it.failureReason.isNotBlank() }?.let { "${it.name}:${it.failureReason}" } ?: ""
@@ -2378,7 +2413,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source/real-decoder-ring-pause-resume smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

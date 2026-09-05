@@ -10,16 +10,18 @@
 // P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION (Y15) +
 // P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16) +
 // P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF (Y18b) +
-// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, and real-decoder ring frame source diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c) +
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, and real-decoder ring pause/resume diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
 // Diagnostic-only - drives the production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock) through twelve
-// scenarios, plus the isolated Y18b ring-transport frame-source proof and the
-// isolated Y18c real-decoder ring-transport frame-source proof:
+// scenarios, plus the isolated Y18b ring-transport frame-source proof, the
+// isolated Y18c real-decoder ring-transport frame-source proof, and the
+// isolated Y19 real-decoder ring pause/resume proof:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
 //   3. Synthetic dead-object recovery to EOS.
@@ -34,8 +36,9 @@
 //  12. Presentation clock query surface with off-thread poller to EOS, clock correlation observation, and post-teardown latched read.
 //  13. Ring frame source isolated proof driving production sink to EOS without state machine.
 //  14. Real-decoder ring frame source isolated proof driving production sink to EOS without state machine.
+//  15. Real-decoder ring pause/resume isolated proof: one owner-thread-executed native pause/resume cycle to EOS with checksum identity.
 //
-// Required proof lanes (75 native lanes plus canonical equals 76 total lanes):
+// Required proof lanes (79 native lanes plus canonical equals 80 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -111,10 +114,14 @@
 //  73. clockAuthorityUnchangedOk: clock authority and query surface unchanged
 //  74. ringFrameSourceOk: production sink consumes async-runtime multi-source output ring to EOS without state machine
 //  75. realDecoderRingFrameSourceOk: production sink consumes real-decoder (MediaExtractor/MediaCodec track0 plus synthetic track1 lockstep) async-runtime output ring to EOS without state machine
+//  76. realRingPauseAckOk: native pause acknowledged on the ring owner thread after feed quiesced at a clean boundary and the sink was parked before ring pause
+//  77. realRingPauseHoldFrozenOk: paused hold observed frozen with no owner feed step, EOS poll, or drain while paused
+//  78. realRingResumeAckOk: native resume acknowledged on the ring owner thread with totals unchanged across the hold and the sink unparked after
+//  79. realRingPostResumeChecksumOk: resume drains to EOS with exact frame and checksum identity across the full real-decoder ring pause/resume route
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_ring_transport_frame_source_seam_production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_native_eos_drained_observed_by_sink_read_no_owner_pre_drain_real_decoder_ring_frame_source_proof_only_kotlin_owned_mediaextractor_mediacodec_track0_plus_synthetic_track1_lockstep_ingest_pump_to_async_runtime_multi_source_output_ring_ring_owner_thread_services_sink_drains_per_drain_wait_bound_no_private_output_drain_expected_frames_window_aligned_eos_pad_budget_one_second_or_truncate_codec_extractor_released_once_missing_frame_source_fails_before_audiotrack_no_current_position_authority_switch_no_fleet_claim_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_ring_transport_frame_source_seam_production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_native_eos_drained_observed_by_sink_read_no_owner_pre_drain_real_decoder_ring_frame_source_proof_only_kotlin_owned_mediaextractor_mediacodec_track0_plus_synthetic_track1_lockstep_ingest_pump_to_async_runtime_multi_source_output_ring_ring_owner_thread_services_sink_drains_per_drain_wait_bound_no_private_output_drain_expected_frames_window_aligned_eos_pad_budget_one_second_or_truncate_codec_extractor_released_once_missing_frame_source_fails_before_audiotrack_no_current_position_authority_switch_no_fleet_claim_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback_real_decoder_ring_pause_resume_proof_only_one_owner_thread_executed_native_pause_resume_cycle_feed_quiesced_at_clean_boundary_before_sink_park_sink_parked_before_ring_pause_no_feedstep_no_eos_poll_no_native_read_while_paused_resume_drains_to_eos_with_checksum_identity_no_seek_no_flush_no_dead_object_no_feedback_no_pacing_no_resampling_no_current_position_authority_switch_no_av_sync_closure_no_fleet_claim_no_app_no_editor_claim
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -140,6 +147,14 @@
 //     no seek, no pause/resume, no drift feedback, no pacing correction, no resampling,
 //     no currentPosition authority switch, no A/V sync closure, no cross-device
 //     bit-exact decoder claim, and no fleet claim.
+//   - Real-decoder ring pause/resume (Y19) proves exactly one owner-thread-executed
+//     native Pause/Resume cycle on the Y18c real-decoder ring: feed quiesced at a
+//     clean boundary before the sink is parked, the sink parked before the ring is
+//     paused, no feedStep/EOS poll/native read while paused, and resume draining to
+//     EOS with exact frame and checksum identity; it carries no seek, no flush, no
+//     dead object, no drift feedback, no pacing correction, no resampling, no
+//     currentPosition authority switch, no A/V sync closure, no fleet claim, and no
+//     app/editor claim.
 
 import 'dart:async';
 
@@ -241,6 +256,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.clockAuthorityUnchangedOk,
     required this.ringFrameSourceOk,
     required this.realDecoderRingFrameSourceOk,
+    required this.realRingPauseAckOk,
+    required this.realRingPauseHoldFrozenOk,
+    required this.realRingResumeAckOk,
+    required this.realRingPostResumeChecksumOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -269,7 +288,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_ring_transport_frame_source_seam_production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_native_eos_drained_observed_by_sink_read_no_owner_pre_drain_real_decoder_ring_frame_source_proof_only_kotlin_owned_mediaextractor_mediacodec_track0_plus_synthetic_track1_lockstep_ingest_pump_to_async_runtime_multi_source_output_ring_ring_owner_thread_services_sink_drains_per_drain_wait_bound_no_private_output_drain_expected_frames_window_aligned_eos_pad_budget_one_second_or_truncate_codec_extractor_released_once_missing_frame_source_fails_before_audiotrack_no_current_position_authority_switch_no_fleet_claim_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_ring_transport_frame_source_seam_production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_native_eos_drained_observed_by_sink_read_no_owner_pre_drain_real_decoder_ring_frame_source_proof_only_kotlin_owned_mediaextractor_mediacodec_track0_plus_synthetic_track1_lockstep_ingest_pump_to_async_runtime_multi_source_output_ring_ring_owner_thread_services_sink_drains_per_drain_wait_bound_no_private_output_drain_expected_frames_window_aligned_eos_pad_budget_one_second_or_truncate_codec_extractor_released_once_missing_frame_source_fails_before_audiotrack_no_current_position_authority_switch_no_fleet_claim_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback_real_decoder_ring_pause_resume_proof_only_one_owner_thread_executed_native_pause_resume_cycle_feed_quiesced_at_clean_boundary_before_sink_park_sink_parked_before_ring_pause_no_feedstep_no_eos_poll_no_native_read_while_paused_resume_drains_to_eos_with_checksum_identity_no_seek_no_flush_no_dead_object_no_feedback_no_pacing_no_resampling_no_current_position_authority_switch_no_av_sync_closure_no_fleet_claim_no_app_no_editor_claim';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -348,6 +367,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'clockAuthorityUnchangedOk',
     'ringFrameSourceOk',
     'realDecoderRingFrameSourceOk',
+    'realRingPauseAckOk',
+    'realRingPauseHoldFrozenOk',
+    'realRingResumeAckOk',
+    'realRingPostResumeChecksumOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -604,6 +627,18 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether production sink consumes a real-decoder (MediaExtractor/MediaCodec track0 plus synthetic track1 lockstep) async-runtime output ring to EOS without state machine.
   final bool realDecoderRingFrameSourceOk;
 
+  /// Whether native pause was acknowledged on the ring owner thread after feed quiesced at a clean boundary and the sink was parked before ring pause.
+  final bool realRingPauseAckOk;
+
+  /// Whether the paused hold was observed frozen with no owner feed step, EOS poll, or drain while paused.
+  final bool realRingPauseHoldFrozenOk;
+
+  /// Whether native resume was acknowledged on the ring owner thread with totals unchanged across the hold and the sink unparked after.
+  final bool realRingResumeAckOk;
+
+  /// Whether resume drained to EOS with exact frame and checksum identity across the full real-decoder ring pause/resume route.
+  final bool realRingPostResumeChecksumOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -709,7 +744,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       driftSampleNoFeedbackOk &&
       clockAuthorityUnchangedOk &&
       ringFrameSourceOk &&
-      realDecoderRingFrameSourceOk;
+      realDecoderRingFrameSourceOk &&
+      realRingPauseAckOk &&
+      realRingPauseHoldFrozenOk &&
+      realRingResumeAckOk &&
+      realRingPostResumeChecksumOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -809,6 +848,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         clockAuthorityUnchangedOk: false,
         ringFrameSourceOk: false,
         realDecoderRingFrameSourceOk: false,
+        realRingPauseAckOk: false,
+        realRingPauseHoldFrozenOk: false,
+        realRingResumeAckOk: false,
+        realRingPostResumeChecksumOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -1027,6 +1070,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final realDecoderRingFrameSourceOk = parseBool(
       'realDecoderRingFrameSourceOk',
     );
+    final realRingPauseAckOk = parseBool('realRingPauseAckOk');
+    final realRingPauseHoldFrozenOk = parseBool('realRingPauseHoldFrozenOk');
+    final realRingResumeAckOk = parseBool('realRingResumeAckOk');
+    final realRingPostResumeChecksumOk = parseBool(
+      'realRingPostResumeChecksumOk',
+    );
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -1110,7 +1159,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         driftSampleNoFeedbackOk &&
         clockAuthorityUnchangedOk &&
         ringFrameSourceOk &&
-        realDecoderRingFrameSourceOk;
+        realDecoderRingFrameSourceOk &&
+        realRingPauseAckOk &&
+        realRingPauseHoldFrozenOk &&
+        realRingResumeAckOk &&
+        realRingPostResumeChecksumOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -1249,6 +1302,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'clockAuthorityUnchangedOk': clockAuthorityUnchangedOk,
       'ringFrameSourceOk': ringFrameSourceOk,
       'realDecoderRingFrameSourceOk': realDecoderRingFrameSourceOk,
+      'realRingPauseAckOk': realRingPauseAckOk,
+      'realRingPauseHoldFrozenOk': realRingPauseHoldFrozenOk,
+      'realRingResumeAckOk': realRingResumeAckOk,
+      'realRingPostResumeChecksumOk': realRingPostResumeChecksumOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -1338,6 +1395,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       clockAuthorityUnchangedOk: clockAuthorityUnchangedOk,
       ringFrameSourceOk: ringFrameSourceOk,
       realDecoderRingFrameSourceOk: realDecoderRingFrameSourceOk,
+      realRingPauseAckOk: realRingPauseAckOk,
+      realRingPauseHoldFrozenOk: realRingPauseHoldFrozenOk,
+      realRingResumeAckOk: realRingResumeAckOk,
+      realRingPostResumeChecksumOk: realRingPostResumeChecksumOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -1463,6 +1524,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       clockAuthorityUnchangedOk: false,
       ringFrameSourceOk: false,
       realDecoderRingFrameSourceOk: false,
+      realRingPauseAckOk: false,
+      realRingPauseHoldFrozenOk: false,
+      realRingResumeAckOk: false,
+      realRingPostResumeChecksumOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1653,6 +1718,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.clockAuthorityUnchangedOk == clockAuthorityUnchangedOk &&
         other.ringFrameSourceOk == ringFrameSourceOk &&
         other.realDecoderRingFrameSourceOk == realDecoderRingFrameSourceOk &&
+        other.realRingPauseAckOk == realRingPauseAckOk &&
+        other.realRingPauseHoldFrozenOk == realRingPauseHoldFrozenOk &&
+        other.realRingResumeAckOk == realRingResumeAckOk &&
+        other.realRingPostResumeChecksumOk == realRingPostResumeChecksumOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1741,6 +1810,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     clockAuthorityUnchangedOk,
     ringFrameSourceOk,
     realDecoderRingFrameSourceOk,
+    realRingPauseAckOk,
+    realRingPauseHoldFrozenOk,
+    realRingResumeAckOk,
+    realRingPostResumeChecksumOk,
     canonical,
   ]);
 
@@ -1810,6 +1883,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'clockAuthorityUnchangedOk: $clockAuthorityUnchangedOk, '
       'ringFrameSourceOk: $ringFrameSourceOk, '
       'realDecoderRingFrameSourceOk: $realDecoderRingFrameSourceOk, '
+      'realRingPauseAckOk: $realRingPauseAckOk, '
+      'realRingPauseHoldFrozenOk: $realRingPauseHoldFrozenOk, '
+      'realRingResumeAckOk: $realRingResumeAckOk, '
+      'realRingPostResumeChecksumOk: $realRingPostResumeChecksumOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 
