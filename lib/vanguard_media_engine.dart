@@ -350,6 +350,8 @@ export 'vg_camerax_thermal_fps_bridge.dart';
 export 'vg_camerax_thermal_load_shedding_coordinator.dart';
 // P3-CAM-CONCURRENT-ANDROID-MULTICAM-CAPABILITY-WIRING: Android static MultiCam capability routes smoke foundation.
 export 'vg_android_multicam_capability_routes_smoke.dart';
+// P3-CAM-CONCURRENT-STARTMULTICAM-FAIL-CLOSED-ANDROID-HANDLER: Android startMultiCamPreview/stopMultiCamPreview fail-closed route smoke foundation.
+export 'vg_android_multicam_preview_routes_smoke.dart';
 
 const String _libName = 'vanguard_media_engine';
 

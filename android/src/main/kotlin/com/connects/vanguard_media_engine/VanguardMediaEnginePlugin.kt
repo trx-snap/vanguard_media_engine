@@ -18,6 +18,7 @@ import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoo
 import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2CapabilityProbe
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSmokeCoordinator
+import com.connects.vanguard_media_engine.camera.AndroidCamera2MultiCamPreviewCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestSpatialSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestVulkanSpatialSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
@@ -152,6 +153,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // AndroidCameraGraphTransactionCoordinator's header for the full
     // non-claims.
     private var cameraGraphTransactionCoordinator: AndroidCameraGraphTransactionCoordinator? = null
+
+    // ── P3-CAM-CONCURRENT-STARTMULTICAM-FAIL-CLOSED-ANDROID-HANDLER: owns ─────
+    // "startMultiCamPreview" / "stopMultiCamPreview" as explicit fail-closed
+    // guard routes. Does NOT implement real concurrent camera capture; see
+    // AndroidCamera2MultiCamPreviewCoordinator's header for the full non-claims.
+    private var multiCamPreviewCoordinator: AndroidCamera2MultiCamPreviewCoordinator? = null
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
@@ -613,6 +620,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         cameraGraphTransactionCoordinator = AndroidCameraGraphTransactionCoordinator(
             hasActiveCameraProvider = { cameraSource != null },
+        )
+        multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
+            context               = binding.applicationContext,
+            hasActiveSingleCamera = { cameraSource != null },
         )
         cameraXThermalActuationRouter = AndroidCameraXThermalActuationRouter(
             cameraSourceProvider = { cameraSource },
@@ -1782,6 +1793,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android camera graph transaction coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidCamera2MultiCamPreviewCoordinator.ownsMethod(call.method)) {
+            val coord = multiCamPreviewCoordinator
+            if (coord != null) {
+                @Suppress("UNCHECKED_CAST")
+                coord.handle(call.method, args as? Map<String, Any?>, result)
+            } else {
+                result.error("UNAVAILABLE", "Android multicam preview coordinator unavailable", null)
             }
             return
         }
@@ -3308,6 +3330,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Camera graph transaction coordinator is stateless (no native
         // resources) -- just drop the reference, no disposeAll() to call.
         cameraGraphTransactionCoordinator = null
+        // Multicam preview coordinator is stateless (no native resources,
+        // opens no camera) -- just drop the reference, no disposeAll() to call.
+        multiCamPreviewCoordinator = null
         // CameraX thermal actuation router is a stateless dispatch shim over
         // cameraSource (already stopped/nulled above) -- just drop the
         // reference, no disposeAll() to call.
