@@ -49,6 +49,15 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             "ANDROID_DAG_PHASE5_GLES_EXPORT_OVERLAY_PRODUCTION_PHYSICAL_SMOKE_PASS"
         const val FAIL_MARKER =
             "ANDROID_DAG_PHASE5_GLES_EXPORT_OVERLAY_PRODUCTION_PHYSICAL_SMOKE_FAIL"
+
+        // P5-GLES-EXPORT-ES3-CONTEXT-READINESS: minimum GL major version
+        // asserted (Gate 10, [glMajorVersionOk]) for the current SM-A566B
+        // physical fleet device -- an ES3-negotiating driver. This is a
+        // lower bound, never an exact-equality check, since a driver may
+        // promote an ES2 context request to ES3 and expose a higher major
+        // version in the future; the gate fails closed if any encode
+        // negotiates below this value.
+        const val EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION = 3
     }
 
     fun run(
@@ -68,6 +77,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         var pixelDeltaOk = false
         var missingBridgeRejectedOk = false
         var stillImageOverlayEncodeOk = false
+        var glMajorVersionOk = false
         var cleanupOk = false
 
         var firstFailureReason: String? = null
@@ -93,6 +103,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -112,6 +123,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -131,6 +143,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -150,6 +163,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -237,6 +251,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    glMajorVersionOk = false,
                     cleanupOk = true,
                     details = details,
                 )
@@ -537,6 +552,40 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     "${stillOverlayResult.reason}:samples=${stillOverlayResult.writtenVideoSamples}:" +
                     "overlayFrames=${stillOverlayResult.overlayFrameCount}"
             }
+
+            // ── Gate 10: GL major version negotiation (P5-GLES-EXPORT-ES3-
+            // CONTEXT-READINESS) ─────────────────────────────────────────────
+            // Proves the baseline, overlay, and still-image-overlay encodes
+            // all negotiated the same GL major version, and that it is at
+            // least [EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION] (3 on the
+            // current SM-A566B physical fleet device) -- a lower-bound
+            // assertion, not exact equality to 3, since a driver may promote
+            // an ES2 context request to an ES3 (or higher) context. An ES2
+            // fallback on this device fails this gate rather than silently
+            // passing the physical ES3-readiness proof.
+            val baselineGlMajorVersion = baselineResult.glMajorVersion
+            val overlayGlMajorVersion = overlayResult.glMajorVersion
+            val stillImageOverlayGlMajorVersion = stillOverlayResult.glMajorVersion
+            glMajorVersionOk = baselineEncodeOk &&
+                overlayEncodeOk &&
+                stillImageOverlayEncodeOk &&
+                baselineGlMajorVersion == overlayGlMajorVersion &&
+                baselineGlMajorVersion == stillImageOverlayGlMajorVersion &&
+                baselineGlMajorVersion >= EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION
+            details["baselineGlMajorVersion"] = baselineGlMajorVersion
+            details["overlayGlMajorVersion"] = overlayGlMajorVersion
+            details["stillImageOverlayGlMajorVersion"] = stillImageOverlayGlMajorVersion
+            details["expectedPhysicalMinGlMajorVersion"] = EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION
+            details["glMajorVersionDetails"] =
+                "baseline=$baselineGlMajorVersion overlay=$overlayGlMajorVersion " +
+                    "stillImageOverlay=$stillImageOverlayGlMajorVersion " +
+                    "expectedPhysicalMin=$EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION(SM-A566B)"
+
+            if (!glMajorVersionOk && firstFailureReason == null) {
+                firstFailureReason = "gl_major_version_gate_failed:baseline=$baselineGlMajorVersion:" +
+                    "overlay=$overlayGlMajorVersion:still=$stillImageOverlayGlMajorVersion:" +
+                    "expectedMin=$EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION"
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "Exception during smoke harness run", t)
             if (firstFailureReason == null) {
@@ -544,7 +593,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             }
             details["exception"] = "${t.javaClass.simpleName}:${t.message}"
         } finally {
-            // ── Gate 10: Cleanup ──────────────────────────────────────────────────
+            // ── Gate 11: Cleanup ──────────────────────────────────────────────────
             for (f in filesToClean) {
                 try {
                     if (f.exists()) f.delete()
@@ -556,7 +605,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             }
         }
 
-        // ── Gate 11: Canonical route verification ─────────────────────────────
+        // ── Gate 12: Canonical route verification ─────────────────────────────
         val canonical = inputValidationOk &&
             sourceMetadataOk &&
             baselineEncodeOk &&
@@ -566,6 +615,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             pixelDeltaOk &&
             missingBridgeRejectedOk &&
             stillImageOverlayEncodeOk &&
+            glMajorVersionOk &&
             cleanupOk
 
         val pass = canonical
@@ -583,6 +633,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             pixelDeltaOk = pixelDeltaOk,
             missingBridgeRejectedOk = missingBridgeRejectedOk,
             stillImageOverlayEncodeOk = stillImageOverlayEncodeOk,
+            glMajorVersionOk = glMajorVersionOk,
             cleanupOk = cleanupOk,
             details = details,
         )
@@ -642,6 +693,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         pixelDeltaOk: Boolean,
         missingBridgeRejectedOk: Boolean,
         stillImageOverlayEncodeOk: Boolean,
+        glMajorVersionOk: Boolean,
         cleanupOk: Boolean,
         details: Map<String, Any?>,
     ): Map<String, Any?> {
@@ -654,6 +706,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             pixelDeltaOk &&
             missingBridgeRejectedOk &&
             stillImageOverlayEncodeOk &&
+            glMajorVersionOk &&
             cleanupOk
 
         val map = LinkedHashMap<String, Any?>()
@@ -672,6 +725,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         map["pixelDeltaOk"] = pixelDeltaOk
         map["missingBridgeRejectedOk"] = missingBridgeRejectedOk
         map["stillImageOverlayEncodeOk"] = stillImageOverlayEncodeOk
+        map["glMajorVersionOk"] = glMajorVersionOk
         map["cleanupOk"] = cleanupOk
         map["canonical"] = canonical
 

@@ -26,6 +26,7 @@ const List<String> _gateKeys = <String>[
   'pixelDeltaOk',
   'missingBridgeRejectedOk',
   'stillImageOverlayEncodeOk',
+  'glMajorVersionOk',
   'cleanupOk',
   'canonical',
 ];
@@ -43,6 +44,12 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) => {
     'overlayFrameCount': 30,
     'changedPixels': 240,
     'meanDelta': 42.5,
+    'baselineGlMajorVersion': 3,
+    'overlayGlMajorVersion': 3,
+    'stillImageOverlayGlMajorVersion': 3,
+    'expectedPhysicalMinGlMajorVersion': 3,
+    'glMajorVersionDetails':
+        'baseline=3 overlay=3 stillImageOverlay=3 expectedPhysicalMin=3(SM-A566B)',
   },
   'raw': '{"pass":true,"status":"PASS"}',
   if (overrides != null) ...overrides,
@@ -104,6 +111,10 @@ void main() {
         1,
       );
       expect(
+        VGGlesExportOverlayProductionSmokeReport.glMajorVersionGateKeys.length,
+        1,
+      );
+      expect(
         VGGlesExportOverlayProductionSmokeReport.cleanupGateKeys.length,
         1,
       );
@@ -111,8 +122,8 @@ void main() {
         VGGlesExportOverlayProductionSmokeReport.canonicalGateKeys.length,
         1,
       );
-      expect(_gateKeys.toSet().length, 11, reason: 'unique');
-      expect(_gateKeys.length, 11);
+      expect(_gateKeys.toSet().length, 12, reason: 'unique');
+      expect(_gateKeys.length, 12);
     });
   });
 
@@ -201,6 +212,14 @@ void main() {
       expect(report.stillImageOverlayEncodePass, isTrue);
       expect(report.stillImageOverlayPass, isTrue);
 
+      expect(report.glMajorVersionOkPass, isTrue);
+      expect(report.glMajorVersionPass, isTrue);
+      expect(report.baselineGlMajorVersion, 3);
+      expect(report.overlayGlMajorVersion, 3);
+      expect(report.stillImageOverlayGlMajorVersion, 3);
+      expect(report.expectedPhysicalMinGlMajorVersion, 3);
+      expect(report.glMajorVersionDetails, isNotNull);
+
       expect(report.cleanupPass, isTrue);
       expect(report.cleanupGroupPass, isTrue);
 
@@ -279,6 +298,23 @@ void main() {
       });
       expect(failClosedFail.failClosedPass, isFalse);
       expect(failClosedFail.cleanupGroupPass, isTrue);
+
+      final glMajorVersionFail = _createSampleReport({
+        'glMajorVersionOk': false,
+      });
+      expect(glMajorVersionFail.glMajorVersionPass, isFalse);
+      expect(glMajorVersionFail.stillImageOverlayPass, isTrue);
+      expect(glMajorVersionFail.cleanupGroupPass, isTrue);
+      expect(glMajorVersionFail.canonicalPass, isTrue);
+      expect(
+        glMajorVersionFail.isPass,
+        isFalse,
+        reason:
+            'a native glMajorVersionOk=false (e.g. an ES2 fallback on the '
+            'ES3-expected physical device, or a version mismatch across '
+            'baseline/overlay/still-image encodes) must flip overall isPass '
+            'to false even when every other gate reports true',
+      );
 
       final cleanupFail = _createSampleReport({'cleanupOk': false});
       expect(cleanupFail.cleanupGroupPass, isFalse);

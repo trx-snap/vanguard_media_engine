@@ -110,6 +110,16 @@ class VGGlesExportOverlayProductionSmokeReport {
     'stillImageOverlayEncodeOk',
   ];
 
+  /// GL major version negotiation gate keys
+  /// (P5-GLES-EXPORT-ES3-CONTEXT-READINESS: asserts the baseline, overlay,
+  /// and still-image-overlay encodes all negotiate the same GL major
+  /// version and that it is at least `expectedPhysicalMinGlMajorVersion`
+  /// (3 on the current SM-A566B physical fleet device) -- a minimum bound,
+  /// not exact equality, computed natively).
+  static const List<String> glMajorVersionGateKeys = <String>[
+    'glMajorVersionOk',
+  ];
+
   /// Resource cleanup gate keys.
   static const List<String> cleanupGateKeys = <String>['cleanupOk'];
 
@@ -123,6 +133,7 @@ class VGGlesExportOverlayProductionSmokeReport {
     ...pixelGateKeys,
     ...failClosedGateKeys,
     ...stillImageOverlayGateKeys,
+    ...glMajorVersionGateKeys,
     ...cleanupGateKeys,
     ...canonicalGateKeys,
   ];
@@ -208,6 +219,39 @@ class VGGlesExportOverlayProductionSmokeReport {
 
   /// Whether every still-image overlay gate passed.
   bool get stillImageOverlayPass => stillImageOverlayGateKeys.every(_gate);
+
+  // -- GL major version negotiation gate ---------------------------------------
+
+  /// Whether the baseline, overlay, and still-image-overlay encodes all
+  /// negotiated the same GL major version and it is at least
+  /// [expectedPhysicalMinGlMajorVersion] (P5-GLES-EXPORT-ES3-CONTEXT-
+  /// READINESS) -- asserted as a minimum bound, not exact equality, by the
+  /// native harness; this is never merely informational.
+  bool get glMajorVersionOkPass => _gate('glMajorVersionOk');
+
+  /// Whether every GL major version negotiation gate passed.
+  bool get glMajorVersionPass => glMajorVersionGateKeys.every(_gate);
+
+  /// GL major version negotiated by the baseline encode, when reported.
+  int? get baselineGlMajorVersion => details['baselineGlMajorVersion'] as int?;
+
+  /// GL major version negotiated by the overlay encode, when reported.
+  int? get overlayGlMajorVersion => details['overlayGlMajorVersion'] as int?;
+
+  /// GL major version negotiated by the still-image overlay encode, when reported.
+  int? get stillImageOverlayGlMajorVersion =>
+      details['stillImageOverlayGlMajorVersion'] as int?;
+
+  /// Minimum GL major version asserted by the native [glMajorVersionOkPass]
+  /// gate for the current SM-A566B physical fleet device -- a lower bound
+  /// enforced natively (baseline/overlay/still-image GL major version must
+  /// be >= this value), never asserted as exactly this value.
+  int? get expectedPhysicalMinGlMajorVersion =>
+      details['expectedPhysicalMinGlMajorVersion'] as int?;
+
+  /// Concise human-readable GL major version summary emitted by the native harness.
+  String? get glMajorVersionDetails =>
+      details['glMajorVersionDetails'] as String?;
 
   // -- Cleanup gates ----------------------------------------------------------
 

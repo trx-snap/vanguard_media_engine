@@ -17,6 +17,7 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLES30
 import android.opengl.GLUtils
 import android.util.Log
 import android.view.Surface
@@ -128,6 +129,11 @@ class AndroidTimelineVideoEncoder(
         // transition-overlap) that composited at least one active overlay.
         // Defaulted so pre-N3 callers/constructors remain valid.
         val overlayFrameCount: Int = 0,
+        // P5-GLES-EXPORT-ES3-CONTEXT-READINESS: the GL major version
+        // negotiated by [setupGlAndDecodeSurface] when it ran for this
+        // encode call (2 or 3); stays at the default 2 for early rejects
+        // that never reach GL setup.
+        val glMajorVersion: Int = 2,
     )
 
     @Volatile private var cancelRequested = false
@@ -156,6 +162,11 @@ class AndroidTimelineVideoEncoder(
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+    // P5-GLES-EXPORT-ES3-CONTEXT-READINESS: the GL major version actually
+    // negotiated by [setupGlAndDecodeSurface] -- 3 when an ES3 context was
+    // created and GL_MAJOR_VERSION confirms it, 2 for the ES2 fallback path
+    // or an ES2 context that doesn't expose GL_MAJOR_VERSION.
+    private var glMajorVersion: Int = 2
     private var glProgram = 0
     private var oesTextureId = 0
     private var aPositionLoc = 0
@@ -263,6 +274,11 @@ class AndroidTimelineVideoEncoder(
         var muxerStoppedCleanly = false
         var reason = "not_run"
         try {
+            // P5-GLES-EXPORT-ES3-CONTEXT-READINESS: reset before setup so a
+            // reused encoder instance never reports a stale GL major version
+            // from a prior successful encode() call if this call's GL setup
+            // fails before [setupGlAndDecodeSurface] re-negotiates it.
+            glMajorVersion = 2
             setupEncoderAndMuxer()
             setupGlAndDecodeSurface()
 
@@ -274,7 +290,7 @@ class AndroidTimelineVideoEncoder(
                 ) {
                     is AndroidTimelineGlesOverlayRenderSession.PrepareResult.Failure -> {
                         reason = "overlay_prepare_failed:${prepareResult.code}:${prepareResult.message}"
-                        return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                        return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
                     }
                     is AndroidTimelineGlesOverlayRenderSession.PrepareResult.Success -> {
                         glesOverlaySession = prepareResult.session
@@ -294,25 +310,25 @@ class AndroidTimelineVideoEncoder(
                 if (failureReason != null) {
                     if (cancelRequested) break
                     reason = failureReason
-                    return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                    return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
                 }
             }
 
             if (cancelRequested) {
                 reason = "cancelled"
-                return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
             }
 
             codec!!.signalEndOfInputStream()
             val eosObserved = drainEncoder(endOfStream = true, deadlineMs = ENCODE_EOS_DEADLINE_MS)
             if (!eosObserved) {
                 reason = "encoder_eos_drain_timeout"
-                return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
             }
 
             if (!muxerStarted || writtenVideoSamples <= 0) {
                 reason = "no_video_samples_written"
-                return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
             }
 
             muxer!!.stop()
@@ -322,7 +338,7 @@ class AndroidTimelineVideoEncoder(
             val outSize = if (outFile.exists()) outFile.length() else 0L
             if (outSize <= 0L) {
                 reason = "output_file_empty_or_missing"
-                return EncodeResult(false, reason, writtenVideoSamples, 0L)
+                return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
             }
 
             succeeded = true
@@ -330,11 +346,12 @@ class AndroidTimelineVideoEncoder(
             return EncodeResult(
                 true, reason, writtenVideoSamples, outSize,
                 overlayFrameCount = overlayFramesRendered,
+                glMajorVersion = glMajorVersion,
             )
         } catch (t: Throwable) {
             reason = "exception:${t.javaClass.simpleName}"
             Log.e(TAG, "encode failed: $t", t)
-            return EncodeResult(false, reason, writtenVideoSamples, 0L)
+            return EncodeResult(false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion)
         } finally {
             if (muxerStarted && !muxerStoppedCleanly) {
                 try { muxer?.stop() } catch (_: Throwable) {}
@@ -389,8 +406,18 @@ class AndroidTimelineVideoEncoder(
         EGL14.eglChooseConfig(eglDisplay, attribs, 0, configs, 0, 1, numConfigs, 0)
         val config = configs[0] ?: throw IllegalStateException("eglChooseConfig failed")
 
-        val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-        eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
+        // P5-GLES-EXPORT-ES3-CONTEXT-READINESS: attempt an ES3 context first
+        // -- the EGL_RENDERABLE_TYPE config bit above stays EGL_OPENGL_ES2_BIT
+        // (an ES3-capable driver creates an ES3 context from an ES2-bit
+        // config; requiring an ES3-only config bit here would break the ES2
+        // fallback on devices/configs that never advertise ES3). Falls back
+        // to an ES2 context only when the ES3 attempt returns EGL_NO_CONTEXT.
+        val contextAttribsEs3 = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE)
+        eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, contextAttribsEs3, 0)
+        if (eglContext == EGL14.EGL_NO_CONTEXT) {
+            val contextAttribsEs2 = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+            eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, contextAttribsEs2, 0)
+        }
         if (eglContext == EGL14.EGL_NO_CONTEXT) throw IllegalStateException("eglCreateContext failed")
 
         val surfaceAttribs = intArrayOf(EGL14.EGL_NONE)
@@ -399,6 +426,23 @@ class AndroidTimelineVideoEncoder(
 
         if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
             throw IllegalStateException("eglMakeCurrent failed")
+        }
+
+        // Confirm the actually-negotiated GL major version rather than
+        // trusting the requested EGL_CONTEXT_CLIENT_VERSION -- some drivers
+        // silently promote an ES2 request to an ES3 context. GL_MAJOR_VERSION
+        // is an ES3+ query; an ES2-only context leaves a GL error that must
+        // be drained rather than left pending for the first real GL call.
+        val majorVersionOut = IntArray(1)
+        GLES20.glGetIntegerv(GLES30.GL_MAJOR_VERSION, majorVersionOut, 0)
+        val majorVersionQueryError = GLES20.glGetError()
+        glMajorVersion = if (majorVersionQueryError == GLES20.GL_NO_ERROR && majorVersionOut[0] >= 3) {
+            majorVersionOut[0]
+        } else {
+            while (GLES20.glGetError() != GLES20.GL_NO_ERROR) {
+                // Drain any remaining pending GL error from the failed query.
+            }
+            2
         }
 
         val textures = IntArray(1)

@@ -126,6 +126,14 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
         'stillImageOverlayFrameCount=${report.details['stillImageOverlayFrameCount']}',
       );
       print(
+        '${_logPrefix}_LANE_GL_MAJOR_VERSION: glMajorVersionOk=${report.glMajorVersionOkPass} '
+        'baselineGlMajorVersion=${report.baselineGlMajorVersion} '
+        'overlayGlMajorVersion=${report.overlayGlMajorVersion} '
+        'stillImageOverlayGlMajorVersion=${report.stillImageOverlayGlMajorVersion} '
+        'expectedPhysicalMinGlMajorVersion=${report.expectedPhysicalMinGlMajorVersion} '
+        'details=${report.glMajorVersionDetails}',
+      );
+      print(
         '${_logPrefix}_LANE_CLEANUP: cleanupOk=${report.cleanupPass} '
         'canonical=${report.canonicalPass}',
       );
