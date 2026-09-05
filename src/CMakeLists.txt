@@ -22,6 +22,12 @@ add_library(vanguard_sinks STATIC "sinks/src/passthrough_remux_sink_node.cpp")
 target_include_directories(vanguard_sinks PUBLIC "sinks/include")
 target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 
+# P1-DAG-MULTINODE-HARDWARE-BUFFER-SOURCE-NODE: platform-neutral logical DAG
+# source nodes (owns no AHardwareBuffer*/fence/texture/OS resource).
+add_library(vanguard_sources STATIC "sources/src/hardware_buffer_source_node.cpp")
+target_include_directories(vanguard_sources PUBLIC "sources/include")
+target_link_libraries(vanguard_sources PRIVATE vanguard_graph vanguard_core)
+
 add_library(vanguard_audio STATIC
     "audio/src/decoded_audio_pcm_source_node.cpp"
     "audio/src/audio_gain_envelope.cpp"
@@ -261,6 +267,13 @@ if (ANDROID)
     # closed, unchanged Graph cycle rejection). Diagnostic-only; no
     # production timeline playback wiring.
     "platform/android/src/android_phase1_dag_multinode_execution_plan_jni.cpp"
+    # P1-DAG-MULTINODE-HARDWARE-BUFFER-SOURCE-NODE: platform-neutral logical
+    # DAG HardwareBufferSourceNode diagnostic (construction validation,
+    # identity/port shape, timeline-window semantics, real
+    # GraphExecutionPlan source->sink pass). Diagnostic-only; no production
+    # AHardwareBuffer ownership, no Camera2/MediaCodec lifecycle, no
+    # product/editor/app/ConnectsApp wiring.
+    "platform/android/src/android_phase1_hardware_buffer_source_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
@@ -294,6 +307,7 @@ if (ANDROID)
     vanguard_core
     vanguard_graph
     vanguard_sinks
+    vanguard_sources
     vanguard_audio
     vanguard_compositors
     vanguard_render_shared

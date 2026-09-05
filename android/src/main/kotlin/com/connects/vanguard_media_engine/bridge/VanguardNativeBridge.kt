@@ -1066,6 +1066,15 @@ class VanguardNativeBridge(
     // SurfaceProducer production path.
     external fun runAndroidDagPhase1DagMultinodeExecutionPlanSmoke(): String
 
+    // -- P1-DAG-MULTINODE-HARDWARE-BUFFER-SOURCE-NODE: platform-neutral
+    // logical DAG HardwareBufferSourceNode diagnostic. Proves construction
+    // validation, identity/port shape, timeline-window semantics, and a
+    // real GraphExecutionPlan source->sink pass over TU-local synthetic
+    // nodes only. Diagnostic-only: no production AHardwareBuffer ownership,
+    // no Camera2/MediaCodec lifecycle, no product/editor/app/ConnectsApp
+    // wiring.
+    external fun runAndroidDagPhase1HardwareBufferSourceNodeSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,

@@ -44,6 +44,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2QCapabilityProbe",
             "runAndroidDagPhase1GpuBlacklistNativeSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke",
+            "runAndroidDagPhase1HardwareBufferSourceNodeSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -104,6 +105,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2QCapabilityProbe" -> runPhase2QCapabilityProbe(result)
             "runAndroidDagPhase1GpuBlacklistNativeSmoke" -> runPhase1GpuBlacklistNativeSmoke(result)
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke" -> runPhase1DagMultinodeExecutionPlanSmoke(result)
+            "runAndroidDagPhase1HardwareBufferSourceNodeSmoke" -> runPhase1HardwareBufferSourceNodeSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -260,6 +262,46 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "DAG_MULTINODE_EXECUTION_PLAN_SMOKE_FAILED",
                         "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-DAG-MULTINODE-HARDWARE-BUFFER-SOURCE-NODE: platform-neutral
+    // logical DAG HardwareBufferSourceNode diagnostic. Runs synthetic native
+    // lanes only (construction validation, identity/port shape, timeline-
+    // window semantics, real GraphExecutionPlan source->sink pass). Proof
+    // boundary: platform-neutral logical DAG source - no AHardwareBuffer
+    // ownership, no Android lifecycle, no product/app/editor wiring.
+    private fun runPhase1HardwareBufferSourceNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1HardwareBufferSourceNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_hardware_buffer_source_node_logical_dag_source_no_ahardwarebuffer_" +
+                        "ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "HARDWARE_BUFFER_SOURCE_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase1HardwareBufferSourceNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
