@@ -14,8 +14,9 @@ target_include_directories(vanguard_core PUBLIC "core/include")
 add_library(vanguard_graph STATIC
     "graph/src/graph.cpp"
     "graph/src/graph_execution_plan.cpp"
+    "graph/src/gpu_frame_token.cpp"
 )
-target_include_directories(vanguard_graph PUBLIC "graph/include")
+target_include_directories(vanguard_graph PUBLIC "graph/include" "render/shared/include")
 target_link_libraries(vanguard_graph PRIVATE vanguard_core)
 
 add_library(vanguard_sinks STATIC
@@ -295,6 +296,15 @@ if (ANDROID)
     # precedence. Diagnostic-only: no rendering, no GPU/pixel/handle
     # transport, no product/editor/app/ConnectsApp wiring.
     "platform/android/src/android_phase1_dag_multinode_topology_composition_jni.cpp"
+    # P1-DAG-MULTINODE-GPU-FRAME-TOKEN-CONTRACT: platform-neutral, non-owning
+    # GPU frame token identity/binding contract diagnostic (real four-node
+    # topology - two real HardwareBufferSourceNode instances ->
+    # MultiCamCompositorNode -> PreviewSurfaceSinkNode - proving
+    # GpuFrameTokenSession publish/resolve over BuildGraphExecutionPlan's
+    # ExecutionInputBinding values). Diagnostic-only: no OS/GPU resource
+    # ownership, no rendering, no GPU transport, no product/editor/app/
+    # ConnectsApp wiring.
+    "platform/android/src/android_phase1_dag_multinode_gpu_frame_token_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

@@ -47,6 +47,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke",
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
+            "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -111,6 +112,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
+            "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
+                runPhase1DagMultinodeGpuFrameTokenSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -391,6 +394,51 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "DAG_MULTINODE_TOPOLOGY_COMPOSITION_SMOKE_FAILED",
                         "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-DAG-MULTINODE-GPU-FRAME-TOKEN-CONTRACT: platform-neutral,
+    // non-owning GPU frame token identity/binding contract diagnostic. Runs
+    // synthetic native lanes only, driving
+    // vanguard::graph::GpuFrameTokenSession publish/resolve over
+    // vanguard::graph::BuildGraphExecutionPlan()'s ExecutionInputBinding
+    // values across the same real four-node topology used by the topology
+    // composition route above (two HardwareBufferSourceNode instances ->
+    // MultiCamCompositorNode -> PreviewSurfaceSinkNode, no TU-local Node
+    // subclasses). Proof boundary: platform-neutral GPU frame token binding
+    // contract - diagnostic-only, no OS/GPU resource ownership, no
+    // rendering, no GPU transport, no product/app/editor wiring.
+    private fun runPhase1DagMultinodeGpuFrameTokenSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_gpu_frame_token_binding_contract_diagnostic_only_no_os_" +
+                        "resource_ownership_no_render_no_gpu_transport_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "DAG_MULTINODE_GPU_FRAME_TOKEN_SMOKE_FAILED",
+                        "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

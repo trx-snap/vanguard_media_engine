@@ -1098,6 +1098,20 @@ class VanguardNativeBridge(
     // GPU/pixel/handle transport, no product/editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke(): String
 
+    // -- P1-DAG-MULTINODE-GPU-FRAME-TOKEN-CONTRACT: platform-neutral,
+    // non-owning GPU frame token identity/binding contract diagnostic.
+    // Proves GpuFrameTokenSession publish/resolve over
+    // BuildGraphExecutionPlan()'s ExecutionInputBinding values across the
+    // same real four-node topology (two real HardwareBufferSourceNode
+    // instances -> real MultiCamCompositorNode -> real
+    // PreviewSurfaceSinkNode). Runs synthetic native lanes only (token value
+    // contract, descriptor validation, plan resolution, source/compositor/
+    // sink token publish and resolve, duplicate-publish fail-closed,
+    // stale-generation fail-closed, no-OS-resource-ownership boundary).
+    // Diagnostic-only: no OS/GPU resource ownership, no rendering, no GPU
+    // transport, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,
