@@ -18,7 +18,7 @@
 //
 // Contract mirrored from AndroidTimelineExportSession /
 // AndroidExportRenderBackendSelector / AndroidTimelineVideoEncoder /
-// AndroidTimelineVulkanVideoEncoder:
+// AndroidTimelineVulkanVideoEncoder / AndroidTimelineAudioOverlapAdmission:
 //   - accepted: local video clips only, speed == 1.0, trimEnd > trimStart,
 //     one or more hard-cut clips (no transitions) that may be forward or
 //     reversed, with an optional per-clip colorMatrix applied through the
@@ -28,10 +28,17 @@
 //     is simply the sum of every clip's trim window;
 //   - isReversed=true on a non-video (image) clip fails closed with
 //     INVALID_ARG (message contains both "isReversed" and "video");
-//   - a reversed clip alongside any transition, any overlay, any clip-level
-//     Beauty V2, or any draft.audioSidecar track fails closed with
-//     UNSUPPORTED_EXPORT_FEATURE before pass-1 -- there is no positive
-//     production shape for those combinations in this slice;
+//   - a reversed clip alongside any transition, any overlay, or any
+//     clip-level Beauty V2 fails closed with UNSUPPORTED_EXPORT_FEATURE
+//     before pass-1 -- there is no positive production shape for those
+//     combinations in this slice;
+//   - P5-REVERSE-AUDIO-SIDECAR-EXPORT: a reversed hard-cut timeline
+//     carrying draft.audioSidecar tracks is admitted -- not blanket-
+//     rejected -- when every track's timing fits the reversed timeline's
+//     total duration (AndroidTimelineAudioOverlapAdmission, the same gate
+//     P5-TRANSITION-AUDIO-SIDECAR-EXPORT uses). A track whose timing
+//     doesn't fit still fails closed with INVALID_ARG rather than muxing
+//     desynchronized audio;
 //   - a reversed clip with non-zero rotation metadata also fails closed
 //     with UNSUPPORTED_EXPORT_FEATURE (not exercised by this Dart-only
 //     model's lanes, since the harness never emits clip rotation metadata).
@@ -71,9 +78,11 @@ const String reversedClipsWithOverlaysToken = 'reversed clips with overlays';
 /// Message token for a reversed clip alongside clip-level Beauty V2.
 const String reversedClipsWithBeautyToken = 'reversed clips with Beauty V2';
 
-/// Message token for a reversed clip alongside draft.audioSidecar tracks.
-const String reversedClipsWithAudioTracksToken =
-    'reversed clips with audio tracks';
+/// Message token substring the production route embeds when a reversed
+/// timeline's audioSidecar track fails AndroidTimelineAudioOverlapAdmission
+/// timing validation (see P5-REVERSE-AUDIO-SIDECAR-EXPORT) -- e.g. an end
+/// time past the reversed timeline's total duration.
+const String reversedAudioSidecarInvalidTimingToken = 'audioSidecar track';
 
 /// Message token for a reversed clip carrying non-zero rotation metadata.
 const String reversedClipsWithRotationToken =
@@ -210,10 +219,18 @@ class VGTimelineReverseExportSmokeOverlay {
   };
 }
 
-/// One draft.audioSidecar track entry for a fail-closed "reversed + audio
-/// tracks" lane -- this slice never accepts a non-empty audioSidecar track
-/// list alongside a reversed clip, so the exact wire shape beyond
-/// non-emptiness is never validated by that route.
+/// One draft.audioSidecar track entry of a reversed hard-cut smoke draft
+/// (wire shape of `VGAudioSidecarTrack.toMap()` for the fields this smoke
+/// exercises).
+///
+/// P5-REVERSE-AUDIO-SIDECAR-EXPORT: [startTime]/[duration] are expressed on
+/// the reversed timeline's own output basis -- the plain sum of clip trim
+/// windows, since reversing a clip's playback direction does not shorten or
+/// overlap the timeline the way a transition does. A track admitted by
+/// AndroidTimelineAudioOverlapAdmission routes through the existing pass-2
+/// mux/mixdown path exactly like a forward hard-cut timeline's audio tracks
+/// do; a track whose timing doesn't fit still fails closed with
+/// INVALID_ARG.
 @immutable
 class VGTimelineReverseExportSmokeAudioTrack {
   const VGTimelineReverseExportSmokeAudioTrack({
@@ -221,20 +238,38 @@ class VGTimelineReverseExportSmokeAudioTrack {
     required this.url,
     this.startTime = 0.0,
     this.duration = 1.0,
+    this.role,
+    this.volume = 1.0,
+    this.fadeInSeconds = 0.0,
+    this.fadeOutSeconds = 0.0,
+    this.sourceTrimStart = 0.0,
   });
 
   final String trackId;
   final String url;
   final double startTime;
   final double duration;
+  final String? role;
+  final double volume;
+  final double fadeInSeconds;
+  final double fadeOutSeconds;
+  final double sourceTrimStart;
 
-  Map<String, Object?> toMap() => <String, Object?>{
-    'trackId': trackId,
-    'url': url,
-    'startTime': startTime,
-    'duration': duration,
-    'volume': 1.0,
-  };
+  /// Matches `VGAudioSidecarTrack.toMap()`'s wire keys/omission rules.
+  Map<String, Object?> toMap() {
+    final m = <String, Object?>{
+      'trackId': trackId,
+      'url': url,
+      'startTime': startTime,
+      'duration': duration,
+      'volume': volume,
+    };
+    if (role != null) m['role'] = role;
+    if (fadeInSeconds != 0.0) m['fadeInSeconds'] = fadeInSeconds;
+    if (fadeOutSeconds != 0.0) m['fadeOutSeconds'] = fadeOutSeconds;
+    if (sourceTrimStart != 0.0) m['sourceTrimStart'] = sourceTrimStart;
+    return m;
+  }
 }
 
 /// What a lane expects from the production route.
@@ -561,9 +596,7 @@ class VGTimelineReverseExportSmokeReport {
 
   /// Parses a map produced by [toMap]. A malformed `lanes` entry yields an
   /// empty (failing) report.
-  static VGTimelineReverseExportSmokeReport fromMap(
-    Map<Object?, Object?> map,
-  ) {
+  static VGTimelineReverseExportSmokeReport fromMap(Map<Object?, Object?> map) {
     final rawLanes = map['lanes'];
     final lanes = <VGTimelineReverseExportSmokeLaneReport>[];
     if (rawLanes is List) {

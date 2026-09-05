@@ -144,7 +144,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedBeauty() =>
       ),
     );
 
-// (g) reversed + audioSidecar fail closed.
+// (g) reversed + audioSidecar with valid timing succeeds.
 VGTimelineReverseExportSmokeRequest _laneReversedAudioSidecar() =>
     VGTimelineReverseExportSmokeRequest(
       laneId: 'reversed_audio_sidecar',
@@ -154,13 +154,35 @@ VGTimelineReverseExportSmokeRequest _laneReversedAudioSidecar() =>
       audioTracks: const <VGTimelineReverseExportSmokeAudioTrack>[
         VGTimelineReverseExportSmokeAudioTrack(
           trackId: 'track-1',
-          url: '/data/local/tmp/audio.m4a',
+          url: '/data/local/tmp/clip.mov',
+          startTime: 0.0,
+          duration: 2.0,
+          sourceTrimStart: 0.0,
         ),
       ],
       outputPath: '/data/local/tmp/out_reversed_audio.mp4',
+      expectation: const VGTimelineReverseExportSmokeExpectation.success(),
+    );
+
+// (g2) reversed + audioSidecar with invalid timing fails closed.
+VGTimelineReverseExportSmokeRequest _laneReversedAudioSidecarInvalidTiming() =>
+    VGTimelineReverseExportSmokeRequest(
+      laneId: 'reversed_audio_sidecar_invalid_timing',
+      clips: <VGTimelineReverseExportSmokeClip>[
+        _clip('clip-a', isReversed: true),
+      ],
+      audioTracks: const <VGTimelineReverseExportSmokeAudioTrack>[
+        VGTimelineReverseExportSmokeAudioTrack(
+          trackId: 'track-overrun',
+          url: '/data/local/tmp/clip.mov',
+          startTime: 1.0,
+          duration: 3.0,
+        ),
+      ],
+      outputPath: '/data/local/tmp/out_reversed_audio_invalid.mp4',
       expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: reversedClipsWithAudioTracksToken,
+        errorCode: invalidArgExportCode,
+        messageContains: reversedAudioSidecarInvalidTimingToken,
       ),
     );
 
@@ -295,16 +317,23 @@ void main() {
       expect((clips[0] as Map)['beautyIntensity'], 0.5);
     });
 
-    test(
-      '(g) reversed + audioSidecar arguments carry a non-empty tracks list',
-      () {
-        final args = _laneReversedAudioSidecar().toExportTimelineArguments();
-        final draft = args['draft'] as Map<String, Object?>;
-        expect(draft.containsKey('audioSidecar'), isTrue);
-        final sidecar = draft['audioSidecar'] as Map<String, Object?>;
-        expect(sidecar['tracks'], hasLength(1));
-      },
-    );
+    test('(g) reversed + audioSidecar arguments carry a non-empty tracks list '
+        'with the expected wire fields', () {
+      final args = _laneReversedAudioSidecar().toExportTimelineArguments();
+      final draft = args['draft'] as Map<String, Object?>;
+      expect(draft.containsKey('audioSidecar'), isTrue);
+      final sidecar = draft['audioSidecar'] as Map<String, Object?>;
+      final tracks = sidecar['tracks'] as List<Object?>;
+      expect(tracks, hasLength(1));
+      final track = tracks.single as Map;
+      expect(track['trackId'], 'track-1');
+      expect(track['startTime'], 0.0);
+      expect(track['duration'], 2.0);
+      expect(track['volume'], 1.0);
+      expect(track.containsKey('fadeInSeconds'), isFalse);
+      expect(track.containsKey('fadeOutSeconds'), isFalse);
+      expect(track.containsKey('sourceTrimStart'), isFalse);
+    });
 
     test('(h) image + isReversed arguments preserve both fields', () {
       final args = _laneImageReversed().toExportTimelineArguments();
@@ -346,6 +375,22 @@ void main() {
       );
       expect(report.pass, isTrue);
       expect(report.renderBackend, expectedReverseRenderBackend);
+    });
+
+    test('(g) reversed + audioSidecar with valid timing passes with gles '
+        'duration ~2.0', () {
+      final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+        _laneReversedAudioSidecar(),
+        _successResult(
+          duration: 2.0,
+          path: '/data/local/tmp/out_reversed_audio.mp4',
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, expectedReverseRenderBackend);
+      expect(report.outputExists, isTrue);
     });
 
     test('fails when renderBackend is vulkan', () {
@@ -459,17 +504,50 @@ void main() {
       expect(report.pass, isTrue);
     });
 
-    test('(g) reversed + audioSidecar requires the audio tracks token', () {
-      final report = VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
-        _laneReversedAudioSidecar(),
-        PlatformException(
-          code: unsupportedExportFeatureCode,
-          message:
-              'exportTimeline: reversed clips with audio tracks are not supported',
-        ),
+    test('(g) reversed + audioSidecar with valid timing that unexpectedly '
+        'throws fails', () {
+      final report =
+          VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
+            _laneReversedAudioSidecar(),
+            PlatformException(code: 'EXPORT_FAILED', message: 'pass-2 failed'),
+          );
+      expect(report.pass, isFalse);
+      expect(
+        report.failureReason,
+        'unexpected_platform_exception:EXPORT_FAILED',
       );
-      expect(report.pass, isTrue);
     });
+
+    test(
+      '(g2) reversed + audioSidecar with invalid timing requires INVALID_ARG '
+      'and the audioSidecar track token',
+      () {
+        final report =
+            VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
+              _laneReversedAudioSidecarInvalidTiming(),
+              PlatformException(
+                code: invalidArgExportCode,
+                message:
+                    "exportTimeline: audioSidecar track 'track-overrun' end "
+                    'time 4.0 exceeds the overlap-adjusted output duration 2.0',
+              ),
+            );
+        expect(report.pass, isTrue);
+
+        final wrongCode =
+            VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
+              _laneReversedAudioSidecarInvalidTiming(),
+              PlatformException(
+                code: unsupportedExportFeatureCode,
+                message:
+                    "exportTimeline: audioSidecar track 'track-overrun' end "
+                    'time 4.0 exceeds the overlap-adjusted output duration 2.0',
+              ),
+            );
+        expect(wrongCode.pass, isFalse);
+        expect(wrongCode.failureReason, startsWith('error_code_mismatch'));
+      },
+    );
 
     test(
       '(h) image + isReversed requires INVALID_ARG and the isReversed token, '
@@ -667,6 +745,41 @@ void main() {
         expect(report.lanes[1].errorCode, unsupportedExportFeatureCode);
       },
     );
+
+    test('(g) reversed + audioSidecar with valid timing passes end to end, '
+        '(g2) invalid timing fails closed with INVALID_ARG', () async {
+      _setMockHandler((method, args) async {
+        final draft = (args as Map)['draft'] as Map;
+        final sidecar = draft['audioSidecar'] as Map?;
+        final tracks = sidecar?['tracks'] as List?;
+        final track = tracks?.single as Map?;
+        if (track != null && (track['duration'] as num) > 2.0) {
+          throw PlatformException(
+            code: invalidArgExportCode,
+            message:
+                "exportTimeline: audioSidecar track 'track-overrun' end "
+                'time 4.0 exceeds the overlap-adjusted output duration 2.0',
+          );
+        }
+        return _successResult(
+          duration: 2.0,
+          path: '/data/local/tmp/out_reversed_audio.mp4',
+        );
+      });
+      final runner = VGTimelineReverseExportSmokeRunner(
+        channel: _channel,
+        fileExists: (path) => path == '/data/local/tmp/out_reversed_audio.mp4',
+      );
+      final report = await runner.run(<VGTimelineReverseExportSmokeRequest>[
+        _laneReversedAudioSidecar(),
+        _laneReversedAudioSidecarInvalidTiming(),
+      ]);
+      expect(report.pass, isTrue);
+      expect(report.lanes, hasLength(2));
+      expect(report.lanes[0].renderBackend, expectedReverseRenderBackend);
+      expect(report.lanes[0].outputExists, isTrue);
+      expect(report.lanes[1].errorCode, invalidArgExportCode);
+    });
 
     test('a vulkan-backed success fails the positive lane', () async {
       _setMockHandler(

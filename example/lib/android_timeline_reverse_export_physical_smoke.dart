@@ -33,8 +33,9 @@
 //                                       -> fail closed with
 //                                       UNSUPPORTED_EXPORT_FEATURE.
 //   Lane reversed_audio_sidecar       : a reversed clip alongside a
-//                                       draft.audioSidecar track -> fail closed
-//                                       with UNSUPPORTED_EXPORT_FEATURE.
+//                                       draft.audioSidecar track whose timing
+//                                       fits the reversed timeline -> success,
+//                                       renderBackend=gles, duration ~= 2.0.
 //   Lane image_reversed               : a still-image clip with isReversed=true
 //                                       -> fail closed with INVALID_ARG.
 //
@@ -243,18 +244,18 @@ class _AndroidTimelineReverseExportSmokeAppState
           clips: <VGTimelineReverseExportSmokeClip>[
             videoClip('clip-a', clipA.path, isReversed: true),
           ],
-          audioTracks: const <VGTimelineReverseExportSmokeAudioTrack>[
+          audioTracks: <VGTimelineReverseExportSmokeAudioTrack>[
             VGTimelineReverseExportSmokeAudioTrack(
               trackId: 'track-1',
-              url: '/data/local/tmp/vg_reverse_export_audio_not_used.m4a',
+              url: clipA.path,
+              startTime: 0.0,
+              duration: _clipTrimEndSeconds,
+              sourceTrimStart: 0.0,
             ),
           ],
           outputPath:
               '${workDir.path}/vg_reverse_export_audio_sidecar_$stamp.mp4',
-          expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: reversedClipsWithAudioTracksToken,
-          ),
+          expectation: const VGTimelineReverseExportSmokeExpectation.success(),
         ),
         VGTimelineReverseExportSmokeRequest(
           laneId: 'image_reversed',

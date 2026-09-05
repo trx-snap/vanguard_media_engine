@@ -45,12 +45,23 @@ import kotlin.math.floor
 //     fallback (renderReversedClipIntoEncoder) -- reversed clips never
 //     route through Vulkan (AndroidExportRenderBackendSelector /
 //     AndroidTimelineVulkanVideoEncoder both fail closed for them). A
-//     reversed clip alongside a transition, an overlay, clip-level Beauty
-//     V2, or an audioSidecar track fails closed with
-//     UNSUPPORTED_EXPORT_FEATURE before pass-1; isReversed=true on a
-//     non-video clip fails closed with INVALID_ARG. This route never reads
+//     reversed clip alongside a transition, an overlay, or clip-level
+//     Beauty V2 fails closed with UNSUPPORTED_EXPORT_FEATURE before
+//     pass-1; isReversed=true on a non-video clip fails closed with
+//     INVALID_ARG. This route never reads
 //     AndroidReverseSidecarCoordinator/Transcoder output -- those sidecars
 //     remain preview/playback-only.
+//   - P5-REVERSE-AUDIO-SIDECAR-EXPORT: a reversed hard-cut timeline carrying
+//     audioSidecar tracks is admitted -- not blanket-rejected -- when every
+//     parsed track's timing is valid on the reversed timeline's total
+//     duration (AndroidTimelineAudioOverlapAdmission, reusing the same
+//     admission gate as P5-TRANSITION-AUDIO-SIDECAR-EXPORT). Reversing a
+//     clip's playback direction does not change its duration, so this
+//     duration is simply the sum of each parsed clip's trimEnd - trimStart;
+//     this gate never adjusts or clamps the already-computed wire values.
+//     Admitted tracks route through the existing pass-2 mux/mixdown path
+//     (AndroidTimelineAudioPass2Muxer) exactly like a forward hard-cut
+//     timeline's audio tracks do.
 //   - P5-COMPOSITOR-TRANS: compositor-owned clip overlap transitions
 //     (AndroidTimelineTransitionDescriptor: dissolve/crossfade, slide*,
 //     wipe*) between adjacent video clips, rendered ONLY by
@@ -291,7 +302,8 @@ class AndroidTimelineExportSession(private val context: Context) {
             // has no defined semantics here and fails closed with a
             // malformed-argument code rather than UNSUPPORTED_EXPORT_FEATURE.
             // The remaining reversed-clip guardrails (transitions/overlays/
-            // Beauty V2/audio tracks/rotation) depend on context not yet
+            // Beauty V2/rotation, plus the P5-REVERSE-AUDIO-SIDECAR-EXPORT
+            // audioSidecar timing admission) depend on context not yet
             // known at this point in per-clip parsing and are enforced
             // further below, once every clip has been parsed (and, for
             // rotation, probed).
@@ -404,11 +416,19 @@ class AndroidTimelineExportSession(private val context: Context) {
         // GLES-only production route (see AndroidTimelineVideoEncoder /
         // AndroidExportRenderBackendSelector) -- any scope that mixes a
         // reversed clip with a feature that has no reversed-clip support yet
-        // (transitions, overlays, clip-level Beauty V2, audio tracks) fails
-        // closed here, before transitions/overlays are even parsed, rather
-        // than silently producing wrong output. Rotation metadata on a
-        // reversed clip is checked further below (step 3), once each video
-        // clip has been probed.
+        // (transitions, overlays, clip-level Beauty V2) fails closed here,
+        // before transitions/overlays are even parsed, rather than silently
+        // producing wrong output. Rotation metadata on a reversed clip is
+        // checked further below (step 3), once each video clip has been
+        // probed.
+        //
+        // P5-REVERSE-AUDIO-SIDECAR-EXPORT: audioSidecar tracks are admitted
+        // alongside a reversed hard-cut timeline -- not blanket-rejected --
+        // when every parsed track's timing is valid on the reversed
+        // timeline's total duration (sum of each parsed clip's trimEnd -
+        // trimStart; reversing a clip's playback direction does not change
+        // its duration). An invalid track still fails closed rather than
+        // producing desynchronized output.
         val anyReversed = parsedClips.any { it.isReversed }
         if (anyReversed) {
             if (rawTransitions.isNotEmpty()) {
@@ -432,12 +452,22 @@ class AndroidTimelineExportSession(private val context: Context) {
                 )
                 return
             }
-            if (rawSidecarTracks.isNotEmpty()) {
-                onError(
-                    "UNSUPPORTED_EXPORT_FEATURE",
-                    "exportTimeline: reversed clips with audio tracks are not supported",
-                )
-                return
+            if (audioSpecs.isNotEmpty()) {
+                val reverseTimelineDurationSeconds = parsedClips
+                    .sumOf { it.trimEnd - it.trimStart }
+                    .coerceAtLeast(0.0)
+                when (
+                    val admission = AndroidTimelineAudioOverlapAdmission.validate(
+                        audioSpecs,
+                        reverseTimelineDurationSeconds,
+                    )
+                ) {
+                    is AndroidTimelineAudioOverlapAdmission.Result.Failure -> {
+                        onError(admission.code, admission.message)
+                        return
+                    }
+                    AndroidTimelineAudioOverlapAdmission.Result.Admitted -> {}
+                }
             }
         }
 
