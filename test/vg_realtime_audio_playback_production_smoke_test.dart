@@ -4,8 +4,10 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
-// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, and drift sample ownership diagnostic smoke foundation
+// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16) +
+// P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF (Y18b) +
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, drift sample ownership, ring frame source, and real-decoder ring frame source diagnostic smoke foundation
 // Dart model and MethodChannel unit tests.
 
 import 'package:flutter/services.dart';
@@ -13,7 +15,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_ring_transport_frame_source_seam_production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_native_eos_drained_observed_by_sink_read_no_owner_pre_drain_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_one_backward_seek_while_paused_declared_to_decoder_sink_clock_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_ring_transport_frame_source_seam_production_sink_consumes_async_runtime_multi_source_output_ring_to_eos_without_state_machine_native_eos_drained_observed_by_sink_read_no_owner_pre_drain_real_decoder_ring_frame_source_proof_only_kotlin_owned_mediaextractor_mediacodec_track0_plus_synthetic_track1_lockstep_ingest_pump_to_async_runtime_multi_source_output_ring_ring_owner_thread_services_sink_drains_per_drain_wait_bound_no_private_output_drain_expected_frames_window_aligned_eos_pad_budget_one_second_or_truncate_codec_extractor_released_once_missing_frame_source_fails_before_audiotrack_no_current_position_authority_switch_no_fleet_claim_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -100,6 +102,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'driftSampleNoFeedbackOk': true,
     'clockAuthorityUnchangedOk': true,
     'ringFrameSourceOk': true,
+    'realDecoderRingFrameSourceOk': true,
     'canonical': true,
   };
 
@@ -325,7 +328,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16/Y17/Y18b realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_BACKWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE,SCENARIO_RING_FRAME_SOURCE_TO_EOS',
+        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16/Y17/Y18b/Y18c realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_BACKWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE,SCENARIO_RING_FRAME_SOURCE_TO_EOS,SCENARIO_REAL_DECODER_RING_FRAME_SOURCE_TO_EOS',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -394,11 +397,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(74),
+        equals(75),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(75),
+        equals(76),
       );
 
       final expectedLanes = <String>[
@@ -476,6 +479,7 @@ void main() {
         'driftSampleNoFeedbackOk',
         'clockAuthorityUnchangedOk',
         'ringFrameSourceOk',
+        'realDecoderRingFrameSourceOk',
         'canonical',
       ];
 
@@ -485,6 +489,11 @@ void main() {
           contains(lane),
         );
       }
+
+      expect(
+        VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes,
+        orderedEquals(expectedLanes),
+      );
     });
   });
 
@@ -1476,6 +1485,40 @@ void main() {
         expect(report.clockCorrelationCommandsAfter, equals(-1));
       },
     );
+
+    test('missing required Y18c lane fails isVerifiedPass', () {
+      for (final lane in <String>['realDecoderRingFrameSourceOk']) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test('report details contains Y18c real-decoder ring scenario', () {
+      final report = _createSampleReport();
+      expect(
+        report.details.contains(
+          'SCENARIO_REAL_DECODER_RING_FRAME_SOURCE_TO_EOS',
+        ),
+        isTrue,
+      );
+    });
 
     test('fail map with deadObjectBaseStepBounded=false fails validation', () {
       final report = _createSampleReport(<String, Object?>{

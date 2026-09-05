@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.diagnostics
 
+import android.media.AudioFormat
 import android.media.AudioTrack
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSession
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkBridge
@@ -70,6 +71,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_COMMAND
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_THIRD_REJECT
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REAL_DECODER_RING_FRAME_SOURCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_FRAME_SOURCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_MONITOR_TEARDOWN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_SETUP
@@ -1930,6 +1932,395 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             routeOk && sinkLifecycleOk && threadOk && ringDrainOk && frameAccountingOk &&
             eosOk && checksumOk && ringCloseOk && nativeOk && noSeekPauseResumeOk &&
             noFeedbackOk && proofBoundaryOk
+    }
+
+    // Y18c (P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE): the
+    // ONE real-decoder ring-transport lane. The production sink was fed
+    // through the Y18a frameSource seam from the async-runtime multi-source
+    // native output ring with a Kotlin-owned MediaExtractor/MediaCodec PCM16
+    // decode on track 0 and the pump's synthetic track 1 in lockstep (no
+    // state machine, no session, no production decoder feed), drained to
+    // the NATIVE eosDrained verdict, then released/joined; the ring released
+    // codec + extractor exactly once, took its final native snapshot and
+    // destroyed/joined the native worker. Every fact below is read from the
+    // captured sink / ring / decoder / folded-native telemetry; a missing
+    // snapshot fails the lane closed. Non-claims stay explicit: no seek, no
+    // pause/resume, no drift feedback, no pacing correction, no resampling,
+    // no currentPosition authority switch, no A/V sync closure, no
+    // cross-device bit-exact decoder claim, no fleet claim.
+    fun evaluateRealDecoderRingFrameSource(
+        sink: VanguardRealtimeAudioPlaybackSinkTelemetry?,
+        ring: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Telemetry?,
+        sinkClock: VanguardRealtimePlaybackPresentationClock.Snapshot?,
+        geometry: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Geometry?,
+        negativeProbeOk: Boolean,
+        realDecoderSourceUsed: Boolean,
+        stateMachineSourceUsed: Boolean,
+        sinkReadyBeforeTransportStart: Boolean,
+        drainAllowedAfterTransportStart: Boolean,
+        sinkJoined: Boolean,
+        ringClosed: Boolean,
+        coordinatorThreadId: Long,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val native = ring?.native
+        val decoder = ring?.decoder
+        val g = geometry ?: ring?.geometry
+        val expectedFrames = g?.expectedFrames ?: -1L
+        val m = out.metrics
+        m["realRingSinkTelemetryPresent"] = sink != null
+        m["realRingTelemetryPresent"] = ring != null
+        m["realRingNativeTelemetryPresent"] = native != null
+        m["realRingGeometryPresent"] = g != null
+        m["realRingMaxFramesPerMixConfig"] = config.maxFramesPerMix
+        m["realRingMaxDurationSecConfig"] = config.maxDurationSec
+
+        // ── Frozen geometry (real decoder output format) ────────────────────
+        m["realRingSourceMime"] = g?.sourceMime ?: ""
+        m["realRingSourceTrackIndex"] = g?.sourceTrackIndex ?: -1
+        m["realRingSourceDurationUs"] = g?.sourceDurationUs ?: -1L
+        m["realRingDeclaredWindowUs"] = g?.declaredWindowUs ?: -1L
+        m["realRingSampleRate"] = g?.sampleRate ?: -1
+        m["realRingChannelCount"] = g?.channelCount ?: -1
+        m["realRingPcmEncoding"] = g?.pcmEncoding ?: -1
+        m["realRingExpectedFrames"] = expectedFrames
+        m["realRingPadBudgetFrames"] = g?.padBudgetFrames ?: -1L
+        m["realRingInputEndUs"] = g?.inputEndUs ?: -1L
+
+        // ── Sink-side facts (production VanguardRealtimeAudioPlaybackSinkBridge) ─
+        m["sinkPhase"] = sink?.phase?.name ?: "none"
+        m["sinkExitReason"] = sink?.exitReason ?: "none"
+        m["sinkThreadId"] = sink?.threadId ?: -1L
+        m["sinkThreadIsFrameSourceOwner"] = sink?.threadIsTransportOwner ?: true
+        m["sinkFramesReadFromTransport"] = sink?.framesReadFromTransport ?: -1L
+        m["sinkFramesWrittenToSink"] = sink?.framesWrittenToSink ?: -1L
+        m["sinkDrainCalls"] = sink?.drainCalls ?: -1L
+        m["sinkDrainCallsBeforeAllow"] = sink?.drainCallsBeforeAllow ?: -1L
+        m["sinkDrainRequestSizeChanges"] = sink?.drainRequestSizeChanges ?: -1L
+        m["sinkEmptyDrainCount"] = sink?.emptyDrainCount ?: -1L
+        m["sinkProductiveDrainPasses"] = sink?.productiveDrainPasses ?: -1L
+        m["sinkEosDrainedObserved"] = sink?.eosDrainedObserved ?: false
+        m["sinkPartialWriteCount"] = sink?.partialWriteCount ?: -1L
+        m["sinkZeroWriteCount"] = sink?.zeroWriteCount ?: -1L
+        m["sinkAudioTrackInitOk"] = sink?.audioTrackInitOk ?: false
+        m["sinkGainSetOk"] = sink?.gainSetOk ?: false
+        m["sinkGainValue"] = sink?.gainValue ?: 0f
+        m["sinkPlayed"] = sink?.played ?: false
+        m["sinkAudioTracksCreated"] = sink?.audioTracksCreated ?: -1
+        m["sinkReleaseCount"] = sink?.releaseCount ?: -1
+        m["sinkReleaseExecutedOnSinkThread"] = sink?.releaseExecutedOnSinkThread ?: false
+        m["sinkAudioTrackCallsOffSinkThread"] = sink?.audioTrackCallsOffSinkThread ?: -1L
+        m["sinkParkCount"] = sink?.parkCount ?: -1
+        m["sinkUnparkCount"] = sink?.unparkCount ?: -1
+        m["sinkSeekParkCount"] = sink?.seekParkCount ?: -1
+        m["sinkFlushCount"] = sink?.flushCount ?: -1
+        m["sinkDeadObjectInjectedCount"] = sink?.deadObjectInjectedCount ?: -1L
+        m["sinkDeadObjectObservedCount"] = sink?.deadObjectObservedCount ?: -1L
+        m["sinkTimestampPollAttempts"] = sink?.timestampPollAttempts ?: -1L
+        m["sinkTimestampMaxPollsInOnePass"] = sink?.timestampMaxPollsInOnePass ?: -1L
+        m["sinkTimestampPollsWhileParked"] = sink?.timestampPollsWhileParked ?: -1L
+        m["sinkDriftSamplesPosted"] = sink?.driftSamplesPosted ?: -1L
+        m["sinkDriftCallbackCount"] = sink?.driftCallbackCount ?: -1L
+        m["sinkDriftSamplesRecorded"] = sink?.driftSamplesRecorded ?: -1L
+        m["sinkDriftSamplesStaleRejected"] = sink?.driftSamplesStaleRejected ?: -1L
+        m["sinkDriftSamplesOtherRejected"] = sink?.driftSamplesOtherRejected ?: -1L
+        m["sinkDriftLastRejectReason"] = sink?.driftLastRejectReason ?: ""
+        m["sinkDriftNativeSamplesRecorded"] = sink?.driftNativeSamplesRecorded ?: -1L
+        m["sinkChecksumHex"] = sink?.checksumHex ?: ""
+        m["sinkThreadWallMs"] = sink?.sinkThreadWallMs ?: -1L
+        m["sinkLastReplyEosDrained"] = sink?.lastReply?.eosDrained ?: false
+        m["sinkJoined"] = sinkJoined
+
+        // ── Sink presentation clock (observation only; never a lane gate here) ─
+        m["sinkClockConsistent"] = sinkClock?.consistent ?: false
+        m["sinkClockFaulted"] = sinkClock?.faulted ?: true
+        m["sinkClockPositionFrames"] = sinkClock?.positionFrames ?: -1L
+        m["sinkClockPositionUs"] = sinkClock?.positionUs ?: -1L
+        m["sinkClockAnchoredCount"] = sinkClock?.anchoredCount ?: -1L
+        m["sinkClockRegressionCount"] = sinkClock?.regressionCount ?: -1L
+        m["sinkClockEpochOpen"] = sinkClock?.epochOpen ?: true
+        m["sinkClockEpochOpenCount"] = sinkClock?.epochOpenCount ?: -1
+        m["sinkClockEpochCloseCount"] = sinkClock?.epochCloseCount ?: -1
+
+        // ── Ring adapter facts (AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource) ─
+        m["realRingStage"] = ring?.stage?.name ?: "none"
+        m["realRingStageTrace"] = ring?.stageTrace ?: ""
+        m["realRingFailureReason"] = ring?.failureReason ?: "none"
+        m["realRingOwnerThreadId"] = ring?.ownerThreadId ?: -1L
+        m["realRingSinkThreadIdObserved"] = ring?.sinkThreadIdObserved ?: -1L
+        m["realRingDrainCallsFromSink"] = ring?.drainCallsFromSink ?: -1L
+        m["realRingDrainCallsOnOwnerThread"] = ring?.drainCallsOnOwnerThread ?: -1L
+        m["realRingDrainCallsOnOtherThreads"] = ring?.drainCallsOnOtherThreads ?: -1L
+        m["realRingDrainOverlapRejects"] = ring?.drainOverlapRejects ?: -1L
+        m["realRingDrainsBeforeStartRejected"] = ring?.drainsBeforeStartRejected ?: -1L
+        m["realRingDrainsServiced"] = ring?.drainsServiced ?: -1L
+        m["realRingDrainsServicedFromMakeRoom"] = ring?.drainsServicedFromMakeRoom ?: -1L
+        m["realRingDrainsAfterCloseRejected"] = ring?.drainsAfterCloseRejected ?: -1L
+        m["realRingDrainWaitBoundMs"] = ring?.drainWaitBoundMs ?: -1L
+        m["realRingDrainWaitTimeouts"] = ring?.drainWaitTimeouts ?: -1L
+        m["realRingLastDrainTimeoutWaitMs"] = ring?.lastDrainTimeoutWaitMs ?: -1L
+        m["realRingMaxDrainServiceLatencyMs"] = ring?.maxDrainServiceLatencyMs ?: -1L
+        m["realRingDrainLatencyBoundViolations"] = ring?.drainLatencyBoundViolations ?: -1L
+        m["realRingFramesReadBySink"] = ring?.framesReadBySink ?: -1L
+        m["realRingEmptyReadsServiced"] = ring?.emptyReadsServiced ?: -1L
+        m["realRingOutputSinkAccountedFrames"] = ring?.outputSinkAccountedFrames ?: -1L
+        m["realRingOutputSinkCallbacks"] = ring?.outputSinkCallbacks ?: -1L
+        m["realRingOutputSinkCallbacksOffOwner"] = ring?.outputSinkCallbacksOffOwner ?: -1L
+        m["realRingPrivateOutputDrains"] = ring?.privateOutputDrains ?: -1L
+        m["realRingTotalOutputFramesRead"] = ring?.totalOutputFramesRead ?: -1L
+        m["realRingNativeOutputReadChecksumHex"] = ring?.nativeOutputReadChecksumHex ?: ""
+        m["realRingKotlinReferenceMixChecksumHex"] = ring?.kotlinReferenceMixChecksumHex ?: ""
+        m["realRingKotlinTrack0ChecksumHex"] = ring?.kotlinTrack0ChecksumHex ?: ""
+        m["realRingKotlinTrack1ChecksumHex"] = ring?.kotlinTrack1ChecksumHex ?: ""
+        m["realRingNativeAcceptedChecksumHexTrack0"] = ring?.nativeAcceptedChecksumHexTrack0 ?: ""
+        m["realRingNativeAcceptedChecksumHexTrack1"] = ring?.nativeAcceptedChecksumHexTrack1 ?: ""
+        m["realRingPumpFramesAccepted"] = ring?.pumpFramesAccepted ?: -1L
+        m["realRingFramesAcceptedTrack0"] = ring?.framesAcceptedTrack0 ?: -1L
+        m["realRingFramesAcceptedTrack1"] = ring?.framesAcceptedTrack1 ?: -1L
+        m["realRingTrack0NonZeroSampleCount"] = ring?.track0NonZeroSampleCount ?: -1L
+        m["realRingTrack1NonZeroSampleCount"] = ring?.track1NonZeroSampleCount ?: -1L
+        m["realRingChecksumChainSelfOk"] = ring?.checksumChainSelfOk ?: false
+        m["realRingPreStartFillFrames"] = ring?.preStartFillFrames ?: -1L
+        m["realRingTransportCommandsIssued"] = ring?.transportCommandsIssued ?: -1L
+        m["realRingTransportCommandsFromDrain"] = ring?.transportCommandsFromDrain ?: -1L
+        m["realRingEosSetWithoutDrain"] = ring?.eosSetWithoutDrain ?: false
+        m["realRingTotalFramesPushedAtEos"] = ring?.totalFramesPushedAtEos ?: -1L
+        m["realRingEosDrainedObservedByRing"] = ring?.eosDrainedObservedByRing ?: false
+        m["realRingEosPollSnapshots"] = ring?.eosPollSnapshots ?: -1L
+        m["realRingDriftSamplesPosted"] = ring?.driftSamplesPosted ?: -1L
+        m["realRingDriftSamplesRejectedUnsupported"] = ring?.driftSamplesRejectedUnsupported ?: -1L
+        m["realRingDriftSamplesRejectedStale"] = ring?.driftSamplesRejectedStale ?: -1L
+        m["realRingDestroyJoinOk"] = ring?.destroyJoinOk ?: false
+        m["realRingDestroyIdempotentOk"] = ring?.destroyIdempotentOk ?: false
+        m["realRingMakeRoomCallbacks"] = ring?.makeRoomCallbacks ?: -1L
+        m["realRingMakeRoomIdleReturns"] = ring?.makeRoomIdleReturns ?: -1L
+        m["realRingWriterBackpressureRejects"] = ring?.writerBackpressureRejects ?: -1L
+        m["realRingOpenWallMs"] = ring?.openWallMs ?: -1L
+        m["realRingFormatProbeWallMs"] = ring?.formatProbeWallMs ?: -1L
+        m["realRingPrefillWallMs"] = ring?.prefillWallMs ?: -1L
+        m["realRingStartWallMs"] = ring?.startWallMs ?: -1L
+        m["realRingOwnerLoopWallMs"] = ring?.ownerLoopWallMs ?: -1L
+        m["realRingOwnerLoopIterations"] = ring?.ownerLoopIterations ?: -1L
+
+        // ── Decoder facts (Kotlin-owned MediaExtractor/MediaCodec on the owner thread) ─
+        m["decoderFormatResolved"] = decoder?.formatResolved ?: false
+        m["decoderMidStreamFormatChanges"] = decoder?.midStreamFormatChanges ?: -1L
+        m["decoderDecodeSteps"] = decoder?.decodeSteps ?: -1L
+        m["decoderTryAgainSteps"] = decoder?.tryAgainSteps ?: -1L
+        m["decoderInputSamplesQueued"] = decoder?.inputSamplesQueued ?: -1L
+        m["decoderInputEosQueued"] = decoder?.inputEosQueued ?: false
+        m["decoderOutputEosReached"] = decoder?.outputEosReached ?: false
+        m["decoderChunks"] = decoder?.decoderChunks ?: -1L
+        m["decoderFramesDecoded"] = decoder?.framesDecoded ?: -1L
+        m["decoderFramesIngestedReal"] = decoder?.framesIngestedReal ?: -1L
+        m["decoderEosPadFrames"] = decoder?.eosPadFrames ?: -1L
+        m["decoderEosPadChunks"] = decoder?.eosPadChunks ?: -1L
+        m["decoderEosTruncatedFrames"] = decoder?.eosTruncatedFrames ?: -1L
+        m["decoderPadBudgetFrames"] = decoder?.padBudgetFrames ?: -1L
+        m["decoderIngestComplete"] = decoder?.ingestComplete ?: false
+        m["decoderSliceGrowths"] = decoder?.sliceGrowths ?: -1L
+        m["decoderCodecCallsOffOwnerThread"] = decoder?.codecCallsOffOwnerThread ?: -1L
+        m["decoderMediaReleaseCount"] = decoder?.mediaReleaseCount ?: -1
+        m["decoderCodecReleaseCount"] = decoder?.codecReleaseCount ?: -1
+        m["decoderExtractorReleaseCount"] = decoder?.extractorReleaseCount ?: -1
+        m["decoderMediaReleaseClean"] = decoder?.mediaReleaseClean ?: false
+        m["decoderMediaReleasedAtDecoderEos"] = decoder?.mediaReleasedAtDecoderEos ?: false
+
+        // ── Folded FINAL native snapshot (multi-source realtime-clock worker) ─
+        m["nativeCommandsEnqueued"] = native?.commandsEnqueued ?: -1L
+        m["nativeCommandsProcessed"] = native?.commandsProcessed ?: -1L
+        m["nativeCommandErrors"] = native?.commandErrors ?: -1L
+        m["nativeQueueDepth"] = native?.queueDepth ?: -1L
+        m["nativeDispatchCount"] = native?.dispatchCount ?: -1L
+        m["nativeOkCount"] = native?.okCount ?: -1L
+        m["nativeSilenceCount"] = native?.silenceCount ?: -1L
+        m["nativeBackpressureCount"] = native?.backpressureCount ?: -1L
+        m["nativeSchedulerErrorCount"] = native?.schedulerErrorCount ?: -1L
+        m["nativeWorkerDispatchAnomalies"] = native?.workerDispatchAnomalies ?: -1L
+        m["nativeNonMonotonicTimeAnomalies"] = native?.nonMonotonicTimeAnomalies ?: -1L
+        m["nativeWorkerStarvedWaits"] = native?.workerStarvedWaits ?: -1L
+        m["nativeTotalFramesRendered"] = native?.totalFramesRendered ?: -1L
+        m["nativeTotalFramesPushed"] = native?.totalFramesPushed ?: -1L
+        m["nativeOwnerDispatchCalls"] = native?.ownerDispatchCalls ?: -1L
+        m["nativeWorkerThreadDistinct"] = native?.workerThreadDistinct ?: false
+        m["nativeNoCallerSuppliedNativeTime"] = native?.noCallerSuppliedNativeTime ?: false
+        m["nativeWorkerOwnsMonotonicClock"] = native?.workerOwnsMonotonicClock ?: false
+        m["nativeTerminal"] = native?.terminal ?: false
+        m["nativeTimelineComplete"] = native?.timelineComplete ?: false
+        m["nativeEosTrack0"] = native?.eosTrack0 ?: false
+        m["nativeEosTrack1"] = native?.eosTrack1 ?: false
+        m["nativeProviderFramesZeroFilledTrack0"] = native?.providerFramesZeroFilledTrack0 ?: -1L
+        m["nativeProviderFramesZeroFilledTrack1"] = native?.providerFramesZeroFilledTrack1 ?: -1L
+        m["nativeProviderUnderrunEventsTrack0"] = native?.providerUnderrunEventsTrack0 ?: -1L
+        m["nativeProviderUnderrunEventsTrack1"] = native?.providerUnderrunEventsTrack1 ?: -1L
+        m["nativeWriterSeekRequestsTrack0"] = native?.writerSeekRequestsTrack0 ?: -1L
+        m["nativeWriterSeekRequestsTrack1"] = native?.writerSeekRequestsTrack1 ?: -1L
+        m["nativeTotalFramesAcceptedTrack0"] = native?.totalFramesAcceptedTrack0 ?: -1L
+        m["nativeTotalFramesAcceptedTrack1"] = native?.totalFramesAcceptedTrack1 ?: -1L
+        m["nativeOutputAvailableReadFrames"] = native?.outputAvailableReadFrames ?: -1L
+        m["nativeTotalOutputFramesRead"] = native?.totalOutputFramesRead ?: -1L
+        m["nativePaused"] = native?.paused ?: true
+        m["nativePauseCommandsProcessed"] = native?.pauseCommandsProcessed ?: -1L
+        m["nativeResumeCommandsProcessed"] = native?.resumeCommandsProcessed ?: -1L
+        m["nativeRealtimeElapsedOk"] = native?.realtimeElapsedOk ?: false
+        m["nativeRealtimeElapsedMs"] = native?.nativeRealtimeElapsedMs ?: -1L
+        m["nativeRealtimeBacklogBoundOk"] = native?.realtimeBacklogBoundOk ?: false
+        m["nativeClockDriftSampleCount"] = native?.clockDriftSampleCount ?: -1L
+        m["nativeProofBoundaryOk"] = native?.proofBoundaryOk ?: false
+
+        // ── Lane decomposition (each sub-verdict is also reported) ──────────
+        val routeOk = realDecoderSourceUsed && !stateMachineSourceUsed &&
+            sinkReadyBeforeTransportStart && drainAllowedAfterTransportStart
+        // Frozen geometry honesty: PCM16, 1..2 channels, 8000..192000 Hz,
+        // and expectedFrames recomputed from the frozen inputs exactly as
+        // window-aligned floor(min(mediaDuration, maxDurationSec) * sr / window) * window.
+        val formatOk = g != null && expectedFrames > 0L &&
+            g.pcmEncoding == AudioFormat.ENCODING_PCM_16BIT &&
+            (g.channelCount == 1 || g.channelCount == 2) &&
+            g.sampleRate >= VanguardRealtimePlaybackNativeSession.MIN_SAMPLE_RATE &&
+            g.sampleRate <= VanguardRealtimePlaybackNativeSession.MAX_SAMPLE_RATE &&
+            g.maxFramesPerMix == config.maxFramesPerMix &&
+            g.sourceDurationUs > 0L &&
+            g.declaredWindowUs == minOf(g.sourceDurationUs, (config.maxDurationSec * 1_000_000.0).toLong()) &&
+            expectedFrames == (g.declaredWindowUs * g.sampleRate / 1_000_000L) / g.maxFramesPerMix * g.maxFramesPerMix &&
+            expectedFrames % g.maxFramesPerMix == 0L &&
+            g.padBudgetFrames in 1L..g.sampleRate.toLong() &&
+            (decoder?.formatResolved ?: false) && decoder?.midStreamFormatChanges == 0L
+        val sinkLifecycleOk = sink != null &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            sink.releaseCount == 1 && sink.releaseExecutedOnSinkThread && sinkJoined &&
+            sink.audioTrackInitOk && sink.gainSetOk && sink.gainValue > 0f && sink.played &&
+            sink.audioTracksCreated == 1 && sink.audioTrackCallsOffSinkThread == 0L &&
+            sink.deadObjectInjectedCount == 0L && sink.deadObjectObservedCount == 0L &&
+            sink.drainCallsBeforeAllow == 0L && sink.drainCalls > 0L && sink.eosDrainedObserved
+        val threadOk = sink != null && ring != null && decoder != null &&
+            sink.threadId > 0L && ring.ownerThreadId > 0L && coordinatorThreadId > 0L &&
+            sink.threadId != coordinatorThreadId && sink.threadId != ring.ownerThreadId &&
+            ring.ownerThreadId != coordinatorThreadId && !sink.threadIsTransportOwner &&
+            ring.sinkThreadIdObserved == sink.threadId &&
+            decoder.codecCallsOffOwnerThread == 0L && ring.outputSinkCallbacksOffOwner == 0L
+        // The production sink is the ONLY output-ring consumer: no private
+        // drain path exists, every native read landed in the sink's buffer.
+        val ringDrainOk = ring != null &&
+            ring.drainCallsFromSink > 0L && ring.drainsServiced > 0L &&
+            ring.drainCallsOnOwnerThread == 0L && ring.drainCallsOnOtherThreads == 0L &&
+            ring.drainOverlapRejects == 0L && ring.drainsBeforeStartRejected == 0L &&
+            ring.drainsAfterCloseRejected == 0L && ring.privateOutputDrains == 0L &&
+            ring.outputSinkAccountedFrames == ring.framesReadBySink &&
+            ring.transportCommandsIssued == 1L && ring.transportCommandsFromDrain == 0L
+        val drainLatencyOk = ring != null &&
+            ring.drainWaitBoundMs > 0L && ring.drainWaitBoundMs < config.deadlineMs &&
+            ring.drainWaitTimeouts == 0L && ring.drainLatencyBoundViolations == 0L &&
+            ring.maxDrainServiceLatencyMs in 0L..ring.drainWaitBoundMs
+        val frameAccountingOk = sink != null && ring != null && decoder != null && expectedFrames > 0L &&
+            ring.framesReadBySink == expectedFrames &&
+            sink.framesReadFromTransport == expectedFrames &&
+            sink.framesWrittenToSink == expectedFrames &&
+            ring.totalOutputFramesRead == expectedFrames &&
+            ring.outputSinkAccountedFrames == expectedFrames &&
+            ring.pumpFramesAccepted == expectedFrames &&
+            ring.framesAcceptedTrack0 == expectedFrames && ring.framesAcceptedTrack1 == expectedFrames &&
+            decoder.ingestComplete &&
+            decoder.framesIngestedReal + decoder.eosPadFrames == expectedFrames &&
+            decoder.framesDecoded == decoder.framesIngestedReal + decoder.eosTruncatedFrames &&
+            decoder.eosPadFrames in 0L..decoder.padBudgetFrames &&
+            // Pre-start lockstep quota (Y18b parity): one output ring, or the whole timeline if shorter.
+            ring.preStartFillFrames >= minOf(
+                expectedFrames,
+                AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.DEFAULT_OUTPUT_RING_CAPACITY_FRAMES.toLong(),
+            )
+        // Decoder exit at EOS with codec + extractor released exactly once.
+        val decoderEosOk = decoder != null &&
+            decoder.inputEosQueued && decoder.outputEosReached && decoder.decoderChunks > 0L &&
+            decoder.mediaReleaseCount == 1 && decoder.codecReleaseCount == 1 &&
+            decoder.extractorReleaseCount == 1 && decoder.mediaReleaseClean && decoder.mediaReleasedAtDecoderEos
+        // Lockstep: both native accepted totals equal the Kotlin model at
+        // the end (the pump fails closed on any per-chunk divergence).
+        val lockstepOk = ring != null && expectedFrames > 0L &&
+            ring.framesAcceptedTrack0 == ring.framesAcceptedTrack1 &&
+            ring.framesAcceptedTrack0 == ring.pumpFramesAccepted &&
+            ring.track1NonZeroSampleCount > 0L
+        val eosOk = sink != null && ring != null &&
+            ring.eosSetWithoutDrain && ring.eosDrainedObservedByRing && sink.eosDrainedObserved &&
+            ring.totalFramesPushedAtEos == expectedFrames
+        val checksumOk = sink != null && ring != null &&
+            ring.nativeOutputReadChecksumHex.isNotBlank() &&
+            ring.nativeAcceptedChecksumHexTrack0.isNotBlank() && ring.nativeAcceptedChecksumHexTrack1.isNotBlank() &&
+            ring.nativeAcceptedChecksumHexTrack0 == ring.kotlinTrack0ChecksumHex &&
+            ring.nativeAcceptedChecksumHexTrack1 == ring.kotlinTrack1ChecksumHex &&
+            ring.nativeOutputReadChecksumHex == ring.kotlinReferenceMixChecksumHex &&
+            ring.nativeOutputReadChecksumHex == sink.checksumHex &&
+            ring.kotlinReferenceMixChecksumHex != ring.kotlinTrack0ChecksumHex &&
+            ring.kotlinReferenceMixChecksumHex != ring.kotlinTrack1ChecksumHex &&
+            ring.checksumChainSelfOk
+        val ringCloseOk = ring != null && ringClosed &&
+            ring.stage == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Stage.CLOSED &&
+            ring.failureReason.isBlank() && ring.destroyJoinOk && ring.destroyIdempotentOk &&
+            ring.stageTrace.contains("eos_set_without_drain") && ring.stageTrace.contains("close_dispose")
+        // `terminal` is reported, not gated: the worker reaches it only via
+        // Stop/error, and this route ends at EOS + destroy (X4..X15 parity).
+        val nativeOk = native != null &&
+            native.timelineComplete &&
+            native.totalFramesPushed == expectedFrames &&
+            native.outputAvailableReadFrames == 0L &&
+            native.totalOutputFramesRead == expectedFrames &&
+            native.totalFramesAcceptedTrack0 == expectedFrames &&
+            native.totalFramesAcceptedTrack1 == expectedFrames &&
+            native.eosTrack0 && native.eosTrack1 &&
+            native.workerThreadDistinct && native.ownerDispatchCalls == 0L &&
+            native.commandErrors == 0L && native.schedulerErrorCount == 0L &&
+            native.workerDispatchAnomalies == 0L && native.nonMonotonicTimeAnomalies == 0L &&
+            native.commandsEnqueued == 1L && native.commandsProcessed == 1L && native.queueDepth == 0L &&
+            native.noCallerSuppliedNativeTime && native.workerOwnsMonotonicClock &&
+            native.providerFramesZeroFilledTrack0 == 0L && native.providerFramesZeroFilledTrack1 == 0L &&
+            native.providerUnderrunEventsTrack0 == 0L && native.providerUnderrunEventsTrack1 == 0L &&
+            native.proofBoundaryOk
+        // No seek / pause / resume anywhere on the route (sink park/flush
+        // surface untouched, native writer seek and pause/resume counters 0).
+        val noSeekPauseResumeOk = sink != null && native != null &&
+            sink.parkCount == 0 && sink.unparkCount == 0 && sink.seekParkCount == 0 &&
+            sink.flushCount == 0 &&
+            native.writerSeekRequestsTrack0 == 0L && native.writerSeekRequestsTrack1 == 0L &&
+            native.pauseCommandsProcessed == 0L && native.resumeCommandsProcessed == 0L && !native.paused
+        // No drift feedback: every sample the sink posted was rejected inline
+        // by the ring (unsupported or stale), nothing was recorded on either
+        // side, and the sink's drain shape / clock polling never adapted.
+        val noFeedbackOk = sink != null && ring != null &&
+            ring.driftSamplesPosted == ring.driftSamplesRejectedUnsupported + ring.driftSamplesRejectedStale &&
+            sink.driftSamplesPosted == ring.driftSamplesPosted &&
+            sink.driftSamplesRecorded == 0L && sink.driftNativeSamplesRecorded == 0L &&
+            sink.drainRequestSizeChanges == 0L && sink.timestampMaxPollsInOnePass <= 1L &&
+            sink.timestampPollsWhileParked == 0L
+        val proofBoundaryOk = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
+
+        m["realRingLaneNegativeProbeOk"] = negativeProbeOk
+        m["realRingLaneRouteOk"] = routeOk
+        m["realRingLaneFormatOk"] = formatOk
+        m["realRingLaneSinkLifecycleOk"] = sinkLifecycleOk
+        m["realRingLaneThreadOk"] = threadOk
+        m["realRingLaneRingDrainOk"] = ringDrainOk
+        m["realRingLaneDrainLatencyOk"] = drainLatencyOk
+        m["realRingLaneFrameAccountingOk"] = frameAccountingOk
+        m["realRingLaneDecoderEosOk"] = decoderEosOk
+        m["realRingLaneLockstepOk"] = lockstepOk
+        m["realRingLaneEosOk"] = eosOk
+        m["realRingLaneChecksumOk"] = checksumOk
+        m["realRingLaneRingCloseOk"] = ringCloseOk
+        m["realRingLaneNativeOk"] = nativeOk
+        m["realRingLaneNoSeekPauseResumeOk"] = noSeekPauseResumeOk
+        m["realRingLaneNoFeedbackOk"] = noFeedbackOk
+        m["realRingLaneProofBoundaryOk"] = proofBoundaryOk
+        m["realRingNonClaims"] = "real_decoder_ring_frame_source_proof_only_no_seek_no_pause_resume_no_drift_feedback_" +
+            "no_feedback_control_loop_no_pacing_correction_no_resampling_no_current_position_authority_switch_" +
+            "no_av_sync_closure_no_cross_device_bit_exact_decoder_claim_no_session_no_production_feed_" +
+            "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_fleet_claim"
+
+        out.lanes[LANE_REAL_DECODER_RING_FRAME_SOURCE] = out.failureReason.isBlank() &&
+            negativeProbeOk && routeOk && formatOk && sinkLifecycleOk && threadOk && ringDrainOk &&
+            drainLatencyOk && frameAccountingOk && decoderEosOk && lockstepOk && eosOk && checksumOk &&
+            ringCloseOk && nativeOk && noSeekPauseResumeOk && noFeedbackOk && proofBoundaryOk
     }
 
     // A lane holds only when every scenario that evaluated it passed and at
