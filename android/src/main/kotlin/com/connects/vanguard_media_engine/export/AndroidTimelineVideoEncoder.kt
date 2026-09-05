@@ -202,10 +202,14 @@ class AndroidTimelineVideoEncoder(
     /// [encode]. A non-empty [overlays] is accepted only for the narrow
     /// shape [AndroidExportRenderBackendSelector.ExportRenderScope
     /// .glesOverlayEligible] also requires -- hard-cut-only [transitions],
-    /// no still-image clip, no reversed clip, no clip-level Beauty V2, and a
-    /// non-null [nativeBridge] -- rejecting anything wider with a precise
+    /// no reversed clip, no clip-level Beauty V2, and a non-null
+    /// [nativeBridge] -- rejecting anything wider with a precise
     /// machine-readable reason rather than silently dropping the overlays.
-    /// Still-image + overlays stays unsupported by this GLES route.
+    /// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: a still-image clip is no longer
+    /// rejected here -- [renderStillClipIntoEncoder] composites overlays on
+    /// its existing GL_TEXTURE_2D base draw path via
+    /// [drawAndSubmitFrame2D]/[compositeActiveOverlaysIfPresent], the same
+    /// route video clips use.
     override fun encode(
         clips: List<ClipInput>,
         transitions: List<AndroidTimelineTransitionDescriptor>,
@@ -222,9 +226,6 @@ class AndroidTimelineVideoEncoder(
                 0,
                 0L,
             )
-        }
-        if (clips.any { it.mediaKind != "video" }) {
-            return EncodeResult(false, "overlays_still_image_unsupported", 0, 0L)
         }
         if (clips.any { it.isReversed }) {
             return EncodeResult(false, "overlays_reversed_clip_unsupported", 0, 0L)
@@ -915,7 +916,16 @@ class AndroidTimelineVideoEncoder(
     /// row-major) filter, applied by the 2D fragment shader for this frame
     /// only -- same semantics/upload path as the OES program's
     /// [drawAndSubmitFrame], via the 2D program's own uniform locations.
-    private fun drawAndSubmitFrame2D(textureId: Int, colorMatrix: FloatArray?) {
+    ///
+    /// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: when [glesOverlaySession] is
+    /// non-null, every overlay active at `framesSubmitted * frameDurationUs`
+    /// is composited after this base draw and before presentation/swap (see
+    /// [compositeActiveOverlaysIfPresent]) -- the same ordering
+    /// [drawAndSubmitFrame] uses for OES/video frames. Returns a
+    /// machine-readable failure reason on any overlay payload/draw/upload
+    /// failure -- this frame is never submitted with a silently-dropped
+    /// overlay -- or null on success.
+    private fun drawAndSubmitFrame2D(textureId: Int, colorMatrix: FloatArray?): String? {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
         GLES20.glViewport(0, 0, width, height)
@@ -947,9 +957,13 @@ class AndroidTimelineVideoEncoder(
         GLES20.glDisableVertexAttribArray(aPositionLoc2D)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc2D)
 
+        val overlayFailure = compositeActiveOverlaysIfPresent()
+        if (overlayFailure != null) return overlayFailure
+
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, framesSubmitted * frameDurationUs * 1000L)
         framesSubmitted++
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        return null
     }
 
     /// Decodes [clip]'s local still-image file (BitmapFactory, sample-size
@@ -1000,7 +1014,8 @@ class AndroidTimelineVideoEncoder(
             var framesRendered = 0
             for (i in 0 until clip.stillFrameCount) {
                 if (cancelRequested) break
-                drawAndSubmitFrame2D(textureId, clip.colorMatrix)
+                val drawFailure = drawAndSubmitFrame2D(textureId, clip.colorMatrix)
+                if (drawFailure != null) return drawFailure
                 drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
                 framesRendered++
             }

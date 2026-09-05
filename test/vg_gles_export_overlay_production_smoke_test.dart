@@ -25,7 +25,7 @@ const List<String> _gateKeys = <String>[
   'frameExtractOk',
   'pixelDeltaOk',
   'missingBridgeRejectedOk',
-  'stillImageRejectedOk',
+  'stillImageOverlayEncodeOk',
   'cleanupOk',
   'canonical',
 ];
@@ -95,7 +95,13 @@ void main() {
       expect(VGGlesExportOverlayProductionSmokeReport.pixelGateKeys.length, 2);
       expect(
         VGGlesExportOverlayProductionSmokeReport.failClosedGateKeys.length,
-        2,
+        1,
+      );
+      expect(
+        VGGlesExportOverlayProductionSmokeReport
+            .stillImageOverlayGateKeys
+            .length,
+        1,
       );
       expect(
         VGGlesExportOverlayProductionSmokeReport.cleanupGateKeys.length,
@@ -190,8 +196,10 @@ void main() {
       expect(report.pixelPass, isTrue);
 
       expect(report.missingBridgeRejectedPass, isTrue);
-      expect(report.stillImageRejectedPass, isTrue);
       expect(report.failClosedPass, isTrue);
+
+      expect(report.stillImageOverlayEncodePass, isTrue);
+      expect(report.stillImageOverlayPass, isTrue);
 
       expect(report.cleanupPass, isTrue);
       expect(report.cleanupGroupPass, isTrue);

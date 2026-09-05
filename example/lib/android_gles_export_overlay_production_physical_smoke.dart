@@ -117,9 +117,13 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
       );
       print(
         '${_logPrefix}_LANE_FAIL_CLOSED: missingBridgeRejectedOk=${report.missingBridgeRejectedPass} '
-        'missingBridgeReason=${report.details['missingBridgeRejectedReason']} '
-        'stillImageRejectedOk=${report.stillImageRejectedPass} '
-        'stillImageReason=${report.details['stillImageRejectedReason']}',
+        'missingBridgeReason=${report.details['missingBridgeRejectedReason']}',
+      );
+      print(
+        '${_logPrefix}_LANE_STILL_IMAGE_OVERLAY: stillImageOverlayEncodeOk=${report.stillImageOverlayEncodePass} '
+        'stillImageOverlayReason=${report.details['stillImageOverlayReason']} '
+        'stillImageOverlaySamples=${report.details['stillImageOverlayWrittenSamples']} '
+        'stillImageOverlayFrameCount=${report.details['stillImageOverlayFrameCount']}',
       );
       print(
         '${_logPrefix}_LANE_CLEANUP: cleanupOk=${report.cleanupPass} '

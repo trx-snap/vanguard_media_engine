@@ -16,9 +16,10 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A: physical smoke harness verifying that the
+ * P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A, extended by
+ * P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: physical smoke harness verifying that the
  * production [AndroidTimelineVideoEncoder] directly executes GLES overlay composition via
- * [VanguardNativeBridge] on caller-current context.
+ * [VanguardNativeBridge] on caller-current context, for both video and still-image clips.
  *
  * Proof boundary: [PROOF_BOUNDARY].
  *
@@ -30,9 +31,13 @@ import kotlin.math.min
  *    Verifies encode success and overlayFrameCount > 0.
  * 4. Pixel proof: extracts mid-frame bitmaps from baseline and overlay renders, confirms non-blank
  *    content and matching dimensions, and asserts meaningful RGB delta in the overlay region.
- * 5. Fail-closed gates: rejects null nativeBridge ("overlays_missing_native_bridge") and
- *    still-image clip with overlays ("overlays_still_image_unsupported") without writing output.
- * 6. Guaranteed cleanup of all created output files.
+ * 5. Fail-closed gate: rejects null nativeBridge ("overlays_missing_native_bridge") without
+ *    writing output.
+ * 6. Still-image overlay lane: encodes a still-image clip with the same overlay set on GLES,
+ *    reusing [AndroidTimelineVideoEncoder]'s existing still-image GL_TEXTURE_2D base draw path.
+ *    Verifies encode success, non-empty output, writtenVideoSamples > 0, and
+ *    overlayFrameCount > 0.
+ * 7. Guaranteed cleanup of all created output files.
  */
 class AndroidGlesExportOverlayProductionSmokeHarness {
 
@@ -62,7 +67,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         var frameExtractOk = false
         var pixelDeltaOk = false
         var missingBridgeRejectedOk = false
-        var stillImageRejectedOk = false
+        var stillImageOverlayEncodeOk = false
         var cleanupOk = false
 
         var firstFailureReason: String? = null
@@ -87,7 +92,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     frameExtractOk = false,
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
-                    stillImageRejectedOk = false,
+                    stillImageOverlayEncodeOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -106,7 +111,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     frameExtractOk = false,
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
-                    stillImageRejectedOk = false,
+                    stillImageOverlayEncodeOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -125,7 +130,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     frameExtractOk = false,
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
-                    stillImageRejectedOk = false,
+                    stillImageOverlayEncodeOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -144,7 +149,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     frameExtractOk = false,
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
-                    stillImageRejectedOk = false,
+                    stillImageOverlayEncodeOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
                 )
@@ -231,7 +236,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     frameExtractOk = false,
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
-                    stillImageRejectedOk = false,
+                    stillImageOverlayEncodeOk = false,
                     cleanupOk = true,
                     details = details,
                 )
@@ -490,9 +495,9 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                 firstFailureReason = "missing_bridge_gate_failed:${failBridgeResult.success}:${failBridgeResult.reason}"
             }
 
-            // ── Gate 9: Fail-closed on still image clip with overlays ─────────────
-            val failImageFile = File(outDirFile, "p5_prod_fail_image_${timestamp}.mp4")
-            filesToClean.add(failImageFile)
+            // ── Gate 9: Still-image clip with overlays succeeds on GLES ───────────
+            val stillOverlayFile = File(outDirFile, "p5_prod_still_overlay_${timestamp}.mp4")
+            filesToClean.add(stillOverlayFile)
             val imageClip = AndroidTimelineVideoEncoder.ClipInput(
                 sourcePath = stickerPath,
                 trimStartSeconds = 0.0,
@@ -503,26 +508,34 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                 mediaKind = "image",
                 stillFrameCount = 30,
             )
-            val imageClipEncoder = AndroidTimelineVideoEncoder(
-                outputPath = failImageFile.absolutePath,
+            val stillOverlayEncoder = AndroidTimelineVideoEncoder(
+                outputPath = stillOverlayFile.absolutePath,
                 width = encodeWidth,
                 height = encodeHeight,
                 fps = fps,
                 bitrateBps = bitrateBps,
                 nativeBridge = nativeBridge,
             )
-            val failImageResult = imageClipEncoder.encode(
+            val stillOverlayResult = stillOverlayEncoder.encode(
                 clips = listOf(imageClip),
                 transitions = emptyList(),
                 overlays = overlays,
             )
-            stillImageRejectedOk = !failImageResult.success &&
-                failImageResult.reason == "overlays_still_image_unsupported" &&
-                (!failImageFile.exists() || failImageFile.length() == 0L)
-            details["stillImageRejectedReason"] = failImageResult.reason
+            stillImageOverlayEncodeOk = stillOverlayResult.success &&
+                stillOverlayFile.exists() &&
+                stillOverlayFile.length() > 0L &&
+                stillOverlayResult.writtenVideoSamples > 0 &&
+                stillOverlayResult.overlayFrameCount > 0
+            details["stillImageOverlaySuccess"] = stillOverlayResult.success
+            details["stillImageOverlayReason"] = stillOverlayResult.reason
+            details["stillImageOverlayWrittenSamples"] = stillOverlayResult.writtenVideoSamples
+            details["stillImageOverlayFrameCount"] = stillOverlayResult.overlayFrameCount
+            details["stillImageOverlaySizeBytes"] = stillOverlayFile.length()
 
-            if (!stillImageRejectedOk && firstFailureReason == null) {
-                firstFailureReason = "still_image_gate_failed:${failImageResult.success}:${failImageResult.reason}"
+            if (!stillImageOverlayEncodeOk && firstFailureReason == null) {
+                firstFailureReason = "still_image_overlay_encode_failed:${stillOverlayResult.success}:" +
+                    "${stillOverlayResult.reason}:samples=${stillOverlayResult.writtenVideoSamples}:" +
+                    "overlayFrames=${stillOverlayResult.overlayFrameCount}"
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Exception during smoke harness run", t)
@@ -552,7 +565,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             frameExtractOk &&
             pixelDeltaOk &&
             missingBridgeRejectedOk &&
-            stillImageRejectedOk &&
+            stillImageOverlayEncodeOk &&
             cleanupOk
 
         val pass = canonical
@@ -569,7 +582,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             frameExtractOk = frameExtractOk,
             pixelDeltaOk = pixelDeltaOk,
             missingBridgeRejectedOk = missingBridgeRejectedOk,
-            stillImageRejectedOk = stillImageRejectedOk,
+            stillImageOverlayEncodeOk = stillImageOverlayEncodeOk,
             cleanupOk = cleanupOk,
             details = details,
         )
@@ -628,7 +641,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         frameExtractOk: Boolean,
         pixelDeltaOk: Boolean,
         missingBridgeRejectedOk: Boolean,
-        stillImageRejectedOk: Boolean,
+        stillImageOverlayEncodeOk: Boolean,
         cleanupOk: Boolean,
         details: Map<String, Any?>,
     ): Map<String, Any?> {
@@ -640,7 +653,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             frameExtractOk &&
             pixelDeltaOk &&
             missingBridgeRejectedOk &&
-            stillImageRejectedOk &&
+            stillImageOverlayEncodeOk &&
             cleanupOk
 
         val map = LinkedHashMap<String, Any?>()
@@ -658,7 +671,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         map["frameExtractOk"] = frameExtractOk
         map["pixelDeltaOk"] = pixelDeltaOk
         map["missingBridgeRejectedOk"] = missingBridgeRejectedOk
-        map["stillImageRejectedOk"] = stillImageRejectedOk
+        map["stillImageOverlayEncodeOk"] = stillImageOverlayEncodeOk
         map["cleanupOk"] = cleanupOk
         map["canonical"] = canonical
 

@@ -100,10 +100,14 @@ class VGGlesExportOverlayProductionSmokeReport {
     'pixelDeltaOk',
   ];
 
-  /// Fail-closed rejection gate keys (missing bridge, still-image input).
+  /// Fail-closed rejection gate keys (missing bridge).
   static const List<String> failClosedGateKeys = <String>[
     'missingBridgeRejectedOk',
-    'stillImageRejectedOk',
+  ];
+
+  /// Still-image overlay encode gate keys (positive GLES still-image + overlay lane).
+  static const List<String> stillImageOverlayGateKeys = <String>[
+    'stillImageOverlayEncodeOk',
   ];
 
   /// Resource cleanup gate keys.
@@ -118,6 +122,7 @@ class VGGlesExportOverlayProductionSmokeReport {
     ...encodeGateKeys,
     ...pixelGateKeys,
     ...failClosedGateKeys,
+    ...stillImageOverlayGateKeys,
     ...cleanupGateKeys,
     ...canonicalGateKeys,
   ];
@@ -192,11 +197,17 @@ class VGGlesExportOverlayProductionSmokeReport {
   /// Whether calling overlay encode with null nativeBridge was rejected.
   bool get missingBridgeRejectedPass => _gate('missingBridgeRejectedOk');
 
-  /// Whether calling overlay encode with still-image clip was rejected.
-  bool get stillImageRejectedPass => _gate('stillImageRejectedOk');
-
   /// Whether every fail-closed rejection gate passed.
   bool get failClosedPass => failClosedGateKeys.every(_gate);
+
+  // -- Still-image overlay encode gate -----------------------------------------
+
+  /// Whether the still-image clip with overlays succeeded on GLES (non-empty
+  /// output, samples > 0, overlayFrameCount > 0).
+  bool get stillImageOverlayEncodePass => _gate('stillImageOverlayEncodeOk');
+
+  /// Whether every still-image overlay gate passed.
+  bool get stillImageOverlayPass => stillImageOverlayGateKeys.every(_gate);
 
   // -- Cleanup gates ----------------------------------------------------------
 
