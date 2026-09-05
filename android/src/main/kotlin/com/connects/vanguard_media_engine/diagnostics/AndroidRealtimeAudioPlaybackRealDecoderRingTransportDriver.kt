@@ -19,8 +19,14 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeA
 // unwrapped, adding no second indirection onto the sink's hot drain /
 // postDriftSample path. Only that one production seam and this driver
 // interface's primitives are exposed here; the ring's own diagnostics-only
-// pause/resume/seek control surface and its [Geometry] / [Stage] types never
-// cross into [com.connects.vanguard_media_engine.audio_playback_graph].
+// seek control surface and its [Geometry] / [Stage] types never cross into
+// [com.connects.vanguard_media_engine.audio_playback_graph]. Y22
+// (P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-PAUSE-RESUME): the
+// driver's four bounded pause/resume primitives map 1:1 onto the ring's
+// verified Y19 cycle -- [prepareForPause] -> [quiesceFeedForPause], [pause]
+// -> [pauseTransport], [confirmHold] -> [assertPausedHoldFrozen], [resume]
+// -> [resumeTransport] -- each a Boolean-only forward with no ring type or
+// ring-specific name leaving this class.
 //
 // Ownership: this adapter owns no thread and does not construct the ring
 // itself -- the caller builds an
@@ -71,4 +77,15 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver(
     override fun cancel() = ring.cancel()
 
     override fun close(timeoutMs: Long): Boolean = ring.close(timeoutMs)
+
+    // Y22: the ring's verified pause/resume cycle, forwarded 1:1 (class comment).
+    override val supportsPauseResume: Boolean get() = true
+
+    override fun prepareForPause(timeoutMs: Long): Boolean = ring.quiesceFeedForPause(timeoutMs)
+
+    override fun pause(timeoutMs: Long): Boolean = ring.pauseTransport(timeoutMs)
+
+    override fun confirmHold(timeoutMs: Long): Boolean = ring.assertPausedHoldFrozen(timeoutMs)
+
+    override fun resume(timeoutMs: Long): Boolean = ring.resumeTransport(timeoutMs)
 }

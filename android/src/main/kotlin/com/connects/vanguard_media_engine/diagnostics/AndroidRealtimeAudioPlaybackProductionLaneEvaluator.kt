@@ -74,7 +74,11 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REAL_DECODER_RING_FRAME_SOURCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_FRAME_SOURCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_CHECKSUM_IDENTITY
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_PAUSE_HOLD_FROZEN
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_PAUSE_ORDER
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_PLAYTHROUGH_ACCOUNTING
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_POST_RESUME_CHECKSUM
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_RESUME_ORDER
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_START
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_STOP_DISPOSE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_MONITOR_TEARDOWN
@@ -2486,6 +2490,184 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.lanes[LANE_RING_SESSION_PLAYTHROUGH_ACCOUNTING] = out.failureReason.isBlank() && playthroughAccountingOk
         out.lanes[LANE_RING_SESSION_CHECKSUM_IDENTITY] = out.failureReason.isBlank() && checksumOk
         out.lanes[LANE_RING_SESSION_STOP_DISPOSE] = out.failureReason.isBlank() && stopDisposeOk
+    }
+
+    // ── Y22: Real-decoder ring transport session pause/resume proof ─────────
+    fun evaluateRealDecoderRingSessionPauseResume(
+        startAccepted: Boolean,
+        firstAudioOk: Boolean,
+        pauseAccepted: Boolean,
+        prePauseSnap: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        duringHoldSnap: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        endHoldSnap: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        resumeAccepted: Boolean,
+        postResumeSnap: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        completionOk: Boolean,
+        completedSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        stopAccepted: Boolean,
+        stopResultReason: String,
+        postDisposeSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        ring: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Telemetry?,
+        geometry: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Geometry?,
+        holdMs: Long,
+        maxPauseHoldMs: Long,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val m = out.metrics
+        val snap = completedSnapshot
+        val postSnap = postDisposeSnapshot
+        val native = ring?.native
+        val sink = snap?.sink ?: postSnap?.sink
+        val expectedFrames = snap?.driverDeclaredFrameCount ?: geometry?.expectedFrames ?: -1L
+        val pr = ring?.pauseResume
+
+        // 1. ringSessionPauseOrderOk:
+        // session pause accepted, driverPauseQuiesceAccepted true, driverPauseAccepted true,
+        // pauseAccepted true, state PAUSED during hold, pauseGeneration == -1,
+        // driverGenerationAtPause == ring/frame source generation, sink parkCount==1,
+        // sink phase/clock frozen evidence present, driverStageAtPauseAck nonblank.
+        val sinkPhaseClockFrozenEvidence = duringHoldSnap?.sink != null &&
+            duringHoldSnap.sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED &&
+            duringHoldSnap.sink.playStateAtPark == AudioTrack.PLAYSTATE_PAUSED &&
+            duringHoldSnap.sink.parkedPlayStateViolations == 0L &&
+            duringHoldSnap.clockAtPauseAck != null &&
+            !duringHoldSnap.clockAtPauseAck.epochOpen &&
+            (endHoldSnap == null || endHoldSnap.sink?.framesWrittenToSink == duringHoldSnap.sink.framesWrittenToSink)
+
+        val pauseOrderOk = pauseAccepted &&
+            (duringHoldSnap?.driverPauseQuiesceAccepted == true || snap?.driverPauseQuiesceAccepted == true) &&
+            (duringHoldSnap?.driverPauseAccepted == true || snap?.driverPauseAccepted == true) &&
+            (duringHoldSnap?.pauseAccepted == true || snap?.pauseAccepted == true) &&
+            duringHoldSnap?.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            (endHoldSnap == null || endHoldSnap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED) &&
+            duringHoldSnap?.pauseGeneration == -1L &&
+            snap?.pauseGeneration == -1L &&
+            duringHoldSnap?.driverGenerationAtPause == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.RING_GENERATION &&
+            sink != null && sink.parkCount == 1 &&
+            sinkPhaseClockFrozenEvidence &&
+            (duringHoldSnap?.driverStageAtPauseAck?.isNotBlank() == true || snap?.driverStageAtPauseAck?.isNotBlank() == true)
+
+        // 2. ringSessionPauseHoldFrozenOk:
+        // driverHoldProofOk true after resume, ring telemetry quiesceAckOk, pauseAckOk,
+        // holdAssertAckOk, pauseQuiescedFirst, nativePauseProofOk, nativeHoldFrozenProofOk;
+        // dispatchCountAfterHold == dispatchCountAtPause; totalFramesPushedAfterHold == totalFramesPushedAtPause;
+        // feedStepsWhilePaused/eosPollsWhilePaused/makeRoomCallbacksWhilePaused if present must prove no advancement;
+        // paused drain rejects should be zero because sink stayed parked.
+        val driverHoldProofOk = (postResumeSnap?.driverHoldProofOk == true) || (snap?.driverHoldProofOk == true)
+        val ringHoldFrozenProof = pr != null &&
+            pr.quiesceAckOk &&
+            pr.pauseAckOk &&
+            pr.holdAssertAckOk &&
+            pr.pauseQuiescedFirst &&
+            pr.nativePauseProofOk &&
+            pr.nativeHoldFrozenProofOk &&
+            pr.dispatchCountAfterHold == pr.dispatchCountAtPause &&
+            pr.totalFramesPushedAfterHold == pr.totalFramesPushedAtPause &&
+            pr.feedStepsWhilePaused == 0L &&
+            pr.eosPollsWhilePaused == 0L &&
+            pr.makeRoomCallbacksWhilePaused == 0L &&
+            pr.pausedDrainRejectsSinkThread == 0L &&
+            pr.pausedDrainRejectsOwnerThread == 0L
+
+        val pauseHoldFrozenOk = driverHoldProofOk && ringHoldFrozenProof
+
+        // 3. ringSessionResumeOrderOk:
+        // resume accepted, driverResumeAccepted true, resumeAccepted true,
+        // state PLAYING or later after resume, sink unparkCount==1,
+        // driverStageBeforeResume nonblank, driverGenerationAtResume == driverGenerationAtPause or documented stable ring generation,
+        // clockAfterResume present, pauseHoldObservedMs bounded and >= hold ms minus tolerance.
+        val toleranceMs = 100L
+        val validStateAfterResume = postResumeSnap != null && postResumeSnap.state in setOf(
+            VanguardRealtimeAudioPlaybackSession.State.PLAYING,
+            VanguardRealtimeAudioPlaybackSession.State.COMPLETED,
+            VanguardRealtimeAudioPlaybackSession.State.STOPPED,
+            VanguardRealtimeAudioPlaybackSession.State.DISPOSED,
+        )
+        val observedHoldMs = snap?.pauseHoldObservedMs ?: postResumeSnap?.pauseHoldObservedMs ?: -1L
+        val holdDurationBounded = observedHoldMs >= (holdMs - toleranceMs) && observedHoldMs <= maxPauseHoldMs
+
+        val resumeOrderOk = resumeAccepted &&
+            (postResumeSnap?.driverResumeAccepted == true || snap?.driverResumeAccepted == true) &&
+            (postResumeSnap?.resumeAccepted == true || snap?.resumeAccepted == true) &&
+            validStateAfterResume &&
+            sink != null && sink.unparkCount == 1 &&
+            (postResumeSnap?.driverStageBeforeResume?.isNotBlank() == true || snap?.driverStageBeforeResume?.isNotBlank() == true) &&
+            snap != null && snap.driverGenerationAtResume == snap.driverGenerationAtPause &&
+            snap.driverGenerationAtResume == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.RING_GENERATION &&
+            (snap.clockAfterResume != null || postResumeSnap?.clockAfterResume != null) &&
+            holdDurationBounded
+
+        // 4. ringSessionPostResumeChecksumOk:
+        // completion true, sink EOS, sink frames read/written match expected,
+        // sink checksum equals ring native output/read checksum,
+        // ring destroy/join/idempotent clean, no failure reasons.
+        val sinkExitEos = sink != null &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS &&
+            sink.eosDrainedObserved
+        val frameAccountingOk = sink != null &&
+            expectedFrames > 0L &&
+            sink.framesReadFromTransport == expectedFrames &&
+            sink.framesWrittenToSink == expectedFrames
+        val checksumOk = sink != null && ring != null &&
+            sink.checksumHex.isNotBlank() &&
+            ring.nativeOutputReadChecksumHex.isNotBlank() &&
+            sink.checksumHex == ring.nativeOutputReadChecksumHex &&
+            ring.nativeOutputReadChecksumHex == ring.kotlinReferenceMixChecksumHex &&
+            ring.checksumChainSelfOk
+        val ringClean = ring != null &&
+            ring.destroyJoinOk &&
+            ring.destroyIdempotentOk &&
+            ring.stage == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Stage.CLOSED
+        val noFailures = out.failureReason.isBlank() &&
+            (snap?.failureReason?.isBlank() ?: false) &&
+            (postSnap?.failureReason?.isBlank() ?: false) &&
+            (ring?.failureReason?.isBlank() ?: false)
+
+        val postResumeChecksumOk = completionOk &&
+            sinkExitEos &&
+            frameAccountingOk &&
+            checksumOk &&
+            ringClean &&
+            noFailures
+
+        // Metrics recording
+        m["ringSessionPauseOrderOk"] = pauseOrderOk
+        m["ringSessionPauseHoldFrozenOk"] = pauseHoldFrozenOk
+        m["ringSessionResumeOrderOk"] = resumeOrderOk
+        m["ringSessionPostResumeChecksumOk"] = postResumeChecksumOk
+        m["startAccepted"] = startAccepted
+        m["firstAudioOk"] = firstAudioOk
+        m["pauseAccepted"] = pauseAccepted
+        m["resumeAccepted"] = resumeAccepted
+        m["completionOk"] = completionOk
+        m["stopAccepted"] = stopAccepted
+        m["driverPauseQuiesceAccepted"] = snap?.driverPauseQuiesceAccepted ?: false
+        m["driverPauseAccepted"] = snap?.driverPauseAccepted ?: false
+        m["driverHoldProofOk"] = snap?.driverHoldProofOk ?: false
+        m["driverResumeAccepted"] = snap?.driverResumeAccepted ?: false
+        m["driverStageAtPauseAck"] = snap?.driverStageAtPauseAck ?: ""
+        m["driverStageBeforeResume"] = snap?.driverStageBeforeResume ?: ""
+        m["driverGenerationAtPause"] = snap?.driverGenerationAtPause ?: -1L
+        m["driverGenerationAtResume"] = snap?.driverGenerationAtResume ?: -1L
+        m["pauseHoldObservedMs"] = observedHoldMs
+        m["sinkParkCount"] = sink?.parkCount ?: -1
+        m["sinkUnparkCount"] = sink?.unparkCount ?: -1
+        m["sinkExitReason"] = sink?.exitReason ?: ""
+        m["sinkFramesReadFromTransport"] = sink?.framesReadFromTransport ?: -1L
+        m["sinkFramesWrittenToSink"] = sink?.framesWrittenToSink ?: -1L
+        m["sinkChecksumHex"] = sink?.checksumHex ?: ""
+        m["ringNativeOutputReadChecksumHex"] = ring?.nativeOutputReadChecksumHex ?: ""
+        m["ringChecksumChainSelfOk"] = ring?.checksumChainSelfOk ?: false
+        m["ringDestroyJoinOk"] = ring?.destroyJoinOk ?: false
+        m["ringDestroyIdempotentOk"] = ring?.destroyIdempotentOk ?: false
+        m["ringFailureReason"] = ring?.failureReason ?: ""
+        m["sessionFailureReason"] = postSnap?.failureReason ?: ""
+
+        out.lanes[LANE_RING_SESSION_PAUSE_ORDER] = out.failureReason.isBlank() && pauseOrderOk
+        out.lanes[LANE_RING_SESSION_PAUSE_HOLD_FROZEN] = out.failureReason.isBlank() && pauseHoldFrozenOk
+        out.lanes[LANE_RING_SESSION_RESUME_ORDER] = out.failureReason.isBlank() && resumeOrderOk
+        out.lanes[LANE_RING_SESSION_POST_RESUME_CHECKSUM] = out.failureReason.isBlank() && postResumeChecksumOk
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

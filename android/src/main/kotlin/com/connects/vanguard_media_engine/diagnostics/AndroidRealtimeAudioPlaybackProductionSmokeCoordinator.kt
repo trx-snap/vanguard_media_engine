@@ -203,6 +203,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // Y21: the ONE session integration proof for the real-decoder ring transport driver route.
         const val SCENARIO_REAL_DECODER_RING_SESSION_INTEGRATION_TO_EOS =
             "SCENARIO_REAL_DECODER_RING_SESSION_INTEGRATION_TO_EOS"
+        // Y22: the ONE session pause/resume proof for the real-decoder ring transport driver route.
+        const val SCENARIO_REAL_DECODER_RING_SESSION_PAUSE_RESUME_TO_EOS =
+            "SCENARIO_REAL_DECODER_RING_SESSION_PAUSE_RESUME_TO_EOS"
+        const val RING_SESSION_PAUSE_HOLD_MS = 500L
+        const val RING_SESSION_MAX_PAUSE_HOLD_MS = 4_000L
 
         // Y18c real-decoder ring: the sink-thread per-drain wait bound (well
         // below the sink's own drain-stall budget) and the negative probe's
@@ -345,6 +350,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_RING_SESSION_PLAYTHROUGH_ACCOUNTING = "ringSessionPlaythroughAccountingOk"
         const val LANE_RING_SESSION_CHECKSUM_IDENTITY = "ringSessionChecksumIdentityOk"
         const val LANE_RING_SESSION_STOP_DISPOSE = "ringSessionStopDisposeOk"
+        // Y22 lanes, evaluated by the real-decoder ring session pause/resume scenario only.
+        const val LANE_RING_SESSION_PAUSE_ORDER = "ringSessionPauseOrderOk"
+        const val LANE_RING_SESSION_PAUSE_HOLD_FROZEN = "ringSessionPauseHoldFrozenOk"
+        const val LANE_RING_SESSION_RESUME_ORDER = "ringSessionResumeOrderOk"
+        const val LANE_RING_SESSION_POST_RESUME_CHECKSUM = "ringSessionPostResumeChecksumOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -391,6 +401,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_REAL_RING_SEEK_POST_SEEK_DRAIN, LANE_REAL_RING_SEEK_CHECKSUM_IDENTITY,
             LANE_RING_SESSION_START, LANE_RING_SESSION_PLAYTHROUGH_ACCOUNTING,
             LANE_RING_SESSION_CHECKSUM_IDENTITY, LANE_RING_SESSION_STOP_DISPOSE,
+            LANE_RING_SESSION_PAUSE_ORDER, LANE_RING_SESSION_PAUSE_HOLD_FROZEN,
+            LANE_RING_SESSION_RESUME_ORDER, LANE_RING_SESSION_POST_RESUME_CHECKSUM,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -759,6 +771,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // driver route (session constructed with driverFactory, start/awaitFirstAudio/
         // awaitCompletion to EOS, stop, and dispose through session).
         outcomes += realDecoderRingSessionIntegrationScenario(config)
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y22: the ONE session pause/resume proof for the real-decoder ring transport
+        // driver route (session constructed with driverFactory, start/awaitFirstAudio/
+        // bounded pause/hold/resume/awaitCompletion to EOS, stop, and dispose through session).
+        outcomes += realDecoderRingSessionPauseResumeScenario(config)
         if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
@@ -2254,6 +2271,164 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         return outcome
     }
 
+    private fun realDecoderRingSessionPauseResumeScenario(config: SmokeConfig): ScenarioOutcome {
+        val outcome = ScenarioOutcome(SCENARIO_REAL_DECODER_RING_SESSION_PAUSE_RESUME_TO_EOS)
+        val wallStart = SystemClock.elapsedRealtime()
+        var session: VanguardRealtimeAudioPlaybackSession? = null
+        var ring: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource? = null
+        var startAccepted = false
+        var firstAudioOk = false
+        var pauseAccepted = false
+        var prePauseSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var duringHoldSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var endHoldSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var resumeAccepted = false
+        var postResumeSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var completionOk = false
+        var completedSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var stopResult = VanguardRealtimeAudioPlaybackSession.CommandResult(false, VanguardRealtimeAudioPlaybackSession.State.IDLE, "")
+        var postDisposeSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+
+        outcome.metrics["deadObjectInjectAfterFrames"] = 0L
+        outcome.metrics["seekTargetSecArmed"] = 0.0
+        outcome.metrics["secondSeekTargetSecArmed"] = 0.0
+        outcome.metrics["seekBackwardArmed"] = false
+        outcome.metrics["enableAudioFocusResponse"] = false
+        outcome.metrics["enableAudioRoutingResponse"] = false
+        outcome.metrics["ringSessionPauseResumeNonClaims"] =
+            "no_seek_no_focus_routing_no_dead_object_no_feedback_no_pacing_no_resampling_" +
+                "no_av_sync_no_product_no_editor_no_app_no_ios_no_streaming_no_cache_no_fleet"
+
+        try {
+            if (disposed.get()) throw FailClosed("coordinator_disposed")
+            val sess = VanguardRealtimeAudioPlaybackSession(
+                VanguardRealtimeAudioPlaybackSession.Config(
+                    sourcePath = config.sourcePath,
+                    maxDurationSec = config.maxDurationSec,
+                    maxFramesPerMix = config.maxFramesPerMix,
+                    gain = config.gain,
+                    deadlineMs = config.deadlineMs,
+                    maxPauseHoldMs = RING_SESSION_MAX_PAUSE_HOLD_MS,
+                    threadNamePrefix = "Y22RingSession",
+                    driverFactory = { ctx ->
+                        val r = AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
+                            AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Config(
+                                sourcePath = config.sourcePath,
+                                maxDurationSec = config.maxDurationSec,
+                                maxFramesPerMix = ctx.maxFramesPerMix,
+                                deadlineAtMs = ctx.deadlineAtMs,
+                                drainWaitBoundMs = REAL_RING_DRAIN_WAIT_BOUND_MS,
+                                threadName = "Y22RealRingDriverOwner",
+                            ),
+                        )
+                        ring = r
+                        AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver(r)
+                    },
+                    seekTargetSec = 0.0,
+                    secondSeekTargetSec = 0.0,
+                    seekBackward = false,
+                    syntheticDeadObjectInjectAfterFrames = 0L,
+                    enableAudioFocusResponse = false,
+                    enableAudioRoutingResponse = false,
+                ),
+            )
+            session = sess
+            activeSession = sess
+
+            val startRes = sess.start()
+            startAccepted = startRes.accepted && startRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING
+            require(startAccepted, "start_rejected:${startRes.reason}")
+
+            firstAudioOk = sess.awaitFirstAudio(config.deadlineMs)
+            require(firstAudioOk, "first_audio_failed:${sess.snapshot().failureReason}")
+
+            prePauseSnap = sess.snapshot()
+
+            val pauseRes = sess.pauseBounded()
+            pauseAccepted = pauseRes.accepted && pauseRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED
+            require(pauseAccepted, "pause_rejected:${pauseRes.reason}")
+
+            duringHoldSnap = sess.snapshot()
+
+            val holdStartedAt = SystemClock.elapsedRealtime()
+            while (SystemClock.elapsedRealtime() - holdStartedAt < RING_SESSION_PAUSE_HOLD_MS) {
+                require(sess.failureReason.isBlank(), "failure_during_hold:${sess.failureReason}")
+                SystemClock.sleep(WAIT_SLICE_MS)
+            }
+            endHoldSnap = sess.snapshot()
+
+            val resumeRes = sess.resume()
+            resumeAccepted = resumeRes.accepted && (resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING || resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.COMPLETED)
+            require(resumeAccepted, "resume_rejected:${resumeRes.reason}")
+
+            postResumeSnap = sess.snapshot()
+
+            completionOk = sess.awaitCompletion(config.deadlineMs)
+            require(completionOk, "completion_failed:${sess.snapshot().failureReason}")
+
+            completedSnapshot = sess.snapshot()
+
+            stopResult = sess.stop()
+            require(stopResult.accepted || stopResult.state == VanguardRealtimeAudioPlaybackSession.State.STOPPED, "stop_rejected:${stopResult.reason}")
+
+            sess.dispose()
+            sess.dispose()
+            postDisposeSnapshot = sess.snapshot()
+        } catch (f: FailClosed) {
+            outcome.failureReason = f.reason
+        } catch (t: Throwable) {
+            outcome.failureReason = "exception:${t.javaClass.simpleName}:${t.message}"
+        } finally {
+            val sess = session
+            try {
+                sess?.dispose()
+            } catch (_: Throwable) {}
+            if (activeSession === sess) activeSession = null
+
+            val finalSnap = sess?.snapshot()
+            if (postDisposeSnapshot == null) {
+                postDisposeSnapshot = finalSnap
+            }
+            if (completedSnapshot == null) {
+                completedSnapshot = postDisposeSnapshot
+            }
+            if (outcome.failureReason.isBlank() && finalSnap != null && finalSnap.failureReason.isNotBlank()) {
+                outcome.failureReason = finalSnap.failureReason
+            }
+            if (finalSnap != null) {
+                outcome.metrics.putAll(snapshotMetrics(finalSnap))
+            }
+            val ringTelemetry = ring?.telemetry()
+            val geometry = ring?.frozenGeometry
+
+            AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRealDecoderRingSessionPauseResume(
+                startAccepted = startAccepted,
+                firstAudioOk = firstAudioOk,
+                pauseAccepted = pauseAccepted,
+                prePauseSnap = prePauseSnap,
+                duringHoldSnap = duringHoldSnap,
+                endHoldSnap = endHoldSnap,
+                resumeAccepted = resumeAccepted,
+                postResumeSnap = postResumeSnap,
+                completionOk = completionOk,
+                completedSnapshot = completedSnapshot,
+                stopAccepted = stopResult.accepted || stopResult.state == VanguardRealtimeAudioPlaybackSession.State.STOPPED,
+                stopResultReason = stopResult.reason,
+                postDisposeSnapshot = postDisposeSnapshot,
+                ring = ringTelemetry,
+                geometry = geometry,
+                holdMs = RING_SESSION_PAUSE_HOLD_MS,
+                maxPauseHoldMs = RING_SESSION_MAX_PAUSE_HOLD_MS,
+                config = config,
+                out = outcome,
+            )
+
+            outcome.metrics["scenarioWallMs"] = SystemClock.elapsedRealtime() - wallStart
+            outcome.metrics["failureReason"] = outcome.failureReason
+        }
+        return outcome
+    }
+
     // ── Metrics ────────────────────────────────────────────────────────────
 
     private fun snapshotMetrics(s: VanguardRealtimeAudioPlaybackSession.Snapshot): LinkedHashMap<String, Any?> {
@@ -2554,6 +2729,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         m["driverChannelCount"] = s.driverChannelCount
         m["driverMaxFramesPerMix"] = s.driverMaxFramesPerMix
         m["driverDeclaredFrameCount"] = s.driverDeclaredFrameCount
+        m["driverPauseQuiesceAccepted"] = s.driverPauseQuiesceAccepted
+        m["driverPauseAccepted"] = s.driverPauseAccepted
+        m["driverHoldProofOk"] = s.driverHoldProofOk
+        m["driverResumeAccepted"] = s.driverResumeAccepted
+        m["driverStageAtPauseAck"] = s.driverStageAtPauseAck
+        m["driverStageBeforeResume"] = s.driverStageBeforeResume
+        m["driverGenerationAtPause"] = s.driverGenerationAtPause
+        m["driverGenerationAtResume"] = s.driverGenerationAtResume
         return m
     }
 

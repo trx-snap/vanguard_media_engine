@@ -23,8 +23,23 @@ package com.connects.vanguard_media_engine.audio_playback_graph
 // after [start] returns true. [cancel] is any-thread and non-blocking (a
 // wake-up only, mirroring the sink/decoder feed's own `cancel()`); [close]
 // is bounded and idempotent, called once at teardown after the sink has
-// already been cancelled and joined. No seek, no pause/resume, no focus/
-// routing response exists on this route (validated at session start).
+// already been cancelled and joined. No seek and no focus/routing response
+// exists on this route (validated at session start).
+//
+// Bounded pause/resume (Y22, P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-
+// SESSION-PAUSE-RESUME), additive and opt-in per driver: a driver that
+// reports [supportsPauseResume] = true admits exactly ONE session pause/
+// resume cycle through four bounded, command-lock-holder-thread primitives
+// the session sequences in this fixed order around its own sink park/unpark
+// -- [prepareForPause] (quiesce the driver's own feed at a clean boundary
+// WHILE the sink still drains; the session parks the sink only after this
+// returns true) -> sink park + ack -> [pause] -> ... -> [confirmHold]
+// (mandatory proof the driven transport stayed frozen across the hold;
+// the session never resumes after a failed proof) -> [resume] -> sink
+// unpark. Every primitive is false on timeout, rejection, or failure; the
+// session fails closed on any false and tears down through the existing
+// [cancel] / [close] wake-up paths. The defaults below (unsupported, all
+// false) keep every existing driver's behavior unchanged.
 interface VanguardRealtimeAudioPlaybackTransportDriver {
 
     // Caller-supplied construction context (Opus architecture requirement):
@@ -85,4 +100,28 @@ interface VanguardRealtimeAudioPlaybackTransportDriver {
     // Stops and releases the driver; bounded. False on timeout, failure, or
     // when called from the driver's own owner thread.
     fun close(timeoutMs: Long): Boolean
+
+    // ── Y22 bounded pause/resume (additive defaults; class comment) ─────────
+
+    // True only for a driver that implements the four primitives below; the
+    // session rejects (typed, no mutation) a pause/resume against a driver
+    // that reports false.
+    val supportsPauseResume: Boolean get() = false
+
+    // Holds the driver's own feed at its next clean boundary while the sink
+    // keeps draining; must precede the session's sink park. False on
+    // timeout/rejection/failure (a withdrawn timeout may leave the feed held).
+    fun prepareForPause(timeoutMs: Long): Boolean = false
+
+    // Pauses the driven transport; called only after [prepareForPause]
+    // returned true and the sink has acked its park. False on timeout/rejection/failure.
+    fun pause(timeoutMs: Long): Boolean = false
+
+    // Proves the driven transport stayed frozen during the hold; called
+    // before [resume], which must not run if this returns false.
+    fun confirmHold(timeoutMs: Long): Boolean = false
+
+    // Resumes the driven transport and releases its feed; called before the
+    // session unparks the sink. False on timeout/rejection/failure.
+    fun resume(timeoutMs: Long): Boolean = false
 }

@@ -174,13 +174,26 @@ import kotlin.concurrent.withLock
 // routing response is disabled. All of this is published through
 // [Snapshot.routing] as [VanguardRealtimeAudioPlaybackRoutingTelemetry].
 //
+// Ring/driver route bounded pause/resume (Y22, P4-AUDIO-REALTIME-PLAYBACK-
+// RING-TRANSPORT-SESSION-PAUSE-RESUME), default OFF (driver route only, and
+// only for a driver reporting supportsPauseResume): ONE pause/resume cycle
+// per run through the same public [pauseBounded] / [resume] entry points,
+// sequenced as driver.prepareForPause (feed quiesced while the sink still
+// drains) -> sink park + ack -> driver.pause -> PAUSED, then
+// driver.confirmHold (mandatory) -> driver.resume -> sink unpark + ack ->
+// PLAYING; see the "── Y22 ring/driver route bounded pause/resume ──"
+// section below for the full order and fail-closed reasons.
+//
 // Modularity note: this session file stays a single cohesive class rather
 // than being split by lifecycle concern. Y12 is another additive,
 // default-OFF lifecycle extension of the existing production session/sink
 // model (seek, focus, now routing), grouped with its siblings under
 // matching "── Y<n> ... internals ──" sections below; extracting it would
 // separate tightly command-lock-coupled state without reducing the actual
-// coordination the class performs.
+// coordination the class performs. Y22 follows the same judgment: its two
+// driver-route pause/resume helpers share the sink park/unpark ack loops,
+// clock bookkeeping, deadline/cancel checks and fail-closed teardown with
+// the default route, so they live beside it rather than in a separate file.
 class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
 
     data class Config(
@@ -325,6 +338,18 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val driverChannelCount: Int = -1,
         val driverMaxFramesPerMix: Int = -1,
         val driverDeclaredFrameCount: Long = -1L,
+        // Y22 driver-route bounded pause/resume (class comment): the four
+        // driver primitive outcomes plus the driver's own stage/generation
+        // reads at pause ack and before resume. [pauseGeneration] /
+        // [resumeGeneration] above stay -1 on this route (no transport).
+        val driverPauseQuiesceAccepted: Boolean = false,
+        val driverPauseAccepted: Boolean = false,
+        val driverHoldProofOk: Boolean = false,
+        val driverResumeAccepted: Boolean = false,
+        val driverStageAtPauseAck: String = "",
+        val driverStageBeforeResume: String = "",
+        val driverGenerationAtPause: Long = -1L,
+        val driverGenerationAtResume: Long = -1L,
     )
 
     companion object {
@@ -338,6 +363,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         private const val SINK_READY_TIMEOUT_MS = 5_000L
         private const val PARK_ACK_TIMEOUT_MS = 2_000L
         private const val UNPARK_ACK_TIMEOUT_MS = 2_000L
+        // Y22: bound on each of the four driver pause/resume primitives
+        // (further clamped to the session deadline via [remainingMs]).
+        private const val DRIVER_PAUSE_CONTROL_TIMEOUT_MS = 2_000L
 
         private fun alignUp(frame: Long, window: Long): Long = ((frame + window - 1L) / window) * window
     }
@@ -398,6 +426,20 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // Y21: set from [VanguardRealtimeAudioPlaybackTransportDriver.close]'s
     // own return value at teardown; stays false when no driver route ran.
     @Volatile private var driverClosed = false
+    // Y22 driver-route bounded pause/resume bookkeeping (command-lock holder
+    // writes; published through snapshot()). [driverPauseCycleStarted] is
+    // set once, immediately before the first mutating step of the ONE
+    // admitted cycle, so a second driver-route pause rejects without
+    // mutation (driver_route_pause_repeated).
+    @Volatile private var driverPauseCycleStarted = false
+    @Volatile private var driverPauseQuiesceAccepted = false
+    @Volatile private var driverPauseAccepted = false
+    @Volatile private var driverHoldProofOk = false
+    @Volatile private var driverResumeAccepted = false
+    @Volatile private var driverStageAtPauseAck = ""
+    @Volatile private var driverStageBeforeResume = ""
+    @Volatile private var driverGenerationAtPause = -1L
+    @Volatile private var driverGenerationAtResume = -1L
     @Volatile private var terminalReply: Reply? = null
     @Volatile private var sessionStartedAtMs = -1L
     @Volatile private var sessionWallMs = 0L
@@ -963,9 +1005,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // never mutates [userIntentPlaying].
     private fun pauseBoundedLocked(): CommandResult {
         if (state != State.PLAYING) return reject("invalid_state_${state.name.lowercase()}")
-        // Y21: the ring/driver route has no bounded pause; reject with a
-        // typed reason and mutate nothing (not fail closed).
-        if (config.driverFactory != null) return reject("driver_route_pause_unsupported")
+        // Y21/Y22: the ring/driver route runs its own bounded pause order
+        // ([pauseDriverRouteLocked]); the default route below is unchanged.
+        if (config.driverFactory != null) {
+            val d = driver ?: return reject("driver_route_pause_unsupported")
+            return pauseDriverRouteLocked(d)
+        }
         failure.get()?.let { return failClosed(it) }
         val s = sink ?: return failClosed("sink_missing")
         val machine = transport ?: return failClosed("transport_missing")
@@ -1012,11 +1057,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // resume); never mutates [userIntentPlaying].
     private fun resumeLocked(): CommandResult {
         if (state != State.PAUSED) return reject("invalid_state_${state.name.lowercase()}")
-        // Y21: the ring/driver route has no bounded resume (it never
-        // reaches PAUSED via [pauseBoundedLocked] above, but this stays
-        // defensive/symmetric); reject with a typed reason and mutate
-        // nothing (not fail closed).
-        if (config.driverFactory != null) return reject("driver_route_resume_unsupported")
+        // Y21/Y22: the ring/driver route runs its own bounded resume order
+        // ([resumeDriverRouteLocked]); the default route below is unchanged.
+        if (config.driverFactory != null) {
+            val d = driver ?: return reject("driver_route_resume_unsupported")
+            return resumeDriverRouteLocked(d)
+        }
         // Y12: a terminal route disconnect fails any resume closed-off
         // (never cleared by this session) without altering state or flags.
         if (routingTerminalDisconnect) return reject("routing_terminal_disconnect")
@@ -1052,6 +1098,132 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             failClosed("exception:${t.javaClass.simpleName}:${t.message}")
         }
     }
+
+    // ── Y22 ring/driver route bounded pause/resume ─────────────────────────
+    //
+    // (P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-PAUSE-RESUME.)
+    // Exactly ONE pause/resume cycle per driver-route run, sequenced under
+    // the command lock in a fixed order that differs from the default route
+    // in one deliberate way: the driver's feed is quiesced FIRST, while the
+    // sink still drains (the driver may need a few more drains to reach a
+    // clean boundary), and only then is the sink parked. Parking before
+    // [VanguardRealtimeAudioPlaybackTransportDriver.prepareForPause] is
+    // forbidden (it would starve the quiesce of drains). Pause:
+    //   PLAYING + driver supports pause/resume + first cycle + no failure +
+    //   sink alive -> driver.prepareForPause -> sink park + ack
+    //   (pauseRequestedAtMs / pauseAckedAtMs / clockAtPauseAck) ->
+    //   driver.pause -> pauseAccepted -> PAUSED.
+    // Resume:
+    //   PAUSED + no failure + sink alive -> clockBeforeResume ->
+    //   driver.confirmHold (MANDATORY hold proof; never resume after it
+    //   fails) -> driver.resume -> sink unpark + ack (resumedAtMs /
+    //   pauseHoldObservedMs / clockAfterResume) -> resumeAccepted -> PLAYING.
+    // Unparking the sink before driver.resume is forbidden. Every false /
+    // timeout from a driver primitive fails closed with a typed reason
+    // (driver_pause_quiesce_failed / driver_pause_rejected /
+    // driver_pause_hold_violated / driver_resume_rejected + the driver's
+    // exit reason or stage); the common teardown wakes a parked sink through
+    // sink.cancel and the driver through its close/cancel path. A driver
+    // that does not support the cycle, or a second pause, is rejected with
+    // a typed reason and NO mutation. [pauseGeneration] / [resumeGeneration]
+    // stay -1 here (no transport generation exists to report); the driver's
+    // own frame-source generation is published separately.
+
+    private fun pauseDriverRouteLocked(d: VanguardRealtimeAudioPlaybackTransportDriver): CommandResult {
+        if (!d.supportsPauseResume) return reject("driver_route_pause_unsupported")
+        if (driverPauseCycleStarted) return reject("driver_route_pause_repeated")
+        failure.get()?.let { return failClosed(it) }
+        val s = sink ?: return failClosed("sink_missing")
+        if (!s.isAlive) return failClosed("sink_exited_before_pause:${s.currentExitReason}")
+        if (!d.isAlive) return failClosed("driver_exited_before_pause:${driverFailureLabel(d)}")
+        driverPauseCycleStarted = true
+        return try {
+            checkDeadlineAndCancel()
+            // 1. Quiesce the driver's feed at a clean boundary WHILE the
+            //    sink still drains (class comment / section comment).
+            driverPauseQuiesceAccepted = d.prepareForPause(driverControlTimeoutMs())
+            if (!driverPauseQuiesceAccepted) throw FailClosed("driver_pause_quiesce_failed:${driverFailureLabel(d)}")
+            checkDeadlineAndCancel()
+            failure.get()?.let { throw FailClosed(it) }
+            // 2. Sink park + ack (same bounded loop as the default route).
+            pauseRequestedAtMs = SystemClock.elapsedRealtime()
+            if (!s.requestPark()) throw FailClosed("sink_park_rejected:${s.phase.name.lowercase()}")
+            val ackDeadline = pauseRequestedAtMs + PARK_ACK_TIMEOUT_MS
+            while (!s.awaitParked(WAIT_SLICE_MS)) {
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_park_ack:${s.currentExitReason}")
+                if (SystemClock.elapsedRealtime() > ackDeadline) throw FailClosed("sink_park_ack_timeout")
+            }
+            pauseAckedAtMs = SystemClock.elapsedRealtime()
+            clockAtPauseAck = s.clockSnapshot()
+            // 3. Pause the driven transport only once the sink is parked.
+            driverPauseAccepted = d.pause(driverControlTimeoutMs())
+            driverStageAtPauseAck = d.currentStageLabel
+            driverGenerationAtPause = d.frameSource.currentGeneration
+            if (!driverPauseAccepted) throw FailClosed("driver_pause_rejected:${driverFailureLabel(d)}")
+            pauseAccepted = true
+            state = State.PAUSED
+            accept()
+        } catch (f: FailClosed) {
+            failClosed(f.reason)
+        } catch (t: Throwable) {
+            failClosed("exception:${t.javaClass.simpleName}:${t.message}")
+        }
+    }
+
+    private fun resumeDriverRouteLocked(d: VanguardRealtimeAudioPlaybackTransportDriver): CommandResult {
+        if (!d.supportsPauseResume) return reject("driver_route_resume_unsupported")
+        failure.get()?.let { return failClosed(it) }
+        val s = sink ?: return failClosed("sink_missing")
+        return try {
+            if (!s.isAlive) throw FailClosed("sink_exited_during_pause:${s.currentExitReason}")
+            if (!d.isAlive) throw FailClosed("driver_exited_during_pause:${driverFailureLabel(d)}")
+            checkDeadlineAndCancel()
+            clockBeforeResume = s.clockSnapshot()
+            driverStageBeforeResume = d.currentStageLabel
+            // 1. Mandatory hold proof; a failed proof never proceeds to resume.
+            driverHoldProofOk = d.confirmHold(driverControlTimeoutMs())
+            if (!driverHoldProofOk) throw FailClosed("driver_pause_hold_violated:${driverFailureLabel(d)}")
+            checkDeadlineAndCancel()
+            failure.get()?.let { throw FailClosed(it) }
+            // 2. Resume the driven transport while the sink is still parked.
+            driverResumeAccepted = d.resume(driverControlTimeoutMs())
+            driverGenerationAtResume = d.frameSource.currentGeneration
+            if (!driverResumeAccepted) throw FailClosed("driver_resume_rejected:${driverFailureLabel(d)}")
+            // 3. Sink unpark + ack (same bounded loop as the default route).
+            val unparkAt = SystemClock.elapsedRealtime()
+            if (!s.unpark()) throw FailClosed("sink_unpark_rejected:${s.phase.name.lowercase()}")
+            val ackDeadline = unparkAt + UNPARK_ACK_TIMEOUT_MS
+            while (!s.awaitRunning(WAIT_SLICE_MS)) {
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_unpark_ack:${s.currentExitReason}")
+                if (SystemClock.elapsedRealtime() > ackDeadline) throw FailClosed("sink_unpark_ack_timeout")
+            }
+            resumedAtMs = SystemClock.elapsedRealtime()
+            pauseHoldObservedMs = resumedAtMs - pauseAckedAtMs
+            clockAfterResume = s.clockSnapshot()
+            resumeAccepted = true
+            state = State.PLAYING
+            focusPausedByPolicy = false
+            accept()
+        } catch (f: FailClosed) {
+            failClosed(f.reason)
+        } catch (t: Throwable) {
+            failClosed("exception:${t.javaClass.simpleName}:${t.message}")
+        }
+    }
+
+    // Bound for one driver pause/resume primitive: the fixed control
+    // timeout, never past the session deadline.
+    private fun driverControlTimeoutMs(): Long = minOf(DRIVER_PAUSE_CONTROL_TIMEOUT_MS, remainingMs())
+
+    // The driver's typed exit reason when it recorded one, else its current
+    // stage label (a timed-out / rejected primitive need not have failed the
+    // driver itself).
+    private fun driverFailureLabel(d: VanguardRealtimeAudioPlaybackTransportDriver): String =
+        d.exitReason.ifEmpty { d.currentStageLabel }
 
     // Y9 (default): the ONE armed forward seek (targetFrame must equal the
     // armed target), PLAYING -> SEEKING -> PLAYING in the class-comment
@@ -1356,6 +1528,14 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             driverChannelCount = driver?.channelCount ?: -1,
             driverMaxFramesPerMix = driver?.maxFramesPerMix ?: -1,
             driverDeclaredFrameCount = driver?.declaredFrameCount ?: -1L,
+            driverPauseQuiesceAccepted = driverPauseQuiesceAccepted,
+            driverPauseAccepted = driverPauseAccepted,
+            driverHoldProofOk = driverHoldProofOk,
+            driverResumeAccepted = driverResumeAccepted,
+            driverStageAtPauseAck = driverStageAtPauseAck,
+            driverStageBeforeResume = driverStageBeforeResume,
+            driverGenerationAtPause = driverGenerationAtPause,
+            driverGenerationAtResume = driverGenerationAtResume,
         )
     }
 

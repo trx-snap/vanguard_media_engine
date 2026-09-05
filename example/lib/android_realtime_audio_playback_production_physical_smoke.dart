@@ -13,8 +13,9 @@
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20) +
-// P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-INTEGRATION (Y21): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, real-decoder ring forward-seek, and real-decoder ring transport session integration diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-INTEGRATION (Y21) +
+// P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-PAUSE-RESUME (Y22): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, real-decoder ring forward-seek, real-decoder ring transport session integration, and real-decoder ring transport session pause/resume diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
@@ -71,6 +72,14 @@
 //     no focus/routing, no dead object, no drift feedback, no pacing correction,
 //     no resampling, no currentPosition authority switch, no A/V sync closure, no
 //     fleet claim, and no app/editor claim.
+//   - Real-decoder ring transport session pause/resume (Y22) proves the production
+//     VanguardRealtimeAudioPlaybackSession driving the real-decoder ring transport driver
+//     through a bounded pause/resume cycle: asserts pause quiescence and hold frozen state,
+//     resumes to EOS, verifies playthrough frame accounting and checksum identity, and
+//     cleans up via stop and idempotent dispose. It carries no seek, no focus/routing,
+//     no dead object, no drift feedback, no pacing correction, no resampling,
+//     no currentPosition authority switch, no A/V sync closure, no fleet claim, and no
+//     app/editor claim.
 //
 // This is a component diagnostic smoke. It must not claim
 // product/editor/UI/ConnectsApp/iOS/streaming/cache/audio clock mutator changes/clock feedback proof.
@@ -109,7 +118,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19/Y20/Y21) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change, Presentation-Clock, Position-Query, Clock Correlation, Drift Sample Ownership, Ring Frame Source, Real-Decoder Ring Frame Source, Real-Decoder Ring Pause/Resume, Real-Decoder Ring Seek & Real-Decoder Ring Session Integration smoke...';
+      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19/Y20/Y21/Y22) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change, Presentation-Clock, Position-Query, Clock Correlation, Drift Sample Ownership, Ring Frame Source, Real-Decoder Ring Frame Source, Real-Decoder Ring Pause/Resume, Real-Decoder Ring Seek, Real-Decoder Ring Session Integration & Real-Decoder Ring Session Pause/Resume smoke...';
 
   @override
   void initState() {
@@ -419,6 +428,18 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [LANE] ringSessionStopDisposeOk: ${activeReport.ringSessionStopDisposeOk}',
     );
+    print(
+      '  [LANE] ringSessionPauseOrderOk: ${activeReport.ringSessionPauseOrderOk}',
+    );
+    print(
+      '  [LANE] ringSessionPauseHoldFrozenOk: ${activeReport.ringSessionPauseHoldFrozenOk}',
+    );
+    print(
+      '  [LANE] ringSessionResumeOrderOk: ${activeReport.ringSessionResumeOrderOk}',
+    );
+    print(
+      '  [LANE] ringSessionPostResumeChecksumOk: ${activeReport.ringSessionPostResumeChecksumOk}',
+    );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -454,6 +475,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     const realRingSeekScenarioKey = 'SCENARIO_REAL_DECODER_RING_SEEK_TO_EOS';
     const ringSessionScenarioKey =
         'SCENARIO_REAL_DECODER_RING_SESSION_INTEGRATION_TO_EOS';
+    const ringSessionPauseResumeScenarioKey =
+        'SCENARIO_REAL_DECODER_RING_SESSION_PAUSE_RESUME_TO_EOS';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -506,6 +529,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final ringSessionMetrics = asStringKeyedMap(
       topMetrics[ringSessionScenarioKey],
+    );
+    final ringSessionPauseResumeMetrics = asStringKeyedMap(
+      topMetrics[ringSessionPauseResumeScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -1647,6 +1673,54 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       ringSessionCompactKeys,
     );
 
+    const ringSessionPauseResumeCompactKeys = <String>[
+      'ringSessionPauseOrderOk',
+      'ringSessionPauseHoldFrozenOk',
+      'ringSessionResumeOrderOk',
+      'ringSessionPostResumeChecksumOk',
+      'startAccepted',
+      'firstAudioOk',
+      'pauseAccepted',
+      'resumeAccepted',
+      'completionOk',
+      'stopAccepted',
+      'driverPauseQuiesceAccepted',
+      'driverPauseAccepted',
+      'driverHoldProofOk',
+      'driverResumeAccepted',
+      'driverStageAtPauseAck',
+      'driverStageBeforeResume',
+      'driverGenerationAtPause',
+      'driverGenerationAtResume',
+      'pauseHoldObservedMs',
+      'driverDeclaredFrameCount',
+      'driverSampleRate',
+      'driverChannelCount',
+      'driverMaxFramesPerMix',
+      'driverEnabled',
+      'driverClosed',
+      'sinkParkCount',
+      'sinkUnparkCount',
+      'sinkExitReason',
+      'sinkFramesReadFromTransport',
+      'sinkFramesWrittenToSink',
+      'sinkChecksumHex',
+      'ringNativeOutputReadChecksumHex',
+      'ringChecksumChainSelfOk',
+      'ringDestroyJoinOk',
+      'ringDestroyIdempotentOk',
+      'ringFailureReason',
+      'sessionFailureReason',
+      'ringSessionPauseResumeNonClaims',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRingSessionPauseResume = extractCompactScenario(
+      ringSessionPauseResumeMetrics,
+      ringSessionPauseResumeCompactKeys,
+    );
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -1962,6 +2036,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     print('  [SCENARIO] $realRingSeekScenarioKey: $compactRealRingSeek');
     print('  [SCENARIO] $ringSessionScenarioKey: $compactRingSession');
+    print(
+      '  [SCENARIO] $ringSessionPauseResumeScenarioKey: $compactRingSessionPauseResume',
+    );
 
     // 5. Verification evaluation.
     final pass =
@@ -1991,13 +2068,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       realRingPauseResumeScenarioKey: compactRealRingPauseResume,
       realRingSeekScenarioKey: compactRealRingSeek,
       ringSessionScenarioKey: compactRingSession,
+      ringSessionPauseResumeScenarioKey: compactRingSessionPauseResume,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-INTEGRATION',
-      'subSlice': 'Y21',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-PAUSE-RESUME',
+      'subSlice': 'Y22',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,

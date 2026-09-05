@@ -116,6 +116,10 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'ringSessionPlaythroughAccountingOk': true,
     'ringSessionChecksumIdentityOk': true,
     'ringSessionStopDisposeOk': true,
+    'ringSessionPauseOrderOk': true,
+    'ringSessionPauseHoldFrozenOk': true,
+    'ringSessionResumeOrderOk': true,
+    'ringSessionPostResumeChecksumOk': true,
     'canonical': true,
   };
 
@@ -410,11 +414,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(87),
+        equals(91),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(88),
+        equals(92),
       );
 
       final expectedLanes = <String>[
@@ -505,6 +509,10 @@ void main() {
         'ringSessionPlaythroughAccountingOk',
         'ringSessionChecksumIdentityOk',
         'ringSessionStopDisposeOk',
+        'ringSessionPauseOrderOk',
+        'ringSessionPauseHoldFrozenOk',
+        'ringSessionResumeOrderOk',
+        'ringSessionPostResumeChecksumOk',
         'canonical',
       ];
 
@@ -650,6 +658,10 @@ void main() {
       expect(report.ringSessionPlaythroughAccountingOk, isTrue);
       expect(report.ringSessionChecksumIdentityOk, isTrue);
       expect(report.ringSessionStopDisposeOk, isTrue);
+      expect(report.ringSessionPauseOrderOk, isTrue);
+      expect(report.ringSessionPauseHoldFrozenOk, isTrue);
+      expect(report.ringSessionResumeOrderOk, isTrue);
+      expect(report.ringSessionPostResumeChecksumOk, isTrue);
       expect(report.canonical, isTrue);
       expect(report.allRequiredNonCanonicalLanesPass, isTrue);
 
@@ -1631,6 +1643,42 @@ void main() {
         'ringSessionPlaythroughAccountingOk',
         'ringSessionChecksumIdentityOk',
         'ringSessionStopDisposeOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+
+        final reportFalse = _createSampleReport(<String, Object?>{lane: false});
+        expect(reportFalse.pass, isFalse);
+        expect(reportFalse.isVerifiedPass, isFalse);
+        expect(reportFalse.marker, equals(_kFailMarker));
+        expect(reportFalse.status, equals('lane_failed'));
+        expect(reportFalse.lastError, equals('lane_failed'));
+      }
+    });
+
+    test('missing required Y22 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'ringSessionPauseOrderOk',
+        'ringSessionPauseHoldFrozenOk',
+        'ringSessionResumeOrderOk',
+        'ringSessionPostResumeChecksumOk',
       ]) {
         final raw = _createSampleRawMap();
         final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
