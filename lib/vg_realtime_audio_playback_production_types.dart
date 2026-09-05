@@ -11,8 +11,9 @@
 // P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16) +
 // P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF (Y18b) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c) +
-// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, and real-decoder ring pause/resume diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19) +
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, and real-decoder ring forward-seek diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
@@ -20,8 +21,9 @@
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock) through twelve
 // scenarios, plus the isolated Y18b ring-transport frame-source proof, the
-// isolated Y18c real-decoder ring-transport frame-source proof, and the
-// isolated Y19 real-decoder ring pause/resume proof:
+// isolated Y18c real-decoder ring-transport frame-source proof, the
+// isolated Y19 real-decoder ring pause/resume proof, and the isolated Y20
+// real-decoder ring true forward-seek proof:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
 //   3. Synthetic dead-object recovery to EOS.
@@ -37,8 +39,9 @@
 //  13. Ring frame source isolated proof driving production sink to EOS without state machine.
 //  14. Real-decoder ring frame source isolated proof driving production sink to EOS without state machine.
 //  15. Real-decoder ring pause/resume isolated proof: one owner-thread-executed native pause/resume cycle to EOS with checksum identity.
+//  16. Real-decoder ring true forward-seek isolated proof: feed held at H, sink drained to H, seek-parked and flushed, one owner-thread-executed native joint seek to T with both ring providers re-anchored by the worker, drained to the seek-aware EOS with checksum identity over expectedFrames - skipped.
 //
-// Required proof lanes (79 native lanes plus canonical equals 80 total lanes):
+// Required proof lanes (83 native lanes plus canonical equals 84 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -118,6 +121,10 @@
 //  77. realRingPauseHoldFrozenOk: paused hold observed frozen with no owner feed step, EOS poll, or drain while paused
 //  78. realRingResumeAckOk: native resume acknowledged on the ring owner thread with totals unchanged across the hold and the sink unparked after
 //  79. realRingPostResumeChecksumOk: resume drains to EOS with exact frame and checksum identity across the full real-decoder ring pause/resume route
+//  80. realRingSeekQuiesceAckOk: feed held at the derived hold frame, sink drained exactly to it, seek-parked and flushed before the ring seek, native quiescence proven snapshot-only
+//  81. realRingSeekReanchorOk: one owner-thread-executed native joint seek to a target strictly past the hold, both ring providers re-anchored by the worker at the target, generator/extractor/codec re-anchored, post-seek prefill, output seek ack consumed with zero discard
+//  82. realRingSeekPostSeekDrainOk: sink unparked after the ring seek with its epoch at the target and drained to the native seek-aware EOS over exactly the effective frames
+//  83. realRingSeekChecksumIdentityOk: exact frame and checksum identity over the effective (expectedFrames - skipped) frames across the full real-decoder ring forward-seek route
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
@@ -155,6 +162,17 @@
 //     dead object, no drift feedback, no pacing correction, no resampling, no
 //     currentPosition authority switch, no A/V sync closure, no fleet claim, and no
 //     app/editor claim.
+//   - Real-decoder ring forward seek (Y20) proves exactly one owner-thread-executed
+//     native joint seek on the Y18c real-decoder ring to a window-aligned target T
+//     strictly past the window-aligned hold H: feed held at H, the production sink
+//     drained to H, seek-parked and flushed before the ring seek, native quiescence
+//     proven snapshot-only, both native ring providers re-anchored once by the
+//     worker at T (no provider forward skip, no zero-fill), and every frame and
+//     checksum identity asserted over the effective (expectedFrames - skipped)
+//     frames; the extractor landing at or before T is reported, never claimed
+//     exact. It carries no pause/resume, no dead object, no drift feedback, no
+//     pacing correction, no resampling, no currentPosition authority switch, no
+//     A/V sync closure, no fleet claim, and no app/editor claim.
 
 import 'dart:async';
 
@@ -260,6 +278,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.realRingPauseHoldFrozenOk,
     required this.realRingResumeAckOk,
     required this.realRingPostResumeChecksumOk,
+    required this.realRingSeekQuiesceAckOk,
+    required this.realRingSeekReanchorOk,
+    required this.realRingSeekPostSeekDrainOk,
+    required this.realRingSeekChecksumIdentityOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -371,6 +393,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'realRingPauseHoldFrozenOk',
     'realRingResumeAckOk',
     'realRingPostResumeChecksumOk',
+    'realRingSeekQuiesceAckOk',
+    'realRingSeekReanchorOk',
+    'realRingSeekPostSeekDrainOk',
+    'realRingSeekChecksumIdentityOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -639,6 +665,18 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether resume drained to EOS with exact frame and checksum identity across the full real-decoder ring pause/resume route.
   final bool realRingPostResumeChecksumOk;
 
+  /// Whether the feed was held at the derived hold frame, the sink drained exactly to it, seek-parked and flushed before the ring seek, and native quiescence was proven snapshot-only.
+  final bool realRingSeekQuiesceAckOk;
+
+  /// Whether one owner-thread-executed native joint seek to a target strictly past the hold re-anchored the generator, extractor and codec, prefilled post-seek, and consumed the output seek ack with zero discard.
+  final bool realRingSeekReanchorOk;
+
+  /// Whether the sink unparked after the ring seek with its epoch at the target and drained to the native seek-aware EOS over exactly the effective frames.
+  final bool realRingSeekPostSeekDrainOk;
+
+  /// Whether exact frame and checksum identity held over the effective (expectedFrames - skipped) frames across the full real-decoder ring forward-seek route.
+  final bool realRingSeekChecksumIdentityOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -748,7 +786,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       realRingPauseAckOk &&
       realRingPauseHoldFrozenOk &&
       realRingResumeAckOk &&
-      realRingPostResumeChecksumOk;
+      realRingPostResumeChecksumOk &&
+      realRingSeekQuiesceAckOk &&
+      realRingSeekReanchorOk &&
+      realRingSeekPostSeekDrainOk &&
+      realRingSeekChecksumIdentityOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -852,6 +894,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         realRingPauseHoldFrozenOk: false,
         realRingResumeAckOk: false,
         realRingPostResumeChecksumOk: false,
+        realRingSeekQuiesceAckOk: false,
+        realRingSeekReanchorOk: false,
+        realRingSeekPostSeekDrainOk: false,
+        realRingSeekChecksumIdentityOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -1075,6 +1121,14 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final realRingResumeAckOk = parseBool('realRingResumeAckOk');
     final realRingPostResumeChecksumOk = parseBool(
       'realRingPostResumeChecksumOk',
+    );
+    final realRingSeekQuiesceAckOk = parseBool('realRingSeekQuiesceAckOk');
+    final realRingSeekReanchorOk = parseBool('realRingSeekReanchorOk');
+    final realRingSeekPostSeekDrainOk = parseBool(
+      'realRingSeekPostSeekDrainOk',
+    );
+    final realRingSeekChecksumIdentityOk = parseBool(
+      'realRingSeekChecksumIdentityOk',
     );
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
@@ -1306,6 +1360,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'realRingPauseHoldFrozenOk': realRingPauseHoldFrozenOk,
       'realRingResumeAckOk': realRingResumeAckOk,
       'realRingPostResumeChecksumOk': realRingPostResumeChecksumOk,
+      'realRingSeekQuiesceAckOk': realRingSeekQuiesceAckOk,
+      'realRingSeekReanchorOk': realRingSeekReanchorOk,
+      'realRingSeekPostSeekDrainOk': realRingSeekPostSeekDrainOk,
+      'realRingSeekChecksumIdentityOk': realRingSeekChecksumIdentityOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -1399,6 +1457,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       realRingPauseHoldFrozenOk: realRingPauseHoldFrozenOk,
       realRingResumeAckOk: realRingResumeAckOk,
       realRingPostResumeChecksumOk: realRingPostResumeChecksumOk,
+      realRingSeekQuiesceAckOk: realRingSeekQuiesceAckOk,
+      realRingSeekReanchorOk: realRingSeekReanchorOk,
+      realRingSeekPostSeekDrainOk: realRingSeekPostSeekDrainOk,
+      realRingSeekChecksumIdentityOk: realRingSeekChecksumIdentityOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -1528,6 +1590,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       realRingPauseHoldFrozenOk: false,
       realRingResumeAckOk: false,
       realRingPostResumeChecksumOk: false,
+      realRingSeekQuiesceAckOk: false,
+      realRingSeekReanchorOk: false,
+      realRingSeekPostSeekDrainOk: false,
+      realRingSeekChecksumIdentityOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1722,6 +1788,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.realRingPauseHoldFrozenOk == realRingPauseHoldFrozenOk &&
         other.realRingResumeAckOk == realRingResumeAckOk &&
         other.realRingPostResumeChecksumOk == realRingPostResumeChecksumOk &&
+        other.realRingSeekQuiesceAckOk == realRingSeekQuiesceAckOk &&
+        other.realRingSeekReanchorOk == realRingSeekReanchorOk &&
+        other.realRingSeekPostSeekDrainOk == realRingSeekPostSeekDrainOk &&
+        other.realRingSeekChecksumIdentityOk == realRingSeekChecksumIdentityOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1814,6 +1884,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     realRingPauseHoldFrozenOk,
     realRingResumeAckOk,
     realRingPostResumeChecksumOk,
+    realRingSeekQuiesceAckOk,
+    realRingSeekReanchorOk,
+    realRingSeekPostSeekDrainOk,
+    realRingSeekChecksumIdentityOk,
     canonical,
   ]);
 
@@ -1887,6 +1961,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'realRingPauseHoldFrozenOk: $realRingPauseHoldFrozenOk, '
       'realRingResumeAckOk: $realRingResumeAckOk, '
       'realRingPostResumeChecksumOk: $realRingPostResumeChecksumOk, '
+      'realRingSeekQuiesceAckOk: $realRingSeekQuiesceAckOk, '
+      'realRingSeekReanchorOk: $realRingSeekReanchorOk, '
+      'realRingSeekPostSeekDrainOk: $realRingSeekPostSeekDrainOk, '
+      'realRingSeekChecksumIdentityOk: $realRingSeekChecksumIdentityOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 

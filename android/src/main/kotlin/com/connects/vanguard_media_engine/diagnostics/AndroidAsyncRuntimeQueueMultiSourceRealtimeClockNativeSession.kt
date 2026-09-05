@@ -67,8 +67,21 @@ import java.nio.ByteOrder
 // into [SinkReadReply] / the snap* mirror and compares timeline completion
 // against expectedPlayableFrameCount instead of expectedFrames. For every
 // existing no-seek and boundary-seek run those are identical (skipped ==
-// discarded == 0, asserted fail-closed). No true forward-seek scenario is
-// driven here.
+// discarded == 0, asserted fail-closed).
+//
+// Y20 (P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK) adds the
+// DECOUPLED owner-thread seek entry points a ring-fed PRODUCTION sink
+// route needs: [assertQuiescentForSeek] (snapshot-only quiescence proof at
+// the hold frame, NO private drain: the production sink is the sole output
+// consumer and must already have read every pushed frame) and [seek]
+// (posts + awaits the native joint seek to an arbitrary aligned target
+// strictly past the accepted boundary, again without any private drain).
+// The X4 [seekAtQuiescentBoundary] keeps its exact behavior (target ==
+// accepted, private boundary drain, same tokens) and now shares the
+// command-posting path [postSeekCommandAndAwait] with [seek]. The pending
+// output ack is still consumed only by [consumeSeekAckAndReanchor]
+// (ack-only read, zero discard asserted); [readOutputInto] still fails
+// closed on an ack consumed inside a sink read.
 class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     private val deadlineElapsedRealtimeMs: Long,
     private val outputSink: OutputSink,
@@ -172,6 +185,56 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         private set
     var seekTargetFrame = -1L
         private set
+    // Y20 owner-side seek facts (recorded by [postSeekCommandAndAwait] /
+    // [consumeSeekAckAndReanchor]; -1 / 0 / false when no seek was posted).
+    var seekCommandSeq = -1L
+        private set
+    var seekRequestedPtsUs = -1L
+        private set
+    var seekReplyTargetFrame = -1L
+        private set
+    var seekTransientRetries = 0L
+        private set
+    var seekProcessedOk = false
+        private set
+    var seekSkippedFramesAtProcessed = -1L
+        private set
+    var seekExpectedPlayableAtProcessed = -1L
+        private set
+    var seekSkipAnomaliesAtProcessed = -1L
+        private set
+    var seekNextDispatchFrameAtProcessed = -1L
+        private set
+    // Provider external re-anchor facts from the processed-Seek snapshot
+    // (P4-AUDIO-SEEK-PROVIDER-COORDINATOR-REANCHOR): after the worker
+    // consumed both source acks and coordinator.seek succeeded, it must have
+    // moved BOTH RingBufferAudioSampleProviders to the shared target before
+    // any post-seek dispatch (the output ack gate holds dispatch until
+    // [consumeSeekAckAndReanchor]), so at this snapshot each provider's
+    // expected next frame IS the target. -1 until a seek was processed.
+    val seekProviderExternalReanchorCountAtProcessedTrack = longArrayOf(-1L, -1L)
+    val seekProviderLastExternalReanchorFrameAtProcessedTrack = longArrayOf(-1L, -1L)
+    val seekProviderExpectedNextFrameAtProcessedTrack = longArrayOf(-1L, -1L)
+    var seekAckConsumedByAckOnlyRead = false
+        private set
+    var seekAckNewStartFrame = -1L
+        private set
+    var seekAckDiscardedFrames = -1L
+        private set
+    var seekAckTotalDiscardedOnSeekFrames = -1L
+        private set
+    // Y20 pre-seek quiescence facts from the snapshot [assertQuiescentForSeek]
+    // accepted (no private drain took place to reach it).
+    var quiescentForSeekProofOk = false
+        private set
+    var quiescentForSeekTotalFramesPushed = -1L
+        private set
+    var quiescentForSeekNextDispatchFrame = -1L
+        private set
+    var quiescentForSeekOutputAvailableReadFrames = -1L
+        private set
+    var quiescentForSeekTimingT1Ns = -1L
+        private set
 
     // Folded from the most recent snapshot (final metrics for the driver).
     var snapCommandsEnqueued = -1L
@@ -206,6 +269,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     val snapProviderFramesZeroFilledTrack = longArrayOf(-1L, -1L)
     val snapProviderForwardSkipFramesTrack = longArrayOf(-1L, -1L)
     val snapProviderRewindRejectsTrack = longArrayOf(-1L, -1L)
+    // Provider cursor + external re-anchor diagnostics (raw native keys;
+    // count 0 / frame -1 for a run that never processed a Seek).
+    val snapProviderExpectedNextFrameTrack = longArrayOf(-1L, -1L)
+    val snapProviderExternalReanchorCountTrack = longArrayOf(-1L, -1L)
+    val snapProviderLastExternalReanchorFrameTrack = longArrayOf(-1L, -1L)
     var snapTotalFramesRendered = -1L
         private set
     var snapTotalFramesPushed = -1L
@@ -282,6 +350,23 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     var snapTotalDiscardedOnSeekFrames = -1L
         private set
     var snapSeekSkipAnomalies = -1L
+        private set
+    // Y20 seek handshake / cursor facts folded from the snapshot (raw native
+    // keys; -1 until a snapshot has been taken).
+    var snapNextDispatchFrame = -1L
+        private set
+    var snapOutputSeekRequest = -1L
+        private set
+    var snapOutputSeekAck = -1L
+        private set
+    val snapSourceSeekRequestTrack = longArrayOf(-1L, -1L)
+    val snapSourceSeekAckTrack = longArrayOf(-1L, -1L)
+    val snapWriterSeekRequestsTrack = longArrayOf(-1L, -1L)
+    val snapWriterNextWriteFrameTrack = longArrayOf(-1L, -1L)
+    val snapSourceAvailableReadFramesTrack = longArrayOf(-1L, -1L)
+    var snapOutputAvailableReadFrames = -1L
+        private set
+    var snapNativeTimingT1Ns = -1L
         private set
     // X15 owner-side pause/resume proof facts, recorded by
     // [pauseAndAwaitProof] / [assertPausedHoldFrozen] / [resumeAndAwaitProof].
@@ -618,7 +703,119 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         }
         drainUntilRead(target)
         onQuiescentBeforeSeek()
+        // The boundary drain already emptied the output ring; an undrained
+        // ring here means the quiescence claim was false (X4 token kept).
+        postSeekCommandAndAwait(target, notDrainedReason = "seek_output_not_drained_after_quiescence")
+        return target
+    }
+
+    // ── Y20 decoupled forward seek (owner thread; NO private drain) ────────
+
+    // Snapshot-only quiescence proof at the hold frame [expectedPushed]
+    // BEFORE a true forward seek: every command processed, the worker
+    // dispatched exactly [expectedPushed] frames (which must equal both
+    // accepted totals: shared accepted-frame axis), both source rings empty
+    // with settled acks, and the output ring EMPTY with a settled ack. This
+    // wrapper never reads the output ring here: the production sink is the
+    // sole consumer of the pushed frames, so an undrained ring is a caller
+    // ordering defect (sink not drained to the hold) and fails closed at
+    // once instead of waiting for a drain that can never come. The
+    // one-second native timing gate (timingT1Ns) must already have closed:
+    // the worker rejects a Seek command before it, so a hold below that
+    // gate fails closed here with a typed reason rather than as an opaque
+    // command error.
+    fun assertQuiescentForSeek(expectedPushed: Long): Map<String, String> {
+        if (expectedPushed <= 0L || expectedPushed % mfpm != 0L) throw Failure("seek_hold_not_aligned")
+        if (totalFramesAcceptedTrack[0] != expectedPushed || totalFramesAcceptedTrack[1] != expectedPushed) {
+            throw Failure("seek_hold_lockstep_mismatch")
+        }
+        val snap = awaitSnapshot("seek_quiescent_no_drain") {
+            longField(it, "commandsProcessed") == longField(it, "commandsEnqueued") &&
+                longField(it, "totalFramesPushed") == expectedPushed &&
+                longField(it, "sourceAvailableReadFramesTrack0") == 0L &&
+                longField(it, "sourceAvailableReadFramesTrack1") == 0L
+        }
+        if (longField(snap, "commandErrors") != 0L) throw Failure("seek_quiescent_command_errors")
+        if (snap["paused"] == "true") throw Failure("seek_quiescent_while_paused")
+        if (longField(snap, "nextDispatchFrame") != expectedPushed) throw Failure("seek_quiescent_cursor_mismatch")
+        if (longField(snap, "outputAvailableReadFrames") != 0L) throw Failure("seek_output_not_drained_by_sink")
+        if (longField(snap, "outputSeekRequest") != longField(snap, "outputSeekAck")) {
+            throw Failure("seek_output_ack_pending_at_hold")
+        }
+        for (track in 0..1) {
+            if (longField(snap, "sourceSeekRequestTrack$track") != longField(snap, "sourceSeekAckTrack$track")) {
+                throw Failure("seek_source_ack_pending_at_hold_track$track")
+            }
+        }
+        if (totalOutputFramesRead != expectedPushed) throw Failure("seek_hold_read_total_mismatch")
+        val timingT1 = longField(snap, "nativeTimingT1Ns")
+        if (timingT1 < 0L) throw Failure("seek_hold_below_native_timing_gate")
+        quiescentForSeekTotalFramesPushed = longField(snap, "totalFramesPushed")
+        quiescentForSeekNextDispatchFrame = longField(snap, "nextDispatchFrame")
+        quiescentForSeekOutputAvailableReadFrames = longField(snap, "outputAvailableReadFrames")
+        quiescentForSeekTimingT1Ns = timingT1
+        quiescentForSeekProofOk = true
+        return snap
+    }
+
+    // Posts and awaits the native joint seek to the window-aligned content
+    // frame [target] STRICTLY past the current accepted boundary (a true
+    // forward content skip). No output read of any kind happens here: the
+    // caller proved quiescence through [assertQuiescentForSeek] and the
+    // pending OUTPUT ack is consumed later by [consumeSeekAckAndReanchor]
+    // after the post-seek lockstep prefill. Returns the processed-command
+    // snapshot; the native seek-aware accounting it carries (skipped frames
+    // == target - boundary, playable == expectedFrames - skipped) is
+    // asserted fail-closed and mirrored into the seek* facts.
+    fun seek(target: Long): Map<String, String> {
+        if (seekTargetFrame >= 0L) throw Failure("seek_already_exercised")
+        val boundary = totalFramesAcceptedTrack[0]
+        if (boundary <= 0L || boundary % mfpm != 0L) throw Failure("seek_boundary_not_aligned")
+        if (totalFramesAcceptedTrack[1] != boundary) throw Failure("seek_boundary_lockstep_mismatch")
+        if (target <= boundary) throw Failure("seek_target_not_forward")
+        if (target % mfpm != 0L) throw Failure("seek_target_not_aligned")
+        if (target >= expectedFrames) throw Failure("seek_target_beyond_timeline")
+        val snap = postSeekCommandAndAwait(target, notDrainedReason = "seek_output_not_drained_by_sink")
+        val skipped = longField(snap, "totalForwardSeekSkippedFrames")
+        val playable = expectedPlayableFrameCountOf(snap)
+        if (skipped != target - boundary) throw Failure("seek_skipped_frames_mismatch")
+        if (playable != expectedFrames - skipped) throw Failure("seek_playable_frames_mismatch")
+        if (longField(snap, "seekSkipAnomalies") != 0L) throw Failure("seek_skip_anomaly")
+        if (longField(snap, "nextDispatchFrame") != target) throw Failure("seek_cursor_not_at_target")
+        // Both providers must have been re-anchored exactly once to the
+        // target by the worker (the one Seek this session ever processes),
+        // and must now expect the target: a provider left at the pre-seek
+        // cursor would forward-skip / zero-fill the first post-seek window
+        // and stall the timeline at EOS. Fail closed here with a typed
+        // reason instead of as an opaque drain stall later.
+        for (track in 0..1) {
+            if (seekProviderExternalReanchorCountAtProcessedTrack[track] != 1L ||
+                seekProviderLastExternalReanchorFrameAtProcessedTrack[track] != target
+            ) {
+                throw Failure("seek_provider_not_reanchored_track$track")
+            }
+            if (seekProviderExpectedNextFrameAtProcessedTrack[track] != target) {
+                throw Failure("seek_provider_cursor_not_at_target_track$track")
+            }
+        }
+        seekSkippedFramesAtProcessed = skipped
+        seekExpectedPlayableAtProcessed = playable
+        seekSkipAnomaliesAtProcessed = longField(snap, "seekSkipAnomalies")
+        seekNextDispatchFrameAtProcessed = longField(snap, "nextDispatchFrame")
+        return snap
+    }
+
+    // Shared command-posting path of [seekAtQuiescentBoundary] (X4, target
+    // == accepted) and [seek] (Y20, target > accepted): enqueues the native
+    // joint seek (no time value crosses JNI beyond the frame-derived pts),
+    // retries the bounded transient statuses, asserts the reply's target
+    // frame and command sequence, awaits the worker's execution and records
+    // the seek target. [notDrainedReason] is the caller's typed token for an
+    // undrained output ring (the X4 caller drained it privately, the Y20
+    // caller relies on the production sink having drained it).
+    private fun postSeekCommandAndAwait(target: Long, notDrainedReason: String): Map<String, String> {
         val seekPtsUs = ceilDiv(target * 1_000_000L, sampleRate.toLong())
+        seekRequestedPtsUs = seekPtsUs
         var attempts = 0
         while (true) {
             checkDeadline()
@@ -632,28 +829,42 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
             )
             when (kv["status"]) {
                 "enqueued" -> {
-                    if (longField(kv, "targetFrame") != target) {
+                    seekReplyTargetFrame = longField(kv, "targetFrame")
+                    if (seekReplyTargetFrame != target) {
                         throw Failure("seek_target_frame_mismatch")
                     }
                     val seq = ++nextCommandSeq
                     if (longField(kv, "commandSeq") != seq) {
                         throw Failure("seek_command_seq_mismatch")
                     }
-                    awaitCommandProcessed(seq)
+                    seekCommandSeq = seq
+                    val snap = awaitCommandProcessed(seq)
+                    // Provider re-anchor facts of the processed snapshot
+                    // (mirrored for both callers; only the Y20 [seek] path
+                    // asserts them, the X4 boundary path stays inert).
+                    for (track in 0..1) {
+                        seekProviderExternalReanchorCountAtProcessedTrack[track] =
+                            snapProviderExternalReanchorCountTrack[track]
+                        seekProviderLastExternalReanchorFrameAtProcessedTrack[track] =
+                            snapProviderLastExternalReanchorFrameTrack[track]
+                        seekProviderExpectedNextFrameAtProcessedTrack[track] =
+                            snapProviderExpectedNextFrameTrack[track]
+                    }
                     seekTargetFrame = target
-                    return target
+                    seekProcessedOk = true
+                    return snap
                 }
-                // The boundary drain already emptied the output ring; an
-                // undrained ring here means the quiescence claim was false.
-                "seek_output_ring_not_drained" ->
-                    throw Failure("seek_output_not_drained_after_quiescence")
+                "seek_output_ring_not_drained" -> throw Failure(notDrainedReason)
                 // Bounded wait/retry transients (per-track suffixed).
                 "seek_pending_commands",
                 "seek_source_ring_not_empty_track0",
                 "seek_source_ring_not_empty_track1",
                 "seek_source_ack_pending_track0",
                 "seek_source_ack_pending_track1",
-                "seek_output_ack_pending" -> Thread.sleep(POLL_SLEEP_MS)
+                "seek_output_ack_pending" -> {
+                    seekTransientRetries += 1L
+                    Thread.sleep(POLL_SLEEP_MS)
+                }
                 // Everything else (seek_track_frame_axis_divergence,
                 // behind_cursor, behind_writer_track0/1,
                 // writer_seek_rejected_track0/1, seek_rejected_eos,
@@ -763,9 +974,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     fun consumeSeekAckAndReanchor() {
         if (seekTargetFrame < 0L) throw Failure("seek_ack_without_seek")
         val ack = ackOnlyRead()
-        if (ack["seekAckConsumed"] != "true" ||
-            longField(ack, "newStartFrame") != seekTargetFrame ||
-            longField(ack, "discardedFramesOnSeek") != 0L
+        seekAckConsumedByAckOnlyRead = ack["seekAckConsumed"] == "true"
+        seekAckNewStartFrame = ack["newStartFrame"]?.toLongOrNull() ?: -1L
+        seekAckDiscardedFrames = ack["discardedFramesOnSeek"]?.toLongOrNull() ?: -1L
+        seekAckTotalDiscardedOnSeekFrames = ack["totalDiscardedOnSeekFrames"]?.toLongOrNull() ?: -1L
+        if (!seekAckConsumedByAckOnlyRead ||
+            seekAckNewStartFrame != seekTargetFrame ||
+            seekAckDiscardedFrames != 0L
         ) {
             throw Failure("seek_ack_not_consumed_cleanly")
         }
@@ -932,6 +1147,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
                 longField(kv, "providerForwardSkipFramesTrack$track")
             snapProviderRewindRejectsTrack[track] =
                 longField(kv, "providerRewindRejectsTrack$track")
+            snapProviderExpectedNextFrameTrack[track] =
+                longField(kv, "providerExpectedNextFrameTrack$track")
+            snapProviderExternalReanchorCountTrack[track] =
+                longField(kv, "providerExternalReanchorCountTrack$track")
+            snapProviderLastExternalReanchorFrameTrack[track] =
+                longField(kv, "providerLastExternalReanchorFrameTrack$track")
         }
         snapTotalFramesRendered = longField(kv, "totalFramesRendered")
         snapTotalFramesPushed = longField(kv, "totalFramesPushed")
@@ -966,6 +1187,18 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         snapTotalForwardSeekSkippedFrames = longField(kv, "totalForwardSeekSkippedFrames")
         snapTotalDiscardedOnSeekFrames = longField(kv, "totalDiscardedOnSeekFrames")
         snapSeekSkipAnomalies = longField(kv, "seekSkipAnomalies")
+        snapNextDispatchFrame = longField(kv, "nextDispatchFrame")
+        snapOutputSeekRequest = longField(kv, "outputSeekRequest")
+        snapOutputSeekAck = longField(kv, "outputSeekAck")
+        for (track in 0..1) {
+            snapSourceSeekRequestTrack[track] = longField(kv, "sourceSeekRequestTrack$track")
+            snapSourceSeekAckTrack[track] = longField(kv, "sourceSeekAckTrack$track")
+            snapWriterSeekRequestsTrack[track] = longField(kv, "writerSeekRequestsTrack$track")
+            snapWriterNextWriteFrameTrack[track] = longField(kv, "writerNextWriteFrameTrack$track")
+            snapSourceAvailableReadFramesTrack[track] = longField(kv, "sourceAvailableReadFramesTrack$track")
+        }
+        snapOutputAvailableReadFrames = longField(kv, "outputAvailableReadFrames")
+        snapNativeTimingT1Ns = longField(kv, "nativeTimingT1Ns")
         snapProofBoundary = kv["proofBoundary"] ?: ""
         return kv
     }

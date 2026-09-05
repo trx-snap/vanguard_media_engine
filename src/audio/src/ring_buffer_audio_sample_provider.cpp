@@ -79,5 +79,19 @@ core::Status RingBufferAudioSampleProvider::provide(const AudioWindowRequest& re
     return core::Status::OK();
 }
 
+core::Status RingBufferAudioSampleProvider::reanchorAfterExternalSeek(
+    int64_t targetFrame) noexcept {
+    if (targetFrame < 0) {
+        return core::Status(core::StatusCode::kError,
+                            "reanchorAfterExternalSeek: negative target frame");
+    }
+    // Cursor-only: the caller already consumed this ring's seek ack for
+    // exactly this frame on this (consumer) thread; the ring is not touched.
+    expectedNextFrame_         = targetFrame;
+    lastExternalReanchorFrame_ = targetFrame;
+    ++externalReanchorCount_;
+    return core::Status::OK();
+}
+
 } // namespace audio
 } // namespace vanguard

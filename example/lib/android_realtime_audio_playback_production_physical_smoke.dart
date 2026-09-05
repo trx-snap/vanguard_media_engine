@@ -11,8 +11,9 @@
 // P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16) +
 // P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF (Y18b) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c) +
-// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, and real-decoder ring pause/resume diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19) +
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, and real-decoder ring forward-seek diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
@@ -49,6 +50,17 @@
 //     dead object, no drift feedback, no pacing correction, no resampling, no
 //     currentPosition authority switch, no A/V sync closure, no fleet claim, and no
 //     app/editor claim.
+//   - Real-decoder ring forward seek (Y20) proves exactly one owner-thread-executed
+//     native joint seek on the Y18c real-decoder ring to a window-aligned target T
+//     strictly past the window-aligned hold H: feed held at H, the production sink
+//     drained to H, seek-parked and flushed before the ring seek, native quiescence
+//     proven snapshot-only, both native ring providers re-anchored once by the
+//     worker at T (no provider forward skip, no zero-fill), and every frame and
+//     checksum identity asserted over the effective (expectedFrames - skipped)
+//     frames; the extractor landing at or before T is reported, never claimed
+//     exact. It carries no pause/resume, no dead object, no drift feedback, no
+//     pacing correction, no resampling, no currentPosition authority switch, no
+//     A/V sync closure, no fleet claim, and no app/editor claim.
 //
 // This is a component diagnostic smoke. It must not claim
 // product/editor/UI/ConnectsApp/iOS/streaming/cache/audio clock mutator changes/clock feedback proof.
@@ -407,6 +419,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'SCENARIO_REAL_DECODER_RING_FRAME_SOURCE_TO_EOS';
     const realRingPauseResumeScenarioKey =
         'SCENARIO_REAL_DECODER_RING_PAUSE_RESUME_TO_EOS';
+    const realRingSeekScenarioKey = 'SCENARIO_REAL_DECODER_RING_SEEK_TO_EOS';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -453,6 +466,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final realRingPauseResumeMetrics = asStringKeyedMap(
       topMetrics[realRingPauseResumeScenarioKey],
+    );
+    final realRingSeekMetrics = asStringKeyedMap(
+      topMetrics[realRingSeekScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -1390,6 +1406,172 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       realRingPauseResumeCompactKeys,
     );
 
+    const realRingSeekCompactKeys = <String>[
+      'realRingStage',
+      'realRingFailureReason',
+      'y20CoordinatorThreadId',
+      'realRingOwnerThreadId',
+      'realRingSinkThreadIdObserved',
+      'realRingTransportCommandsIssued',
+      'realRingSeekQuiesceRequests',
+      'realRingSeekRequests',
+      'realRingQuiesceRequests',
+      'realRingPauseRequests',
+      'realRingResumeRequests',
+      'realRingControlRequestsOnOwnerThread',
+      'realRingControlOverlapRejects',
+      'realRingControlWaitTimeouts',
+      'realRingExpectedFrames',
+      'y20EffectiveExpectedFrames',
+      'y20HoldFrame',
+      'y20TargetFrame',
+      'y20SkipFrames',
+      'y20ExpectedPlayableFrames',
+      'y20PostSeekExpectedFrames',
+      'y20NativeTimingGateFrames',
+      'y20HoldAboveNativeTimingGate',
+      'y20HoldAckOk',
+      'y20HoldAckWallMs',
+      'y20FeedHeldObserved',
+      'y20IngestCompleteAtHold',
+      'y20SinkDrainedToHold',
+      'y20SinkFramesReadAtHoldDrained',
+      'y20RingFramesReadBySinkAtHoldDrained',
+      'y20SinkSeekParkRequested',
+      'y20SinkParked',
+      'y20SinkFlushRequested',
+      'y20SinkFlushed',
+      'y20SinkParkedBeforeRingSeek',
+      'y20SinkFlushedBeforeRingSeek',
+      'y20SinkPhaseAtRingSeek',
+      'sinkParkCount',
+      'sinkUnparkCount',
+      'sinkSeekParkCount',
+      'sinkFlushCount',
+      'sinkFramesReadAtFlush',
+      'sinkPostSeekExpectedFrames',
+      'sinkReadBudgetFrames',
+      'sinkSeekTargetFrame',
+      'sinkSeekEpochBaseFrame',
+      'sinkSeekDiscontinuityFrames',
+      'sinkPostSeekFramesWritten',
+      'realRingSeekHoldFrame',
+      'realRingSeekHoldAckOk',
+      'realRingSeekHoldExecutedOnOwnerThread',
+      'realRingSeekHoldDiscardedStagedFrames',
+      'realRingFeedStepsWhileHeld',
+      'realRingFramesAcceptedTrack0AtHold',
+      'realRingFramesAcceptedTrack1AtHold',
+      'realRingNativeQuiescentProofOk',
+      'realRingNativeQuiescentTotalFramesPushed',
+      'realRingNativeQuiescentNextDispatchFrame',
+      'realRingNativeQuiescentOutputAvailableReadFrames',
+      'realRingSeekDrainRejectsSinkThread',
+      'realRingSeekDrainRejectsOwnerThread',
+      'y20RingSeekAckOk',
+      'realRingSeekAckOk',
+      'realRingSeekExecutedOnOwnerThread',
+      'realRingSeekWallMs',
+      'realRingSeekTargetFrame',
+      'realRingSeekSkipFrames',
+      'realRingSeekCleanBoundaryOk',
+      'realRingNativeSeekCommandSeq',
+      'realRingNativeSeekRequestedPtsUs',
+      'realRingNativeSeekReplyTargetFrame',
+      'realRingNativeSeekTransientRetries',
+      'realRingNativeSeekProcessedOk',
+      'realRingNativeSkippedFramesAtSeek',
+      'realRingNativeExpectedPlayableAtSeek',
+      'realRingNativeSeekSkipAnomaliesAtSeek',
+      'realRingNativeNextDispatchFrameAtSeek',
+      'realRingSeekAckConsumedByAckOnlyRead',
+      'realRingSeekAckNewStartFrame',
+      'realRingSeekAckDiscardedFrames',
+      'realRingSeekAckTotalDiscardedOnSeekFrames',
+      'realRingExtractorSeekCalls',
+      'realRingCodecFlushCalls',
+      'realRingSeekTargetUs',
+      'realRingSeekLandingPtsUs',
+      'realRingSeekLandingLeadUs',
+      'realRingSeekLandingAtOrBeforeTarget',
+      'realRingPreTargetDiscardedFrames',
+      'realRingFirstPostSeekChunkPtsUs',
+      'realRingFirstIngestedPostSeekPtsUs',
+      'realRingGeneratorReanchorCount',
+      'realRingGeneratorReanchorFrame',
+      'realRingPostSeekPrefillQuotaFrames',
+      'realRingPostSeekPrefillCommittedFrames',
+      'realRingPostSeekPrefillAcceptedFrames',
+      'realRingPostSeekPrefillStalled',
+      'realRingPostSeekPrefillWallMs',
+      'y20SinkUnparked',
+      'y20SinkUnparkAfterRingSeek',
+      'y20SinkFramesReadAtUnpark',
+      'sinkPlayStateAfterUnpark',
+      'sinkEpochClosedAtPark',
+      'sinkEpochOpenedAtUnpark',
+      'sinkSeekEpochOpenedAtUnpark',
+      'sinkEpochRawOriginAtUnpark',
+      'realRingPostSeekFramesReadBySink',
+      'realRingFramesReadBySink',
+      'realRingTotalOutputFramesRead',
+      'realRingTotalFramesPushedAtEos',
+      'realRingExpectedPlayableFrameCountAtEos',
+      'realRingTotalForwardSeekSkippedFramesAtEos',
+      'realRingNativeExpectedPlayableFrameCount',
+      'realRingNativeTotalForwardSeekSkippedFrames',
+      'realRingNativeTotalDiscardedOnSeekFrames',
+      'realRingNativeSeekSkipAnomalies',
+      'realRingNativeNextDispatchFrame',
+      'realRingNativeProviderExternalReanchorCountAtSeekTrack0',
+      'realRingNativeProviderExternalReanchorCountAtSeekTrack1',
+      'realRingNativeProviderLastExternalReanchorFrameAtSeekTrack0',
+      'realRingNativeProviderLastExternalReanchorFrameAtSeekTrack1',
+      'realRingNativeProviderExpectedNextFrameAtSeekTrack0',
+      'realRingNativeProviderExpectedNextFrameAtSeekTrack1',
+      'nativeProviderExternalReanchorCountTrack0',
+      'nativeProviderExternalReanchorCountTrack1',
+      'nativeProviderLastExternalReanchorFrameTrack0',
+      'nativeProviderLastExternalReanchorFrameTrack1',
+      'nativeProviderForwardSkipFramesTrack0',
+      'nativeProviderForwardSkipFramesTrack1',
+      'nativeProviderRewindRejectsTrack0',
+      'nativeProviderRewindRejectsTrack1',
+      'nativeProviderFramesZeroFilledTrack0',
+      'nativeProviderFramesZeroFilledTrack1',
+      'nativeProviderUnderrunEventsTrack0',
+      'nativeProviderUnderrunEventsTrack1',
+      'decoderFramesDecoded',
+      'decoderFramesIngestedReal',
+      'decoderEosPadFrames',
+      'decoderEosTruncatedFrames',
+      'realRingNativeOutputReadChecksumHex',
+      'realRingKotlinReferenceMixChecksumHex',
+      'realRingKotlinTrack0ChecksumHex',
+      'realRingKotlinTrack1ChecksumHex',
+      'realRingChecksumChainSelfOk',
+      'realRingDestroyJoinOk',
+      'realRingDestroyIdempotentOk',
+      'y20LaneSeekGeometryOk',
+      'y20LaneFrameAccountingOk',
+      'y20LaneEosOk',
+      'y20LaneChecksumOk',
+      'y20LaneRingCloseOk',
+      'y20LaneNativeOk',
+      'y20LaneSeekCycleCountsOk',
+      'y20LaneNoFeedbackOk',
+      'y20LaneControlOk',
+      'y20LaneBaseOk',
+      'y20NonClaims',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRealRingSeek = extractCompactScenario(
+      realRingSeekMetrics,
+      realRingSeekCompactKeys,
+    );
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -1703,6 +1885,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [SCENARIO] $realRingPauseResumeScenarioKey: $compactRealRingPauseResume',
     );
+    print('  [SCENARIO] $realRingSeekScenarioKey: $compactRealRingSeek');
 
     // 5. Verification evaluation.
     final pass =
@@ -1730,13 +1913,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       ringFrameSourceScenarioKey: compactRingFrameSource,
       realDecoderRingFrameSourceScenarioKey: compactRealDecoderRingFrameSource,
       realRingPauseResumeScenarioKey: compactRealRingPauseResume,
+      realRingSeekScenarioKey: compactRealRingSeek,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME',
-      'subSlice': 'Y19',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK',
+      'subSlice': 'Y20',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,

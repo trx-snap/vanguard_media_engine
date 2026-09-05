@@ -120,12 +120,52 @@ import kotlin.concurrent.withLock
 //     into [PauseResumeTelemetry] together with the Kotlin-side frame /
 //     dispatch totals at pause, after the hold, and at resume.
 //
+// Y20 (P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK): exactly ONE
+// true FORWARD content seek (target frame T strictly past the hold frame
+// H, skipped = T - H > 0), requested from any non-owner thread and EXECUTED
+// on the ring-owner thread through the same control request/latch
+// ([quiesceFeedForSeek], [seekTransport]); the coordinator never touches
+// the native seek entry points itself. Rules:
+//   - [quiesceFeedForSeek] arms a FEED CAP at the window-aligned hold frame
+//     H: the feed keeps running (drains serviced) but ingests no frame past
+//     H; a staged codec slice straddling H is cut at H and its surplus is
+//     discarded with honest accounting (seekHoldDiscardedStagedFrames: that
+//     content lies inside the skipped span [H, T) and is never checksummed).
+//     Once the pump has committed exactly H frames at a clean boundary the
+//     feed is held (quiesced: drains still serviced, no decode / ingest /
+//     EOS poll) and the request completes. H must be above the native
+//     one-second timing gate (the worker rejects a Seek before it closes).
+//   - The scenario then lets the PRODUCTION sink drain every pushed frame
+//     (totalOutputFramesRead == H: the sink is the sole output consumer;
+//     this class never drains privately), seek-parks and flushes the sink,
+//     and only then requests [seekTransport]. On the owner thread the seek
+//     proves native quiescence at H snapshot-only, posts + awaits the native
+//     joint seek to T (skipped == T - H asserted from the worker's
+//     seek-aware accounting), re-anchors the synthetic generator on the
+//     pump's accepted-count axis, re-anchors the MediaExtractor
+//     (SEEK_TO_PREVIOUS_SYNC, landing pts at or before T reported as
+//     telemetry) and flushes the MediaCodec, discards decoded frames whose
+//     pts lie before T (counted, budgeted), prefills the post-seek lockstep
+//     source rings with drains forbidden (the pending output ack survives),
+//     consumes the output seek ack with an ACK-ONLY read (zero discard
+//     asserted: the ring was empty), releases the feed gate and completes.
+//   - From the seek on the EFFECTIVE expected frames are expectedFrames -
+//     skipped (== the native expectedPlayableFrameCount): the feed
+//     truncates / pads / completes against that count, the joint EOS is
+//     set at that count, and the final checksum chain is asserted over
+//     exactly those frames. This class never claims the original
+//     expectedFrames were pushed after a true skip.
+//   - While the seek executes, sink drains are rejected inline
+//     ([REASON_DRAIN_DURING_SEEK], never a native read); the scenario keeps
+//     the sink parked across the seek, so zero such rejections are expected.
+//
 // Honest non-claims: diagnostic real-decoder ring frame-source proof only.
 // No feedback control loop, no pacing correction, no resampling, no
-// currentPosition authority switch, no A/V sync closure, no seek, no
+// currentPosition authority switch, no A/V sync closure, no exact keyframe
+// landing claim (extractor landing is media-local, at or before T), no
 // product/editor/app/ConnectsApp/iOS/streaming/cache, no fleet claim, no
-// change to the sink, the seam, the production feed, the session, the
-// native session wrapper, or any X4..X15 entry point.
+// change to the sink, the seam, the production feed, the session, or any
+// X4..X15 entry point.
 class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     private val config: Config,
 ) : VanguardRealtimeAudioPlaybackFrameSource {
@@ -148,7 +188,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
 
     enum class Stage {
         CREATED, OPENING, FORMAT_PROBE, GEOMETRY_FROZEN, SESSION_CREATED, PRE_ROLL, READY,
-        TRANSPORT_START, ACTIVE_DRAIN, PAUSED, DECODER_EOS, EOS_SET, CLOSING, CLOSED, FAILED,
+        TRANSPORT_START, ACTIVE_DRAIN, PAUSED, SEEKING, DECODER_EOS, EOS_SET, CLOSING, CLOSED, FAILED,
     }
 
     class FailClosed(val reason: String) : Exception(reason)
@@ -274,9 +314,151 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         val stageAfterResume: String,
     )
 
+    // Y20 seek facts, part 1: requester-side control accounting, the feed
+    // hold at H, and the owner-executed native seek (owner thread writes;
+    // requester counters are atomics). -1 / false means "never reached".
+    data class SeekTelemetry(
+        val seekQuiesceRequests: Long,
+        val seekRequests: Long,
+        val seekDrainRejectsSinkThread: Long,
+        val seekDrainRejectsOwnerThread: Long,
+        // Feed hold at the window-aligned hold frame H.
+        val holdFrame: Long,
+        val holdArmed: Boolean,
+        val holdArmedOnOwnerThread: Boolean,
+        val holdCommittedFramesAtArm: Long,
+        val holdReached: Boolean,
+        val holdAckOk: Boolean,
+        val holdExecutedOnOwnerThread: Boolean,
+        val holdWallMs: Long,
+        val holdDiscardedStagedFrames: Long,
+        val feedStepsWhileHeld: Long,
+        val framesReadBySinkAtHold: Long,
+        val drainsServicedAtHold: Long,
+        val framesAcceptedTrack0AtHold: Long,
+        val framesAcceptedTrack1AtHold: Long,
+        val framesDecodedAtHold: Long,
+        val decodeStepsAtHold: Long,
+        // Owner-executed seek to T.
+        val seekExercised: Boolean,
+        val seekAckOk: Boolean,
+        val seekExecutedOnOwnerThread: Boolean,
+        val seekWallMs: Long,
+        val seekTargetFrame: Long,
+        val seekSkipFrames: Long,
+        val seekQuiescedFirst: Boolean,
+        val seekCleanBoundaryOk: Boolean,
+        val seekPendingSliceFramesAtRequest: Int,
+        val seekPumpPendingChunkAtRequest: Boolean,
+        val seekCodecOutputHeldAtRequest: Boolean,
+        val seekIngestCompleteAtRequest: Boolean,
+        val seekPausedAtRequest: Boolean,
+        val framesReadBySinkAtSeek: Long,
+        val drainsServicedAtSeek: Long,
+        val drainsServicedDuringSeek: Long,
+        val stageBeforeSeek: String,
+        val stageAfterSeek: String,
+        // Native pre-seek quiescence proof (snapshot-only, no private drain).
+        val nativeQuiescentProofOk: Boolean,
+        val nativeQuiescentTotalFramesPushed: Long,
+        val nativeQuiescentNextDispatchFrame: Long,
+        val nativeQuiescentOutputAvailableReadFrames: Long,
+        val nativeQuiescentTimingT1Ns: Long,
+        // Native seek command + processed-snapshot facts.
+        val nativeSeekCommandSeq: Long,
+        val nativeSeekRequestedPtsUs: Long,
+        val nativeSeekReplyTargetFrame: Long,
+        val nativeSeekTransientRetries: Long,
+        val nativeSeekProcessedOk: Boolean,
+        val nativeSkippedFramesAtSeek: Long,
+        val nativeExpectedPlayableAtSeek: Long,
+        val nativeSeekSkipAnomaliesAtSeek: Long,
+        val nativeNextDispatchFrameAtSeek: Long,
+        // Provider external re-anchor at the processed-Seek snapshot
+        // (P4-AUDIO-SEEK-PROVIDER-COORDINATOR-REANCHOR): the worker consumed
+        // both source acks itself, so it must have re-anchored BOTH
+        // RingBufferAudioSampleProviders to T (count exactly 1, frame == T,
+        // expected next frame == T) before any post-seek dispatch.
+        val nativeProviderExternalReanchorCountAtSeekTrack0: Long,
+        val nativeProviderExternalReanchorCountAtSeekTrack1: Long,
+        val nativeProviderLastExternalReanchorFrameAtSeekTrack0: Long,
+        val nativeProviderLastExternalReanchorFrameAtSeekTrack1: Long,
+        val nativeProviderExpectedNextFrameAtSeekTrack0: Long,
+        val nativeProviderExpectedNextFrameAtSeekTrack1: Long,
+        val effectiveExpectedFrames: Long,
+        // Output seek ack (ack-only read on the owner thread).
+        val seekAckConsumedByAckOnlyRead: Boolean,
+        val seekAckNewStartFrame: Long,
+        val seekAckDiscardedFrames: Long,
+        val seekAckTotalDiscardedOnSeekFrames: Long,
+        val seekAckWallMs: Long,
+    )
+
+    // Y20 seek facts, part 2: the media re-anchor, the post-seek prefill,
+    // the synthetic generator re-anchor and the FINAL native seek-aware
+    // accounting (folded from the final snapshot).
+    data class SeekReanchorTelemetry(
+        val extractorSeekCalls: Long,
+        val codecFlushCalls: Long,
+        val extractorReanchoredOnOwnerThread: Boolean,
+        val seekTargetUs: Long,
+        val seekLandingPtsUs: Long,
+        val seekLandingLeadUs: Long,
+        val seekLandingAtOrBeforeTarget: Boolean,
+        val preTargetDiscardedFrames: Long,
+        val preTargetDiscardBudgetFrames: Long,
+        val firstPostSeekChunkPtsUs: Long,
+        val firstIngestedPostSeekPtsUs: Long,
+        val inputEosAtSeek: Boolean,
+        val outputEosAtSeek: Boolean,
+        val generatorReanchorCount: Long,
+        val generatorReanchorFrame: Long,
+        val generatorAxis: String,
+        // Post-seek lockstep prefill (drains forbidden) before the ack.
+        val postSeekPrefillQuotaFrames: Long,
+        val postSeekPrefillFeedSteps: Long,
+        val postSeekPrefillCommittedFrames: Long,
+        val postSeekPrefillAcceptedFrames: Long,
+        val postSeekPrefillStalled: Boolean,
+        val postSeekPrefillWallMs: Long,
+        val postSeekFramesReadBySink: Long,
+        // Final native seek-aware accounting (final snapshot).
+        val nativeExpectedPlayableFrameCount: Long,
+        val nativeTotalForwardSeekSkippedFrames: Long,
+        val nativeTotalDiscardedOnSeekFrames: Long,
+        val nativeSeekSkipAnomalies: Long,
+        val nativeNextDispatchFrame: Long,
+        val nativeOutputSeekRequest: Long,
+        val nativeOutputSeekAck: Long,
+        val nativeSourceSeekRequestTrack0: Long,
+        val nativeSourceSeekAckTrack0: Long,
+        val nativeSourceSeekRequestTrack1: Long,
+        val nativeSourceSeekAckTrack1: Long,
+        val nativeWriterNextWriteFrameTrack0: Long,
+        val nativeWriterNextWriteFrameTrack1: Long,
+        val nativeTimingT1Ns: Long,
+        // Final provider facts (final snapshot): the one external re-anchor
+        // per track landed at T and no provider ever forward-skipped or
+        // rejected a rewind over the whole run (the shared NativeTelemetry
+        // already carries zero-fill / underrun).
+        val nativeProviderExternalReanchorCountTrack0: Long,
+        val nativeProviderExternalReanchorCountTrack1: Long,
+        val nativeProviderLastExternalReanchorFrameTrack0: Long,
+        val nativeProviderLastExternalReanchorFrameTrack1: Long,
+        val nativeProviderForwardSkipFramesTrack0: Long,
+        val nativeProviderForwardSkipFramesTrack1: Long,
+        val nativeProviderRewindRejectsTrack0: Long,
+        val nativeProviderRewindRejectsTrack1: Long,
+        val expectedPlayableFrameCountAtEos: Long,
+        val totalForwardSeekSkippedFramesAtEos: Long,
+    )
+
     // Adapter-side facts (owner thread + sink thread counters). The folded
     // final native snapshot reuses the Y18b [AndroidRealtimeAudioPlaybackRingTransportFrameSource.NativeTelemetry]
     // shape so the evaluator reads one native fact type for both ring routes.
+    // Y20: [effectiveExpectedFrames] is the seek-aware expected frame count
+    // (expectedFrames - skipped; == expectedFrames without a seek) every
+    // accounting identity below is asserted against.
     data class Telemetry(
         val stage: Stage,
         val stageTrace: String,
@@ -340,6 +522,9 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         val decoder: DecoderTelemetry,
         val native: AndroidRealtimeAudioPlaybackRingTransportFrameSource.NativeTelemetry?,
         val pauseResume: PauseResumeTelemetry,
+        val effectiveExpectedFrames: Long,
+        val seek: SeekTelemetry,
+        val seekReanchor: SeekReanchorTelemetry,
     )
 
     companion object {
@@ -377,6 +562,30 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         const val REASON_RESUME_BEFORE_HOLD_ASSERT = "real_ring_resume_before_hold_assert"
         const val REASON_RESUME_ALREADY_EXERCISED = "real_ring_resume_already_exercised"
         const val REASON_CONTROL_CLOSED = "real_ring_control_closed"
+        // Y20 typed seek reasons.
+        const val REASON_DRAIN_DURING_SEEK = "real_ring_drain_during_seek"
+        const val REASON_SEEK_HOLD_INVALID = "real_ring_seek_hold_invalid:"
+        const val REASON_SEEK_HOLD_ALREADY_HELD = "real_ring_seek_hold_already_held"
+        const val REASON_SEEK_HOLD_ALREADY_PASSED = "real_ring_seek_hold_already_passed:"
+        const val REASON_SEEK_HOLD_AFTER_INGEST_COMPLETE = "real_ring_seek_hold_after_ingest_complete"
+        const val REASON_SEEK_NOT_HELD = "real_ring_seek_not_held"
+        const val REASON_SEEK_NOT_AT_CLEAN_BOUNDARY = "real_ring_seek_not_at_clean_boundary:"
+        const val REASON_SEEK_ALREADY_EXERCISED = "real_ring_seek_already_exercised"
+        const val REASON_SEEK_WHILE_PAUSED = "real_ring_seek_while_paused"
+        const val REASON_SEEK_TARGET_INVALID = "real_ring_seek_target_invalid:"
+        const val REASON_SEEK_SINK_NOT_DRAINED_TO_HOLD = "real_ring_seek_sink_not_drained_to_hold:"
+        const val REASON_SEEK_AFTER_DECODER_EOS = "real_ring_seek_after_decoder_eos"
+        const val REASON_SEEK_LANDING_UNAVAILABLE = "real_ring_seek_landing_unavailable"
+        const val REASON_SEEK_PREFILL_EMPTY = "real_ring_seek_post_seek_prefill_empty"
+        const val REASON_SEEK_SKIP_BELOW_DISCARDED = "real_ring_seek_skip_below_discarded_staged:"
+        const val REASON_SEEK_EFFECTIVE_FRAMES_MISMATCH = "real_ring_seek_effective_frames_mismatch:"
+        // Native worker timing gate floor (kTimingWarmupFrames): the worker
+        // closes its one-second gate only once the dispatch cursor passed
+        // ceil(8192 / window) * window + sampleRate frames, and rejects a
+        // Seek command before that. Exposed so a scenario can derive a
+        // valid hold frame from the frozen geometry instead of guessing.
+        const val NATIVE_TIMING_WARMUP_FRAMES = 8_192L
+        const val GENERATOR_AXIS_ACCEPTED_COUNT = "pump_accepted_count_axis"
 
         // Frozen X3/X4 decode dequeue timeout: the owner returns to drain work quickly.
         private const val DEQUEUE_TIMEOUT_US = 2_000L
@@ -397,16 +606,20 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
 
     // Y19 owner-executed control request (same request/latch shape as
     // [DrainRequest]): at most one pending at a time, executed in order
-    // QUIESCE -> PAUSE -> HOLD_ASSERT -> RESUME, each at most once.
-    private enum class Control { QUIESCE, PAUSE, HOLD_ASSERT, RESUME }
+    // QUIESCE -> PAUSE -> HOLD_ASSERT -> RESUME, each at most once. Y20
+    // adds QUIESCE_FOR_SEEK (feed cap at the hold frame, completes once the
+    // feed is held there) and SEEK (the one owner-executed forward seek).
+    private enum class Control { QUIESCE, PAUSE, HOLD_ASSERT, RESUME, QUIESCE_FOR_SEEK, SEEK }
 
-    private class ControlRequest(val kind: Control, val enqueuedAtMs: Long) {
+    private class ControlRequest(val kind: Control, val enqueuedAtMs: Long, val frame: Long = -1L) {
         val latch = CountDownLatch(1)
         @Volatile var ok = false
         @Volatile var reason = ""
     }
 
-    private enum class Feed { PROGRESSED, RETRY, STALLED, IDLE }
+    // HELD (Y20): the feed reached the armed seek hold frame at a clean
+    // boundary and ingests nothing further until the seek executes.
+    private enum class Feed { PROGRESSED, RETRY, STALLED, IDLE, HELD }
 
     // ── Cross-thread control ───────────────────────────────────────────────
 
@@ -514,6 +727,111 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     // True only between MediaCodec.getOutputBuffer and releaseOutputBuffer
     // inside [decodeStep]; a clean boundary requires it false.
     @Volatile private var codecOutputHeld = false
+
+    // ── Y20 seek control telemetry (requester side: atomics) ──────────────
+
+    private val seekQuiesceRequests = AtomicLong(0L)
+    private val seekRequests = AtomicLong(0L)
+    private val seekDrainRejectsSinkThread = AtomicLong(0L)
+
+    // ── Y20 seek facts (owner thread writes) ───────────────────────────────
+
+    // Seek-aware expected frames: expectedFrames until the one forward seek
+    // is processed, expectedFrames - skipped afterwards (owner writes).
+    @Volatile private var effectiveExpectedFrames = 0L
+    // Feed cap / hold gate (owner thread only; volatile for telemetry).
+    @Volatile private var seekHoldFrame = -1L
+    @Volatile private var seekHoldArmed = false
+    @Volatile private var seekHoldArmedOnOwnerThread = false
+    @Volatile private var seekHoldCommittedFramesAtArm = -1L
+    @Volatile private var seekHoldReached = false
+    @Volatile private var seekHoldAckOk = false
+    @Volatile private var seekHoldExecutedOnOwnerThread = false
+    @Volatile private var seekHoldWallMs = -1L
+    @Volatile private var seekHoldDiscardedStagedFrames = 0L
+    @Volatile private var feedStepsWhileHeld = 0L
+    @Volatile private var framesReadBySinkAtHold = -1L
+    @Volatile private var drainsServicedAtHold = -1L
+    @Volatile private var framesAcceptedTrack0AtHold = -1L
+    @Volatile private var framesAcceptedTrack1AtHold = -1L
+    @Volatile private var framesDecodedAtHold = -1L
+    @Volatile private var decodeStepsAtHold = -1L
+    // Owner-executed seek.
+    @Volatile private var seekInProgress = false
+    @Volatile private var seekExercised = false
+    @Volatile private var seekAckOk = false
+    @Volatile private var seekExecutedOnOwnerThread = false
+    @Volatile private var seekWallMs = -1L
+    @Volatile private var seekTargetFrame = -1L
+    @Volatile private var seekSkipFrames = -1L
+    @Volatile private var seekQuiescedFirst = false
+    @Volatile private var seekCleanBoundaryOk = false
+    @Volatile private var seekPendingSliceFramesAtRequest = -1
+    @Volatile private var seekPumpPendingChunkAtRequest = false
+    @Volatile private var seekCodecOutputHeldAtRequest = false
+    @Volatile private var seekIngestCompleteAtRequest = false
+    @Volatile private var seekPausedAtRequest = false
+    @Volatile private var framesReadBySinkAtSeek = -1L
+    @Volatile private var drainsServicedAtSeek = -1L
+    @Volatile private var drainsServicedDuringSeek = 0L
+    @Volatile private var seekDrainRejectsOwnerThread = 0L
+    @Volatile private var stageBeforeSeek: Stage? = null
+    @Volatile private var stageAfterSeek: Stage? = null
+    @Volatile private var seekAckWallMs = -1L
+    // Media re-anchor.
+    @Volatile private var extractorSeekCalls = 0L
+    @Volatile private var codecFlushCalls = 0L
+    @Volatile private var extractorReanchoredOnOwnerThread = false
+    @Volatile private var seekTargetUs = -1L
+    @Volatile private var seekLandingPtsUs = -1L
+    @Volatile private var seekLandingLeadUs = -1L
+    @Volatile private var seekLandingAtOrBeforeTarget = false
+    @Volatile private var preTargetDiscardedFrames = 0L
+    @Volatile private var firstPostSeekChunkPtsUs = -1L
+    @Volatile private var firstIngestedPostSeekPtsUs = -1L
+    @Volatile private var inputEosAtSeek = false
+    @Volatile private var outputEosAtSeek = false
+    @Volatile private var generatorReanchorFrame = -1L
+    // Owner-thread-confined: true between the codec flush and the first
+    // post-seek chunk whose pts reaches the target.
+    private var postSeekPreTargetDiscardActive = false
+    // Post-seek prefill.
+    @Volatile private var postSeekPrefillActive = false
+    @Volatile private var postSeekPrefillQuotaFrames = -1L
+    @Volatile private var postSeekPrefillFeedSteps = 0L
+    @Volatile private var postSeekPrefillCommittedFrames = -1L
+    @Volatile private var postSeekPrefillAcceptedFrames = -1L
+    @Volatile private var postSeekPrefillStalled = false
+    @Volatile private var postSeekPrefillWallMs = -1L
+    // Final native seek-aware accounting (finalizeSession).
+    @Volatile private var finalNativeExpectedPlayableFrameCount = -1L
+    @Volatile private var finalNativeTotalForwardSeekSkippedFrames = -1L
+    @Volatile private var finalNativeTotalDiscardedOnSeekFrames = -1L
+    @Volatile private var finalNativeSeekSkipAnomalies = -1L
+    @Volatile private var finalNativeNextDispatchFrame = -1L
+    @Volatile private var finalNativeOutputSeekRequest = -1L
+    @Volatile private var finalNativeOutputSeekAck = -1L
+    @Volatile private var finalNativeSourceSeekRequestTrack0 = -1L
+    @Volatile private var finalNativeSourceSeekAckTrack0 = -1L
+    @Volatile private var finalNativeSourceSeekRequestTrack1 = -1L
+    @Volatile private var finalNativeSourceSeekAckTrack1 = -1L
+    @Volatile private var finalNativeWriterNextWriteFrameTrack0 = -1L
+    @Volatile private var finalNativeWriterNextWriteFrameTrack1 = -1L
+    @Volatile private var finalNativeTimingT1Ns = -1L
+    @Volatile private var finalNativeProviderExternalReanchorCountTrack0 = -1L
+    @Volatile private var finalNativeProviderExternalReanchorCountTrack1 = -1L
+    @Volatile private var finalNativeProviderLastExternalReanchorFrameTrack0 = -1L
+    @Volatile private var finalNativeProviderLastExternalReanchorFrameTrack1 = -1L
+    @Volatile private var finalNativeProviderForwardSkipFramesTrack0 = -1L
+    @Volatile private var finalNativeProviderForwardSkipFramesTrack1 = -1L
+    @Volatile private var finalNativeProviderRewindRejectsTrack0 = -1L
+    @Volatile private var finalNativeProviderRewindRejectsTrack1 = -1L
+    @Volatile private var finalExpectedPlayableFrameCountAtEos = -1L
+    @Volatile private var finalTotalForwardSeekSkippedFramesAtEos = -1L
+    @Volatile private var finalSeekAckConsumed = false
+    @Volatile private var finalSeekAckNewStartFrame = -1L
+    @Volatile private var finalSeekAckDiscardedFrames = -1L
+    @Volatile private var finalSeekAckTotalDiscardedOnSeekFrames = -1L
 
     // ── Sink-thread telemetry (atomics: written on the sink thread, read anywhere) ─
 
@@ -630,6 +948,11 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     val isFeedQuiesced: Boolean get() = quiesced
     val isTransportPaused: Boolean get() = paused
     val framesReadBySinkObserved: Long get() = framesReadBySink
+    // Y20 cheap any-thread observations.
+    val isFeedHeldForSeek: Boolean get() = seekHoldReached && quiesced
+    val isSeekInProgress: Boolean get() = seekInProgress
+    val seekExercisedObserved: Boolean get() = seekExercised
+    val effectiveExpectedFramesObserved: Long get() = effectiveExpectedFrames
 
     // ── Seam (VanguardRealtimeAudioPlaybackFrameSource) ────────────────────
 
@@ -657,6 +980,12 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         if (paused) {
             pausedDrainRejectsSinkThread.incrementAndGet()
             return reject(REASON_DRAIN_WHILE_PAUSED)
+        }
+        // Y20: while the owner executes the seek no drain may reach it (the
+        // scenario keeps the sink seek-parked across the seek: telemetry only).
+        if (seekInProgress) {
+            seekDrainRejectsSinkThread.incrementAndGet()
+            return reject(REASON_DRAIN_DURING_SEEK)
         }
         when (stage) {
             Stage.CLOSING, Stage.CLOSED -> {
@@ -789,12 +1118,34 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     // for its processed-snapshot proof and releases the feed gate.
     fun resumeTransport(timeoutMs: Long): Boolean = submitControl(Control.RESUME, timeoutMs)
 
-    private fun submitControl(kind: Control, timeoutMs: Long): Boolean {
+    // ── Y20 forward seek (any non-owner thread requests; owner executes) ───
+
+    // Arms the feed cap at the window-aligned hold frame [holdFrame] and
+    // blocks until the owner has committed exactly that many frames at a
+    // clean boundary and holds the feed there (drains still serviced, no
+    // decode / ingest / EOS poll). False on timeout, overlap, before Start,
+    // after close, when called on the owner thread, or when the owner fails
+    // closed (hold frame invalid / already passed / timeline completed).
+    fun quiesceFeedForSeek(holdFrame: Long, timeoutMs: Long): Boolean =
+        submitControl(Control.QUIESCE_FOR_SEEK, timeoutMs, holdFrame)
+
+    // Executes the ONE forward seek to [targetFrame] on the ring-owner
+    // thread (class comment): native quiescence proof at the hold frame,
+    // native joint seek, generator + extractor + codec re-anchor, post-seek
+    // lockstep prefill, ack-only output ack consume, feed gate released.
+    // The caller must already have drained the production sink to the hold
+    // frame and seek-parked + flushed it. False on timeout or failure.
+    fun seekTransport(targetFrame: Long, timeoutMs: Long): Boolean =
+        submitControl(Control.SEEK, timeoutMs, targetFrame)
+
+    private fun submitControl(kind: Control, timeoutMs: Long, frame: Long = -1L): Boolean {
         when (kind) {
             Control.QUIESCE -> quiesceRequests.incrementAndGet()
             Control.PAUSE -> pauseRequests.incrementAndGet()
             Control.HOLD_ASSERT -> holdAssertRequests.incrementAndGet()
             Control.RESUME -> resumeRequests.incrementAndGet()
+            Control.QUIESCE_FOR_SEEK -> seekQuiesceRequests.incrementAndGet()
+            Control.SEEK -> seekRequests.incrementAndGet()
         }
         if (ownerThreadId > 0L && Thread.currentThread().id == ownerThreadId) {
             controlRequestsOnOwnerThread.incrementAndGet()
@@ -812,7 +1163,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             }
             else -> {}
         }
-        val request = ControlRequest(kind, SystemClock.elapsedRealtime())
+        val request = ControlRequest(kind, SystemClock.elapsedRealtime(), frame)
         requestLock.withLock {
             if (!acceptingRequests) {
                 lastControlRejectReason = REASON_CONTROL_CLOSED
@@ -958,8 +1309,134 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             decoder = decoder,
             native = finalNative,
             pauseResume = pauseResumeTelemetry(),
+            effectiveExpectedFrames = effectiveExpectedFrames,
+            seek = seekTelemetry(),
+            seekReanchor = seekReanchorTelemetry(),
         )
     }
+
+    private fun seekTelemetry(): SeekTelemetry = SeekTelemetry(
+        seekQuiesceRequests = seekQuiesceRequests.get(),
+        seekRequests = seekRequests.get(),
+        seekDrainRejectsSinkThread = seekDrainRejectsSinkThread.get(),
+        seekDrainRejectsOwnerThread = seekDrainRejectsOwnerThread,
+        holdFrame = seekHoldFrame,
+        holdArmed = seekHoldArmed,
+        holdArmedOnOwnerThread = seekHoldArmedOnOwnerThread,
+        holdCommittedFramesAtArm = seekHoldCommittedFramesAtArm,
+        holdReached = seekHoldReached,
+        holdAckOk = seekHoldAckOk,
+        holdExecutedOnOwnerThread = seekHoldExecutedOnOwnerThread,
+        holdWallMs = seekHoldWallMs,
+        holdDiscardedStagedFrames = seekHoldDiscardedStagedFrames,
+        feedStepsWhileHeld = feedStepsWhileHeld,
+        framesReadBySinkAtHold = framesReadBySinkAtHold,
+        drainsServicedAtHold = drainsServicedAtHold,
+        framesAcceptedTrack0AtHold = framesAcceptedTrack0AtHold,
+        framesAcceptedTrack1AtHold = framesAcceptedTrack1AtHold,
+        framesDecodedAtHold = framesDecodedAtHold,
+        decodeStepsAtHold = decodeStepsAtHold,
+        seekExercised = seekExercised,
+        seekAckOk = seekAckOk,
+        seekExecutedOnOwnerThread = seekExecutedOnOwnerThread,
+        seekWallMs = seekWallMs,
+        seekTargetFrame = seekTargetFrame,
+        seekSkipFrames = seekSkipFrames,
+        seekQuiescedFirst = seekQuiescedFirst,
+        seekCleanBoundaryOk = seekCleanBoundaryOk,
+        seekPendingSliceFramesAtRequest = seekPendingSliceFramesAtRequest,
+        seekPumpPendingChunkAtRequest = seekPumpPendingChunkAtRequest,
+        seekCodecOutputHeldAtRequest = seekCodecOutputHeldAtRequest,
+        seekIngestCompleteAtRequest = seekIngestCompleteAtRequest,
+        seekPausedAtRequest = seekPausedAtRequest,
+        framesReadBySinkAtSeek = framesReadBySinkAtSeek,
+        drainsServicedAtSeek = drainsServicedAtSeek,
+        drainsServicedDuringSeek = drainsServicedDuringSeek,
+        stageBeforeSeek = stageBeforeSeek?.name ?: "none",
+        stageAfterSeek = stageAfterSeek?.name ?: "none",
+        nativeQuiescentProofOk = session?.quiescentForSeekProofOk ?: false,
+        nativeQuiescentTotalFramesPushed = session?.quiescentForSeekTotalFramesPushed ?: -1L,
+        nativeQuiescentNextDispatchFrame = session?.quiescentForSeekNextDispatchFrame ?: -1L,
+        nativeQuiescentOutputAvailableReadFrames = session?.quiescentForSeekOutputAvailableReadFrames ?: -1L,
+        nativeQuiescentTimingT1Ns = session?.quiescentForSeekTimingT1Ns ?: -1L,
+        nativeSeekCommandSeq = session?.seekCommandSeq ?: -1L,
+        nativeSeekRequestedPtsUs = session?.seekRequestedPtsUs ?: -1L,
+        nativeSeekReplyTargetFrame = session?.seekReplyTargetFrame ?: -1L,
+        nativeSeekTransientRetries = session?.seekTransientRetries ?: -1L,
+        nativeSeekProcessedOk = session?.seekProcessedOk ?: false,
+        nativeSkippedFramesAtSeek = session?.seekSkippedFramesAtProcessed ?: -1L,
+        nativeExpectedPlayableAtSeek = session?.seekExpectedPlayableAtProcessed ?: -1L,
+        nativeSeekSkipAnomaliesAtSeek = session?.seekSkipAnomaliesAtProcessed ?: -1L,
+        nativeNextDispatchFrameAtSeek = session?.seekNextDispatchFrameAtProcessed ?: -1L,
+        nativeProviderExternalReanchorCountAtSeekTrack0 =
+            session?.seekProviderExternalReanchorCountAtProcessedTrack?.get(0) ?: -1L,
+        nativeProviderExternalReanchorCountAtSeekTrack1 =
+            session?.seekProviderExternalReanchorCountAtProcessedTrack?.get(1) ?: -1L,
+        nativeProviderLastExternalReanchorFrameAtSeekTrack0 =
+            session?.seekProviderLastExternalReanchorFrameAtProcessedTrack?.get(0) ?: -1L,
+        nativeProviderLastExternalReanchorFrameAtSeekTrack1 =
+            session?.seekProviderLastExternalReanchorFrameAtProcessedTrack?.get(1) ?: -1L,
+        nativeProviderExpectedNextFrameAtSeekTrack0 =
+            session?.seekProviderExpectedNextFrameAtProcessedTrack?.get(0) ?: -1L,
+        nativeProviderExpectedNextFrameAtSeekTrack1 =
+            session?.seekProviderExpectedNextFrameAtProcessedTrack?.get(1) ?: -1L,
+        effectiveExpectedFrames = effectiveExpectedFrames,
+        seekAckConsumedByAckOnlyRead = finalSeekAckConsumed,
+        seekAckNewStartFrame = finalSeekAckNewStartFrame,
+        seekAckDiscardedFrames = finalSeekAckDiscardedFrames,
+        seekAckTotalDiscardedOnSeekFrames = finalSeekAckTotalDiscardedOnSeekFrames,
+        seekAckWallMs = seekAckWallMs,
+    )
+
+    private fun seekReanchorTelemetry(): SeekReanchorTelemetry = SeekReanchorTelemetry(
+        extractorSeekCalls = extractorSeekCalls,
+        codecFlushCalls = codecFlushCalls,
+        extractorReanchoredOnOwnerThread = extractorReanchoredOnOwnerThread,
+        seekTargetUs = seekTargetUs,
+        seekLandingPtsUs = seekLandingPtsUs,
+        seekLandingLeadUs = seekLandingLeadUs,
+        seekLandingAtOrBeforeTarget = seekLandingAtOrBeforeTarget,
+        preTargetDiscardedFrames = preTargetDiscardedFrames,
+        preTargetDiscardBudgetFrames = padBudgetFrames,
+        firstPostSeekChunkPtsUs = firstPostSeekChunkPtsUs,
+        firstIngestedPostSeekPtsUs = firstIngestedPostSeekPtsUs,
+        inputEosAtSeek = inputEosAtSeek,
+        outputEosAtSeek = outputEosAtSeek,
+        generatorReanchorCount = pump?.generatorReanchorCount ?: 0L,
+        generatorReanchorFrame = generatorReanchorFrame,
+        generatorAxis = GENERATOR_AXIS_ACCEPTED_COUNT,
+        postSeekPrefillQuotaFrames = postSeekPrefillQuotaFrames,
+        postSeekPrefillFeedSteps = postSeekPrefillFeedSteps,
+        postSeekPrefillCommittedFrames = postSeekPrefillCommittedFrames,
+        postSeekPrefillAcceptedFrames = postSeekPrefillAcceptedFrames,
+        postSeekPrefillStalled = postSeekPrefillStalled,
+        postSeekPrefillWallMs = postSeekPrefillWallMs,
+        postSeekFramesReadBySink = if (framesReadBySinkAtSeek >= 0L) framesReadBySink - framesReadBySinkAtSeek else -1L,
+        nativeExpectedPlayableFrameCount = finalNativeExpectedPlayableFrameCount,
+        nativeTotalForwardSeekSkippedFrames = finalNativeTotalForwardSeekSkippedFrames,
+        nativeTotalDiscardedOnSeekFrames = finalNativeTotalDiscardedOnSeekFrames,
+        nativeSeekSkipAnomalies = finalNativeSeekSkipAnomalies,
+        nativeNextDispatchFrame = finalNativeNextDispatchFrame,
+        nativeOutputSeekRequest = finalNativeOutputSeekRequest,
+        nativeOutputSeekAck = finalNativeOutputSeekAck,
+        nativeSourceSeekRequestTrack0 = finalNativeSourceSeekRequestTrack0,
+        nativeSourceSeekAckTrack0 = finalNativeSourceSeekAckTrack0,
+        nativeSourceSeekRequestTrack1 = finalNativeSourceSeekRequestTrack1,
+        nativeSourceSeekAckTrack1 = finalNativeSourceSeekAckTrack1,
+        nativeWriterNextWriteFrameTrack0 = finalNativeWriterNextWriteFrameTrack0,
+        nativeWriterNextWriteFrameTrack1 = finalNativeWriterNextWriteFrameTrack1,
+        nativeTimingT1Ns = finalNativeTimingT1Ns,
+        nativeProviderExternalReanchorCountTrack0 = finalNativeProviderExternalReanchorCountTrack0,
+        nativeProviderExternalReanchorCountTrack1 = finalNativeProviderExternalReanchorCountTrack1,
+        nativeProviderLastExternalReanchorFrameTrack0 = finalNativeProviderLastExternalReanchorFrameTrack0,
+        nativeProviderLastExternalReanchorFrameTrack1 = finalNativeProviderLastExternalReanchorFrameTrack1,
+        nativeProviderForwardSkipFramesTrack0 = finalNativeProviderForwardSkipFramesTrack0,
+        nativeProviderForwardSkipFramesTrack1 = finalNativeProviderForwardSkipFramesTrack1,
+        nativeProviderRewindRejectsTrack0 = finalNativeProviderRewindRejectsTrack0,
+        nativeProviderRewindRejectsTrack1 = finalNativeProviderRewindRejectsTrack1,
+        expectedPlayableFrameCountAtEos = finalExpectedPlayableFrameCountAtEos,
+        totalForwardSeekSkippedFramesAtEos = finalTotalForwardSeekSkippedFramesAtEos,
+    )
 
     private fun pauseResumeTelemetry(): PauseResumeTelemetry = PauseResumeTelemetry(
         quiesceRequests = quiesceRequests.get(),
@@ -1222,6 +1699,9 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             throw FailClosed("real_ring_timeline_too_short:$expectedFrames:${config.outputRingCapacityFrames}")
         }
         padBudgetFrames = (EOS_PAD_BUDGET_SEC * sampleRate).toLong()
+        // Y20: seek-aware effective count starts at the declared count and
+        // drops by the skipped span once the one forward seek is processed.
+        effectiveExpectedFrames = expectedFrames
         geometry = Geometry(
             sourceMime = sourceMime,
             sourceTrackIndex = sourceTrackIndex,
@@ -1299,7 +1779,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         while (true) {
             checkDeadlineAndCancel()
             when (feedStep(allowDrain = false)) {
-                Feed.STALLED, Feed.IDLE -> break
+                Feed.STALLED, Feed.IDLE, Feed.HELD -> break
                 Feed.PROGRESSED, Feed.RETRY -> {}
             }
         }
@@ -1318,18 +1798,42 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
     private fun feedStep(allowDrain: Boolean): Feed {
         val p = requirePump()
         // Y19 evidence counters: the owner-loop gate never calls this while
-        // paused or quiesced, so both stay zero structurally.
+        // paused or quiesced, so both stay zero structurally. Y20: the
+        // post-seek prefill runs feed steps while the gate is still held
+        // (counted separately), and nothing runs while held for the seek.
         if (paused) feedStepsWhilePaused += 1L
-        if (quiesced) feedStepsWhileQuiesced += 1L
+        if (quiesced && postSeekPrefillActive) postSeekPrefillFeedSteps += 1L
+        else if (quiesced && seekHoldReached) feedStepsWhileHeld += 1L
+        else if (quiesced) feedStepsWhileQuiesced += 1L
+        // Y20 feed cap: until the seek executes no frame past the armed hold
+        // frame is ingested; at the hold with nothing staged / latched the
+        // feed is HELD (no decode either: the codec is flushed at the seek).
+        val holdCapActive = seekHoldArmed && !seekExercised
+        val cap = if (holdCapActive) minOf(effectiveExpectedFrames, seekHoldFrame) else effectiveExpectedFrames
+        val capIsSeekHold = holdCapActive && seekHoldFrame < effectiveExpectedFrames
         if (pendingSliceFrames == 0 && p.hasPendingChunk) {
             if (!allowDrain) return Feed.STALLED
             p.completePendingLockstep()
-            if (p.framesCommitted >= expectedFrames) markIngestComplete()
+            if (!capIsSeekHold && p.framesCommitted >= effectiveExpectedFrames) markIngestComplete()
             return Feed.PROGRESSED
         }
+        if (capIsSeekHold && pendingSliceFrames == 0 && p.framesCommitted >= seekHoldFrame) {
+            if (!seekHoldReached) {
+                seekHoldReached = true
+                trace("feed_held_for_seek")
+            }
+            return Feed.HELD
+        }
         if (pendingSliceFrames > 0) {
-            val room = expectedFrames - p.framesCommitted
+            val room = cap - p.framesCommitted
             if (room <= 0L) {
+                if (capIsSeekHold) {
+                    // Staged content past the hold lies inside the skipped
+                    // span: honest accounting, never checksummed or ingested.
+                    seekHoldDiscardedStagedFrames += pendingSliceFrames.toLong()
+                    pendingSliceFrames = 0
+                    return Feed.PROGRESSED
+                }
                 noteTruncated(pendingSliceFrames)
                 pendingSliceFrames = 0
                 markIngestComplete()
@@ -1337,13 +1841,15 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             }
             val take = minOf(pendingSliceFrames.toLong(), room).toInt()
             val surplus = pendingSliceFrames - take
-            if (surplus > 0) noteTruncated(surplus)
+            if (surplus > 0) {
+                if (capIsSeekHold) seekHoldDiscardedStagedFrames += surplus.toLong() else noteTruncated(surplus)
+            }
             val remaining = p.ingestDecodedSlice(slice, take, allowDrain)
             val ingested = (take - remaining).toLong()
             if (!sliceIsPad) framesIngestedReal += ingested
             pendingSliceFrames = remaining
             if (remaining > 0) return Feed.STALLED
-            if (p.framesCommitted >= expectedFrames && !p.hasPendingChunk) markIngestComplete()
+            if (!capIsSeekHold && p.framesCommitted >= effectiveExpectedFrames && !p.hasPendingChunk) markIngestComplete()
             return Feed.PROGRESSED
         }
         if (ingestComplete) {
@@ -1352,7 +1858,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             return if (decodeStep()) Feed.PROGRESSED else Feed.RETRY
         }
         if (outputEos) {
-            val shortfall = expectedFrames - p.framesCommitted
+            val shortfall = effectiveExpectedFrames - p.framesCommitted
             if (shortfall <= 0L) {
                 markIngestComplete()
                 return Feed.PROGRESSED
@@ -1443,25 +1949,49 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                             dec.releaseOutputBuffer(outIdx, false)
                             throw FailClosed(REASON_PREFIX_DECODER + "codec_chunk_shape_invalid:$size")
                         }
-                        val outBuf = dec.getOutputBuffer(outIdx)
-                        if (outBuf == null) {
-                            dec.releaseOutputBuffer(outIdx, false)
-                            throw FailClosed(REASON_PREFIX_DECODER + "null_output_buffer")
-                        }
-                        codecOutputHeld = true
-                        try {
-                            ensureSliceCapacity(size)
-                            outBuf.position(bufferInfo.offset)
-                            outBuf.limit(bufferInfo.offset + size)
-                            slice.clear()
-                            slice.put(outBuf)
-                        } finally {
-                            dec.releaseOutputBuffer(outIdx, false)
-                            codecOutputHeld = false
-                        }
                         val frames = size / bytesPerFrame
-                        pendingSliceFrames = frames
-                        sliceIsPad = false
+                        // Y20: after the extractor re-anchor (which may land
+                        // at a sync point BEFORE the target) decoded frames
+                        // whose pts lies before the target are discarded
+                        // (counted), so ingested post-seek content starts at
+                        // the target within one frame of pts rounding.
+                        var dropFrames = 0
+                        if (postSeekPreTargetDiscardActive) {
+                            val pts = bufferInfo.presentationTimeUs
+                            if (firstPostSeekChunkPtsUs < 0L) firstPostSeekChunkPtsUs = pts
+                            if (pts < seekTargetUs) {
+                                val lead = ((seekTargetUs - pts) * sampleRate.toLong() + 999_999L) / 1_000_000L
+                                dropFrames = minOf(frames.toLong(), lead).toInt()
+                            }
+                            if (dropFrames < frames) {
+                                postSeekPreTargetDiscardActive = false
+                                firstIngestedPostSeekPtsUs = pts + dropFrames.toLong() * 1_000_000L / sampleRate.toLong()
+                            }
+                        }
+                        val stagedFrames = frames - dropFrames
+                        if (stagedFrames > 0) {
+                            val outBuf = dec.getOutputBuffer(outIdx)
+                            if (outBuf == null) {
+                                dec.releaseOutputBuffer(outIdx, false)
+                                throw FailClosed(REASON_PREFIX_DECODER + "null_output_buffer")
+                            }
+                            codecOutputHeld = true
+                            try {
+                                ensureSliceCapacity(stagedFrames * bytesPerFrame)
+                                outBuf.position(bufferInfo.offset + dropFrames * bytesPerFrame)
+                                outBuf.limit(bufferInfo.offset + size)
+                                slice.clear()
+                                slice.put(outBuf)
+                            } finally {
+                                dec.releaseOutputBuffer(outIdx, false)
+                                codecOutputHeld = false
+                            }
+                            pendingSliceFrames = stagedFrames
+                            sliceIsPad = false
+                        } else {
+                            dec.releaseOutputBuffer(outIdx, false)
+                        }
+                        preTargetDiscardedFrames += dropFrames.toLong()
                         decoderChunks++
                         framesDecoded += frames.toLong()
                     } else {
@@ -1540,7 +2070,7 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                     when (feedStep(allowDrain = true)) {
                         Feed.PROGRESSED, Feed.RETRY -> progressed = true
                         Feed.STALLED -> throw FailClosed(REASON_PREFIX_LOCKSTEP + "stall_with_drain_allowed")
-                        Feed.IDLE -> {}
+                        Feed.IDLE, Feed.HELD -> {}
                     }
                 } else if (!s.eosSetWithoutDrain) {
                     val now = SystemClock.elapsedRealtime()
@@ -1626,7 +2156,219 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                 executeResume(s, r)
                 true
             }
+            Control.QUIESCE_FOR_SEEK -> serviceQuiesceForSeek(r)
+            Control.SEEK -> {
+                if (!takeControl(r)) return false
+                executeSeek(s, r)
+                true
+            }
         }
+    }
+
+    // ── Y20 owner-thread seek execution ────────────────────────────────────
+
+    // Arms the feed cap at the request's hold frame on first sight, then
+    // stays pending (feed running under the cap, drains serviced) until the
+    // feed is HELD at exactly that frame at a clean boundary; only then the
+    // feed gate closes (quiesced) and the request completes.
+    private fun serviceQuiesceForSeek(r: ControlRequest): Boolean {
+        val p = requirePump()
+        if (!seekHoldArmed) {
+            if (quiesced || paused) {
+                takeControl(r)
+                completeControl(r, false, REASON_SEEK_HOLD_ALREADY_HELD)
+                return true
+            }
+            if (seekExercised) failControl(r, REASON_SEEK_ALREADY_EXERCISED)
+            if (ingestComplete) failControl(r, REASON_SEEK_HOLD_AFTER_INGEST_COMPLETE)
+            val window = config.maxFramesPerMix.toLong()
+            if (r.frame <= 0L || r.frame % window != 0L || r.frame >= effectiveExpectedFrames) {
+                failControl(r, "$REASON_SEEK_HOLD_INVALID${r.frame}:$window:$effectiveExpectedFrames")
+            }
+            if (p.framesCommitted > r.frame) {
+                failControl(r, "$REASON_SEEK_HOLD_ALREADY_PASSED${p.framesCommitted}:${r.frame}")
+            }
+            seekHoldFrame = r.frame
+            seekHoldCommittedFramesAtArm = p.framesCommitted
+            seekHoldArmedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+            seekHoldArmed = true
+            trace("seek_hold_armed")
+        }
+        if (ingestComplete) failControl(r, REASON_SEEK_HOLD_AFTER_INGEST_COMPLETE)
+        if (!seekHoldReached || !atCleanBoundary() || p.framesCommitted != seekHoldFrame) return false
+        if (!takeControl(r)) return false
+        quiesced = true
+        seekHoldAckOk = true
+        seekHoldExecutedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        seekHoldWallMs = SystemClock.elapsedRealtime() - r.enqueuedAtMs
+        framesReadBySinkAtHold = framesReadBySink
+        drainsServicedAtHold = drainsServiced
+        framesAcceptedTrack0AtHold = requireSession().totalFramesAcceptedTrack0
+        framesAcceptedTrack1AtHold = requireSession().totalFramesAcceptedTrack1
+        framesDecodedAtHold = framesDecoded
+        decodeStepsAtHold = decodeSteps
+        trace("feed_quiesced_for_seek")
+        completeControl(r, true, REASON_OK)
+        return true
+    }
+
+    // The ONE forward seek (class comment). Every step runs on this owner
+    // thread; the request is completed with a typed reason on any failure
+    // and the owner loop then fails closed.
+    private fun executeSeek(s: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession, r: ControlRequest) {
+        if (seekExercised) failControl(r, REASON_SEEK_ALREADY_EXERCISED)
+        if (paused) failControl(r, REASON_SEEK_WHILE_PAUSED)
+        if (!seekHoldArmed || !seekHoldReached || !quiesced) failControl(r, REASON_SEEK_NOT_HELD)
+        val p = requirePump()
+        seekPendingSliceFramesAtRequest = pendingSliceFrames
+        seekPumpPendingChunkAtRequest = p.hasPendingChunk
+        seekCodecOutputHeldAtRequest = codecOutputHeld
+        seekIngestCompleteAtRequest = ingestComplete
+        seekPausedAtRequest = paused
+        seekCleanBoundaryOk = atCleanBoundary() && p.framesCommitted == seekHoldFrame
+        if (!seekCleanBoundaryOk) {
+            failControl(
+                r,
+                "$REASON_SEEK_NOT_AT_CLEAN_BOUNDARY$pendingSliceFrames:${p.hasPendingChunk}:$codecOutputHeld:$ingestComplete:${p.framesCommitted}:$seekHoldFrame",
+            )
+        }
+        if (outputEos || codec == null || extractor == null) failControl(r, REASON_SEEK_AFTER_DECODER_EOS)
+        val target = r.frame
+        val window = config.maxFramesPerMix.toLong()
+        if (target <= seekHoldFrame || target % window != 0L || target >= effectiveExpectedFrames) {
+            failControl(r, "$REASON_SEEK_TARGET_INVALID$target:$seekHoldFrame:$window:$effectiveExpectedFrames")
+        }
+        val skip = target - seekHoldFrame
+        if (skip < seekHoldDiscardedStagedFrames) {
+            failControl(r, "$REASON_SEEK_SKIP_BELOW_DISCARDED$skip:$seekHoldDiscardedStagedFrames")
+        }
+        // The production sink is the only output consumer: it must already
+        // have read every frame pushed up to the hold (no private drain).
+        if (framesReadBySink != seekHoldFrame) {
+            failControl(r, "$REASON_SEEK_SINK_NOT_DRAINED_TO_HOLD$framesReadBySink:$seekHoldFrame")
+        }
+        seekExercised = true
+        seekInProgress = true
+        seekQuiescedFirst = quiesced
+        seekExecutedOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        seekTargetFrame = target
+        seekSkipFrames = skip
+        framesReadBySinkAtSeek = framesReadBySink
+        drainsServicedAtSeek = drainsServiced
+        stageBeforeSeek = stage
+        inputEosAtSeek = inputEos
+        outputEosAtSeek = outputEos
+        setStage(Stage.SEEKING, "seeking")
+        val at = SystemClock.elapsedRealtime()
+        try {
+            // 1. Native quiescence at H, snapshot-only (no private drain).
+            s.assertQuiescentForSeek(seekHoldFrame)
+            // 2. Native joint seek to T (skipped == T - H asserted inside).
+            transportCommandsIssued += 1L
+            s.seek(target)
+            trace("native_seek_processed")
+            val playable = s.seekExpectedPlayableAtProcessed
+            if (s.seekSkippedFramesAtProcessed != skip || playable != expectedFrames - skip) {
+                throw FailClosed("$REASON_SEEK_EFFECTIVE_FRAMES_MISMATCH${s.seekSkippedFramesAtProcessed}:$skip:$playable")
+            }
+            effectiveExpectedFrames = playable
+            // 3. Synthetic generator re-anchor on the pump's accepted-count
+            //    axis (the pump's own invariant; the Kotlin reference mix and
+            //    the native mix see identical track-1 samples either way).
+            generatorReanchorFrame = p.kotlinFramesAccepted
+            p.reanchorSyntheticGenerator(generatorReanchorFrame)
+            // 4. Extractor re-anchor + codec flush, consistently on this thread.
+            reanchorMediaForSeek(target)
+            // 5. Post-seek lockstep prefill with drains forbidden (the pending
+            //    output ack must survive until the quota is met or a stall).
+            prefillAfterSeek(p)
+            // 6. Output seek ack: ack-only read, zero discard (ring was empty).
+            val ackAt = SystemClock.elapsedRealtime()
+            s.consumeSeekAckAndReanchor()
+            seekAckWallMs = SystemClock.elapsedRealtime() - ackAt
+            finalSeekAckConsumed = s.seekAckConsumedByAckOnlyRead
+            finalSeekAckNewStartFrame = s.seekAckNewStartFrame
+            finalSeekAckDiscardedFrames = s.seekAckDiscardedFrames
+            finalSeekAckTotalDiscardedOnSeekFrames = s.seekAckTotalDiscardedOnSeekFrames
+            trace("seek_ack_consumed")
+        } catch (t: Throwable) {
+            seekInProgress = false
+            completeControl(r, false, describe(t))
+            throw t
+        }
+        seekWallMs = SystemClock.elapsedRealtime() - at
+        // Release the gates: the feed resumes past the re-anchored boundary
+        // (a latched prefill chunk completes on the next owner feed step).
+        seekInProgress = false
+        quiesced = false
+        val restored = Stage.ACTIVE_DRAIN
+        setStage(restored, "seek_reanchored")
+        stageAfterSeek = restored
+        nextEosPollAtMs = 0L
+        seekAckOk = s.seekReanchorOk && finalSeekAckConsumed
+        completeControl(r, seekAckOk, if (seekAckOk) REASON_OK else "real_ring_native_seek_ack_missing")
+    }
+
+    // MediaExtractor.seekTo(SEEK_TO_PREVIOUS_SYNC) + MediaCodec.flush on the
+    // owner thread. Landing at or before the target is Android extractor
+    // behavior and is reported, never claimed exact; frames decoded before
+    // the target are discarded by [decodeStep] (counted). The input EOS flag
+    // is re-armed so the feed re-queues samples from the new position.
+    private fun reanchorMediaForSeek(targetFrame: Long) {
+        val dec = codec ?: throw FailClosed(REASON_PREFIX_DECODER + "codec_missing")
+        val ex = extractor ?: throw FailClosed(REASON_PREFIX_DECODER + "extractor_missing")
+        seekTargetUs = (targetFrame * 1_000_000L + sampleRate.toLong() - 1L) / sampleRate.toLong()
+        if (pendingSliceFrames != 0) throw FailClosed("real_ring_seek_reanchor_over_pending_slice")
+        noteCodecCall()
+        decoderGuard("seek_reanchor") {
+            ex.seekTo(seekTargetUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            extractorSeekCalls += 1L
+            val landing = ex.sampleTime
+            if (landing < 0L) throw FailClosed(REASON_SEEK_LANDING_UNAVAILABLE)
+            seekLandingPtsUs = landing
+            seekLandingLeadUs = seekTargetUs - landing
+            seekLandingAtOrBeforeTarget = landing <= seekTargetUs
+            trace("extractor_reanchored")
+            dec.flush()
+            codecFlushCalls += 1L
+            trace("codec_flushed")
+        }
+        extractorReanchoredOnOwnerThread = Thread.currentThread().id == ownerThreadId
+        inputEos = false
+        postSeekPreTargetDiscardActive = true
+    }
+
+    // Post-seek lockstep source prefill: feed steps with drains FORBIDDEN
+    // until the quota (one output ring, or the whole remaining timeline) is
+    // committed or the source rings stall (a stalled sub-chunk stays latched
+    // and completes after the ack, exactly like the pre-start pre-roll).
+    private fun prefillAfterSeek(p: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockIngestPump) {
+        val s = requireSession()
+        val start = SystemClock.elapsedRealtime()
+        val remainingFrames = effectiveExpectedFrames - seekHoldFrame
+        postSeekPrefillQuotaFrames = minOf(config.outputRingCapacityFrames.toLong(), remainingFrames)
+        postSeekPrefillActive = true
+        trace("post_seek_prefill")
+        try {
+            while (true) {
+                checkDeadlineAndCancel()
+                if (p.framesCommitted - seekHoldFrame >= postSeekPrefillQuotaFrames) break
+                when (feedStep(allowDrain = false)) {
+                    Feed.STALLED -> {
+                        postSeekPrefillStalled = true
+                        break
+                    }
+                    Feed.IDLE, Feed.HELD -> break
+                    Feed.PROGRESSED, Feed.RETRY -> {}
+                }
+            }
+        } finally {
+            postSeekPrefillActive = false
+        }
+        postSeekPrefillCommittedFrames = p.framesCommitted - seekHoldFrame
+        postSeekPrefillAcceptedFrames = minOf(s.totalFramesAcceptedTrack0, s.totalFramesAcceptedTrack1) - seekHoldFrame
+        postSeekPrefillWallMs = SystemClock.elapsedRealtime() - start
+        if (postSeekPrefillAcceptedFrames <= 0L) throw FailClosed(REASON_SEEK_PREFILL_EMPTY)
     }
 
     private fun serviceQuiesce(r: ControlRequest): Boolean {
@@ -1805,6 +2547,14 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
                 request.result = reject(REASON_DRAIN_WHILE_PAUSED)
                 return 0L
             }
+            // Y20: no native read while the seek executes (the pending output
+            // ack must be consumed by the ack-only read, never inside a sink
+            // read); the sink is seek-parked, so this is telemetry only.
+            if (seekInProgress) {
+                seekDrainRejectsOwnerThread += 1L
+                request.result = reject(REASON_DRAIN_DURING_SEEK)
+                return 0L
+            }
             val s = requireSession()
             val r = s.readOutputInto(request.dst, request.maxFrames)
             drainsServiced += 1L
@@ -1877,6 +2627,28 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
             if (s.isCreated) {
                 val snap = s.finalSnapshot()
                 finalNative = foldNative(s, snap)
+                finalNativeExpectedPlayableFrameCount = s.snapExpectedPlayableFrameCount
+                finalNativeTotalForwardSeekSkippedFrames = s.snapTotalForwardSeekSkippedFrames
+                finalNativeTotalDiscardedOnSeekFrames = s.snapTotalDiscardedOnSeekFrames
+                finalNativeSeekSkipAnomalies = s.snapSeekSkipAnomalies
+                finalNativeNextDispatchFrame = s.snapNextDispatchFrame
+                finalNativeOutputSeekRequest = s.snapOutputSeekRequest
+                finalNativeOutputSeekAck = s.snapOutputSeekAck
+                finalNativeSourceSeekRequestTrack0 = s.snapSourceSeekRequestTrack[0]
+                finalNativeSourceSeekAckTrack0 = s.snapSourceSeekAckTrack[0]
+                finalNativeSourceSeekRequestTrack1 = s.snapSourceSeekRequestTrack[1]
+                finalNativeSourceSeekAckTrack1 = s.snapSourceSeekAckTrack[1]
+                finalNativeWriterNextWriteFrameTrack0 = s.snapWriterNextWriteFrameTrack[0]
+                finalNativeWriterNextWriteFrameTrack1 = s.snapWriterNextWriteFrameTrack[1]
+                finalNativeTimingT1Ns = s.snapNativeTimingT1Ns
+                finalNativeProviderExternalReanchorCountTrack0 = s.snapProviderExternalReanchorCountTrack[0]
+                finalNativeProviderExternalReanchorCountTrack1 = s.snapProviderExternalReanchorCountTrack[1]
+                finalNativeProviderLastExternalReanchorFrameTrack0 = s.snapProviderLastExternalReanchorFrameTrack[0]
+                finalNativeProviderLastExternalReanchorFrameTrack1 = s.snapProviderLastExternalReanchorFrameTrack[1]
+                finalNativeProviderForwardSkipFramesTrack0 = s.snapProviderForwardSkipFramesTrack[0]
+                finalNativeProviderForwardSkipFramesTrack1 = s.snapProviderForwardSkipFramesTrack[1]
+                finalNativeProviderRewindRejectsTrack0 = s.snapProviderRewindRejectsTrack[0]
+                finalNativeProviderRewindRejectsTrack1 = s.snapProviderRewindRejectsTrack[1]
             }
         } catch (t: Throwable) {
             if (failureReason.isBlank()) {
@@ -1895,11 +2667,17 @@ class AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
         finalWriterBackpressureRejects = s.writerBackpressureRejects
         finalEosSetWithoutDrain = s.eosSetWithoutDrain
         finalTotalFramesPushedAtEos = s.totalFramesPushedAtEos
+        finalExpectedPlayableFrameCountAtEos = s.expectedPlayableFrameCountAtEos
+        finalTotalForwardSeekSkippedFramesAtEos = s.totalForwardSeekSkippedFramesAtEos
         val p = pump
-        finalChecksumChainSelfOk = p != null && !p.hasPendingChunk &&
-            p.kotlinFramesAccepted == expectedFrames &&
-            s.totalFramesAcceptedTrack0 == expectedFrames && s.totalFramesAcceptedTrack1 == expectedFrames &&
-            s.totalOutputFramesRead == expectedFrames &&
+        // Y20: seek-aware chain: every identity holds over the EFFECTIVE
+        // expected frames (== expectedFrames without a seek), never over the
+        // original count after a true skip.
+        val effective = effectiveExpectedFrames
+        finalChecksumChainSelfOk = p != null && !p.hasPendingChunk && effective > 0L &&
+            p.kotlinFramesAccepted == effective &&
+            s.totalFramesAcceptedTrack0 == effective && s.totalFramesAcceptedTrack1 == effective &&
+            s.totalOutputFramesRead == effective &&
             p.kotlinTrack0AcceptedChecksumHex == s.nativeAcceptedChecksumHexTrack0 &&
             p.kotlinTrack1AcceptedChecksumHex == s.nativeAcceptedChecksumHexTrack1 &&
             p.kotlinReferenceMixChecksumHex.isNotBlank() &&

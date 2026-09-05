@@ -108,6 +108,10 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'realRingPauseHoldFrozenOk': true,
     'realRingResumeAckOk': true,
     'realRingPostResumeChecksumOk': true,
+    'realRingSeekQuiesceAckOk': true,
+    'realRingSeekReanchorOk': true,
+    'realRingSeekPostSeekDrainOk': true,
+    'realRingSeekChecksumIdentityOk': true,
     'canonical': true,
   };
 
@@ -402,11 +406,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(79),
+        equals(83),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(80),
+        equals(84),
       );
 
       final expectedLanes = <String>[
@@ -489,6 +493,10 @@ void main() {
         'realRingPauseHoldFrozenOk',
         'realRingResumeAckOk',
         'realRingPostResumeChecksumOk',
+        'realRingSeekQuiesceAckOk',
+        'realRingSeekReanchorOk',
+        'realRingSeekPostSeekDrainOk',
+        'realRingSeekChecksumIdentityOk',
         'canonical',
       ];
 
@@ -1575,6 +1583,35 @@ void main() {
         );
       },
     );
+
+    test('missing required Y20 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'realRingSeekQuiesceAckOk',
+        'realRingSeekReanchorOk',
+        'realRingSeekPostSeekDrainOk',
+        'realRingSeekChecksumIdentityOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
 
     test('fail map with deadObjectBaseStepBounded=false fails validation', () {
       final report = _createSampleReport(<String, Object?>{

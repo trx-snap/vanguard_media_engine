@@ -36,7 +36,13 @@
 //   of every AudioClock mutator (including recordDriftSample), every
 //   coordinator control/dispatch method, and the output ring's producer
 //   role (plus the explicit per-track source seek-ack consumes while
-//   executing a Seek command).
+//   executing a Seek command, followed by the explicit per-track provider
+//   re-anchor: because the worker, not provide(), consumed each source
+//   ring's ack, it must tell both RingBufferAudioSampleProviders the acked
+//   target via reanchorAfterExternalSeek() after coordinator.seek succeeds,
+//   so the first post-seek window is read from T instead of being
+//   forward-skipped / zero-filled from the pre-seek cursor
+//   (P4-AUDIO-SEEK-PROVIDER-COORDINATOR-REANCHOR)).
 //
 // Realtime pacing contract (constants frozen at the X3 values):
 // - FULL maxFramesPerMix windows only; expectedFrameCount must be
@@ -423,6 +429,13 @@ struct PublishedState {
     uint64_t providerFramesZeroFilled[kTrackCount]{0, 0};
     uint64_t providerForwardSkipFrames[kTrackCount]{0, 0};
     uint64_t providerRewindRejects[kTrackCount]{0, 0};
+    // Provider external re-anchor diagnostics (worker Seek command, after a
+    // successful coordinator.seek): count of successful
+    // reanchorAfterExternalSeek() calls and the last frame set (-1 never).
+    // Structurally 0 / -1 for no-seek runs; a boundary seek (target ==
+    // provider cursor) re-anchors idempotently and still counts.
+    uint64_t providerExternalReanchorCount[kTrackCount]{0, 0};
+    int64_t  providerLastExternalReanchorFrame[kTrackCount]{-1, -1};
 
     // X5 envelope telemetry folded by the worker from DispatchOutput; all
     // false/0 for the X4 unit-gain/no-envelope mode.
@@ -820,6 +833,8 @@ private:
                 ps.providerFramesZeroFilled[t]  = p.framesZeroFilled();
                 ps.providerForwardSkipFrames[t] = p.forwardSkipFrames();
                 ps.providerRewindRejects[t]     = p.rewindRejects();
+                ps.providerExternalReanchorCount[t]     = p.externalReanchorCount();
+                ps.providerLastExternalReanchorFrame[t] = p.lastExternalReanchorFrame();
             }
         };
 
@@ -857,6 +872,16 @@ private:
                     const int64_t targetFrame =
                         ClockedAudioTransportCoordinator::frameOfPositionUs(
                             cmd.a, sampleRate);
+                    // Validated once, up front: the same shared targetFrame
+                    // is what both acks are compared against and what both
+                    // providers are re-anchored to below, so the provider
+                    // re-anchor's own negative-frame rejection is
+                    // unreachable from this path.
+                    if (targetFrame < 0) {
+                        lastCommandResult = "seek_target_negative";
+                        ++commandErrors;
+                        break;
+                    }
                     // The owner already published BOTH source-ring seek
                     // requests (producer role) over verified-empty rings.
                     // Verify both handshakes are pending BEFORE consuming
@@ -907,6 +932,28 @@ private:
                     const Status st = coordinator.seek(cmd.a, now);
                     if (st.ok()) {
                         epochStartFrame = targetFrame;
+                        // Provider re-anchor (header thread map): both
+                        // source acks for exactly targetFrame were consumed
+                        // above by THIS thread, not by provide(), so each
+                        // provider still expects the pre-seek cursor. Now
+                        // that the coordinator cursor is at targetFrame,
+                        // move both providers to the same shared, already
+                        // validated frame BEFORE any post-seek dispatch can
+                        // run; otherwise the first post-seek window would
+                        // forward-skip / zero-fill. Never reached on an ack
+                        // mismatch/missing or a coordinator failure (all
+                        // broke out above). The failure branch is
+                        // unreachable (targetFrame >= 0 was checked up
+                        // front) and kept only so a defect is a typed
+                        // command error, never silent.
+                        const char* reanchorFailure = nullptr;
+                        for (int t = 0; t < kTrackCount; ++t) {
+                            if (!providerAt(t).reanchorAfterExternalSeek(targetFrame).ok() &&
+                                reanchorFailure == nullptr) {
+                                reanchorFailure = t == 0 ? "provider_reanchor_failed_track0"
+                                                         : "provider_reanchor_failed_track1";
+                            }
+                        }
                         lastNowNs       = now;
                         int64_t skip = targetFrame - previousNextDispatchFrame;
                         if (skip < 0) {
@@ -914,7 +961,12 @@ private:
                             ++seekSkipAnomalies;
                         }
                         totalForwardSeekSkippedFrames += skip;
-                        lastCommandResult = "ok";
+                        if (reanchorFailure != nullptr) {
+                            lastCommandResult = reanchorFailure;
+                            ++commandErrors;
+                        } else {
+                            lastCommandResult = "ok";
+                        }
                     } else {
                         lastCommandResult = "clock_error";
                         ++commandErrors;
@@ -1996,6 +2048,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
             "providerExpectedNextFrameTrack%d=%lld;providerUnderrunEventsTrack%d=%llu;"
             "providerFramesZeroFilledTrack%d=%llu;providerForwardSkipFramesTrack%d=%llu;"
             "providerRewindRejectsTrack%d=%llu;"
+            "providerExternalReanchorCountTrack%d=%llu;"
+            "providerLastExternalReanchorFrameTrack%d=%lld;"
             "sourceAvailableReadFramesTrack%d=%lld;"
             "sourceSeekRequestTrack%d=%u;sourceSeekAckTrack%d=%u;"
             "writerEosTrack%d=%s;writerNextWriteFrameTrack%d=%lld;"
@@ -2008,6 +2062,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
             track, static_cast<unsigned long long>(ps.providerFramesZeroFilled[track]),
             track, static_cast<unsigned long long>(ps.providerForwardSkipFrames[track]),
             track, static_cast<unsigned long long>(ps.providerRewindRejects[track]),
+            track, static_cast<unsigned long long>(ps.providerExternalReanchorCount[track]),
+            track, static_cast<long long>(ps.providerLastExternalReanchorFrame[track]),
             track, static_cast<long long>(s.sourceRingAt(track).availableReadFrames()),
             track, s.sourceRingAt(track).seekRequest(),
             track, s.sourceRingAt(track).seekAck(),

@@ -198,6 +198,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_REAL_DECODER_RING_FRAME_SOURCE = "SCENARIO_REAL_DECODER_RING_FRAME_SOURCE_TO_EOS"
         // Y19: the ONE isolated REAL-decoder ring pause/resume scenario.
         const val SCENARIO_REAL_DECODER_RING_PAUSE_RESUME_TO_EOS = "SCENARIO_REAL_DECODER_RING_PAUSE_RESUME_TO_EOS"
+        // Y20: the ONE isolated REAL-decoder ring true forward-seek scenario.
+        const val SCENARIO_REAL_DECODER_RING_SEEK_TO_EOS = "SCENARIO_REAL_DECODER_RING_SEEK_TO_EOS"
 
         // Y18c real-decoder ring: the sink-thread per-drain wait bound (well
         // below the sink's own drain-stall budget) and the negative probe's
@@ -330,6 +332,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_REAL_RING_PAUSE_HOLD_FROZEN = "realRingPauseHoldFrozenOk"
         const val LANE_REAL_RING_RESUME_ACK = "realRingResumeAckOk"
         const val LANE_REAL_RING_POST_RESUME_CHECKSUM = "realRingPostResumeChecksumOk"
+        // Y20 lanes, evaluated by the real-decoder ring forward-seek scenario only.
+        const val LANE_REAL_RING_SEEK_QUIESCE_ACK = "realRingSeekQuiesceAckOk"
+        const val LANE_REAL_RING_SEEK_REANCHOR = "realRingSeekReanchorOk"
+        const val LANE_REAL_RING_SEEK_POST_SEEK_DRAIN = "realRingSeekPostSeekDrainOk"
+        const val LANE_REAL_RING_SEEK_CHECKSUM_IDENTITY = "realRingSeekChecksumIdentityOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -372,6 +379,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_REAL_DECODER_RING_FRAME_SOURCE,
             LANE_REAL_RING_PAUSE_ACK, LANE_REAL_RING_PAUSE_HOLD_FROZEN,
             LANE_REAL_RING_RESUME_ACK, LANE_REAL_RING_POST_RESUME_CHECKSUM,
+            LANE_REAL_RING_SEEK_QUIESCE_ACK, LANE_REAL_RING_SEEK_REANCHOR,
+            LANE_REAL_RING_SEEK_POST_SEEK_DRAIN, LANE_REAL_RING_SEEK_CHECKSUM_IDENTITY,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -714,6 +723,20 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // route as Y18c; one owner-thread-executed native pause/resume cycle
         // with the sink parked first). Y18b/Y18c above stay untouched.
         outcomes += AndroidRealtimeAudioPlaybackRealDecoderRingPauseResumeScenario(
+            config = config,
+            isDisposed = { disposed.get() },
+            bindActive = { sink, ring ->
+                activeRingSink = sink
+                activeRealDecoderRing = ring
+            },
+        ).run()
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y20: the ONE isolated REAL-decoder ring TRUE FORWARD SEEK proof
+        // (same route as Y18c; feed held at H, sink drained to H, seek-parked
+        // and flushed, one owner-thread-executed native joint seek to T with
+        // both ring providers re-anchored by the worker, drained to the
+        // seek-aware EOS). Y18b/Y18c/Y19 above stay untouched.
+        outcomes += AndroidRealtimeAudioPlaybackRealDecoderRingSeekScenario(
             config = config,
             isDisposed = { disposed.get() },
             bindActive = { sink, ring ->
@@ -2413,7 +2436,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source/real-decoder-ring-pause-resume smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19/Y20 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source/real-decoder-ring-pause-resume/real-decoder-ring-seek smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,
