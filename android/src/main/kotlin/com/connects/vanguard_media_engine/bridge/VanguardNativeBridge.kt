@@ -2327,6 +2327,31 @@ class VanguardNativeBridge(
     // no export session, no product UI.
     external fun runAndroidDagPhase5TimelineOverlayGlesRenderSmoke(): String
 
+    // ── P5-GLES-EXPORT-OVERLAY-SEAM-A: diagnostic-only seam proving a REAL
+    // MediaCodec decode -> SurfaceTexture -> GL_TEXTURE_EXTERNAL_OES frame can
+    // still route into the exact same private GlesOverlayCompositor helper
+    // exercised by the synthetic-pbuffer diagnostic above. Creates/destroys no
+    // EGL context and no caller texture: the caller
+    // (AndroidGlesExportOverlaySeamSmokeHarness) must already have its own EGL
+    // context current on the calling thread -- with a real decoded OES frame
+    // already drawn into it -- before invoking this. Validates
+    // dimensions/count/array lengths itself, then forwards already-resolved
+    // GlesOverlayLayerDescriptor fields (7 doubles per layer, in order: x, y,
+    // width, height, rotation, scale, opacity) to the private helper.
+    // overlayCount == 0 is a legal no-op draw (every array argument may then
+    // be null). Returns a JSON object string with at least status/pass/
+    // failureReason/overlayCount/surfaceWidth/surfaceHeight. Diagnostic only:
+    // no production export/session/backend-selector/encoder change.
+    external fun drawAndroidDagPhase5GlesExportOverlaySeam(
+        textureIds: IntArray?,
+        textureTargets: IntArray?,
+        geometry: DoubleArray?,
+        zIndices: IntArray?,
+        overlayCount: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+    ): String
+
     // ── P5-BEAUTY-V2-GLES-RENDER: GlesBeautyV2Compositor 3-pass bilateral ────
     // beauty smoothing shader/raster + CPU-reference-parity proof diagnostic.
     // Native creates its own temporary 64x64 EGL pbuffer context (OpenGL ES

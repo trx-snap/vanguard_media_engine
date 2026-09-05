@@ -226,6 +226,12 @@ if (ANDROID)
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_overlay_gles_render_jni.cpp"
+    # P5-GLES-EXPORT-OVERLAY-SEAM-A: diagnostic-only seam proving a real
+    # MediaCodec decode -> SurfaceTexture -> GL_TEXTURE_EXTERNAL_OES frame
+    # (owned entirely by the Kotlin harness's own EGL context) still routes
+    # into the private GlesOverlayCompositor::drawOverlays helper above. This
+    # TU creates/destroys no EGL context and no caller texture.
+    "platform/android/src/android_phase5_gles_export_overlay_seam_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_overlay_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_jni.cpp"

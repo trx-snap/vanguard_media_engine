@@ -48,6 +48,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioTransportCoord
 import com.connects.vanguard_media_engine.diagnostics.AndroidBeautyV2GlesRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidGlesExportOverlaySeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMulticamDynamicDescriptorSpatialVulkanRenderSmokeCoordinator
@@ -420,6 +421,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var timelineOverlayGlesRenderSmokeCoordinator:
         AndroidTimelineOverlayGlesRenderSmokeCoordinator? = null
 
+    // ── P5-GLES-EXPORT-OVERLAY-SEAM-A: diagnostic-only seam proving a real ──
+    // MediaCodec decode -> SurfaceTexture -> GL_TEXTURE_EXTERNAL_OES frame
+    // still routes into the caller-current GlesOverlayCompositor helper.
+    private var glesExportOverlaySeamSmokeCoordinator:
+        AndroidGlesExportOverlaySeamSmokeCoordinator? = null
+
     // ── P5-OVERLAYS-TEXT-RASTERIZER-DIAGNOSTIC: AndroidTimelineOverlayTextRasterizer
     // helper proof smoke coordinator.
     private var timelineOverlayTextRasterizerSmokeCoordinator:
@@ -764,6 +771,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         timelineOverlayGlesRenderSmokeCoordinator = AndroidTimelineOverlayGlesRenderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        glesExportOverlaySeamSmokeCoordinator = AndroidGlesExportOverlaySeamSmokeCoordinator(
             mainHandler = mainHandler,
         )
         timelineOverlayTextRasterizerSmokeCoordinator = AndroidTimelineOverlayTextRasterizerSmokeCoordinator(
@@ -1518,6 +1528,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android timeline overlay GLES render smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidGlesExportOverlaySeamSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = glesExportOverlaySeamSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android GLES export overlay seam smoke coordinator unavailable",
                     null,
                 )
             }
@@ -3134,6 +3158,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // tears them down in the native call before returning.
         timelineOverlayGlesRenderSmokeCoordinator?.disposeAll()
         timelineOverlayGlesRenderSmokeCoordinator = null
+        // P5-GLES-EXPORT-OVERLAY-SEAM-A: release the smoke executor. An
+        // in-flight run owns its EGL context/textures/MediaCodec on its own
+        // thread and tears them down in the harness before returning.
+        glesExportOverlaySeamSmokeCoordinator?.disposeAll()
+        glesExportOverlaySeamSmokeCoordinator = null
         // P5-OVERLAYS-TEXT-RASTERIZER-DIAGNOSTIC: release the smoke executor.
         timelineOverlayTextRasterizerSmokeCoordinator?.disposeAll()
         timelineOverlayTextRasterizerSmokeCoordinator = null
