@@ -56,6 +56,8 @@ export 'vg_camera2_texture_native_render_loop_smoke.dart';
 export 'vg_camera2_concurrent_ingest_smoke.dart';
 // P1-DAG-MULTINODE-HARDWARE-BUFFER-SOURCE-NODE: platform-neutral HardwareBufferSourceNode logical DAG source smoke.
 export 'vg_hardware_buffer_source_node_smoke.dart';
+// P1-DAG-MULTINODE-PREVIEW-SURFACE-SINK-NODE: platform-neutral PreviewSurfaceSinkNode logical DAG sink smoke.
+export 'vg_preview_surface_sink_node_smoke.dart';
 // P3-MULTICAM-NODE: Android True-DAG MultiCamCompositorNode native topology and layout math smoke foundation.
 export 'vg_multicam_compositor_smoke.dart';
 // P3-MULTICAM-NODE: Android True-DAG Phase 3 GLES-first spatial multi-texture diagnostic render pass smoke foundation.

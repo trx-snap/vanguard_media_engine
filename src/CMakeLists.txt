@@ -18,7 +18,10 @@ add_library(vanguard_graph STATIC
 target_include_directories(vanguard_graph PUBLIC "graph/include")
 target_link_libraries(vanguard_graph PRIVATE vanguard_core)
 
-add_library(vanguard_sinks STATIC "sinks/src/passthrough_remux_sink_node.cpp")
+add_library(vanguard_sinks STATIC
+    "sinks/src/passthrough_remux_sink_node.cpp"
+    "sinks/src/preview_surface_sink_node.cpp"
+)
 target_include_directories(vanguard_sinks PUBLIC "sinks/include")
 target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 
@@ -274,6 +277,14 @@ if (ANDROID)
     # AHardwareBuffer ownership, no Camera2/MediaCodec lifecycle, no
     # product/editor/app/ConnectsApp wiring.
     "platform/android/src/android_phase1_hardware_buffer_source_node_jni.cpp"
+    # P1-DAG-MULTINODE-PREVIEW-SURFACE-SINK-NODE: platform-neutral logical
+    # DAG PreviewSurfaceSinkNode diagnostic (construction validation,
+    # identity/port shape, default timeline semantics, real
+    # GraphExecutionPlan source->sink pass against the real
+    # HardwareBufferSourceNode, missing-input fail-closed, stale-generation
+    # rejection). Diagnostic-only; no production TextureRegistry/
+    # SurfaceProducer ownership, no product/editor/app/ConnectsApp wiring.
+    "platform/android/src/android_phase1_preview_surface_sink_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

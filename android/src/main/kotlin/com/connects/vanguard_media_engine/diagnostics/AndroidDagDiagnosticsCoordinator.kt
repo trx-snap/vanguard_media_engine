@@ -45,6 +45,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1GpuBlacklistNativeSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke",
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke",
+            "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -106,6 +107,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1GpuBlacklistNativeSmoke" -> runPhase1GpuBlacklistNativeSmoke(result)
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke" -> runPhase1DagMultinodeExecutionPlanSmoke(result)
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke" -> runPhase1HardwareBufferSourceNodeSmoke(result)
+            "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -302,6 +304,48 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "HARDWARE_BUFFER_SOURCE_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase1HardwareBufferSourceNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-DAG-MULTINODE-PREVIEW-SURFACE-SINK-NODE: platform-neutral
+    // logical DAG PreviewSurfaceSinkNode diagnostic. Runs synthetic native
+    // lanes only (construction validation, identity/port shape, default
+    // timeline semantics, real GraphExecutionPlan source->sink pass against
+    // the real HardwareBufferSourceNode, missing-input fail-closed, stale-
+    // generation rejection). Proof boundary: platform-neutral logical DAG
+    // sink - no Surface ownership, no Android lifecycle, no product/app/
+    // editor wiring.
+    private fun runPhase1PreviewSurfaceSinkNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_preview_surface_sink_node_logical_dag_sink_no_surface_" +
+                        "ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "PREVIEW_SURFACE_SINK_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

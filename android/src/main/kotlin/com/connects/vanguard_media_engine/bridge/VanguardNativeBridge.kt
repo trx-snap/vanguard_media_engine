@@ -1075,6 +1075,16 @@ class VanguardNativeBridge(
     // wiring.
     external fun runAndroidDagPhase1HardwareBufferSourceNodeSmoke(): String
 
+    // -- P1-DAG-MULTINODE-PREVIEW-SURFACE-SINK-NODE: platform-neutral
+    // logical DAG PreviewSurfaceSinkNode diagnostic. Proves construction
+    // validation, identity/port shape, default timeline semantics, and a
+    // real GraphExecutionPlan source->sink pass wiring the real
+    // HardwareBufferSourceNode's "kVideoFrame" output into this real sink's
+    // "video_in" input, plus missing-input fail-closed and stale-generation
+    // rejection. Diagnostic-only: no production TextureRegistry/
+    // SurfaceProducer ownership, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,
