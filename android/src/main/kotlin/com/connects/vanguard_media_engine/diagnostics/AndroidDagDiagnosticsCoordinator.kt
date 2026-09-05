@@ -46,6 +46,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke",
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke",
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
+            "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase3CEvalRenderSmoke",
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
@@ -108,6 +109,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke" -> runPhase1DagMultinodeExecutionPlanSmoke(result)
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke" -> runPhase1HardwareBufferSourceNodeSmoke(result)
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
+            "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
+                runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase3CEvalRenderSmoke" -> runPhase3CEvalRenderSmoke(args, result)
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
@@ -346,6 +349,48 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "PREVIEW_SURFACE_SINK_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
+    // diagnostic. Runs synthetic native lanes only, driving
+    // vanguard::graph::BuildGraphExecutionPlan() over a real four-node
+    // topology built from concrete platform-neutral node classes (two
+    // HardwareBufferSourceNode instances -> MultiCamCompositorNode ->
+    // PreviewSurfaceSinkNode, no TU-local Node subclasses). Proof boundary:
+    // real-node multinode topology composition - diagnostic-only, no
+    // rendering, no GPU transport, no product/app/editor wiring.
+    private fun runPhase1DagMultinodeTopologyCompositionSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "real_node_multinode_topology_composition_diagnostic_only_no_render_no_gpu_" +
+                        "transport_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "DAG_MULTINODE_TOPOLOGY_COMPOSITION_SMOKE_FAILED",
+                        "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

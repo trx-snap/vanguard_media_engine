@@ -285,6 +285,16 @@ if (ANDROID)
     # rejection). Diagnostic-only; no production TextureRegistry/
     # SurfaceProducer ownership, no product/editor/app/ConnectsApp wiring.
     "platform/android/src/android_phase1_preview_surface_sink_node_jni.cpp"
+    # P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
+    # diagnostic (two real HardwareBufferSourceNode instances ->
+    # MultiCamCompositorNode -> PreviewSurfaceSinkNode, all concrete
+    # platform-neutral node classes, no TU-local Node subclasses). Proves
+    # BuildGraphExecutionPlan over this real topology: wiring, dependency
+    # order, compositor/sink input-binding resolution, orphan culling,
+    # missing/inactive secondary-input fail-closed, and stale-generation
+    # precedence. Diagnostic-only: no rendering, no GPU/pixel/handle
+    # transport, no product/editor/app/ConnectsApp wiring.
+    "platform/android/src/android_phase1_dag_multinode_topology_composition_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

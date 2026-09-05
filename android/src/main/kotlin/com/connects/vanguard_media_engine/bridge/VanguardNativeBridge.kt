@@ -1085,6 +1085,19 @@ class VanguardNativeBridge(
     // SurfaceProducer ownership, no product/editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke(): String
 
+    // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
+    // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
+    // topology - two real HardwareBufferSourceNode instances feeding a real
+    // MultiCamCompositorNode's "primary_video_in"/"secondary_video_in" ports,
+    // whose "composited_video_out" output feeds a real
+    // PreviewSurfaceSinkNode's "video_in" port - with no TU-local Node
+    // subclasses. Runs synthetic native lanes only (node port contract,
+    // wiring, dependency order, compositor/sink input-binding resolution,
+    // orphan culling, missing/inactive secondary-input fail-closed,
+    // stale-generation precedence). Diagnostic-only: no rendering, no
+    // GPU/pixel/handle transport, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke(): String
+
     external fun runAndroidDagRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,
