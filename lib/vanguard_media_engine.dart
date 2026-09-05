@@ -354,6 +354,8 @@ export 'vg_android_multicam_capability_routes_smoke.dart';
 export 'vg_android_multicam_preview_routes_smoke.dart';
 // P3-CAM-CONCURRENT-MULTICAM-ACTIONS-FAIL-CLOSED-ANDROID-HANDLER: Android MultiCam preview/action routes fail-closed smoke foundation.
 export 'vg_android_multicam_actions_fail_closed_smoke.dart';
+// P3-CAM-CONCURRENT-DIAGNOSTIC-FAIL-CLOSED-ANDROID-HANDLER: Android MultiCam legacy diagnostic routes fail-closed smoke foundation.
+export 'vg_android_multicam_diagnostic_fail_closed_smoke.dart';
 
 const String _libName = 'vanguard_media_engine';
 

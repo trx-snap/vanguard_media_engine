@@ -28,6 +28,17 @@ import io.flutter.plugin.common.MethodChannel
  *    stopMultiCamRecording all reject with NOT_RUNNING (after arg
  *    validation) because there is never a running Android MultiCam preview
  *    session in this slice to update, photograph, or record.
+ *  - measureMultiCamHardwareCost/runMultiCamStreamingDiagnostic/
+ *    runMultiCamSyncDiagnostic/runMultiCamSourceLifecycleDiagnostic
+ *    (P3-CAM-CONCURRENT-DIAGNOSTIC-FAIL-CLOSED-ANDROID-HANDLER) are explicit
+ *    fail-closed guard routes with the same validation/capability-gated
+ *    shape as [startMultiCamPreviewLikeGuard]: hardware without a matching
+ *    concurrent combo rejects with CONCURRENT_NOT_SUPPORTED, and a matching
+ *    combo still rejects with CONCURRENT_DIAGNOSTIC_NOT_READY because this
+ *    package has no production Android concurrent-diagnostic lifecycle
+ *    owner yet. No camera is opened, no frames are streamed, no
+ *    hardware-cost measurement is performed, and no fake cost/report map is
+ *    ever returned by any of the four routes.
  *
  * Capability lookups go through [AndroidCamera2CapabilityProbe.probe], which
  * only calls CameraManager.getCameraIdList / getCameraCharacteristics /
@@ -50,6 +61,10 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             "takeMultiCamPhoto",
             "startMultiCamRecording",
             "stopMultiCamRecording",
+            "measureMultiCamHardwareCost",
+            "runMultiCamStreamingDiagnostic",
+            "runMultiCamSyncDiagnostic",
+            "runMultiCamSourceLifecycleDiagnostic",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -66,6 +81,10 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             "takeMultiCamPhoto" -> takeMultiCamPhoto(args, result)
             "startMultiCamRecording" -> startMultiCamRecording(args, result)
             "stopMultiCamRecording" -> stopMultiCamRecording(result)
+            "measureMultiCamHardwareCost" -> multiCamDiagnosticFailClosedGuard(args, result)
+            "runMultiCamStreamingDiagnostic" -> multiCamDiagnosticFailClosedGuard(args, result)
+            "runMultiCamSyncDiagnostic" -> multiCamDiagnosticFailClosedGuard(args, result)
+            "runMultiCamSourceLifecycleDiagnostic" -> multiCamDiagnosticFailClosedGuard(args, result)
             else -> return false
         }
         return true
@@ -223,6 +242,87 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             "NOT_RUNNING",
             "Android MultiCam preview is not running",
             null,
+        )
+    }
+
+    // -- measureMultiCamHardwareCost / runMultiCamStreamingDiagnostic /
+    // -- runMultiCamSyncDiagnostic / runMultiCamSourceLifecycleDiagnostic ------
+    //
+    // All four legacy diagnostic routes share the same validation/
+    // capability-gated fail-closed path as [startMultiCamPreviewLikeGuard]:
+    // no camera is opened, no session/surface/TextureRegistry/ImageReader is
+    // allocated, and no file is written by any of them.
+
+    private fun multiCamDiagnosticFailClosedGuard(
+        args: Map<String, Any?>?,
+        result: MethodChannel.Result,
+    ) {
+        val frontDeviceId = (args?.get("frontDeviceId") as? String)?.trim()
+        val backDeviceId = (args?.get("backDeviceId") as? String)?.trim()
+        if (frontDeviceId.isNullOrEmpty() || backDeviceId.isNullOrEmpty()) {
+            result.error(
+                "INVALID_ARG",
+                "This route requires non-blank frontDeviceId and backDeviceId",
+                null,
+            )
+            return
+        }
+
+        if (hasActiveSingleCamera()) {
+            result.error(
+                "CAMERA_ACTIVE",
+                "A single-camera session is active; stop it before running a multi-cam diagnostic",
+                null,
+            )
+            return
+        }
+
+        val probeResult = try {
+            AndroidCamera2CapabilityProbe(context).probe()
+        } catch (t: Throwable) {
+            Log.w(TAG, "multiCamDiagnosticFailClosedGuard: probe failed: ${t.javaClass.simpleName}: ${t.message}")
+            result.error(
+                "CONCURRENT_NOT_SUPPORTED",
+                "Unable to determine concurrent camera capability: ${t.message}",
+                null,
+            )
+            return
+        }
+
+        val supportsConcurrentCamera = probeResult["supportsConcurrentCamera"] as? Boolean ?: false
+        @Suppress("UNCHECKED_CAST")
+        val concurrentCameraIdSets =
+            probeResult["concurrentCameraIdSets"] as? List<List<String>> ?: emptyList()
+
+        val matchingSet = concurrentCameraIdSets.firstOrNull { idSet ->
+            idSet.contains(frontDeviceId) && idSet.contains(backDeviceId)
+        }
+
+        if (!supportsConcurrentCamera || matchingSet == null) {
+            result.error(
+                "CONCURRENT_NOT_SUPPORTED",
+                "No concurrent camera combination supports frontDeviceId=$frontDeviceId " +
+                    "and backDeviceId=$backDeviceId on this device",
+                mapOf(
+                    "supportsConcurrentCamera" to supportsConcurrentCamera,
+                    "concurrentCameraIdSets" to concurrentCameraIdSets,
+                ),
+            )
+            return
+        }
+
+        // A matching hardware combination exists, but this package has no
+        // production Android concurrent camera diagnostic lifecycle owner in
+        // this slice. Fail closed instead of streaming frames / measuring
+        // hardware cost / creating a source lifecycle for a diagnostic
+        // nothing drives.
+        result.error(
+            "CONCURRENT_DIAGNOSTIC_NOT_READY",
+            "Android production concurrent camera diagnostic lifecycle is not implemented",
+            mapOf(
+                "supportsConcurrentCamera" to supportsConcurrentCamera,
+                "matchingConcurrentCameraIdSet" to matchingSet,
+            ),
         )
     }
 }
