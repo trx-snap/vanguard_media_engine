@@ -87,11 +87,24 @@
 // src/CMakeLists.txt. Its handle registry is disjoint from every
 // diagnostic session TU.
 //
+// Y16 CLOCK-DRIFT-SAMPLE-OWNERSHIP (input half only, no control loop):
+// - The owner thread hands a Kotlin presentation-clock position (us +
+//   frame) to the WORKER through the ordinary single command slot
+//   (kDriftSample). The worker alone stamps SteadyNowNs(), computes the
+//   expected position with clock->currentPositionUs(now) and calls
+//   clock->recordDriftSample(expected, reported, now): Kotlin never passes
+//   a Kotlin timebase to an AudioClock mutator, and AudioClock keeps its
+//   single-mutator contract. recordDriftSample only updates diagnostic
+//   fields (never read by currentPositionUs), so nothing here feeds
+//   pacing, dispatch, or transport state; a rejected sample (no clock,
+//   not playing, negative input) is a nonterminal status, never a fail().
+//
 // JNI entry points (VanguardRealtimePlaybackNativeBridge.kt, Kotlin object):
 //   createRealtimePlaybackGraphSession            -> jlong handle (0 on failure)
 //   prepare/start/pause/resume/seek/stop...Session -> jstring key=value
 //   drainRealtimePlaybackGraphSessionOutputPcm16  -> jstring key=value
 //   ingestRealtimePlaybackGraphSessionExternalPcm16 -> jstring key=value (Y5a)
+//   recordDriftSampleRealtimePlaybackGraphSession -> jstring key=value (Y16)
 //   snapshotRealtimePlaybackGraphSession          -> jstring key=value
 //   destroyRealtimePlaybackGraphSession           -> jstring key=value
 
@@ -151,7 +164,7 @@ constexpr int64_t kMaxRingCapacityFrames = AudioSpscAudioRingBuffer::kMaxCapacit
 constexpr int     kMaxDispatchesPerWake  = 8;
 constexpr int64_t kMaxWaitNs             = 5'000'000LL;      // 5ms cv clamp
 constexpr int64_t kCommandAckTimeoutMs   = 1'000LL;          // owner-side bounded ack wait
-constexpr size_t  kReplyCapacity         = 2048; // Y15a: widened for nativeClock* telemetry
+constexpr size_t  kReplyCapacity         = 2560; // Y15a/Y16: widened for nativeClock*/drift telemetry
 constexpr int64_t kMaxIngestFrames       = kMaxWriteFrames;                                    // 8192
 
 // ---------------------------------------------------------------------------
@@ -270,13 +283,13 @@ struct RealtimePlaybackGraphSession {
 
     // Owner-thread: places the single command slot; returns seq or 0 when
     // a previous (timed-out) command still occupies the slot.
-    uint64_t enqueueCommand(CommandType type, int64_t arg) {
+    uint64_t enqueueCommand(CommandType type, int64_t arg, int64_t arg2 = 0) {
         uint64_t seq = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (commandPending) return 0;
             seq = ++commandsEnqueued;
-            pendingCommand = Command{type, arg, seq};
+            pendingCommand = Command{type, arg, seq, arg2};
             commandPending = true;
         }
         cv_.notify_all();
@@ -341,6 +354,9 @@ private:
         uint64_t    commandErrors  = 0;
         uint64_t    ackedSeq       = 0;
         uint64_t    underruns      = 0; // Y5a external-ingest underruns (nonterminal)
+        uint64_t    driftRecorded  = 0; // Y16 drift samples recorded into the clock
+        uint64_t    driftRejected  = 0; // Y16 drift samples rejected by the worker
+        int64_t     driftLastFrame = -1; // Y16 last reported presentation frame recorded
         uint64_t    pushedChecksum = 0;
         const char* lastResult     = "none";
         const char* lastError      = "none";
@@ -387,6 +403,8 @@ private:
                 ps.nativeClockSpeedDenominator   = cs.speedDenominator;
                 ps.nativeClockDriftSampleCount   = cs.driftSampleCount;
                 ps.nativeClockLastDriftDeltaUs   = cs.lastDriftDeltaUs;
+                ps.nativeClockLastDriftExpectedPtsUs = cs.lastDriftExpectedPtsUs;
+                ps.nativeClockLastDriftReportedPtsUs = cs.lastDriftReportedPtsUs;
             } else {
                 ps.nativeClockState              = "none";
                 ps.nativeClockPositionUs         = 0;
@@ -397,7 +415,14 @@ private:
                 ps.nativeClockSpeedDenominator   = 1;
                 ps.nativeClockDriftSampleCount   = 0;
                 ps.nativeClockLastDriftDeltaUs   = 0;
+                ps.nativeClockLastDriftExpectedPtsUs = 0;
+                ps.nativeClockLastDriftReportedPtsUs = 0;
             }
+            // Y16: worker-lifetime drift ingestion tallies (survive the
+            // per-stop clock teardown, unlike the AudioClock's own count).
+            ps.nativeDriftLastReportedFrame  = driftLastFrame;
+            ps.nativeDriftSamplesRecorded    = driftRecorded;
+            ps.nativeDriftSamplesRejected    = driftRejected;
         };
 
         auto fail = [&](const char* token) {
@@ -509,6 +534,36 @@ private:
             if (!CommandAllowed(cmd.type, state)) {
                 lastResult = "invalid_state";
                 ++commandErrors;
+                if (cmd.type == CommandType::kDriftSample) ++driftRejected;
+                return;
+            }
+            if (cmd.type == CommandType::kDriftSample) {
+                // Y16: diagnostic only. The worker is the sole steady-clock
+                // reader and AudioClock mutator, so `now` and the expected
+                // position are both computed HERE; cmd.arg is the reported
+                // presentation pts (us), cmd.arg2 the reported frame. No
+                // state change, no lastNowNs update, no fail() on rejection.
+                if (!clock) {
+                    lastResult = "no_clock";
+                    ++driftRejected;
+                    return;
+                }
+                if (cmd.arg < 0 || cmd.arg2 < 0) {
+                    lastResult = "invalid_args";
+                    ++driftRejected;
+                    return;
+                }
+                const int64_t now        = SteadyNowNs();
+                const int64_t expectedUs = clock->currentPositionUs(now);
+                const Status  st         = clock->recordDriftSample(expectedUs, cmd.arg, now);
+                if (!st.ok()) {
+                    lastResult = "drift_sample_rejected";
+                    ++driftRejected;
+                    return;
+                }
+                driftLastFrame = cmd.arg2;
+                ++driftRecorded;
+                lastResult = "ok";
                 return;
             }
             switch (cmd.type) {
@@ -587,6 +642,8 @@ private:
                     if (!err) state = NativeState::kStopped;
                     break;
                 }
+                case CommandType::kDriftSample:
+                    break; // handled above; unreachable
             }
             if (err) {
                 fail(err);
@@ -835,6 +892,17 @@ jstring ReplyFull(JNIEnv* env, RealtimePlaybackGraphSession& s, const char* stat
         static_cast<int>(ps.nativeClockSpeedDenominator),
         static_cast<unsigned long long>(ps.nativeClockDriftSampleCount),
         static_cast<long long>(ps.nativeClockLastDriftDeltaUs));
+    // Y16: drift-sample ingestion mirror (last expected/reported pair from
+    // the AudioClock, worker-lifetime recorded/rejected tallies).
+    out.appendf(
+        ";nativeClockLastDriftExpectedPtsUs=%lld;nativeClockLastDriftReportedPtsUs=%lld;"
+        "nativeDriftLastReportedFrame=%lld;nativeDriftSamplesRecorded=%llu;"
+        "nativeDriftSamplesRejected=%llu",
+        static_cast<long long>(ps.nativeClockLastDriftExpectedPtsUs),
+        static_cast<long long>(ps.nativeClockLastDriftReportedPtsUs),
+        static_cast<long long>(ps.nativeDriftLastReportedFrame),
+        static_cast<unsigned long long>(ps.nativeDriftSamplesRecorded),
+        static_cast<unsigned long long>(ps.nativeDriftSamplesRejected));
     if (out.overflowed()) {
         std::snprintf(buf, sizeof(buf), "status=reply_overflow;state=unknown;handle=%lld",
                       static_cast<long long>(s.handle));
@@ -843,8 +911,9 @@ jstring ReplyFull(JNIEnv* env, RealtimePlaybackGraphSession& s, const char* stat
 }
 
 // Shared owner-thread command path: precheck, enqueue, bounded ack wait,
-// owner-side output-ring epoch handling, reply.
-jstring RunCommand(JNIEnv* env, jlong handle, CommandType type, int64_t arg) {
+// owner-side output-ring epoch handling, reply. `arg2` is used by
+// kDriftSample only (reported presentation frame).
+jstring RunCommand(JNIEnv* env, jlong handle, CommandType type, int64_t arg, int64_t arg2 = 0) {
     const auto session = FindRtPlaybackSession(handle);
     if (!session) return ReplyMinimal(env, "not_found", handle, "unknown");
     RealtimePlaybackGraphSession& s = *session;
@@ -860,8 +929,11 @@ jstring RunCommand(JNIEnv* env, jlong handle, CommandType type, int64_t arg) {
     if (type == CommandType::kSeek && (arg < 0 || arg >= s.declaredFrames)) {
         return ReplyFull(env, s, "invalid_args", ps, 0, 0);
     }
+    if (type == CommandType::kDriftSample && (arg < 0 || arg2 < 0)) {
+        return ReplyFull(env, s, "invalid_args", ps, 0, 0);
+    }
 
-    const uint64_t seq = s.enqueueCommand(type, arg);
+    const uint64_t seq = s.enqueueCommand(type, arg, arg2);
     if (seq == 0) return ReplyFull(env, s, "command_busy", ps, 0, 0);
     if (!s.waitForAck(seq, &ps)) {
         return ReplyFull(env, s, ps.workerExited ? "worker_exited" : "command_timeout", ps, seq, 0);
@@ -885,6 +957,7 @@ jstring RunCommand(JNIEnv* env, jlong handle, CommandType type, int64_t arg) {
                 break;
             case CommandType::kPause:
             case CommandType::kResume:
+            case CommandType::kDriftSample:
                 break;
         }
     }
@@ -1158,6 +1231,30 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeB
     }
     if (written > 0) s.cv_.notify_all(); // an underrun-paused worker may dispatch now
     return ReplyFull(env, s, status, ps, ps.ackedSeq, 0, x);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: recordDriftSampleRealtimePlaybackGraphSession (Y16)
+// Owner-thread ingestion of ONE Kotlin presentation-clock drift sample
+// (reportedPtsUs / reportedFrame), executed by the worker through the
+// ordinary command slot (see the Y16 TU comment). Inputs carry NO Kotlin
+// timebase: the worker stamps SteadyNowNs() and computes the expected
+// position itself. Status tokens:
+//   ok                     recorded (reply mirrors the new last expected/
+//                          reported/delta/count)
+//   invalid_state          native state is not playing (owner precheck or
+//                          worker re-validation); nonterminal
+//   invalid_args           reportedPtsUs < 0 or reportedFrame < 0
+//   no_clock               no AudioClock instance at execution time
+//   drift_sample_rejected  AudioClock::recordDriftSample refused
+//   not_found / wrong_owner_thread / worker_exited / command_busy /
+//   command_timeout        registry / affinity / slot faults (unchanged)
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeBridge_recordDriftSampleRealtimePlaybackGraphSession(
+    JNIEnv* env, jobject /* bridge */, jlong handle, jlong reportedPtsUs, jlong reportedFrame) {
+    return RunCommand(env, handle, CommandType::kDriftSample,
+                      static_cast<int64_t>(reportedPtsUs), static_cast<int64_t>(reportedFrame));
 }
 
 extern "C" JNIEXPORT jstring JNICALL

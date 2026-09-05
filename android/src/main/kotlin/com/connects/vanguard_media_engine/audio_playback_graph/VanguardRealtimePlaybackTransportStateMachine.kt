@@ -42,6 +42,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 // "producer must re-anchor / retry" ([IngestRequest] anchor mismatch,
 // ring full, command in flight, format/argument errors) are rejected
 // results that do NOT fail the machine; only native session faults do.
+//
+// Y16 (CLOCK-DRIFT-SAMPLE-OWNERSHIP): [postDriftSample] is the ONLY
+// sanctioned way to hand a Kotlin presentation-clock position to the
+// native worker-owned AudioClock as a drift sample. It rides the same
+// generation-pinned [post] path (stale generation rejected before any
+// native call), carries no Kotlin timebase (native stamps its own steady
+// clock), never transitions [State] and never advances the generation.
+// Rejections (stale, disposed, not PLAYING, negative input, native
+// no_clock / invalid_state / invalid_args / drift_sample_rejected) are
+// telemetry-sample rejections whose reason starts with
+// [REASON_DRIFT_PREFIX]; only native session faults fail the machine.
 class VanguardRealtimePlaybackTransportStateMachine(
     private val config: VanguardRealtimePlaybackNativeSession.Config,
     private val listener: Listener? = null,
@@ -49,7 +60,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
 ) {
     enum class State { IDLE, PREPARED, PLAYING, PAUSED, STOPPED, COMPLETED, FAILED, DISPOSED }
 
-    enum class Op { LOAD, PREPARE, START, PAUSE, RESUME, SEEK, STOP, SNAPSHOT, DRAIN, INGEST }
+    enum class Op { LOAD, PREPARE, START, PAUSE, RESUME, SEEK, STOP, SNAPSHOT, DRAIN, INGEST, DRIFT_SAMPLE }
 
     // Y5a typed ingest request. `src` is a direct buffer holding frameCount
     // interleaved PCM16 frames at byte offset 0 in the session format;
@@ -59,6 +70,14 @@ class VanguardRealtimePlaybackTransportStateMachine(
         val src: ByteBuffer,
         val frameCount: Int,
         val expectedStartFrame: Long,
+    )
+
+    // Y16 typed drift-sample request: the Kotlin presentation clock's
+    // reported position, in microseconds and frames (both >= 0). No
+    // wall-clock / nanoTime field exists here by design.
+    data class DriftSampleRequest(
+        val reportedPtsUs: Long,
+        val reportedFrame: Long,
     )
 
     // All callbacks run on the owner thread.
@@ -82,6 +101,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
         const val REASON_DISPOSED = "disposed"
         const val REASON_OWNER_THREAD_TIMEOUT = "owner_thread_timeout"
         const val REASON_INGEST_PREFIX = "ingest_"
+        const val REASON_DRIFT_PREFIX = "drift_"
         private const val OWNER_WAIT_TIMEOUT_MS = 10_000L
         private const val DISPOSE_JOIN_TIMEOUT_MS = 5_000L
     }
@@ -140,6 +160,16 @@ class VanguardRealtimePlaybackTransportStateMachine(
         callback: ((Result) -> Unit)? = null,
     ): Boolean = post(Op.INGEST, 0L, expectedGeneration, null, request, callback)
 
+    // Y16: callback-friendly, generation-pinned drift-sample ingestion. The
+    // sink thread never reaches JNI itself and never blocks on the result;
+    // `callback` runs on the owner thread (or inline on rejection after
+    // dispose, like [post]). Never transitions state.
+    fun postDriftSample(
+        request: DriftSampleRequest,
+        expectedGeneration: Long? = null,
+        callback: ((Result) -> Unit)? = null,
+    ): Boolean = post(Op.DRIFT_SAMPLE, 0L, expectedGeneration, null, null, callback, request)
+
     // ── Callback-friendly API ──────────────────────────────────────────────
 
     // Enqueues `op` on the owner thread. When `expectedGeneration` is set
@@ -158,6 +188,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
         drainBuffer: ByteBuffer? = null,
         ingestRequest: IngestRequest? = null,
         callback: ((Result) -> Unit)? = null,
+        driftSampleRequest: DriftSampleRequest? = null,
     ): Boolean {
         if (disposed.get()) {
             callback?.invoke(disposedResult())
@@ -177,6 +208,12 @@ class VanguardRealtimePlaybackTransportStateMachine(
                     Result(false, state, generation, "null_ingest_request", null)
                 } else {
                     executeIngest(ingestRequest)
+                }
+            } else if (op == Op.DRIFT_SAMPLE) {
+                if (driftSampleRequest == null) {
+                    Result(false, state, generation, "null_drift_sample_request", null)
+                } else {
+                    executeDriftSample(driftSampleRequest)
                 }
             } else {
                 execute(op, arg)
@@ -293,7 +330,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
             Op.SEEK -> s.seek(arg)
             Op.STOP -> s.stop()
             Op.SNAPSHOT -> s.snapshot()
-            Op.LOAD, Op.DRAIN, Op.INGEST -> return reject("unreachable")
+            Op.LOAD, Op.DRAIN, Op.INGEST, Op.DRIFT_SAMPLE -> return reject("unreachable")
         }
         if (!reply.ok) return failClosedOnReply(op, reply)
 
@@ -305,7 +342,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
             Op.SEEK -> generation++ // paused stays PAUSED, playing stays PLAYING
             Op.STOP -> { generation++; transition(State.STOPPED) }
             Op.SNAPSHOT -> Unit
-            Op.LOAD, Op.DRAIN, Op.INGEST -> Unit
+            Op.LOAD, Op.DRAIN, Op.INGEST, Op.DRIFT_SAMPLE -> Unit
         }
         publishedGeneration = generation
         return verifyAndObserve(reply)
@@ -377,6 +414,37 @@ class VanguardRealtimePlaybackTransportStateMachine(
             "insufficient_buffer_capacity",
             -> reject("$REASON_INGEST_PREFIX${reply.status}", reply)
             else -> failClosedOnReply(Op.INGEST, reply)
+        }
+    }
+
+    // Y16 owner-thread drift-sample ingestion. Every gate here is a
+    // telemetry rejection (never a [fail]): disposed, not loaded, already
+    // failed, not PLAYING, negative input. On an ok reply the result is
+    // accepted WITHOUT [verifyAndObserve]: the drift sample must never
+    // transition state (not even completion observation, which stays with
+    // drain/snapshot) and never advances the generation. Native
+    // invalid_state for this op is a normal nonterminal race (the worker
+    // left playing between Kotlin's check and execution), not a
+    // divergence; only genuine session faults fail closed.
+    private fun executeDriftSample(request: DriftSampleRequest): Result {
+        if (state == State.DISPOSED) return reject(REASON_DISPOSED)
+        val s = session ?: return reject("${REASON_DRIFT_PREFIX}not_loaded")
+        if (state == State.FAILED) return reject("${REASON_DRIFT_PREFIX}failed:${failureReason ?: "unknown"}")
+        if (!commandAllowed(Op.DRIFT_SAMPLE, state)) {
+            return reject("${REASON_DRIFT_PREFIX}invalid_state_${state.name.lowercase()}")
+        }
+        if (request.reportedPtsUs < 0L || request.reportedFrame < 0L) {
+            return reject("${REASON_DRIFT_PREFIX}invalid_args")
+        }
+        val reply = s.recordDriftSample(request.reportedPtsUs, request.reportedFrame)
+        if (reply.ok) return accept(reply)
+        return when (reply.status) {
+            VanguardRealtimePlaybackNativeSession.STATUS_INVALID_STATE,
+            VanguardRealtimePlaybackNativeSession.STATUS_INVALID_ARGS,
+            VanguardRealtimePlaybackNativeSession.STATUS_NO_CLOCK,
+            VanguardRealtimePlaybackNativeSession.STATUS_DRIFT_SAMPLE_REJECTED,
+            -> reject("$REASON_DRIFT_PREFIX${reply.status}", reply)
+            else -> failClosedOnReply(Op.DRIFT_SAMPLE, reply)
         }
     }
 
@@ -458,5 +526,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
         // Pre-roll while PREPARED/STOPPED, steady-state while PLAYING/PAUSED;
         // COMPLETED answers eos_reached natively (harmless, no mutation).
         Op.INGEST -> current != State.IDLE && current != State.FAILED && current != State.DISPOSED
+        // Y16: a drift sample is only meaningful against a running clock.
+        Op.DRIFT_SAMPLE -> current == State.PLAYING
     }
 }

@@ -15,6 +15,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_BOUNDED_PAUSE_RESUME
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CHECKSUM_IDENTITY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_ANCHORED
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_AUTHORITY_UNCHANGED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_CORRELATION_TELEMETRY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_EPOCH_BALANCED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_MONOTONIC
@@ -23,6 +24,9 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_POLLER_MONOTONIC
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_QUERY_SURFACE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DRIFT_SAMPLE_GENERATION_PINNED
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DRIFT_SAMPLE_NO_FEEDBACK
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DRIFT_SAMPLE_WORKER_OWNED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_CLOCK_EPOCH
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_RECOVERY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_REMAINDER
@@ -1273,6 +1277,23 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["clockCorrelationOffsetFrames"] = correlation?.offsetFrames ?: -1L
         out.metrics["clockCorrelationCommandsBefore"] = commandsBefore
         out.metrics["clockCorrelationCommandsAfter"] = commandsAfter
+        out.metrics["driftSamplesPosted"] = sink.driftSamplesPosted
+        out.metrics["driftSamplesSkipped"] = sink.driftSamplesSkipped
+        out.metrics["driftSamplesDropped"] = sink.driftSamplesDropped
+        out.metrics["driftCallbackCount"] = sink.driftCallbackCount
+        out.metrics["driftSamplesRecorded"] = sink.driftSamplesRecorded
+        out.metrics["driftSamplesStaleRejected"] = sink.driftSamplesStaleRejected
+        out.metrics["driftSamplesOtherRejected"] = sink.driftSamplesOtherRejected
+        out.metrics["driftLastRejectReason"] = sink.driftLastRejectReason
+        out.metrics["driftMaxQueueLatencyNs"] = sink.driftMaxQueueLatencyNs
+        out.metrics["driftLastPostedGeneration"] = sink.driftLastPostedGeneration
+        out.metrics["driftLastExpectedPtsUs"] = sink.driftLastExpectedPtsUs
+        out.metrics["driftLastReportedPtsUs"] = sink.driftLastReportedPtsUs
+        out.metrics["driftLastDeltaUs"] = sink.driftLastDeltaUs
+        out.metrics["driftLastReportedFrame"] = sink.driftLastReportedFrame
+        out.metrics["driftNativeSampleCount"] = sink.driftNativeSampleCount
+        out.metrics["driftNativeSamplesRecorded"] = sink.driftNativeSamplesRecorded
+        out.metrics["driftNativeSamplesRejected"] = sink.driftNativeSamplesRejected
 
         out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
         out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
@@ -1340,6 +1361,63 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.lanes[LANE_CLOCK_OBSERVATION_NO_FEEDBACK] = correlation != null &&
             commandsBefore >= 0 &&
             commandsBefore == commandsAfter
+
+        out.lanes[LANE_DRIFT_SAMPLE_WORKER_OWNED] = sink.driftSamplesPosted > 0L &&
+            sink.driftCallbackCount > 0L &&
+            sink.driftSamplesRecorded > 0L &&
+            sink.driftNativeSamplesRecorded > 0L &&
+            sink.driftNativeSampleCount > 0L &&
+            sink.driftLastExpectedPtsUs >= 0L &&
+            sink.driftLastReportedPtsUs >= 0L &&
+            sink.driftLastReportedFrame >= 0L &&
+            sink.driftNativeSamplesRejected >= 0L &&
+            sink.driftNativeSamplesRejected <= sink.driftSamplesPosted
+
+        val staleAttempted = out.metrics["staleProbeAttempted"] as? Boolean ?: false
+        val stalePostReturn = out.metrics["staleProbePostReturn"] as? Boolean ?: false
+        val staleCallbackCount = (out.metrics["staleProbeCallbackCount"] as? Number)?.toLong() ?: -1L
+        val staleRejectedCount = (out.metrics["staleProbeStaleRejectedCount"] as? Number)?.toLong() ?: -1L
+        val staleReason = out.metrics["staleProbeReason"] as? String ?: ""
+        val staleAccepted = out.metrics["staleProbeAccepted"] as? Boolean ?: true
+        val nativeRecBefore = (out.metrics["staleProbeNativeRecordedBefore"] as? Number)?.toLong() ?: -1L
+        val nativeRecAfter = (out.metrics["staleProbeNativeRecordedAfter"] as? Number)?.toLong() ?: -2L
+        val nativeCntBefore = (out.metrics["staleProbeNativeCountBefore"] as? Number)?.toLong() ?: -1L
+        val nativeCntAfter = (out.metrics["staleProbeNativeCountAfter"] as? Number)?.toLong() ?: -2L
+        val cmdBefore = (out.metrics["staleProbeCommandsBefore"] as? Number)?.toInt() ?: -1
+        val cmdAfter = (out.metrics["staleProbeCommandsAfter"] as? Number)?.toInt() ?: -2
+        val stateBefore = out.metrics["staleProbeStateBefore"] as? String ?: ""
+        val stateAfter = out.metrics["staleProbeStateAfter"] as? String ?: ""
+
+        out.lanes[LANE_DRIFT_SAMPLE_GENERATION_PINNED] = staleAttempted &&
+            stalePostReturn &&
+            staleCallbackCount == 1L &&
+            staleRejectedCount == 1L &&
+            staleReason == VanguardRealtimePlaybackTransportStateMachine.REASON_STALE_GENERATION &&
+            !staleAccepted &&
+            nativeRecBefore >= 0L &&
+            nativeRecBefore == nativeRecAfter &&
+            nativeCntBefore >= 0L &&
+            nativeCntBefore == nativeCntAfter &&
+            cmdBefore >= 0 &&
+            cmdBefore == cmdAfter &&
+            stateBefore.isNotBlank() &&
+            stateBefore == stateAfter
+
+        out.lanes[LANE_DRIFT_SAMPLE_NO_FEEDBACK] = final.failureReason.isBlank() &&
+            stateAtCompletion == VanguardRealtimeAudioPlaybackSession.State.COMPLETED &&
+            playthroughAccountingOk(final, stateAtCompletion) &&
+            checksumIdentityOk(final) &&
+            out.lanes[LANE_NO_FEEDBACK] == true &&
+            final.transportCompletedCallbacks >= 1 &&
+            final.transportFailedCallbacks == 0
+
+        out.lanes[LANE_CLOCK_AUTHORITY_UNCHANGED] = out.lanes[LANE_CURRENT_POSITION_QUERY_SURFACE] == true &&
+            out.lanes[LANE_CURRENT_POSITION_POLLER_MONOTONIC] == true &&
+            out.lanes[LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION] == true &&
+            out.lanes[LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED] == true &&
+            postTeardownFrames >= clock.positionFrames &&
+            postTeardownUs >= clock.positionUs &&
+            clock.offWriterThreadCalls == 0L
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

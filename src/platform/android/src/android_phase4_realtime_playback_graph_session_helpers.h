@@ -87,6 +87,12 @@ enum class CommandType : int32_t {
     kResume  = 4,
     kSeek    = 5, // arg = targetFrame
     kStop    = 6,
+    // Y16 (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP): a
+    // diagnostic drift sample, arg = reported presentation pts (us),
+    // arg2 = reported presentation frame. Rides the same single command
+    // slot so the worker (sole AudioClock mutator) records it; it never
+    // changes NativeState and never feeds pacing.
+    kDriftSample = 7,
 };
 
 // Shared owner-precheck / worker-revalidation predicate. Kotlin mirrors
@@ -107,6 +113,11 @@ inline bool CommandAllowed(CommandType type, NativeState state) {
                    state == NativeState::kPaused || state == NativeState::kStopped;
         case CommandType::kStop:
             return state != NativeState::kIdle;
+        // Y16: a drift sample is meaningful only against a running clock;
+        // Kotlin treats this invalid_state as a telemetry rejection, never
+        // as a state divergence.
+        case CommandType::kDriftSample:
+            return state == NativeState::kPlaying;
     }
     return false;
 }
@@ -193,6 +204,9 @@ struct Command {
     CommandType type{CommandType::kPrepare};
     int64_t     arg{0};
     uint64_t    seq{0};
+    // Y16: second argument (kDriftSample: reported presentation frame);
+    // 0 for every other command.
+    int64_t     arg2{0};
 };
 
 // Worker-published mirror (guarded by Session::mutex_). All tokens are
@@ -231,6 +245,17 @@ struct PublishedState {
     int32_t     nativeClockSpeedDenominator{1};
     uint64_t    nativeClockDriftSampleCount{0};
     int64_t     nativeClockLastDriftDeltaUs{0};
+    // Y16: drift-sample ingestion mirror. The expected/reported pair is the
+    // AudioClock's own last recorded sample (expected = the worker's
+    // currentPositionUs(SteadyNowNs()) at record time, reported = the
+    // Kotlin presentation position handed in); the counters are
+    // worker-lifetime tallies of kDriftSample commands. Publication only:
+    // no feedback into pacing, commands, or currentPositionUs.
+    int64_t     nativeClockLastDriftExpectedPtsUs{0};
+    int64_t     nativeClockLastDriftReportedPtsUs{0};
+    int64_t     nativeDriftLastReportedFrame{-1};
+    uint64_t    nativeDriftSamplesRecorded{0};
+    uint64_t    nativeDriftSamplesRejected{0};
 };
 
 inline std::vector<std::shared_ptr<vanguard::audio::DecodedAudioPcmSourceNode>> MakeSources(

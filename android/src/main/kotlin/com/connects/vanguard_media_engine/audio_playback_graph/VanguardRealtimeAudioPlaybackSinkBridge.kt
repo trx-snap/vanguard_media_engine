@@ -12,6 +12,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -57,6 +58,20 @@ import kotlin.concurrent.withLock
 //     bounded, epoch-relative production-clock lag sample is recorded as
 //     diagnostic telemetry only -- a bounded query surface, not a claim
 //     that P4-AUDIO-MIXBUS or P4-AUDIO-GRAPH-TRANSPORT-CLOCK are complete.
+//   - Y16 (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP): at
+//     that SAME post-write poll point, and only when the poll produced an
+//     honest position, the sink thread posts the presentation clock's
+//     (us, frame) position to the transport owner thread through the
+//     generation-pinned [VanguardRealtimePlaybackTransportStateMachine.
+//     postDriftSample] (expectedGeneration = currentGeneration at sample
+//     creation); the native worker alone stamps its steady clock, computes
+//     the expected position and records the drift sample on its
+//     AudioClock. No Kotlin timebase crosses that seam, no monitor thread
+//     exists, the sink thread never blocks on the callback (owner thread,
+//     counters only), and the result NEVER feeds back: drain size, sleeps,
+//     gating, checksum, park/unpark, epoch decisions, transport commands
+//     and currentPositionFrames()/Us() authority are untouched. Stale /
+//     invalid-state / disposed rejections are counted, never acted on.
 //
 // Seek (Y9, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK): one forward seek
 // reuses the park protocol as a seek park capped by [Config.maxSeekHoldMs]
@@ -161,6 +176,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         private const val GAIN_AWAIT_POLL_MS = 5L
         private const val GAIN_REQUEST_QUEUE_CAPACITY = 8
         private const val FRAME_WRAP_MODULUS = VanguardRealtimePlaybackPresentationClock.FRAME_WRAP_MODULUS
+        // Y16: bound on drift samples posted but not yet called back; extras are dropped (counted).
+        private const val MAX_DRIFT_SAMPLES_IN_FLIGHT = 4
 
         fun hex16(value: Long): String = String.format("%016x", value)
     }
@@ -295,6 +312,23 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     @Volatile private var seekUnwrapResetAtFlush = false
     @Volatile private var epochRawOriginAtUnpark = -1L
     @Volatile private var playbackHeadAtSeekUnpark = -1L
+
+    // Y16 drift-sample ingestion telemetry (class comment). Sink thread
+    // writes the post-side fields; the owner-thread callback (or an inline
+    // post-dispose rejection on the sink thread) updates the atomic
+    // callback-side tallies. Diagnostic only: nothing reads them back.
+    @Volatile private var driftSamplesPosted = 0L
+    @Volatile private var driftSamplesSkipped = 0L
+    @Volatile private var driftSamplesDropped = 0L
+    @Volatile private var driftLastPostedGeneration = -1L
+    private val driftInFlight = AtomicInteger(0)
+    private val driftCallbackCount = AtomicLong(0L)
+    private val driftSamplesRecorded = AtomicLong(0L)
+    private val driftSamplesStaleRejected = AtomicLong(0L)
+    private val driftSamplesOtherRejected = AtomicLong(0L)
+    private val driftMaxQueueLatencyNs = AtomicLong(-1L)
+    @Volatile private var driftLastRejectReason = ""
+    @Volatile private var lastDriftReply: Reply? = null
 
     // ── Sink-thread-confined state ─────────────────────────────────────────
 
@@ -479,156 +513,268 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     fun currentPositionFrames(): Long = clockWriter.currentPositionFrames()
     fun currentPositionUs(): Long = clockWriter.currentPositionUs()
 
-    fun telemetry(): VanguardRealtimeAudioPlaybackSinkTelemetry = VanguardRealtimeAudioPlaybackSinkTelemetry(
-        phase = phaseRef.get(),
-        exitReason = exitReason,
-        threadId = threadId,
-        threadIsTransportOwner = threadIsTransportOwner,
-        clockWriterBoundOnSinkThread = clockWriterBoundOnSinkThread,
-        audioTrackInitOk = audioTrackInitOk,
-        gainSetOk = gainSetOk,
-        gainValue = gainValue,
-        gainRequestCount = gainRequestCount,
-        gainAppliedCount = gainAppliedCount,
-        gainRejectedCount = gainRejectedCount,
-        gainQueueFullCount = gainQueueFullCount,
-        lastGainRequestSeq = lastGainRequestSeq,
-        lastGainAppliedSeq = lastGainAppliedSeq,
-        gainAppliedOnSinkThread = gainAppliedOnSinkThread,
-        effectiveGain = gainValue,
-        audioTrackBufferBytes = audioTrackBufferBytes,
-        audioTracksCreated = audioTracksCreated,
-        releaseCount = releaseCounter.get(),
-        releaseExecutedOnSinkThread = releaseExecutedOnSinkThread,
-        audioTrackCallsOffSinkThread = audioTrackCallsOffSinkThread,
-        played = played,
-        initialPlayState = initialPlayState,
-        framesReadFromTransport = framesReadFromTransport,
-        framesWrittenToSink = framesWrittenToSink,
-        partialWriteCount = partialWriteCount,
-        zeroWriteCount = zeroWriteCount,
-        drainCalls = drainCalls,
-        drainCallsBeforeAllow = drainCallsBeforeAllow,
-        drainRequestSizeChanges = drainRequestSizeChanges,
-        emptyDrainCount = emptyDrainCount,
-        productiveDrainPasses = productiveDrainPasses,
-        eosDrainedObserved = eosDrainedObserved,
-        timestampPollAttempts = clockWriter.timestampPollAttempts,
-        timestampPollSuccesses = clockWriter.timestampPollSuccesses,
-        timestampPollUnavailable = clockWriter.timestampPollUnavailable,
-        timestampPollsWhileParked = clockWriter.timestampPollsWhileParked,
-        timestampMaxPollsInOnePass = clockWriter.timestampMaxPollsInOnePass,
-        clockEpochOpenCalls = clockWriter.clockEpochOpenCalls,
-        clockEpochCloseCalls = clockWriter.clockEpochCloseCalls,
-        clockRejectedCount = clockWriter.clockRejectedCount,
-        clockSnapshotsAtPark = clockWriter.clockSnapshotsAtPark,
-        rebasedClampCount = clockWriter.rebasedClampCount,
-        currentEpoch = clockWriter.currentEpoch,
-        parkCount = parkCount,
-        unparkCount = unparkCount,
-        playStateAtPark = playStateAtPark,
-        playStateAfterUnpark = playStateAfterUnpark,
-        parkedPlayStateViolations = parkedPlayStateViolations,
-        parkExecutedOnSinkThread = parkExecutedOnSinkThread,
-        unparkExecutedOnSinkThread = unparkExecutedOnSinkThread,
-        positionAtPark = positionAtPark,
-        epochClosedAtPark = epochClosedAtPark,
-        epochOpenedAtUnpark = epochOpenedAtUnpark,
-        parkAckLatencyMs = parkAckLatencyMs,
-        parkedHoldMs = parkedHoldMs,
-        playbackHeadAtPark = playbackHeadAtPark,
-        playbackHeadAtUnpark = playbackHeadAtUnpark,
-        playbackHeadFinal = playbackHeadFinal,
-        readyAtMs = readyAtMs,
-        drainAllowedAtMs = drainAllowedAtMs,
-        firstDrainAtMs = firstDrainAtMs,
-        firstWriteAtMs = firstWriteAtMs,
-        sinkThreadWallMs = sinkThreadWallMs,
-        checksumHex = hex16(checksum),
-        lastReply = lastReply,
-        syntheticDeadObjectInjectAfterFrames = config.syntheticDeadObjectInjectAfterFrames,
-        deadObjectInjectedCount = clockWriter.deadObjectInjectedCount,
-        deadObjectObservedCount = clockWriter.deadObjectObservedCount,
-        deadObjectRecoveryCount = clockWriter.deadObjectRecoveryCount,
-        deadObjectOldTrackReleaseCount = clockWriter.deadObjectOldTrackReleaseCount,
-        deadObjectRecoveryExecutedOnSinkThread = clockWriter.deadObjectRecoveryExecutedOnSinkThread,
-        deadObjectNewTrackInitOk = clockWriter.deadObjectNewTrackInitOk,
-        deadObjectNewTrackVolumeOk = clockWriter.deadObjectNewTrackVolumeOk,
-        deadObjectNewTrackPlayOk = clockWriter.deadObjectNewTrackPlayOk,
-        deadObjectNewTrackPlayState = clockWriter.deadObjectNewTrackPlayState,
-        deadObjectNewTrackSameBuffer = clockWriter.deadObjectNewTrackSameBuffer,
-        audioTrackBufferFrames = audioTrackBufferFrames,
-        deadObjectNewTrackBufferFrames = clockWriter.deadObjectNewTrackBufferFrames,
-        deadObjectRecoveryWallMs = clockWriter.deadObjectRecoveryWallMs,
-        deadObjectEpochBeforeRecovery = clockWriter.deadObjectEpochBeforeRecovery,
-        deadObjectEpochOpenedAfterRecovery = clockWriter.deadObjectEpochOpenedAfterRecovery,
-        deadObjectEpochCloseAccepted = clockWriter.deadObjectEpochCloseAccepted,
-        deadObjectEpochOpenAccepted = clockWriter.deadObjectEpochOpenAccepted,
-        deadObjectPositionBeforeRecovery = clockWriter.deadObjectPositionBeforeRecovery,
-        deadObjectBaseFrameAfterRecovery = clockWriter.deadObjectBaseFrameAfterRecovery,
-        deadObjectBaseStepFrames = clockWriter.deadObjectBaseStepFrames,
-        deadObjectBaseStepBounded = clockWriter.deadObjectBaseStepBounded,
-        deadObjectContentHeadAtDeadObject = clockWriter.deadObjectContentHeadAtDeadObject,
-        deadObjectWrittenAheadOfHeadFrames = clockWriter.deadObjectWrittenAheadOfHeadFrames,
-        deadObjectPublicationLagFrames = clockWriter.deadObjectPublicationLagFrames,
-        deadObjectBaseStepDecompositionOk = clockWriter.deadObjectBaseStepDecompositionOk,
-        deadObjectClockProvenanceAtRecovery = clockWriter.deadObjectClockProvenanceAtRecovery,
-        deadObjectClockLastAgeNsAtRecovery = clockWriter.deadObjectClockLastAgeNsAtRecovery,
-        deadObjectSliceBytesAtRecovery = clockWriter.deadObjectSliceBytesAtRecovery,
-        deadObjectUnwrittenBytesAtRecovery = clockWriter.deadObjectUnwrittenBytesAtRecovery,
-        deadObjectBufferPositionAtRecovery = clockWriter.deadObjectBufferPositionAtRecovery,
-        deadObjectFramesReadAtRecovery = clockWriter.deadObjectFramesReadAtRecovery,
-        deadObjectFramesWrittenBeforeRecovery = clockWriter.deadObjectFramesWrittenBeforeRecovery,
-        deadObjectRemainderFramesExpected = clockWriter.deadObjectRemainderFramesExpected,
-        deadObjectRemainderFramesWrittenOnNewTrack = clockWriter.deadObjectRemainderFramesWrittenOnNewTrack,
-        deadObjectRemainderAccountingOk = clockWriter.deadObjectRemainderAccountingOk,
-        deadObjectTimestampPollsDuringRecovery = clockWriter.deadObjectTimestampPollsDuringRecovery,
-        clockSnapshotsAtDeadObjectRecovery = clockWriter.clockSnapshotsAtDeadObjectRecovery,
-        playbackHeadAtDeadObject = clockWriter.playbackHeadAtDeadObject,
-        maxSeekHoldMs = config.maxSeekHoldMs,
-        seekParkCount = seekParkCount,
-        parkHoldCapMs = parkHoldCapMs,
-        flushRequestCount = flushRequestCount,
-        flushCount = flushCount,
-        flushExecutedOnSinkThread = flushExecutedOnSinkThread,
-        flushAckLatencyMs = flushAckLatencyMs,
-        playStateBeforeFlush = playStateBeforeFlush,
-        playStateAfterFlush = playStateAfterFlush,
-        playbackHeadBeforeFlush = playbackHeadBeforeFlush,
-        playbackHeadAfterFlush = playbackHeadAfterFlush,
-        framesWrittenAtFlush = framesWrittenAtFlush,
-        framesReadAtFlush = framesReadAtFlush,
-        drainCallsAtFlush = drainCallsAtFlush,
-        timestampPollsDuringFlush = timestampPollsDuringFlush,
-        postSeekExpectedFrames = postSeekExpectedFrames,
-        readBudgetFrames = readBudgetFrames,
-        seekTargetFrame = seekTargetFrame,
-        seekEpochOpenedAtUnpark = seekEpochOpenedAtUnpark,
-        seekEpochBaseFrame = seekEpochBaseFrame,
-        seekDiscontinuityFrames = seekDiscontinuityFrames,
-        seekEpochOpenAccepted = seekEpochOpenAccepted,
-        seekUnwrapResetAtFlush = seekUnwrapResetAtFlush,
-        epochRawOriginAtUnpark = epochRawOriginAtUnpark,
-        playbackHeadAtSeekUnpark = playbackHeadAtSeekUnpark,
-        postSeekFramesWritten = if (flushCount > 0) framesWrittenToSink - framesWrittenAtFlush else 0L,
-        epochBaseFrame = clockWriter.epochBaseFrame,
-        framesWrittenAtEpochOpen = clockWriter.framesWrittenAtEpochOpen,
-        framesReadAtEpochOpen = clockWriter.framesReadAtEpochOpen,
-        presentationLagSampleCount = clockWriter.presentationLagSampleCount,
-        presentationLagBoundedSampleCount = clockWriter.presentationLagBoundedSampleCount,
-        presentationLagExcludedSampleCount = clockWriter.presentationLagExcludedSampleCount,
-        lastPresentationLagFrames = clockWriter.lastPresentationLagFrames,
-        minPresentationLagFrames = clockWriter.minPresentationLagFrames,
-        maxPresentationLagFrames = clockWriter.maxPresentationLagFrames,
-        presentationLagLowerBoundFrames = clockWriter.presentationLagLowerBoundFrames,
-        presentationLagUpperBoundFrames = clockWriter.presentationLagUpperBoundFrames,
-        lastPositionFramesAtPoll = clockWriter.lastPositionFramesAtPoll,
-        lastPositionUsAtPoll = clockWriter.lastPositionUsAtPoll,
-        positionAtEosFrames = clockWriter.positionAtEosFrames,
-        positionAtEosUs = clockWriter.positionAtEosUs,
-        currentPositionReadsFromWriterThread = clockWriter.currentPositionReadsFromWriterThread,
-        currentPositionReadsFromOtherThreads = clockWriter.currentPositionReadsFromOtherThreads,
-    )
+    // Built section-by-section (each constructor call kept well under the
+    // Android verifier's argument-register budget; see the telemetry file's
+    // header) rather than one flat ~165-parameter invocation.
+    fun telemetry(): VanguardRealtimeAudioPlaybackSinkTelemetry {
+        val core = VanguardRealtimeAudioPlaybackSinkTelemetryCore(
+            phase = phaseRef.get(),
+            exitReason = exitReason,
+            threadId = threadId,
+            threadIsTransportOwner = threadIsTransportOwner,
+            clockWriterBoundOnSinkThread = clockWriterBoundOnSinkThread,
+            audioTrackInitOk = audioTrackInitOk,
+            gainSetOk = gainSetOk,
+            gainValue = gainValue,
+        )
+        val gainQueue = VanguardRealtimeAudioPlaybackSinkTelemetryGainQueue(
+            gainRequestCount = gainRequestCount,
+            gainAppliedCount = gainAppliedCount,
+            gainRejectedCount = gainRejectedCount,
+            gainQueueFullCount = gainQueueFullCount,
+            lastGainRequestSeq = lastGainRequestSeq,
+            lastGainAppliedSeq = lastGainAppliedSeq,
+            gainAppliedOnSinkThread = gainAppliedOnSinkThread,
+            effectiveGain = gainValue,
+        )
+        val trackLifecycle = VanguardRealtimeAudioPlaybackSinkTelemetryTrackLifecycle(
+            audioTrackBufferBytes = audioTrackBufferBytes,
+            audioTracksCreated = audioTracksCreated,
+            releaseCount = releaseCounter.get(),
+            releaseExecutedOnSinkThread = releaseExecutedOnSinkThread,
+            audioTrackCallsOffSinkThread = audioTrackCallsOffSinkThread,
+            played = played,
+            initialPlayState = initialPlayState,
+        )
+        val writePath = VanguardRealtimeAudioPlaybackSinkTelemetryWritePath(
+            framesReadFromTransport = framesReadFromTransport,
+            framesWrittenToSink = framesWrittenToSink,
+            partialWriteCount = partialWriteCount,
+            zeroWriteCount = zeroWriteCount,
+            drainCalls = drainCalls,
+            drainCallsBeforeAllow = drainCallsBeforeAllow,
+            drainRequestSizeChanges = drainRequestSizeChanges,
+        )
+        val drainSummary = VanguardRealtimeAudioPlaybackSinkTelemetryDrainSummary(
+            emptyDrainCount = emptyDrainCount,
+            productiveDrainPasses = productiveDrainPasses,
+            eosDrainedObserved = eosDrainedObserved,
+        )
+        val clockPollA = VanguardRealtimeAudioPlaybackSinkTelemetryClockPollA(
+            timestampPollAttempts = clockWriter.timestampPollAttempts,
+            timestampPollSuccesses = clockWriter.timestampPollSuccesses,
+            timestampPollUnavailable = clockWriter.timestampPollUnavailable,
+            timestampPollsWhileParked = clockWriter.timestampPollsWhileParked,
+            timestampMaxPollsInOnePass = clockWriter.timestampMaxPollsInOnePass,
+            clockEpochOpenCalls = clockWriter.clockEpochOpenCalls,
+        )
+        val clockPollB = VanguardRealtimeAudioPlaybackSinkTelemetryClockPollB(
+            clockEpochCloseCalls = clockWriter.clockEpochCloseCalls,
+            clockRejectedCount = clockWriter.clockRejectedCount,
+            clockSnapshotsAtPark = clockWriter.clockSnapshotsAtPark,
+            rebasedClampCount = clockWriter.rebasedClampCount,
+            currentEpoch = clockWriter.currentEpoch,
+        )
+        val parkA = VanguardRealtimeAudioPlaybackSinkTelemetryParkA(
+            parkCount = parkCount,
+            unparkCount = unparkCount,
+            playStateAtPark = playStateAtPark,
+            playStateAfterUnpark = playStateAfterUnpark,
+            parkedPlayStateViolations = parkedPlayStateViolations,
+            parkExecutedOnSinkThread = parkExecutedOnSinkThread,
+            unparkExecutedOnSinkThread = unparkExecutedOnSinkThread,
+            positionAtPark = positionAtPark,
+        )
+        val parkB = VanguardRealtimeAudioPlaybackSinkTelemetryParkB(
+            epochClosedAtPark = epochClosedAtPark,
+            epochOpenedAtUnpark = epochOpenedAtUnpark,
+            parkAckLatencyMs = parkAckLatencyMs,
+            parkedHoldMs = parkedHoldMs,
+            playbackHeadAtPark = playbackHeadAtPark,
+            playbackHeadAtUnpark = playbackHeadAtUnpark,
+            playbackHeadFinal = playbackHeadFinal,
+        )
+        val parkC = VanguardRealtimeAudioPlaybackSinkTelemetryParkC(
+            readyAtMs = readyAtMs,
+            drainAllowedAtMs = drainAllowedAtMs,
+            firstDrainAtMs = firstDrainAtMs,
+            firstWriteAtMs = firstWriteAtMs,
+            sinkThreadWallMs = sinkThreadWallMs,
+            checksumHex = hex16(checksum),
+            lastReply = lastReply,
+        )
+        val deadObjectA = VanguardRealtimeAudioPlaybackSinkTelemetryDeadObjectA(
+            syntheticDeadObjectInjectAfterFrames = config.syntheticDeadObjectInjectAfterFrames,
+            deadObjectInjectedCount = clockWriter.deadObjectInjectedCount,
+            deadObjectObservedCount = clockWriter.deadObjectObservedCount,
+            deadObjectRecoveryCount = clockWriter.deadObjectRecoveryCount,
+            deadObjectOldTrackReleaseCount = clockWriter.deadObjectOldTrackReleaseCount,
+            deadObjectRecoveryExecutedOnSinkThread = clockWriter.deadObjectRecoveryExecutedOnSinkThread,
+            deadObjectNewTrackInitOk = clockWriter.deadObjectNewTrackInitOk,
+            deadObjectNewTrackVolumeOk = clockWriter.deadObjectNewTrackVolumeOk,
+        )
+        val deadObjectB = VanguardRealtimeAudioPlaybackSinkTelemetryDeadObjectB(
+            deadObjectNewTrackPlayOk = clockWriter.deadObjectNewTrackPlayOk,
+            deadObjectNewTrackPlayState = clockWriter.deadObjectNewTrackPlayState,
+            deadObjectNewTrackSameBuffer = clockWriter.deadObjectNewTrackSameBuffer,
+            audioTrackBufferFrames = audioTrackBufferFrames,
+            deadObjectNewTrackBufferFrames = clockWriter.deadObjectNewTrackBufferFrames,
+            deadObjectRecoveryWallMs = clockWriter.deadObjectRecoveryWallMs,
+            deadObjectEpochBeforeRecovery = clockWriter.deadObjectEpochBeforeRecovery,
+            deadObjectEpochOpenedAfterRecovery = clockWriter.deadObjectEpochOpenedAfterRecovery,
+        )
+        val deadObjectC = VanguardRealtimeAudioPlaybackSinkTelemetryDeadObjectC(
+            deadObjectEpochCloseAccepted = clockWriter.deadObjectEpochCloseAccepted,
+            deadObjectEpochOpenAccepted = clockWriter.deadObjectEpochOpenAccepted,
+            deadObjectPositionBeforeRecovery = clockWriter.deadObjectPositionBeforeRecovery,
+            deadObjectBaseFrameAfterRecovery = clockWriter.deadObjectBaseFrameAfterRecovery,
+            deadObjectBaseStepFrames = clockWriter.deadObjectBaseStepFrames,
+            deadObjectBaseStepBounded = clockWriter.deadObjectBaseStepBounded,
+            deadObjectContentHeadAtDeadObject = clockWriter.deadObjectContentHeadAtDeadObject,
+            deadObjectWrittenAheadOfHeadFrames = clockWriter.deadObjectWrittenAheadOfHeadFrames,
+        )
+        val deadObjectD = VanguardRealtimeAudioPlaybackSinkTelemetryDeadObjectD(
+            deadObjectPublicationLagFrames = clockWriter.deadObjectPublicationLagFrames,
+            deadObjectBaseStepDecompositionOk = clockWriter.deadObjectBaseStepDecompositionOk,
+            deadObjectClockProvenanceAtRecovery = clockWriter.deadObjectClockProvenanceAtRecovery,
+            deadObjectClockLastAgeNsAtRecovery = clockWriter.deadObjectClockLastAgeNsAtRecovery,
+            deadObjectSliceBytesAtRecovery = clockWriter.deadObjectSliceBytesAtRecovery,
+            deadObjectUnwrittenBytesAtRecovery = clockWriter.deadObjectUnwrittenBytesAtRecovery,
+            deadObjectBufferPositionAtRecovery = clockWriter.deadObjectBufferPositionAtRecovery,
+            deadObjectFramesReadAtRecovery = clockWriter.deadObjectFramesReadAtRecovery,
+        )
+        val deadObjectE = VanguardRealtimeAudioPlaybackSinkTelemetryDeadObjectE(
+            deadObjectFramesWrittenBeforeRecovery = clockWriter.deadObjectFramesWrittenBeforeRecovery,
+            deadObjectRemainderFramesExpected = clockWriter.deadObjectRemainderFramesExpected,
+            deadObjectRemainderFramesWrittenOnNewTrack = clockWriter.deadObjectRemainderFramesWrittenOnNewTrack,
+            deadObjectRemainderAccountingOk = clockWriter.deadObjectRemainderAccountingOk,
+            deadObjectTimestampPollsDuringRecovery = clockWriter.deadObjectTimestampPollsDuringRecovery,
+            clockSnapshotsAtDeadObjectRecovery = clockWriter.clockSnapshotsAtDeadObjectRecovery,
+            playbackHeadAtDeadObject = clockWriter.playbackHeadAtDeadObject,
+        )
+        val seekFlushA = VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushA(
+            maxSeekHoldMs = config.maxSeekHoldMs,
+            seekParkCount = seekParkCount,
+            parkHoldCapMs = parkHoldCapMs,
+            flushRequestCount = flushRequestCount,
+            flushCount = flushCount,
+            flushExecutedOnSinkThread = flushExecutedOnSinkThread,
+            flushAckLatencyMs = flushAckLatencyMs,
+        )
+        val seekFlushB = VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushB(
+            playStateBeforeFlush = playStateBeforeFlush,
+            playStateAfterFlush = playStateAfterFlush,
+            playbackHeadBeforeFlush = playbackHeadBeforeFlush,
+            playbackHeadAfterFlush = playbackHeadAfterFlush,
+            framesWrittenAtFlush = framesWrittenAtFlush,
+            framesReadAtFlush = framesReadAtFlush,
+            drainCallsAtFlush = drainCallsAtFlush,
+        )
+        val seekFlushC = VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushC(
+            timestampPollsDuringFlush = timestampPollsDuringFlush,
+            postSeekExpectedFrames = postSeekExpectedFrames,
+            readBudgetFrames = readBudgetFrames,
+            seekTargetFrame = seekTargetFrame,
+            seekEpochOpenedAtUnpark = seekEpochOpenedAtUnpark,
+            seekEpochBaseFrame = seekEpochBaseFrame,
+        )
+        val seekFlushD = VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushD(
+            seekDiscontinuityFrames = seekDiscontinuityFrames,
+            seekEpochOpenAccepted = seekEpochOpenAccepted,
+            seekUnwrapResetAtFlush = seekUnwrapResetAtFlush,
+            epochRawOriginAtUnpark = epochRawOriginAtUnpark,
+            playbackHeadAtSeekUnpark = playbackHeadAtSeekUnpark,
+            postSeekFramesWritten = if (flushCount > 0) framesWrittenToSink - framesWrittenAtFlush else 0L,
+        )
+        val presentationLagA = VanguardRealtimeAudioPlaybackSinkTelemetryPresentationLagA(
+            epochBaseFrame = clockWriter.epochBaseFrame,
+            framesWrittenAtEpochOpen = clockWriter.framesWrittenAtEpochOpen,
+            framesReadAtEpochOpen = clockWriter.framesReadAtEpochOpen,
+            presentationLagSampleCount = clockWriter.presentationLagSampleCount,
+            presentationLagBoundedSampleCount = clockWriter.presentationLagBoundedSampleCount,
+            presentationLagExcludedSampleCount = clockWriter.presentationLagExcludedSampleCount,
+        )
+        val presentationLagB = VanguardRealtimeAudioPlaybackSinkTelemetryPresentationLagB(
+            lastPresentationLagFrames = clockWriter.lastPresentationLagFrames,
+            minPresentationLagFrames = clockWriter.minPresentationLagFrames,
+            maxPresentationLagFrames = clockWriter.maxPresentationLagFrames,
+            presentationLagLowerBoundFrames = clockWriter.presentationLagLowerBoundFrames,
+            presentationLagUpperBoundFrames = clockWriter.presentationLagUpperBoundFrames,
+            lastPositionFramesAtPoll = clockWriter.lastPositionFramesAtPoll,
+        )
+        val presentationLagC = VanguardRealtimeAudioPlaybackSinkTelemetryPresentationLagC(
+            lastPositionUsAtPoll = clockWriter.lastPositionUsAtPoll,
+            positionAtEosFrames = clockWriter.positionAtEosFrames,
+            positionAtEosUs = clockWriter.positionAtEosUs,
+            currentPositionReadsFromWriterThread = clockWriter.currentPositionReadsFromWriterThread,
+            currentPositionReadsFromOtherThreads = clockWriter.currentPositionReadsFromOtherThreads,
+        )
+        val driftA = VanguardRealtimeAudioPlaybackSinkTelemetryDriftA(
+            driftSamplesPosted = driftSamplesPosted,
+            driftSamplesSkipped = driftSamplesSkipped,
+            driftSamplesDropped = driftSamplesDropped,
+            driftCallbackCount = driftCallbackCount.get(),
+            driftSamplesRecorded = driftSamplesRecorded.get(),
+            driftSamplesStaleRejected = driftSamplesStaleRejected.get(),
+        )
+        val driftB = VanguardRealtimeAudioPlaybackSinkTelemetryDriftB(
+            driftSamplesOtherRejected = driftSamplesOtherRejected.get(),
+            driftLastRejectReason = driftLastRejectReason,
+            driftMaxQueueLatencyNs = driftMaxQueueLatencyNs.get(),
+            driftLastPostedGeneration = driftLastPostedGeneration,
+            driftLastExpectedPtsUs = lastDriftReply?.nativeClockLastDriftExpectedPtsUs ?: -1L,
+            driftLastReportedPtsUs = lastDriftReply?.nativeClockLastDriftReportedPtsUs ?: -1L,
+        )
+        val driftC = VanguardRealtimeAudioPlaybackSinkTelemetryDriftC(
+            driftLastDeltaUs = lastDriftReply?.nativeClockLastDriftDeltaUs ?: 0L,
+            driftLastReportedFrame = lastDriftReply?.nativeDriftLastReportedFrame ?: -1L,
+            driftNativeSampleCount = lastDriftReply?.nativeClockDriftSampleCount ?: 0L,
+            driftNativeSamplesRecorded = lastDriftReply?.nativeDriftSamplesRecorded ?: 0L,
+            driftNativeSamplesRejected = lastDriftReply?.nativeDriftSamplesRejected ?: 0L,
+        )
+        val coreBundle = VanguardRealtimeAudioPlaybackSinkTelemetryCoreBundle(
+            core = core,
+            gainQueue = gainQueue,
+            trackLifecycle = trackLifecycle,
+            writePath = writePath,
+            drainSummary = drainSummary,
+        )
+        val clockParkBundle = VanguardRealtimeAudioPlaybackSinkTelemetryClockParkBundle(
+            clockPollA = clockPollA,
+            clockPollB = clockPollB,
+            parkA = parkA,
+            parkB = parkB,
+            parkC = parkC,
+        )
+        val deadObjectBundle = VanguardRealtimeAudioPlaybackSinkTelemetryDeadObjectBundle(
+            deadObjectA = deadObjectA,
+            deadObjectB = deadObjectB,
+            deadObjectC = deadObjectC,
+            deadObjectD = deadObjectD,
+            deadObjectE = deadObjectE,
+        )
+        val seekFlushBundle = VanguardRealtimeAudioPlaybackSinkTelemetrySeekFlushBundle(
+            seekFlushA = seekFlushA,
+            seekFlushB = seekFlushB,
+            seekFlushC = seekFlushC,
+            seekFlushD = seekFlushD,
+        )
+        val lagDriftBundle = VanguardRealtimeAudioPlaybackSinkTelemetryLagDriftBundle(
+            presentationLagA = presentationLagA,
+            presentationLagB = presentationLagB,
+            presentationLagC = presentationLagC,
+            driftA = driftA,
+            driftB = driftB,
+            driftC = driftC,
+        )
+        return VanguardRealtimeAudioPlaybackSinkTelemetry(
+            coreBundle = coreBundle,
+            clockParkBundle = clockParkBundle,
+            deadObjectBundle = deadObjectBundle,
+            seekFlushBundle = seekFlushBundle,
+            lagDriftBundle = lagDriftBundle,
+        )
+    }
 
     // ── Sink thread body ───────────────────────────────────────────────────
 
@@ -1016,7 +1162,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             false
         }
         val head = rawHead()
-        clockWriter.recordTimestampPoll(
+        val honestPosition = clockWriter.recordTimestampPoll(
             available,
             audioTimestamp.framePosition and 0xFFFF_FFFFL,
             audioTimestamp.nanoTime,
@@ -1026,6 +1172,53 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             audioTrackBufferFrames,
             config.maxFramesPerMix,
         )
+        // Y16: the ONLY drift-sample emission point (class comment).
+        if (honestPosition) emitDriftSample() else driftSamplesSkipped++
+    }
+
+    // Y16 (sink thread only): hands the presentation clock's position just
+    // published by this poll to the transport owner thread as a
+    // generation-pinned drift sample. Fire-and-forget: never blocks, never
+    // throws back into the drain loop, never reads the result for any
+    // decision. The callback runs on the owner thread (inline only on a
+    // post-dispose rejection) and only updates the atomic tallies.
+    private fun emitDriftSample() {
+        val reportedFrame = clockWriter.lastPositionFramesAtPoll
+        val reportedPtsUs = clockWriter.lastPositionUsAtPoll
+        if (reportedFrame < 0L || reportedPtsUs < 0L) {
+            driftSamplesSkipped++
+            return
+        }
+        if (driftInFlight.get() >= MAX_DRIFT_SAMPLES_IN_FLIGHT) {
+            driftSamplesDropped++
+            return
+        }
+        val machine = config.stateMachine
+        val generation = machine.currentGeneration
+        val postedAtNs = SystemClock.elapsedRealtimeNanos() // Kotlin-only queue latency diagnostic
+        driftInFlight.incrementAndGet()
+        driftLastPostedGeneration = generation
+        driftSamplesPosted++
+        machine.postDriftSample(
+            VanguardRealtimePlaybackTransportStateMachine.DriftSampleRequest(reportedPtsUs, reportedFrame),
+            expectedGeneration = generation,
+        ) { result ->
+            driftInFlight.decrementAndGet()
+            driftCallbackCount.incrementAndGet()
+            val latencyNs = SystemClock.elapsedRealtimeNanos() - postedAtNs
+            driftMaxQueueLatencyNs.accumulateAndGet(latencyNs) { a, b -> if (a >= b) a else b }
+            if (result.accepted) {
+                driftSamplesRecorded.incrementAndGet()
+                result.reply?.let { lastDriftReply = it }
+            } else {
+                if (result.reason == VanguardRealtimePlaybackTransportStateMachine.REASON_STALE_GENERATION) {
+                    driftSamplesStaleRejected.incrementAndGet()
+                } else {
+                    driftSamplesOtherRejected.incrementAndGet()
+                }
+                driftLastRejectReason = result.reason
+            }
+        }
     }
 
     // ── Y9 flush (sink thread only, while PARKED on a seek park, once) ─────

@@ -20,6 +20,11 @@ import java.nio.ByteBuffer
 // default (0) keeps every track native-synthetic, so existing callers are
 // unchanged. This wrapper still carries no policy: which ingest statuses
 // are terminal is decided by the transport state machine.
+//
+// Y16 (CLOCK-DRIFT-SAMPLE-OWNERSHIP): [recordDriftSample] forwards one
+// reported presentation position to the native worker-owned AudioClock;
+// no Kotlin timebase is ever passed, and the Reply mirrors the native
+// drift fields read-only.
 class VanguardRealtimePlaybackNativeSession private constructor(
     val handle: Long,
     val config: Config,
@@ -131,6 +136,17 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         val nativeClockSpeedDenominator: Int,
         val nativeClockDriftSampleCount: Long,
         val nativeClockLastDriftDeltaUs: Long,
+        // Y16 (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP):
+        // drift-sample ingestion mirror on every full reply. Expected /
+        // reported are the native AudioClock's last recorded pair (expected
+        // computed by the worker at record time); recorded/rejected are
+        // worker-lifetime tallies; lastReportedFrame is -1 until one sample
+        // was recorded. Parse-compatible defaults for older native builds.
+        val nativeClockLastDriftExpectedPtsUs: Long,
+        val nativeClockLastDriftReportedPtsUs: Long,
+        val nativeDriftLastReportedFrame: Long,
+        val nativeDriftSamplesRecorded: Long,
+        val nativeDriftSamplesRejected: Long,
         val raw: String,
     ) {
         val ok: Boolean get() = status == STATUS_OK
@@ -164,6 +180,10 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         const val STATUS_TRACK_NOT_EXTERNAL = "track_not_external"
         const val STATUS_WORKER_EXITED = "worker_exited"
         const val MAX_INGEST_FRAMES = 8_192
+
+        // Y16 drift-sample rejection statuses (native tokens, nonterminal).
+        const val STATUS_NO_CLOCK = "no_clock"
+        const val STATUS_DRIFT_SAMPLE_REJECTED = "drift_sample_rejected"
 
         // Mirrors the native admission table exactly (AudioMixBusNode /
         // DecodedAudioPcmSourceNode / AudioDecoderRingWriter bounds).
@@ -280,6 +300,11 @@ class VanguardRealtimePlaybackNativeSession private constructor(
                 nativeClockSpeedDenominator = kv["nativeClockSpeedDenominator"]?.toIntOrNull() ?: 1,
                 nativeClockDriftSampleCount = long("nativeClockDriftSampleCount"),
                 nativeClockLastDriftDeltaUs = long("nativeClockLastDriftDeltaUs"),
+                nativeClockLastDriftExpectedPtsUs = long("nativeClockLastDriftExpectedPtsUs"),
+                nativeClockLastDriftReportedPtsUs = long("nativeClockLastDriftReportedPtsUs"),
+                nativeDriftLastReportedFrame = kv["nativeDriftLastReportedFrame"]?.toLongOrNull() ?: -1L,
+                nativeDriftSamplesRecorded = long("nativeDriftSamplesRecorded"),
+                nativeDriftSamplesRejected = long("nativeDriftSamplesRejected"),
                 raw = raw,
             )
         }
@@ -332,6 +357,17 @@ class VanguardRealtimePlaybackNativeSession private constructor(
     fun ingest(trackIndex: Int, src: ByteBuffer, frameCount: Int, expectedStartFrame: Long): Reply = guarded {
         VanguardRealtimePlaybackNativeBridge.ingestRealtimePlaybackGraphSessionExternalPcm16(
             handle, trackIndex, src, frameCount, config.sampleRate, config.channelCount, expectedStartFrame,
+        )
+    }
+
+    // Y16: owner-thread drift-sample ingestion. Carries only the Kotlin
+    // presentation clock's reported position (us + frame); the native
+    // worker stamps its own steady clock and computes the expected position.
+    // Which rejection statuses are terminal is decided by the transport
+    // state machine (this wrapper still carries no policy).
+    fun recordDriftSample(reportedPtsUs: Long, reportedFrame: Long): Reply = guarded {
+        VanguardRealtimePlaybackNativeBridge.recordDriftSampleRealtimePlaybackGraphSession(
+            handle, reportedPtsUs, reportedFrame,
         )
     }
 

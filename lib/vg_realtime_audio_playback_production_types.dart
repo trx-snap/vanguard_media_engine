@@ -7,8 +7,9 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE (Y13) +
 // P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT (Y14) +
-// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION (Y15): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, and clock correlation diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION (Y15) +
+// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, and drift sample ownership diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
@@ -28,7 +29,7 @@
 //  10. Route disconnect while paused by focus policy: public resume blocked and focus auto-resume blocked.
 //  11. Presentation clock query surface with off-thread poller to EOS, clock correlation observation, and post-teardown latched read.
 //
-// Required proof lanes (56 native lanes plus canonical equals 57 total lanes):
+// Required proof lanes (60 native lanes plus canonical equals 61 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -85,10 +86,14 @@
 //  54. nativeAudioClockSnapshotPublishedOk: native audio clock snapshot published with non-blank state and non-negative positions
 //  55. clockCorrelationTelemetryOk: presentation clock snapshot consistent and correlation offset telemetry present
 //  56. clockObservationNoFeedbackOk: clock correlation observation executed without feedback or transport mutation
+//  57. driftSampleWorkerOwnedOk: drift samples posted on sink worker thread and verified
+//  58. driftSampleGenerationPinnedOk: drift sample generation pinned and stale generation rejected
+//  59. driftSampleNoFeedbackOk: drift sample observation without feedback or pacing mutation
+//  60. clockAuthorityUnchangedOk: clock authority and query surface unchanged
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -184,6 +189,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.nativeAudioClockSnapshotPublishedOk,
     required this.clockCorrelationTelemetryOk,
     required this.clockObservationNoFeedbackOk,
+    required this.driftSampleWorkerOwnedOk,
+    required this.driftSampleGenerationPinnedOk,
+    required this.driftSampleNoFeedbackOk,
+    required this.clockAuthorityUnchangedOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -212,7 +221,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_native_clock_drift_sample_ownership_generation_pinned_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -272,6 +281,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'nativeAudioClockSnapshotPublishedOk',
     'clockCorrelationTelemetryOk',
     'clockObservationNoFeedbackOk',
+    'driftSampleWorkerOwnedOk',
+    'driftSampleGenerationPinnedOk',
+    'driftSampleNoFeedbackOk',
+    'clockAuthorityUnchangedOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -471,6 +484,18 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether clock correlation observation executed without feedback or transport command mutation.
   final bool clockObservationNoFeedbackOk;
 
+  /// Whether drift samples were posted and recorded on the sink worker thread.
+  final bool driftSampleWorkerOwnedOk;
+
+  /// Whether drift sample generation was pinned and stale generation was rejected.
+  final bool driftSampleGenerationPinnedOk;
+
+  /// Whether drift sample observation operated without feedback or pacing mutation.
+  final bool driftSampleNoFeedbackOk;
+
+  /// Whether presentation clock authority remained unchanged across drift sampling.
+  final bool clockAuthorityUnchangedOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -557,7 +582,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       positionQueryPostTeardownLatchedOk &&
       nativeAudioClockSnapshotPublishedOk &&
       clockCorrelationTelemetryOk &&
-      clockObservationNoFeedbackOk;
+      clockObservationNoFeedbackOk &&
+      driftSampleWorkerOwnedOk &&
+      driftSampleGenerationPinnedOk &&
+      driftSampleNoFeedbackOk &&
+      clockAuthorityUnchangedOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -638,6 +667,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         nativeAudioClockSnapshotPublishedOk: false,
         clockCorrelationTelemetryOk: false,
         clockObservationNoFeedbackOk: false,
+        driftSampleWorkerOwnedOk: false,
+        driftSampleGenerationPinnedOk: false,
+        driftSampleNoFeedbackOk: false,
+        clockAuthorityUnchangedOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -819,6 +852,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final clockObservationNoFeedbackOk = parseBool(
       'clockObservationNoFeedbackOk',
     );
+    final driftSampleWorkerOwnedOk = parseBool('driftSampleWorkerOwnedOk');
+    final driftSampleGenerationPinnedOk = parseBool(
+      'driftSampleGenerationPinnedOk',
+    );
+    final driftSampleNoFeedbackOk = parseBool('driftSampleNoFeedbackOk');
+    final clockAuthorityUnchangedOk = parseBool('clockAuthorityUnchangedOk');
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -883,7 +922,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         positionQueryPostTeardownLatchedOk &&
         nativeAudioClockSnapshotPublishedOk &&
         clockCorrelationTelemetryOk &&
-        clockObservationNoFeedbackOk;
+        clockObservationNoFeedbackOk &&
+        driftSampleWorkerOwnedOk &&
+        driftSampleGenerationPinnedOk &&
+        driftSampleNoFeedbackOk &&
+        clockAuthorityUnchangedOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -1003,6 +1046,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
           nativeAudioClockSnapshotPublishedOk,
       'clockCorrelationTelemetryOk': clockCorrelationTelemetryOk,
       'clockObservationNoFeedbackOk': clockObservationNoFeedbackOk,
+      'driftSampleWorkerOwnedOk': driftSampleWorkerOwnedOk,
+      'driftSampleGenerationPinnedOk': driftSampleGenerationPinnedOk,
+      'driftSampleNoFeedbackOk': driftSampleNoFeedbackOk,
+      'clockAuthorityUnchangedOk': clockAuthorityUnchangedOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -1073,6 +1120,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       nativeAudioClockSnapshotPublishedOk: nativeAudioClockSnapshotPublishedOk,
       clockCorrelationTelemetryOk: clockCorrelationTelemetryOk,
       clockObservationNoFeedbackOk: clockObservationNoFeedbackOk,
+      driftSampleWorkerOwnedOk: driftSampleWorkerOwnedOk,
+      driftSampleGenerationPinnedOk: driftSampleGenerationPinnedOk,
+      driftSampleNoFeedbackOk: driftSampleNoFeedbackOk,
+      clockAuthorityUnchangedOk: clockAuthorityUnchangedOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -1179,6 +1230,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       nativeAudioClockSnapshotPublishedOk: false,
       clockCorrelationTelemetryOk: false,
       clockObservationNoFeedbackOk: false,
+      driftSampleWorkerOwnedOk: false,
+      driftSampleGenerationPinnedOk: false,
+      driftSampleNoFeedbackOk: false,
+      clockAuthorityUnchangedOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1346,6 +1401,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
             nativeAudioClockSnapshotPublishedOk &&
         other.clockCorrelationTelemetryOk == clockCorrelationTelemetryOk &&
         other.clockObservationNoFeedbackOk == clockObservationNoFeedbackOk &&
+        other.driftSampleWorkerOwnedOk == driftSampleWorkerOwnedOk &&
+        other.driftSampleGenerationPinnedOk == driftSampleGenerationPinnedOk &&
+        other.driftSampleNoFeedbackOk == driftSampleNoFeedbackOk &&
+        other.clockAuthorityUnchangedOk == clockAuthorityUnchangedOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1415,6 +1474,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     nativeAudioClockSnapshotPublishedOk,
     clockCorrelationTelemetryOk,
     clockObservationNoFeedbackOk,
+    driftSampleWorkerOwnedOk,
+    driftSampleGenerationPinnedOk,
+    driftSampleNoFeedbackOk,
+    clockAuthorityUnchangedOk,
     canonical,
   ]);
 
@@ -1465,6 +1528,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'nativeAudioClockSnapshotPublishedOk: $nativeAudioClockSnapshotPublishedOk, '
       'clockCorrelationTelemetryOk: $clockCorrelationTelemetryOk, '
       'clockObservationNoFeedbackOk: $clockObservationNoFeedbackOk, '
+      'driftSampleWorkerOwnedOk: $driftSampleWorkerOwnedOk, '
+      'driftSampleGenerationPinnedOk: $driftSampleGenerationPinnedOk, '
+      'driftSampleNoFeedbackOk: $driftSampleNoFeedbackOk, '
+      'clockAuthorityUnchangedOk: $clockAuthorityUnchangedOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 
@@ -1842,4 +1909,277 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
               as num?)
           ?.toInt() ??
       -1;
+
+  // ---- Clock Drift Sample Ownership Getters (Y16) -------------------------
+
+  /// Drift samples posted count.
+  int get driftSamplesPosted =>
+      (metrics['driftSamplesPosted'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftSamplesPosted']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Drift samples skipped count.
+  int get driftSamplesSkipped =>
+      (metrics['driftSamplesSkipped'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftSamplesSkipped']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Drift samples dropped count.
+  int get driftSamplesDropped =>
+      (metrics['driftSamplesDropped'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftSamplesDropped']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Drift callback invocation count.
+  int get driftCallbackCount =>
+      (metrics['driftCallbackCount'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftCallbackCount']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Drift samples recorded count.
+  int get driftSamplesRecorded =>
+      (metrics['driftSamplesRecorded'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftSamplesRecorded']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Drift samples rejected due to stale generation count.
+  int get driftSamplesStaleRejected =>
+      (metrics['driftSamplesStaleRejected'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftSamplesStaleRejected']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Drift samples rejected due to other reasons count.
+  int get driftSamplesOtherRejected =>
+      (metrics['driftSamplesOtherRejected'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftSamplesOtherRejected']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Last reject reason token for drift samples.
+  String get driftLastRejectReason =>
+      metrics['driftLastRejectReason']?.toString() ??
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['driftLastRejectReason']
+          ?.toString() ??
+      '';
+
+  /// Maximum queue latency in nanoseconds for drift samples.
+  int get driftMaxQueueLatencyNs =>
+      (metrics['driftMaxQueueLatencyNs'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftMaxQueueLatencyNs']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Last posted generation for drift samples.
+  int get driftLastPostedGeneration =>
+      (metrics['driftLastPostedGeneration'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftLastPostedGeneration']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Last expected PTS in microseconds for drift samples.
+  int get driftLastExpectedPtsUs =>
+      (metrics['driftLastExpectedPtsUs'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftLastExpectedPtsUs']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Last reported PTS in microseconds for drift samples.
+  int get driftLastReportedPtsUs =>
+      (metrics['driftLastReportedPtsUs'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftLastReportedPtsUs']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Last drift delta in microseconds.
+  int get driftLastDeltaUs =>
+      (metrics['driftLastDeltaUs'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftLastDeltaUs']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Last reported frame for drift samples.
+  int get driftLastReportedFrame =>
+      (metrics['driftLastReportedFrame'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftLastReportedFrame']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native clock drift sample count.
+  int get driftNativeSampleCount =>
+      (metrics['driftNativeSampleCount'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftNativeSampleCount']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native drift samples recorded count.
+  int get driftNativeSamplesRecorded =>
+      (metrics['driftNativeSamplesRecorded'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftNativeSamplesRecorded']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native drift samples rejected count.
+  int get driftNativeSamplesRejected =>
+      (metrics['driftNativeSamplesRejected'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['driftNativeSamplesRejected']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  // ---- Stale Probe Getters (Y16) ------------------------------------------
+
+  /// Whether deliberate stale probe was attempted.
+  bool get staleProbeAttempted =>
+      metrics['staleProbeAttempted'] == true ||
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['staleProbeAttempted'] ==
+          true;
+
+  /// Return value of postDriftSample for stale probe.
+  bool get staleProbePostReturn =>
+      metrics['staleProbePostReturn'] == true ||
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['staleProbePostReturn'] ==
+          true;
+
+  /// Stale probe callback invocation count.
+  int get staleProbeCallbackCount =>
+      (metrics['staleProbeCallbackCount'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeCallbackCount']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Stale probe stale rejected count.
+  int get staleProbeStaleRejectedCount =>
+      (metrics['staleProbeStaleRejectedCount'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeStaleRejectedCount']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Stale probe reject reason token.
+  String get staleProbeReason =>
+      metrics['staleProbeReason']?.toString() ??
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['staleProbeReason']
+          ?.toString() ??
+      '';
+
+  /// Whether stale probe was accepted.
+  bool get staleProbeAccepted =>
+      metrics['staleProbeAccepted'] == true ||
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['staleProbeAccepted'] ==
+          true;
+
+  /// Native recorded drift samples before stale probe.
+  int get staleProbeNativeRecordedBefore =>
+      (metrics['staleProbeNativeRecordedBefore'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeNativeRecordedBefore']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native recorded drift samples after stale probe.
+  int get staleProbeNativeRecordedAfter =>
+      (metrics['staleProbeNativeRecordedAfter'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeNativeRecordedAfter']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native sample count before stale probe.
+  int get staleProbeNativeCountBefore =>
+      (metrics['staleProbeNativeCountBefore'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeNativeCountBefore']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native sample count after stale probe.
+  int get staleProbeNativeCountAfter =>
+      (metrics['staleProbeNativeCountAfter'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeNativeCountAfter']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Transport commandsIssued before stale probe.
+  int get staleProbeCommandsBefore =>
+      (metrics['staleProbeCommandsBefore'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeCommandsBefore']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Transport commandsIssued after stale probe.
+  int get staleProbeCommandsAfter =>
+      (metrics['staleProbeCommandsAfter'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['staleProbeCommandsAfter']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// State machine state name before stale probe.
+  String get staleProbeStateBefore =>
+      metrics['staleProbeStateBefore']?.toString() ??
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['staleProbeStateBefore']
+          ?.toString() ??
+      '';
+
+  /// State machine state name after stale probe.
+  String get staleProbeStateAfter =>
+      metrics['staleProbeStateAfter']?.toString() ??
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['staleProbeStateAfter']
+          ?.toString() ??
+      '';
 }

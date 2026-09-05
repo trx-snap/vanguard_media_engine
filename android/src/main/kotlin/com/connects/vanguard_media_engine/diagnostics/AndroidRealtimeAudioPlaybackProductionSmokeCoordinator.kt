@@ -20,7 +20,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
- * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12):
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
+ * P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP (Y16):
  * production-component diagnostic smoke coordinator.
  *
  * Owns the [METHOD_NAME] MethodChannel route only. It drives the PRODUCTION
@@ -123,8 +124,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_" +
                 "position_query_lifecycle_pause_seek_dead_object_teardown_" +
                 "native_clock_correlation_observation_no_feedback_" +
+                "native_clock_drift_sample_ownership_generation_pinned_no_feedback_" +
                 "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_" +
+                "no_feedback_control_loop_no_pacing_correction_no_resampling_no_av_sync_closure_" +
+                "no_real_os_call_bt_route_arbitration_no_acoustic_loudness_snr_claim_" +
                 "no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback"
 
         const val SCENARIO_PLAYTHROUGH = "PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS"
@@ -222,6 +226,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_NATIVE_AUDIO_CLOCK_SNAPSHOT_PUBLISHED = "nativeAudioClockSnapshotPublishedOk"
         const val LANE_CLOCK_CORRELATION_TELEMETRY = "clockCorrelationTelemetryOk"
         const val LANE_CLOCK_OBSERVATION_NO_FEEDBACK = "clockObservationNoFeedbackOk"
+        // Y16 lanes, evaluated by drift sample ownership and query surface.
+        const val LANE_DRIFT_SAMPLE_WORKER_OWNED = "driftSampleWorkerOwnedOk"
+        const val LANE_DRIFT_SAMPLE_GENERATION_PINNED = "driftSampleGenerationPinnedOk"
+        const val LANE_DRIFT_SAMPLE_NO_FEEDBACK = "driftSampleNoFeedbackOk"
+        const val LANE_CLOCK_AUTHORITY_UNCHANGED = "clockAuthorityUnchangedOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -249,6 +258,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_NATIVE_AUDIO_CLOCK_SNAPSHOT_PUBLISHED,
             LANE_CLOCK_CORRELATION_TELEMETRY,
             LANE_CLOCK_OBSERVATION_NO_FEEDBACK,
+            LANE_DRIFT_SAMPLE_WORKER_OWNED,
+            LANE_DRIFT_SAMPLE_GENERATION_PINNED,
+            LANE_DRIFT_SAMPLE_NO_FEEDBACK,
+            LANE_CLOCK_AUTHORITY_UNCHANGED,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -275,10 +288,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "position_at_eos_no_runaway",
             "position_query_lifecycle_pause_seek_dead_object_teardown",
             "native_clock_correlation_observation_no_feedback",
+            "native_clock_drift_sample_ownership_generation_pinned_no_feedback",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
-            "no_streaming", "no_cache", "no_audio_clock_mutator_changes",
-            "no_clock_feedback_no_pacing_feedback",
+            "no_streaming", "no_cache",
+            "no_feedback_control_loop", "no_pacing_correction", "no_resampling", "no_av_sync_closure",
+            "no_real_os_call_bt_route_arbitration", "no_acoustic_loudness_snr_claim",
+            "no_audio_clock_mutator_changes", "no_clock_feedback_no_pacing_feedback",
         )
 
         private const val FAILURE_SOURCE_PATH_REQUIRED = "source_path_required"
@@ -1338,7 +1354,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             final.decoderAcceptedFrames < declared
     }
 
-    // ── Scenario 11 (Y13/Y14): load/start -> active playback with off-thread
+    // ── Scenario 11 (Y13/Y14/Y15/Y16): load/start -> active playback with off-thread
     //    presentation clock poller -> EOS -> post-teardown latched read ────
 
     private fun presentationClockQuerySurfaceScenario(
@@ -1347,6 +1363,72 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out: ScenarioOutcome,
     ) {
         startAndAwaitAudio(session)
+
+        // Y16: perform explicit one-off stale drift-sample probe while playing
+        val transportField = try {
+            VanguardRealtimeAudioPlaybackSession::class.java.getDeclaredField("transport").apply {
+                isAccessible = true
+            }
+        } catch (_: Throwable) {
+            null
+        }
+        val machine = transportField?.get(session) as? VanguardRealtimePlaybackTransportStateMachine
+        if (machine != null) {
+            val curGen = machine.currentGeneration
+            val staleGen = curGen - 1L
+            val snapBeforeStale = session.snapshot()
+            val nativeRecordedBefore = snapBeforeStale.sink?.driftNativeSamplesRecorded ?: 0L
+            val nativeCountBefore = snapBeforeStale.sink?.driftNativeSampleCount ?: 0L
+            val commandsBeforeStale = snapBeforeStale.commandsIssued
+            val stateBeforeStale = machine.currentState
+
+            var probeCallbackCount = 0L
+            var probeStaleRejectedCount = 0L
+            var probeReason = ""
+            var probeAccepted = false
+            val probeLatch = java.util.concurrent.CountDownLatch(1)
+
+            val postReturn = machine.postDriftSample(
+                VanguardRealtimePlaybackTransportStateMachine.DriftSampleRequest(
+                    reportedPtsUs = 100_000L,
+                    reportedFrame = 4_410L,
+                ),
+                expectedGeneration = staleGen,
+            ) { result ->
+                probeCallbackCount++
+                if (result.reason == VanguardRealtimePlaybackTransportStateMachine.REASON_STALE_GENERATION) {
+                    probeStaleRejectedCount++
+                }
+                probeReason = result.reason
+                probeAccepted = result.accepted
+                probeLatch.countDown()
+            }
+            probeLatch.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+            val snapAfterStale = session.snapshot()
+            val nativeRecordedAfter = snapAfterStale.sink?.driftNativeSamplesRecorded ?: 0L
+            val nativeCountAfter = snapAfterStale.sink?.driftNativeSampleCount ?: 0L
+            val commandsAfterStale = snapAfterStale.commandsIssued
+            val stateAfterStale = machine.currentState
+
+            out.metrics["staleProbeAttempted"] = true
+            out.metrics["staleProbePostReturn"] = postReturn
+            out.metrics["staleProbeCallbackCount"] = probeCallbackCount
+            out.metrics["staleProbeStaleRejectedCount"] = probeStaleRejectedCount
+            out.metrics["staleProbeReason"] = probeReason
+            out.metrics["staleProbeAccepted"] = probeAccepted
+            out.metrics["staleProbeNativeRecordedBefore"] = nativeRecordedBefore
+            out.metrics["staleProbeNativeRecordedAfter"] = nativeRecordedAfter
+            out.metrics["staleProbeNativeCountBefore"] = nativeCountBefore
+            out.metrics["staleProbeNativeCountAfter"] = nativeCountAfter
+            out.metrics["staleProbeCommandsBefore"] = commandsBeforeStale
+            out.metrics["staleProbeCommandsAfter"] = commandsAfterStale
+            out.metrics["staleProbeStateBefore"] = stateBeforeStale.name
+            out.metrics["staleProbeStateAfter"] = stateAfterStale.name
+        } else {
+            out.metrics["staleProbeAttempted"] = false
+        }
+
         var completionReached = false
         val pollerMetrics = runWithPositionPoller(session, "Y13PositionPoller") {
             completionReached = session.awaitCompletion(config.deadlineMs)
@@ -1551,6 +1633,23 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["positionAtEosUs"] = k.positionAtEosUs
             m["currentPositionReadsFromWriterThread"] = k.currentPositionReadsFromWriterThread
             m["currentPositionReadsFromOtherThreads"] = k.currentPositionReadsFromOtherThreads
+            m["driftSamplesPosted"] = k.driftSamplesPosted
+            m["driftSamplesSkipped"] = k.driftSamplesSkipped
+            m["driftSamplesDropped"] = k.driftSamplesDropped
+            m["driftCallbackCount"] = k.driftCallbackCount
+            m["driftSamplesRecorded"] = k.driftSamplesRecorded
+            m["driftSamplesStaleRejected"] = k.driftSamplesStaleRejected
+            m["driftSamplesOtherRejected"] = k.driftSamplesOtherRejected
+            m["driftLastRejectReason"] = k.driftLastRejectReason
+            m["driftMaxQueueLatencyNs"] = k.driftMaxQueueLatencyNs
+            m["driftLastPostedGeneration"] = k.driftLastPostedGeneration
+            m["driftLastExpectedPtsUs"] = k.driftLastExpectedPtsUs
+            m["driftLastReportedPtsUs"] = k.driftLastReportedPtsUs
+            m["driftLastDeltaUs"] = k.driftLastDeltaUs
+            m["driftLastReportedFrame"] = k.driftLastReportedFrame
+            m["driftNativeSampleCount"] = k.driftNativeSampleCount
+            m["driftNativeSamplesRecorded"] = k.driftNativeSamplesRecorded
+            m["driftNativeSamplesRejected"] = k.driftNativeSamplesRejected
         }
         if (c != null) {
             m["clockConsistent"] = c.consistent
@@ -1677,7 +1776,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

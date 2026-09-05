@@ -317,6 +317,13 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
     // no extra AudioTrack call); framesReadFromTransport is accepted for
     // anchor-input symmetry with [openEpoch] but the lag formula itself
     // (class comment) does not use it.
+    //
+    // Y16: returns true iff this poll produced an honest presentation
+    // position (the same accepted ANCHORED/EXTRAPOLATED + epoch-anchored
+    // eligibility the lag sample uses), so the bridge may hand
+    // [lastPositionUsAtPoll]/[lastPositionFramesAtPoll] to the native clock
+    // as a drift sample. The return value gates ONLY that diagnostic
+    // emission; no drain/gating/epoch decision reads it.
     fun recordTimestampPoll(
         available: Boolean,
         framePositionRaw: Long,
@@ -326,7 +333,7 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
         framesReadFromTransport: Long,
         audioTrackBufferFrames: Int,
         maxFramesPerMix: Int,
-    ) {
+    ): Boolean {
         val epoch = currentEpoch
         val outcome: VanguardRealtimePlaybackPresentationClock.Outcome
         if (available) {
@@ -339,7 +346,7 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
             }
             if (rebased >= FRAME_WRAP_MODULUS) {
                 clockRejectedCount++
-                return
+                return false
             }
             outcome = presentationClock.observeTimestamp(epoch, rebased, frameNanoTime)
             countClockOutcome(outcome)
@@ -348,7 +355,7 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
             outcome = presentationClock.observeTimestampUnavailable(epoch, head, System.nanoTime())
             countClockOutcome(outcome)
         }
-        recordPresentationLag(outcome, framesWrittenToSink, audioTrackBufferFrames, maxFramesPerMix)
+        return recordPresentationLag(outcome, framesWrittenToSink, audioTrackBufferFrames, maxFramesPerMix)
     }
 
     // Y13 bounded diagnostic only (class comment): never fails closed, never
@@ -356,13 +363,13 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
     // only for an accepted ANCHORED/EXTRAPOLATED outcome with an epoch-open
     // anchor on record; every other outcome (RESET/STALE/no-anchor/rejected)
     // is excluded and counted separately, honestly, with no nonnegative-lag
-    // claim.
+    // claim. Returns that same eligibility (Y16 drift-sample gate).
     private fun recordPresentationLag(
         outcome: VanguardRealtimePlaybackPresentationClock.Outcome,
         framesWrittenToSink: Long,
         audioTrackBufferFrames: Int,
         maxFramesPerMix: Int,
-    ) {
+    ): Boolean {
         val positionFrames = presentationClock.currentPositionFrames()
         lastPositionFramesAtPoll = positionFrames
         lastPositionUsAtPoll = VanguardRealtimePlaybackPresentationClock.framesToUs(positionFrames, presentationClock.sampleRate)
@@ -370,7 +377,7 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
             outcome == VanguardRealtimePlaybackPresentationClock.Outcome.ACCEPTED_EXTRAPOLATED
         if (!eligible || epochBaseFrame < 0L) {
             presentationLagExcludedSampleCount++
-            return
+            return false
         }
         val lag = (framesWrittenToSink - framesWrittenAtEpochOpen) - (positionFrames - epochBaseFrame)
         presentationLagSampleCount++
@@ -391,5 +398,6 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
         presentationLagLowerBoundFrames = lower
         presentationLagUpperBoundFrames = upper
         if (lag in lower..upper) presentationLagBoundedSampleCount++
+        return true
     }
 }

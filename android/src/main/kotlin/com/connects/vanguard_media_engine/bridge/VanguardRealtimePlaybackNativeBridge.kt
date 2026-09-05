@@ -26,6 +26,13 @@ import java.nio.ByteBuffer
 //   direct buffer into that track's source ring. Decoder/background
 //   threads must never call it directly: route through
 //   VanguardRealtimePlaybackTransportStateMachine.ingest/postIngest.
+// - Y16 (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-DRIFT-SAMPLE-OWNERSHIP):
+//   [recordDriftSampleRealtimePlaybackGraphSession] is the owner-thread
+//   entry point that hands ONE Kotlin presentation-clock position to the
+//   native worker, which alone stamps its steady clock and records the
+//   drift sample on its AudioClock. No Kotlin timebase crosses this seam.
+//   Sink/background threads must never call it directly: route through
+//   VanguardRealtimePlaybackTransportStateMachine.postDriftSample.
 //
 // Every string reply is a `;`-separated `key=value` list parsed by
 // com.connects.vanguard_media_engine.audio_playback_graph.
@@ -93,6 +100,19 @@ object VanguardRealtimePlaybackNativeBridge {
         sampleRate: Int,
         channelCount: Int,
         expectedStartFrame: Long,
+    ): String
+
+    // Y16: records one presentation-clock drift sample on the worker-owned
+    // native AudioClock. reportedPtsUs / reportedFrame are the Kotlin
+    // presentation clock's position (both must be >= 0); the worker computes
+    // `now` and the expected position itself. Statuses: ok; invalid_state
+    // (native not playing), invalid_args, no_clock, drift_sample_rejected
+    // (nonterminal, no mutation); wrong_owner_thread / not_found /
+    // worker_exited / command_busy / command_timeout. Never changes state.
+    external fun recordDriftSampleRealtimePlaybackGraphSession(
+        handle: Long,
+        reportedPtsUs: Long,
+        reportedFrame: Long,
     ): String
 
     external fun snapshotRealtimePlaybackGraphSession(handle: Long): String
