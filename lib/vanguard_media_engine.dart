@@ -38,6 +38,8 @@ export 'vg_camera2_concurrent_session_validation.dart';
 export 'vg_dual_camera_capability_policy.dart';
 // P3-CAM-DUET-CAPABILITY-ADMISSION-ROUTE: Duet dual-camera capability admission physical smoke foundation.
 export 'vg_duet_dual_camera_capability_smoke.dart';
+// P3-CAM-DUET-SESSION-ADMISSION-ROUTE: Duet dual-camera capability-gated session admission wrapper and launcher.
+export 'vg_duet_camera_session.dart';
 // Phase 3-Unit H: Android Camera2 single-camera open/close lifecycle smoke foundation.
 export 'vg_camera2_open_close_smoke.dart';
 // Phase 3-Unit I: Android Camera2 single-camera ImageReader frame smoke foundation.

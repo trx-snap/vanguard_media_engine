@@ -31,6 +31,7 @@ import 'vg_live_preview_config.dart';
 import 'vg_recording_stats.dart';
 import 'vg_multicam_recording_stats.dart';
 import 'vg_dual_camera_capability_policy.dart';
+import 'vg_duet_camera_session.dart';
 import 'vg_photo_capture_result.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,12 +319,12 @@ class VGMultiCamStreamingReport {
 
   @override
   int get hashCode => Object.hash(
-        frontFramesReceived,
-        backFramesReceived,
-        peakSystemPressureCost,
-        hardwareCost,
-        durationSeconds,
-      );
+    frontFramesReceived,
+    backFramesReceived,
+    peakSystemPressureCost,
+    hardwareCost,
+    durationSeconds,
+  );
 
   @override
   String toString() =>
@@ -637,12 +638,13 @@ class VGMultiCamSyncReport {
       durationSeconds: duration,
       pairingThresholdSeconds: threshold,
       // MC-8 optional fields — absent in MC-5/MC-7 native maps, default safely.
-      delegatePairedFramesReceived: _parseInt(map['delegatePairedFramesReceived']) ?? 0,
-      frontBufferWidth:             _parseInt(map['frontBufferWidth'])             ?? 0,
-      frontBufferHeight:            _parseInt(map['frontBufferHeight'])            ?? 0,
-      backBufferWidth:              _parseInt(map['backBufferWidth'])              ?? 0,
-      backBufferHeight:             _parseInt(map['backBufferHeight'])             ?? 0,
-      buffersValid:                 map['buffersValid'] as bool?                   ?? false,
+      delegatePairedFramesReceived:
+          _parseInt(map['delegatePairedFramesReceived']) ?? 0,
+      frontBufferWidth: _parseInt(map['frontBufferWidth']) ?? 0,
+      frontBufferHeight: _parseInt(map['frontBufferHeight']) ?? 0,
+      backBufferWidth: _parseInt(map['backBufferWidth']) ?? 0,
+      backBufferHeight: _parseInt(map['backBufferHeight']) ?? 0,
+      buffersValid: map['buffersValid'] as bool? ?? false,
     );
   }
 
@@ -679,24 +681,24 @@ class VGMultiCamSyncReport {
 
   @override
   int get hashCode => Object.hash(
-        pairedFramesReceived,
-        frontFramesReceived,
-        backFramesReceived,
-        unmatchedFrontFrames,
-        unmatchedBackFrames,
-        maxDriftSeconds,
-        averageDriftSeconds,
-        peakSystemPressureCost,
-        hardwareCost,
-        durationSeconds,
-        pairingThresholdSeconds,
-        delegatePairedFramesReceived,
-        frontBufferWidth,
-        frontBufferHeight,
-        backBufferWidth,
-        backBufferHeight,
-        buffersValid,
-      );
+    pairedFramesReceived,
+    frontFramesReceived,
+    backFramesReceived,
+    unmatchedFrontFrames,
+    unmatchedBackFrames,
+    maxDriftSeconds,
+    averageDriftSeconds,
+    peakSystemPressureCost,
+    hardwareCost,
+    durationSeconds,
+    pairingThresholdSeconds,
+    delegatePairedFramesReceived,
+    frontBufferWidth,
+    frontBufferHeight,
+    backBufferWidth,
+    backBufferHeight,
+    buffersValid,
+  );
 
   @override
   String toString() =>
@@ -783,8 +785,8 @@ class VGMultiCamRenderTextureSession {
     final int h = rawH is int ? rawH : (rawH is double ? rawH.toInt() : 0);
 
     return VGMultiCamRenderTextureSession(
-      textureId:    tid,
-      outputWidth:  w,
+      textureId: tid,
+      outputWidth: w,
       outputHeight: h,
     );
   }
@@ -794,8 +796,8 @@ class VGMultiCamRenderTextureSession {
       identical(this, other) ||
       other is VGMultiCamRenderTextureSession &&
           runtimeType == other.runtimeType &&
-          textureId   == other.textureId    &&
-          outputWidth == other.outputWidth  &&
+          textureId == other.textureId &&
+          outputWidth == other.outputWidth &&
           outputHeight == other.outputHeight;
 
   @override
@@ -962,18 +964,18 @@ class VGMultiCamRenderReport {
     if (duration == null) return null;
 
     return VGMultiCamRenderReport(
-      renderedFrames:       rendered,
-      droppedRenderFrames:  dropped,
-      averageRenderMs:      avgRender,
-      peakRenderMs:         peakRender,
-      outputWidth:          outW,
-      outputHeight:         outH,
+      renderedFrames: rendered,
+      droppedRenderFrames: dropped,
+      averageRenderMs: avgRender,
+      peakRenderMs: peakRender,
+      outputWidth: outW,
+      outputHeight: outH,
       pairedFramesReceived: paired,
-      frontFramesReceived:  frontFrames,
-      backFramesReceived:   backFrames,
+      frontFramesReceived: frontFrames,
+      backFramesReceived: backFrames,
       peakSystemPressureCost: peakPressure,
-      hardwareCost:         hw,
-      durationSeconds:      duration,
+      hardwareCost: hw,
+      durationSeconds: duration,
     );
   }
 
@@ -1013,19 +1015,19 @@ class VGMultiCamRenderReport {
 
   @override
   int get hashCode => Object.hash(
-        renderedFrames,
-        droppedRenderFrames,
-        averageRenderMs,
-        peakRenderMs,
-        outputWidth,
-        outputHeight,
-        pairedFramesReceived,
-        frontFramesReceived,
-        backFramesReceived,
-        peakSystemPressureCost,
-        hardwareCost,
-        durationSeconds,
-      );
+    renderedFrames,
+    droppedRenderFrames,
+    averageRenderMs,
+    peakRenderMs,
+    outputWidth,
+    outputHeight,
+    pairedFramesReceived,
+    frontFramesReceived,
+    backFramesReceived,
+    peakSystemPressureCost,
+    hardwareCost,
+    durationSeconds,
+  );
 
   @override
   String toString() =>
@@ -1043,7 +1045,6 @@ class VGMultiCamRenderReport {
 }
 
 final class VGCameraSession {
-
   // ── Channel ──────────────────────────────────────────────────────────────────
 
   static const _channel = MethodChannel('vanguard_media_engine');
@@ -1170,12 +1171,9 @@ final class VGCameraSession {
   Future<VGCameraZoomCapabilities> getZoomCapabilities() async {
     if (_disposed) return VGCameraZoomCapabilities.fallback;
     try {
-      final raw =
-          await _channel.invokeMethod<Map>('getCameraZoomCapabilities');
+      final raw = await _channel.invokeMethod<Map>('getCameraZoomCapabilities');
       if (raw == null) return VGCameraZoomCapabilities.fallback;
-      return VGCameraZoomCapabilities.fromMap(
-        Map<String, dynamic>.from(raw),
-      );
+      return VGCameraZoomCapabilities.fromMap(Map<String, dynamic>.from(raw));
     } on PlatformException {
       return VGCameraZoomCapabilities.fallback;
     }
@@ -1200,8 +1198,9 @@ final class VGCameraSession {
   ///   - A [PlatformException] is thrown (Android or unexpected native error).
   static Future<bool> isMultiCamSupported() async {
     try {
-      final supported =
-          await _channel.invokeMethod<bool>('isMultiCamSupported');
+      final supported = await _channel.invokeMethod<bool>(
+        'isMultiCamSupported',
+      );
       return supported ?? false;
     } on PlatformException {
       return false;
@@ -1242,9 +1241,12 @@ final class VGCameraSession {
   ///   - iOS < 13.0 (guarded natively with `#available`).
   ///   - A [PlatformException] is thrown (Android or unexpected native error).
   ///   - Malformed or null native response.
-  static Future<List<List<Map<String, Object?>>>> getMultiCamDeviceSets() async {
+  static Future<List<List<Map<String, Object?>>>>
+  getMultiCamDeviceSets() async {
     try {
-      final raw = await _channel.invokeMethod<List<Object?>>('getMultiCamDeviceSets');
+      final raw = await _channel.invokeMethod<List<Object?>>(
+        'getMultiCamDeviceSets',
+      );
       if (raw == null) return [];
       return raw.map((setRaw) {
         if (setRaw is! List) return <Map<String, Object?>>[];
@@ -1271,6 +1273,27 @@ final class VGCameraSession {
     return const VGDuetDualCameraCapabilityEvaluator().evaluateDevicePolicy(
       channel: _channel,
       allowDiagnosticSyntheticMode: allowDiagnosticSyntheticMode,
+    );
+  }
+
+  /// Thin convenience delegate to [VGDuetCameraSessionLauncher.startSession].
+  ///
+  /// Evaluates Duet/Dual Camera capability policy first and only opens a
+  /// native camera session according to the fail-closed / diagnostic /
+  /// production-real admission rules documented on
+  /// [VGDuetCameraSessionLauncher]. Does not change any existing camera
+  /// behaviour on this class.
+  static Future<VGDuetCameraSession?> startDuetSession({
+    bool allowDiagnosticSyntheticMode = false,
+    VGCameraPosition position = VGCameraPosition.back,
+    int fps = 30,
+    VGLivePreviewConfig? config,
+  }) {
+    return const VGDuetCameraSessionLauncher(channel: _channel).startSession(
+      allowDiagnosticSyntheticMode: allowDiagnosticSyntheticMode,
+      position: position,
+      fps: fps,
+      config: config,
     );
   }
 
@@ -1309,10 +1332,7 @@ final class VGCameraSession {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
         'measureMultiCamHardwareCost',
-        {
-          'frontDeviceId': frontDeviceId,
-          'backDeviceId': backDeviceId,
-        },
+        {'frontDeviceId': frontDeviceId, 'backDeviceId': backDeviceId},
       );
       return VGMultiCamCostReport.fromMap(raw);
     } on PlatformException {
@@ -1361,10 +1381,7 @@ final class VGCameraSession {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
         'runMultiCamStreamingDiagnostic',
-        {
-          'frontDeviceId': frontDeviceId,
-          'backDeviceId': backDeviceId,
-        },
+        {'frontDeviceId': frontDeviceId, 'backDeviceId': backDeviceId},
       );
       return VGMultiCamStreamingReport.fromMap(raw);
     } on PlatformException {
@@ -1426,10 +1443,7 @@ final class VGCameraSession {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
         'runMultiCamSyncDiagnostic',
-        {
-          'frontDeviceId': frontDeviceId,
-          'backDeviceId': backDeviceId,
-        },
+        {'frontDeviceId': frontDeviceId, 'backDeviceId': backDeviceId},
       );
       return VGMultiCamSyncReport.fromMap(raw);
     } on PlatformException {
@@ -1491,10 +1505,7 @@ final class VGCameraSession {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
         'runMultiCamSourceLifecycleDiagnostic',
-        {
-          'frontDeviceId': frontDeviceId,
-          'backDeviceId': backDeviceId,
-        },
+        {'frontDeviceId': frontDeviceId, 'backDeviceId': backDeviceId},
       );
       return VGMultiCamSyncReport.fromMap(raw);
     } on PlatformException {
@@ -1534,14 +1545,12 @@ final class VGCameraSession {
     VGLivePreviewConfig? config,
   }) async {
     try {
-      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
-        'runMultiCamRenderDiagnostic',
-        {
-          'frontDeviceId': frontDeviceId,
-          'backDeviceId': backDeviceId,
-          if (config != null) 'config': config.toMap(),
-        },
-      );
+      final raw = await _channel
+          .invokeMethod<Map<Object?, Object?>>('runMultiCamRenderDiagnostic', {
+            'frontDeviceId': frontDeviceId,
+            'backDeviceId': backDeviceId,
+            if (config != null) 'config': config.toMap(),
+          });
       return VGMultiCamRenderReport.fromMap(raw);
     } on PlatformException {
       return null;
@@ -1665,14 +1674,12 @@ final class VGCameraSession {
     VGLivePreviewConfig? config,
   }) async {
     try {
-      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
-        'startMultiCamPreview',
-        {
-          'frontDeviceId': frontDeviceId,
-          'backDeviceId': backDeviceId,
-          if (config != null) 'config': config.toMap(),
-        },
-      );
+      final raw = await _channel
+          .invokeMethod<Map<Object?, Object?>>('startMultiCamPreview', {
+            'frontDeviceId': frontDeviceId,
+            'backDeviceId': backDeviceId,
+            if (config != null) 'config': config.toMap(),
+          });
       return VGMultiCamRenderTextureSession.fromMap(raw);
     } on PlatformException {
       return null;
@@ -1771,10 +1778,9 @@ final class VGCameraSession {
   ///   - `INVALID_ARG`      — Path is empty or missing.
   static Future<bool> startMultiCamRecording(String path) async {
     try {
-      final ok = await _channel.invokeMethod<bool>(
-        'startMultiCamRecording',
-        {'path': path},
-      );
+      final ok = await _channel.invokeMethod<bool>('startMultiCamRecording', {
+        'path': path,
+      });
       return ok == true;
     } on PlatformException {
       return false;
@@ -1804,7 +1810,9 @@ final class VGCameraSession {
         'stopMultiCamRecording',
       );
       if (raw == null) return null;
-      final stringMap = raw.map((key, value) => MapEntry(key.toString(), value));
+      final stringMap = raw.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
       return VGMultiCamRecordingStats.fromMap(stringMap);
     } on PlatformException {
       return null;
@@ -1824,12 +1832,12 @@ final class VGCameraSession {
   ///   - `NOT_RUNNING`  — MultiCam preview is not active.
   ///   - `INVALID_ARG`  — Internal: config serialisation error (should not occur).
   static Future<void> updateMultiCamPreviewConfig(
-      VGLivePreviewConfig config) async {
+    VGLivePreviewConfig config,
+  ) async {
     try {
-      await _channel.invokeMethod<void>(
-        'updateMultiCamPreviewConfig',
-        {'config': config.toMap()},
-      );
+      await _channel.invokeMethod<void>('updateMultiCamPreviewConfig', {
+        'config': config.toMap(),
+      });
     } on PlatformException {
       // Silent: caller does not need to handle layout-update failures.
     }
