@@ -34,6 +34,8 @@ export 'vg_camera2_readiness_plan.dart';
 export 'vg_camera2_session_configuration_plan.dart';
 // Phase 3-Unit F: Android Camera2 guarded concurrent SessionConfiguration validation.
 export 'vg_camera2_concurrent_session_validation.dart';
+// P3-CAM-DUET-CAPABILITY-POLICY: Android Camera2 Duet dual-camera capability policy and diagnostic continuation.
+export 'vg_dual_camera_capability_policy.dart';
 // Phase 3-Unit H: Android Camera2 single-camera open/close lifecycle smoke foundation.
 export 'vg_camera2_open_close_smoke.dart';
 // Phase 3-Unit I: Android Camera2 single-camera ImageReader frame smoke foundation.
