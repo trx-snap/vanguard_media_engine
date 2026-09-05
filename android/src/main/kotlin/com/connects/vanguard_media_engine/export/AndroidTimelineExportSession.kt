@@ -58,9 +58,17 @@ import kotlin.math.floor
 //     Vulkan backend: when the selector cannot resolve Vulkan the export
 //     fails closed with UNSUPPORTED_EXPORT_FEATURE before pass-1, and a
 //     failed Vulkan pass-1 never falls back to GLES hard cuts. `fade` and
-//     any other unsupported type fail closed at parse time. Transition
-//     timelines carrying audioSidecar tracks fail closed too: this route
-//     does not overlap-adjust serialized audio timings.
+//     any other unsupported type fail closed at parse time.
+//   - P5-TRANSITION-AUDIO-SIDECAR-EXPORT: a transition timeline carrying
+//     audioSidecar tracks is admitted -- not blanket-rejected -- when every
+//     parsed track's timing is valid on the overlap-adjusted output
+//     timeline (AndroidTimelineAudioOverlapAdmission). Dart is the single
+//     source of truth for that timing (VGEditorDraft
+//     .sequentialWithTransitions / flattenOriginalClipAudio); this gate
+//     only validates the already-computed wire values, it never adjusts or
+//     clamps them. Admitted tracks route through the existing pass-2
+//     mux/mixdown path (AndroidTimelineAudioPass2Muxer) exactly like a
+//     hard-cut timeline's audio tracks do.
 //   - P5-OVERLAYS-TRANS Route-A N9, extended by P5-OVERLAYS-TRANSITION-COMP-N3
 //     and P5-OVERLAYS-BEAUTY-SOLO: static sticker overlays
 //     (AndroidTimelineOverlayDescriptor, up to 128 per export) composited by
@@ -197,6 +205,15 @@ class AndroidTimelineExportSession(private val context: Context) {
         // parsed clip order below (step 2b), once clip ids and trim windows
         // are known.
         val rawTransitions = draftMap["transitions"] as? List<*> ?: emptyList<Any?>()
+
+        // P5-TRANSITION-AUDIO-SIDECAR-EXPORT: audioSidecar tracks are parsed
+        // once, here, so the reversed-clip guardrail below, the transition
+        // audio admission gate (step 2b), and pass-2 mux/mixdown (step 6)
+        // all share one parsed AndroidAudioTrackSpec list instead of
+        // re-parsing the raw wire list repeatedly.
+        val rawSidecarTracks = ((draftMap["audioSidecar"] as? Map<*, *>)?.get("tracks") as? List<*>)
+            ?: emptyList<Any?>()
+        val (audioSpecs, _) = AndroidAudioTrackSpec.parseList(rawSidecarTracks)
 
         // P5-OVERLAYS-TRANS Route-A N9: overlay preflight parser and admission
         // gate. Static sticker overlays are validated here; feature-shape
@@ -415,9 +432,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 )
                 return
             }
-            val reversedSidecarTracks = ((draftMap["audioSidecar"] as? Map<*, *>)?.get("tracks") as? List<*>)
-                ?: emptyList<Any?>()
-            if (reversedSidecarTracks.isNotEmpty()) {
+            if (rawSidecarTracks.isNotEmpty()) {
                 onError(
                     "UNSUPPORTED_EXPORT_FEATURE",
                     "exportTimeline: reversed clips with audio tracks are not supported",
@@ -455,18 +470,31 @@ class AndroidTimelineExportSession(private val context: Context) {
             // timeline to UNAVAILABLE (transitions_require_vulkan:...) and the
             // check after backend selection below fails closed.
             //
-            // Serialized audioSidecar track timings are not overlap-adjusted by
-            // this route; muxing them under an overlap-shortened video would
-            // desynchronize audio. Fail closed rather than produce wrong output.
-            val sidecarTracks = ((draftMap["audioSidecar"] as? Map<*, *>)?.get("tracks") as? List<*>)
-                ?: emptyList<Any?>()
-            if (sidecarTracks.isNotEmpty()) {
-                onError(
-                    "UNSUPPORTED_EXPORT_FEATURE",
-                    "exportTimeline: transitions with audioSidecar tracks are not supported " +
-                        "(audio timings are not overlap-adjusted)",
+            // P5-TRANSITION-AUDIO-SIDECAR-EXPORT: audioSidecar tracks are
+            // admitted alongside a transition timeline only when every
+            // parsed track's timing is valid on the overlap-adjusted output
+            // timeline this session independently derives from the parsed
+            // clip trim windows and transitions -- muxing an invalid track
+            // under an overlap-shortened video would desynchronize audio, so
+            // an invalid track still fails closed rather than producing
+            // wrong output.
+            if (audioSpecs.isNotEmpty()) {
+                val overlapAdjustedDurationSeconds = AndroidTimelineTransitionDescriptor.timelineDurationSeconds(
+                    parsedClips.map { it.trimEnd - it.trimStart },
+                    transitions,
                 )
-                return
+                when (
+                    val admission = AndroidTimelineAudioOverlapAdmission.validate(
+                        audioSpecs,
+                        overlapAdjustedDurationSeconds,
+                    )
+                ) {
+                    is AndroidTimelineAudioOverlapAdmission.Result.Failure -> {
+                        onError(admission.code, admission.message)
+                        return
+                    }
+                    AndroidTimelineAudioOverlapAdmission.Result.Admitted -> {}
+                }
             }
         }
 
@@ -877,12 +905,11 @@ class AndroidTimelineExportSession(private val context: Context) {
         onProgress?.invoke(PASS1_PROGRESS_WEIGHT)
 
         // ── 6. Pass 2: audio mux / mixdown ───────────────────────────────────
-        val rawSidecar = draftMap["audioSidecar"] as? Map<*, *>
-        val rawTracks = (rawSidecar?.get("tracks") as? List<*>) ?: emptyList<Any?>()
-        val (specs, _) = AndroidAudioTrackSpec.parseList(rawTracks)
-
+        // audioSpecs was already parsed once, above, before the transition
+        // admission gate -- reused here rather than re-parsing the raw wire
+        // list again.
         val pass2Failure = AndroidTimelineAudioPass2Muxer().run(
-            specs = specs,
+            specs = audioSpecs,
             videoTempPath = videoTempPath,
             audioTempPath = audioTempPath,
             finalTmpPath = finalTmpPath,

@@ -123,6 +123,54 @@ class VGTimelineTransitionExportSmokeClip {
   };
 }
 
+/// One audioSidecar track of a smoke draft (wire shape of
+/// `VGAudioSidecarTrack.toMap()` for the fields this smoke exercises).
+///
+/// P5-TRANSITION-AUDIO-SIDECAR-EXPORT: [startTime]/[duration] are expressed
+/// on the *output* (overlap-adjusted) timeline -- the same basis
+/// `flattenOriginalClipAudio` uses for generated original-clip-audio tracks
+/// (lib/vg_editor_draft.dart:660-703) -- not the source clip's own timeline.
+@immutable
+class VGTimelineTransitionExportSmokeAudioTrack {
+  const VGTimelineTransitionExportSmokeAudioTrack({
+    required this.trackId,
+    required this.url,
+    required this.startTime,
+    required this.duration,
+    this.role,
+    this.volume = 1.0,
+    this.fadeInSeconds = 0.0,
+    this.fadeOutSeconds = 0.0,
+    this.sourceTrimStart = 0.0,
+  });
+
+  final String trackId;
+  final String url;
+  final double startTime;
+  final double duration;
+  final String? role;
+  final double volume;
+  final double fadeInSeconds;
+  final double fadeOutSeconds;
+  final double sourceTrimStart;
+
+  /// Matches `VGAudioSidecarTrack.toMap()`'s wire keys/omission rules.
+  Map<String, Object?> toMap() {
+    final m = <String, Object?>{
+      'trackId': trackId,
+      'url': url,
+      'startTime': startTime,
+      'duration': duration,
+      'volume': volume,
+    };
+    if (role != null) m['role'] = role;
+    if (fadeInSeconds != 0.0) m['fadeInSeconds'] = fadeInSeconds;
+    if (fadeOutSeconds != 0.0) m['fadeOutSeconds'] = fadeOutSeconds;
+    if (sourceTrimStart != 0.0) m['sourceTrimStart'] = sourceTrimStart;
+    return m;
+  }
+}
+
 /// One transition of a smoke draft (wire shape of
 /// VGTransitionDescriptor.toMap(), with a raw [type] wire name).
 @immutable
@@ -186,6 +234,8 @@ class VGTimelineTransitionExportSmokeRequest {
     required this.transitions,
     required this.outputPath,
     required this.expectation,
+    this.audioSidecarTracks =
+        const <VGTimelineTransitionExportSmokeAudioTrack>[],
     this.canvasWidth = 720,
     this.canvasHeight = 1280,
     this.fps = 30,
@@ -197,6 +247,12 @@ class VGTimelineTransitionExportSmokeRequest {
   final List<VGTimelineTransitionExportSmokeTransition> transitions;
   final String outputPath;
   final VGTimelineTransitionExportSmokeExpectation expectation;
+
+  /// P5-TRANSITION-AUDIO-SIDECAR-EXPORT: optional audioSidecar tracks.
+  /// Emitted under `draft['audioSidecar']` only when non-empty, so existing
+  /// requests without audio tracks produce the exact same wire shape as
+  /// before this field existed.
+  final List<VGTimelineTransitionExportSmokeAudioTrack> audioSidecarTracks;
   final int canvasWidth;
   final int canvasHeight;
   final int fps;
@@ -235,6 +291,10 @@ class VGTimelineTransitionExportSmokeRequest {
       'canvasHeight': canvasHeight,
       'fps': fps,
       'overlays': const <Object?>[],
+      if (audioSidecarTracks.isNotEmpty)
+        'audioSidecar': <String, Object?>{
+          'tracks': audioSidecarTracks.map((t) => t.toMap()).toList(),
+        },
     },
     'outputPath': outputPath,
     'bitrateBps': bitrateBps,

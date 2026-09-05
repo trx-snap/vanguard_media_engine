@@ -21,6 +21,8 @@ VGTimelineTransitionExportSmokeRequest _request({
   String laneId = 'dissolve',
   String type = 'dissolve',
   double transitionSeconds = 0.5,
+  List<VGTimelineTransitionExportSmokeAudioTrack> audioSidecarTracks =
+      const <VGTimelineTransitionExportSmokeAudioTrack>[],
   VGTimelineTransitionExportSmokeExpectation expectation =
       const VGTimelineTransitionExportSmokeExpectation.success(),
 }) => VGTimelineTransitionExportSmokeRequest(
@@ -39,8 +41,31 @@ VGTimelineTransitionExportSmokeRequest _request({
     ),
   ],
   outputPath: '/data/local/tmp/out_$laneId.mp4',
+  audioSidecarTracks: audioSidecarTracks,
   expectation: expectation,
 );
+
+/// Original-clip-audio tracks on the output (overlap-adjusted) timeline for
+/// the same two 2.0 s clips joined by a 0.5 s dissolve: track A occupies
+/// [0.0, 2.0) with a fade-out into the overlap, track B occupies
+/// [1.5, 3.5) with a fade-in out of the overlap.
+List<VGTimelineTransitionExportSmokeAudioTrack> _dissolveAudioSidecarTracks() =>
+    const <VGTimelineTransitionExportSmokeAudioTrack>[
+      VGTimelineTransitionExportSmokeAudioTrack(
+        trackId: 'audio-clip-a',
+        url: '/data/local/tmp/clip-a.mov',
+        startTime: 0.0,
+        duration: 2.0,
+        fadeOutSeconds: 0.5,
+      ),
+      VGTimelineTransitionExportSmokeAudioTrack(
+        trackId: 'audio-clip-b',
+        url: '/data/local/tmp/clip-b.mov',
+        startTime: 1.5,
+        duration: 2.0,
+        fadeInSeconds: 0.5,
+      ),
+    ];
 
 Map<String, Object?> _successResult({
   String backend = 'vulkan',
@@ -206,6 +231,37 @@ void main() {
         expect(args['bitrateBps'], 4000000);
       },
     );
+
+    test(
+      'exportTimeline arguments include audioSidecar only when tracks are present',
+      () {
+        final withoutAudio = _request().toExportTimelineArguments();
+        final draftWithoutAudio = withoutAudio['draft'] as Map<String, Object?>;
+        expect(draftWithoutAudio.containsKey('audioSidecar'), isFalse);
+
+        final withAudio = _request(
+          laneId: 'dissolve_audio_sidecar_success',
+          audioSidecarTracks: _dissolveAudioSidecarTracks(),
+        ).toExportTimelineArguments();
+        final draftWithAudio = withAudio['draft'] as Map<String, Object?>;
+        expect(draftWithAudio.containsKey('audioSidecar'), isTrue);
+        final sidecar = draftWithAudio['audioSidecar'] as Map<String, Object?>;
+        final tracks = sidecar['tracks'] as List<Object?>;
+        expect(tracks, hasLength(2));
+        final trackA = tracks[0] as Map;
+        expect(trackA['trackId'], 'audio-clip-a');
+        expect(trackA['startTime'], 0.0);
+        expect(trackA['duration'], 2.0);
+        expect(trackA['fadeOutSeconds'], 0.5);
+        expect(trackA.containsKey('fadeInSeconds'), isFalse);
+        final trackB = tracks[1] as Map;
+        expect(trackB['trackId'], 'audio-clip-b');
+        expect(trackB['startTime'], 1.5);
+        expect(trackB['duration'], 2.0);
+        expect(trackB['fadeInSeconds'], 0.5);
+        expect(trackB.containsKey('fadeOutSeconds'), isFalse);
+      },
+    );
   });
 
   group('lane report from export result', () {
@@ -221,6 +277,29 @@ void main() {
       expect(report.durationDeltaSeconds, closeTo(0.1, 1e-9));
       expect(report.transitionCount, 1);
     });
+
+    test(
+      'dissolve_audio_sidecar_success lane passes with vulkan duration 3.5',
+      () {
+        final report =
+            VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+              _request(
+                laneId: 'dissolve_audio_sidecar_success',
+                audioSidecarTracks: _dissolveAudioSidecarTracks(),
+              ),
+              _successResult(
+                duration: 3.5,
+                path: '/data/local/tmp/out_dissolve_audio_sidecar_success.mp4',
+              ),
+              outputExists: true,
+            );
+        expect(report.pass, isTrue);
+        expect(report.status, 'PASS');
+        expect(report.renderBackend, 'vulkan');
+        expect(report.transitionCount, 1);
+        expect(report.durationDeltaSeconds, closeTo(0.0, 1e-9));
+      },
+    );
 
     test('fails when renderBackend is gles', () {
       final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
@@ -361,6 +440,37 @@ void main() {
       },
     );
 
+    test('invalid audioSidecar track timing fails closed with INVALID_ARG', () {
+      final request = _request(
+        laneId: 'dissolve_audio_sidecar_invalid_timing',
+        audioSidecarTracks: const <VGTimelineTransitionExportSmokeAudioTrack>[
+          VGTimelineTransitionExportSmokeAudioTrack(
+            trackId: 'audio-clip-b-overrun',
+            url: '/data/local/tmp/clip-b.mov',
+            startTime: 1.5,
+            duration: 3.0,
+          ),
+        ],
+        expectation:
+            const VGTimelineTransitionExportSmokeExpectation.failClosed(
+              errorCode: 'INVALID_ARG',
+              messageContains: 'exportTimeline: audioSidecar track',
+            ),
+      );
+      final report =
+          VGTimelineTransitionExportSmokeLaneReport.fromPlatformException(
+            request,
+            PlatformException(
+              code: 'INVALID_ARG',
+              message:
+                  "exportTimeline: audioSidecar track 'audio-clip-b-overrun' "
+                  'end time 4.5 exceeds the overlap-adjusted output duration 3.5',
+            ),
+          );
+      expect(report.pass, isTrue);
+      expect(report.errorCode, 'INVALID_ARG');
+    });
+
     test('wrong error code fails', () {
       final report =
           VGTimelineTransitionExportSmokeLaneReport.fromPlatformException(
@@ -493,6 +603,38 @@ void main() {
         expect((transitions.single as Map)['type'], 'dissolve');
         expect(report.pass, isTrue);
         expect(report.lanes.single.outputExists, isTrue);
+      },
+    );
+
+    test(
+      'invokes exportTimeline with audioSidecar tracks and passes a vulkan result',
+      () async {
+        Map<Object?, Object?>? seenArgs;
+        _setMockHandler((method, args) async {
+          seenArgs = args as Map<Object?, Object?>;
+          return _successResult(
+            duration: 3.5,
+            path: '/data/local/tmp/out_dissolve_audio_sidecar_success.mp4',
+          );
+        });
+        final runner = VGTimelineTransitionExportSmokeRunner(
+          channel: _channel,
+          fileExists: (path) =>
+              path == '/data/local/tmp/out_dissolve_audio_sidecar_success.mp4',
+        );
+        final request = _request(
+          laneId: 'dissolve_audio_sidecar_success',
+          audioSidecarTracks: _dissolveAudioSidecarTracks(),
+        );
+        final report = await runner.run(
+          <VGTimelineTransitionExportSmokeRequest>[request],
+        );
+        final draft = seenArgs!['draft'] as Map<Object?, Object?>;
+        final sidecar = draft['audioSidecar'] as Map<Object?, Object?>;
+        final tracks = sidecar['tracks'] as List<Object?>;
+        expect(tracks, hasLength(2));
+        expect(report.pass, isTrue);
+        expect(report.lanes.single.renderBackend, 'vulkan');
       },
     );
 

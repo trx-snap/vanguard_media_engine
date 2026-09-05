@@ -12,6 +12,11 @@
 //   Lane crossfade  : crossfade alias  -> same assertions
 //   Lane slideLeft  : slide family     -> same assertions
 //   Lane wipeRight  : wipe family      -> same assertions
+//   Lane dissolve_audio_sidecar_success : dissolve 0.5 s + two audioSidecar
+//                     tracks representing each clip's own original audio on
+//                     the overlap-adjusted output timeline (P5-TRANSITION-
+//                     AUDIO-SIDECAR-EXPORT) -> success, renderBackend=vulkan,
+//                     duration ~= 3.5, transitionCount=1, output exists.
 //   Lane fade       : `fade` must fail closed (UNSUPPORTED_EXPORT_FEATURE);
 //                     it is never remapped to dissolve.
 //   Lane noVulkan   : still image + video with a dissolve is outside the
@@ -128,6 +133,46 @@ class _AndroidTimelineTransitionExportSmokeAppState
         positiveLane('crossfade'),
         positiveLane('slideLeft'),
         positiveLane('wipeRight'),
+        VGTimelineTransitionExportSmokeRequest(
+          laneId: 'dissolve_audio_sidecar_success',
+          clips: <VGTimelineTransitionExportSmokeClip>[
+            videoClip('clip-a', clipA.path),
+            videoClip('clip-b', clipB.path),
+          ],
+          transitions: <VGTimelineTransitionExportSmokeTransition>[
+            VGTimelineTransitionExportSmokeTransition(
+              id: 'tr-dissolve-audio-sidecar',
+              type: 'dissolve',
+              durationSeconds: _transitionSeconds,
+              fromClipId: 'clip-a',
+              toClipId: 'clip-b',
+            ),
+          ],
+          // Original clip audio on the overlap-adjusted output timeline:
+          // clip-a occupies [0.0, 2.0) fading out into the overlap, clip-b
+          // occupies [1.5, 3.5) fading in out of it -- the same shape
+          // flattenOriginalClipAudio produces for a transition timeline.
+          audioSidecarTracks: <VGTimelineTransitionExportSmokeAudioTrack>[
+            VGTimelineTransitionExportSmokeAudioTrack(
+              trackId: 'audio-clip-a',
+              url: clipA.path,
+              startTime: 0.0,
+              duration: _clipTrimEndSeconds,
+              fadeOutSeconds: _transitionSeconds,
+            ),
+            VGTimelineTransitionExportSmokeAudioTrack(
+              trackId: 'audio-clip-b',
+              url: clipB.path,
+              startTime: _clipTrimEndSeconds - _transitionSeconds,
+              duration: _clipTrimEndSeconds,
+              fadeInSeconds: _transitionSeconds,
+            ),
+          ],
+          outputPath:
+              '${tempDir.path}/vg_trans_export_dissolve_audio_sidecar_success_$stamp.mp4',
+          expectation:
+              const VGTimelineTransitionExportSmokeExpectation.success(),
+        ),
         VGTimelineTransitionExportSmokeRequest(
           laneId: 'fade_fail_closed',
           clips: <VGTimelineTransitionExportSmokeClip>[
