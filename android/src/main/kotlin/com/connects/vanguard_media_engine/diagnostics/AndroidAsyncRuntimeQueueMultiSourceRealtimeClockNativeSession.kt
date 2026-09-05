@@ -59,6 +59,16 @@ import java.nio.ByteOrder
 // timeline completed WITHOUT draining the output ring here, because the
 // sink is the sole consumer of those frames). Every X4..X15 entry point is
 // untouched.
+//
+// Y20-prep (P4-AUDIO-ASYNC-RUNTIME-QUEUE-SEEK-AWARE-EOS): the native read
+// reply and snapshot now publish seek-aware EOS accounting
+// (expectedPlayableFrameCount, totalForwardSeekSkippedFrames,
+// totalDiscardedOnSeekFrames, seekSkipAnomalies); this wrapper parses them
+// into [SinkReadReply] / the snap* mirror and compares timeline completion
+// against expectedPlayableFrameCount instead of expectedFrames. For every
+// existing no-seek and boundary-seek run those are identical (skipped ==
+// discarded == 0, asserted fail-closed). No true forward-seek scenario is
+// driven here.
 class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     private val deadlineElapsedRealtimeMs: Long,
     private val outputSink: OutputSink,
@@ -78,7 +88,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         fun onOutputFramesRead(frames: Long)
     }
 
-    // Y18b: one destructive read into a sink-owned buffer.
+    // Y18b: one destructive read into a sink-owned buffer. Y20-prep adds
+    // the native seek-aware EOS accounting the reply's eosDrained verdict
+    // is computed from (all structurally expectedFrames / 0 for no-seek
+    // and boundary-seek runs).
     data class SinkReadReply(
         val framesRead: Long,
         val bytesRead: Long,
@@ -89,6 +102,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         val timelineComplete: Boolean,
         val totalFramesPushed: Long,
         val eosDrained: Boolean,
+        val expectedPlayableFrameCount: Long,
+        val totalForwardSeekSkippedFrames: Long,
+        val totalDiscardedOnSeekFrames: Long,
+        val seekSkipAnomalies: Long,
     )
 
     data class IngestReply(
@@ -255,6 +272,17 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         private set
     var snapPausedDispatchFrozenOk = false
         private set
+    // Y20-prep seek-aware EOS accounting folded from the snapshot
+    // (defaults keep the seek-free shape: playable == expectedFrames,
+    // skipped/discarded/anomalies 0 once a snapshot has been taken).
+    var snapExpectedPlayableFrameCount = -1L
+        private set
+    var snapTotalForwardSeekSkippedFrames = -1L
+        private set
+    var snapTotalDiscardedOnSeekFrames = -1L
+        private set
+    var snapSeekSkipAnomalies = -1L
+        private set
     // X15 owner-side pause/resume proof facts, recorded by
     // [pauseAndAwaitProof] / [assertPausedHoldFrozen] / [resumeAndAwaitProof].
     var pauseProofCommandSeq = -1L
@@ -293,6 +321,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     var eosSetWithoutDrain = false
         private set
     var totalFramesPushedAtEos = -1L
+        private set
+    // Y20-prep: the playable/skipped facts from the very snapshot that
+    // authorized the no-drain EOS set (== expectedFrames / 0 for runs
+    // without a true forward seek).
+    var expectedPlayableFrameCountAtEos = -1L
+        private set
+    var totalForwardSeekSkippedFramesAtEos = -1L
         private set
 
     val isCreated: Boolean get() = handle != 0L
@@ -514,7 +549,30 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
             timelineComplete = kv["timelineComplete"] == "true",
             totalFramesPushed = kv["totalFramesPushed"]?.toLongOrNull() ?: -1L,
             eosDrained = kv["eosDrained"] == "true",
+            expectedPlayableFrameCount = expectedPlayableFrameCountOf(kv),
+            totalForwardSeekSkippedFrames = longField(kv, "totalForwardSeekSkippedFrames"),
+            totalDiscardedOnSeekFrames = longField(kv, "totalDiscardedOnSeekFrames"),
+            seekSkipAnomalies = longField(kv, "seekSkipAnomalies"),
         )
+    }
+
+    // Y20-prep: the native seek-aware playable frame count from a read
+    // reply or snapshot, validated against the seek-free invariant: with
+    // zero forward-seek skipped frames it MUST equal expectedFrames, and
+    // it can never exceed expectedFrames or go negative. Any violation is
+    // a native accounting defect and fails closed.
+    private fun expectedPlayableFrameCountOf(kv: Map<String, String>): Long {
+        val playable = longField(kv, "expectedPlayableFrameCount")
+        val skipped = longField(kv, "totalForwardSeekSkippedFrames")
+        if (skipped < 0L || playable < 0L || playable > expectedFrames ||
+            playable != expectedFrames - skipped
+        ) {
+            throw Failure("expected_playable_frame_count_inconsistent")
+        }
+        if (skipped == 0L && playable != expectedFrames) {
+            throw Failure("expected_playable_frame_count_mismatch")
+        }
+        return playable
     }
 
     fun drainAvailableOutput(): Long =
@@ -722,12 +780,23 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
     // remaining window to dispatch, so provider zero-fill cannot occur on
     // either track; any observed zero-fill fails closed to keep the
     // identity checksums pure.
+    //
+    // Y20-prep: the completion target is the native seek-aware
+    // expectedPlayableFrameCount (== expectedFrames whenever no true
+    // forward seek skipped content; the boundary seek of this driver
+    // skips nothing) and the drain target excludes frames the reader
+    // already discarded at seek-ack consumption (0 for this driver).
     fun completeTimelineAndSetEos() {
-        awaitSnapshotDraining("timeline_complete") {
+        val complete = awaitSnapshotDraining("timeline_complete") {
             it["timelineComplete"] == "true" &&
-                longField(it, "totalFramesPushed") == expectedFrames
+                longField(it, "totalFramesPushed") == expectedPlayableFrameCountOf(it)
         }
-        drainUntilRead(expectedFrames)
+        val playable = expectedPlayableFrameCountOf(complete)
+        val discarded = longField(complete, "totalDiscardedOnSeekFrames")
+        if (discarded < 0L || discarded > playable) {
+            throw Failure("discarded_on_seek_frames_inconsistent")
+        }
+        drainUntilRead(playable - discarded)
         val kv = parseNative(
             VanguardNativeBridge.setAsyncRuntimeQueueMultiSourceRealtimeClockEos(handle)
         )
@@ -746,7 +815,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
 
     // Y18b (owner thread only, non-blocking poll): takes ONE snapshot and,
     // if the worker has completed the exact expected timeline
-    // (timelineComplete with totalFramesPushed == expectedFrames), sets the
+    // (timelineComplete with totalFramesPushed == the native seek-aware
+    // expectedPlayableFrameCount, which is expectedFrames whenever no true
+    // forward seek skipped content, Y20-prep), sets the
     // JOINT writer-local EOS exactly once and returns true. Unlike
     // [completeTimelineAndSetEos] it never reads the output ring: the
     // production sink is the sole consumer of those frames (observing
@@ -759,8 +830,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         if (eosSetWithoutDrain) return true
         val snap = snapshot()
         if (longField(snap, "commandErrors") != 0L) throw Failure("eos_poll_command_errors")
+        val playable = expectedPlayableFrameCountOf(snap)
         if (snap["timelineComplete"] != "true" ||
-            longField(snap, "totalFramesPushed") != expectedFrames
+            longField(snap, "totalFramesPushed") != playable
         ) {
             return false
         }
@@ -776,6 +848,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
             throw Failure("eos_set_failed_${kv["status"]}")
         }
         totalFramesPushedAtEos = longField(snap, "totalFramesPushed")
+        expectedPlayableFrameCountAtEos = playable
+        totalForwardSeekSkippedFramesAtEos = longField(snap, "totalForwardSeekSkippedFrames")
         eosSetWithoutDrain = true
         return true
     }
@@ -888,6 +962,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         snapTotalPausedNs = longField(kv, "totalPausedNs")
         snapTimingPausedExcludedNs = longField(kv, "timingPausedExcludedNs")
         snapPausedDispatchFrozenOk = kv["pausedDispatchFrozenOk"] == "true"
+        snapExpectedPlayableFrameCount = expectedPlayableFrameCountOf(kv)
+        snapTotalForwardSeekSkippedFrames = longField(kv, "totalForwardSeekSkippedFrames")
+        snapTotalDiscardedOnSeekFrames = longField(kv, "totalDiscardedOnSeekFrames")
+        snapSeekSkipAnomalies = longField(kv, "seekSkipAnomalies")
         snapProofBoundary = kv["proofBoundary"] ?: ""
         return kv
     }

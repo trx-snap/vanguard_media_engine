@@ -451,6 +451,23 @@ struct PublishedState {
     // True when every completed paused interval saw dispatchCount and
     // totalFramesPushed unchanged between its pause and resume.
     bool     pausedDispatchFrozenOk{true};
+
+    // Y20-prep seek-aware EOS accounting (worker-local facts, mirrored
+    // here so the read reply and snapshot copy them under the SAME lock
+    // as timelineComplete/totalFramesPushed; never a bare cross-thread
+    // session field). totalForwardSeekSkippedFrames accumulates, per
+    // successful worker Seek, the content frames the coordinator cursor
+    // jumped over (targetFrame - previousNextDispatchFrame, from the
+    // coordinator snapshot taken immediately before coordinator.seek).
+    // expectedPlayableFrameCount = expectedFrames - skipped: the frames
+    // the worker will actually push over the whole run. Both are
+    // structurally expectedFrames / 0 for no-seek and boundary-seek
+    // (target == cursor) runs. seekSkipAnomalies counts a negative skip
+    // (clamped to 0); correctness relies on the coordinator's
+    // target-behind-cursor rejection, the clamp is only defensive.
+    int64_t  expectedPlayableFrameCount{0};
+    int64_t  totalForwardSeekSkippedFrames{0};
+    uint64_t seekSkipAnomalies{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -494,6 +511,13 @@ struct AsyncRuntimeQueueMultiSourceRealtimeClockSession {
     int64_t  totalFramesAccepted[kTrackCount]{0, 0};
     uint64_t nativeOutputReadChecksum{0};
     int64_t  totalOutputFramesRead{0};
+    // Y20-prep: frames this reader discarded at output-ring start/seek
+    // ack consumption (sum of every discardedFramesOnSeek the read entry
+    // point computed). Pushed frames are either read or discarded, so
+    // totalOutputFramesRead + totalDiscardedOnSeekFrames == totalFramesPushed
+    // is the seek-aware "reader consumed everything" condition. 0 for
+    // no-seek and boundary-seek runs (the ring is drained before the seek).
+    int64_t  totalDiscardedOnSeekFrames{0};
     bool     startEnqueued{false};
     // X15 owner-side pause bookkeeping: true from a successfully enqueued
     // Pause until the matching Resume is enqueued (pause_already_pending_
@@ -552,7 +576,13 @@ struct AsyncRuntimeQueueMultiSourceRealtimeClockSession {
           sampleRate(sampleRateIn),
           channelCount(channelCountIn),
           maxFramesPerMix(maxFramesPerMixIn),
-          expectedFrames(expectedFrameCountIn) {}
+          expectedFrames(expectedFrameCountIn) {
+        // Before the worker's first publish the mirror must already report
+        // the seek-free playable count (== expectedFrames), never 0. Set
+        // here on the constructing thread; the worker is started only
+        // after construction (std::thread construction orders this write).
+        published_.expectedPlayableFrameCount = expectedFrameCountIn;
+    }
 
     ~AsyncRuntimeQueueMultiSourceRealtimeClockSession() { shutdownWorker(); }
 
@@ -671,6 +701,12 @@ private:
         uint64_t dispatchAnomalies = 0, nonMonotonicAnomalies = 0;
         uint64_t backlogSamples = 0;
 
+        // Y20-prep seek-aware EOS accounting (worker-private; mirrored via
+        // publish under mutex_). Accumulated only after a successful
+        // coordinator.seek, from the cursor snapshot taken right before it.
+        int64_t  totalForwardSeekSkippedFrames = 0;
+        uint64_t seekSkipAnomalies             = 0;
+
         // X5 envelope telemetry folded from every ok/silence DispatchOutput
         // (structurally all-false/0 in X4 mode: the scheduler mixes no
         // envelope-bearing track without mix params).
@@ -773,6 +809,10 @@ private:
             ps.totalPausedNs            = totalPausedNs;
             ps.timingPausedExcludedNs   = timingPausedExcludedNs;
             ps.pausedDispatchFrozenOk   = pausedDispatchFrozenOk;
+            ps.totalForwardSeekSkippedFrames = totalForwardSeekSkippedFrames;
+            ps.expectedPlayableFrameCount    =
+                expectedFrames - totalForwardSeekSkippedFrames;
+            ps.seekSkipAnomalies             = seekSkipAnomalies;
             for (int t = 0; t < kTrackCount; ++t) {
                 RingBufferAudioSampleProvider& p = providerAt(t);
                 ps.providerExpectedNextFrame[t] = p.expectedNextFrame();
@@ -857,10 +897,23 @@ private:
                         ++commandErrors;
                         break;
                     }
+                    // Y20-prep: the content cursor BEFORE the seek, read on
+                    // this (sole coordinator-mutating) thread immediately
+                    // before coordinator.seek, so the skipped span below is
+                    // exact. The coordinator itself rejects a target behind
+                    // the cursor; the clamp is defensive only.
+                    const int64_t previousNextDispatchFrame =
+                        coordinator.snapshot().nextDispatchFrame;
                     const Status st = coordinator.seek(cmd.a, now);
                     if (st.ok()) {
                         epochStartFrame = targetFrame;
                         lastNowNs       = now;
+                        int64_t skip = targetFrame - previousNextDispatchFrame;
+                        if (skip < 0) {
+                            skip = 0;
+                            ++seekSkipAnomalies;
+                        }
+                        totalForwardSeekSkippedFrames += skip;
                         lastCommandResult = "ok";
                     } else {
                         lastCommandResult = "clock_error";
@@ -1664,6 +1717,21 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
 // expected timeline, and this reader has popped every pushed frame (ring
 // empty). Purely additive keys; no owner/worker role, no ring, no clock
 // and no command behavior changes.
+//
+// Y20-prep (P4-AUDIO-ASYNC-RUNTIME-QUEUE-SEEK-AWARE-EOS): eosDrained is
+// seek-aware. A true forward seek (target > content cursor) makes the
+// worker skip content frames, so the pushed total at timeline completion
+// is expectedPlayableFrameCount = expectedFrames - skipped, and frames the
+// reader discarded at seek-ack consumption count as consumed. Verdict:
+//   eosPublished && timelineComplete
+//   && totalFramesPushed == expectedPlayableFrameCount
+//   && totalOutputFramesRead + totalDiscardedOnSeekFrames == totalFramesPushed
+//   && outputAvailableReadFrames == 0.
+// For no-seek and boundary-seek runs skipped == discarded == 0, so the
+// verdict is identical to Y18b. expectedPlayableFrameCount and skipped are
+// copied under the same lock as timelineComplete/totalFramesPushed (no
+// torn triple). The reply buffer is bounded and checked: a truncated
+// reply fails closed with status=read_reply_overflow.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_readAsyncRuntimeQueueMultiSourceRealtimeClockOutputPcm16(
@@ -1673,7 +1741,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     jobject pcmBufferJ,
     jint maxFrames) {
 
-    char status[768];
+    char status[1280];
 
     auto replyReject = [&](const char* token) -> jstring {
         std::snprintf(status, sizeof(status),
@@ -1710,6 +1778,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
             seekAckConsumed       = true;
             discardedFramesOnSeek = unreadBeforeAck;
             newStartFrame         = ackFrame;
+            // Y20-prep: discarded frames were pushed but never read; they
+            // count toward the reader-consumed total in eosDrained.
+            session->totalDiscardedOnSeekFrames += discardedFramesOnSeek;
             session->cv_.notify_all(); // wake the worker: ack consumed
         }
     }
@@ -1734,26 +1805,39 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     // exactly like the snapshot entry point does; the ring facts are read
     // after the pop above on this consumer thread.
     const bool eosPublished = session->eosPublished.load(std::memory_order_acquire);
-    bool    timelineComplete  = false;
-    int64_t totalFramesPushed = 0;
+    bool     timelineComplete              = false;
+    int64_t  totalFramesPushed             = 0;
+    int64_t  expectedPlayableFrameCount    = 0;
+    int64_t  totalForwardSeekSkippedFrames = 0;
+    uint64_t seekSkipAnomalies             = 0;
     {
+        // One lock_guard for the whole worker-published tuple so the
+        // (timelineComplete, totalFramesPushed, expectedPlayable, skipped)
+        // facts are from a single publish, never torn across two.
         std::lock_guard<std::mutex> lock(session->mutex_);
-        timelineComplete  = session->published_.timelineComplete;
-        totalFramesPushed = session->published_.totalFramesPushed;
+        timelineComplete              = session->published_.timelineComplete;
+        totalFramesPushed             = session->published_.totalFramesPushed;
+        expectedPlayableFrameCount    = session->published_.expectedPlayableFrameCount;
+        totalForwardSeekSkippedFrames = session->published_.totalForwardSeekSkippedFrames;
+        seekSkipAnomalies             = session->published_.seekSkipAnomalies;
     }
     const int64_t outputAvailableAfterRead = session->outputRing.availableReadFrames();
+    const int64_t readerConsumedFrames =
+        session->totalOutputFramesRead + session->totalDiscardedOnSeekFrames;
     const bool eosDrained = eosPublished && timelineComplete &&
-                            totalFramesPushed == session->expectedFrames &&
-                            session->totalOutputFramesRead == totalFramesPushed &&
+                            totalFramesPushed == expectedPlayableFrameCount &&
+                            readerConsumedFrames == totalFramesPushed &&
                             outputAvailableAfterRead == 0;
 
-    std::snprintf(status, sizeof(status),
+    const int written = std::snprintf(status, sizeof(status),
         "status=ok;framesRequested=%d;framesRead=%lld;bytesRead=%lld;"
         "channelCount=%d;outputAvailableReadFrames=%lld;"
         "nativeOutputReadChecksumHex=%016llx;totalOutputFramesRead=%lld;"
         "seekAckConsumed=%s;discardedFramesOnSeek=%lld;newStartFrame=%lld;"
         "eosPublished=%s;timelineComplete=%s;totalFramesPushed=%lld;"
-        "expectedFrameCount=%lld;eosDrained=%s",
+        "expectedFrameCount=%lld;expectedPlayableFrameCount=%lld;"
+        "totalForwardSeekSkippedFrames=%lld;totalDiscardedOnSeekFrames=%lld;"
+        "seekSkipAnomalies=%llu;eosDrained=%s",
         static_cast<int>(maxFrames),
         static_cast<long long>(framesRead),
         static_cast<long long>(framesRead * bytesPerFrame),
@@ -1768,7 +1852,20 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         timelineComplete ? "true" : "false",
         static_cast<long long>(totalFramesPushed),
         static_cast<long long>(session->expectedFrames),
+        static_cast<long long>(expectedPlayableFrameCount),
+        static_cast<long long>(totalForwardSeekSkippedFrames),
+        static_cast<long long>(session->totalDiscardedOnSeekFrames),
+        static_cast<unsigned long long>(seekSkipAnomalies),
         eosDrained ? "true" : "false");
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(status)) {
+        // Fail closed: a truncated reply would silently drop trailing keys
+        // (eosDrained among them). The pop above already happened and is
+        // folded into the owner totals; the caller sees a non-ok status.
+        std::snprintf(status, sizeof(status),
+            "status=read_reply_overflow;framesRequested=%d;framesRead=%lld",
+            static_cast<int>(maxFrames),
+            static_cast<long long>(framesRead));
+    }
     return env->NewStringUTF(status);
 }
 
@@ -1972,6 +2069,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         "joinCount=%u;destroyCalls=%u;"
         "sampleRate=%d;channelCount=%d;maxFramesPerMix=%lld;"
         "expectedFrameCount=%lld;"
+        "expectedPlayableFrameCount=%lld;totalForwardSeekSkippedFrames=%lld;"
+        "totalDiscardedOnSeekFrames=%lld;seekSkipAnomalies=%llu;"
         "proofBoundary=%s",
         static_cast<long long>(s.outputRing.availableReadFrames()),
         s.outputRing.seekRequest(),
@@ -1984,6 +2083,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         static_cast<int>(s.channelCount),
         static_cast<long long>(s.maxFramesPerMix),
         static_cast<long long>(s.expectedFrames),
+        // Y20-prep: worker-published (same mirror copy as timelineComplete
+        // / totalFramesPushed above) plus the owner-side discard total.
+        static_cast<long long>(ps.expectedPlayableFrameCount),
+        static_cast<long long>(ps.totalForwardSeekSkippedFrames),
+        static_cast<long long>(s.totalDiscardedOnSeekFrames),
+        static_cast<unsigned long long>(ps.seekSkipAnomalies),
         kProofBoundary);
 
     if (out.overflowed()) {
