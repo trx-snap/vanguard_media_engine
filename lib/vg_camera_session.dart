@@ -1189,13 +1189,14 @@ final class VGCameraSession {
   /// (e.g., iPhone XS and later with A12 Bionic or newer).
   ///
   /// ## Android
-  /// The native handler is absent on Android. Returns `false` silently via
-  /// `PlatformException` fallback.
+  /// Backed by read-only Camera2 capability routes (`AndroidCamera2CapabilityProbe`).
+  /// Returns `false` if there are no concurrent camera combinations or on failure.
   ///
   /// ## Failure behaviour
   /// Returns `false` on any of:
   ///   - iOS < 13.0 (guarded natively with `#available`).
-  ///   - A [PlatformException] is thrown (Android or unexpected native error).
+  ///   - No concurrent camera combinations on Android.
+  ///   - A [PlatformException] is thrown (unexpected native error or probe failure).
   static Future<bool> isMultiCamSupported() async {
     try {
       final supported = await _channel.invokeMethod<bool>(
@@ -1232,14 +1233,15 @@ final class VGCameraSession {
   /// pairing the front TrueDepth camera with a back camera.
   ///
   /// ## Android
-  /// The native handler is absent on Android. Returns `[]` silently via
-  /// `PlatformException` fallback.
+  /// Backed by read-only Camera2 capability routes (`AndroidCamera2CapabilityProbe`).
+  /// Returns `[]` if there are no concurrent camera combinations or on failure.
   ///
   /// ## Failure behaviour
   /// Returns `[]` on any of:
   ///   - Device does not support MultiCam (natively detected before query).
   ///   - iOS < 13.0 (guarded natively with `#available`).
-  ///   - A [PlatformException] is thrown (Android or unexpected native error).
+  ///   - No concurrent camera combinations on Android.
+  ///   - A [PlatformException] is thrown (unexpected native error or probe failure).
   ///   - Malformed or null native response.
   static Future<List<List<Map<String, Object?>>>>
   getMultiCamDeviceSets() async {

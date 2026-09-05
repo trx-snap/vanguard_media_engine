@@ -16,6 +16,7 @@ import com.connects.vanguard_media_engine.audio.AndroidWaveformResult
 import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractionCoordinator
 import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoordinator
 import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingCoordinator
+import com.connects.vanguard_media_engine.camera.AndroidCamera2CapabilityProbe
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestSpatialSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2SingleCamIngestVulkanSpatialSmokeCoordinator
@@ -2698,17 +2699,59 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.success(cameraSource?.isCameraReady ?: false)
             }
 
-            // ── MultiCam capability fallback (read-only, parity with iOS routes) ────
-            // Android does not implement live MultiCam/Duet capture in this slice.
-            // These exist only so the Dart startup capability probe resolves instead
-            // of hitting MissingPluginException; false/[] is a capability fallback,
-            // not a Duet implementation.
+            // -- MultiCam capability query (read-only Camera2 probe) ---------------------
+            // Backed by AndroidCamera2CapabilityProbe.probe(), which only calls
+            // CameraManager.getCameraIdList / getCameraCharacteristics / concurrentCameraIds.
+            // Never opens a camera, never starts a capture session, does not require
+            // camera permission. Android does not implement live MultiCam/Duet capture
+            // in this slice; these routes only surface hardware capability data.
             "isMultiCamSupported" -> {
-                result.success(false)
+                val supported = try {
+                    AndroidCamera2CapabilityProbe(context).probe()["supportsConcurrentCamera"] as? Boolean
+                        ?: false
+                } catch (t: Throwable) {
+                    Log.w(TAG, "isMultiCamSupported: probe failed: ${t.javaClass.simpleName}: ${t.message}")
+                    false
+                }
+                result.success(supported)
             }
 
             "getMultiCamDeviceSets" -> {
-                result.success(emptyList<List<Map<String, String>>>())
+                val deviceSets = try {
+                    val probeResult = AndroidCamera2CapabilityProbe(context).probe()
+                    @Suppress("UNCHECKED_CAST")
+                    val concurrentIdSets =
+                        probeResult["concurrentCameraIdSets"] as? List<List<String>> ?: emptyList()
+                    @Suppress("UNCHECKED_CAST")
+                    val cameras = probeResult["cameras"] as? List<Map<String, Any?>> ?: emptyList()
+                    val camerasById = cameras.associateBy { it["cameraId"] as? String }
+                    concurrentIdSets
+                        .filter { it.size >= 2 }
+                        .map { idSet ->
+                            idSet.map { cameraId ->
+                                val camera = camerasById[cameraId]
+                                val lensFacing = camera?.get("lensFacing") as? String ?: "unknown"
+                                val isLogicalMultiCamera =
+                                    camera?.get("isLogicalMultiCamera") as? Boolean ?: false
+                                val deviceType = if (isLogicalMultiCamera) "logicalMultiCamera" else "camera2"
+                                val localizedName = when (lensFacing) {
+                                    "front" -> "Front Camera $cameraId"
+                                    "back" -> "Back Camera $cameraId"
+                                    else -> "Camera $cameraId"
+                                }
+                                mapOf(
+                                    "uniqueId" to cameraId,
+                                    "localizedName" to localizedName,
+                                    "position" to lensFacing,
+                                    "deviceType" to deviceType,
+                                )
+                            }
+                        }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "getMultiCamDeviceSets: probe failed: ${t.javaClass.simpleName}: ${t.message}")
+                    emptyList<List<Map<String, Any?>>>()
+                }
+                result.success(deviceSets)
             }
 
             // ─── B4-S5: cancelExport ──────────────────────────────────────────────────

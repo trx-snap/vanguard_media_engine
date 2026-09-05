@@ -348,6 +348,8 @@ export 'src/diagnostics/vg_gpu_driver_blacklist.dart';
 export 'vg_camerax_thermal_fps_bridge.dart';
 // P3-CAM-THERMAL-ACT-DART-CALLBACK-CAMERAX-WIRING: Dart thermal callback path to verified CameraX FPS actuator coordinator.
 export 'vg_camerax_thermal_load_shedding_coordinator.dart';
+// P3-CAM-CONCURRENT-ANDROID-MULTICAM-CAPABILITY-WIRING: Android static MultiCam capability routes smoke foundation.
+export 'vg_android_multicam_capability_routes_smoke.dart';
 
 const String _libName = 'vanguard_media_engine';
 
