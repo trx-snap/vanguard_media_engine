@@ -73,6 +73,10 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_THIRD_REJECT
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REAL_DECODER_RING_FRAME_SOURCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_FRAME_SOURCE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_CHECKSUM_IDENTITY
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_PLAYTHROUGH_ACCOUNTING
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_START
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_STOP_DISPOSE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_MONITOR_TEARDOWN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_SETUP
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTE_CHANGE_OBSERVATION
@@ -2321,6 +2325,167 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             negativeProbeOk && routeOk && formatOk && sinkLifecycleOk && threadOk && ringDrainOk &&
             drainLatencyOk && frameAccountingOk && decoderEosOk && lockstepOk && eosOk && checksumOk &&
             ringCloseOk && nativeOk && noSeekPauseResumeOk && noFeedbackOk && proofBoundaryOk
+    }
+
+    // ── Y21: Real-decoder ring transport session integration proof ─────────
+    fun evaluateRealDecoderRingSessionIntegration(
+        startAccepted: Boolean,
+        firstAudioOk: Boolean,
+        completionOk: Boolean,
+        completedSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        stopAccepted: Boolean,
+        stopResultReason: String,
+        postDisposeSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        ring: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Telemetry?,
+        geometry: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Geometry?,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val m = out.metrics
+        val snap = completedSnapshot
+        val postSnap = postDisposeSnapshot
+        val native = ring?.native
+        val sink = snap?.sink ?: postSnap?.sink
+        val expectedFrames = snap?.driverDeclaredFrameCount ?: geometry?.expectedFrames ?: -1L
+
+        // 1. ringSessionStartOk: start accepted, snapshot.driverEnabled true, state PLAYING or later,
+        // driver geometry valid, sinkReadyBeforeTransportStart true, drainAllowedAfterTransportStart true,
+        // sink telemetry shows frame source path active (stateMachine not used if such telemetry exists;
+        // otherwise use driverEnabled + sink started/drained facts).
+        val validState = snap != null && snap.state in setOf(
+            VanguardRealtimeAudioPlaybackSession.State.PLAYING,
+            VanguardRealtimeAudioPlaybackSession.State.COMPLETED,
+            VanguardRealtimeAudioPlaybackSession.State.STOPPED,
+            VanguardRealtimeAudioPlaybackSession.State.DISPOSED,
+        )
+        val geometryValid = snap != null &&
+            snap.driverSampleRate >= VanguardRealtimePlaybackNativeSession.MIN_SAMPLE_RATE &&
+            snap.driverSampleRate <= VanguardRealtimePlaybackNativeSession.MAX_SAMPLE_RATE &&
+            (snap.driverChannelCount == 1 || snap.driverChannelCount == 2) &&
+            snap.driverMaxFramesPerMix == config.maxFramesPerMix &&
+            snap.driverDeclaredFrameCount > 0L &&
+            (geometry == null || snap.driverDeclaredFrameCount == geometry.expectedFrames)
+        val sinkFrameSourcePathActive = sink != null &&
+            sink.audioTrackInitOk &&
+            sink.played &&
+            sink.drainCalls > 0L &&
+            sink.drainCallsBeforeAllow == 0L &&
+            sink.audioTracksCreated == 1 &&
+            snap?.transportState == null
+
+        val startOk = startAccepted &&
+            (snap?.driverEnabled == true) &&
+            validState &&
+            geometryValid &&
+            (snap?.sinkReadyBeforeTransportStart == true) &&
+            (snap?.drainAllowedAfterTransportStart == true) &&
+            sinkFrameSourcePathActive
+
+        // 2. ringSessionPlaythroughAccountingOk: awaitFirstAudio and awaitCompletion true,
+        // completed state reached, sink exit EOS, frames read/written match expected driverDeclaredFrameCount,
+        // ring native/provider reports no zero-fill/underrun and EOS terminal.
+        val completedState = snap?.state == VanguardRealtimeAudioPlaybackSession.State.COMPLETED
+        val sinkExitEos = sink != null &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS &&
+            sink.eosDrainedObserved
+        val frameAccountingOk = sink != null &&
+            expectedFrames > 0L &&
+            sink.framesReadFromTransport == expectedFrames &&
+            sink.framesWrittenToSink == expectedFrames
+        val nativeTerminalOk = native != null &&
+            native.providerFramesZeroFilledTrack0 == 0L &&
+            native.providerFramesZeroFilledTrack1 == 0L &&
+            native.providerUnderrunEventsTrack0 == 0L &&
+            native.providerUnderrunEventsTrack1 == 0L &&
+            native.eosTrack0 &&
+            native.eosTrack1 &&
+            native.timelineComplete &&
+            native.totalFramesRendered == expectedFrames &&
+            ring != null &&
+            ring.eosDrainedObservedByRing &&
+            (ring.stage == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Stage.CLOSED ||
+                ring.stage == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Stage.EOS_SET)
+
+        val playthroughAccountingOk = firstAudioOk &&
+            completionOk &&
+            completedState &&
+            sinkExitEos &&
+            frameAccountingOk &&
+            nativeTerminalOk
+
+        // 3. ringSessionChecksumIdentityOk: reuse Y18c checksum identity facts from ring telemetry/sink telemetry;
+        // expected chain matches native output/read/sink checksum as available.
+        val checksumOk = sink != null && ring != null &&
+            ring.nativeOutputReadChecksumHex.isNotBlank() &&
+            ring.nativeAcceptedChecksumHexTrack0.isNotBlank() &&
+            ring.nativeAcceptedChecksumHexTrack1.isNotBlank() &&
+            ring.nativeAcceptedChecksumHexTrack0 == ring.kotlinTrack0ChecksumHex &&
+            ring.nativeAcceptedChecksumHexTrack1 == ring.kotlinTrack1ChecksumHex &&
+            ring.nativeOutputReadChecksumHex == ring.kotlinReferenceMixChecksumHex &&
+            ring.nativeOutputReadChecksumHex == sink.checksumHex &&
+            ring.kotlinReferenceMixChecksumHex != ring.kotlinTrack0ChecksumHex &&
+            ring.kotlinReferenceMixChecksumHex != ring.kotlinTrack1ChecksumHex &&
+            ring.checksumChainSelfOk
+
+        // 4. ringSessionStopDisposeOk: stop accepted after completion or reports ok/stopped,
+        // dispose idempotent enough for snapshot/driverClosed true, sink joined true,
+        // native/ring close clean, no failure reason.
+        val stopOk = stopAccepted ||
+            stopResultReason == VanguardRealtimeAudioPlaybackSession.REASON_OK ||
+            postSnap?.state == VanguardRealtimeAudioPlaybackSession.State.STOPPED ||
+            postSnap?.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED
+        val disposeIdempotentOk = postSnap != null &&
+            postSnap.driverClosed &&
+            postSnap.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED
+        val sinkJoinedOk = postSnap != null && postSnap.sinkJoined
+        val ringCloseClean = ring != null &&
+            ring.destroyJoinOk &&
+            ring.destroyIdempotentOk &&
+            ring.failureReason.isBlank() &&
+            ring.stage == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Stage.CLOSED
+        val noFailureReason = out.failureReason.isBlank() &&
+            (snap?.failureReason?.isBlank() ?: false) &&
+            (postSnap?.failureReason?.isBlank() ?: false)
+
+        val stopDisposeOk = stopOk &&
+            disposeIdempotentOk &&
+            sinkJoinedOk &&
+            ringCloseClean &&
+            noFailureReason
+
+        // Metrics recording
+        m["ringSessionStartOk"] = startOk
+        m["ringSessionPlaythroughAccountingOk"] = playthroughAccountingOk
+        m["ringSessionChecksumIdentityOk"] = checksumOk
+        m["ringSessionStopDisposeOk"] = stopDisposeOk
+        m["startAccepted"] = startAccepted
+        m["firstAudioOk"] = firstAudioOk
+        m["completionOk"] = completionOk
+        m["stopAccepted"] = stopAccepted
+        m["driverEnabled"] = snap?.driverEnabled ?: false
+        m["driverDeclaredFrameCount"] = expectedFrames
+        m["driverSampleRate"] = snap?.driverSampleRate ?: -1
+        m["driverChannelCount"] = snap?.driverChannelCount ?: -1
+        m["driverMaxFramesPerMix"] = snap?.driverMaxFramesPerMix ?: -1
+        m["driverClosed"] = postSnap?.driverClosed ?: false
+        m["sinkReadyBeforeTransportStart"] = snap?.sinkReadyBeforeTransportStart ?: false
+        m["drainAllowedAfterTransportStart"] = snap?.drainAllowedAfterTransportStart ?: false
+        m["sinkExitReason"] = sink?.exitReason ?: ""
+        m["sinkFramesReadFromTransport"] = sink?.framesReadFromTransport ?: -1L
+        m["sinkFramesWrittenToSink"] = sink?.framesWrittenToSink ?: -1L
+        m["sinkJoined"] = postSnap?.sinkJoined ?: false
+        m["sinkChecksumHex"] = sink?.checksumHex ?: ""
+        m["ringNativeOutputReadChecksumHex"] = ring?.nativeOutputReadChecksumHex ?: ""
+        m["ringChecksumChainSelfOk"] = ring?.checksumChainSelfOk ?: false
+        m["ringDestroyJoinOk"] = ring?.destroyJoinOk ?: false
+        m["ringDestroyIdempotentOk"] = ring?.destroyIdempotentOk ?: false
+        m["ringFailureReason"] = ring?.failureReason ?: ""
+        m["sessionFailureReason"] = postSnap?.failureReason ?: ""
+
+        out.lanes[LANE_RING_SESSION_START] = out.failureReason.isBlank() && startOk
+        out.lanes[LANE_RING_SESSION_PLAYTHROUGH_ACCOUNTING] = out.failureReason.isBlank() && playthroughAccountingOk
+        out.lanes[LANE_RING_SESSION_CHECKSUM_IDENTITY] = out.failureReason.isBlank() && checksumOk
+        out.lanes[LANE_RING_SESSION_STOP_DISPOSE] = out.failureReason.isBlank() && stopDisposeOk
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

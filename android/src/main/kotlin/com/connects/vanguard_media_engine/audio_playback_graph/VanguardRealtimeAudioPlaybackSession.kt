@@ -236,6 +236,17 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val routingEventPollMs: Long = 10L,
         // Bounded join of the routing monitor thread at teardown.
         val routingMonitorJoinMs: Long = 1000L,
+        // Y21 ring/driver route (P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-
+        // SESSION-INTEGRATION), default OFF (absent): the ONE route
+        // selector. When non-null, [start] builds exactly one
+        // [VanguardRealtimeAudioPlaybackTransportDriver] from this factory
+        // (after the session deadline above is computed) and drives
+        // playback through it instead of the default decoder-feed/
+        // transport-state-machine route; every seek variant, focus
+        // response and routing response is validated OFF for this route
+        // (class comment). Absent leaves the default route entirely
+        // unchanged.
+        val driverFactory: ((VanguardRealtimeAudioPlaybackTransportDriver.Context) -> VanguardRealtimeAudioPlaybackTransportDriver)? = null,
     )
 
     enum class State { IDLE, STARTING, PLAYING, PAUSED, SEEKING, COMPLETED, STOPPED, FAILED, DISPOSED }
@@ -304,6 +315,16 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val seek: VanguardRealtimeAudioPlaybackSeekObservation,
         val focus: VanguardRealtimeAudioPlaybackFocusTelemetry,
         val routing: VanguardRealtimeAudioPlaybackRoutingTelemetry,
+        // Y21 ring/driver route (small harness fields, class comment): never
+        // populates [format] or any decoder field above.
+        val driverEnabled: Boolean = false,
+        val driverExitReason: String = "",
+        val driverClosed: Boolean = false,
+        val driverStageLabel: String = "",
+        val driverSampleRate: Int = -1,
+        val driverChannelCount: Int = -1,
+        val driverMaxFramesPerMix: Int = -1,
+        val driverDeclaredFrameCount: Long = -1L,
     )
 
     companion object {
@@ -340,6 +361,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     @Volatile private var feed: VanguardRealtimePlaybackDecoderFeed? = null
     @Volatile private var sink: VanguardRealtimeAudioPlaybackSinkBridge? = null
     @Volatile private var format: VanguardRealtimePlaybackDecoderFeed.Format? = null
+    // Y21: non-null only on the ring/driver route ([Config.driverFactory]);
+    // [transport] and [feed] stay null for the whole run on that route.
+    @Volatile private var driver: VanguardRealtimeAudioPlaybackTransportDriver? = null
     @Volatile private var deadlineAtMs = Long.MAX_VALUE
     @Volatile private var decoderCancelRequested = false
 
@@ -371,6 +395,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     @Volatile private var clockAfterResume: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
     @Volatile private var decoderJoined = false
     @Volatile private var sinkJoined = false
+    // Y21: set from [VanguardRealtimeAudioPlaybackTransportDriver.close]'s
+    // own return value at teardown; stays false when no driver route ran.
+    @Volatile private var driverClosed = false
     @Volatile private var terminalReply: Reply? = null
     @Volatile private var sessionStartedAtMs = -1L
     @Volatile private var sessionWallMs = 0L
@@ -585,6 +612,20 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             if (config.routingEventPollMs <= 0L) return failClosed("invalid_routing_event_poll_ms")
             if (config.routingMonitorJoinMs <= 0L) return failClosed("invalid_routing_monitor_join_ms")
         }
+        // Y21: the ring/driver route is validated before STARTING or any
+        // object creation (class comment) -- incompatible with every seek
+        // variant and with focus/routing response; the Y8b synthetic
+        // dead-object seam never arms on this route either, since it is a
+        // sink-thread AudioTrack recovery concern the driver route does not
+        // route through the same way.
+        if (config.driverFactory != null) {
+            if (config.seekTargetSec > 0.0) return failClosed("driver_route_seek_unsupported")
+            if (config.secondSeekTargetSec > 0.0) return failClosed("driver_route_seek_unsupported")
+            if (config.seekBackward) return failClosed("driver_route_seek_unsupported")
+            if (config.enableAudioFocusResponse) return failClosed("driver_route_focus_unsupported")
+            if (config.enableAudioRoutingResponse) return failClosed("driver_route_routing_unsupported")
+            if (config.syntheticDeadObjectInjectAfterFrames > 0L) return failClosed("driver_route_dead_object_unsupported")
+        }
         state = State.STARTING
         // Only an accepted start attempt (validation above already passed)
         // begins the session and sets user intent; a rejected invalid-
@@ -605,6 +646,14 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     }
 
     private fun openAndStartLocked() {
+        // Y21: the ring/driver route is a full alternative to everything
+        // below (default route unchanged when [Config.driverFactory] is
+        // null, class comment).
+        val driverFactory = config.driverFactory
+        if (driverFactory != null) {
+            openAndStartDriverRouteLocked(driverFactory)
+            return
+        }
         val f = VanguardRealtimePlaybackDecoderFeed(
             VanguardRealtimePlaybackDecoderFeed.Config(
                 sourcePath = config.sourcePath,
@@ -815,6 +864,92 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         drainAllowedAtMs = SystemClock.elapsedRealtime()
     }
 
+    // Y21 ring/driver route (P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-
+    // SESSION-INTEGRATION), default OFF: builds and starts the pipeline from
+    // ONE caller-supplied [VanguardRealtimeAudioPlaybackTransportDriver]
+    // instead of the decoder feed + native transport state machine above --
+    // no MediaExtractor/MediaCodec, no
+    // [VanguardRealtimePlaybackTransportStateMachine], no native call in
+    // this file. Fixed order (class comment): create the driver once ->
+    // [VanguardRealtimeAudioPlaybackTransportDriver.open] -> read its
+    // geometry -> construct the sink with `stateMachine = null`,
+    // `frameSource = driver.frameSource` and that geometry -> sink started
+    // and READY -> [VanguardRealtimeAudioPlaybackTransportDriver.start] ->
+    // sink.allowDrain(). [transport] and [feed] are never assigned on this
+    // route.
+    private fun openAndStartDriverRouteLocked(
+        factory: (VanguardRealtimeAudioPlaybackTransportDriver.Context) -> VanguardRealtimeAudioPlaybackTransportDriver,
+    ) {
+        val d = factory(
+            VanguardRealtimeAudioPlaybackTransportDriver.Context(
+                deadlineAtMs = deadlineAtMs,
+                maxFramesPerMix = config.maxFramesPerMix,
+                externallyCancelled = { cancelled.get() },
+            ),
+        )
+        driver = d
+        if (!d.open(remainingMs())) throw FailClosed("driver_open_failed:${d.exitReason}")
+        checkDeadlineAndCancel()
+
+        // Frozen order (class comment): driver open -> read and validate
+        // geometry -> sink construction. The mirrored admission table is the
+        // SAME one the default route validates against above.
+        val sampleRate = d.sampleRate
+        val channelCount = d.channelCount
+        val maxFramesPerMix = d.maxFramesPerMix
+        val declaredFrameCount = d.declaredFrameCount
+        if (maxFramesPerMix != config.maxFramesPerMix) {
+            throw FailClosed("driver_geometry_invalid:max_frames_per_mix_mismatch")
+        }
+        val driverSessionConfig = VanguardRealtimePlaybackNativeSession.Config(
+            sampleRate = sampleRate,
+            channelCount = channelCount,
+            maxFramesPerMix = maxFramesPerMix,
+            trackCount = 1,
+            declaredFrameCount = declaredFrameCount,
+        )
+        VanguardRealtimePlaybackNativeSession.validate(driverSessionConfig)?.let {
+            throw FailClosed("driver_geometry_invalid:${it.name.lowercase()}")
+        }
+
+        // Sink exists and is READY (AudioTrack created, gain set) before the
+        // driver starts; it only drains after allowDrain() (same ordering
+        // contract as the default route above).
+        val s = VanguardRealtimeAudioPlaybackSinkBridge(
+            VanguardRealtimeAudioPlaybackSinkBridge.Config(
+                stateMachine = null,
+                sampleRate = sampleRate,
+                channelCount = channelCount,
+                maxFramesPerMix = maxFramesPerMix,
+                declaredFrameCount = declaredFrameCount,
+                gain = config.gain,
+                maxPauseHoldMs = config.maxPauseHoldMs,
+                maxSeekHoldMs = config.maxSeekHoldMs,
+                deadlineAtMs = deadlineAtMs,
+                threadName = "${config.threadNamePrefix}Sink",
+                externallyCancelled = { cancelled.get() },
+                onExited = { reason -> onSinkExited(reason) },
+                frameSource = d.frameSource,
+            ),
+        )
+        sink = s
+        if (!s.start()) throw FailClosed("sink_start_rejected")
+        val readyDeadline = SystemClock.elapsedRealtime() + SINK_READY_TIMEOUT_MS
+        while (!s.awaitReady(WAIT_SLICE_MS)) {
+            checkDeadlineAndCancel()
+            failure.get()?.let { throw FailClosed(it) }
+            if (!s.isAlive) throw FailClosed("sink_exited_before_ready:${s.currentExitReason}")
+            if (SystemClock.elapsedRealtime() > readyDeadline) throw FailClosed("sink_ready_timeout")
+        }
+        sinkReadyAtMs = SystemClock.elapsedRealtime()
+
+        if (!d.start(remainingMs())) throw FailClosed("driver_start_rejected:${d.exitReason}")
+        startAccepted = true
+        transportStartAtMs = SystemClock.elapsedRealtime()
+        s.allowDrain()
+        drainAllowedAtMs = SystemClock.elapsedRealtime()
+    }
+
     // Sink park -> ack -> transport.pause. The hold is bounded by the sink.
     // A user pause always clears user intent (Y11b); a focus-induced pause
     // goes through [pauseBoundedLocked] directly and never touches it.
@@ -828,6 +963,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // never mutates [userIntentPlaying].
     private fun pauseBoundedLocked(): CommandResult {
         if (state != State.PLAYING) return reject("invalid_state_${state.name.lowercase()}")
+        // Y21: the ring/driver route has no bounded pause; reject with a
+        // typed reason and mutate nothing (not fail closed).
+        if (config.driverFactory != null) return reject("driver_route_pause_unsupported")
         failure.get()?.let { return failClosed(it) }
         val s = sink ?: return failClosed("sink_missing")
         val machine = transport ?: return failClosed("transport_missing")
@@ -874,6 +1012,11 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     // resume); never mutates [userIntentPlaying].
     private fun resumeLocked(): CommandResult {
         if (state != State.PAUSED) return reject("invalid_state_${state.name.lowercase()}")
+        // Y21: the ring/driver route has no bounded resume (it never
+        // reaches PAUSED via [pauseBoundedLocked] above, but this stays
+        // defensive/symmetric); reject with a typed reason and mutate
+        // nothing (not fail closed).
+        if (config.driverFactory != null) return reject("driver_route_resume_unsupported")
         // Y12: a terminal route disconnect fails any resume closed-off
         // (never cleared by this session) without altering state or flags.
         if (routingTerminalDisconnect) return reject("routing_terminal_disconnect")
@@ -979,6 +1122,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         cancelled.set(true)
         sink?.cancel()
         feed?.cancel()
+        // Y21: non-blocking wake so the ring/driver route owner never runs
+        // until the deadline (class comment); a no-op on the default route.
+        driver?.cancel()
         // Y11b: non-blocking wake so the focus monitor (if any) notices
         // cancellation without waiting for its next poll slice; the bounded
         // join itself only happens at teardown.
@@ -1038,6 +1184,11 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     fun awaitCompletion(timeoutMs: Long): Boolean {
         val until = SystemClock.elapsedRealtime() + timeoutMs
         val s = sink ?: return false
+        // Y21: the ring/driver route has no decoder feed (class comment);
+        // completion there is sink EOS plus the driver's own terminal/no-
+        // failure signal instead of a feed EOS exit.
+        val d = driver
+        if (d != null) return awaitDriverCompletion(s, d, until)
         val f = feed ?: return false
         while (!s.awaitExit(WAIT_SLICE_MS)) {
             if (pollFailure() != null) return false
@@ -1047,6 +1198,31 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         if (!f.awaitExit(maxOf(1L, until - SystemClock.elapsedRealtime()))) return false
         if (f.exitReason != VanguardRealtimePlaybackDecoderFeed.EXIT_EOS) {
             recordFailure("decoder:${f.exitReason}")
+            return false
+        }
+        if (pollFailure() != null) return false
+        commandLock.withLock {
+            if (state == State.PLAYING || state == State.PAUSED) state = State.COMPLETED
+        }
+        return state == State.COMPLETED
+    }
+
+    // Y21 ring/driver route (any thread; lock-free until the final publish):
+    // mirrors [awaitCompletion]'s sink-EOS + producer-EOS gate above, using
+    // the driver's own [VanguardRealtimeAudioPlaybackTransportDriver.isEosTerminal]
+    // in place of the decoder feed's EXIT_EOS (this route has no feed).
+    private fun awaitDriverCompletion(
+        s: VanguardRealtimeAudioPlaybackSinkBridge,
+        d: VanguardRealtimeAudioPlaybackTransportDriver,
+        until: Long,
+    ): Boolean {
+        while (!s.awaitExit(WAIT_SLICE_MS)) {
+            if (pollFailure() != null) return false
+            if (SystemClock.elapsedRealtime() > until) return false
+        }
+        if (s.currentExitReason != VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS) return false
+        if (!d.isEosTerminal) {
+            recordFailure("driver:${d.exitReason.ifEmpty { "not_terminal_${d.currentStageLabel}" }}")
             return false
         }
         if (pollFailure() != null) return false
@@ -1172,6 +1348,14 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             ),
             focus = buildFocusTelemetry(),
             routing = buildRoutingTelemetry(),
+            driverEnabled = config.driverFactory != null,
+            driverExitReason = driver?.exitReason ?: "",
+            driverClosed = driverClosed,
+            driverStageLabel = driver?.currentStageLabel ?: "",
+            driverSampleRate = driver?.sampleRate ?: -1,
+            driverChannelCount = driver?.channelCount ?: -1,
+            driverMaxFramesPerMix = driver?.maxFramesPerMix ?: -1,
+            driverDeclaredFrameCount = driver?.declaredFrameCount ?: -1L,
         )
     }
 
@@ -1203,6 +1387,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         if (reason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_CANCELLED && cancelled.get()) return
         recordFailure("sink:$reason")
         cancelDecoder()
+        // Y21: non-blocking wake so the ring/driver route owner never runs
+        // until the deadline (class comment); a no-op on the default route.
+        driver?.cancel()
         if (state == State.STARTING || state == State.PLAYING || state == State.PAUSED || state == State.SEEKING) state = State.FAILED
     }
 
@@ -1225,6 +1412,18 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                 !(reason == VanguardRealtimePlaybackDecoderFeed.EXIT_CANCELLED && (cancelled.get() || decoderCancelRequested))
             ) {
                 recordFailure("decoder:$reason")
+            }
+        }
+        // Y21: checked before the sink branch below so a driver failure's
+        // typed root cause wins the race against the sink's own generic
+        // drain-rejected exit for the same underlying event (class comment).
+        val d = driver
+        if (d != null && !d.isAlive) {
+            val reason = d.exitReason
+            if (reason.isNotEmpty() &&
+                !(reason == VanguardRealtimeAudioPlaybackTransportDriver.REASON_CANCELLED && cancelled.get())
+            ) {
+                recordFailure("driver:$reason")
             }
         }
         val s = sink
@@ -1286,6 +1485,23 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             machine.dispose()
             transportDisposeCalls++
             transportStateAfterDispose = machine.currentState
+        }
+        // Y21 ring/driver route (class comment): no transport exists on
+        // this route (`machine` stays null above), so transportStopAccepted
+        // / transportDisposeCalls / the transport state fields are left
+        // untouched here; the driver's own bounded close replaces transport
+        // stop/dispose, and its terminal reply comes from the sink's own
+        // last drain reply (no native transport snapshot to fall back to).
+        val d = driver
+        if (d != null) {
+            driverClosed = d.close(JOIN_TIMEOUT_MS)
+            // Guard against a self-join from the driver's own owner thread:
+            // [VanguardRealtimeAudioPlaybackTransportDriver.close] already
+            // returns false (never blocks) when called from that thread, so
+            // a false result here is treated the same as any other bounded-
+            // close failure, with the driver's own typed reason preserved.
+            if (!driverClosed) recordFailure("driver:close_failed:${d.exitReason}")
+            if (state == State.COMPLETED) terminalReply = s?.telemetry()?.lastReply
         }
         if (sessionStartedAtMs >= 0L) sessionWallMs = SystemClock.elapsedRealtime() - sessionStartedAtMs
     }

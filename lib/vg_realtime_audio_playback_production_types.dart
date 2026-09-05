@@ -12,8 +12,9 @@
 // P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF (Y18b) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19) +
-// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, and real-decoder ring forward-seek diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20) +
+// P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-INTEGRATION (Y21): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, real-decoder ring forward-seek, and real-decoder ring transport session integration diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
@@ -22,8 +23,9 @@
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock) through twelve
 // scenarios, plus the isolated Y18b ring-transport frame-source proof, the
 // isolated Y18c real-decoder ring-transport frame-source proof, the
-// isolated Y19 real-decoder ring pause/resume proof, and the isolated Y20
-// real-decoder ring true forward-seek proof:
+// isolated Y19 real-decoder ring pause/resume proof, the isolated Y20
+// real-decoder ring true forward-seek proof, and the Y21 real-decoder ring
+// transport session integration proof:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
 //   3. Synthetic dead-object recovery to EOS.
@@ -40,8 +42,9 @@
 //  14. Real-decoder ring frame source isolated proof driving production sink to EOS without state machine.
 //  15. Real-decoder ring pause/resume isolated proof: one owner-thread-executed native pause/resume cycle to EOS with checksum identity.
 //  16. Real-decoder ring true forward-seek isolated proof: feed held at H, sink drained to H, seek-parked and flushed, one owner-thread-executed native joint seek to T with both ring providers re-anchored by the worker, drained to the seek-aware EOS with checksum identity over expectedFrames - skipped.
+//  17. Real-decoder ring transport session integration proof: session constructed with driverFactory route, runs start, awaitFirstAudio, awaitCompletion to EOS, stop, and dispose through session.
 //
-// Required proof lanes (83 native lanes plus canonical equals 84 total lanes):
+// Required proof lanes (87 native lanes plus canonical equals 88 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -125,6 +128,10 @@
 //  81. realRingSeekReanchorOk: one owner-thread-executed native joint seek to a target strictly past the hold, both ring providers re-anchored by the worker at the target, generator/extractor/codec re-anchored, post-seek prefill, output seek ack consumed with zero discard
 //  82. realRingSeekPostSeekDrainOk: sink unparked after the ring seek with its epoch at the target and drained to the native seek-aware EOS over exactly the effective frames
 //  83. realRingSeekChecksumIdentityOk: exact frame and checksum identity over the effective (expectedFrames - skipped) frames across the full real-decoder ring forward-seek route
+//  84. ringSessionStartOk: session and transport transition to PLAYING on driver route accepted cleanly with valid driver geometry
+//  85. ringSessionPlaythroughAccountingOk: playthrough accounting matches declared frame count to EOS via session completion
+//  86. ringSessionChecksumIdentityOk: ring native output and read checksums match sink checksum across session integration
+//  87. ringSessionStopDisposeOk: session stop and dispose cleans up driver and sink cleanly without failure
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
@@ -282,6 +289,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.realRingSeekReanchorOk,
     required this.realRingSeekPostSeekDrainOk,
     required this.realRingSeekChecksumIdentityOk,
+    required this.ringSessionStartOk,
+    required this.ringSessionPlaythroughAccountingOk,
+    required this.ringSessionChecksumIdentityOk,
+    required this.ringSessionStopDisposeOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -397,6 +408,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'realRingSeekReanchorOk',
     'realRingSeekPostSeekDrainOk',
     'realRingSeekChecksumIdentityOk',
+    'ringSessionStartOk',
+    'ringSessionPlaythroughAccountingOk',
+    'ringSessionChecksumIdentityOk',
+    'ringSessionStopDisposeOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -677,6 +692,18 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether exact frame and checksum identity held over the effective (expectedFrames - skipped) frames across the full real-decoder ring forward-seek route.
   final bool realRingSeekChecksumIdentityOk;
 
+  /// Whether session and transport transition to PLAYING on driver route was accepted cleanly with valid driver geometry.
+  final bool ringSessionStartOk;
+
+  /// Whether playthrough accounting matched declared frame count to EOS via session completion.
+  final bool ringSessionPlaythroughAccountingOk;
+
+  /// Whether ring native output and read checksums matched sink checksum across session integration.
+  final bool ringSessionChecksumIdentityOk;
+
+  /// Whether session stop and dispose cleaned up driver and sink cleanly without failure.
+  final bool ringSessionStopDisposeOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -790,7 +817,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       realRingSeekQuiesceAckOk &&
       realRingSeekReanchorOk &&
       realRingSeekPostSeekDrainOk &&
-      realRingSeekChecksumIdentityOk;
+      realRingSeekChecksumIdentityOk &&
+      ringSessionStartOk &&
+      ringSessionPlaythroughAccountingOk &&
+      ringSessionChecksumIdentityOk &&
+      ringSessionStopDisposeOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -898,6 +929,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         realRingSeekReanchorOk: false,
         realRingSeekPostSeekDrainOk: false,
         realRingSeekChecksumIdentityOk: false,
+        ringSessionStartOk: false,
+        ringSessionPlaythroughAccountingOk: false,
+        ringSessionChecksumIdentityOk: false,
+        ringSessionStopDisposeOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -1130,6 +1165,14 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final realRingSeekChecksumIdentityOk = parseBool(
       'realRingSeekChecksumIdentityOk',
     );
+    final ringSessionStartOk = parseBool('ringSessionStartOk');
+    final ringSessionPlaythroughAccountingOk = parseBool(
+      'ringSessionPlaythroughAccountingOk',
+    );
+    final ringSessionChecksumIdentityOk = parseBool(
+      'ringSessionChecksumIdentityOk',
+    );
+    final ringSessionStopDisposeOk = parseBool('ringSessionStopDisposeOk');
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -1217,7 +1260,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         realRingPauseAckOk &&
         realRingPauseHoldFrozenOk &&
         realRingResumeAckOk &&
-        realRingPostResumeChecksumOk;
+        realRingPostResumeChecksumOk &&
+        realRingSeekQuiesceAckOk &&
+        realRingSeekReanchorOk &&
+        realRingSeekPostSeekDrainOk &&
+        realRingSeekChecksumIdentityOk &&
+        ringSessionStartOk &&
+        ringSessionPlaythroughAccountingOk &&
+        ringSessionChecksumIdentityOk &&
+        ringSessionStopDisposeOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -1364,6 +1415,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'realRingSeekReanchorOk': realRingSeekReanchorOk,
       'realRingSeekPostSeekDrainOk': realRingSeekPostSeekDrainOk,
       'realRingSeekChecksumIdentityOk': realRingSeekChecksumIdentityOk,
+      'ringSessionStartOk': ringSessionStartOk,
+      'ringSessionPlaythroughAccountingOk': ringSessionPlaythroughAccountingOk,
+      'ringSessionChecksumIdentityOk': ringSessionChecksumIdentityOk,
+      'ringSessionStopDisposeOk': ringSessionStopDisposeOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -1461,6 +1516,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       realRingSeekReanchorOk: realRingSeekReanchorOk,
       realRingSeekPostSeekDrainOk: realRingSeekPostSeekDrainOk,
       realRingSeekChecksumIdentityOk: realRingSeekChecksumIdentityOk,
+      ringSessionStartOk: ringSessionStartOk,
+      ringSessionPlaythroughAccountingOk: ringSessionPlaythroughAccountingOk,
+      ringSessionChecksumIdentityOk: ringSessionChecksumIdentityOk,
+      ringSessionStopDisposeOk: ringSessionStopDisposeOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -1594,6 +1653,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       realRingSeekReanchorOk: false,
       realRingSeekPostSeekDrainOk: false,
       realRingSeekChecksumIdentityOk: false,
+      ringSessionStartOk: false,
+      ringSessionPlaythroughAccountingOk: false,
+      ringSessionChecksumIdentityOk: false,
+      ringSessionStopDisposeOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1791,7 +1854,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.realRingSeekQuiesceAckOk == realRingSeekQuiesceAckOk &&
         other.realRingSeekReanchorOk == realRingSeekReanchorOk &&
         other.realRingSeekPostSeekDrainOk == realRingSeekPostSeekDrainOk &&
-        other.realRingSeekChecksumIdentityOk == realRingSeekChecksumIdentityOk &&
+        other.realRingSeekChecksumIdentityOk ==
+            realRingSeekChecksumIdentityOk &&
+        other.ringSessionStartOk == ringSessionStartOk &&
+        other.ringSessionPlaythroughAccountingOk ==
+            ringSessionPlaythroughAccountingOk &&
+        other.ringSessionChecksumIdentityOk == ringSessionChecksumIdentityOk &&
+        other.ringSessionStopDisposeOk == ringSessionStopDisposeOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1888,6 +1957,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     realRingSeekReanchorOk,
     realRingSeekPostSeekDrainOk,
     realRingSeekChecksumIdentityOk,
+    ringSessionStartOk,
+    ringSessionPlaythroughAccountingOk,
+    ringSessionChecksumIdentityOk,
+    ringSessionStopDisposeOk,
     canonical,
   ]);
 
@@ -1965,6 +2038,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'realRingSeekReanchorOk: $realRingSeekReanchorOk, '
       'realRingSeekPostSeekDrainOk: $realRingSeekPostSeekDrainOk, '
       'realRingSeekChecksumIdentityOk: $realRingSeekChecksumIdentityOk, '
+      'ringSessionStartOk: $ringSessionStartOk, '
+      'ringSessionPlaythroughAccountingOk: $ringSessionPlaythroughAccountingOk, '
+      'ringSessionChecksumIdentityOk: $ringSessionChecksumIdentityOk, '
+      'ringSessionStopDisposeOk: $ringSessionStopDisposeOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 

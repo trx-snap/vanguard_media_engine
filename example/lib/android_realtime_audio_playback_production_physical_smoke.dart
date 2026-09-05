@@ -12,8 +12,9 @@
 // P4-AUDIO-REALTIME-PLAYBACK-RING-FRAME-SOURCE-PROOF (Y18b) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-FRAME-SOURCE (Y18c) +
 // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-PAUSE-RESUME (Y19) +
-// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, and real-decoder ring forward-seek diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK (Y20) +
+// P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-INTEGRATION (Y21): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, clock correlation, drift sample ownership, ring frame source, real-decoder ring frame source, real-decoder ring pause/resume, real-decoder ring forward-seek, and real-decoder ring transport session integration diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
@@ -61,6 +62,15 @@
 //     exact. It carries no pause/resume, no dead object, no drift feedback, no
 //     pacing correction, no resampling, no currentPosition authority switch, no
 //     A/V sync closure, no fleet claim, and no app/editor claim.
+//   - Real-decoder ring transport session integration (Y21) proves the production
+//     VanguardRealtimeAudioPlaybackSession constructed with the driverFactory route
+//     driving the real-decoder ring transport driver to EOS: starts session, awaits
+//     first audio, awaits completion to EOS, asserts playthrough frame accounting,
+//     verifies checksum identity between native output read, reference mix, and sink,
+//     and cleans up via stop and idempotent dispose. It carries no seek, no pause/resume,
+//     no focus/routing, no dead object, no drift feedback, no pacing correction,
+//     no resampling, no currentPosition authority switch, no A/V sync closure, no
+//     fleet claim, and no app/editor claim.
 //
 // This is a component diagnostic smoke. It must not claim
 // product/editor/UI/ConnectsApp/iOS/streaming/cache/audio clock mutator changes/clock feedback proof.
@@ -99,7 +109,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change, Presentation-Clock, Position-Query, Clock Correlation & Drift Sample Ownership smoke...';
+      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19/Y20/Y21) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change, Presentation-Clock, Position-Query, Clock Correlation, Drift Sample Ownership, Ring Frame Source, Real-Decoder Ring Frame Source, Real-Decoder Ring Pause/Resume, Real-Decoder Ring Seek & Real-Decoder Ring Session Integration smoke...';
 
   @override
   void initState() {
@@ -387,6 +397,28 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [LANE] realRingPostResumeChecksumOk: ${activeReport.realRingPostResumeChecksumOk}',
     );
+    print(
+      '  [LANE] realRingSeekQuiesceAckOk: ${activeReport.realRingSeekQuiesceAckOk}',
+    );
+    print(
+      '  [LANE] realRingSeekReanchorOk: ${activeReport.realRingSeekReanchorOk}',
+    );
+    print(
+      '  [LANE] realRingSeekPostSeekDrainOk: ${activeReport.realRingSeekPostSeekDrainOk}',
+    );
+    print(
+      '  [LANE] realRingSeekChecksumIdentityOk: ${activeReport.realRingSeekChecksumIdentityOk}',
+    );
+    print('  [LANE] ringSessionStartOk: ${activeReport.ringSessionStartOk}');
+    print(
+      '  [LANE] ringSessionPlaythroughAccountingOk: ${activeReport.ringSessionPlaythroughAccountingOk}',
+    );
+    print(
+      '  [LANE] ringSessionChecksumIdentityOk: ${activeReport.ringSessionChecksumIdentityOk}',
+    );
+    print(
+      '  [LANE] ringSessionStopDisposeOk: ${activeReport.ringSessionStopDisposeOk}',
+    );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -420,6 +452,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     const realRingPauseResumeScenarioKey =
         'SCENARIO_REAL_DECODER_RING_PAUSE_RESUME_TO_EOS';
     const realRingSeekScenarioKey = 'SCENARIO_REAL_DECODER_RING_SEEK_TO_EOS';
+    const ringSessionScenarioKey =
+        'SCENARIO_REAL_DECODER_RING_SESSION_INTEGRATION_TO_EOS';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -469,6 +503,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final realRingSeekMetrics = asStringKeyedMap(
       topMetrics[realRingSeekScenarioKey],
+    );
+    final ringSessionMetrics = asStringKeyedMap(
+      topMetrics[ringSessionScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -1572,6 +1609,44 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       realRingSeekCompactKeys,
     );
 
+    const ringSessionCompactKeys = <String>[
+      'ringSessionStartOk',
+      'ringSessionPlaythroughAccountingOk',
+      'ringSessionChecksumIdentityOk',
+      'ringSessionStopDisposeOk',
+      'startAccepted',
+      'firstAudioOk',
+      'completionOk',
+      'stopAccepted',
+      'driverEnabled',
+      'driverDeclaredFrameCount',
+      'driverSampleRate',
+      'driverChannelCount',
+      'driverMaxFramesPerMix',
+      'driverClosed',
+      'sinkReadyBeforeTransportStart',
+      'drainAllowedAfterTransportStart',
+      'sinkExitReason',
+      'sinkFramesReadFromTransport',
+      'sinkFramesWrittenToSink',
+      'sinkJoined',
+      'sinkChecksumHex',
+      'ringNativeOutputReadChecksumHex',
+      'ringChecksumChainSelfOk',
+      'ringDestroyJoinOk',
+      'ringDestroyIdempotentOk',
+      'ringFailureReason',
+      'sessionFailureReason',
+      'ringSessionNonClaims',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactRingSession = extractCompactScenario(
+      ringSessionMetrics,
+      ringSessionCompactKeys,
+    );
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -1886,6 +1961,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       '  [SCENARIO] $realRingPauseResumeScenarioKey: $compactRealRingPauseResume',
     );
     print('  [SCENARIO] $realRingSeekScenarioKey: $compactRealRingSeek');
+    print('  [SCENARIO] $ringSessionScenarioKey: $compactRingSession');
 
     // 5. Verification evaluation.
     final pass =
@@ -1914,13 +1990,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       realDecoderRingFrameSourceScenarioKey: compactRealDecoderRingFrameSource,
       realRingPauseResumeScenarioKey: compactRealRingPauseResume,
       realRingSeekScenarioKey: compactRealRingSeek,
+      ringSessionScenarioKey: compactRingSession,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER-RING-SEEK',
-      'subSlice': 'Y20',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-INTEGRATION',
+      'subSlice': 'Y21',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
