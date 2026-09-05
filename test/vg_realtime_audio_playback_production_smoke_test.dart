@@ -120,6 +120,10 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'ringSessionPauseHoldFrozenOk': true,
     'ringSessionResumeOrderOk': true,
     'ringSessionPostResumeChecksumOk': true,
+    'ringSessionSeekOrderOk': true,
+    'ringSessionSeekEpochOk': true,
+    'ringSessionPostSeekAccountingOk': true,
+    'ringSessionSeekFailClosedOk': true,
     'canonical': true,
   };
 
@@ -131,7 +135,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'maxDurationSec': 3.0,
     'maxFramesPerMix': 256,
     'gain': 0.5,
-    'deadlineMs': 30000,
+    'deadlineMs': 45000,
     'pauseHoldMs': 400,
     'maxPauseHoldMs': 3000,
     'stopAfterMs': 300,
@@ -414,11 +418,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(91),
+        equals(95),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(92),
+        equals(96),
       );
 
       final expectedLanes = <String>[
@@ -513,6 +517,10 @@ void main() {
         'ringSessionPauseHoldFrozenOk',
         'ringSessionResumeOrderOk',
         'ringSessionPostResumeChecksumOk',
+        'ringSessionSeekOrderOk',
+        'ringSessionSeekEpochOk',
+        'ringSessionPostSeekAccountingOk',
+        'ringSessionSeekFailClosedOk',
         'canonical',
       ];
 
@@ -662,6 +670,10 @@ void main() {
       expect(report.ringSessionPauseHoldFrozenOk, isTrue);
       expect(report.ringSessionResumeOrderOk, isTrue);
       expect(report.ringSessionPostResumeChecksumOk, isTrue);
+      expect(report.ringSessionSeekOrderOk, isTrue);
+      expect(report.ringSessionSeekEpochOk, isTrue);
+      expect(report.ringSessionPostSeekAccountingOk, isTrue);
+      expect(report.ringSessionSeekFailClosedOk, isTrue);
       expect(report.canonical, isTrue);
       expect(report.allRequiredNonCanonicalLanesPass, isTrue);
 
@@ -1709,6 +1721,42 @@ void main() {
       }
     });
 
+    test('missing required Y23 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'ringSessionSeekOrderOk',
+        'ringSessionSeekEpochOk',
+        'ringSessionPostSeekAccountingOk',
+        'ringSessionSeekFailClosedOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+
+        final reportFalse = _createSampleReport(<String, Object?>{lane: false});
+        expect(reportFalse.pass, isFalse);
+        expect(reportFalse.isVerifiedPass, isFalse);
+        expect(reportFalse.marker, equals(_kFailMarker));
+        expect(reportFalse.status, equals('lane_failed'));
+        expect(reportFalse.lastError, equals('lane_failed'));
+      }
+    });
+
     test('fail map with deadObjectBaseStepBounded=false fails validation', () {
       final report = _createSampleReport(<String, Object?>{
         'pass': false,
@@ -1866,7 +1914,7 @@ void main() {
               maxDurationSec: 3.0,
               maxFramesPerMix: 256,
               gain: 0.5,
-              deadlineMs: 30000,
+              deadlineMs: 45000,
               pauseHoldMs: 400,
               maxPauseHoldMs: 3000,
               stopAfterMs: 300,
@@ -1885,7 +1933,7 @@ void main() {
         expect(invokedArguments?['maxDurationSec'], equals(3.0));
         expect(invokedArguments?['maxFramesPerMix'], equals(256));
         expect(invokedArguments?['gain'], equals(0.5));
-        expect(invokedArguments?['deadlineMs'], equals(30000));
+        expect(invokedArguments?['deadlineMs'], equals(45000));
         expect(invokedArguments?['pauseHoldMs'], equals(400));
         expect(invokedArguments?['maxPauseHoldMs'], equals(3000));
         expect(invokedArguments?['stopAfterMs'], equals(300));
@@ -1940,6 +1988,8 @@ void main() {
           sourcePath: '/tmp/test_clip.mov',
         );
 
+        expect(invokedArguments?['maxDurationSec'], equals(3.0));
+        expect(invokedArguments?['deadlineMs'], equals(45000));
         expect(invokedArguments?['seekTargetSec'], equals(1.0));
         expect(invokedArguments?['secondSeekTargetSec'], equals(2.0));
         expect(invokedArguments?['duckGain'], equals(0.1));

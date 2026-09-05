@@ -40,6 +40,24 @@ package com.connects.vanguard_media_engine.audio_playback_graph
 // session fails closed on any false and tears down through the existing
 // [cancel] / [close] wake-up paths. The defaults below (unsupported, all
 // false) keep every existing driver's behavior unchanged.
+//
+// Bounded forward seek (Y23, P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-
+// SESSION-SEEK), additive and opt-in per driver: a driver that reports
+// [supportsSeek] = true admits exactly ONE forward seek per run through two
+// bounded, command-lock-holder-thread primitives the session sequences
+// around its own sink seek park / flush / unpark -- [prepareForSeek]
+// (arm the driver's own feed cap at the window-aligned hold frame H WHILE
+// the sink still drains, returning once the feed is held exactly there at
+// a clean boundary) -> session waits for exact drain-to-H equality on BOTH
+// its sink and [framesConsumedBySinkObserved] -> sink seek park + ack ->
+// sink flush + ack -> [seek] (the driven transport jumps to T; called only
+// after the sink flush acked) -> sink unpark. The session admits H/T at
+// start against [earliestSeekHoldFrame] (a conservative frame no earlier
+// than the driver's own pre-start fill / feed lead). Every primitive is
+// false on timeout, rejection, or failure; the session fails closed on any
+// false, never unparks the sink after a failed prepare / flush / seek, and
+// tears down through [cancel] / [close]. The defaults below (unsupported,
+// -1, all false) keep every existing driver's behavior unchanged.
 interface VanguardRealtimeAudioPlaybackTransportDriver {
 
     // Caller-supplied construction context (Opus architecture requirement):
@@ -124,4 +142,38 @@ interface VanguardRealtimeAudioPlaybackTransportDriver {
     // Resumes the driven transport and releases its feed; called before the
     // session unparks the sink. False on timeout/rejection/failure.
     fun resume(timeoutMs: Long): Boolean = false
+
+    // ── Y23 bounded forward seek (additive defaults; class comment) ─────────
+
+    // True only for a driver that implements the primitives below; the
+    // session fails a driver-route run closed (typed, before the driver is
+    // opened) when a seek is armed against a driver that reports false.
+    val supportsSeek: Boolean get() = false
+
+    // Cumulative frames the production sink has consumed from this driver's
+    // frame source, as observed on the driver side; -1 when unsupported /
+    // not yet observable. The session requires this to equal its own sink's
+    // read count at exactly the hold frame before it parks the sink.
+    val framesConsumedBySinkObserved: Long get() = -1L
+
+    // Conservative window-aligned lower bound (exclusive) for a seek hold
+    // frame: no earlier than every frame the driver commits before / ahead
+    // of the sink's first consumption, so a hold frame strictly past it can
+    // still be reached by [prepareForSeek] rather than already passed.
+    // Valid once [open] has returned true; -1 when unsupported.
+    val earliestSeekHoldFrame: Long get() = -1L
+
+    // Arms the driver's own feed cap at the window-aligned [holdFrame] while
+    // the sink keeps draining and returns true once the feed is held exactly
+    // there at a clean boundary (drains still serviced). Must precede the
+    // session's sink seek park. False on timeout/rejection/failure (hold
+    // frame invalid or already passed, timeline complete).
+    fun prepareForSeek(holdFrame: Long, timeoutMs: Long): Boolean = false
+
+    // Executes the ONE forward seek of the driven transport to the window-
+    // aligned [targetFrame]; called only after [prepareForSeek] returned
+    // true, the sink drained exactly to the hold frame, seek-parked and
+    // acked its flush. Releases the driver's feed on success. False on
+    // timeout/rejection/failure; the session never unparks the sink then.
+    fun seek(targetFrame: Long, timeoutMs: Long): Boolean = false
 }

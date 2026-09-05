@@ -81,6 +81,10 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_RESUME_ORDER
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_START
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_STOP_DISPOSE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_SEEK_ORDER
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_SEEK_EPOCH
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_POST_SEEK_ACCOUNTING
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_RING_SESSION_SEEK_FAIL_CLOSED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_MONITOR_TEARDOWN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTING_SETUP
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_ROUTE_CHANGE_OBSERVATION
@@ -2668,6 +2672,276 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.lanes[LANE_RING_SESSION_PAUSE_HOLD_FROZEN] = out.failureReason.isBlank() && pauseHoldFrozenOk
         out.lanes[LANE_RING_SESSION_RESUME_ORDER] = out.failureReason.isBlank() && resumeOrderOk
         out.lanes[LANE_RING_SESSION_POST_RESUME_CHECKSUM] = out.failureReason.isBlank() && postResumeChecksumOk
+    }
+
+    // ── Y23: Real-decoder ring transport session forward seek proof ─────────
+    fun evaluateRealDecoderRingSessionSeek(
+        startAccepted: Boolean,
+        firstAudioOk: Boolean,
+        seekAccepted: Boolean,
+        preSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        postSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        completionOk: Boolean,
+        completedSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        stopAccepted: Boolean,
+        stopResultReason: String,
+        postDisposeSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot?,
+        ring: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Telemetry?,
+        geometry: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Geometry?,
+        seekFailClosedOk: Boolean,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val m = out.metrics
+        val snap = completedSnapshot
+        val postSnap = postDisposeSnapshot
+        val sink = snap?.sink ?: postSnap?.sink
+        val clock = snap?.clock ?: postSnap?.clock
+        val q = snap?.seek ?: postSnap?.seek
+        val postQ = postSnap?.seek
+        val ringSeek = ring?.seek
+        val declared = snap?.driverDeclaredFrameCount ?: geometry?.expectedFrames ?: -1L
+        val hold = q?.holdFrame ?: snap?.seek?.holdFrame ?: -1L
+        val target = q?.targetFrame ?: snap?.seek?.targetFrame ?: -1L
+        val expectedTotal = if (declared > 0L && hold >= 0L && target >= 0L) hold + declared - target else -1L
+
+        // 1. ringSessionSeekOrderOk:
+        // Start and first audio ok, seek accepted.
+        // Feed prepare accepted, feed held at window-aligned anchor H.
+        // Exact H equality: sink read == hold, sink written == hold, driver consumed == hold.
+        // Sink seek park acked while PAUSED, parkCount == 1, seekParkCount == 1.
+        // Sink flush acked strictly before driver seek while PARKED.
+        // Driver seek accepted to target T with non-blank stage and stable ring generation.
+        // Sink unparked to PLAYING, unparkCount == 1.
+        val exactHEquality = hold > 0L && target > hold &&
+            (snap?.driverFramesConsumedAtHold == hold || postSnap?.driverFramesConsumedAtHold == hold) &&
+            (q?.quiesceAccountingOk == true || postQ?.quiesceAccountingOk == true) &&
+            q != null && q.quiesceAccountingOk &&
+            q.quiesceSinkReadFrames == hold &&
+            q.quiesceSinkWrittenFrames == hold &&
+            sink != null && sink.framesWrittenAtFlush == hold && sink.framesReadAtFlush == hold &&
+            sink.parkCount == 1 && sink.seekParkCount == 1 &&
+            sink.playStateAtPark == AudioTrack.PLAYSTATE_PAUSED &&
+            sink.parkedPlayStateViolations == 0L
+
+        val flushAckBeforeDriverSeek = q != null &&
+            q.flushRequestedWhilePaused &&
+            q.flushAckedBeforeSeek &&
+            (q.flushAckedBeforeSeek || postQ?.flushAckedBeforeSeek == true) &&
+            (q.flushRequestedWhilePaused || postQ?.flushRequestedWhilePaused == true) &&
+            (q.sinkPhaseAtSeek == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED.name ||
+                postQ?.sinkPhaseAtSeek == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED.name) &&
+            sink != null && sink.flushCount == 1 && sink.flushRequestCount == 1 &&
+            sink.playStateBeforeFlush == AudioTrack.PLAYSTATE_PAUSED &&
+            sink.playStateAfterFlush == AudioTrack.PLAYSTATE_PAUSED
+
+        val driverSeekExecutionOk = seekAccepted &&
+            (snap?.driverSeekAccepted == true || postSnap?.driverSeekAccepted == true) &&
+            (q?.seekAccepted == true) &&
+            (snap?.driverStageAtSeek?.isNotBlank() == true || postSnap?.driverStageAtSeek?.isNotBlank() == true) &&
+            (snap?.driverStageAfterSeek?.isNotBlank() == true || postSnap?.driverStageAfterSeek?.isNotBlank() == true) &&
+            (snap?.driverGenerationAtSeek == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.RING_GENERATION ||
+                postSnap?.driverGenerationAtSeek == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.RING_GENERATION)
+
+        val unparkAndResumeOk = sink != null && sink.unparkCount == 1 &&
+            sink.playStateAfterUnpark == AudioTrack.PLAYSTATE_PLAYING &&
+            postSeekSnap != null && postSeekSnap.state in setOf(
+                VanguardRealtimeAudioPlaybackSession.State.PLAYING,
+                VanguardRealtimeAudioPlaybackSession.State.COMPLETED,
+                VanguardRealtimeAudioPlaybackSession.State.STOPPED,
+                VanguardRealtimeAudioPlaybackSession.State.DISPOSED,
+            )
+
+        val ringSeekOk = ring == null || (
+            ringSeek != null &&
+                ringSeek.seekExercised &&
+                ringSeek.seekAckOk &&
+                ringSeek.seekQuiescedFirst &&
+                ringSeek.holdReached &&
+                ringSeek.holdAckOk &&
+                ringSeek.holdFrame == hold &&
+                ringSeek.seekTargetFrame == target
+        )
+
+        // Y23 native timing gate relation, proven from the FROZEN geometry
+        // and the driver's own admission-time earliest (driver comment):
+        // E is window-aligned and at or above the gate floor (first window
+        // boundary strictly past F1); H is exactly the session's
+        // alignUp(E + preSeekHoldWindows * window) and therefore strictly
+        // past F1; the ring's final native snapshot shows the timing gate
+        // closed (nativeTimingT1Ns >= 0), which is the very fact the native
+        // session's seek_hold_below_native_timing_gate check requires.
+        val gateWindow = geometry?.maxFramesPerMix?.toLong() ?: -1L
+        val nativeTimingGateFrames = if (geometry != null && gateWindow > 0L) {
+            AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver.nativeTimingGateFrames(geometry.sampleRate, gateWindow)
+        } else {
+            -1L
+        }
+        val earliestHoldFloorFrames = if (geometry != null && gateWindow > 0L) {
+            AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver.nativeTimingGateHoldFloorFrames(geometry.sampleRate, gateWindow)
+        } else {
+            -1L
+        }
+        val earliestHold = snap?.driverSeekEarliestHoldFrame ?: postSnap?.driverSeekEarliestHoldFrame ?: -1L
+        val expectedHoldFromEarliest = if (earliestHold >= 0L && gateWindow > 0L) {
+            (earliestHold + config.preSeekHoldWindows.toLong() * gateWindow + gateWindow - 1L) / gateWindow * gateWindow
+        } else {
+            -1L
+        }
+        val holdAboveNativeTimingGate = geometry != null && gateWindow > 0L &&
+            nativeTimingGateFrames > 0L &&
+            earliestHold >= earliestHoldFloorFrames &&
+            earliestHold % gateWindow == 0L &&
+            hold == expectedHoldFromEarliest &&
+            hold > nativeTimingGateFrames &&
+            (ring == null || (ringSeek != null && ringSeek.nativeQuiescentTimingT1Ns >= 0L))
+
+        val seekOrderOk = startAccepted &&
+            firstAudioOk &&
+            (snap?.driverSeekPrepareAccepted == true || postSnap?.driverSeekPrepareAccepted == true) &&
+            exactHEquality &&
+            flushAckBeforeDriverSeek &&
+            driverSeekExecutionOk &&
+            unparkAndResumeOk &&
+            ringSeekOk &&
+            holdAboveNativeTimingGate
+
+        // 2. ringSessionSeekEpochOk:
+        // Clock epoch opened at target frame T on unpark, target declared forward (not backward).
+        // Clock snapshot after unpark epochOpen, epochBase == T, epochId >= 1.
+        // Clock never faulted, monotonic, zero regression, zero base clamps.
+        val clockAfterUnpark = q?.clockAfterUnpark ?: snap?.seek?.clockAfterUnpark
+        val epochOpenedAtTarget = target > 0L &&
+            sink != null &&
+            sink.seekEpochOpenedAtUnpark != VanguardRealtimeAudioPlaybackSinkBridge.EPOCH_NONE &&
+            sink.seekEpochBaseFrame == target &&
+            sink.clockDeclaredBackwardOpenCalls == 0 &&
+            !sink.seekDeclaredBackward
+
+        val clockSnapshotEpochOk = clockAfterUnpark != null &&
+            clockAfterUnpark.epochOpen &&
+            clockAfterUnpark.epochBaseOffsetFrames == target &&
+            clockAfterUnpark.epochId >= 1 &&
+            clockAfterUnpark.positionFrames >= target
+
+        val clockMonotonicOk = clock != null &&
+            !clock.faulted &&
+            clock.regressionCount == 0L &&
+            clock.monotonicViolationCount == 0L &&
+            clock.baseClampCount == 0L &&
+            clock.positionFrames >= target
+
+        val seekEpochOk = epochOpenedAtTarget &&
+            clockSnapshotEpochOk &&
+            clockMonotonicOk
+
+        // 3. ringSessionPostSeekAccountingOk:
+        // Completion ok, sink reached EOS.
+        // Frames read and written match expected total H + declared - T.
+        // Checksum identity holds across sink and ring native/reference mix.
+        // Driver closed and disposed cleanly, sink joined, zero failure reason.
+        val sinkExitEos = sink != null &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS &&
+            sink.eosDrainedObserved
+
+        val frameAccountingOk = expectedTotal > 0L &&
+            sink != null &&
+            sink.framesReadFromTransport == expectedTotal &&
+            sink.framesWrittenToSink == expectedTotal &&
+            sink.readBudgetFrames == expectedTotal &&
+            sink.postSeekExpectedFrames == declared - target &&
+            (ring == null || ring.effectiveExpectedFrames == expectedTotal) &&
+            (ring == null || ring.framesReadBySink == expectedTotal)
+
+        val checksumOk = sink != null && ring != null &&
+            sink.checksumHex.isNotBlank() &&
+            ring.nativeOutputReadChecksumHex.isNotBlank() &&
+            sink.checksumHex == ring.nativeOutputReadChecksumHex &&
+            ring.nativeOutputReadChecksumHex == ring.kotlinReferenceMixChecksumHex &&
+            ring.checksumChainSelfOk
+
+        val driverClosedAndDisposed = stopAccepted &&
+            postSnap != null &&
+            postSnap.driverClosed &&
+            postSnap.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
+            postSnap.sinkJoined &&
+            (ring == null || (
+                ring.destroyJoinOk &&
+                    ring.destroyIdempotentOk &&
+                    ring.stage == AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Stage.CLOSED
+            ))
+
+        val noFailures = out.failureReason.isBlank() &&
+            (snap?.failureReason?.isBlank() ?: false) &&
+            (postSnap?.failureReason?.isBlank() ?: false) &&
+            (ring?.failureReason?.isBlank() ?: false)
+
+        val postSeekAccountingOk = completionOk &&
+            sinkExitEos &&
+            frameAccountingOk &&
+            checksumOk &&
+            driverClosedAndDisposed &&
+            noFailures
+
+        // 4. ringSessionSeekFailClosedOk:
+        // Probe unsupported seek confirmed to fail closed with driver_route_seek_unsupported,
+        // driver closed, and state transitioned cleanly.
+        val seekFailClosedOkFinal = seekFailClosedOk && out.failureReason.isBlank()
+
+        // Metrics recording
+        m["ringSessionSeekOrderOk"] = seekOrderOk
+        m["ringSessionSeekEpochOk"] = seekEpochOk
+        m["ringSessionPostSeekAccountingOk"] = postSeekAccountingOk
+        m["ringSessionSeekFailClosedOk"] = seekFailClosedOkFinal
+        m["startAccepted"] = startAccepted
+        m["firstAudioOk"] = firstAudioOk
+        m["seekAccepted"] = seekAccepted
+        m["completionOk"] = completionOk
+        m["stopAccepted"] = stopAccepted
+        m["driverSeekPrepareAccepted"] = snap?.driverSeekPrepareAccepted ?: false
+        m["driverSeekAccepted"] = snap?.driverSeekAccepted ?: false
+        m["driverSeekQuiesceAccountingOk"] = q?.quiesceAccountingOk ?: postQ?.quiesceAccountingOk ?: false
+        m["driverSeekFlushAckedBeforeSeek"] = q?.flushAckedBeforeSeek ?: postQ?.flushAckedBeforeSeek ?: false
+        m["driverFramesConsumedAtHold"] = snap?.driverFramesConsumedAtHold ?: -1L
+        m["driverSeekHoldWaitMs"] = snap?.driverSeekHoldWaitMs ?: -1L
+        m["driverStageAtSeek"] = snap?.driverStageAtSeek ?: ""
+        m["driverStageAfterSeek"] = snap?.driverStageAfterSeek ?: ""
+        m["driverGenerationAtSeek"] = snap?.driverGenerationAtSeek ?: -1L
+        m["driverSeekEarliestHoldFrame"] = snap?.driverSeekEarliestHoldFrame ?: -1L
+        m["driverSeekNativeTimingGateFrames"] = nativeTimingGateFrames
+        m["driverSeekEarliestHoldFloorFrames"] = earliestHoldFloorFrames
+        m["driverSeekExpectedHoldFromEarliest"] = expectedHoldFromEarliest
+        m["driverSeekHoldAboveNativeTimingGate"] = holdAboveNativeTimingGate
+        m["ringNativeTimingT1Ns"] = ringSeek?.nativeQuiescentTimingT1Ns ?: -1L
+        m["holdFrame"] = hold
+        m["targetFrame"] = target
+        m["declaredFrames"] = declared
+        m["expectedTotalFrames"] = expectedTotal
+        m["sinkParkCount"] = sink?.parkCount ?: -1
+        m["sinkSeekParkCount"] = sink?.seekParkCount ?: -1
+        m["sinkUnparkCount"] = sink?.unparkCount ?: -1
+        m["sinkFlushCount"] = sink?.flushCount ?: -1
+        m["sinkFramesWrittenAtFlush"] = sink?.framesWrittenAtFlush ?: -1L
+        m["sinkFramesReadAtFlush"] = sink?.framesReadAtFlush ?: -1L
+        m["sinkSeekEpochBaseFrame"] = sink?.seekEpochBaseFrame ?: -1L
+        m["sinkSeekEpochOpenedAtUnpark"] = sink?.seekEpochOpenedAtUnpark ?: -1
+        m["sinkExitReason"] = sink?.exitReason ?: ""
+        m["sinkFramesReadFromTransport"] = sink?.framesReadFromTransport ?: -1L
+        m["sinkFramesWrittenToSink"] = sink?.framesWrittenToSink ?: -1L
+        m["sinkChecksumHex"] = sink?.checksumHex ?: ""
+        m["ringNativeOutputReadChecksumHex"] = ring?.nativeOutputReadChecksumHex ?: ""
+        m["ringChecksumChainSelfOk"] = ring?.checksumChainSelfOk ?: false
+        m["ringDestroyJoinOk"] = ring?.destroyJoinOk ?: false
+        m["ringDestroyIdempotentOk"] = ring?.destroyIdempotentOk ?: false
+        m["ringFailureReason"] = ring?.failureReason ?: ""
+        m["sessionFailureReason"] = postSnap?.failureReason ?: ""
+        m["driverClosed"] = postSnap?.driverClosed ?: false
+        m["seekFailClosedOk"] = seekFailClosedOkFinal
+
+        out.lanes[LANE_RING_SESSION_SEEK_ORDER] = out.failureReason.isBlank() && seekOrderOk
+        out.lanes[LANE_RING_SESSION_SEEK_EPOCH] = out.failureReason.isBlank() && seekEpochOk
+        out.lanes[LANE_RING_SESSION_POST_SEEK_ACCOUNTING] = out.failureReason.isBlank() && postSeekAccountingOk
+        out.lanes[LANE_RING_SESSION_SEEK_FAIL_CLOSED] = out.failureReason.isBlank() && seekFailClosedOkFinal
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

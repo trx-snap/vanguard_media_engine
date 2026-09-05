@@ -1,6 +1,7 @@
 package com.connects.vanguard_media_engine.audio_playback_graph
 
 import android.content.Context
+import android.media.AudioTrack
 import android.os.Handler
 import android.os.SystemClock
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackAudioFocusController.Tag as FocusTag
@@ -184,6 +185,23 @@ import kotlin.concurrent.withLock
 // PLAYING; see the "── Y22 ring/driver route bounded pause/resume ──"
 // section below for the full order and fail-closed reasons.
 //
+// Ring/driver route bounded forward seek (Y23, P4-AUDIO-REALTIME-PLAYBACK-
+// RING-TRANSPORT-SESSION-SEEK), default OFF (driver route only, only for
+// a driver reporting supportsSeek, and only the ONE forward
+// [Config.seekTargetSec] seek: secondSeekTargetSec / seekBackward stay
+// rejected on this route): H/T are admitted at start against the driver's
+// own earliestSeekHoldFrame (H = first window boundary at least
+// preSeekHoldWindows windows past it; T = seekTargetSec aligned down to a
+// window; T - H >= one window; T + one second <= declared) together with a
+// hold-cap / deadline budget check, before the driver starts. [seek] then
+// runs PLAYING -> SEEKING -> PLAYING as driver.prepareForSeek(H) (feed held
+// at H while the sink still drains) -> EXACT drain-to-H equality on both
+// the sink's read count and the driver's framesConsumedBySinkObserved ->
+// sink seek park + ack -> sink flush (declared - T, T) + ack -> driver.seek(T)
+// (never before the flush ack) -> sink unpark + ack (never before a
+// successful driver seek); see the "── Y23 ring/driver route bounded
+// forward seek ──" section below. It never overlaps the Y22 pause cycle.
+//
 // Modularity note: this session file stays a single cohesive class rather
 // than being split by lifecycle concern. Y12 is another additive,
 // default-OFF lifecycle extension of the existing production session/sink
@@ -255,10 +273,11 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         // [VanguardRealtimeAudioPlaybackTransportDriver] from this factory
         // (after the session deadline above is computed) and drives
         // playback through it instead of the default decoder-feed/
-        // transport-state-machine route; every seek variant, focus
-        // response and routing response is validated OFF for this route
-        // (class comment). Absent leaves the default route entirely
-        // unchanged.
+        // transport-state-machine route; the second seek, the backward
+        // seek, focus response and routing response are validated OFF for
+        // this route, and the ONE forward seek is admitted only against a
+        // driver reporting supportsSeek (Y23, class comment). Absent leaves
+        // the default route entirely unchanged.
         val driverFactory: ((VanguardRealtimeAudioPlaybackTransportDriver.Context) -> VanguardRealtimeAudioPlaybackTransportDriver)? = null,
     )
 
@@ -350,6 +369,19 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val driverStageBeforeResume: String = "",
         val driverGenerationAtPause: Long = -1L,
         val driverGenerationAtResume: Long = -1L,
+        // Y23 driver-route bounded forward seek (class comment): the two
+        // driver primitive outcomes, the driver-side consumed count at the
+        // exact hold equality, and the driver's stage/generation reads
+        // around its seek. [seek] above carries the shared seek observation
+        // (sequencer fields stay at their defaults on this route).
+        val driverSeekPrepareAccepted: Boolean = false,
+        val driverSeekAccepted: Boolean = false,
+        val driverSeekHoldWaitMs: Long = -1L,
+        val driverFramesConsumedAtHold: Long = -1L,
+        val driverStageAtSeek: String = "",
+        val driverStageAfterSeek: String = "",
+        val driverGenerationAtSeek: Long = -1L,
+        val driverSeekEarliestHoldFrame: Long = -1L,
     )
 
     companion object {
@@ -366,8 +398,21 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         // Y22: bound on each of the four driver pause/resume primitives
         // (further clamped to the session deadline via [remainingMs]).
         private const val DRIVER_PAUSE_CONTROL_TIMEOUT_MS = 2_000L
+        // Y23 driver-route seek bounds (each further clamped to the session
+        // deadline via [remainingMs]): the initial sink write wait and the
+        // sink flush ack mirror [VanguardRealtimeAudioPlaybackSeekSequencer];
+        // the driver seek itself (media re-anchor + post-seek prefill) gets
+        // its own bound; the drain-to-H wait is sized per run from H's
+        // realtime length plus this slack.
+        private const val DRIVER_SEEK_INITIAL_WRITE_WAIT_MS = 2_000L
+        private const val DRIVER_SEEK_FLUSH_ACK_TIMEOUT_MS = 2_000L
+        private const val DRIVER_SEEK_CONTROL_TIMEOUT_MS = 10_000L
+        private const val DRIVER_SEEK_HOLD_WAIT_SLACK_MS = 10_000L
 
         private fun alignUp(frame: Long, window: Long): Long = ((frame + window - 1L) / window) * window
+        private fun alignDown(frame: Long, window: Long): Long = (frame / window) * window
+        private fun framesToMs(frames: Long, sampleRate: Int): Long =
+            if (sampleRate <= 0 || frames <= 0L) 0L else (frames * 1_000L + sampleRate - 1L) / sampleRate
     }
 
     private class FailClosed(val reason: String) : Exception(reason)
@@ -440,6 +485,40 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     @Volatile private var driverStageBeforeResume = ""
     @Volatile private var driverGenerationAtPause = -1L
     @Volatile private var driverGenerationAtResume = -1L
+    // Y23 driver-route bounded forward seek bookkeeping (command-lock holder
+    // writes; published through snapshot()). [driverSeekCycleStarted] is set
+    // once, immediately before the first mutating step of the ONE admitted
+    // seek, so a second driver-route seek rejects without mutation
+    // (seek_repeated) and a Y22 pause can never interleave with it. The
+    // shared seek-observation fields below mirror the sequencer's for the
+    // steps that exist on this route (no transport pause/seek/resume, no
+    // native replies, no feed re-anchor).
+    @Volatile private var driverSeekCycleStarted = false
+    @Volatile private var driverSeekPrepareAccepted = false
+    @Volatile private var driverSeekAccepted = false
+    @Volatile private var driverSeekHoldWaitMs = -1L
+    @Volatile private var driverFramesConsumedAtHold = -1L
+    @Volatile private var driverStageAtSeek = ""
+    @Volatile private var driverStageAfterSeek = ""
+    @Volatile private var driverGenerationAtSeek = -1L
+    @Volatile private var driverSeekEarliestHoldFrame = -1L
+    @Volatile private var driverSeekInitialWriteWaitMs = -1L
+    @Volatile private var driverSeekQuiesceSinkReadFrames = -1L
+    @Volatile private var driverSeekQuiesceSinkWrittenFrames = -1L
+    @Volatile private var driverSeekQuiesceAccountingOk = false
+    @Volatile private var driverSeekFlushRequestedWhileHeld = false
+    @Volatile private var driverSeekFlushAckWaitMs = -1L
+    @Volatile private var driverSeekFlushAckedBeforeSeek = false
+    @Volatile private var driverSeekSinkPhaseAtSeek = ""
+    @Volatile private var driverSeekParkRequestedAtMs = -1L
+    @Volatile private var driverSeekParkAckedAtMs = -1L
+    @Volatile private var driverSeekUnparkedAtMs = -1L
+    @Volatile private var driverSeekResumedAtMs = -1L
+    @Volatile private var driverSeekHoldObservedMs = -1L
+    @Volatile private var driverSeekWallMs = -1L
+    @Volatile private var driverSeekClockAtPark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
+    @Volatile private var driverSeekClockBeforeUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
+    @Volatile private var driverSeekClockAfterUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
     @Volatile private var terminalReply: Reply? = null
     @Volatile private var sessionStartedAtMs = -1L
     @Volatile private var sessionWallMs = 0L
@@ -655,13 +734,16 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             if (config.routingMonitorJoinMs <= 0L) return failClosed("invalid_routing_monitor_join_ms")
         }
         // Y21: the ring/driver route is validated before STARTING or any
-        // object creation (class comment) -- incompatible with every seek
-        // variant and with focus/routing response; the Y8b synthetic
-        // dead-object seam never arms on this route either, since it is a
-        // sink-thread AudioTrack recovery concern the driver route does not
-        // route through the same way.
+        // object creation (class comment) -- incompatible with the second
+        // and backward seek variants and with focus/routing response; the
+        // Y8b synthetic dead-object seam never arms on this route either,
+        // since it is a sink-thread AudioTrack recovery concern the driver
+        // route does not route through the same way. Y23: the ONE forward
+        // seek (seekTargetSec > 0.0) is admitted on this route against a
+        // driver reporting supportsSeek, checked as soon as the driver
+        // exists in [openAndStartDriverRouteLocked] (its support is not
+        // knowable before the factory runs).
         if (config.driverFactory != null) {
-            if (config.seekTargetSec > 0.0) return failClosed("driver_route_seek_unsupported")
             if (config.secondSeekTargetSec > 0.0) return failClosed("driver_route_seek_unsupported")
             if (config.seekBackward) return failClosed("driver_route_seek_unsupported")
             if (config.enableAudioFocusResponse) return failClosed("driver_route_focus_unsupported")
@@ -930,6 +1012,10 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             ),
         )
         driver = d
+        // Y23: a forward seek armed against a driver without seek support
+        // fails closed (typed) at the earliest point support is knowable --
+        // before the driver is even opened.
+        if (config.seekTargetSec > 0.0 && !d.supportsSeek) throw FailClosed("driver_route_seek_unsupported")
         if (!d.open(remainingMs())) throw FailClosed("driver_open_failed:${d.exitReason}")
         checkDeadlineAndCancel()
 
@@ -952,6 +1038,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         )
         VanguardRealtimePlaybackNativeSession.validate(driverSessionConfig)?.let {
             throw FailClosed("driver_geometry_invalid:${it.name.lowercase()}")
+        }
+
+        // Y23 seek admission (class comment): after the geometry is frozen
+        // and validated, before the sink exists or the driver starts.
+        if (config.seekTargetSec > 0.0) {
+            admitDriverRouteSeekLocked(d, sampleRate, maxFramesPerMix.toLong(), declaredFrameCount)
         }
 
         // Sink exists and is READY (AudioTrack created, gain set) before the
@@ -990,6 +1082,59 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         transportStartAtMs = SystemClock.elapsedRealtime()
         s.allowDrain()
         drainAllowedAtMs = SystemClock.elapsedRealtime()
+    }
+
+    // Y23 driver-route seek admission (command-lock holder, STARTING, driver
+    // open, geometry validated, driver NOT started). Frame math with
+    // window = maxFramesPerMix: E = driver.earliestSeekHoldFrame (>= 0,
+    // window-aligned); H = first window boundary >= E + preSeekHoldWindows
+    // windows (so H > E); T = seekTargetSec * sampleRate aligned DOWN to a
+    // window; T - H >= one clean window; T + one second <= declared. Budget
+    // math: the sink's seek-park cap must cover flush ack + driver seek +
+    // unpark ack; the session deadline must cover the realtime drain to H,
+    // every bounded seek step and the realtime post-seek drain of
+    // (declared - T). Each check has its own typed fail-closed reason; the
+    // arming fields are set only once every check passed. [seekHoldPinned]
+    // is set here (no feed exists to pin on this route -- the driver arms
+    // its own hold in prepareForSeek at seek time).
+    private fun admitDriverRouteSeekLocked(
+        d: VanguardRealtimeAudioPlaybackTransportDriver,
+        sampleRate: Int,
+        window: Long,
+        declared: Long,
+    ) {
+        val earliest = d.earliestSeekHoldFrame
+        driverSeekEarliestHoldFrame = earliest
+        if (earliest < 0L) throw FailClosed("driver_seek_earliest_hold_unavailable:$earliest")
+        if (earliest % window != 0L) throw FailClosed("driver_seek_earliest_hold_unaligned:$earliest:$window")
+        val hold = alignUp(earliest + config.preSeekHoldWindows.toLong() * window, window)
+        val target = alignDown((config.seekTargetSec * sampleRate).toLong(), window)
+        val holdAligned = hold % window == 0L
+        val holdPastEarliest = hold > earliest
+        val cleanWindowBeforeTarget = target - hold >= window
+        val targetLeavesTail = target + sampleRate.toLong() <= declared
+        val admissionOk = holdAligned && holdPastEarliest && target > 0L && cleanWindowBeforeTarget && targetLeavesTail
+        if (!admissionOk) {
+            throw FailClosed(
+                "driver_seek_admission:earliest=$earliest:hold=$hold:target=$target:declared=$declared:window=$window:" +
+                    "holdAligned=$holdAligned:holdPastEarliest=$holdPastEarliest:cleanWindowBeforeTarget=$cleanWindowBeforeTarget:" +
+                    "targetLeavesTail=$targetLeavesTail",
+            )
+        }
+        val holdCapNeededMs = DRIVER_SEEK_FLUSH_ACK_TIMEOUT_MS + DRIVER_SEEK_CONTROL_TIMEOUT_MS + UNPARK_ACK_TIMEOUT_MS
+        if (config.maxSeekHoldMs < holdCapNeededMs) {
+            throw FailClosed("driver_seek_hold_cap_too_short:${config.maxSeekHoldMs}:$holdCapNeededMs")
+        }
+        val deadlineNeededMs = DRIVER_SEEK_INITIAL_WRITE_WAIT_MS + framesToMs(hold, sampleRate) + DRIVER_SEEK_HOLD_WAIT_SLACK_MS +
+            PARK_ACK_TIMEOUT_MS + holdCapNeededMs + framesToMs(declared - target, sampleRate)
+        if (config.deadlineMs < deadlineNeededMs) {
+            throw FailClosed("driver_seek_deadline_too_short:${config.deadlineMs}:$deadlineNeededMs")
+        }
+        seekArmed = true
+        seekTargetFrame = target
+        preSeekHoldFrame = hold
+        seekAdmissionOk = true
+        seekHoldPinned = true
     }
 
     // Sink park -> ack -> transport.pause. The hold is bounded by the sink.
@@ -1236,6 +1381,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     fun seek(targetFrame: Long): CommandResult = commandLock.withLock {
         if (state != State.PLAYING) return reject("invalid_state_${state.name.lowercase()}")
         if (!seekArmed || !seekHoldPinned) return reject("seek_not_armed")
+        // Y23: the ring/driver route runs its own bounded seek order
+        // ([seekDriverRouteLocked]); the default route below is unchanged.
+        if (config.driverFactory != null) {
+            val d = driver ?: return reject("driver_route_seek_unsupported")
+            return seekDriverRouteLocked(d, targetFrame)
+        }
         val maxSeeks = if (repeatedSeekArmed) 2 else 1
         if (seekCount >= maxSeeks) return reject("seek_repeated")
         val index = seekCount
@@ -1265,6 +1416,220 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             failClosed(reason)
         }
     }
+
+    // ── Y23 ring/driver route bounded forward seek ─────────────────────────
+    //
+    // (P4-AUDIO-REALTIME-PLAYBACK-RING-TRANSPORT-SESSION-SEEK.) Exactly ONE
+    // forward seek per driver-route run, sequenced under the command lock
+    // (state SEEKING) in this fixed order; every step is verified and any
+    // false / timeout / exited thread / cancel / accounting divergence fails
+    // closed through the common teardown ([failClosed] -> [teardownLocked]:
+    // sink.cancel wakes a parked sink thread, the driver is closed).
+    //   PLAYING + armed + first seek + target == armed T + Y22 pause cycle
+    //   never started + no failure + sink/driver alive
+    //   -> initial sink play/write (the seek must land on a really playing
+    //      sink); fail if the sink already read >= H
+    //   -> driver.prepareForSeek(H) WHILE the sink still drains (the
+    //      driver's feed is held exactly at H; parking first would starve it)
+    //   -> EXACT equality sink.framesRead == H AND
+    //      driver.framesConsumedBySinkObserved == H (fail closed the moment
+    //      either passes H, the sink leaves RUNNING, or the bounded wait ends)
+    //   -> sink seek park + ack (AudioTrack paused, park/seek-park counts 1)
+    //   -> sink flush (declared - T, T, forward) + ack, verified on the
+    //      sink's telemetry (written/read at flush == H, budget H + declared - T)
+    //   -> driver.seek(T) ONLY after the flush ack
+    //   -> sink unpark + ack ONLY after a successful driver seek (epoch
+    //      opened at T, forward)
+    //   -> PLAYING.
+    // The sink is never unparked after a failed prepare / flush / driver
+    // seek: the failure path leaves it parked for teardown's cancel wake-up.
+    // No transport generation exists on this route: the driver's own frame-
+    // source generation is published instead (Y22 precedent).
+
+    private fun seekDriverRouteLocked(d: VanguardRealtimeAudioPlaybackTransportDriver, targetFrame: Long): CommandResult {
+        if (!d.supportsSeek) return reject("driver_route_seek_unsupported")
+        if (driverSeekCycleStarted || seekCount >= 1) return reject("seek_repeated")
+        if (targetFrame != seekTargetFrame) return reject("seek_target_mismatch:$targetFrame:$seekTargetFrame")
+        if (driverPauseCycleStarted) return reject("driver_route_seek_after_pause_cycle")
+        failure.get()?.let { return failClosed(it) }
+        val s = sink ?: return failClosed("sink_missing")
+        if (!s.isAlive) return failClosed("sink_exited_before_seek:${s.currentExitReason}")
+        if (!d.isAlive) return failClosed("driver_exited_before_seek:${driverFailureLabel(d)}")
+        val hold = preSeekHoldFrame
+        val target = seekTargetFrame
+        val declared = d.declaredFrameCount
+        val sampleRate = d.sampleRate
+        driverSeekCycleStarted = true
+        seekCount = 1
+        state = State.SEEKING
+        return try {
+            val seekStartedAt = SystemClock.elapsedRealtime()
+            checkDeadlineAndCancel()
+            // 1. The seek must land on a really playing sink.
+            val writeWaitDeadline = seekStartedAt + DRIVER_SEEK_INITIAL_WRITE_WAIT_MS
+            while (!s.hasPlayed || s.framesWritten <= 0L) {
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_first_write:${s.currentExitReason}")
+                if (SystemClock.elapsedRealtime() > writeWaitDeadline) throw FailClosed("no_initial_sink_write")
+                sleepSlice()
+            }
+            driverSeekInitialWriteWaitMs = SystemClock.elapsedRealtime() - seekStartedAt
+            if (s.framesRead >= hold) throw FailClosed("driver_seek_hold_passed_before_prepare:${s.framesRead}:$hold")
+            if (!d.isAlive) throw FailClosed("driver_exited_before_seek_prepare:${driverFailureLabel(d)}")
+            // 2. Hold the driver's feed at H while the sink keeps draining.
+            driverSeekPrepareAccepted = d.prepareForSeek(hold, driverSeekHoldWaitTimeoutMs(hold, sampleRate))
+            if (!driverSeekPrepareAccepted) throw FailClosed("driver_seek_prepare_failed:${driverFailureLabel(d)}")
+            checkDeadlineAndCancel()
+            failure.get()?.let { throw FailClosed(it) }
+            // 3. Exact drain-to-H equality on BOTH counters before any park.
+            val holdWaitStart = SystemClock.elapsedRealtime()
+            val holdWaitDeadline = holdWaitStart + driverSeekHoldWaitTimeoutMs(hold, sampleRate)
+            while (true) {
+                val sinkRead = s.framesRead
+                val driverConsumed = d.framesConsumedBySinkObserved
+                if (sinkRead == hold && driverConsumed == hold) break
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_seek_hold:${s.currentExitReason}")
+                if (!d.isAlive) throw FailClosed("driver_exited_before_seek_hold:${driverFailureLabel(d)}")
+                if (sinkRead > hold) throw FailClosed("sink_read_past_hold:$sinkRead:$hold")
+                if (driverConsumed > hold) throw FailClosed("driver_consumed_past_hold:$driverConsumed:$hold")
+                if (s.phase != VanguardRealtimeAudioPlaybackSinkBridge.Phase.RUNNING) {
+                    throw FailClosed("quiesce_sink_phase:${s.phase.name.lowercase()}")
+                }
+                if (SystemClock.elapsedRealtime() > holdWaitDeadline) {
+                    throw FailClosed("driver_seek_hold_timeout:read=$sinkRead:consumed=$driverConsumed:hold=$hold")
+                }
+                sleepSlice()
+            }
+            driverSeekHoldWaitMs = SystemClock.elapsedRealtime() - holdWaitStart
+            driverSeekQuiesceSinkReadFrames = s.framesRead
+            driverFramesConsumedAtHold = d.framesConsumedBySinkObserved
+            // 4. Sink seek park + ack; counts verified on the sink's telemetry.
+            driverSeekParkRequestedAtMs = SystemClock.elapsedRealtime()
+            if (!s.requestSeekPark()) throw FailClosed("sink_seek_park_rejected:${s.phase.name.lowercase()}")
+            val parkAckDeadline = driverSeekParkRequestedAtMs + PARK_ACK_TIMEOUT_MS
+            while (!s.awaitParked(WAIT_SLICE_MS)) {
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_seek_park_ack:${s.currentExitReason}")
+                if (SystemClock.elapsedRealtime() > parkAckDeadline) throw FailClosed("sink_seek_park_ack_timeout")
+            }
+            driverSeekParkAckedAtMs = SystemClock.elapsedRealtime()
+            driverSeekClockAtPark = s.clockSnapshot()
+            driverSeekQuiesceSinkWrittenFrames = s.framesWritten
+            val parkTelemetry = s.telemetry()
+            if (parkTelemetry.playStateAtPark != AudioTrack.PLAYSTATE_PAUSED) {
+                throw FailClosed("sink_not_paused_at_seek_park:${parkTelemetry.playStateAtPark}")
+            }
+            if (parkTelemetry.parkCount != 1 || parkTelemetry.seekParkCount != 1) {
+                throw FailClosed("sink_seek_park_count:${parkTelemetry.parkCount}:${parkTelemetry.seekParkCount}:1")
+            }
+            // Parked after a fully written window: the sink's read and
+            // written counts must both sit exactly at H, and the driver
+            // must still see exactly H consumed.
+            driverSeekQuiesceAccountingOk = s.framesRead == hold && s.framesWritten == hold &&
+                d.framesConsumedBySinkObserved == hold
+            if (!driverSeekQuiesceAccountingOk) {
+                throw FailClosed(
+                    "driver_seek_quiesce_accounting:read=${s.framesRead}:written=${s.framesWritten}:" +
+                        "consumed=${d.framesConsumedBySinkObserved}:hold=$hold",
+                )
+            }
+            if (!d.isAlive) throw FailClosed("driver_exited_at_seek_park:${driverFailureLabel(d)}")
+            // 5. Sink flush + ack (read budget H + declared - T, epoch to
+            //    open at T on unpark), strictly before the driver seek.
+            driverSeekFlushRequestedWhileHeld = true
+            val flushAt = SystemClock.elapsedRealtime()
+            if (!s.requestFlush(declared - target, target, false)) {
+                throw FailClosed("sink_flush_request_rejected:${s.phase.name.lowercase()}")
+            }
+            val flushAckDeadline = flushAt + DRIVER_SEEK_FLUSH_ACK_TIMEOUT_MS
+            while (!s.awaitFlushed(WAIT_SLICE_MS, 1)) {
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_flush_ack:${s.currentExitReason}")
+                if (SystemClock.elapsedRealtime() > flushAckDeadline) {
+                    throw FailClosed("sink_flush_ack_timeout:${s.currentFlushCount}:1")
+                }
+            }
+            driverSeekFlushAckWaitMs = SystemClock.elapsedRealtime() - flushAt
+            val k = s.telemetry()
+            val flushOk = k.flushCount == 1 && k.flushRequestCount == 1 && k.flushExecutedOnSinkThread &&
+                k.playStateBeforeFlush == AudioTrack.PLAYSTATE_PAUSED && k.playStateAfterFlush == AudioTrack.PLAYSTATE_PAUSED &&
+                k.framesWrittenAtFlush == hold && k.framesReadAtFlush == hold &&
+                k.postSeekExpectedFrames == declared - target && k.readBudgetFrames == hold + (declared - target) &&
+                k.seekTargetFrame == target && k.timestampPollsDuringFlush == 0L && !k.seekDeclaredBackward &&
+                s.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED
+            if (!flushOk) {
+                throw FailClosed(
+                    "sink_flush_verification:count=${k.flushCount}:requests=${k.flushRequestCount}:before=${k.playStateBeforeFlush}:" +
+                        "after=${k.playStateAfterFlush}:written=${k.framesWrittenAtFlush}:read=${k.framesReadAtFlush}:" +
+                        "expected=${k.postSeekExpectedFrames}:budget=${k.readBudgetFrames}:sink=${s.phase.name.lowercase()}:" +
+                        "backward=${k.seekDeclaredBackward}",
+                )
+            }
+            // 6. Driver seek ONLY after the flush ack.
+            driverSeekFlushAckedBeforeSeek = s.currentFlushCount == 1
+            if (!driverSeekFlushAckedBeforeSeek) throw FailClosed("seek_before_flush:${s.currentFlushCount}:1")
+            driverSeekSinkPhaseAtSeek = s.phase.name
+            driverStageAtSeek = d.currentStageLabel
+            if (!d.isAlive) throw FailClosed("driver_exited_before_seek:${driverFailureLabel(d)}")
+            checkDeadlineAndCancel()
+            driverSeekAccepted = d.seek(target, driverSeekControlTimeoutMs())
+            driverStageAfterSeek = d.currentStageLabel
+            driverGenerationAtSeek = d.frameSource.currentGeneration
+            if (!driverSeekAccepted) throw FailClosed("driver_seek_rejected:${driverFailureLabel(d)}")
+            checkDeadlineAndCancel()
+            failure.get()?.let { throw FailClosed(it) }
+            if (!d.isAlive) throw FailClosed("driver_exited_after_seek:${driverFailureLabel(d)}")
+            // 7. Sink unpark + ack ONLY after the successful driver seek.
+            if (!s.isAlive) throw FailClosed("sink_exited_during_seek:${s.currentExitReason}")
+            driverSeekClockBeforeUnpark = s.clockSnapshot()
+            val unparkAt = SystemClock.elapsedRealtime()
+            if (!s.unpark()) throw FailClosed("sink_seek_unpark_rejected:${s.phase.name.lowercase()}:${s.currentFlushCount}")
+            val unparkAckDeadline = unparkAt + UNPARK_ACK_TIMEOUT_MS
+            while (!s.awaitRunning(WAIT_SLICE_MS)) {
+                checkDeadlineAndCancel()
+                failure.get()?.let { throw FailClosed(it) }
+                if (!s.isAlive) throw FailClosed("sink_exited_before_seek_unpark_ack:${s.currentExitReason}")
+                if (SystemClock.elapsedRealtime() > unparkAckDeadline) throw FailClosed("sink_seek_unpark_ack_timeout")
+            }
+            driverSeekUnparkedAtMs = SystemClock.elapsedRealtime()
+            driverSeekHoldObservedMs = driverSeekUnparkedAtMs - driverSeekParkAckedAtMs
+            driverSeekClockAfterUnpark = s.clockSnapshot()
+            val u = s.telemetry()
+            if (u.playStateAfterUnpark != AudioTrack.PLAYSTATE_PLAYING) {
+                throw FailClosed("sink_not_playing_after_seek_unpark:${u.playStateAfterUnpark}")
+            }
+            if (u.unparkCount != 1 || u.seekEpochOpenedAtUnpark == VanguardRealtimeAudioPlaybackSinkBridge.EPOCH_NONE ||
+                u.seekEpochBaseFrame != target
+            ) {
+                throw FailClosed("seek_epoch_not_opened:${u.unparkCount}:${u.seekEpochOpenedAtUnpark}:${u.seekEpochBaseFrame}:$target:1")
+            }
+            if (u.seekDeclaredBackward || u.clockDeclaredBackwardOpenCalls != 0) {
+                throw FailClosed("seek_epoch_direction:${u.seekDeclaredBackward}:${u.clockDeclaredBackwardOpenCalls}:declared=false:want=0")
+            }
+            driverSeekResumedAtMs = SystemClock.elapsedRealtime()
+            driverSeekWallMs = driverSeekResumedAtMs - seekStartedAt
+            state = State.PLAYING
+            accept()
+        } catch (f: FailClosed) {
+            failClosed(f.reason)
+        } catch (t: Throwable) {
+            failClosed("exception:${t.javaClass.simpleName}:${t.message}")
+        }
+    }
+
+    // Bound for the driver's prepareForSeek and for the session's own exact
+    // drain-to-H wait: H's realtime length plus a fixed slack, never past
+    // the session deadline.
+    private fun driverSeekHoldWaitTimeoutMs(hold: Long, sampleRate: Int): Long =
+        minOf(framesToMs(hold, sampleRate) + DRIVER_SEEK_HOLD_WAIT_SLACK_MS, remainingMs())
+
+    // Bound for the driver's seek primitive, never past the session deadline.
+    private fun driverSeekControlTimeoutMs(): Long = minOf(DRIVER_SEEK_CONTROL_TIMEOUT_MS, remainingMs())
 
     // Any state. Tears the pipeline down (sink, decoder, transport) once.
     fun stop(): CommandResult = commandLock.withLock {
@@ -1470,7 +1835,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             sinkJoined = sinkJoined,
             terminalReply = terminalReply,
             sessionWallMs = wall,
-            seek = VanguardRealtimeAudioPlaybackSeekObservation(
+            seek = if (config.driverFactory != null) buildDriverRouteSeekObservation() else VanguardRealtimeAudioPlaybackSeekObservation(
                 armed = seekArmed,
                 targetFrame = seekTargetFrame,
                 holdFrame = preSeekHoldFrame,
@@ -1536,8 +1901,78 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             driverStageBeforeResume = driverStageBeforeResume,
             driverGenerationAtPause = driverGenerationAtPause,
             driverGenerationAtResume = driverGenerationAtResume,
+            driverSeekPrepareAccepted = driverSeekPrepareAccepted,
+            driverSeekAccepted = driverSeekAccepted,
+            driverSeekHoldWaitMs = driverSeekHoldWaitMs,
+            driverFramesConsumedAtHold = driverFramesConsumedAtHold,
+            driverStageAtSeek = driverStageAtSeek,
+            driverStageAfterSeek = driverStageAfterSeek,
+            driverGenerationAtSeek = driverGenerationAtSeek,
+            driverSeekEarliestHoldFrame = driverSeekEarliestHoldFrame,
         )
     }
+
+    // Y23: the shared seek observation on the ring/driver route, carrying
+    // the same field semantics as the default route for every step that
+    // exists here (initial write wait, drain-to-H quiescence, seek park,
+    // flush, unpark, clocks, wall times) and neutral defaults for the
+    // transport-only ones (no native replies, no transport pause/resume,
+    // no feed re-anchor / post-seek pre-roll, no decoder seek telemetry).
+    // `seekAccepted` / `seekGeneration` mirror the driver primitive's
+    // outcome and the driver's own frame-source generation at its seek;
+    // `staleGeneration` stays -1 (no transport generation is fabricated).
+    // `quiesceFeedHeld` is the driver's prepare (feed-hold) acceptance;
+    // `flushRequestedWhilePaused` reports the flush was requested while the
+    // driver's feed was held and the sink parked.
+    private fun buildDriverRouteSeekObservation(): VanguardRealtimeAudioPlaybackSeekObservation =
+        VanguardRealtimeAudioPlaybackSeekObservation(
+            armed = seekArmed,
+            targetFrame = seekTargetFrame,
+            holdFrame = preSeekHoldFrame,
+            admissionOk = seekAdmissionOk,
+            holdPinned = seekHoldPinned,
+            seekCount = seekCount,
+            seekAccepted = driverSeekAccepted,
+            staleGeneration = -1L,
+            seekGeneration = driverGenerationAtSeek,
+            pauseAccepted = false,
+            pauseGeneration = -1L,
+            resumeAccepted = false,
+            resumeGeneration = -1L,
+            initialWriteWaitMs = driverSeekInitialWriteWaitMs,
+            quiesceWaitMs = driverSeekHoldWaitMs,
+            quiesceFeedHeld = driverSeekPrepareAccepted,
+            quiesceSinkReadFrames = driverSeekQuiesceSinkReadFrames,
+            quiesceSinkWrittenFrames = driverSeekQuiesceSinkWrittenFrames,
+            quiesceAccountingOk = driverSeekQuiesceAccountingOk,
+            preSeekSettleMs = -1L,
+            preSeekReply = null,
+            preSeekTransportState = null,
+            postPauseReply = null,
+            flushRequestedWhilePaused = driverSeekFlushRequestedWhileHeld,
+            flushAckWaitMs = driverSeekFlushAckWaitMs,
+            flushAckedBeforeSeek = driverSeekFlushAckedBeforeSeek,
+            sinkPhaseAtSeek = driverSeekSinkPhaseAtSeek,
+            postSeekReply = null,
+            postSeekTransportState = null,
+            reanchorWaitMs = -1L,
+            postSeekPreRollWaitMs = -1L,
+            postSeekPreRollReply = null,
+            postSeekPreRollTransportState = null,
+            transportStateAtUnpark = null,
+            parkRequestedAtMs = driverSeekParkRequestedAtMs,
+            parkAckedAtMs = driverSeekParkAckedAtMs,
+            unparkedAtMs = driverSeekUnparkedAtMs,
+            resumedAtMs = driverSeekResumedAtMs,
+            holdObservedMs = driverSeekHoldObservedMs,
+            seekWallMs = driverSeekWallMs,
+            clockAtPark = driverSeekClockAtPark,
+            clockBeforeUnpark = driverSeekClockBeforeUnpark,
+            clockAfterUnpark = driverSeekClockAfterUnpark,
+            decoder = null,
+            backward = false,
+            declaredBackward = false,
+        )
 
     // ── Internals ──────────────────────────────────────────────────────────
 

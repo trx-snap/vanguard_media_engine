@@ -7,12 +7,15 @@ import android.os.Handler
 import android.os.SystemClock
 import android.util.Log
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackClockCorrelation
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackFrameSource
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSession
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkBridge
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackTransportDriver
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackDecoderFeed
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine
 import io.flutter.plugin.common.MethodChannel
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -206,6 +209,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // Y22: the ONE session pause/resume proof for the real-decoder ring transport driver route.
         const val SCENARIO_REAL_DECODER_RING_SESSION_PAUSE_RESUME_TO_EOS =
             "SCENARIO_REAL_DECODER_RING_SESSION_PAUSE_RESUME_TO_EOS"
+        // Y23: the ONE session forward seek proof for the real-decoder ring transport driver route.
+        const val SCENARIO_REAL_DECODER_RING_SESSION_SEEK_TO_EOS =
+            "SCENARIO_REAL_DECODER_RING_SESSION_SEEK_TO_EOS"
         const val RING_SESSION_PAUSE_HOLD_MS = 500L
         const val RING_SESSION_MAX_PAUSE_HOLD_MS = 4_000L
 
@@ -355,6 +361,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_RING_SESSION_PAUSE_HOLD_FROZEN = "ringSessionPauseHoldFrozenOk"
         const val LANE_RING_SESSION_RESUME_ORDER = "ringSessionResumeOrderOk"
         const val LANE_RING_SESSION_POST_RESUME_CHECKSUM = "ringSessionPostResumeChecksumOk"
+        // Y23 lanes, evaluated by the real-decoder ring session seek scenario only.
+        const val LANE_RING_SESSION_SEEK_ORDER = "ringSessionSeekOrderOk"
+        const val LANE_RING_SESSION_SEEK_EPOCH = "ringSessionSeekEpochOk"
+        const val LANE_RING_SESSION_POST_SEEK_ACCOUNTING = "ringSessionPostSeekAccountingOk"
+        const val LANE_RING_SESSION_SEEK_FAIL_CLOSED = "ringSessionSeekFailClosedOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -403,6 +414,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_RING_SESSION_CHECKSUM_IDENTITY, LANE_RING_SESSION_STOP_DISPOSE,
             LANE_RING_SESSION_PAUSE_ORDER, LANE_RING_SESSION_PAUSE_HOLD_FROZEN,
             LANE_RING_SESSION_RESUME_ORDER, LANE_RING_SESSION_POST_RESUME_CHECKSUM,
+            LANE_RING_SESSION_SEEK_ORDER, LANE_RING_SESSION_SEEK_EPOCH,
+            LANE_RING_SESSION_POST_SEEK_ACCOUNTING, LANE_RING_SESSION_SEEK_FAIL_CLOSED,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -517,7 +530,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             maxDurationSec = (args["maxDurationSec"] as? Number)?.toDouble() ?: 3.0,
             maxFramesPerMix = (args["maxFramesPerMix"] as? Number)?.toInt() ?: 256,
             gain = (args["gain"] as? Number)?.toFloat() ?: 0.5f,
-            deadlineMs = (args["deadlineMs"] as? Number)?.toLong() ?: 30_000L,
+            deadlineMs = (args["deadlineMs"] as? Number)?.toLong() ?: 45_000L,
             pauseHoldMs = (args["pauseHoldMs"] as? Number)?.toLong() ?: DEFAULT_PAUSE_HOLD_MS,
             maxPauseHoldMs = (args["maxPauseHoldMs"] as? Number)?.toLong()
                 ?: VanguardRealtimeAudioPlaybackSession.DEFAULT_MAX_PAUSE_HOLD_MS,
@@ -776,6 +789,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // driver route (session constructed with driverFactory, start/awaitFirstAudio/
         // bounded pause/hold/resume/awaitCompletion to EOS, stop, and dispose through session).
         outcomes += realDecoderRingSessionPauseResumeScenario(config)
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y23: the ONE session forward seek proof for the real-decoder ring transport
+        // driver route (session constructed with driverFactory, start/awaitFirstAudio/
+        // seek(targetFrame)/awaitCompletion to EOS, stop, and dispose through session).
+        outcomes += realDecoderRingSessionSeekScenario(config)
         if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
@@ -2429,6 +2447,379 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         return outcome
     }
 
+    private class FakeUnsupportedSeekDriver : VanguardRealtimeAudioPlaybackTransportDriver {
+        var closed = false
+        override val sampleRate: Int = 44_100
+        override val channelCount: Int = 2
+        override val maxFramesPerMix: Int = 256
+        override val declaredFrameCount: Long = 44_100L
+        override val frameSource: VanguardRealtimeAudioPlaybackFrameSource = object : VanguardRealtimeAudioPlaybackFrameSource {
+            override val isOwnerThread: Boolean = false
+            override val currentGeneration: Long = 0L
+            override val currentStateLabel: String = "idle"
+            override fun drain(dst: ByteBuffer, maxFrames: Int): VanguardRealtimeAudioPlaybackFrameSource.DrainResult =
+                VanguardRealtimeAudioPlaybackFrameSource.DrainResult(false, "stub", null)
+            override fun postDriftSample(
+                request: VanguardRealtimePlaybackTransportStateMachine.DriftSampleRequest,
+                expectedGeneration: Long?,
+                callback: ((VanguardRealtimeAudioPlaybackFrameSource.DriftResult) -> Unit)?,
+            ): Boolean = false
+        }
+        override val isAlive: Boolean = true
+        override val exitReason: String = ""
+        override val currentStageLabel: String = "idle"
+        override val isEosTerminal: Boolean = false
+        override fun open(timeoutMs: Long): Boolean = true
+        override fun start(timeoutMs: Long): Boolean = true
+        override fun cancel() {}
+        override fun close(timeoutMs: Long): Boolean {
+            closed = true
+            return true
+        }
+    }
+
+    private fun probeUnsupportedSeekFailClosed(config: SmokeConfig): Boolean {
+        return try {
+            val fakeDriver = FakeUnsupportedSeekDriver()
+            val failSess = VanguardRealtimeAudioPlaybackSession(
+                VanguardRealtimeAudioPlaybackSession.Config(
+                    sourcePath = config.sourcePath,
+                    maxDurationSec = 1.0,
+                    maxFramesPerMix = 256,
+                    seekTargetSec = 0.5,
+                    driverFactory = { fakeDriver },
+                    threadNamePrefix = "Y23FailClosedProbe",
+                ),
+            )
+            val res = failSess.start()
+            val snapBeforeDispose = failSess.snapshot()
+            failSess.dispose()
+            val snapAfterDispose = failSess.snapshot()
+            !res.accepted &&
+                res.reason == "driver_route_seek_unsupported" &&
+                res.state == VanguardRealtimeAudioPlaybackSession.State.FAILED &&
+                fakeDriver.closed &&
+                snapBeforeDispose.failureReason == "driver_route_seek_unsupported" &&
+                snapAfterDispose.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    // Y23: the session derives T from a seconds-valued seekTargetSec against
+    // the driver's earliestSeekHoldFrame, and that earliest is floored at
+    // the native one-second timing gate (driver comment), so a fixed
+    // seekTargetSec (the smoke default of 1.0 s) can no longer host
+    // H + one clean window. Freeze the real ring geometry once with a
+    // short-lived probe ring (open -> frozenGeometry -> close; identical
+    // Config to the session's driver ring, so the frozen sampleRate /
+    // window / expectedFrames are the ones the session will admit against)
+    // and derive the LOWEST seek target that clears the session's own H
+    // for this geometry: E = driver earliest at admission (sink consumed
+    // 0), H = alignUp(E + preSeekHoldWindows * window), T = H + the same
+    // window-aligned forward skip the standalone Y20 lane proves
+    // (alignDown(SEEK_SKIP_SEC * sampleRate), >= one window). The skip must
+    // stay Y20-sized rather than a bare window or two: the ring rejects a
+    // seek whose skip is below the staged frames it discarded at the hold
+    // (real_ring_seek_skip_below_discarded_staged), and only the Y20 skip
+    // is physically proven to clear that bound. The configured
+    // seekTargetSec still wins when its own aligned-down target is already
+    // at or past that; the session's admission checks stay the
+    // authoritative guard.
+    private class RingSessionSeekTargetDerivation(
+        val geometry: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Geometry,
+        val nativeTimingGateFrames: Long,
+        val earliestHoldFloorFrames: Long,
+        val earliestHoldAtAdmission: Long,
+        val expectedHoldFrame: Long,
+        val skipFrames: Long,
+        val minTargetFrame: Long,
+        val derivedSeekTargetSec: Double,
+        val effectiveSeekTargetSec: Double,
+        val effectiveTargetFrame: Long,
+        val probeRingClosed: Boolean,
+    )
+
+    private fun deriveRingSessionSeekTarget(config: SmokeConfig): RingSessionSeekTargetDerivation {
+        val probeDeadlineAtMs = SystemClock.elapsedRealtime() + config.deadlineMs
+        val probe = AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
+            AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Config(
+                sourcePath = config.sourcePath,
+                maxDurationSec = config.maxDurationSec,
+                maxFramesPerMix = config.maxFramesPerMix,
+                deadlineAtMs = probeDeadlineAtMs,
+                drainWaitBoundMs = REAL_RING_DRAIN_WAIT_BOUND_MS,
+                threadName = "Y23RealRingGeometryProbe",
+            ),
+        )
+        var probeClosed = false
+        val geometry: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Geometry = try {
+            require(probe.open(config.deadlineMs), "ring_session_seek_probe_open_failed:${probe.currentFailureReason}:${probe.currentStage}")
+            probe.frozenGeometry ?: throw FailClosed("ring_session_seek_probe_geometry_missing")
+        } finally {
+            // The probe ring is closed from READY (never started); close is
+            // idempotent and joins the owner thread.
+            probeClosed = probe.close(config.deadlineMs)
+            if (!probeClosed) probeClosed = probe.close(RING_JOIN_TIMEOUT_MS)
+        }
+        require(probeClosed, "ring_session_seek_probe_close_failed:${probe.currentStage}")
+        val window = geometry.maxFramesPerMix.toLong()
+        val sampleRate = geometry.sampleRate
+        require(window > 0L && sampleRate > 0, "ring_session_seek_probe_geometry_invalid:$window:$sampleRate")
+        val gate = AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver.nativeTimingGateFrames(sampleRate, window)
+        val floor = AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver.nativeTimingGateHoldFloorFrames(sampleRate, window)
+        val earliest = AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver.conservativeEarliestSeekHoldFrame(0L, sampleRate, window)
+        require(earliest >= floor && earliest % window == 0L, "ring_session_seek_probe_earliest_invalid:$earliest:$floor:$window")
+        val hold = (earliest + config.preSeekHoldWindows.toLong() * window + window - 1L) / window * window
+        fun alignDown(v: Long): Long = v / window * window
+        // The session derives T = alignDown(seconds * sampleRate) itself;
+        // mirror that exact conversion here so the frame the session will
+        // admit is the frame this derivation reasons about.
+        fun sessionTargetFrame(seconds: Double): Long = alignDown((seconds * sampleRate.toDouble()).toLong())
+        // Y20-proven forward skip (class comment on the derivation): the
+        // same alignDown(SEEK_SKIP_SEC * sampleRate) the standalone lane
+        // uses, never a bare window count.
+        val skipFrames = alignDown((AndroidRealtimeAudioPlaybackRealDecoderRingSeekScenario.SEEK_SKIP_SEC * sampleRate.toDouble()).toLong())
+        require(skipFrames >= window, "ring_session_seek_skip_too_small:$skipFrames:$window")
+        val minTarget = hold + skipFrames
+        // Seconds value that the session's own alignDown conversion maps
+        // back to exactly minTarget: half a window of headroom absorbs the
+        // floating-point loss of minTarget / sampleRate without ever
+        // reaching the next window boundary. Proven below, not assumed.
+        val derivedSec = (minTarget.toDouble() + window.toDouble() / 2.0) / sampleRate.toDouble()
+        val derivedTarget = sessionTargetFrame(derivedSec)
+        require(derivedTarget == minTarget, "ring_session_seek_derived_target_mismatch:$derivedTarget:$minTarget:$derivedSec")
+        // The configured seconds win only when their own aligned-down
+        // target already sits at or past minTarget (so T - H >= skip).
+        val configuredTarget = sessionTargetFrame(config.seekTargetSec)
+        val configuredWins = configuredTarget >= minTarget
+        val effectiveSec = if (configuredWins) config.seekTargetSec else derivedSec
+        val effectiveTarget = if (configuredWins) configuredTarget else minTarget
+        val outputRing = AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.DEFAULT_OUTPUT_RING_CAPACITY_FRAMES.toLong()
+        // Fail closed when the aligned timeline cannot host T plus the
+        // session's one-second tail AND one output ring of post-seek content
+        // (the Y20 constraint), or when the seconds fall outside the declared span.
+        require(
+            effectiveSec < config.maxDurationSec &&
+                effectiveTarget + sampleRate.toLong() <= geometry.expectedFrames &&
+                effectiveTarget + outputRing <= geometry.expectedFrames,
+            "ring_session_seek_timeline_too_short:$effectiveTarget:$sampleRate:$outputRing:${geometry.expectedFrames}:$effectiveSec:${config.maxDurationSec}",
+        )
+        return RingSessionSeekTargetDerivation(
+            geometry = geometry,
+            nativeTimingGateFrames = gate,
+            earliestHoldFloorFrames = floor,
+            earliestHoldAtAdmission = earliest,
+            expectedHoldFrame = hold,
+            skipFrames = skipFrames,
+            minTargetFrame = minTarget,
+            derivedSeekTargetSec = derivedSec,
+            effectiveSeekTargetSec = effectiveSec,
+            effectiveTargetFrame = effectiveTarget,
+            probeRingClosed = probeClosed,
+        )
+    }
+
+    private fun realDecoderRingSessionSeekScenario(config: SmokeConfig): ScenarioOutcome {
+        val y23Config = config.copy(maxDurationSec = maxOf(config.maxDurationSec, 4.0))
+        val outcome = ScenarioOutcome(SCENARIO_REAL_DECODER_RING_SESSION_SEEK_TO_EOS)
+        val wallStart = SystemClock.elapsedRealtime()
+        var session: VanguardRealtimeAudioPlaybackSession? = null
+        var ring: AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource? = null
+        var startAccepted = false
+        var firstAudioOk = false
+        var preSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var seekAccepted = false
+        var postSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var completionOk = false
+        var completedSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var stopResult = VanguardRealtimeAudioPlaybackSession.CommandResult(false, VanguardRealtimeAudioPlaybackSession.State.IDLE, "")
+        var postDisposeSnapshot: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+
+        outcome.metrics["ringSessionSeekMaxDurationSec"] = y23Config.maxDurationSec
+        outcome.metrics["deadObjectInjectAfterFrames"] = 0L
+        outcome.metrics["seekTargetSecConfigured"] = y23Config.seekTargetSec
+        outcome.metrics["seekTargetSecArmed"] = y23Config.seekTargetSec
+        outcome.metrics["ringSessionSeekProbeRingClosed"] = false
+        outcome.metrics["ringSessionSeekProbedSampleRate"] = -1
+        outcome.metrics["ringSessionSeekProbedWindow"] = -1
+        outcome.metrics["ringSessionSeekProbedExpectedFrames"] = -1L
+        outcome.metrics["ringSessionNativeTimingGateFrames"] = -1L
+        outcome.metrics["ringSessionEarliestHoldFloorFrames"] = -1L
+        outcome.metrics["ringSessionEarliestHoldAtAdmission"] = -1L
+        outcome.metrics["ringSessionExpectedHoldFrame"] = -1L
+        outcome.metrics["ringSessionSeekSkipFrames"] = -1L
+        outcome.metrics["ringSessionMinTargetFrame"] = -1L
+        outcome.metrics["ringSessionSeekTargetSecDerived"] = -1.0
+        outcome.metrics["ringSessionEffectiveTargetFrame"] = -1L
+        outcome.metrics["secondSeekTargetSecArmed"] = 0.0
+        outcome.metrics["seekBackwardArmed"] = false
+        outcome.metrics["enableAudioFocusResponse"] = false
+        outcome.metrics["enableAudioRoutingResponse"] = false
+        outcome.metrics["ringSessionSeekNonClaims"] =
+            "no_repeated_seek_no_backward_seek_no_focus_routing_no_dead_object_no_feedback_no_pacing_no_resampling_" +
+                "no_av_sync_no_audio_quality_no_fleet_no_product_no_app_no_editor_no_ios_no_streaming_no_cache"
+
+        val seekFailClosedOk = probeUnsupportedSeekFailClosed(y23Config)
+
+        try {
+            if (disposed.get()) throw FailClosed("coordinator_disposed")
+
+            // Y23: derive the gate-clearing seek target from the frozen real
+            // geometry before the session exists (comment on
+            // [deriveRingSessionSeekTarget]); every derived fact is recorded
+            // so the evaluator can prove H against the native timing gate.
+            val derivation = deriveRingSessionSeekTarget(y23Config)
+            val effectiveSeekTargetSec = derivation.effectiveSeekTargetSec
+            outcome.metrics["seekTargetSecArmed"] = effectiveSeekTargetSec
+            outcome.metrics["ringSessionSeekProbeRingClosed"] = derivation.probeRingClosed
+            outcome.metrics["ringSessionSeekProbedSampleRate"] = derivation.geometry.sampleRate
+            outcome.metrics["ringSessionSeekProbedWindow"] = derivation.geometry.maxFramesPerMix
+            outcome.metrics["ringSessionSeekProbedExpectedFrames"] = derivation.geometry.expectedFrames
+            outcome.metrics["ringSessionNativeTimingGateFrames"] = derivation.nativeTimingGateFrames
+            outcome.metrics["ringSessionEarliestHoldFloorFrames"] = derivation.earliestHoldFloorFrames
+            outcome.metrics["ringSessionEarliestHoldAtAdmission"] = derivation.earliestHoldAtAdmission
+            outcome.metrics["ringSessionExpectedHoldFrame"] = derivation.expectedHoldFrame
+            outcome.metrics["ringSessionSeekSkipFrames"] = derivation.skipFrames
+            outcome.metrics["ringSessionMinTargetFrame"] = derivation.minTargetFrame
+            outcome.metrics["ringSessionSeekTargetSecDerived"] = derivation.derivedSeekTargetSec
+            outcome.metrics["ringSessionEffectiveTargetFrame"] = derivation.effectiveTargetFrame
+            if (disposed.get()) throw FailClosed("coordinator_disposed")
+
+            val sess = VanguardRealtimeAudioPlaybackSession(
+                VanguardRealtimeAudioPlaybackSession.Config(
+                    sourcePath = y23Config.sourcePath,
+                    maxDurationSec = y23Config.maxDurationSec,
+                    maxFramesPerMix = y23Config.maxFramesPerMix,
+                    gain = y23Config.gain,
+                    deadlineMs = y23Config.deadlineMs,
+                    threadNamePrefix = "Y23RingSession",
+                    driverFactory = { ctx ->
+                        val r = AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource(
+                            AndroidRealtimeAudioPlaybackRealDecoderRingTransportFrameSource.Config(
+                                sourcePath = y23Config.sourcePath,
+                                maxDurationSec = y23Config.maxDurationSec,
+                                maxFramesPerMix = ctx.maxFramesPerMix,
+                                deadlineAtMs = ctx.deadlineAtMs,
+                                drainWaitBoundMs = REAL_RING_DRAIN_WAIT_BOUND_MS,
+                                threadName = "Y23RealRingDriverOwner",
+                            ),
+                        )
+                        ring = r
+                        AndroidRealtimeAudioPlaybackRealDecoderRingTransportDriver(r)
+                    },
+                    seekTargetSec = effectiveSeekTargetSec,
+                    secondSeekTargetSec = 0.0,
+                    seekBackward = false,
+                    preSeekHoldWindows = y23Config.preSeekHoldWindows,
+                    maxSeekHoldMs = y23Config.maxSeekHoldMs,
+                    syntheticDeadObjectInjectAfterFrames = 0L,
+                    enableAudioFocusResponse = false,
+                    enableAudioRoutingResponse = false,
+                ),
+            )
+            session = sess
+            activeSession = sess
+
+            val startRes = sess.start()
+            startAccepted = startRes.accepted && startRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING
+            require(startAccepted, "start_rejected:${startRes.reason}")
+
+            firstAudioOk = sess.awaitFirstAudio(y23Config.deadlineMs)
+            require(firstAudioOk, "first_audio_failed:${sess.snapshot().failureReason}")
+
+            preSeekSnap = sess.snapshot()
+
+            val targetFrame = sess.snapshot().seek.targetFrame
+            // The session's admitted H must equal the probe-derived H (same
+            // frozen geometry, sink consumed 0 at admission) and T must sit
+            // at least one clean window past it; a mismatch means the probe
+            // and driver geometries diverged and fails closed here.
+            val admittedHold = sess.snapshot().seek.holdFrame
+            require(
+                admittedHold == derivation.expectedHoldFrame,
+                "ring_session_seek_hold_mismatch:$admittedHold:${derivation.expectedHoldFrame}",
+            )
+            require(
+                targetFrame - admittedHold >= derivation.geometry.maxFramesPerMix.toLong(),
+                "ring_session_seek_target_below_hold:$targetFrame:$admittedHold",
+            )
+            // The admitted T must be the frame this derivation sized (so
+            // T - H carries the Y20 skip, never a bare window); a mismatch
+            // means the session's seconds->frame conversion diverged.
+            require(
+                targetFrame == derivation.effectiveTargetFrame && targetFrame - admittedHold >= derivation.skipFrames,
+                "ring_session_seek_target_mismatch:$targetFrame:${derivation.effectiveTargetFrame}:$admittedHold:${derivation.skipFrames}",
+            )
+            val seekRes = sess.seek(targetFrame)
+            seekAccepted = seekRes.accepted && seekRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING
+            require(seekAccepted, "seek_rejected:${seekRes.reason}")
+
+            postSeekSnap = sess.snapshot()
+
+            completionOk = sess.awaitCompletion(y23Config.deadlineMs)
+            require(completionOk, "completion_failed:${sess.snapshot().failureReason}")
+
+            completedSnapshot = sess.snapshot()
+
+            stopResult = sess.stop()
+            require(stopResult.accepted || stopResult.state == VanguardRealtimeAudioPlaybackSession.State.STOPPED, "stop_rejected:${stopResult.reason}")
+
+            sess.dispose()
+            sess.dispose()
+            postDisposeSnapshot = sess.snapshot()
+        } catch (f: FailClosed) {
+            outcome.failureReason = f.reason
+        } catch (t: Throwable) {
+            outcome.failureReason = "exception:${t.javaClass.simpleName}:${t.message}"
+        } finally {
+            val sess = session
+            try {
+                sess?.dispose()
+            } catch (_: Throwable) {}
+            if (activeSession === sess) activeSession = null
+
+            val finalSnap = sess?.snapshot()
+            if (postDisposeSnapshot == null) {
+                postDisposeSnapshot = finalSnap
+            }
+            if (completedSnapshot == null) {
+                completedSnapshot = postDisposeSnapshot
+            }
+            if (outcome.failureReason.isBlank() && finalSnap != null && finalSnap.failureReason.isNotBlank()) {
+                outcome.failureReason = finalSnap.failureReason
+            }
+            if (finalSnap != null) {
+                outcome.metrics.putAll(snapshotMetrics(finalSnap))
+            }
+            val ringTelemetry = ring?.telemetry()
+            val geometry = ring?.frozenGeometry
+
+            AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRealDecoderRingSessionSeek(
+                startAccepted = startAccepted,
+                firstAudioOk = firstAudioOk,
+                seekAccepted = seekAccepted,
+                preSeekSnap = preSeekSnap,
+                postSeekSnap = postSeekSnap,
+                completionOk = completionOk,
+                completedSnapshot = completedSnapshot,
+                stopAccepted = stopResult.accepted || stopResult.state == VanguardRealtimeAudioPlaybackSession.State.STOPPED,
+                stopResultReason = stopResult.reason,
+                postDisposeSnapshot = postDisposeSnapshot,
+                ring = ringTelemetry,
+                geometry = geometry,
+                seekFailClosedOk = seekFailClosedOk,
+                config = y23Config,
+                out = outcome,
+            )
+
+            outcome.metrics["scenarioWallMs"] = SystemClock.elapsedRealtime() - wallStart
+            outcome.metrics["failureReason"] = outcome.failureReason
+            outcome.metrics["ringSessionSeekMaxDurationSec"] = y23Config.maxDurationSec
+        }
+        return outcome
+    }
+
     // ── Metrics ────────────────────────────────────────────────────────────
 
     private fun snapshotMetrics(s: VanguardRealtimeAudioPlaybackSession.Snapshot): LinkedHashMap<String, Any?> {
@@ -2737,6 +3128,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         m["driverStageBeforeResume"] = s.driverStageBeforeResume
         m["driverGenerationAtPause"] = s.driverGenerationAtPause
         m["driverGenerationAtResume"] = s.driverGenerationAtResume
+        m["driverSeekPrepareAccepted"] = s.driverSeekPrepareAccepted
+        m["driverSeekAccepted"] = s.driverSeekAccepted
+        m["driverSeekHoldWaitMs"] = s.driverSeekHoldWaitMs
+        m["driverFramesConsumedAtHold"] = s.driverFramesConsumedAtHold
+        m["driverStageAtSeek"] = s.driverStageAtSeek
+        m["driverStageAfterSeek"] = s.driverStageAfterSeek
+        m["driverGenerationAtSeek"] = s.driverGenerationAtSeek
+        m["driverSeekEarliestHoldFrame"] = s.driverSeekEarliestHoldFrame
         return m
     }
 
@@ -2765,7 +3164,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19/Y20 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source/real-decoder-ring-pause-resume/real-decoder-ring-seek smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y17/Y11b/Y12/Y13/Y14/Y15/Y16/Y18b/Y18c/Y19/Y20/Y21/Y22/Y23 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/backward-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation/drift-sample-ownership/ring-frame-source/real-decoder-ring-frame-source/real-decoder-ring-pause-resume/real-decoder-ring-seek/ring-session-integration/ring-session-pause-resume/ring-session-seek smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,
