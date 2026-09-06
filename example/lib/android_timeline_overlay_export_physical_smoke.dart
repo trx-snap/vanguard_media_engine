@@ -1,5 +1,5 @@
 // android_timeline_overlay_export_physical_smoke.dart
-// Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A / P5-GLES-EXPORT-TRANSITION-OVERLAYS / P5-GLES-EXPORT-BEAUTY-OVERLAYS:
+// Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A / P5-GLES-EXPORT-TRANSITION-OVERLAYS / P5-GLES-EXPORT-BEAUTY-OVERLAYS / P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS:
 // Android production `exportTimeline` static sticker, text, and emoji overlay smoke physical proof.
 //
 // Proof boundary: production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a
@@ -17,19 +17,25 @@
 // rasterized RGBA texture upload (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT), AND
 // emoji overlay production export via rasterized RGBA texture upload
 // (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT), forced GLES overlay+transition export
-// (P5-GLES-EXPORT-TRANSITION-OVERLAYS), AND forced GLES hard-cut
-// overlay+Beauty V2 solo export (P5-GLES-EXPORT-BEAUTY-OVERLAYS) using the
-// zero-rotation clip_A.mov fixture.
+// (P5-GLES-EXPORT-TRANSITION-OVERLAYS), forced GLES hard-cut
+// overlay+Beauty V2 solo export (P5-GLES-EXPORT-BEAUTY-OVERLAYS), AND forced
+// GLES all-video non-hard-cut transition scopes combining clip-level Beauty V2
+// and timeline overlays together (P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS),
+// where the forced Beauty+transition+overlay lane uses the zero-rotation
+// clip_A.mov fixture on both sides.
 //
 // Strict non-claims:
 //   - All supported Vulkan transition wire types with overlays are physically
 //     proved on SM-A566B; unsupported transitions (e.g. fade) fail closed elsewhere;
-//   - GLES overlay export outside supported forced transition overlap and
-//     forced hard-cut beauty-solo scopes (reverse/still-image/colorMatrix Beauty
-//     and rotated Beauty in GLES remain excluded/fail closed by contract);
+//   - GLES overlay export outside supported forced transition overlap,
+//     forced hard-cut beauty-solo, and forced transition+overlay+Beauty
+//     (all-video zero-rotation fixture lane) scopes (reversed,
+//     still-image+Beauty, colorMatrix Beauty, and hard-cut rotated Beauty
+//     in GLES remain excluded/fail closed by contract; existing rotated
+//     transition support is separate);
 //   - No realtime playback overlay compositing;
-//   - No playback, app/editor UI, product, iOS, or streaming/cache;
-//   - No fleet coverage beyond attached device;
+//   - No playback, app/editor UI, ConnectsApp, product, iOS, or streaming/cache;
+//   - No fleet coverage beyond SM-A566B (attached device);
 //   - No pixel-quality typography / emoji glyph guarantee beyond route metrics and prior renderer proofs.
 //
 // Drives the REAL production `exportTimeline` MethodChannel route (no

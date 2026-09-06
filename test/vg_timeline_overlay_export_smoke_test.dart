@@ -151,7 +151,7 @@ void main() {
       expect(keyframesToken, 'keyframe');
       expect(unreadableAssetToken, 'asset');
 
-      expect(defaultOverlaySmokeLaneIds, hasLength(24));
+      expect(defaultOverlaySmokeLaneIds, hasLength(25));
       expect(defaultOverlaySmokeLaneIds, <String>[
         'single_clip_static_sticker_success',
         'multi_layer_z_order_success',
@@ -177,6 +177,7 @@ void main() {
         'forced_gles_overlays_with_transition_dissolve_success',
         'forced_gles_overlays_with_transition_wipe_right_success',
         'forced_gles_overlays_with_beauty_solo_success',
+        'forced_gles_overlays_with_beauty_transition_success',
       ]);
     });
   });
@@ -811,6 +812,65 @@ void main() {
       },
     );
 
+    test('passes for the forced-GLES Beauty+transition+overlay combined lane '
+        'expectation when the mock result reports gles, matching overlay/'
+        'transition counts, and beauty counters above threshold', () {
+      final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+        _request(
+          laneId: 'forced_gles_overlays_with_beauty_transition_success',
+          clips: <VGTimelineOverlayExportSmokeClip>[
+            _clip('clip-1', end: 2.0, beautyIntensity: 0.5),
+            _clip('clip-2', end: 2.0, beautyIntensity: 0.5),
+          ],
+          transitions: const <VGTimelineOverlayExportSmokeTransition>[
+            VGTimelineOverlayExportSmokeTransition(
+              id: 'tr-1',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'clip-1',
+              toClipId: 'clip-2',
+            ),
+          ],
+          overlays: <VGTimelineOverlayExportSmokeOverlay>[
+            _sticker(
+              'sticker-forced-gles-beauty-transition',
+              start: 1.6,
+              duration: 0.3,
+            ),
+          ],
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+          expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+            expectedOverlayCount: 1,
+            expectedTransitionCount: 1,
+            expectedRenderedOverlayFrameCount: 6,
+            expectedBeautyClipCount: 2,
+            expectedBeautyFrameCountMin: 100,
+          ),
+        ),
+        _successResult(
+          backend: 'gles',
+          duration: 3.5,
+          overlayCount: 1,
+          transitionCount: 1,
+          renderedOverlayFrameCount: 8,
+          beautyClipCount: 2,
+          beautyFrameCount: 105,
+        ),
+        outputExists: true,
+      );
+
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, 'gles');
+      expect(report.overlayCount, 1);
+      expect(report.transitionCount, 1);
+      expect(report.renderedOverlayFrameCount, 8);
+      expect(report.beautyClipCount, 2);
+      expect(report.beautyFrameCount, 105);
+      expect(report.failureReason, isEmpty);
+    });
+
     test(
       'fails when beautyClipCount is missing on a positive beauty expectation',
       () {
@@ -1378,17 +1438,17 @@ void main() {
   });
 
   group('default suite construction', () {
-    test('buildDefaultOverlayExportSmokeSuite builds all 24 required lanes', () {
+    test('buildDefaultOverlayExportSmokeSuite builds all 25 required lanes', () {
       final suite = buildDefaultOverlayExportSmokeSuite();
 
-      expect(suite, hasLength(24));
+      expect(suite, hasLength(25));
       final laneIds = suite.map((r) => r.laneId).toList();
       expect(laneIds, defaultOverlaySmokeLaneIds);
 
       final successLanes = suite.where((r) => r.expectation.expectsSuccess);
       final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-      expect(successLanes, hasLength(22));
+      expect(successLanes, hasLength(23));
       expect(failureLanes, hasLength(2));
 
       // Lane 1: single_clip_static_sticker_success
@@ -1618,6 +1678,34 @@ void main() {
       expect(lane24.expectedDurationSeconds, closeTo(2.0, 1e-9));
       final lane24Args = lane24.toExportTimelineArguments();
       expect(lane24Args['debugForceRenderBackend'], 'gles');
+
+      // Lane 25: forced_gles_overlays_with_beauty_transition_success
+      final lane25 = suite[24];
+      expect(
+        lane25.laneId,
+        'forced_gles_overlays_with_beauty_transition_success',
+      );
+      expect(lane25.expectedRenderBackend, 'gles');
+      expect(lane25.debugForceRenderBackend, 'gles');
+      expect(lane25.clips, hasLength(2));
+      expect(lane25.clips[0].hasBeauty, isTrue);
+      expect(lane25.clips[1].hasBeauty, isTrue);
+      expect(lane25.clips[1].sourcePath, lane25.clips[0].sourcePath);
+      expect(lane25.transitions, hasLength(1));
+      expect(lane25.transitions.single.type, 'dissolve');
+      expect(lane25.transitions.single.durationSeconds, 0.5);
+      expect(lane25.overlays, hasLength(1));
+      expect(lane25.overlays.single.startTimeSeconds, 1.6);
+      expect(lane25.overlays.single.durationSeconds, 0.3);
+      expect(lane25.expectation.expectsSuccess, isTrue);
+      expect(lane25.expectation.expectedOverlayCount, 1);
+      expect(lane25.expectation.expectedTransitionCount, 1);
+      expect(lane25.expectation.expectedRenderedOverlayFrameCount, 6);
+      expect(lane25.expectation.expectedBeautyClipCount, 2);
+      expect(lane25.expectation.expectedBeautyFrameCountMin, 100);
+      expect(lane25.expectedDurationSeconds, closeTo(3.5, 1e-9));
+      final lane25Args = lane25.toExportTimelineArguments();
+      expect(lane25Args['debugForceRenderBackend'], 'gles');
     });
   });
 }

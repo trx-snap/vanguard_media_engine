@@ -110,14 +110,19 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // [glesTransitionEligible] on exactly the same terms as one without Beauty,
 // and AndroidTimelineGlesTransitionVideoEncoder applies the existing native
 // Beauty seam per solo frame and per transition-pair side (see its own class
-// doc). The bounded exclusions are Beauty combined with overlays on this
-// route (`beauty_with_overlays_unsupported`) and Beauty combined with any
-// still-image clip in the scope (`beauty_with_still_image_unsupported`,
-// P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS -- out of scope even when the
-// still-image clip itself carries no Beauty and it is only a *video* clip
-// elsewhere in the scope that does) -- both combinations still require
-// Vulkan. See [ExportRenderScope.requiresVulkan] for how Beauty,
-// transitions, and overlays combine.
+// doc). P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS: Beauty combined with
+// timeline overlays on this route is now admitted as well for an all-video
+// non-hard-cut transition scope -- the encoder applies Beauty per solo
+// frame/transition-pair side before transition composition, then composites
+// overlays after transition composition (see
+// [AndroidTimelineGlesTransitionVideoEncoder.compositeActiveOverlaysIfPresent]),
+// so the two combine without conflict. The remaining bounded exclusion is
+// Beauty combined with any still-image clip in the scope
+// (`beauty_with_still_image_unsupported`, P5-GLES-EXPORT-STILL-IMAGE-
+// TRANSITIONS -- out of scope even when the still-image clip itself carries
+// no Beauty and it is only a *video* clip elsewhere in the scope that does),
+// which still requires Vulkan. See [ExportRenderScope.requiresVulkan] for
+// how Beauty, transitions, and overlays combine.
 // P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE widened the
 // eligible transition family from crossfade-only to every closed-set
 // AndroidTimelineTransitionDescriptor.Type member (crossfade, the four
@@ -304,19 +309,22 @@ data class ExportRenderScope(
     /// now applies the same native Beauty seam
     /// (drawAndroidDagPhase5GlesExportBeautySeam) AndroidTimelineVideoEncoder's
     /// hard-cut Beauty route uses, per solo frame and per transition-pair
-    /// side. The remaining bounded exclusions are Beauty combined with
-    /// timeline overlays (`beauty_with_overlays_unsupported`) and Beauty
-    /// combined with any still-image clip in the scope
+    /// side. P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS: Beauty combined with
+    /// timeline overlays is now admitted for an all-video scope as well --
+    /// the encoder applies Beauty before transition composition and
+    /// composites overlays after transition composition (see
+    /// [AndroidTimelineGlesTransitionVideoEncoder.compositeActiveOverlaysIfPresent]),
+    /// so the two no longer conflict. The remaining bounded exclusion is
+    /// Beauty combined with any still-image clip in the scope
     /// (`beauty_with_still_image_unsupported`, P5-GLES-EXPORT-STILL-IMAGE-
-    /// TRANSITIONS) -- the latter applies even when the still-image clip
-    /// itself carries no Beauty and it is only a *video* clip elsewhere in
-    /// the same scope that does. Beauty on an all-video, overlay-free
-    /// non-hard-cut transition scope is exactly as eligible as one without
+    /// TRANSITIONS) -- this applies even when the still-image clip itself
+    /// carries no Beauty and it is only a *video* clip elsewhere in the same
+    /// scope that does. Beauty on an all-video non-hard-cut transition scope
+    /// (with or without overlays) is exactly as eligible as one without
     /// Beauty, subject to every other check below.
     val glesTransitionIneligibleReason: String?
         get() {
             if (!hasNonHardCutTransition) return "no_non_hard_cut_transition"
-            if (hasBeautyClip && hasOverlays) return "beauty_with_overlays_unsupported"
             if (clips.any { it.isReversed }) return "reversed_clip_present"
             if (clips.any { it.mediaKind != "video" && it.mediaKind != "image" }) return "unsupported_media_kind_present"
             // P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS: Beauty V2 combined with any

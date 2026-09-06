@@ -38,7 +38,8 @@ import kotlin.math.sin
 // metadata on every video clip and rotationDegrees == 0 on every still-image
 // clip -- overlays are permitted, see the
 // P5-GLES-EXPORT-TRANSITION-OVERLAYS paragraph below, and clip-level Beauty
-// V2 is permitted on a video clip unless paired with overlays, see the
+// V2 is permitted on a video clip, including when also paired with overlays
+// (P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS), see the
 // P5-GLES-EXPORT-BEAUTY-TRANSITIONS paragraph below -- a still-image clip may
 // never carry Beauty, AND a scope mixing a still-image clip with a *video*
 // clip that carries Beauty is equally out of scope, failing closed with
@@ -112,18 +113,21 @@ import kotlin.math.sin
 // [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionIneligibleReason]
 // both still reject those independently of [encode]'s `overlays` argument.
 //
-// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: this class also applies clip-level
-// Beauty V2 for the same narrow scope, now that
+// P5-GLES-EXPORT-BEAUTY-TRANSITIONS, widened by
+// P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS: this class also applies
+// clip-level Beauty V2 for the same narrow scope, now that
 // [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible]
-// no longer excludes it (unless paired with overlays, which remains
-// ineligible with reason `beauty_with_overlays_unsupported`, or paired with
-// any still-image clip in the scope, which remains ineligible with reason
-// `beauty_with_still_image_unsupported` even when the still-image clip
-// itself carries no Beauty -- see P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS
-// below -- gated by the selector before this class is ever constructed for
-// such a scope, and re-checked defensively in [encode] itself before
-// [setupEncoderAndMuxer]/[setupGl] run, not by [validateClipShape] alone). A
-// solo
+// no longer excludes it, including when paired with overlays -- Beauty is
+// applied before transition composition and overlays are composited after
+// transition composition (see [compositeActiveOverlaysIfPresent]), so the
+// two combine without conflict. The remaining bounded exclusion is Beauty
+// paired with any still-image clip in the scope, which remains ineligible
+// with reason `beauty_with_still_image_unsupported` even when the
+// still-image clip itself carries no Beauty -- see
+// P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS below -- gated by the selector
+// before this class is ever constructed for such a scope, and re-checked
+// defensively in [encode] itself before [setupEncoderAndMuxer]/[setupGl]
+// run, not by [validateClipShape] alone. A solo
 // segment whose clip carries a non-null `beautyIntensity` resolves its OES
 // frame to a 2D texture first, then applies the existing native Beauty seam
 // (`VanguardNativeBridge.drawAndroidDagPhase5GlesExportBeautySeam`, the same

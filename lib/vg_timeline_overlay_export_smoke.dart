@@ -27,15 +27,21 @@
 //     overlays alongside clip-level Beauty V2 on both transition-overlap frames
 //     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
 //     (P5-OVERLAYS-BEAUTY-SOLO), forced GLES transition-overlay export
-//     (P5-GLES-EXPORT-TRANSITION-OVERLAYS), and forced GLES hard-cut
-//     overlay+Beauty V2 solo export (P5-GLES-EXPORT-BEAUTY-OVERLAYS);
+//     (P5-GLES-EXPORT-TRANSITION-OVERLAYS), forced GLES hard-cut
+//     overlay+Beauty V2 solo export (P5-GLES-EXPORT-BEAUTY-OVERLAYS), and
+//     forced GLES all-video transition scopes combining clip-level Beauty V2
+//     and timeline overlays together (P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS);
 //   - Unsupported transition types (e.g. fade) fail closed elsewhere because
 //     fade-through-black semantics are unsupported;
 //   - Strict non-claims: GLES overlay export outside supported forced
-//     transition-overlap and forced hard-cut beauty-solo scopes
-//     (reverse/still-image/colorMatrix Beauty in GLES remain excluded/fail closed),
-//     realtime playback overlay compositing, app/editor/product/iOS/streaming-cache,
-//     fleet coverage beyond tested device, or pixel-quality typography/emoji glyph guarantees;
+//     transition-overlap, forced hard-cut beauty-solo, and forced
+//     all-video zero-rotation transition+overlay+Beauty scopes
+//     (reversed, still-image+Beauty, colorMatrix Beauty, and hard-cut rotated
+//     Beauty in GLES remain excluded/fail closed; existing rotated transition
+//     support is separate), realtime playback overlay compositing,
+//     app/editor/ConnectsApp/product/iOS/streaming/cache, fleet coverage beyond
+//     SM-A566B (tested device), or pixel-quality typography/emoji glyph
+//     guarantees;
 //   - Validates success lanes: `success == true`, output file exists,
 //     `renderBackend == expectedRenderBackend` (`'vulkan'` by default or `'gles'` for forced GLES lanes),
 //     duration within 0.25s tolerance (transition-aware:
@@ -95,7 +101,9 @@ const String keyframesToken = 'keyframe';
 const String unreadableAssetToken = 'asset';
 
 /// Default lane IDs for the full Route-A static sticker, text, and emoji overlay smoke suite,
-/// including forced-GLES transition+overlay proof lanes (P5-GLES-EXPORT-TRANSITION-OVERLAYS).
+/// including forced-GLES transition+overlay proof lanes (P5-GLES-EXPORT-TRANSITION-OVERLAYS)
+/// and the forced-GLES transition+overlay+Beauty V2 combined proof lane
+/// (P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS).
 const List<String> defaultOverlaySmokeLaneIds = <String>[
   'single_clip_static_sticker_success',
   'multi_layer_z_order_success',
@@ -121,6 +129,7 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'forced_gles_overlays_with_transition_dissolve_success',
   'forced_gles_overlays_with_transition_wipe_right_success',
   'forced_gles_overlays_with_beauty_solo_success',
+  'forced_gles_overlays_with_beauty_transition_success',
 ];
 
 /// One clip of a smoke draft (wire shape of VGClipDescriptor.toMap()).
@@ -998,9 +1007,11 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
   );
 }
 
-/// Builds the default suite of 24 static sticker, text, and emoji overlay smoke requests,
+/// Builds the default suite of 25 static sticker, text, and emoji overlay smoke requests,
 /// covering Vulkan Route-A, forced GLES transition-overlay scopes (P5-GLES-EXPORT-TRANSITION-OVERLAYS),
-/// and forced GLES hard-cut overlay+Beauty V2 solo scopes (P5-GLES-EXPORT-BEAUTY-OVERLAYS):
+/// forced GLES hard-cut overlay+Beauty V2 solo scopes (P5-GLES-EXPORT-BEAUTY-OVERLAYS), and the
+/// forced GLES all-video transition scope combining clip-level Beauty V2 and timeline overlays
+/// together (P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS):
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
@@ -1025,6 +1036,7 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
 /// 22. `forced_gles_overlays_with_transition_dissolve_success`
 /// 23. `forced_gles_overlays_with_transition_wipe_right_success`
 /// 24. `forced_gles_overlays_with_beauty_solo_success`
+/// 25. `forced_gles_overlays_with_beauty_transition_success`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
   String clipPathB = '/data/local/tmp/clip_b.mov',
@@ -1689,6 +1701,77 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
         expectedRenderedOverlayFrameCount: 55,
         expectedBeautyClipCount: 1,
         expectedBeautyFrameCountMin: 55,
+      ),
+    ),
+
+    // Lane 25: forced_gles_overlays_with_beauty_transition_success
+    // Uses the zero-rotation clipPathA fixture for both sides so this lane
+    // remains a narrow zero-rotation combined-feature proof, rather than an
+    // accidental rotated-input proof (clipPathB carries rotation tags).
+    VGTimelineOverlayExportSmokeRequest(
+      laneId: 'forced_gles_overlays_with_beauty_transition_success',
+      clips: <VGTimelineOverlayExportSmokeClip>[
+        VGTimelineOverlayExportSmokeClip(
+          id: 'clip-1',
+          sourcePath: clipPathA,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.0,
+          beautyIntensity: 0.5,
+        ),
+        VGTimelineOverlayExportSmokeClip(
+          id: 'clip-2',
+          sourcePath: clipPathA,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.0,
+          beautyIntensity: 0.5,
+        ),
+      ],
+      transitions: const <VGTimelineOverlayExportSmokeTransition>[
+        VGTimelineOverlayExportSmokeTransition(
+          id: 'tr-1',
+          type: 'dissolve',
+          durationSeconds: 0.5,
+          fromClipId: 'clip-1',
+          toClipId: 'clip-2',
+        ),
+      ],
+      overlays: <VGTimelineOverlayExportSmokeOverlay>[
+        VGTimelineOverlayExportSmokeOverlay(
+          id: 'sticker-forced-gles-beauty-transition',
+          assetPath: stickerAssetPath,
+          // Active strictly within the dissolve's INSET output-timeline
+          // overlap window -- same [1.6s, 1.9s) pattern established by
+          // overlays_with_beauty_transition_overlap_success (see that lane's
+          // comment for the inset-window derivation). Proves the forced
+          // production GLES transition route
+          // (P5-GLES-EXPORT-BEAUTY-TRANSITION-OVERLAYS) composites a static
+          // sticker overlay on top of clip-level Beauty V2 output across a
+          // non-hard-cut transition, rather than either effect being
+          // silently dropped or the scope being rejected.
+          startTimeSeconds: 1.6,
+          durationSeconds: 0.3,
+          translationX: 100.0,
+          translationY: 100.0,
+          width: 200.0,
+          height: 200.0,
+          rotation: 0.0,
+          scale: 1.0,
+          opacity: 1.0,
+          zIndex: 0,
+          type: 'sticker',
+        ),
+      ],
+      outputPath: outputPath(
+        'forced_gles_overlays_with_beauty_transition_success',
+      ),
+      expectedRenderBackend: 'gles',
+      debugForceRenderBackend: 'gles',
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedTransitionCount: 1,
+        expectedRenderedOverlayFrameCount: 6,
+        expectedBeautyClipCount: 2,
+        expectedBeautyFrameCountMin: 100,
       ),
     ),
   ];
