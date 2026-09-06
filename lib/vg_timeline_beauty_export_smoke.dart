@@ -195,6 +195,8 @@ class VGTimelineBeautyExportSmokeRequest {
     required this.outputPath,
     required this.expectation,
     this.transitions = const <VGTimelineBeautyExportSmokeTransition>[],
+    this.expectedRenderBackend = 'vulkan',
+    this.debugForceRenderBackend,
     this.canvasWidth = 720,
     this.canvasHeight = 1280,
     this.fps = 30,
@@ -206,6 +208,19 @@ class VGTimelineBeautyExportSmokeRequest {
   final List<VGTimelineBeautyExportSmokeTransition> transitions;
   final String outputPath;
   final VGTimelineBeautyExportSmokeExpectation expectation;
+
+  /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: the `renderBackend` a
+  /// successful lane must report. Defaults to `'vulkan'`, preserving every
+  /// existing lane's behavior; a GLES proof lane sets this to `'gles'`
+  /// alongside [debugForceRenderBackend].
+  final String expectedRenderBackend;
+
+  /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: optional top-level
+  /// `debugForceRenderBackend` argument, matching the transition smoke's
+  /// same-named field. Emitted by [toExportTimelineArguments] only when
+  /// non-null and non-empty, and always as a top-level argument -- never
+  /// inside `draft`.
+  final String? debugForceRenderBackend;
   final int canvasWidth;
   final int canvasHeight;
   final int fps;
@@ -260,6 +275,8 @@ class VGTimelineBeautyExportSmokeRequest {
     'width': canvasWidth,
     'height': canvasHeight,
     'fps': fps,
+    if (debugForceRenderBackend != null && debugForceRenderBackend!.isNotEmpty)
+      'debugForceRenderBackend': debugForceRenderBackend,
   };
 }
 
@@ -362,8 +379,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
       failure = 'result_path_missing';
     } else if (!outputExists) {
       failure = 'output_file_missing';
-    } else if (backend != 'vulkan') {
-      failure = 'render_backend_not_vulkan:${backend ?? 'null'}';
+    } else if (backend != request.expectedRenderBackend) {
+      failure =
+          'render_backend_not_${request.expectedRenderBackend}:${backend ?? 'null'}';
     } else if (duration == null) {
       failure = 'result_duration_missing';
     } else if ((duration - expectedDuration).abs() >

@@ -214,16 +214,20 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
-        // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: a scoped, test-only
-        // force seam for physical proof of the narrow GLES transition
-        // production route. Ignored (has no effect on any other request
-        // shape) unless the scope backend selection resolves against is also
-        // AndroidExportRenderBackendSelector.ExportRenderScope
-        // .glesTransitionEligible -- see the backend-selection call below and
+        // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A / P5-GLES-EXPORT-
+        // BEAUTY-PRODUCTION-ROUTE-A: a scoped, test-only force seam for
+        // physical proof of the narrow GLES transition and GLES Beauty V2
+        // production routes. Parsed once here; routed into exactly one of
+        // `debugForceGlesTransitionExport` (non-hard-cut transition scopes)
+        // or `debugForceGlesBeautyExport` (hard-cut Beauty scopes) further
+        // below, once `transitions` and `hasBeautyClip` are known -- see the
+        // backend-selection call below. Ignored (has no effect on any other
+        // request shape) unless the scope backend selection resolves
+        // against is also eligible for the corresponding narrow route -- see
         // AndroidExportRenderBackendSelector.select's own doc for the exact
         // fail-closed contract when this is set but the scope is not
         // eligible.
-        val debugForceGlesTransitionExport =
+        val debugForceGlesRequested =
             (args["debugForceRenderBackend"] as? String)?.trim()?.equals("gles", ignoreCase = true) == true
 
         val rawClips = draftMap["clips"] as? List<*>
@@ -772,6 +776,23 @@ class AndroidTimelineExportSession(private val context: Context) {
         val sessionLifecycleObserver = VanguardLifecycleObserver(sessionDiagnostics)
         val sessionNativeBridge = VanguardNativeBridge(sessionLifecycleObserver, sessionDiagnostics, null)
 
+        // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A / P5-GLES-EXPORT-
+        // BEAUTY-PRODUCTION-ROUTE-A: route the single top-level debug-force
+        // request into exactly one of the two narrow force seams --
+        // transition-force for a non-hard-cut transition scope, beauty-force
+        // for a hard-cut Beauty scope. A scope that is both (a non-hard-cut
+        // transition alongside a Beauty clip) only ever sets the transition
+        // seam here, matching AndroidExportRenderBackendSelector.select's own
+        // documented priority for that combination -- it already fails
+        // closed with a `gles_transition_not_eligible:beauty_clip_present`
+        // reason for such a scope (see
+        // ExportRenderScope.glesTransitionIneligibleReason), so this session
+        // never needs to also set the beauty seam for it.
+        val hasNonHardCutTransitionForEncoder = transitions.any { !it.isHardCut }
+        val debugForceGlesTransitionExport = debugForceGlesRequested && hasNonHardCutTransitionForEncoder
+        val debugForceGlesBeautyExport =
+            debugForceGlesRequested && !hasNonHardCutTransitionForEncoder && hasBeautyClip
+
         val backendDecision = AndroidExportRenderBackendSelector().select(
             ExportRenderScope(
                 clips = clipInputs,
@@ -782,6 +803,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             ),
             nativeBridge = sessionNativeBridge,
             debugForceGlesTransitionExport = debugForceGlesTransitionExport,
+            debugForceGlesBeautyExport = debugForceGlesBeautyExport,
         )
         // P5-COMPOSITOR-TRANS / P5-OVERLAYS-TRANS: a transition timeline or
         // overlay list that cannot be routed to either Vulkan or (for a
@@ -798,6 +820,9 @@ class AndroidTimelineExportSession(private val context: Context) {
             val errorMessage = when {
                 backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.GLES_TRANSITION_NOT_ELIGIBLE_REASON) ->
                     "exportTimeline: debugForceRenderBackend=gles requires a GLES-transition-eligible " +
+                        "request (${backendDecision.reason})"
+                backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.GLES_BEAUTY_NOT_ELIGIBLE_REASON) ->
+                    "exportTimeline: debugForceRenderBackend=gles requires a GLES-beauty-eligible " +
                         "request (${backendDecision.reason})"
                 backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.TRANSITIONS_REQUIRE_VULKAN_REASON) ->
                     "exportTimeline: transitions require the Vulkan export backend " +
@@ -841,9 +866,14 @@ class AndroidTimelineExportSession(private val context: Context) {
         // decision for a scope actually carrying a non-hard-cut transition
         // routes through the narrow AndroidTimelineGlesTransitionVideoEncoder
         // -- every other GLES decision (hard-cut-only timelines, including
-        // one with only `none` transition entries) keeps using the frozen
-        // AndroidTimelineVideoEncoder hard-cut path unchanged.
-        val hasNonHardCutTransitionForEncoder = transitions.any { !it.isHardCut }
+        // one with only `none` transition entries, and P5-GLES-EXPORT-BEAUTY-
+        // PRODUCTION-ROUTE-A's hard-cut Beauty scopes) keeps using the
+        // frozen AndroidTimelineVideoEncoder hard-cut path unchanged --
+        // AndroidTimelineVideoEncoder itself routes a clip's Beauty V2 frame
+        // through AndroidTimelineGlesBeautyRenderSession when
+        // ClipInput.beautyIntensity is non-null (see its own [encode] doc).
+        // [hasNonHardCutTransitionForEncoder] was already computed above,
+        // before backend selection, to derive the debug-force routing.
         fun buildPass1Encoder(backend: ExportRenderBackend): AndroidTimelineVideoPassEncoder {
             return if (backend == ExportRenderBackend.VULKAN) {
                 AndroidTimelineVulkanVideoEncoder(

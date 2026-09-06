@@ -86,6 +86,32 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // AndroidTimelineGlesTransitionVideoEncoder's own defensive re-validation
 // of the same restrictions is a second defense layer, not the primary
 // gate).
+//
+// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: a scope carrying clip-level
+// Beauty V2 no longer unconditionally requires Vulkan -- when
+// [ExportRenderScope.glesBeautyEligible] holds (hard-cut-only transitions,
+// no overlays, video-only clips, no reversed clip, no colorMatrix, positive
+// decoded/requested dimensions, zero rotation metadata on every clip), the
+// narrow production GLES Beauty route (AndroidTimelineVideoEncoder +
+// AndroidTimelineGlesBeautyRenderSession) is an acceptable alternative to
+// Vulkan. Vulkan remains the default/preferred backend regardless (see
+// [select]'s Vulkan-first branch below, unchanged) -- this only widens what
+// happens when Vulkan is NOT selectable for such a scope: instead of always
+// failing closed with `beauty_v2_requires_vulkan:<reason>`, an eligible
+// scope now resolves to [ExportRenderBackend.GLES]. [select]'s optional
+// `debugForceGlesBeautyExport` parameter additionally allows a caller to
+// force GLES for an eligible hard-cut scope even when Vulkan would
+// otherwise be selected first, purely to physically exercise this route on
+// a Vulkan-capable device -- see [select]'s doc. A scope carrying Beauty V2
+// that is NOT [glesBeautyEligible] still fails closed exactly as before
+// with `beauty_v2_requires_vulkan:...` when Vulkan cannot be selected
+// either -- this slice does not implement a GLES Beauty route for
+// transition/overlay/still-image/reversed/rotated/colorMatrix scopes.
+// [debugForceGlesTransitionExport] takes priority over
+// [debugForceGlesBeautyExport] whenever both could apply to the same
+// non-hard-cut-transition scope (see [select]'s doc); a hard-cut Beauty
+// scope only ever sets the beauty force parameter (see
+// AndroidTimelineExportSession's single top-level debug-force routing).
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -190,14 +216,48 @@ data class ExportRenderScope(
     /// True when [glesTransitionIneligibleReason] is null -- see its doc.
     val glesTransitionEligible: Boolean get() = glesTransitionIneligibleReason == null
 
+    /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: null when this scope's
+    /// clip-level Beauty V2 request(s) are eligible for the narrow
+    /// production GLES Beauty route (AndroidTimelineVideoEncoder +
+    /// AndroidTimelineGlesBeautyRenderSession), or a precise
+    /// machine-readable reason otherwise. Route A only claims hard-cut,
+    /// video-only, non-reversed, colorMatrix-free, zero-rotation timelines
+    /// with positive decoded/requested dimensions -- any non-hard-cut
+    /// transition, overlay, still-image clip, reversed clip, colorMatrix,
+    /// non-zero rotation, or invalid dimension anywhere in the scope fails
+    /// this predicate, even when only one clip in an otherwise-eligible
+    /// mixed hard-cut timeline carries the offending shape. Does not check
+    /// native-bridge availability -- that is a runtime concern the encoder
+    /// itself checks immediately before it would draw a Beauty frame (see
+    /// AndroidTimelineVideoEncoder), not a request-shape property. See
+    /// [glesBeautyEligible].
+    val glesBeautyIneligibleReason: String?
+        get() {
+            if (!hasBeautyClip) return "no_beauty_clip"
+            if (hasNonHardCutTransition) return "non_hard_cut_transition"
+            if (hasOverlays) return "overlays_present"
+            if (clips.any { it.isReversed }) return "reversed_clip_present"
+            if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
+            if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
+            if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
+            if (clips.any { it.rotationDegrees != 0 }) return "non_zero_rotation"
+            if (requestedWidth <= 0 || requestedHeight <= 0) return "invalid_output_dimensions"
+            return null
+        }
+
+    /// True when [glesBeautyIneligibleReason] is null -- see its doc.
+    val glesBeautyEligible: Boolean get() = glesBeautyIneligibleReason == null
+
     /// Overlays only force Vulkan when they fall outside
     /// [glesOverlayEligible] -- a GLES-eligible overlay scope may still be
     /// routed to Vulkan (see [AndroidExportRenderBackendSelector.select]'s
     /// Vulkan-first preference) but is no longer required to be. Likewise, a
     /// non-hard-cut transition only forces Vulkan when the scope falls
-    /// outside [glesTransitionEligible].
+    /// outside [glesTransitionEligible], and clip-level Beauty V2 only
+    /// forces Vulkan when the scope falls outside [glesBeautyEligible].
     val requiresVulkan: Boolean
-        get() = (hasNonHardCutTransition && !glesTransitionEligible) || hasBeautyClip ||
+        get() = (hasNonHardCutTransition && !glesTransitionEligible) ||
+            (hasBeautyClip && !glesBeautyEligible) ||
             (hasOverlays && !glesOverlayEligible)
 }
 
@@ -234,11 +294,29 @@ class AndroidExportRenderBackendSelector {
     /// `$GLES_TRANSITION_NOT_ELIGIBLE_REASON:<reason>` reason -- it never
     /// silently falls through to the normal (non-forced) selection logic.
     /// Ignored (has no effect) when false, which remains the default for
-    /// every production caller.
+    /// every production caller. Takes priority over
+    /// [debugForceGlesBeautyExport] whenever both are true.
+    ///
+    /// [debugForceGlesBeautyExport] (P5-GLES-EXPORT-BEAUTY-PRODUCTION-
+    /// ROUTE-A): the same test-only force-seam pattern as
+    /// [debugForceGlesTransitionExport], for the narrow production GLES
+    /// Beauty route instead. When true (and [debugForceGlesTransitionExport]
+    /// is false), this bypasses the normal Vulkan-first branch entirely and
+    /// resolves to [ExportRenderBackend.GLES] with reason
+    /// [DEBUG_FORCE_GLES_BEAUTY_REASON] ONLY when [scope] is
+    /// [ExportRenderScope.glesBeautyEligible] AND the capability probe
+    /// reports GLES support; otherwise it resolves to
+    /// [ExportRenderBackend.UNAVAILABLE] with a
+    /// `$GLES_BEAUTY_NOT_ELIGIBLE_REASON:<reason>` reason -- it never
+    /// silently falls through to the normal (non-forced) selection logic.
+    /// Ignored (has no effect) when false or when
+    /// [debugForceGlesTransitionExport] is true, which remains the default
+    /// for every production caller.
     fun select(
         scope: ExportRenderScope? = null,
         nativeBridge: VanguardNativeBridge? = null,
         debugForceGlesTransitionExport: Boolean = false,
+        debugForceGlesBeautyExport: Boolean = false,
     ): ExportRenderBackendDecision {
         val decision = try {
             val diagnostics = VanguardDiagnostics()
@@ -286,6 +364,22 @@ class AndroidExportRenderBackendSelector {
                         reason = DEBUG_FORCE_GLES_TRANSITION_REASON
                     }
                 }
+            } else if (debugForceGlesBeautyExport) {
+                val ineligibleReason = scope?.glesBeautyIneligibleReason
+                when {
+                    ineligibleReason != null -> {
+                        actualBackend = ExportRenderBackend.UNAVAILABLE
+                        reason = "$GLES_BEAUTY_NOT_ELIGIBLE_REASON:$ineligibleReason"
+                    }
+                    !report.glesSupported -> {
+                        actualBackend = ExportRenderBackend.UNAVAILABLE
+                        reason = "$GLES_BEAUTY_NOT_ELIGIBLE_REASON:gles_not_supported:${report.fallbackReason}"
+                    }
+                    else -> {
+                        actualBackend = ExportRenderBackend.GLES
+                        reason = DEBUG_FORCE_GLES_BEAUTY_REASON
+                    }
+                }
             } else when (capabilityBackend) {
                 ExportRenderBackend.VULKAN -> {
                     val scopeFailureReason = vulkanScopeFailureReason(scope)
@@ -327,13 +421,15 @@ class AndroidExportRenderBackendSelector {
                 // A probe failure means capability (including GLES support)
                 // could not even be confirmed -- the force seam never
                 // resolves to GLES on this path, regardless of eligibility.
-                actualBackend = if (debugForceGlesTransitionExport || requiresVulkan) {
+                actualBackend = if (debugForceGlesTransitionExport || debugForceGlesBeautyExport || requiresVulkan) {
                     ExportRenderBackend.UNAVAILABLE
                 } else {
                     ExportRenderBackend.GLES
                 },
                 reason = if (debugForceGlesTransitionExport) {
                     "$GLES_TRANSITION_NOT_ELIGIBLE_REASON:capability_probe_failed:${t.javaClass.simpleName}"
+                } else if (debugForceGlesBeautyExport) {
+                    "$GLES_BEAUTY_NOT_ELIGIBLE_REASON:capability_probe_failed:${t.javaClass.simpleName}"
                 } else if (requiresVulkan) {
                     "${requiresVulkanReasonPrefix(scope)}:capability_probe_failed:${t.javaClass.simpleName}"
                 } else {
@@ -447,5 +543,21 @@ class AndroidExportRenderBackendSelector {
         /// logs/reason strings so a forced selection is never mistaken for
         /// the normal capability-driven GLES fallback.
         const val DEBUG_FORCE_GLES_TRANSITION_REASON = "debug_force_gles_transition_export"
+
+        /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: reason prefix used when
+        /// [select]'s `debugForceGlesBeautyExport` seam is set but the scope
+        /// is not [ExportRenderScope.glesBeautyEligible] (or GLES itself is
+        /// not supported) -- the underlying
+        /// [ExportRenderScope.glesBeautyIneligibleReason] (or
+        /// "gles_not_supported:<fallbackReason>"/"capability_probe_failed:...")
+        /// follows after ':'.
+        const val GLES_BEAUTY_NOT_ELIGIBLE_REASON = "gles_beauty_not_eligible"
+
+        /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: the exact reason
+        /// [select] reports when `debugForceGlesBeautyExport` chooses GLES
+        /// for an eligible, GLES-supported scope -- kept obvious in
+        /// logs/reason strings so a forced selection is never mistaken for
+        /// the normal capability-driven GLES fallback.
+        const val DEBUG_FORCE_GLES_BEAUTY_REASON = "debug_force_gles_beauty_export"
     }
 }
