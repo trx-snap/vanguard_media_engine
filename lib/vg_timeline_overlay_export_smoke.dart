@@ -26,12 +26,14 @@
 //     (closing unproved transition directions/types under P5-OVERLAYS-TRANS),
 //     overlays alongside clip-level Beauty V2 on both transition-overlap frames
 //     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
-//     (P5-OVERLAYS-BEAUTY-SOLO), and forced GLES transition-overlay export
-//     (P5-GLES-EXPORT-TRANSITION-OVERLAYS);
+//     (P5-OVERLAYS-BEAUTY-SOLO), forced GLES transition-overlay export
+//     (P5-GLES-EXPORT-TRANSITION-OVERLAYS), and forced GLES hard-cut
+//     overlay+Beauty V2 solo export (P5-GLES-EXPORT-BEAUTY-OVERLAYS);
 //   - Unsupported transition types (e.g. fade) fail closed elsewhere because
 //     fade-through-black semantics are unsupported;
-//   - Strict non-claims: GLES overlay export outside supported forced transition
-//     overlap scopes (Beauty/reverse/still-image/colorMatrix in GLES remain excluded/fail closed),
+//   - Strict non-claims: GLES overlay export outside supported forced
+//     transition-overlap and forced hard-cut beauty-solo scopes
+//     (reverse/still-image/colorMatrix Beauty in GLES remain excluded/fail closed),
 //     realtime playback overlay compositing, app/editor/product/iOS/streaming-cache,
 //     fleet coverage beyond tested device, or pixel-quality typography/emoji glyph guarantees;
 //   - Validates success lanes: `success == true`, output file exists,
@@ -118,6 +120,7 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'fail_closed_unreadable_asset',
   'forced_gles_overlays_with_transition_dissolve_success',
   'forced_gles_overlays_with_transition_wipe_right_success',
+  'forced_gles_overlays_with_beauty_solo_success',
 ];
 
 /// One clip of a smoke draft (wire shape of VGClipDescriptor.toMap()).
@@ -995,8 +998,9 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
   );
 }
 
-/// Builds the default suite of 23 static sticker, text, and emoji overlay smoke requests,
-/// covering Vulkan Route-A and forced GLES transition-overlay scopes (P5-GLES-EXPORT-TRANSITION-OVERLAYS):
+/// Builds the default suite of 24 static sticker, text, and emoji overlay smoke requests,
+/// covering Vulkan Route-A, forced GLES transition-overlay scopes (P5-GLES-EXPORT-TRANSITION-OVERLAYS),
+/// and forced GLES hard-cut overlay+Beauty V2 solo scopes (P5-GLES-EXPORT-BEAUTY-OVERLAYS):
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
@@ -1020,6 +1024,7 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
 /// 21. `fail_closed_unreadable_asset`
 /// 22. `forced_gles_overlays_with_transition_dissolve_success`
 /// 23. `forced_gles_overlays_with_transition_wipe_right_success`
+/// 24. `forced_gles_overlays_with_beauty_solo_success`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
   String clipPathB = '/data/local/tmp/clip_b.mov',
@@ -1638,6 +1643,53 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
       outputPath: outputPath,
       expectedRenderBackend: 'gles',
       debugForceRenderBackend: 'gles',
+    ),
+
+    // Lane 24: forced_gles_overlays_with_beauty_solo_success
+    VGTimelineOverlayExportSmokeRequest(
+      laneId: 'forced_gles_overlays_with_beauty_solo_success',
+      clips: <VGTimelineOverlayExportSmokeClip>[
+        VGTimelineOverlayExportSmokeClip(
+          id: 'clip-1',
+          sourcePath: clipPathA,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.0,
+          beautyIntensity: 0.5,
+        ),
+      ],
+      overlays: <VGTimelineOverlayExportSmokeOverlay>[
+        VGTimelineOverlayExportSmokeOverlay(
+          id: 'sticker-forced-gles-beauty-solo',
+          assetPath: stickerAssetPath,
+          // Active for the full solo hard-cut clip duration -- proves the
+          // forced production GLES route (P5-GLES-EXPORT-BEAUTY-OVERLAYS)
+          // composites a static sticker overlay on top of clip-level
+          // Beauty V2 output via
+          // AndroidTimelineVideoEncoder.drawAndSubmitBeautyFrame's pre-swap
+          // overlay compositing.
+          startTimeSeconds: 0.0,
+          durationSeconds: 2.0,
+          translationX: 100.0,
+          translationY: 100.0,
+          width: 200.0,
+          height: 200.0,
+          rotation: 0.0,
+          scale: 1.0,
+          opacity: 1.0,
+          zIndex: 0,
+          type: 'sticker',
+        ),
+      ],
+      outputPath: outputPath('forced_gles_overlays_with_beauty_solo_success'),
+      expectedRenderBackend: 'gles',
+      debugForceRenderBackend: 'gles',
+      expectation: const VGTimelineOverlayExportSmokeExpectation.success(
+        expectedOverlayCount: 1,
+        expectedTransitionCount: 0,
+        expectedRenderedOverlayFrameCount: 55,
+        expectedBeautyClipCount: 1,
+        expectedBeautyFrameCountMin: 55,
+      ),
     ),
   ];
 }

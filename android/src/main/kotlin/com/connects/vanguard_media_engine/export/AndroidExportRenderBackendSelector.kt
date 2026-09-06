@@ -108,18 +108,20 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // defensive re-validation of the same restriction is a second defense
 // layer, not the primary gate.
 //
-// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: a scope carrying clip-level
-// Beauty V2 no longer unconditionally requires Vulkan -- when
+// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A, widened by
+// P5-GLES-EXPORT-BEAUTY-OVERLAYS: a scope carrying clip-level Beauty V2 no
+// longer unconditionally requires Vulkan -- when
 // [ExportRenderScope.glesBeautyEligible] holds (hard-cut-only transitions,
-// no overlays, video-only clips, no reversed clip, no colorMatrix, positive
-// decoded/requested dimensions, zero rotation metadata on every clip), the
-// narrow production GLES Beauty route (AndroidTimelineVideoEncoder +
-// AndroidTimelineGlesBeautyRenderSession) is an acceptable alternative to
-// Vulkan. Vulkan remains the default/preferred backend regardless (see
-// [select]'s Vulkan-first branch below, unchanged) -- this only widens what
-// happens when Vulkan is NOT selectable for such a scope: instead of always
-// failing closed with `beauty_v2_requires_vulkan:<reason>`, an eligible
-// scope now resolves to [ExportRenderBackend.GLES]. [select]'s optional
+// video-only clips, no reversed clip, no colorMatrix, positive
+// decoded/requested dimensions, zero rotation metadata on every clip --
+// overlays no longer excluded, see below), the narrow production GLES
+// Beauty route (AndroidTimelineVideoEncoder + AndroidTimelineGlesBeautyRenderSession)
+// is an acceptable alternative to Vulkan. Vulkan remains the
+// default/preferred backend regardless (see [select]'s Vulkan-first branch
+// below, unchanged) -- this only widens what happens when Vulkan is NOT
+// selectable for such a scope: instead of always failing closed with
+// `beauty_v2_requires_vulkan:<reason>`, an eligible scope now resolves to
+// [ExportRenderBackend.GLES]. [select]'s optional
 // `debugForceGlesBeautyExport` parameter additionally allows a caller to
 // force GLES for an eligible hard-cut scope even when Vulkan would
 // otherwise be selected first, purely to physically exercise this route on
@@ -127,7 +129,17 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // that is NOT [glesBeautyEligible] still fails closed exactly as before
 // with `beauty_v2_requires_vulkan:...` when Vulkan cannot be selected
 // either -- this slice does not implement a GLES Beauty route for
-// transition/overlay/still-image/reversed/rotated/colorMatrix scopes.
+// transition/still-image/reversed/rotated/colorMatrix scopes.
+// P5-GLES-EXPORT-BEAUTY-OVERLAYS: overlays themselves no longer force this
+// route ineligible -- a hard-cut, video-only Beauty scope that also carries
+// timeline overlays is [glesBeautyEligible] on exactly the same terms as one
+// without overlays, and AndroidTimelineVideoEncoder composites those
+// overlays itself (reusing [compositeActiveOverlaysIfPresent], the same
+// pre-swap route video/still-image frames use) immediately after its Beauty
+// draw/seam-validation pass and before presentation/swap -- see
+// [AndroidTimelineVideoEncoder.drawAndSubmitBeautyFrame]. See
+// [requiresVulkan] for how this interacts with [glesOverlayEligible], which
+// deliberately continues to exclude beauty.
 // [debugForceGlesTransitionExport] takes priority over
 // [debugForceGlesBeautyExport] whenever both could apply to the same
 // non-hard-cut-transition scope (see [select]'s doc); a hard-cut Beauty
@@ -244,26 +256,29 @@ data class ExportRenderScope(
     /// True when [glesTransitionIneligibleReason] is null -- see its doc.
     val glesTransitionEligible: Boolean get() = glesTransitionIneligibleReason == null
 
-    /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: null when this scope's
-    /// clip-level Beauty V2 request(s) are eligible for the narrow
-    /// production GLES Beauty route (AndroidTimelineVideoEncoder +
+    /// P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A, widened by
+    /// P5-GLES-EXPORT-BEAUTY-OVERLAYS: null when this scope's clip-level
+    /// Beauty V2 request(s) are eligible for the narrow production GLES
+    /// Beauty route (AndroidTimelineVideoEncoder +
     /// AndroidTimelineGlesBeautyRenderSession), or a precise
     /// machine-readable reason otherwise. Route A only claims hard-cut,
     /// video-only, non-reversed, colorMatrix-free, zero-rotation timelines
     /// with positive decoded/requested dimensions -- any non-hard-cut
-    /// transition, overlay, still-image clip, reversed clip, colorMatrix,
-    /// non-zero rotation, or invalid dimension anywhere in the scope fails
-    /// this predicate, even when only one clip in an otherwise-eligible
-    /// mixed hard-cut timeline carries the offending shape. Does not check
-    /// native-bridge availability -- that is a runtime concern the encoder
-    /// itself checks immediately before it would draw a Beauty frame (see
+    /// transition, still-image clip, reversed clip, colorMatrix, non-zero
+    /// rotation, or invalid dimension anywhere in the scope fails this
+    /// predicate, even when only one clip in an otherwise-eligible mixed
+    /// hard-cut timeline carries the offending shape. Overlays no longer
+    /// fail this predicate (P5-GLES-EXPORT-BEAUTY-OVERLAYS) -- see
+    /// [AndroidTimelineVideoEncoder.drawAndSubmitBeautyFrame] for where the
+    /// GLES Beauty route composites them. Does not check native-bridge
+    /// availability -- that is a runtime concern the encoder itself checks
+    /// immediately before it would draw a Beauty frame (see
     /// AndroidTimelineVideoEncoder), not a request-shape property. See
     /// [glesBeautyEligible].
     val glesBeautyIneligibleReason: String?
         get() {
             if (!hasBeautyClip) return "no_beauty_clip"
             if (hasNonHardCutTransition) return "non_hard_cut_transition"
-            if (hasOverlays) return "overlays_present"
             if (clips.any { it.isReversed }) return "reversed_clip_present"
             if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
@@ -284,20 +299,27 @@ data class ExportRenderScope(
     /// preference) but is no longer required to be.
     ///
     /// Overlays force Vulkan only when the scope has NO non-hard-cut
-    /// transition (i.e. is hard-cut-only or transition-free) AND falls
-    /// outside [glesOverlayEligible]. P5-GLES-EXPORT-TRANSITION-OVERLAYS:
-    /// when the scope DOES carry a non-hard-cut transition, overlay
-    /// eligibility is governed entirely by [glesTransitionEligible] instead
-    /// (which no longer excludes overlays) -- [glesOverlayEligible] is
-    /// deliberately NOT also consulted in that case, since it always reads
-    /// false for a scope with a non-hard-cut transition (it requires
-    /// `!hasNonHardCutTransition`) and would otherwise wrongly force Vulkan
-    /// for an overlay+transition scope [glesTransitionEligible] already
-    /// admits.
+    /// transition (i.e. is hard-cut-only or transition-free), falls outside
+    /// [glesOverlayEligible], AND falls outside [glesBeautyEligible].
+    /// P5-GLES-EXPORT-BEAUTY-OVERLAYS: the trailing `!glesBeautyEligible`
+    /// term is required because [glesOverlayEligible] deliberately excludes
+    /// any beauty clip (see its own doc) -- without this term, a hard-cut
+    /// scope carrying both overlays and clip-level Beauty V2 that IS
+    /// [glesBeautyEligible] (which composites those overlays itself; see
+    /// [AndroidTimelineVideoEncoder.drawAndSubmitBeautyFrame]) would read
+    /// false on [glesOverlayEligible] alone and be wrongly forced to Vulkan
+    /// by this clause. P5-GLES-EXPORT-TRANSITION-OVERLAYS: when the scope
+    /// DOES carry a non-hard-cut transition, overlay eligibility is governed
+    /// entirely by [glesTransitionEligible] instead (which no longer
+    /// excludes overlays) -- [glesOverlayEligible] is deliberately NOT also
+    /// consulted in that case, since it always reads false for a scope with
+    /// a non-hard-cut transition (it requires `!hasNonHardCutTransition`)
+    /// and would otherwise wrongly force Vulkan for an overlay+transition
+    /// scope [glesTransitionEligible] already admits.
     val requiresVulkan: Boolean
         get() = (hasNonHardCutTransition && !glesTransitionEligible) ||
             (hasBeautyClip && !glesBeautyEligible) ||
-            (hasOverlays && !hasNonHardCutTransition && !glesOverlayEligible)
+            (hasOverlays && !hasNonHardCutTransition && !glesOverlayEligible && !glesBeautyEligible)
 }
 
 class AndroidExportRenderBackendSelector {

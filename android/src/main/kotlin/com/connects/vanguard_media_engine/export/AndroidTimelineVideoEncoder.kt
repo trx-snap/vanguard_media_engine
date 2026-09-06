@@ -224,14 +224,23 @@ class AndroidTimelineVideoEncoder(
     /// [encode]. A non-empty [overlays] is accepted only for the narrow
     /// shape [AndroidExportRenderBackendSelector.ExportRenderScope
     /// .glesOverlayEligible] also requires -- hard-cut-only [transitions],
-    /// no reversed clip, no clip-level Beauty V2, and a non-null
-    /// [nativeBridge] -- rejecting anything wider with a precise
-    /// machine-readable reason rather than silently dropping the overlays.
-    /// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: a still-image clip is no longer
-    /// rejected here -- [renderStillClipIntoEncoder] composites overlays on
-    /// its existing GL_TEXTURE_2D base draw path via
+    /// no reversed clip, and a non-null [nativeBridge] -- rejecting anything
+    /// wider with a precise machine-readable reason rather than silently
+    /// dropping the overlays. P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: a
+    /// still-image clip is no longer rejected here --
+    /// [renderStillClipIntoEncoder] composites overlays on its existing
+    /// GL_TEXTURE_2D base draw path via
     /// [drawAndSubmitFrame2D]/[compositeActiveOverlaysIfPresent], the same
-    /// route video clips use.
+    /// route video clips use. P5-GLES-EXPORT-BEAUTY-OVERLAYS: a clip
+    /// carrying [ClipInput.beautyIntensity] is no longer rejected here
+    /// either -- [drawAndSubmitBeautyFrame] composites overlays on top of
+    /// its Beauty output via that same [compositeActiveOverlaysIfPresent]
+    /// route, provided the wider request shape is still
+    /// [AndroidExportRenderBackendSelector.ExportRenderScope
+    /// .glesBeautyEligible] (hard-cut-only, video-only, non-reversed,
+    /// colorMatrix-free, zero-rotation) upstream in the selector -- this
+    /// encoder does not re-validate that shape beyond the hard-cut/reversed
+    /// checks already below.
     override fun encode(
         clips: List<ClipInput>,
         transitions: List<AndroidTimelineTransitionDescriptor>,
@@ -251,9 +260,6 @@ class AndroidTimelineVideoEncoder(
         }
         if (clips.any { it.isReversed }) {
             return EncodeResult(false, "overlays_reversed_clip_unsupported", 0, 0L)
-        }
-        if (clips.any { it.beautyIntensity != null }) {
-            return EncodeResult(false, "overlays_beauty_unsupported", 0, 0L)
         }
         if (nativeBridge == null) {
             return EncodeResult(false, "overlays_missing_native_bridge", 0, 0L)
@@ -946,9 +952,17 @@ class AndroidTimelineVideoEncoder(
     /// guaranteed >= 3, by [encode]'s upfront beauty preflight -- the
     /// defensive null/version checks here exist only so this method never
     /// silently no-ops if that invariant is ever violated. This narrow route
-    /// never carries overlays or a still-image/reversed clip (see
-    /// [ExportRenderScope.glesBeautyEligible]), so unlike [drawAndSubmitFrame]
-    /// and [drawAndSubmitFrame2D] this never composites overlays.
+    /// never carries a still-image/reversed clip or a non-hard-cut
+    /// transition (see [ExportRenderScope.glesBeautyEligible]).
+    /// P5-GLES-EXPORT-BEAUTY-OVERLAYS: when [glesOverlaySession] is
+    /// non-null, every overlay active at `framesSubmitted * frameDurationUs`
+    /// is composited on top of this frame's Beauty output -- after the seam
+    /// status above is validated and before presentation/swap below -- via
+    /// [compositeActiveOverlaysIfPresent], the same pre-swap ordering
+    /// [drawAndSubmitFrame] and [drawAndSubmitFrame2D] use. Returns a
+    /// machine-readable failure reason on any overlay payload/draw/upload
+    /// failure -- this frame is never submitted with a silently-dropped
+    /// overlay -- or null on success.
     private fun drawAndSubmitBeautyFrame(intensity: Double): String? {
         val session = glesBeautySession ?: return "beauty_v2_gles_missing_native_bridge"
         val bridge = nativeBridge ?: return "beauty_v2_gles_missing_native_bridge"
@@ -979,6 +993,14 @@ class AndroidTimelineVideoEncoder(
                 ?: "unparseable_seam_response"
             return "beauty_v2_gles_render_failed:$failureDetail"
         }
+
+        // P5-GLES-EXPORT-BEAUTY-OVERLAYS: composite overlays on top of the
+        // Beauty output before presentation/swap -- must run after seam
+        // status validation above (never composite onto a failed Beauty
+        // draw) and before eglSwapBuffers below (never submit a frame with a
+        // silently-dropped overlay).
+        val overlayFailure = compositeActiveOverlaysIfPresent()
+        if (overlayFailure != null) return overlayFailure
 
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, framesSubmitted * frameDurationUs * 1000L)
         framesSubmitted++

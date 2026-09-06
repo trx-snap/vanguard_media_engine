@@ -1,5 +1,5 @@
 // android_timeline_overlay_export_physical_smoke.dart
-// Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A / P5-GLES-EXPORT-TRANSITION-OVERLAYS:
+// Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A / P5-GLES-EXPORT-TRANSITION-OVERLAYS / P5-GLES-EXPORT-BEAUTY-OVERLAYS:
 // Android production `exportTimeline` static sticker, text, and emoji overlay smoke physical proof.
 //
 // Proof boundary: production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a
@@ -16,14 +16,17 @@
 // (P5-OVERLAYS-BEAUTY-SOLO), text overlay production export via
 // rasterized RGBA texture upload (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT), AND
 // emoji overlay production export via rasterized RGBA texture upload
-// (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT), AND forced GLES overlay+transition export
-// (P5-GLES-EXPORT-TRANSITION-OVERLAYS).
+// (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT), forced GLES overlay+transition export
+// (P5-GLES-EXPORT-TRANSITION-OVERLAYS), AND forced GLES hard-cut
+// overlay+Beauty V2 solo export (P5-GLES-EXPORT-BEAUTY-OVERLAYS) using the
+// zero-rotation clip_A.mov fixture.
 //
 // Strict non-claims:
 //   - All supported Vulkan transition wire types with overlays are physically
 //     proved on SM-A566B; unsupported transitions (e.g. fade) fail closed elsewhere;
-//   - GLES overlay export outside supported forced transition overlap scopes
-//     (Beauty/reverse/still-image/colorMatrix in GLES remain excluded/fail closed);
+//   - GLES overlay export outside supported forced transition overlap and
+//     forced hard-cut beauty-solo scopes (reverse/still-image/colorMatrix Beauty
+//     and rotated Beauty in GLES remain excluded/fail closed by contract);
 //   - No realtime playback overlay compositing;
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;
 //   - No fleet coverage beyond attached device;
@@ -89,7 +92,7 @@ class _AndroidTimelineOverlayExportSmokeAppState
       workDir.createSync(recursive: true);
 
       final clipA = await _copyAsset(
-        'assets/manual_test_clips/clip_B.mov',
+        'assets/manual_test_clips/clip_A.mov',
         '${workDir.path}/vg_overlay_export_clipA_$stamp.mov',
       );
       final clipB = await _copyAsset(

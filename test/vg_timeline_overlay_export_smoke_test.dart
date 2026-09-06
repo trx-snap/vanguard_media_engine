@@ -151,7 +151,7 @@ void main() {
       expect(keyframesToken, 'keyframe');
       expect(unreadableAssetToken, 'asset');
 
-      expect(defaultOverlaySmokeLaneIds, hasLength(23));
+      expect(defaultOverlaySmokeLaneIds, hasLength(24));
       expect(defaultOverlaySmokeLaneIds, <String>[
         'single_clip_static_sticker_success',
         'multi_layer_z_order_success',
@@ -176,6 +176,7 @@ void main() {
         'fail_closed_unreadable_asset',
         'forced_gles_overlays_with_transition_dissolve_success',
         'forced_gles_overlays_with_transition_wipe_right_success',
+        'forced_gles_overlays_with_beauty_solo_success',
       ]);
     });
   });
@@ -1377,17 +1378,17 @@ void main() {
   });
 
   group('default suite construction', () {
-    test('buildDefaultOverlayExportSmokeSuite builds all 23 required lanes', () {
+    test('buildDefaultOverlayExportSmokeSuite builds all 24 required lanes', () {
       final suite = buildDefaultOverlayExportSmokeSuite();
 
-      expect(suite, hasLength(23));
+      expect(suite, hasLength(24));
       final laneIds = suite.map((r) => r.laneId).toList();
       expect(laneIds, defaultOverlaySmokeLaneIds);
 
       final successLanes = suite.where((r) => r.expectation.expectsSuccess);
       final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-      expect(successLanes, hasLength(21));
+      expect(successLanes, hasLength(22));
       expect(failureLanes, hasLength(2));
 
       // Lane 1: single_clip_static_sticker_success
@@ -1595,6 +1596,28 @@ void main() {
       expect(lane23.expectedTransitionCount, 1);
       final lane23Args = lane23.toExportTimelineArguments();
       expect(lane23Args['debugForceRenderBackend'], 'gles');
+
+      // Lane 24: forced_gles_overlays_with_beauty_solo_success
+      final lane24 = suite[23];
+      expect(lane24.laneId, 'forced_gles_overlays_with_beauty_solo_success');
+      expect(lane24.expectedRenderBackend, 'gles');
+      expect(lane24.debugForceRenderBackend, 'gles');
+      expect(lane24.clips, hasLength(1));
+      expect(lane24.clips.single.hasBeauty, isTrue);
+      expect(lane24.clips.single.durationSeconds, 2.0);
+      expect(lane24.transitions, isEmpty);
+      expect(lane24.overlays, hasLength(1));
+      expect(lane24.overlays.single.startTimeSeconds, 0.0);
+      expect(lane24.overlays.single.durationSeconds, 2.0);
+      expect(lane24.expectation.expectsSuccess, isTrue);
+      expect(lane24.expectation.expectedOverlayCount, 1);
+      expect(lane24.expectation.expectedTransitionCount, 0);
+      expect(lane24.expectation.expectedRenderedOverlayFrameCount, 55);
+      expect(lane24.expectation.expectedBeautyClipCount, 1);
+      expect(lane24.expectation.expectedBeautyFrameCountMin, 55);
+      expect(lane24.expectedDurationSeconds, closeTo(2.0, 1e-9));
+      final lane24Args = lane24.toExportTimelineArguments();
+      expect(lane24Args['debugForceRenderBackend'], 'gles');
     });
   });
 }
