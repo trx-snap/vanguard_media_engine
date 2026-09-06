@@ -1247,6 +1247,17 @@ class VanguardNativeBridge(
     // ConnectsApp wiring.
     external fun runAndroidDagPhase3CameraFrameSourceNodeSmoke(): String
 
+    // -- P1-EXTERNAL-SURFACE-SOURCE-NODE-A: platform-neutral logical DAG
+    // ExternalSurfaceSourceNode diagnostic. Proves construction validation,
+    // identity/port shape, surfaceId/dimension accessors, timeline-window
+    // semantics, and a real GraphExecutionPlan source->sink pass using the
+    // real ExternalSurfaceSourceNode against the real
+    // PreviewSurfaceSinkNode. Diagnostic-only: no production Android
+    // Surface/SurfaceTexture/ANativeWindow/AHardwareBuffer/EGL/GLES/Vulkan/
+    // JNI resource ownership, no Android lifecycle, no product/editor/app/
+    // ConnectsApp wiring.
+    external fun runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real

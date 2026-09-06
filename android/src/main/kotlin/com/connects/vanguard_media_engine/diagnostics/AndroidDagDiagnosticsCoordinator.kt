@@ -49,6 +49,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
             "runAndroidDagPhase6StreamSourceNodeSmoke",
             "runAndroidDagPhase3CameraFrameSourceNodeSmoke",
+            "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -118,6 +119,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
             "runAndroidDagPhase6StreamSourceNodeSmoke" -> runPhase6StreamSourceNodeSmoke(result)
             "runAndroidDagPhase3CameraFrameSourceNodeSmoke" -> runPhase3CameraFrameSourceNodeSmoke(result)
+            "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke" -> runPhase1ExternalSurfaceSourceNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -487,6 +489,48 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "CAMERA_FRAME_SOURCE_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase3CameraFrameSourceNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P1-EXTERNAL-SURFACE-SOURCE-NODE-A: platform-neutral logical DAG
+    // ExternalSurfaceSourceNode diagnostic. Runs native lanes over the real
+    // ExternalSurfaceSourceNode plus the real PreviewSurfaceSinkNode
+    // (construction validation, identity/port shape, surfaceId/dimension
+    // accessors, timeline-window semantics, real GraphExecutionPlan
+    // source->sink pass). Proof boundary: platform-neutral logical DAG
+    // source - no external surface ownership, no Android lifecycle, no
+    // product/app/editor wiring.
+    private fun runPhase1ExternalSurfaceSourceNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_external_surface_source_node_logical_dag_source_no_external_" +
+                        "surface_ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "EXTERNAL_SURFACE_SOURCE_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
