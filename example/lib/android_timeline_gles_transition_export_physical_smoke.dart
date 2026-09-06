@@ -1,8 +1,9 @@
 // android_timeline_gles_transition_export_physical_smoke.dart
-// Vanguard Media Engine — P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A:
+// Vanguard Media Engine — P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A,
+// widened by P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE:
 // Android production `exportTimeline` GLES forced transition route proof.
 //
-// Proof boundary: production_exportTimeline_gles_crossfade_transition_forced_route_a_no_vulkan_no_app
+// Proof boundary: production_exportTimeline_gles_transition_slide_wipe_forced_route_a_no_vulkan_no_app
 //
 // Drives the REAL production `exportTimeline` MethodChannel route with top-level
 // `debugForceRenderBackend: gles` using clip_A.mov copies (zero-rotation
@@ -11,9 +12,13 @@
 //                                    renderBackend=gles, file exists,
 //                                    duration ~= 3.5, transitionCount=1
 //   Lane forced crossfade success  : crossfade 0.5 s (clip_A + clip_A) -> same expectations
-//   Lane forced slideLeft fail closed: slideLeft 0.5 s (clip_A + clip_A) -> fails closed before
-//                                    pass-1 (UNSUPPORTED_EXPORT_FEATURE /
-//                                    gles_transition_not_eligible)
+//   Lane forced slideLeft success  : slideLeft 0.5 s (clip_A + clip_A) -> same expectations
+//   Lane forced wipeRight success  : wipeRight 0.5 s (clip_A + clip_A) -> same expectations
+//   Lane forced fade fail closed   : fade 0.5 s (clip_A + clip_A) -> fails closed before
+//                                    pass-1 (UNSUPPORTED_EXPORT_FEATURE, unsupported wire type
+//                                    -- fade is never GLES-eligible: it fails at
+//                                    AndroidTimelineTransitionDescriptor parse time, before
+//                                    any render-backend selection)
 //   Lane forced still-image dissolve fail closed: image + video (still_C + clip_A) -> fails closed
 //                                    before pass-1 (UNSUPPORTED_EXPORT_FEATURE /
 //                                    gles_transition_not_eligible)
@@ -141,10 +146,10 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
         );
       }
 
-      final slideLeftOutPath =
-          '${tempDir.path}/vg_gles_trans_export_slideLeft_$stamp.mp4';
-      cleanupTargets.add(File(slideLeftOutPath));
-      cleanupTargets.add(File('$slideLeftOutPath.roi.json'));
+      final fadeOutPath =
+          '${tempDir.path}/vg_gles_trans_export_fade_$stamp.mp4';
+      cleanupTargets.add(File(fadeOutPath));
+      cleanupTargets.add(File('$fadeOutPath.roi.json'));
 
       final stillOutPath =
           '${tempDir.path}/vg_gles_trans_export_still_dissolve_$stamp.mp4';
@@ -159,28 +164,30 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
       final requests = <VGTimelineTransitionExportSmokeRequest>[
         positiveLane('dissolve'),
         positiveLane('crossfade'),
+        positiveLane('slideLeft'),
+        positiveLane('wipeRight'),
         VGTimelineTransitionExportSmokeRequest(
-          laneId: 'forced_slide_left_fail_closed',
+          laneId: 'forced_fade_fail_closed',
           clips: <VGTimelineTransitionExportSmokeClip>[
             videoClip('clip-a', clipA1.path),
             videoClip('clip-b', clipA2.path),
           ],
           transitions: const <VGTimelineTransitionExportSmokeTransition>[
             VGTimelineTransitionExportSmokeTransition(
-              id: 'tr-slideLeft',
-              type: 'slideLeft',
+              id: 'tr-fade',
+              type: 'fade',
               durationSeconds: _transitionSeconds,
               fromClipId: 'clip-a',
               toClipId: 'clip-b',
             ),
           ],
-          outputPath: slideLeftOutPath,
+          outputPath: fadeOutPath,
           expectedRenderBackend: 'gles',
           debugForceRenderBackend: 'gles',
           expectation:
               const VGTimelineTransitionExportSmokeExpectation.failClosed(
                 errorCode: unsupportedExportFeatureCode,
-                messageContains: 'gles_transition_not_eligible',
+                messageContains: 'not supported',
               ),
         ),
         VGTimelineTransitionExportSmokeRequest(
@@ -276,7 +283,7 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
         : 'ANDROID_TIMELINE_GLES_TRANSITION_EXPORT_PHYSICAL_SMOKE_FAIL';
     final payload = report.toMap();
     payload['proofBoundary'] =
-        'production_exportTimeline_gles_crossfade_transition_forced_route_a_no_vulkan_no_app';
+        'production_exportTimeline_gles_transition_slide_wipe_forced_route_a_no_vulkan_no_app';
     payload['marker'] = marker;
     print(
       'ANDROID_TIMELINE_GLES_TRANSITION_EXPORT_JSON:${jsonEncode(payload)}',

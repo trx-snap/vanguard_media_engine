@@ -54,7 +54,7 @@ import kotlin.math.min
 // blit, then hands both resolved 2D textures to the native
 // GlesTimelineTransitionCompositor seam
 // (VanguardNativeBridge.drawAndroidTimelineGlesTransitionExportFrame) for a
-// crossfade mix draw at that pair's transition progress, before presenting
+// transition draw at that pair's transition progress, before presenting
 // and draining the shared encoder/muxer -- exactly the proof chain
 // AndroidGlesDualOesTransitionSmokeHarness already physically validated,
 // wired to real per-segment decode windows instead of one fixed diagnostic
@@ -64,12 +64,13 @@ import kotlin.math.min
 // on the Vulkan route) renders its remaining unpaired frame(s) solo through
 // the same OES-to-encoder-surface path, so no source frame is ever dropped.
 //
-// This slice only implements a safe crossfade/dissolve mix: a non-hard-cut
-// transition of any other family fails closed up front (before any encoder/
-// muxer/EGL resource is created) with a precise
-// `gles_transition_unsupported_type:<wire>` reason -- the native compositor
-// seam independently re-validates the same restriction as a second defense
-// layer.
+// P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE: every non-hard-cut
+// AndroidTimelineTransitionDescriptor.Type member (crossfade, the four
+// wipes, the four slides) draws through the native
+// GlesTimelineTransitionCompositor seam at that pair's transition progress
+// -- native transition math (vanguard::compositors::ComputeTransitionGeometry)
+// already implements all nine families, so there is no remaining per-family
+// rejection on this route.
 //
 // Encoder/muxer/EGL/dual-decode-slot resources are all owned by this class
 // and released on every exit path (success, failure, exception, cancel) --
@@ -161,13 +162,6 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         try {
             glMajorVersion = 2
             val nonHardCutTransitions = transitions.filter { !it.isHardCut }
-            val unsupportedTransition = nonHardCutTransitions.firstOrNull {
-                it.type != AndroidTimelineTransitionDescriptor.Type.CROSSFADE
-            }
-            if (unsupportedTransition != null) {
-                reason = "gles_transition_unsupported_type:${unsupportedTransition.type.wireName}"
-                return AndroidTimelineVideoEncoder.EncodeResult(false, reason, 0, 0L, glMajorVersion = glMajorVersion)
-            }
 
             val plan = AndroidTimelineExportSegmentPlanner.build(clips, transitions, fps)
             if (plan.failureReason != null) {
@@ -386,7 +380,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                         val drawFailure: String?
                         if (step.from != null && step.to != null) {
                             val progress = transition.progressForOverlapFrame(pairsRendered, expectedPairs)
-                            drawFailure = drawTransitionPair(fromQuad, toQuad, progress)
+                            drawFailure = drawTransitionPair(fromQuad, toQuad, progress, transition.type.nativeCode)
                             if (drawFailure == null) pairsRendered++
                         } else if (step.from != null) {
                             drawFailure = drawSoloFrameFromSlot(fromSlot, fromQuad)
@@ -441,8 +435,15 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     /// Pre-resolves both sides (with their own SurfaceTexture transform
     /// matrices applied, through their own fit geometry) into their
     /// canvas-sized 2D FBOs, then hands both resolved textures to the native
-    /// crossfade compositor seam, then presents/swaps the encoder surface.
-    private fun drawTransitionPair(fromQuad: FloatArray, toQuad: FloatArray, progress: Double): String? {
+    /// transition compositor seam at [transitionTypeCode]
+    /// (AndroidTimelineTransitionDescriptor.Type.nativeCode), then
+    /// presents/swaps the encoder surface.
+    private fun drawTransitionPair(
+        fromQuad: FloatArray,
+        toQuad: FloatArray,
+        progress: Double,
+        transitionTypeCode: Int,
+    ): String? {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
         val fromResolveFailure = resolveSlotToTexture2d(fromSlot, fromQuad, fromResolveFboId)
@@ -464,7 +465,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             GLES20.GL_TEXTURE_2D,
             width,
             height,
-            AndroidTimelineTransitionDescriptor.Type.CROSSFADE.nativeCode,
+            transitionTypeCode,
             progress,
         )
         if (!status.startsWith("status=OK")) {

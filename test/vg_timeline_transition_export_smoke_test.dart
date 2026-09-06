@@ -346,6 +346,38 @@ void main() {
       expect(report.failureReason, isEmpty);
     });
 
+    test(
+      "a GLES result passes for slideLeft when expectedRenderBackend == 'gles'",
+      () {
+        final report =
+            VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+              _request(type: 'slideLeft', expectedRenderBackend: 'gles'),
+              _successResult(backend: 'gles'),
+              outputExists: true,
+            );
+        expect(report.pass, isTrue);
+        expect(report.status, 'PASS');
+        expect(report.renderBackend, 'gles');
+        expect(report.failureReason, isEmpty);
+      },
+    );
+
+    test(
+      "a GLES result passes for wipeRight when expectedRenderBackend == 'gles'",
+      () {
+        final report =
+            VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+              _request(type: 'wipeRight', expectedRenderBackend: 'gles'),
+              _successResult(backend: 'gles'),
+              outputExists: true,
+            );
+        expect(report.pass, isTrue);
+        expect(report.status, 'PASS');
+        expect(report.renderBackend, 'gles');
+        expect(report.failureReason, isEmpty);
+      },
+    );
+
     test('a GLES result still fails for the default Vulkan expectation', () {
       final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
         _request(),

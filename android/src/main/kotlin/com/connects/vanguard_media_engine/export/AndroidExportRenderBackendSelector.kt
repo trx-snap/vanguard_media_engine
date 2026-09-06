@@ -78,14 +78,19 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // still fails closed exactly as before with `transitions_require_vulkan:...`
 // when Vulkan cannot be selected either -- this slice does not implement a
 // GLES route for reversed/beauty/overlay/still-image/rotated/colorMatrix
-// transition scopes, or for any transition family other than crossfade
-// (the crossfade-only restriction, and the colorMatrix restriction, are
-// both gated by [glesTransitionIneligibleReason]/[glesTransitionEligible]
-// themselves, so the selector never routes an unsupported-type or
-// colorMatrix-bearing scope into GLES pass-1 in the first place;
-// AndroidTimelineGlesTransitionVideoEncoder's own defensive re-validation
-// of the same restrictions is a second defense layer, not the primary
-// gate).
+// transition scopes. P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE widened the
+// eligible transition family from crossfade-only to every closed-set
+// AndroidTimelineTransitionDescriptor.Type member (crossfade, the four
+// wipes, and the four slides) -- native transition math
+// (vanguard::compositors::ComputeTransitionGeometry) and the GLES
+// compositor already implement all nine, so there is no remaining
+// per-family "unsupported_transition_type" gate on this route. The
+// colorMatrix restriction is still gated by
+// [glesTransitionIneligibleReason]/[glesTransitionEligible] themselves, so
+// the selector never routes a colorMatrix-bearing scope into GLES pass-1 in
+// the first place; AndroidTimelineGlesTransitionVideoEncoder's own
+// defensive re-validation of the same restriction is a second defense
+// layer, not the primary gate.
 //
 // P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A: a scope carrying clip-level
 // Beauty V2 no longer unconditionally requires Vulkan -- when
@@ -176,19 +181,19 @@ data class ExportRenderScope(
             clips.none { it.isReversed } &&
             clips.all { it.mediaKind == "video" || it.mediaKind == "image" }
 
-    /// P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: null when this scope's
+    /// P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A, widened by
+    /// P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE: null when this scope's
     /// non-hard-cut transition(s) are eligible for the narrow production GLES
     /// transition route (AndroidTimelineGlesTransitionVideoEncoder), or a
     /// precise machine-readable reason otherwise. Also gates the same limits
     /// the GLES transition encoder itself enforces -- a clip carrying a
     /// non-null colorMatrix (the encoder has no colorMatrix uniform path on
-    /// this route) returns "color_matrix_present", and a non-hard-cut
-    /// transition whose type is not CROSSFADE returns
-    /// "unsupported_transition_type:<wireName>" -- so the selector never
-    /// routes either shape into GLES pass-1 in the first place; the encoder's
-    /// own defensive re-validation (see [AndroidTimelineGlesTransitionVideoEncoder.
-    /// validateClipShape] and its unsupported-type check in [encode]) remains
-    /// a second defense layer, not the primary gate. Rotation is restricted
+    /// this route) returns "color_matrix_present". Every
+    /// AndroidTimelineTransitionDescriptor.Type member other than NONE
+    /// (crossfade, the four wipes, the four slides) is admitted here --
+    /// native transition math (vanguard::compositors::ComputeTransitionGeometry)
+    /// and the GLES compositor already implement all nine, so there is no
+    /// per-family rejection left on this route. Rotation is restricted
     /// to exactly zero (not the wider 0/90/180/270 Vulkan accepts) -- this
     /// route's OES-to-canvas pre-resolve step does not implement a rotated
     /// fit quad, so a non-zero rotation fails closed here rather than risk
@@ -201,12 +206,6 @@ data class ExportRenderScope(
             if (clips.any { it.isReversed }) return "reversed_clip_present"
             if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
-            val unsupportedTransition = transitions.firstOrNull {
-                !it.isHardCut && it.type != AndroidTimelineTransitionDescriptor.Type.CROSSFADE
-            }
-            if (unsupportedTransition != null) {
-                return "unsupported_transition_type:${unsupportedTransition.type.wireName}"
-            }
             if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
             if (clips.any { it.rotationDegrees != 0 }) return "non_zero_rotation"
             if (requestedWidth <= 0 || requestedHeight <= 0) return "invalid_output_dimensions"
