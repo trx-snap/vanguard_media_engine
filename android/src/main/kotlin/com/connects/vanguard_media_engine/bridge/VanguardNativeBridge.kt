@@ -1303,6 +1303,18 @@ class VanguardNativeBridge(
     // editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase5FilterNodeSmoke(): String
 
+    // -- P5-GRAPHIC-OVERLAY-COMPOSITOR-NODE-A: platform-neutral logical DAG
+    // GraphicOverlayCompositorNode diagnostic. Proves construction
+    // validation, identity/port shape, descriptor/overlay accessors,
+    // overlay active-filtering/zIndex-id-sorting math, timeline-window
+    // semantics, and a real GraphExecutionPlan
+    // base+overlay0+overlay1->compositor->sink pass wiring three real
+    // ImageTextureSourceNode instances into this node and this node into
+    // the real PreviewSurfaceSinkNode. Diagnostic-only: no production
+    // renderer/PNG decoder/text rasterizer/shader/texture/GPU ownership,
+    // no Android lifecycle, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real

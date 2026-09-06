@@ -54,6 +54,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke",
             "runAndroidDagPhase5SpatialTransformNodeSmoke",
             "runAndroidDagPhase5FilterNodeSmoke",
+            "runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -128,6 +129,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke" -> runPhase2OfflineMediaMuxerSinkNodeSmoke(result)
             "runAndroidDagPhase5SpatialTransformNodeSmoke" -> runPhase5SpatialTransformNodeSmoke(result)
             "runAndroidDagPhase5FilterNodeSmoke" -> runPhase5FilterNodeSmoke(result)
+            "runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke" ->
+                runPhase5GraphicOverlayCompositorNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -667,6 +670,52 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "FILTER_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase5FilterNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P5-GRAPHIC-OVERLAY-COMPOSITOR-NODE-A: platform-neutral logical DAG
+    // GraphicOverlayCompositorNode diagnostic. Runs native lanes over the
+    // real GraphicOverlayCompositorNode plus the real
+    // ImageTextureSourceNode and PreviewSurfaceSinkNode (construction
+    // validation, identity/port shape, descriptor/overlay accessors,
+    // overlay active-filtering/zIndex-id-sorting math, timeline-window
+    // semantics, real GraphExecutionPlan
+    // base+overlay0+overlay1->compositor->sink pass). Proof boundary:
+    // platform-neutral logical DAG compositor - no PNG decode, no
+    // rasterizer, no shader ownership, no texture ownership, no GPU
+    // lifecycle, no product/app/editor wiring.
+    private fun runPhase5GraphicOverlayCompositorNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_graphic_overlay_compositor_node_logical_dag_compositor_" +
+                        "no_png_decode_no_rasterizer_no_shader_ownership_no_texture_ownership_" +
+                        "no_gpu_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GRAPHIC_OVERLAY_COMPOSITOR_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

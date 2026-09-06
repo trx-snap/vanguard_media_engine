@@ -75,6 +75,12 @@ target_link_libraries(vanguard_audio PRIVATE vanguard_graph vanguard_core)
 add_library(vanguard_compositors STATIC
     "compositors/src/multi_cam_compositor_node.cpp"
     "compositors/src/vg_timeline_compositor_node.cpp"
+    # P5-GRAPHIC-OVERLAY-COMPOSITOR-NODE-A: platform-neutral logical DAG
+    # processing node compositing UI graphic (PNG)/text/sticker/emoji
+    # overlays over a base video stream; owns only primitive overlay/
+    # timeline metadata and pure topology, no renderer/PNG decoder/text
+    # rasterizer/shader/texture/GPU object.
+    "compositors/src/graphic_overlay_compositor_node.cpp"
 )
 target_include_directories(vanguard_compositors PUBLIC "compositors/include")
 target_link_libraries(vanguard_compositors PRIVATE vanguard_graph vanguard_core)
@@ -473,6 +479,16 @@ if (ANDROID)
     # no renderer/shader/texture/decoder ownership, no Android lifecycle,
     # no product/app/editor wiring.
     "platform/android/src/android_phase5_filter_node_jni.cpp"
+    # P5-GRAPHIC-OVERLAY-COMPOSITOR-NODE-A: platform-neutral logical DAG
+    # GraphicOverlayCompositorNode diagnostic (construction validation,
+    # identity/port shape, descriptor/overlay accessors, overlay active-
+    # filtering/zIndex-id-sorting math, timeline-window semantics, real
+    # GraphExecutionPlan base+overlay0+overlay1->compositor->sink pass
+    # against the real ImageTextureSourceNode and PreviewSurfaceSinkNode).
+    # Diagnostic-only; no renderer/PNG decoder/text rasterizer/shader/
+    # texture/GPU ownership, no Android lifecycle, no product/app/editor
+    # wiring.
+    "platform/android/src/android_phase5_graphic_overlay_compositor_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
