@@ -1,7 +1,8 @@
 // android_timeline_gles_transition_export_physical_smoke.dart
 // Vanguard Media Engine — P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A,
-// widened by P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE and
-// P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS:
+// widened by P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE,
+// P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS, and
+// P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS:
 // Android production `exportTimeline` GLES forced transition route proof.
 //
 // Proof boundary: production_exportTimeline_gles_transition_slide_wipe_rotated_forced_route_a_no_vulkan_no_app
@@ -9,7 +10,7 @@
 // Drives the REAL production `exportTimeline` MethodChannel route with top-level
 // `debugForceRenderBackend: gles` using clip_A.mov copies (zero-rotation
 // success fixture), clip_B.mov (real standard-rotation-metadata success
-// fixture), and still_C.png:
+// fixture), and still_C.png copies:
 //   Lane forced dissolve success   : dissolve 0.5 s (clip_A + clip_A) -> success,
 //                                    renderBackend=gles, file exists,
 //                                    duration ~= 3.5, transitionCount=1
@@ -28,9 +29,16 @@
 //                                    -- fade is never GLES-eligible: it fails at
 //                                    AndroidTimelineTransitionDescriptor parse time, before
 //                                    any render-backend selection)
-//   Lane forced still-image dissolve fail closed: image + video (still_C + clip_A) -> fails closed
-//                                    before pass-1 (UNSUPPORTED_EXPORT_FEATURE /
-//                                    gles_transition_not_eligible)
+//   Lane forced still-image dissolve success: image + video (still_C + clip_A) -> success,
+//                                    renderBackend=gles, file exists,
+//                                    duration ~= 3.5, transitionCount=1 -- proves
+//                                    AndroidTimelineGlesTransitionImageRenderer's mixed
+//                                    image/video overlap resolve path
+//                                    (P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS)
+//   Lane forced still-to-still dissolve success: image + image (still_C + still_C) -> success,
+//                                    renderBackend=gles, file exists,
+//                                    duration ~= 3.5, transitionCount=1 -- proves the
+//                                    static image/image overlap resolve path
 //
 // Emits ANDROID_TIMELINE_GLES_TRANSITION_EXPORT_JSON:<json> and the
 // ANDROID_TIMELINE_GLES_TRANSITION_EXPORT_PHYSICAL_SMOKE_PASS/FAIL marker, then
@@ -110,11 +118,30 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
         'assets/manual_test_clips/clip_B.mov',
         '${tempDir.path}/vg_gles_trans_clipB_rotated_$stamp.mov',
       );
-      final still = await _copyAsset(
+      final still1 = await _copyAsset(
         'assets/manual_test_clips/still_C.png',
-        '${tempDir.path}/vg_gles_trans_still_$stamp.png',
+        '${tempDir.path}/vg_gles_trans_still1_$stamp.png',
       );
-      cleanupTargets.addAll(<File>[clipA1, clipA2, clipRotatedB, still]);
+      final still2 = await _copyAsset(
+        'assets/manual_test_clips/still_C.png',
+        '${tempDir.path}/vg_gles_trans_still2_$stamp.png',
+      );
+      cleanupTargets.addAll(<File>[
+        clipA1,
+        clipA2,
+        clipRotatedB,
+        still1,
+        still2,
+      ]);
+
+      VGTimelineTransitionExportSmokeClip imageClip(String id, String path) =>
+          VGTimelineTransitionExportSmokeClip(
+            id: id,
+            sourcePath: path,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: _clipTrimEndSeconds,
+            mediaKind: 'image',
+          );
 
       VGTimelineTransitionExportSmokeClip videoClip(String id, String path) =>
           VGTimelineTransitionExportSmokeClip(
@@ -162,6 +189,11 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
       cleanupTargets.add(File(stillOutPath));
       cleanupTargets.add(File('$stillOutPath.roi.json'));
 
+      final stillToStillOutPath =
+          '${tempDir.path}/vg_gles_trans_export_still_to_still_dissolve_$stamp.mp4';
+      cleanupTargets.add(File(stillToStillOutPath));
+      cleanupTargets.add(File('$stillToStillOutPath.roi.json'));
+
       final rotatedOutPath =
           '${tempDir.path}/vg_gles_trans_export_rotated_$stamp.mp4';
       cleanupTargets.add(File(rotatedOutPath));
@@ -197,15 +229,9 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
               ),
         ),
         VGTimelineTransitionExportSmokeRequest(
-          laneId: 'forced_still_image_dissolve_fail_closed',
+          laneId: 'forced_still_image_dissolve_success',
           clips: <VGTimelineTransitionExportSmokeClip>[
-            VGTimelineTransitionExportSmokeClip(
-              id: 'still-c',
-              sourcePath: still.path,
-              trimStartSeconds: 0.0,
-              trimEndSeconds: _clipTrimEndSeconds,
-              mediaKind: 'image',
-            ),
+            imageClip('still-c', still1.path),
             videoClip('clip-b', clipA2.path),
           ],
           transitions: const <VGTimelineTransitionExportSmokeTransition>[
@@ -221,10 +247,28 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
           expectedRenderBackend: 'gles',
           debugForceRenderBackend: 'gles',
           expectation:
-              const VGTimelineTransitionExportSmokeExpectation.failClosed(
-                errorCode: unsupportedExportFeatureCode,
-                messageContains: 'gles_transition_not_eligible',
-              ),
+              const VGTimelineTransitionExportSmokeExpectation.success(),
+        ),
+        VGTimelineTransitionExportSmokeRequest(
+          laneId: 'forced_still_to_still_dissolve_success',
+          clips: <VGTimelineTransitionExportSmokeClip>[
+            imageClip('still-a', still1.path),
+            imageClip('still-b', still2.path),
+          ],
+          transitions: const <VGTimelineTransitionExportSmokeTransition>[
+            VGTimelineTransitionExportSmokeTransition(
+              id: 'tr-still-to-still-dissolve',
+              type: 'dissolve',
+              durationSeconds: _transitionSeconds,
+              fromClipId: 'still-a',
+              toClipId: 'still-b',
+            ),
+          ],
+          outputPath: stillToStillOutPath,
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+          expectation:
+              const VGTimelineTransitionExportSmokeExpectation.success(),
         ),
         VGTimelineTransitionExportSmokeRequest(
           laneId: 'forced_rotated_clip_success',

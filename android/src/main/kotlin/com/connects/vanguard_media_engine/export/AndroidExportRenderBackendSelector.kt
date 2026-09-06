@@ -69,12 +69,17 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS and
 // P5-GLES-EXPORT-TRANSITION-OVERLAYS: a scope carrying a
 // non-hard-cut transition no longer unconditionally requires Vulkan -- when
-// [ExportRenderScope.glesTransitionEligible] holds (video-only clips, no
+// [ExportRenderScope.glesTransitionEligible] holds (video or still-image
+// clips -- P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS, see below -- no
 // reversed clip, positive decoded/
 // requested dimensions, standard 0/90/180/270 rotation metadata on every
-// clip -- overlays no longer excluded, see below; clip-level Beauty V2 no
-// longer excluded either unless paired with overlays, see
-// P5-GLES-EXPORT-BEAUTY-TRANSITIONS below), the narrow production
+// video clip and rotationDegrees == 0 on every still-image clip --
+// overlays no longer excluded, see below; clip-level Beauty V2 no
+// longer excluded on a video clip either unless paired with overlays, see
+// P5-GLES-EXPORT-BEAUTY-TRANSITIONS below -- a still-image clip may never
+// carry Beauty, AND a scope mixing a still-image clip with a *video* clip
+// that carries Beauty is equally out of scope, see
+// P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS below), the narrow production
 // GLES transition route (AndroidTimelineGlesTransitionVideoEncoder)
 // is an acceptable alternative to Vulkan. Vulkan remains the default/
 // preferred backend regardless (see [select]'s Vulkan-first branch below,
@@ -88,11 +93,12 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // A non-hard-cut transition whose scope is NOT [glesTransitionEligible]
 // still fails closed exactly as before with `transitions_require_vulkan:...`
 // when Vulkan cannot be selected either -- this slice does not implement a
-// GLES route for reversed/still-image/colorMatrix transition scopes, or for
-// a Beauty scope that also carries overlays. P5-GLES-EXPORT-TRANSITION-
-// OVERLAYS: overlays themselves no longer force this route ineligible -- a
-// video-only, non-hard-cut transition scope that also carries timeline
-// overlays is [glesTransitionEligible] on exactly the same terms as one
+// GLES route for reversed/colorMatrix transition scopes, a still-image clip
+// carrying Beauty, or a Beauty scope that also carries overlays.
+// P5-GLES-EXPORT-TRANSITION-OVERLAYS: overlays themselves no longer force
+// this route ineligible -- a video/still-image, non-hard-cut transition
+// scope that also carries timeline overlays is [glesTransitionEligible] on
+// exactly the same terms as one
 // without overlays, and AndroidTimelineGlesTransitionVideoEncoder composites
 // those overlays itself (reusing AndroidTimelineGlesOverlayRenderSession and
 // the native overlay bridge) instead of requiring Vulkan.
@@ -102,9 +108,13 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // [glesTransitionEligible] on exactly the same terms as one without Beauty,
 // and AndroidTimelineGlesTransitionVideoEncoder applies the existing native
 // Beauty seam per solo frame and per transition-pair side (see its own class
-// doc). The one bounded exclusion is Beauty combined with overlays on this
-// route (`beauty_with_overlays_unsupported`) -- that combination still
-// requires Vulkan. See [ExportRenderScope.requiresVulkan] for how Beauty,
+// doc). The bounded exclusions are Beauty combined with overlays on this
+// route (`beauty_with_overlays_unsupported`) and Beauty combined with any
+// still-image clip in the scope (`beauty_with_still_image_unsupported`,
+// P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS -- out of scope even when the
+// still-image clip itself carries no Beauty and it is only a *video* clip
+// elsewhere in the scope that does) -- both combinations still require
+// Vulkan. See [ExportRenderScope.requiresVulkan] for how Beauty,
 // transitions, and overlays combine.
 // P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE widened the
 // eligible transition family from crossfade-only to every closed-set
@@ -119,6 +129,21 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // the first place; AndroidTimelineGlesTransitionVideoEncoder's own
 // defensive re-validation of the same restriction is a second defense
 // layer, not the primary gate.
+// P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS widened the eligible clip kinds
+// from video-only to video or still-image (mediaKind == "image", positive
+// stillFrameCount, rotationDegrees == 0, no Beauty V2) -- a still-image
+// clip has no decoder/OES pipeline on this route, so
+// AndroidTimelineGlesTransitionVideoEncoder resolves it via the dedicated
+// AndroidTimelineGlesTransitionImageRenderer helper (decode/orient/clamp/
+// upload once per solo segment or per overlap side) into the same
+// canvas-sized GL_TEXTURE_2D targets a video side resolves into, so a
+// mixed image/video or image/image transition pair composites through the
+// exact same native transition compositor seam as a video/video pair.
+// Beauty V2 remains entirely out of scope whenever the scope carries any
+// still-image clip -- not only can a still-image clip never itself carry
+// Beauty, but a still-image clip paired with a *video* clip that carries
+// Beauty is equally rejected with `beauty_with_still_image_unsupported`
+// (see [ExportRenderScope.glesTransitionIneligibleReason]).
 //
 // P5-GLES-EXPORT-BEAUTY-PRODUCTION-ROUTE-A, widened by
 // P5-GLES-EXPORT-BEAUTY-OVERLAYS: a scope carrying clip-level Beauty V2 no
@@ -258,19 +283,49 @@ data class ExportRenderScope(
     /// now applies the same native Beauty seam
     /// (drawAndroidDagPhase5GlesExportBeautySeam) AndroidTimelineVideoEncoder's
     /// hard-cut Beauty route uses, per solo frame and per transition-pair
-    /// side. The one remaining bounded exclusion is Beauty combined with
-    /// timeline overlays on this route: `beauty_with_overlays_unsupported`.
-    /// Beauty without overlays on a non-hard-cut transition scope is exactly
-    /// as eligible as one without Beauty, subject to every other check below.
+    /// side. The remaining bounded exclusions are Beauty combined with
+    /// timeline overlays (`beauty_with_overlays_unsupported`) and Beauty
+    /// combined with any still-image clip in the scope
+    /// (`beauty_with_still_image_unsupported`, P5-GLES-EXPORT-STILL-IMAGE-
+    /// TRANSITIONS) -- the latter applies even when the still-image clip
+    /// itself carries no Beauty and it is only a *video* clip elsewhere in
+    /// the same scope that does. Beauty on an all-video, overlay-free
+    /// non-hard-cut transition scope is exactly as eligible as one without
+    /// Beauty, subject to every other check below.
     val glesTransitionIneligibleReason: String?
         get() {
             if (!hasNonHardCutTransition) return "no_non_hard_cut_transition"
             if (hasBeautyClip && hasOverlays) return "beauty_with_overlays_unsupported"
             if (clips.any { it.isReversed }) return "reversed_clip_present"
-            if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
+            if (clips.any { it.mediaKind != "video" && it.mediaKind != "image" }) return "unsupported_media_kind_present"
+            // P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS: Beauty V2 combined with any
+            // still-image clip is out of scope for this route regardless of which
+            // clip in the scope actually carries the non-null beautyIntensity -- a
+            // still-image clip paired with a *video* clip that carries Beauty is
+            // just as unsupported as a still-image clip carrying Beauty directly,
+            // since this encoder's still-image path (AndroidTimelineGlesTransitionImageRenderer)
+            // never participates in the Beauty seam either way.
+            if (clips.any { it.mediaKind == "image" } && hasBeautyClip) return "beauty_with_still_image_unsupported"
+            // The narrower per-clip case above already covers a still-image clip
+            // that itself carries beautyIntensity, so this is unreachable today --
+            // kept as an explicit, independently-correct defense in case the
+            // broader check above is ever narrowed.
+            if (clips.any { it.mediaKind == "image" && it.beautyIntensity != null }) return "beauty_still_image_unsupported"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
             if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
-            if (clips.any { it.rotationDegrees !in setOf(0, 90, 180, 270) }) return "unsupported_rotation"
+            // Video clips keep the standard cardinal rotation set; a still-image
+            // clip's rotation metadata is always normalized to 0 upstream (EXIF is
+            // baked into pixels instead), so any non-zero value here is unexpected.
+            if (clips.any { clip ->
+                    when (clip.mediaKind) {
+                        "video" -> clip.rotationDegrees !in setOf(0, 90, 180, 270)
+                        "image" -> clip.rotationDegrees != 0
+                        else -> false
+                    }
+                }
+            ) {
+                return "unsupported_rotation"
+            }
             if (requestedWidth <= 0 || requestedHeight <= 0) return "invalid_output_dimensions"
             return null
         }

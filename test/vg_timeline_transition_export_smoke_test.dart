@@ -400,6 +400,51 @@ void main() {
       expect(report.failureReason, isEmpty);
     });
 
+    test("a GLES result passes for the forced still-image dissolve lane shape "
+        "(P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS)", () {
+      final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+        _request(
+          laneId: 'forced_still_image_dissolve_success',
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+        ),
+        _successResult(
+          backend: 'gles',
+          path: '/data/local/tmp/out_forced_still_image_dissolve_success.mp4',
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, 'gles');
+      expect(report.durationDeltaSeconds, closeTo(0.0, 1e-9));
+      expect(report.transitionCount, 1);
+      expect(report.failureReason, isEmpty);
+    });
+
+    test("a GLES result passes for the forced still-to-still dissolve lane shape "
+        "(P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS)", () {
+      final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+        _request(
+          laneId: 'forced_still_to_still_dissolve_success',
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+        ),
+        _successResult(
+          backend: 'gles',
+          path:
+              '/data/local/tmp/out_forced_still_to_still_dissolve_success.mp4',
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, 'gles');
+      expect(report.durationDeltaSeconds, closeTo(0.0, 1e-9));
+      expect(report.transitionCount, 1);
+      expect(report.failureReason, isEmpty);
+    });
+
     test('a GLES result still fails for the default Vulkan expectation', () {
       final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
         _request(),
