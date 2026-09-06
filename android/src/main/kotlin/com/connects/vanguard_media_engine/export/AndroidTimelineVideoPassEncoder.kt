@@ -10,9 +10,14 @@ package com.connects.vanguard_media_engine.export
 // P5-COMPOSITOR-TRANS: the transition-aware [encode] overload is the
 // session's single call site. Its default body fails closed for any
 // non-hard-cut transition -- a backend that has not implemented compositor-
-// owned overlap rendering (the GLES encoder) must never re-encode a
-// transition timeline as hard cuts. Only AndroidTimelineVulkanVideoEncoder
-// overrides it with the positive route.
+// owned overlap rendering (the frozen hard-cut GLES encoder,
+// AndroidTimelineVideoEncoder) must never re-encode a transition timeline as
+// hard cuts. AndroidTimelineVulkanVideoEncoder overrides it with the
+// Vulkan-first positive route; P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A
+// adds a second, narrower override -- AndroidTimelineGlesTransitionVideoEncoder
+// -- used only for the video-only, non-reversed, non-beauty, overlay-free,
+// zero-rotation transition shape AndroidExportRenderBackendSelector.
+// ExportRenderScope.glesTransitionEligible admits.
 //
 // P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: the overlay-aware [encode] overload
 // extends the backend-pass seam for timeline overlays. Its default body fails

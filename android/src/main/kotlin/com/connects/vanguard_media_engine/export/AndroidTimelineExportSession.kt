@@ -64,12 +64,25 @@ import kotlin.math.floor
 //     timeline's audio tracks do.
 //   - P5-COMPOSITOR-TRANS: compositor-owned clip overlap transitions
 //     (AndroidTimelineTransitionDescriptor: dissolve/crossfade, slide*,
-//     wipe*) between adjacent video clips, rendered ONLY by
-//     AndroidTimelineVulkanVideoEncoder. A transition timeline requires the
-//     Vulkan backend: when the selector cannot resolve Vulkan the export
-//     fails closed with UNSUPPORTED_EXPORT_FEATURE before pass-1, and a
-//     failed Vulkan pass-1 never falls back to GLES hard cuts. `fade` and
-//     any other unsupported type fail closed at parse time.
+//     wipe*) between adjacent video clips, rendered by
+//     AndroidTimelineVulkanVideoEncoder (Vulkan, preferred/default) or, for
+//     the narrow shape AndroidExportRenderBackendSelector.ExportRenderScope
+//     .glesTransitionEligible admits (P5-GLES-EXPORT-TRANSITION-PRODUCTION-
+//     ROUTE-A: video-only clips, no reversed clip, no clip-level Beauty V2,
+//     no overlays, zero rotation metadata, crossfade/dissolve only),
+//     AndroidTimelineGlesTransitionVideoEncoder. When neither backend can
+//     take the scope (Vulkan unselectable and the scope is not GLES-
+//     transition-eligible) the export fails closed with
+//     UNSUPPORTED_EXPORT_FEATURE before pass-1, and a failed Vulkan pass-1
+//     never falls back to GLES hard cuts. `fade` and any other unsupported
+//     type fail closed at parse time; a non-crossfade non-hard-cut type on
+//     an otherwise GLES-transition-eligible scope fails closed at GLES
+//     render time instead (this route's own crossfade-only implementation).
+//     A top-level `debugForceRenderBackend == "gles"` export argument is a
+//     scoped, test-only force seam that routes an eligible transition scope
+//     through GLES even when Vulkan would otherwise be selected first --
+//     see AndroidExportRenderBackendSelector.select's
+//     `debugForceGlesTransitionExport` parameter.
 //   - P5-TRANSITION-AUDIO-SIDECAR-EXPORT: a transition timeline carrying
 //     audioSidecar tracks is admitted -- not blanket-rejected -- when every
 //     parsed track's timing is valid on the overlap-adjusted output
@@ -200,6 +213,18 @@ class AndroidTimelineExportSession(private val context: Context) {
             onError("INVALID_ARG", "exportTimeline: draft required")
             return
         }
+
+        // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: a scoped, test-only
+        // force seam for physical proof of the narrow GLES transition
+        // production route. Ignored (has no effect on any other request
+        // shape) unless the scope backend selection resolves against is also
+        // AndroidExportRenderBackendSelector.ExportRenderScope
+        // .glesTransitionEligible -- see the backend-selection call below and
+        // AndroidExportRenderBackendSelector.select's own doc for the exact
+        // fail-closed contract when this is set but the scope is not
+        // eligible.
+        val debugForceGlesTransitionExport =
+            (args["debugForceRenderBackend"] as? String)?.trim()?.equals("gles", ignoreCase = true) == true
 
         val rawClips = draftMap["clips"] as? List<*>
         if (rawClips == null || rawClips.isEmpty()) {
@@ -756,17 +781,24 @@ class AndroidTimelineExportSession(private val context: Context) {
                 overlays = overlays,
             ),
             nativeBridge = sessionNativeBridge,
+            debugForceGlesTransitionExport = debugForceGlesTransitionExport,
         )
         // P5-COMPOSITOR-TRANS / P5-OVERLAYS-TRANS: a transition timeline or
-        // overlay list that cannot be routed to Vulkan fails closed here --
-        // there is no GLES transition or overlay route and re-encoding either
-        // as plain hard cuts would be wrong output. The branch below mirrors
+        // overlay list that cannot be routed to either Vulkan or (for a
+        // narrow GLES-transition-eligible shape, per
+        // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A) GLES fails closed
+        // here -- re-encoding either as plain hard cuts would be wrong
+        // output. The branch below mirrors
         // AndroidExportRenderBackendSelector.requiresVulkanReasonPrefix's own
-        // priority (transitions, then beauty, then overlays).
+        // priority (transitions, then beauty, then overlays), plus the
+        // dedicated debug-force-seam-ineligible reason.
         if (backendDecision.actualBackend == ExportRenderBackend.UNAVAILABLE) {
             deleteOwnedTemps()
             logTerminal("backend_unavailable", backendDecision.actualBackend)
             val errorMessage = when {
+                backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.GLES_TRANSITION_NOT_ELIGIBLE_REASON) ->
+                    "exportTimeline: debugForceRenderBackend=gles requires a GLES-transition-eligible " +
+                        "request (${backendDecision.reason})"
                 backendDecision.reason.startsWith(AndroidExportRenderBackendSelector.TRANSITIONS_REQUIRE_VULKAN_REASON) ->
                     "exportTimeline: transitions require the Vulkan export backend " +
                         "(${backendDecision.reason})"
@@ -805,9 +837,25 @@ class AndroidTimelineExportSession(private val context: Context) {
             }
         }
 
+        // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: only a GLES backend
+        // decision for a scope actually carrying a non-hard-cut transition
+        // routes through the narrow AndroidTimelineGlesTransitionVideoEncoder
+        // -- every other GLES decision (hard-cut-only timelines, including
+        // one with only `none` transition entries) keeps using the frozen
+        // AndroidTimelineVideoEncoder hard-cut path unchanged.
+        val hasNonHardCutTransitionForEncoder = transitions.any { !it.isHardCut }
         fun buildPass1Encoder(backend: ExportRenderBackend): AndroidTimelineVideoPassEncoder {
             return if (backend == ExportRenderBackend.VULKAN) {
                 AndroidTimelineVulkanVideoEncoder(
+                    outputPath = videoTempPath,
+                    width = requestWidth,
+                    height = requestHeight,
+                    fps = requestFps,
+                    bitrateBps = requestBitrate,
+                    nativeBridge = sessionNativeBridge,
+                )
+            } else if (hasNonHardCutTransitionForEncoder) {
+                AndroidTimelineGlesTransitionVideoEncoder(
                     outputPath = videoTempPath,
                     width = requestWidth,
                     height = requestHeight,

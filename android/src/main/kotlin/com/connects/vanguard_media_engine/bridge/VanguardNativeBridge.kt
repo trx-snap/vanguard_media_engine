@@ -2515,6 +2515,45 @@ class VanguardNativeBridge(
         toPtsUs: Long,
     ): String
 
+    // ── P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: production native ──────
+    // transition composite seam for the narrow GLES-transition-eligible export
+    // route (AndroidTimelineGlesTransitionVideoEncoder). Same caller-current-
+    // context contract as the P5-GLES-EXPORT-DUAL-OES-PRERESOLVE-TRANSITION-
+    // READINESS diagnostic seam above (drawAndroidDagPhase5GlesDualOesTransition)
+    // and the same private GlesTimelineTransitionCompositor::drawTransition
+    // helper: creates/destroys no EGL context, SurfaceTexture, MediaCodec, or
+    // Java Surface -- the caller must already have both source textures
+    // populated (already resolved to GL_TEXTURE_2D rasters via the caller's
+    // own OES-to-canvas pre-resolve, matching the diagnostic seam's proven
+    // design) and its EGL context current on the calling thread before
+    // invoking this, and owns the target surface's frame clear -- this seam
+    // never clears the framebuffer itself.
+    //
+    // [transitionTypeCode] must equal
+    // AndroidTimelineTransitionDescriptor.Type.CROSSFADE.nativeCode (1) --
+    // this slice only implements a safe crossfade mix draw; any other code
+    // (including hard-cut's 0) fails closed before any GL call with a precise
+    // unsupported-type reason rather than attempt slide/wipe geometry this
+    // route does not yet implement. [progress] is the transition progress in
+    // [0.0, 1.0] for this frame (see
+    // AndroidTimelineTransitionDescriptor.progressForOverlapFrame).
+    //
+    // Unlike the diagnostic seam, this production route returns a compact
+    // "status=OK;..." / "status=FAIL;reason=<reason>" string (the same
+    // key=value convention as android_vulkan_export_jni.cpp's and
+    // drawAndroidTimelineGlesExportOverlays's production routes), not a JSON
+    // object, and carries no diagnostic proofBoundary.
+    external fun drawAndroidTimelineGlesTransitionExportFrame(
+        fromTextureId: Int,
+        fromTextureTarget: Int,
+        toTextureId: Int,
+        toTextureTarget: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        transitionTypeCode: Int,
+        progress: Double,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof diagnostic. Native creates its own temporary
     // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 sampled images,

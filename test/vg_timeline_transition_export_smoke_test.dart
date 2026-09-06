@@ -21,6 +21,8 @@ VGTimelineTransitionExportSmokeRequest _request({
   String laneId = 'dissolve',
   String type = 'dissolve',
   double transitionSeconds = 0.5,
+  String expectedRenderBackend = 'vulkan',
+  String? debugForceRenderBackend,
   List<VGTimelineTransitionExportSmokeAudioTrack> audioSidecarTracks =
       const <VGTimelineTransitionExportSmokeAudioTrack>[],
   VGTimelineTransitionExportSmokeExpectation expectation =
@@ -41,6 +43,8 @@ VGTimelineTransitionExportSmokeRequest _request({
     ),
   ],
   outputPath: '/data/local/tmp/out_$laneId.mp4',
+  expectedRenderBackend: expectedRenderBackend,
+  debugForceRenderBackend: debugForceRenderBackend,
   audioSidecarTracks: audioSidecarTracks,
   expectation: expectation,
 );
@@ -262,6 +266,35 @@ void main() {
         expect(trackB.containsKey('fadeOutSeconds'), isFalse);
       },
     );
+
+    test(
+      'default request does not emit debugForceRenderBackend and still expects vulkan',
+      () {
+        final request = _request();
+        expect(request.expectedRenderBackend, 'vulkan');
+        expect(request.debugForceRenderBackend, isNull);
+        final args = request.toExportTimelineArguments();
+        expect(args.containsKey('debugForceRenderBackend'), isFalse);
+        final draft = args['draft'] as Map<String, Object?>;
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+      },
+    );
+
+    test(
+      "debugForceRenderBackend == 'gles' is emitted as a top-level argument, not inside draft",
+      () {
+        final request = _request(
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+        );
+        expect(request.expectedRenderBackend, 'gles');
+        expect(request.debugForceRenderBackend, 'gles');
+        final args = request.toExportTimelineArguments();
+        expect(args['debugForceRenderBackend'], 'gles');
+        final draft = args['draft'] as Map<String, Object?>;
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+      },
+    );
   });
 
   group('lane report from export result', () {
@@ -301,7 +334,19 @@ void main() {
       },
     );
 
-    test('fails when renderBackend is gles', () {
+    test("a GLES result passes when expectedRenderBackend == 'gles'", () {
+      final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+        _request(expectedRenderBackend: 'gles'),
+        _successResult(backend: 'gles'),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, 'gles');
+      expect(report.failureReason, isEmpty);
+    });
+
+    test('a GLES result still fails for the default Vulkan expectation', () {
       final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
         _request(),
         _successResult(backend: 'gles'),
@@ -691,6 +736,34 @@ void main() {
         startsWith('dissolve:render_backend_not_vulkan'),
       );
     });
+
+    test(
+      'runner forwards debugForceRenderBackend at top level and passes GLES result',
+      () async {
+        Map<Object?, Object?>? seenArgs;
+        _setMockHandler((method, args) async {
+          seenArgs = args as Map<Object?, Object?>;
+          return _successResult(backend: 'gles');
+        });
+        final runner = VGTimelineTransitionExportSmokeRunner(
+          channel: _channel,
+          fileExists: (_) => true,
+        );
+        final report = await runner.run(
+          <VGTimelineTransitionExportSmokeRequest>[
+            _request(
+              expectedRenderBackend: 'gles',
+              debugForceRenderBackend: 'gles',
+            ),
+          ],
+        );
+        expect(seenArgs!['debugForceRenderBackend'], 'gles');
+        final draft = seenArgs!['draft'] as Map<Object?, Object?>;
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+        expect(report.pass, isTrue);
+        expect(report.lanes.single.renderBackend, 'gles');
+      },
+    );
 
     test('a missing plugin becomes a harness failure, not a throw', () async {
       _clearMockHandler();

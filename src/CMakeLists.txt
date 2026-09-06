@@ -276,6 +276,15 @@ if (ANDROID)
     # fixed crossfade midpoint. This TU creates/destroys no EGL context,
     # SurfaceTexture, or MediaCodec.
     "platform/android/src/android_phase5_gles_dual_oes_transition_jni.cpp"
+    # P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: production (non-diagnostic)
+    # native transition composite seam for the narrow GLES-transition-eligible
+    # export route (AndroidTimelineGlesTransitionVideoEncoder). Same
+    # caller-current-context contract and the same private
+    # GlesTimelineTransitionCompositor::drawTransition helper as the dual-OES
+    # diagnostic seam above; returns a compact status string, no JSON, no
+    # proofBoundary. Crossfade-only in this slice; any other transition type
+    # code fails closed before any GL call.
+    "platform/android/src/android_phase5_gles_export_transition_jni.cpp"
     # P5-BEAUTY-V2-VULKAN-RENDER: VulkanBeautyV2Compositor shader/raster +
     # CPU reference parity diagnostic proof (lane execution extracted into
     # the probe translation unit, mirroring the GLES twin's modularity

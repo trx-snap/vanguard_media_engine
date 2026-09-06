@@ -64,6 +64,10 @@ const String unsupportedExportFeatureCode = 'UNSUPPORTED_EXPORT_FEATURE';
 /// timeline cannot be routed to the Vulkan backend.
 const String transitionsRequireVulkanReason = 'transitions_require_vulkan';
 
+/// Reason token carried by the fail-closed message when a transition
+/// timeline is not eligible for the forced GLES transition export route.
+const String glesTransitionNotEligibleReason = 'gles_transition_not_eligible';
+
 /// Classification of a transition wire name against the native contract.
 enum VGTimelineTransitionExportWireKind {
   /// Accepted and rendered as an overlap.
@@ -234,6 +238,8 @@ class VGTimelineTransitionExportSmokeRequest {
     required this.transitions,
     required this.outputPath,
     required this.expectation,
+    this.expectedRenderBackend = 'vulkan',
+    this.debugForceRenderBackend,
     this.audioSidecarTracks =
         const <VGTimelineTransitionExportSmokeAudioTrack>[],
     this.canvasWidth = 720,
@@ -247,6 +253,8 @@ class VGTimelineTransitionExportSmokeRequest {
   final List<VGTimelineTransitionExportSmokeTransition> transitions;
   final String outputPath;
   final VGTimelineTransitionExportSmokeExpectation expectation;
+  final String expectedRenderBackend;
+  final String? debugForceRenderBackend;
 
   /// P5-TRANSITION-AUDIO-SIDECAR-EXPORT: optional audioSidecar tracks.
   /// Emitted under `draft['audioSidecar']` only when non-empty, so existing
@@ -301,6 +309,8 @@ class VGTimelineTransitionExportSmokeRequest {
     'width': canvasWidth,
     'height': canvasHeight,
     'fps': fps,
+    if (debugForceRenderBackend != null && debugForceRenderBackend!.isNotEmpty)
+      'debugForceRenderBackend': debugForceRenderBackend,
   };
 }
 
@@ -379,8 +389,9 @@ class VGTimelineTransitionExportSmokeLaneReport {
       failure = 'result_path_missing';
     } else if (!outputExists) {
       failure = 'output_file_missing';
-    } else if (backend != 'vulkan') {
-      failure = 'render_backend_not_vulkan:${backend ?? 'null'}';
+    } else if (backend != request.expectedRenderBackend) {
+      failure =
+          'render_backend_not_${request.expectedRenderBackend}:${backend ?? 'null'}';
     } else if (duration == null) {
       failure = 'result_duration_missing';
     } else if ((duration - expected).abs() >
