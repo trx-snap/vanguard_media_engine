@@ -100,6 +100,7 @@ import com.connects.vanguard_media_engine.photo_library.AndroidVideoAssetPickerC
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.sidecar.AndroidReverseSidecarCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
+import com.connects.vanguard_media_engine.streaming.AndroidMedia3StreamSourceCoordinator
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
@@ -139,6 +140,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── Phase 4C3D: RTC video coordinator ─────────────────────────────────────
     private var rtcVideoCoordinator: AndroidRtcVideoCoordinator? = null
+
+    // ── P6-MEDIA3-INGEST-STREAM-SOURCE-SEAM-A: Media3 stream-source ingest seam coordinator ──
+    private var media3StreamSourceCoordinator: AndroidMedia3StreamSourceCoordinator? = null
 
     // ── Phase 7.8A-Android: editor playback control coordinator ───────────────
     private var editorPlaybackCoordinator: AndroidEditorPlaybackCoordinator? = null
@@ -626,6 +630,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         rtcVideoCoordinator = AndroidRtcVideoCoordinator(
             mainHandler = mainHandler,
         )
+        media3StreamSourceCoordinator = AndroidMedia3StreamSourceCoordinator(
+            mainHandler = mainHandler,
+        )
         editorPlaybackCoordinator = AndroidEditorPlaybackCoordinator(
             textureRegistry = binding.textureRegistry,
             channel         = channel,
@@ -948,6 +955,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android RTC video coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidMedia3StreamSourceCoordinator.ownsMethod(call.method)) {
+            val coord = media3StreamSourceCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android Media3 stream-source ingest seam coordinator unavailable", null)
             }
             return
         }
@@ -3067,6 +3084,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         dagStreamingPlaybackCoordinator = null
         // Tear down Phase 4C3D RTC video coordinator.
         rtcVideoCoordinator = null
+        // Tear down P6-MEDIA3-INGEST-STREAM-SOURCE-SEAM-A coordinator. Holds no active sessions
+        // across calls (each smoke run owns and closes its own native session).
+        media3StreamSourceCoordinator = null
         // Tear down Phase 7.8A-Android editor playback coordinator.
         editorPlaybackCoordinator?.disposeAll()
         editorPlaybackCoordinator = null

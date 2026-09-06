@@ -373,6 +373,15 @@ if (ANDROID)
     # room/session, no audio, no rendering, no product/editor/app wiring, no
     # HardwareBuffer ownership.
     "platform/android/src/android_phase6_webrtc_ingest_stream_source_seam_jni.cpp"
+    # P6-MEDIA3-INGEST-STREAM-SOURCE-SEAM-A: diagnostic, video-only Media3
+    # decoded-frame ingest seam proving HttpAdaptiveImageReaderBridge/
+    # HttpAdaptiveFrameListener can forward primitive frame metadata (no
+    # pixel buffer, no jobject) into a real
+    # vanguard::sources::StreamSourceNode-backed native session with a small
+    # bounded metadata queue. No Media3/ExoPlayer SDK object, no network
+    # state, no audio, no rendering, no product/editor/app wiring, no
+    # HardwareBuffer ownership.
+    "platform/android/src/android_phase6_media3_ingest_stream_source_seam_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
