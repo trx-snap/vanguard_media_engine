@@ -1292,6 +1292,17 @@ class VanguardNativeBridge(
     // editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase5SpatialTransformNodeSmoke(): String
 
+    // -- P5-FILTER-NODE-A: platform-neutral logical DAG FilterNode
+    // diagnostic. Proves construction validation, identity/port shape,
+    // descriptor/colorMatrix/beauty accessors, color-matrix application
+    // math, pass-through semantics, timeline-window semantics, and a real
+    // GraphExecutionPlan source->filter->sink pass wiring the real
+    // ImageTextureSourceNode into this node and this node into the real
+    // PreviewSurfaceSinkNode. Diagnostic-only: no production renderer/
+    // shader/texture/decoder ownership, no Android lifecycle, no product/
+    // editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase5FilterNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real

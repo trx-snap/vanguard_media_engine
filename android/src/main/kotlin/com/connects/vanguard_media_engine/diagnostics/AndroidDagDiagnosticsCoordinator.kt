@@ -53,6 +53,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5ImageTextureSourceNodeSmoke",
             "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke",
             "runAndroidDagPhase5SpatialTransformNodeSmoke",
+            "runAndroidDagPhase5FilterNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -126,6 +127,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5ImageTextureSourceNodeSmoke" -> runPhase5ImageTextureSourceNodeSmoke(result)
             "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke" -> runPhase2OfflineMediaMuxerSinkNodeSmoke(result)
             "runAndroidDagPhase5SpatialTransformNodeSmoke" -> runPhase5SpatialTransformNodeSmoke(result)
+            "runAndroidDagPhase5FilterNodeSmoke" -> runPhase5FilterNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -622,6 +624,49 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "SPATIAL_TRANSFORM_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase5SpatialTransformNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P5-FILTER-NODE-A: platform-neutral logical DAG FilterNode
+    // diagnostic. Runs native lanes over the real FilterNode plus the real
+    // ImageTextureSourceNode and PreviewSurfaceSinkNode (construction
+    // validation, identity/port shape, descriptor/colorMatrix/beauty
+    // accessors, color-matrix application math, pass-through semantics,
+    // timeline-window semantics, real GraphExecutionPlan
+    // source->filter->sink pass). Proof boundary: platform-neutral logical
+    // DAG filter - no shader ownership, no texture ownership, no GPU
+    // lifecycle, no product/app/editor wiring.
+    private fun runPhase5FilterNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase5FilterNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_filter_node_logical_dag_filter_no_shader_ownership_" +
+                        "no_texture_ownership_no_gpu_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "FILTER_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase5FilterNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
