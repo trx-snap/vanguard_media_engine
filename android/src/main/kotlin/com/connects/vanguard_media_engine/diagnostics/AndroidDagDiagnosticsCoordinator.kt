@@ -52,6 +52,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke",
             "runAndroidDagPhase5ImageTextureSourceNodeSmoke",
             "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke",
+            "runAndroidDagPhase5SpatialTransformNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -124,6 +125,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke" -> runPhase1ExternalSurfaceSourceNodeSmoke(result)
             "runAndroidDagPhase5ImageTextureSourceNodeSmoke" -> runPhase5ImageTextureSourceNodeSmoke(result)
             "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke" -> runPhase2OfflineMediaMuxerSinkNodeSmoke(result)
+            "runAndroidDagPhase5SpatialTransformNodeSmoke" -> runPhase5SpatialTransformNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -577,6 +579,49 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "IMAGE_TEXTURE_SOURCE_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase5ImageTextureSourceNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P5-SPATIAL-TRANSFORM-NODE-A: platform-neutral logical DAG
+    // SpatialTransformNode diagnostic. Runs native lanes over the real
+    // SpatialTransformNode plus the real ImageTextureSourceNode and
+    // PreviewSurfaceSinkNode (construction validation, identity/port
+    // shape, descriptor/matrix/crop accessors, point-transform math,
+    // timeline-window semantics, real GraphExecutionPlan
+    // source->transform->sink pass). Proof boundary: platform-neutral
+    // logical DAG transform - no render ownership, no texture ownership,
+    // no GPU lifecycle, no product/app/editor wiring.
+    private fun runPhase5SpatialTransformNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase5SpatialTransformNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_spatial_transform_node_logical_dag_transform_no_render_" +
+                        "ownership_no_texture_ownership_no_gpu_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "SPATIAL_TRANSFORM_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase5SpatialTransformNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

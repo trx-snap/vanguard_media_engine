@@ -1281,6 +1281,17 @@ class VanguardNativeBridge(
     // lifecycle, no product/editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke(): String
 
+    // -- P5-SPATIAL-TRANSFORM-NODE-A: platform-neutral logical DAG
+    // SpatialTransformNode diagnostic. Proves construction validation,
+    // identity/port shape, descriptor/matrix/crop accessors,
+    // point-transform math, timeline-window semantics, and a real
+    // GraphExecutionPlan source->transform->sink pass wiring the real
+    // ImageTextureSourceNode into this node and this node into the real
+    // PreviewSurfaceSinkNode. Diagnostic-only: no production renderer/
+    // shader/texture/decoder ownership, no Android lifecycle, no product/
+    // editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase5SpatialTransformNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real

@@ -79,6 +79,16 @@ add_library(vanguard_compositors STATIC
 target_include_directories(vanguard_compositors PUBLIC "compositors/include")
 target_link_libraries(vanguard_compositors PRIVATE vanguard_graph vanguard_core)
 
+# P5-SPATIAL-TRANSFORM-NODE-A: platform-neutral logical DAG processing node
+# applying a 2D affine transform (crop, scale, rotate, translate); owns only
+# primitive matrix/crop/timeline metadata, no renderer/shader/texture/
+# decoder/Android/GPU object.
+add_library(vanguard_transforms STATIC
+    "transforms/src/spatial_transform_node.cpp"
+)
+target_include_directories(vanguard_transforms PUBLIC "transforms/include")
+target_link_libraries(vanguard_transforms PRIVATE vanguard_graph vanguard_core)
+
 add_library(vanguard_render_shared STATIC "render/shared/src/backend_capability.cpp")
 target_include_directories(vanguard_render_shared PUBLIC "render/shared/include")
 target_link_libraries(vanguard_render_shared PRIVATE vanguard_core)
@@ -435,6 +445,15 @@ if (ANDROID)
     # PlatformCodecAdapter ownership, no file IO, no Android lifecycle, no
     # product/app/editor wiring.
     "platform/android/src/android_phase2_offline_media_muxer_sink_node_jni.cpp"
+    # P5-SPATIAL-TRANSFORM-NODE-A: platform-neutral logical DAG
+    # SpatialTransformNode diagnostic (construction validation,
+    # identity/port shape, descriptor/matrix/crop accessors,
+    # point-transform math, timeline-window semantics, real
+    # GraphExecutionPlan source->transform->sink pass against the real
+    # ImageTextureSourceNode and PreviewSurfaceSinkNode). Diagnostic-only;
+    # no renderer/shader/texture/decoder ownership, no Android lifecycle,
+    # no product/app/editor wiring.
+    "platform/android/src/android_phase5_spatial_transform_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
@@ -471,6 +490,7 @@ if (ANDROID)
     vanguard_sources
     vanguard_audio
     vanguard_compositors
+    vanguard_transforms
     vanguard_render_shared
     vanguard_render_vulkan
     vanguard_render_gles
