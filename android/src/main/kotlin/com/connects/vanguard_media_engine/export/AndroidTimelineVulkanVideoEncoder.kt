@@ -19,7 +19,6 @@ import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import java.io.File
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import kotlin.math.ceil
 import kotlin.math.min
 
 // ── AndroidTimelineVulkanVideoEncoder (Vulkan-first export, pass-1) ──────────
@@ -151,34 +150,6 @@ class AndroidTimelineVulkanVideoEncoder(
     private var totalExpectedSamples = 0
     private var onProgress: ((Double) -> Unit)? = null
 
-    // ─── Export segment plan ──────────────────────────────────────────────────
-
-    /// One ordered unit of pass-1 work. Windows are end-exclusive source pts
-    /// ranges in seconds; a source frame belongs to exactly one segment.
-    private sealed class Segment {
-        class Solo(
-            val clip: AndroidTimelineVideoEncoder.ClipInput,
-            val windowStartSeconds: Double,
-            val windowEndSeconds: Double,
-        ) : Segment()
-
-        class Overlap(
-            val transition: AndroidTimelineTransitionDescriptor,
-            val fromClip: AndroidTimelineVideoEncoder.ClipInput,
-            val fromWindowStartSeconds: Double,
-            val fromWindowEndSeconds: Double,
-            val toClip: AndroidTimelineVideoEncoder.ClipInput,
-            val toWindowStartSeconds: Double,
-            val toWindowEndSeconds: Double,
-        ) : Segment()
-    }
-
-    private class SegmentPlan(
-        val segments: List<Segment>,
-        val expectedSamples: Int,
-        val failureReason: String?,
-    )
-
     /// Encodes [clips] sequentially (hard-cut concatenation) into [outputPath]
     /// as a video-only MP4, using the native Vulkan export session for every
     /// frame. Returns a structured result; never throws.
@@ -231,7 +202,7 @@ class AndroidTimelineVulkanVideoEncoder(
             return failResult("vulkan_reverse_not_supported")
         }
         val nonHardCutTransitions = transitions.filter { !it.isHardCut }
-        val plan = buildSegmentPlan(clips, nonHardCutTransitions)
+        val plan = AndroidTimelineExportSegmentPlanner.build(clips, nonHardCutTransitions, fps)
         totalExpectedSamples = plan.expectedSamples
         if (plan.failureReason != null) {
             return failResult(plan.failureReason)
@@ -254,12 +225,12 @@ class AndroidTimelineVulkanVideoEncoder(
             for (segment in plan.segments) {
                 if (cancelRequested) break
                 val failureReason = when (segment) {
-                    is Segment.Solo -> decodeClipIntoSession(
+                    is AndroidTimelineExportSegment.Solo -> decodeClipIntoSession(
                         segment.clip,
                         segment.windowStartSeconds,
                         segment.windowEndSeconds,
                     )
-                    is Segment.Overlap -> encodeOverlapSegment(segment)
+                    is AndroidTimelineExportSegment.Overlap -> encodeOverlapSegment(segment)
                 }
                 if (failureReason != null) {
                     if (cancelRequested) break
@@ -306,7 +277,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 TAG,
                 "VG_VULKAN_ENCODE_RESULT status=success rendered=$renderedFrames " +
                     "written=$writtenVideoSamples outputSize=$outSize " +
-                    "transitions=${plan.segments.count { it is Segment.Overlap }} " +
+                    "transitions=${plan.segments.count { it is AndroidTimelineExportSegment.Overlap }} " +
                     "beautyFrames=$beautyFramesRendered overlayFrames=$overlayFramesRendered",
             )
             return AndroidTimelineVideoEncoder.EncodeResult(
@@ -349,89 +320,6 @@ class AndroidTimelineVulkanVideoEncoder(
             beautyFrameCount = beautyFramesRendered,
             overlayFrameCount = overlayFramesRendered,
         )
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Segment planning
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Plans the ordered segments for [clips] and the non-hard-cut
-    /// [transitions]. Without transitions every clip is one solo segment over
-    /// its full trim window (the frozen hard-cut route). With transitions,
-    /// each clip's solo window is shortened by the overlap it lends to its
-    /// incoming and outgoing transitions (a solo window shorter than one
-    /// output frame is skipped), and each transition becomes an overlap
-    /// segment. Fails closed (reason set, no segments) for any shape the
-    /// parser should already have rejected: non-video clips, out-of-range or
-    /// non-adjacent indices, or combined overlaps exceeding a clip.
-    private fun buildSegmentPlan(
-        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
-        transitions: List<AndroidTimelineTransitionDescriptor>,
-    ): SegmentPlan {
-        if (transitions.isEmpty()) {
-            val segments = clips.map { clip ->
-                Segment.Solo(clip, clip.trimStartSeconds, clip.trimEndSeconds)
-            }
-            val expected = clips.sumOf { clip ->
-                ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps).toInt().coerceAtLeast(1)
-            }
-            return SegmentPlan(segments, expected, null)
-        }
-
-        fun fail(reason: String) = SegmentPlan(emptyList(), 0, reason)
-
-        if (clips.any { it.mediaKind != "video" || it.stillFrameCount != 0 }) {
-            return fail("transitions_require_video_clips")
-        }
-        val incomingByClip = HashMap<Int, AndroidTimelineTransitionDescriptor>()
-        val outgoingByClip = HashMap<Int, AndroidTimelineTransitionDescriptor>()
-        for (t in transitions) {
-            if (t.type == AndroidTimelineTransitionDescriptor.Type.NONE) continue
-            if (t.fromClipIndex < 0 || t.toClipIndex >= clips.size || t.toClipIndex != t.fromClipIndex + 1) {
-                return fail("transition_index_invalid:${t.transitionId}:from=${t.fromClipIndex}:to=${t.toClipIndex}")
-            }
-            if (!t.durationSeconds.isFinite() || t.durationSeconds <= 0.0) {
-                return fail("transition_duration_invalid:${t.transitionId}")
-            }
-            if (outgoingByClip.put(t.fromClipIndex, t) != null || incomingByClip.put(t.toClipIndex, t) != null) {
-                return fail("transition_boundary_duplicate:${t.transitionId}")
-            }
-        }
-
-        val minSoloWindowSeconds = 1.0 / fps.coerceAtLeast(1)
-        val segments = ArrayList<Segment>()
-        for ((index, clip) in clips.withIndex()) {
-            val incoming = incomingByClip[index]
-            val outgoing = outgoingByClip[index]
-            val soloStart = clip.trimStartSeconds + (incoming?.durationSeconds ?: 0.0)
-            val soloEnd = clip.trimEndSeconds - (outgoing?.durationSeconds ?: 0.0)
-            if (soloEnd < soloStart - OVERLAP_EPSILON_SECONDS) {
-                return fail("transition_overlap_exceeds_clip:clip=$index")
-            }
-            if (soloEnd - soloStart >= minSoloWindowSeconds) {
-                segments.add(Segment.Solo(clip, soloStart, soloEnd))
-            }
-            if (outgoing != null) {
-                val toClip = clips[outgoing.toClipIndex]
-                segments.add(
-                    Segment.Overlap(
-                        transition = outgoing,
-                        fromClip = clip,
-                        fromWindowStartSeconds = clip.trimEndSeconds - outgoing.durationSeconds,
-                        fromWindowEndSeconds = clip.trimEndSeconds,
-                        toClip = toClip,
-                        toWindowStartSeconds = toClip.trimStartSeconds,
-                        toWindowEndSeconds = toClip.trimStartSeconds + outgoing.durationSeconds,
-                    ),
-                )
-            }
-        }
-        val timelineSeconds = AndroidTimelineTransitionDescriptor.timelineDurationSeconds(
-            clips.map { it.trimEndSeconds - it.trimStartSeconds },
-            transitions,
-        )
-        val expected = ceil(timelineSeconds * fps).toInt().coerceAtLeast(1)
-        return SegmentPlan(segments, expected, null)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1000,7 +888,7 @@ class AndroidTimelineVulkanVideoEncoder(
     /// continuous. Returns null on success or cancellation (the caller checks
     /// [cancelRequested]), else a machine-readable failure reason. Never
     /// throws; the decoder is always closed.
-    private fun encodeOverlapSegment(segment: Segment.Overlap): String? {
+    private fun encodeOverlapSegment(segment: AndroidTimelineExportSegment.Overlap): String? {
         val transition = segment.transition
         val fromClip = segment.fromClip
         val toClip = segment.toClip
@@ -1413,8 +1301,5 @@ class AndroidTimelineVulkanVideoEncoder(
         private const val ENCODE_DRAIN_DEADLINE_MS = 2_000L
         private const val ENCODE_EOS_DEADLINE_MS = 5_000L
         private const val IMAGE_READER_MAX_IMAGES = 3
-
-        /** Tolerance for overlap arithmetic on the parser-validated durations. */
-        private const val OVERLAP_EPSILON_SECONDS = 1e-9
     }
 }
