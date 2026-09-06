@@ -47,6 +47,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke",
             "runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke",
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
+            "runAndroidDagPhase6StreamSourceNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -114,6 +115,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke" ->
                 runPhase2DecodedMediaFrameSourceNodeSmoke(result)
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
+            "runAndroidDagPhase6StreamSourceNodeSmoke" -> runPhase6StreamSourceNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -399,6 +401,48 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "PREVIEW_SURFACE_SINK_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P6-STREAM-SOURCE-NODE-A: platform-neutral logical DAG
+    // StreamSourceNode diagnostic. Runs native lanes over the real
+    // StreamSourceNode plus the real PreviewSurfaceSinkNode (construction
+    // validation, identity/port shape, streamId/live accessors, dimension
+    // accessors, timeline-window semantics, real GraphExecutionPlan
+    // source->sink pass). Proof boundary: platform-neutral logical DAG
+    // source - no network SDK, no decoder/framebuffer ownership, no Android
+    // lifecycle, no product/app/editor wiring.
+    private fun runPhase6StreamSourceNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase6StreamSourceNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_stream_source_node_logical_dag_source_no_network_sdk_no_decoder_" +
+                        "framebuffer_ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "STREAM_SOURCE_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase6StreamSourceNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

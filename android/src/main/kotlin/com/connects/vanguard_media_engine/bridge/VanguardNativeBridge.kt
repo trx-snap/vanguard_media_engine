@@ -1095,6 +1095,17 @@ class VanguardNativeBridge(
     // SurfaceProducer ownership, no product/editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke(): String
 
+    // -- P6-STREAM-SOURCE-NODE-A: platform-neutral logical DAG
+    // StreamSourceNode diagnostic. Proves construction validation,
+    // identity/port shape, streamId/live accessors, dimension accessors,
+    // timeline-window semantics, and a real GraphExecutionPlan source->sink
+    // pass using the real StreamSourceNode against the real
+    // PreviewSurfaceSinkNode. Diagnostic-only: no production Path A Media3/
+    // ExoPlayer or Path B WebRTC/LiveKit session, no RealtimeOutputAdapter
+    // egress, no decoder/frame buffer ownership, no Android lifecycle, no
+    // product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase6StreamSourceNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real
