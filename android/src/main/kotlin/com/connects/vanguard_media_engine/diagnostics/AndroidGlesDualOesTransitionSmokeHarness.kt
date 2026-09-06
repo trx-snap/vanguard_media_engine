@@ -20,32 +20,50 @@ import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import org.json.JSONObject
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 /**
- * P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS: diagnostic-only harness
- * proving that TWO real MediaCodec decodes, each feeding its own
- * SurfaceTexture-backed GL_TEXTURE_EXTERNAL_OES texture on ONE caller-owned,
- * current-verified ES3 EGL pbuffer context, still route into the private
+ * P5-GLES-EXPORT-DUAL-OES-PRERESOLVE-TRANSITION-READINESS: diagnostic-only
+ * harness strengthening the prior dual-OES transition proof. TWO real
+ * MediaCodec decodes, each feeding its own SurfaceTexture-backed
+ * GL_TEXTURE_EXTERNAL_OES texture on ONE caller-owned, current-verified ES3
+ * EGL pbuffer context, are updateTexImage()'d, then EACH OES texture is
+ * pre-resolved -- with its SurfaceTexture transform matrix applied -- into
+ * its own canvas-sized GL_TEXTURE_2D RGBA8 raster via an FBO blit through a
+ * minimal external-OES passthrough shader. Only the two RESOLVED 2D
+ * textures are then handed to the private
  * `GlesTimelineTransitionCompositor::drawTransition` seam (fixed crossfade
  * midpoint: progress 0.5, blendWeightFrom == blendWeightTo == 0.5, identity
  * crops/viewports) through
  * [VanguardNativeBridge.drawAndroidDagPhase5GlesDualOesTransition].
  *
+ * The pre-resolve step exists because feeding raw OES textures straight into
+ * the compositor's mix draw would both skip the SurfaceTexture transform
+ * matrix and risk the crossfade mix path's identity-geometry contract;
+ * resolving to identity-oriented 2D rasters first avoids both failure modes
+ * before any production wiring is attempted.
+ *
  * Every EGL/GL/MediaCodec/SurfaceTexture object is created and destroyed by
  * this harness on the single background thread that calls [run]; the native
  * seam creates/destroys none of them and only draws into the already-current
- * context using the two already-populated OES textures. Diagnostic only: no
- * production GLES export route, no AndroidTimelineExportSession/
+ * context using the two already-populated resolved 2D textures. Diagnostic
+ * only: no production GLES export route, no AndroidTimelineExportSession/
  * AndroidTimelineVideoEncoder/AndroidExportRenderBackendSelector change, and
  * `GlesTimelineTransitionCompositor` itself is untouched.
+ *
+ * Proof chain: dual MediaCodec -> dual SurfaceTexture/OES ->
+ * updateTexImage() -> OES-to-canvas-2D pre-resolve -> GLES transition
+ * compositor with 2D textures -> pixel/state/cleanup proof.
  */
 class AndroidGlesDualOesTransitionSmokeHarness {
 
     companion object {
         private const val PROOF_BOUNDARY =
-            "diagnostic_dual_mediacodec_surfacetexture_oes_to_gles_transition_compositor_no_export"
+            "diagnostic_dual_mediacodec_surfacetexture_oes_to_canvas2d_preresolve_to_gles_transition_compositor_no_export"
         private const val PASS_MARKER =
             "ANDROID_DAG_PHASE5_GLES_DUAL_OES_TRANSITION_PHYSICAL_SMOKE_PASS"
         private const val FAIL_MARKER =
@@ -59,6 +77,21 @@ class AndroidGlesDualOesTransitionSmokeHarness {
         /** Fixed crossfade midpoint this diagnostic exercises. */
         private const val TRANSITION_PROGRESS = 0.5
 
+        // Pre-draw clear color for each resolve FBO. Chosen far from both
+        // typical decoded video content and the native seam's own sentinel
+        // (40,40,40) so a resolved sample escaping this color is unambiguous
+        // proof that the OES-to-2D blit actually drew real content.
+        private const val RESOLVE_CLEAR_R = 10
+        private const val RESOLVE_CLEAR_G = 200
+        private const val RESOLVE_CLEAR_B = 10
+        private const val RESOLVE_COLOR_TOLERANCE = 8
+
+        // Corner + center probes across each resolved raster.
+        private val RESOLVE_SAMPLE_POINTS = listOf(8 to 8, 64 to 64, 120 to 120)
+
+        private val QUAD_POSITIONS = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+        private val QUAD_TEX_COORDS = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
+
         val GATE_KEYS = listOf(
             "argumentValidationOk",
             "eglSetupOk",
@@ -66,6 +99,8 @@ class AndroidGlesDualOesTransitionSmokeHarness {
             "dualDecoderSetupOk",
             "bothFramesAvailableOk",
             "bothUpdateTexImageOk",
+            "bothOesResolveOk",
+            "resolvedContentOk",
             "nativeTransitionDrawOk",
             "pixelProofOk",
             "stateRestoredOk",
@@ -100,6 +135,11 @@ class AndroidGlesDualOesTransitionSmokeHarness {
         var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
         var fromTextureId = 0
         var toTextureId = 0
+        var resolveProgram = 0
+        var fromResolveTextureId = 0
+        var toResolveTextureId = 0
+        var fromResolveFboId = 0
+        var toResolveFboId = 0
         var fromExtractor: MediaExtractor? = null
         var toExtractor: MediaExtractor? = null
         var fromCodec: MediaCodec? = null
@@ -261,6 +301,73 @@ class AndroidGlesDualOesTransitionSmokeHarness {
             gates["bothUpdateTexImageOk"] = updateOk
             if (!updateOk) return
 
+            // -- OES -> canvas-2D pre-resolve: draw each decoded OES texture,
+            //    with its own SurfaceTexture transform matrix applied, into
+            //    its own canvas-sized GL_TEXTURE_2D RGBA8 FBO via a minimal
+            //    external-OES passthrough shader and full-canvas quad. This
+            //    is required before the native transition seam: drawing
+            //    directly from a SurfaceTexture-backed OES texture would
+            //    both skip its transform matrix and risk the crossfade mix
+            //    path's identity-geometry contract, so only the resolved 2D
+            //    rasters -- never the raw OES textures -- are handed to the
+            //    compositor below. -----------------------------------------
+            val program = buildOesPassthroughProgram()
+            if (program <= 0) {
+                fail("resolve_gl_program_link_failed"); return
+            }
+            resolveProgram = program
+            val aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
+            val aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTextureCoord")
+            val uSTMatrixLoc = GLES20.glGetUniformLocation(program, "uSTMatrix")
+
+            fromResolveTextureId = createRgba8Texture(SURFACE_SIZE)
+            toResolveTextureId = createRgba8Texture(SURFACE_SIZE)
+            if (fromResolveTextureId == 0 || toResolveTextureId == 0) {
+                fail("resolve_texture_creation_failed"); return
+            }
+            val fromFboStatus = createFramebufferForTexture(fromResolveTextureId)
+            fromResolveFboId = fromFboStatus.first
+            if (fromResolveFboId == 0) {
+                fail("resolve_fbo_incomplete:from:${fromFboStatus.second}"); return
+            }
+            val toFboStatus = createFramebufferForTexture(toResolveTextureId)
+            toResolveFboId = toFboStatus.first
+            if (toResolveFboId == 0) {
+                fail("resolve_fbo_incomplete:to:${toFboStatus.second}"); return
+            }
+
+            val fromStMatrix = FloatArray(16)
+            fromTexture.getTransformMatrix(fromStMatrix)
+            val toStMatrix = FloatArray(16)
+            toTexture.getTransformMatrix(toStMatrix)
+
+            GLES20.glGetError()
+            val fromResolveOk = resolveOesToTexture2d(
+                program, aPositionLoc, aTexCoordLoc, uSTMatrixLoc,
+                fromTextureId, fromStMatrix, fromResolveFboId,
+            )
+            val toResolveOk = resolveOesToTexture2d(
+                program, aPositionLoc, aTexCoordLoc, uSTMatrixLoc,
+                toTextureId, toStMatrix, toResolveFboId,
+            )
+            gates["bothOesResolveOk"] = fromResolveOk && toResolveOk
+            if (gates["bothOesResolveOk"] != true) {
+                fail("oes_resolve_failed:from=$fromResolveOk,to=$toResolveOk"); return
+            }
+
+            val fromContentEscapedClear = resolvedContentEscapedClear(fromResolveFboId)
+            val toContentEscapedClear = resolvedContentEscapedClear(toResolveFboId)
+            gates["resolvedContentOk"] = fromContentEscapedClear && toContentEscapedClear
+            details["fromResolveEscapedClear"] = fromContentEscapedClear
+            details["toResolveEscapedClear"] = toContentEscapedClear
+            if (gates["resolvedContentOk"] != true) {
+                fail(
+                    "resolved_content_uniform_or_sentinel:" +
+                        "from=$fromContentEscapedClear,to=$toContentEscapedClear",
+                )
+                return
+            }
+
             // -- Native dual-OES transition draw + pixel/state proof -----------
             val nativeBridge = VanguardNativeBridge(
                 VanguardLifecycleObserver(VanguardDiagnostics()),
@@ -268,10 +375,10 @@ class AndroidGlesDualOesTransitionSmokeHarness {
                 null,
             )
             val raw = nativeBridge.drawAndroidDagPhase5GlesDualOesTransition(
-                fromTextureId,
-                GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
-                toTextureId,
-                GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                fromResolveTextureId,
+                GLES20.GL_TEXTURE_2D,
+                toResolveTextureId,
+                GLES20.GL_TEXTURE_2D,
                 SURFACE_SIZE,
                 SURFACE_SIZE,
                 TRANSITION_PROGRESS,
@@ -316,9 +423,15 @@ class AndroidGlesDualOesTransitionSmokeHarness {
                         // context current on this thread during the run.
                         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
                     }
-                    for (id in intArrayOf(fromTextureId, toTextureId)) {
+                    for (id in intArrayOf(
+                        fromTextureId, toTextureId, fromResolveTextureId, toResolveTextureId,
+                    )) {
                         if (id != 0) GLES20.glDeleteTextures(1, intArrayOf(id), 0)
                     }
+                    for (fbo in intArrayOf(fromResolveFboId, toResolveFboId)) {
+                        if (fbo != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
+                    }
+                    if (resolveProgram != 0) GLES20.glDeleteProgram(resolveProgram)
                 } catch (t: Throwable) {
                     cleanupClean = false
                 }
@@ -379,6 +492,202 @@ class AndroidGlesDualOesTransitionSmokeHarness {
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         return if (GLES20.glGetError() == GLES20.GL_NO_ERROR) id else 0
     }
+
+    private fun createRgba8Texture(size: Int): Int {
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        val id = textures[0]
+        if (id == 0) return 0
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, id)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, size, size, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null,
+        )
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        return if (GLES20.glGetError() == GLES20.GL_NO_ERROR) id else 0
+    }
+
+    /** Returns (fboId, statusOrEmpty); fboId is 0 on any failure. */
+    private fun createFramebufferForTexture(textureId: Int): Pair<Int, String> {
+        val fbos = IntArray(1)
+        GLES20.glGenFramebuffers(1, fbos, 0)
+        val fbo = fbos[0]
+        if (fbo == 0) return 0 to "fbo_generation_failed"
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, textureId, 0,
+        )
+        val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+        if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
+            return 0 to "status_0x${Integer.toHexString(status)}"
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        return fbo to ""
+    }
+
+    private fun buildOesPassthroughProgram(): Int {
+        val vertexSrc = """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            uniform mat4 uSTMatrix;
+            varying vec2 vTextureCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTextureCoord = (uSTMatrix * aTextureCoord).xy;
+            }
+        """.trimIndent()
+        val fragmentSrc = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vTextureCoord;
+            uniform samplerExternalOES sTexture;
+            void main() {
+                gl_FragColor = texture2D(sTexture, vTextureCoord);
+            }
+        """.trimIndent()
+
+        val vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexSrc)
+        if (vertexShader == 0) return 0
+        val fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSrc)
+        if (fragmentShader == 0) return 0
+
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vertexShader)
+        GLES20.glAttachShader(program, fragmentShader)
+        GLES20.glLinkProgram(program)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        GLES20.glDeleteShader(vertexShader)
+        GLES20.glDeleteShader(fragmentShader)
+        if (linkStatus[0] == 0) {
+            GLES20.glDeleteProgram(program)
+            return 0
+        }
+        return program
+    }
+
+    private fun compileShader(type: Int, src: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(shader, src)
+        GLES20.glCompileShader(shader)
+        val status = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0)
+        if (status[0] == 0) {
+            GLES20.glDeleteShader(shader)
+            return 0
+        }
+        return shader
+    }
+
+    /**
+     * Draws [oesTextureId] (using [stMatrix] to correct for the
+     * SurfaceTexture's sampling transform) into [fboId] as a full-canvas
+     * quad. Returns true only if every GL call up to and including the draw
+     * reports GL_NO_ERROR.
+     */
+    private fun resolveOesToTexture2d(
+        program: Int,
+        aPositionLoc: Int,
+        aTexCoordLoc: Int,
+        uSTMatrixLoc: Int,
+        oesTextureId: Int,
+        stMatrix: FloatArray,
+        fboId: Int,
+    ): Boolean {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
+        GLES20.glViewport(0, 0, SURFACE_SIZE, SURFACE_SIZE)
+        GLES20.glClearColor(
+            RESOLVE_CLEAR_R / 255f, RESOLVE_CLEAR_G / 255f, RESOLVE_CLEAR_B / 255f, 1f,
+        )
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glUseProgram(program)
+
+        quadPositionBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionLoc)
+        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositionBuffer)
+
+        quadTexCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aTexCoordLoc)
+        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoordBuffer)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+        GLES20.glUniformMatrix4fv(uSTMatrixLoc, 1, false, stMatrix, 0)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(aPositionLoc)
+        GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+
+        // Leave GL state clean so the native GlesTimelineTransitionCompositor seam that
+        // runs immediately after both resolves observes zeroed bindings going in, rather
+        // than correctly restoring this harness's own still-live resolve state and
+        // failing stateRestoredOk.
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glUseProgram(0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glFinish()
+
+        return GLES20.glGetError() == GLES20.GL_NO_ERROR
+    }
+
+    /**
+     * Samples [RESOLVE_SAMPLE_POINTS] from [fboId] and returns true only if
+     * every read reports GL_NO_ERROR AND at least one sample escapes the
+     * pre-draw clear color beyond [RESOLVE_COLOR_TOLERANCE] -- proof the
+     * resolve draw actually painted real decoded content rather than leaving
+     * the sentinel/blank clear (or silently failing to read it back).
+     */
+    private fun resolvedContentEscapedClear(fboId: Int): Boolean {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
+        GLES20.glGetError()
+        var allReadsOk = true
+        var escaped = false
+        for ((x, y) in RESOLVE_SAMPLE_POINTS) {
+            val pixel = readPixelsAt(x, y)
+            val readOk = GLES20.glGetError() == GLES20.GL_NO_ERROR
+            allReadsOk = allReadsOk && readOk
+            if (readOk) {
+                val dr = kotlin.math.abs(pixel[0] - RESOLVE_CLEAR_R)
+                val dg = kotlin.math.abs(pixel[1] - RESOLVE_CLEAR_G)
+                val db = kotlin.math.abs(pixel[2] - RESOLVE_CLEAR_B)
+                if (dr > RESOLVE_COLOR_TOLERANCE || dg > RESOLVE_COLOR_TOLERANCE || db > RESOLVE_COLOR_TOLERANCE) {
+                    escaped = true
+                }
+            }
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        return allReadsOk && escaped
+    }
+
+    /** Reads one RGBA pixel from the currently-bound read framebuffer. */
+    private fun readPixelsAt(x: Int, y: Int): List<Int> {
+        val buffer = ByteBuffer.allocateDirect(4).order(ByteOrder.nativeOrder())
+        GLES20.glReadPixels(x, y, 1, 1, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
+        buffer.position(0)
+        val out = ArrayList<Int>(4)
+        repeat(4) { out.add(buffer.get().toInt() and 0xFF) }
+        return out
+    }
+
+    private val quadPositionBuffer: FloatBuffer =
+        ByteBuffer.allocateDirect(QUAD_POSITIONS.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(QUAD_POSITIONS)
+            position(0)
+        }
+    private val quadTexCoordBuffer: FloatBuffer =
+        ByteBuffer.allocateDirect(QUAD_TEX_COORDS.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(QUAD_TEX_COORDS)
+            position(0)
+        }
 
     /** Returns (failureReasonOrNull, presentationTimeUsOrMinusOne). */
     private fun decodeOneRenderableFrame(extractor: MediaExtractor, codec: MediaCodec): Pair<String?, Long> {

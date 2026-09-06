@@ -1,20 +1,24 @@
 // android_gles_dual_oes_transition_physical_smoke.dart
-// Vanguard Media Engine - P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS:
-// diagnostic-only proof that TWO real MediaCodec decoders feed two
-// independent SurfaceTexture / GL_TEXTURE_EXTERNAL_OES textures on one
-// caller-owned ES3 EGL context, then render one compositor-owned GLES
-// transition frame through the private
-// `GlesTimelineTransitionCompositor::drawTransition` helper.
+// Vanguard Media Engine - P5-GLES-EXPORT-DUAL-OES-PRERESOLVE-TRANSITION-
+// READINESS: diagnostic-only proof that TWO real MediaCodec decoders feed
+// two independent SurfaceTexture / GL_TEXTURE_EXTERNAL_OES textures on one
+// caller-owned ES3 EGL context, each pre-resolved -- with its SurfaceTexture
+// transform matrix applied -- into its own canvas-sized GL_TEXTURE_2D
+// raster, then render one compositor-owned GLES transition frame through the
+// private `GlesTimelineTransitionCompositor::drawTransition` helper using
+// only the two resolved 2D textures.
 //
 // Route:
 //   assets/manual_test_clips/clip_A.mov ("from") and clip_B.mov ("to") ->
 //   two independent MediaCodec decodes onto two harness-owned
 //   GL_TEXTURE_EXTERNAL_OES textures (one caller-owned ES3 EGL pbuffer
 //   context) -> ES3 current-context assertion -> bounded wait for both
-//   frame-available callbacks -> updateTexImage() for both -> native
-//   `drawAndroidDagPhase5GlesDualOesTransition` seam call (fixed crossfade
-//   midpoint, progress 0.5) on the already-current ES3 context ->
-//   glReadPixels pixel-proof/state-restoration assertions.
+//   frame-available callbacks -> updateTexImage() for both -> OES-to-canvas-2D
+//   pre-resolve (SurfaceTexture transform matrix applied, FBO blit) for both
+//   -> native `drawAndroidDagPhase5GlesDualOesTransition` seam call (fixed
+//   crossfade midpoint, progress 0.5) using the two resolved 2D textures on
+//   the already-current ES3 context -> glReadPixels pixel-proof/
+//   state-restoration assertions.
 //
 // Non-claims: diagnostic only. No production GLES transition export route;
 // `GlesTimelineTransitionCompositor` itself is untouched.
@@ -115,6 +119,10 @@ class _AndroidGlesDualOesTransitionPhysicalSmokeAppState
         'bothFramesAvailableOk=${report.bothFramesAvailablePass} '
         'bothUpdateTexImageOk=${report.bothUpdateTexImagePass} '
         'fromPtsUs=${report.fromPtsUs} toPtsUs=${report.toPtsUs}',
+      );
+      print(
+        '${_logPrefix}_LANE_RESOLVE: bothOesResolveOk=${report.bothOesResolvePass} '
+        'resolvedContentOk=${report.resolvedContentPass}',
       );
       print(
         '${_logPrefix}_LANE_TRANSITION: nativeTransitionDrawOk=${report.nativeTransitionDrawPass} '

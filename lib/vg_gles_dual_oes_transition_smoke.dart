@@ -1,10 +1,17 @@
 // vg_gles_dual_oes_transition_smoke.dart
-// vanguard_media_engine - P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS:
-// diagnostic-only Android True-DAG proof that TWO real MediaCodec decoders
-// feed two independent SurfaceTexture / GL_TEXTURE_EXTERNAL_OES textures on
-// one caller-owned ES3 EGL context, then render one compositor-owned GLES
-// transition frame through the private
-// `GlesTimelineTransitionCompositor::drawTransition` helper.
+// vanguard_media_engine - P5-GLES-EXPORT-DUAL-OES-PRERESOLVE-TRANSITION-
+// READINESS: diagnostic-only Android True-DAG proof that TWO real MediaCodec
+// decoders feed two independent SurfaceTexture / GL_TEXTURE_EXTERNAL_OES
+// textures on one caller-owned ES3 EGL context, each of which is then
+// pre-resolved -- with its SurfaceTexture transform matrix applied -- into
+// its own canvas-sized GL_TEXTURE_2D raster before rendering one
+// compositor-owned GLES transition frame through the private
+// `GlesTimelineTransitionCompositor::drawTransition` helper using only the
+// two resolved 2D textures.
+//
+// Proof chain: dual MediaCodec -> dual SurfaceTexture/OES ->
+// updateTexImage() -> OES-to-canvas-2D pre-resolve -> GLES transition
+// compositor with 2D textures -> pixel/state/cleanup proof.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runAndroidDagPhase5GlesDualOesTransitionSmoke` MethodChannel route.
@@ -81,7 +88,7 @@ class VGGlesDualOesTransitionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'diagnostic_dual_mediacodec_surfacetexture_oes_to_gles_transition_compositor_no_export';
+      'diagnostic_dual_mediacodec_surfacetexture_oes_to_canvas2d_preresolve_to_gles_transition_compositor_no_export';
 
   /// Canonical PASS marker emitted by the native harness.
   static const String passMarker =
@@ -113,6 +120,16 @@ class VGGlesDualOesTransitionSmokeReport {
     'bothUpdateTexImageOk',
   ];
 
+  /// OES -> canvas-sized GL_TEXTURE_2D pre-resolve gate keys: a per-texture
+  /// GL-error-free FBO blit (with the SurfaceTexture transform matrix
+  /// applied), and a pixel proof that both resolved rasters escaped their
+  /// pre-draw clear sentinel (i.e. hold real decoded content, not a blank
+  /// clear).
+  static const List<String> resolveGateKeys = <String>[
+    'bothOesResolveOk',
+    'resolvedContentOk',
+  ];
+
   /// Native `GlesTimelineTransitionCompositor::drawTransition` seam call +
   /// pixel-proof gate keys.
   static const List<String> transitionGateKeys = <String>[
@@ -132,6 +149,7 @@ class VGGlesDualOesTransitionSmokeReport {
     ...setupGateKeys,
     ...es3ContextGateKeys,
     ...decodeGateKeys,
+    ...resolveGateKeys,
     ...transitionGateKeys,
     ...stateGateKeys,
     ...cleanupGateKeys,
@@ -223,6 +241,21 @@ class VGGlesDualOesTransitionSmokeReport {
 
   /// Whether every decode gate passed.
   bool get decodeGroupPass => decodeGateKeys.every(_gate);
+
+  // -- OES -> canvas-2D pre-resolve -------------------------------------------
+
+  /// Whether both decoded OES textures were resolved (with their
+  /// SurfaceTexture transform matrices applied) into their own canvas-sized
+  /// GL_TEXTURE_2D FBOs without a GL error.
+  bool get bothOesResolvePass => _gate('bothOesResolveOk');
+
+  /// Whether both resolved 2D rasters were sampled and proved to hold real
+  /// decoded content (escaping the pre-draw clear sentinel), not a blank
+  /// clear.
+  bool get resolvedContentPass => _gate('resolvedContentOk');
+
+  /// Whether every pre-resolve gate passed.
+  bool get resolveGroupPass => resolveGateKeys.every(_gate);
 
   // -- Native transition draw ------------------------------------------------
 

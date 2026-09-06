@@ -1,12 +1,17 @@
 // android_phase5_gles_dual_oes_transition_jni.cpp
-// P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS: diagnostic-only native seam
-// proving that two REAL MediaCodec-decoded GL_TEXTURE_EXTERNAL_OES frames
-// (each fed by its own SurfaceTexture, both textures already
-// updateTexImage()'d by the Kotlin harness on its own caller-owned,
-// current-verified ES3 EGL pbuffer context) can be composed by the private
-// vanguard::render::GlesTimelineTransitionCompositor::drawTransition helper
-// at a fixed crossfade midpoint (progress 0.5, blendWeightFrom ==
-// blendWeightTo == 0.5, identity crops/viewports).
+// P5-GLES-EXPORT-DUAL-OES-PRERESOLVE-TRANSITION-READINESS: diagnostic-only
+// native seam proving that two textures already populated with real decoded
+// content (each already updateTexImage()'d and, per the strengthened Kotlin
+// harness, pre-resolved from its own SurfaceTexture-backed
+// GL_TEXTURE_EXTERNAL_OES source into a canvas-sized GL_TEXTURE_2D raster
+// with the SurfaceTexture transform matrix applied) can be composed by the
+// private vanguard::render::GlesTimelineTransitionCompositor::drawTransition
+// helper at a fixed crossfade midpoint (progress 0.5, blendWeightFrom ==
+// blendWeightTo == 0.5, identity crops/viewports). GL_TEXTURE_2D and
+// GL_TEXTURE_EXTERNAL_OES are independently accepted for fromTextureTarget/
+// toTextureTarget (matching the compositor's own contract), so this seam
+// stays usable both by the pre-resolved-2D harness above and by any other
+// caller that still hands it raw OES textures directly.
 //
 // This translation unit creates and destroys NOTHING EGL/SurfaceTexture/
 // MediaCodec-related: no EGL context, no EGL surface, no Java Surface, no
@@ -43,14 +48,19 @@ using vanguard::render::GlesTimelineTransitionCompositor;
 using vanguard::render::GlesTimelineTransitionGeometry;
 
 constexpr const char* kProofBoundary =
-    "diagnostic_dual_mediacodec_surfacetexture_oes_to_gles_transition_compositor_no_export";
+    "diagnostic_dual_texture_target_2d_or_oes_to_gles_transition_compositor_no_export";
 constexpr const char* kPassMarker =
     "ANDROID_DAG_PHASE5_GLES_DUAL_OES_TRANSITION_PHYSICAL_SMOKE_PASS";
 constexpr const char* kFailMarker =
     "ANDROID_DAG_PHASE5_GLES_DUAL_OES_TRANSITION_PHYSICAL_SMOKE_FAIL";
 
 constexpr uint32_t kTargetOes = 0x8D65;  // GL_TEXTURE_EXTERNAL_OES
+constexpr uint32_t kTarget2d = 0x0DE1;   // GL_TEXTURE_2D
 constexpr int kColorTolerance = 8;
+
+bool IsSupportedTextureTarget(uint32_t target) {
+    return target == kTargetOes || target == kTarget2d;
+}
 
 struct Rgb {
     uint8_t r;
@@ -183,6 +193,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_drawAndroi
     details.I64("fromPtsUs", fromPtsUs);
     details.I64("toPtsUs", toPtsUs);
     details.Dbl("progress", progress);
+    details.I64("textureTargetFrom", fromTextureTarget);
+    details.I64("textureTargetTo", toTextureTarget);
 
     bool argumentValidationOk = false;
     bool nativeTransitionDrawOk = false;
@@ -196,8 +208,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_drawAndroi
             argError = "invalid_texture";
         } else if (surfaceWidth <= 0 || surfaceHeight <= 0) {
             argError = "invalid_dimensions";
-        } else if (static_cast<uint32_t>(fromTextureTarget) != kTargetOes ||
-                   static_cast<uint32_t>(toTextureTarget) != kTargetOes) {
+        } else if (!IsSupportedTextureTarget(static_cast<uint32_t>(fromTextureTarget)) ||
+                   !IsSupportedTextureTarget(static_cast<uint32_t>(toTextureTarget))) {
             argError = "unsupported_texture_target";
         } else if (!std::isfinite(static_cast<double>(progress)) || progress < 0.0 || progress > 1.0) {
             argError = "invalid_progress";
@@ -229,8 +241,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_drawAndroi
         GlesTimelineTransitionCompositor compositor;
         std::string drawErr;
         nativeTransitionDrawOk = compositor.drawTransition(
-            static_cast<uint32_t>(fromTextureId), kTargetOes,
-            static_cast<uint32_t>(toTextureId), kTargetOes,
+            static_cast<uint32_t>(fromTextureId), static_cast<uint32_t>(fromTextureTarget),
+            static_cast<uint32_t>(toTextureId), static_cast<uint32_t>(toTextureTarget),
             static_cast<uint32_t>(surfaceWidth), static_cast<uint32_t>(surfaceHeight),
             geometry, &drawErr);
         details.Dbl("blendWeightFrom", blendWeightFrom);

@@ -1,7 +1,7 @@
 // vg_gles_dual_oes_transition_smoke_test.dart
-// vanguard_media_engine - P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS:
-// diagnostic-only Android True-DAG GLES dual-OES transition smoke Dart
-// model & MethodChannel tests.
+// vanguard_media_engine - P5-GLES-EXPORT-DUAL-OES-PRERESOLVE-TRANSITION-
+// READINESS: diagnostic-only Android True-DAG GLES dual-OES transition smoke
+// Dart model & MethodChannel tests.
 
 import 'dart:convert';
 
@@ -10,7 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_gles_dual_oes_transition_smoke.dart';
 
 const String _proofBoundary =
-    'diagnostic_dual_mediacodec_surfacetexture_oes_to_gles_transition_compositor_no_export';
+    'diagnostic_dual_mediacodec_surfacetexture_oes_to_canvas2d_preresolve_to_gles_transition_compositor_no_export';
 const String _passMarker =
     'ANDROID_DAG_PHASE5_GLES_DUAL_OES_TRANSITION_PHYSICAL_SMOKE_PASS';
 const String _failMarker =
@@ -24,6 +24,8 @@ const List<String> _gateKeys = <String>[
   'dualDecoderSetupOk',
   'bothFramesAvailableOk',
   'bothUpdateTexImageOk',
+  'bothOesResolveOk',
+  'resolvedContentOk',
   'nativeTransitionDrawOk',
   'pixelProofOk',
   'stateRestoredOk',
@@ -94,11 +96,12 @@ void main() {
       expect(VGGlesDualOesTransitionSmokeReport.setupGateKeys.length, 1);
       expect(VGGlesDualOesTransitionSmokeReport.es3ContextGateKeys.length, 1);
       expect(VGGlesDualOesTransitionSmokeReport.decodeGateKeys.length, 3);
+      expect(VGGlesDualOesTransitionSmokeReport.resolveGateKeys.length, 2);
       expect(VGGlesDualOesTransitionSmokeReport.transitionGateKeys.length, 2);
       expect(VGGlesDualOesTransitionSmokeReport.stateGateKeys.length, 1);
       expect(VGGlesDualOesTransitionSmokeReport.cleanupGateKeys.length, 1);
-      expect(_gateKeys.toSet().length, 10, reason: 'unique');
-      expect(_gateKeys.length, 10);
+      expect(_gateKeys.toSet().length, 12, reason: 'unique');
+      expect(_gateKeys.length, 12);
     });
   });
 
@@ -185,6 +188,10 @@ void main() {
       expect(report.bothFramesAvailablePass, isTrue);
       expect(report.bothUpdateTexImagePass, isTrue);
       expect(report.decodeGroupPass, isTrue);
+
+      expect(report.bothOesResolvePass, isTrue);
+      expect(report.resolvedContentPass, isTrue);
+      expect(report.resolveGroupPass, isTrue);
 
       expect(report.nativeTransitionDrawPass, isTrue);
       expect(report.pixelProofPass, isTrue);
@@ -278,6 +285,7 @@ void main() {
       final decodeFail = _createSampleReport({'dualDecoderSetupOk': false});
       expect(decodeFail.decodeGroupPass, isFalse);
       expect(decodeFail.es3ContextGroupPass, isTrue);
+      expect(decodeFail.resolveGroupPass, isTrue);
       expect(decodeFail.transitionGroupPass, isTrue);
 
       final framesFail = _createSampleReport({'bothFramesAvailableOk': false});
@@ -289,12 +297,28 @@ void main() {
       });
       expect(updateTexFail.decodeGroupPass, isFalse);
       expect(updateTexFail.bothFramesAvailablePass, isTrue);
+      expect(updateTexFail.resolveGroupPass, isTrue);
+
+      final resolveFail = _createSampleReport({'bothOesResolveOk': false});
+      expect(resolveFail.resolveGroupPass, isFalse);
+      expect(resolveFail.bothOesResolvePass, isFalse);
+      expect(resolveFail.resolvedContentPass, isTrue);
+      expect(resolveFail.decodeGroupPass, isTrue);
+      expect(resolveFail.transitionGroupPass, isTrue);
+
+      final resolvedContentFail = _createSampleReport({
+        'resolvedContentOk': false,
+      });
+      expect(resolvedContentFail.resolveGroupPass, isFalse);
+      expect(resolvedContentFail.bothOesResolvePass, isTrue);
+      expect(resolvedContentFail.resolvedContentPass, isFalse);
 
       final transitionFail = _createSampleReport({
         'nativeTransitionDrawOk': false,
       });
       expect(transitionFail.transitionGroupPass, isFalse);
       expect(transitionFail.decodeGroupPass, isTrue);
+      expect(transitionFail.resolveGroupPass, isTrue);
       expect(transitionFail.statePass, isTrue);
 
       final stateFail = _createSampleReport({'stateRestoredOk': false});
