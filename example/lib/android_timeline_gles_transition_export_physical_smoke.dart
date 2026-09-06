@@ -1,28 +1,34 @@
 // android_timeline_gles_transition_export_physical_smoke.dart
 // Vanguard Media Engine — P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A,
-// widened by P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE:
+// widened by P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE and
+// P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS:
 // Android production `exportTimeline` GLES forced transition route proof.
 //
-// Proof boundary: production_exportTimeline_gles_transition_slide_wipe_forced_route_a_no_vulkan_no_app
+// Proof boundary: production_exportTimeline_gles_transition_slide_wipe_rotated_forced_route_a_no_vulkan_no_app
 //
 // Drives the REAL production `exportTimeline` MethodChannel route with top-level
 // `debugForceRenderBackend: gles` using clip_A.mov copies (zero-rotation
-// success fixture), clip_B.mov (rotated negative fixture), and still_C.png:
+// success fixture), clip_B.mov (real standard-rotation-metadata success
+// fixture), and still_C.png:
 //   Lane forced dissolve success   : dissolve 0.5 s (clip_A + clip_A) -> success,
 //                                    renderBackend=gles, file exists,
 //                                    duration ~= 3.5, transitionCount=1
 //   Lane forced crossfade success  : crossfade 0.5 s (clip_A + clip_A) -> same expectations
 //   Lane forced slideLeft success  : slideLeft 0.5 s (clip_A + clip_A) -> same expectations
 //   Lane forced wipeRight success  : wipeRight 0.5 s (clip_A + clip_A) -> same expectations
+//   Lane forced rotated clip success: dissolve 0.5 s (clip_A + rotated clip_B) -> success,
+//                                    renderBackend=gles, file exists,
+//                                    duration ~= 3.5, transitionCount=1 -- proves the
+//                                    rotated fit-quad geometry (ported from
+//                                    AndroidTimelineVideoEncoder's hard-cut path) renders
+//                                    a real clip carrying standard Android rotation
+//                                    metadata correctly on this route
 //   Lane forced fade fail closed   : fade 0.5 s (clip_A + clip_A) -> fails closed before
 //                                    pass-1 (UNSUPPORTED_EXPORT_FEATURE, unsupported wire type
 //                                    -- fade is never GLES-eligible: it fails at
 //                                    AndroidTimelineTransitionDescriptor parse time, before
 //                                    any render-backend selection)
 //   Lane forced still-image dissolve fail closed: image + video (still_C + clip_A) -> fails closed
-//                                    before pass-1 (UNSUPPORTED_EXPORT_FEATURE /
-//                                    gles_transition_not_eligible)
-//   Lane forced rotated clip fail closed: dissolve 0.5 s (clip_A + rotated clip_B) -> fails closed
 //                                    before pass-1 (UNSUPPORTED_EXPORT_FEATURE /
 //                                    gles_transition_not_eligible)
 //
@@ -221,7 +227,7 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
               ),
         ),
         VGTimelineTransitionExportSmokeRequest(
-          laneId: 'forced_rotated_clip_fail_closed',
+          laneId: 'forced_rotated_clip_success',
           clips: <VGTimelineTransitionExportSmokeClip>[
             videoClip('clip-a', clipA1.path),
             videoClip('clip-b', clipRotatedB.path),
@@ -239,10 +245,7 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
           expectedRenderBackend: 'gles',
           debugForceRenderBackend: 'gles',
           expectation:
-              const VGTimelineTransitionExportSmokeExpectation.failClosed(
-                errorCode: unsupportedExportFeatureCode,
-                messageContains: 'gles_transition_not_eligible',
-              ),
+              const VGTimelineTransitionExportSmokeExpectation.success(),
         ),
       ];
 
@@ -283,7 +286,7 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
         : 'ANDROID_TIMELINE_GLES_TRANSITION_EXPORT_PHYSICAL_SMOKE_FAIL';
     final payload = report.toMap();
     payload['proofBoundary'] =
-        'production_exportTimeline_gles_transition_slide_wipe_forced_route_a_no_vulkan_no_app';
+        'production_exportTimeline_gles_transition_slide_wipe_rotated_forced_route_a_no_vulkan_no_app';
     payload['marker'] = marker;
     print(
       'ANDROID_TIMELINE_GLES_TRANSITION_EXPORT_JSON:${jsonEncode(payload)}',

@@ -378,6 +378,28 @@ void main() {
       },
     );
 
+    test("a GLES result passes for the rotated-clip lane request shape "
+        "(P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS)", () {
+      final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
+        _request(
+          laneId: 'forced_rotated_clip_success',
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+        ),
+        _successResult(
+          backend: 'gles',
+          path: '/data/local/tmp/out_forced_rotated_clip_success.mp4',
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, 'gles');
+      expect(report.durationDeltaSeconds, closeTo(0.0, 1e-9));
+      expect(report.transitionCount, 1);
+      expect(report.failureReason, isEmpty);
+    });
+
     test('a GLES result still fails for the default Vulkan expectation', () {
       final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
         _request(),

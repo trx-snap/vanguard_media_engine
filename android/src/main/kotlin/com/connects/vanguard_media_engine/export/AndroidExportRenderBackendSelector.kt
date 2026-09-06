@@ -59,12 +59,13 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // `transitions_require_vulkan` and `beauty_v2_requires_vulkan` prefixes take
 // priority in that order when also present).
 //
-// P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: a scope carrying a
+// P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A, widened by
+// P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS: a scope carrying a
 // non-hard-cut transition no longer unconditionally requires Vulkan -- when
 // [ExportRenderScope.glesTransitionEligible] holds (video-only clips, no
 // reversed clip, no clip-level Beauty V2, no overlays, positive decoded/
-// requested dimensions, zero rotation metadata on every clip), the narrow
-// production GLES transition route (AndroidTimelineGlesTransitionVideoEncoder)
+// requested dimensions, standard 0/90/180/270 rotation metadata on every
+// clip), the narrow production GLES transition route (AndroidTimelineGlesTransitionVideoEncoder)
 // is an acceptable alternative to Vulkan. Vulkan remains the default/
 // preferred backend regardless (see [select]'s Vulkan-first branch below,
 // unchanged) -- this only widens what happens when Vulkan is NOT selectable
@@ -77,7 +78,7 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // A non-hard-cut transition whose scope is NOT [glesTransitionEligible]
 // still fails closed exactly as before with `transitions_require_vulkan:...`
 // when Vulkan cannot be selected either -- this slice does not implement a
-// GLES route for reversed/beauty/overlay/still-image/rotated/colorMatrix
+// GLES route for reversed/beauty/overlay/still-image/colorMatrix
 // transition scopes. P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE widened the
 // eligible transition family from crossfade-only to every closed-set
 // AndroidTimelineTransitionDescriptor.Type member (crossfade, the four
@@ -182,7 +183,8 @@ data class ExportRenderScope(
             clips.all { it.mediaKind == "video" || it.mediaKind == "image" }
 
     /// P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A, widened by
-    /// P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE: null when this scope's
+    /// P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE and
+    /// P5-GLES-EXPORT-TRANSITION-ROTATED-CLIPS: null when this scope's
     /// non-hard-cut transition(s) are eligible for the narrow production GLES
     /// transition route (AndroidTimelineGlesTransitionVideoEncoder), or a
     /// precise machine-readable reason otherwise. Also gates the same limits
@@ -194,9 +196,12 @@ data class ExportRenderScope(
     /// native transition math (vanguard::compositors::ComputeTransitionGeometry)
     /// and the GLES compositor already implement all nine, so there is no
     /// per-family rejection left on this route. Rotation is restricted
-    /// to exactly zero (not the wider 0/90/180/270 Vulkan accepts) -- this
-    /// route's OES-to-canvas pre-resolve step does not implement a rotated
-    /// fit quad, so a non-zero rotation fails closed here rather than risk
+    /// to standard 0/90/180/270 cardinal rotation metadata (matching what
+    /// Vulkan accepts) -- this route's OES-to-canvas pre-resolve step now
+    /// ports the same rotated fit-quad geometry AndroidTimelineVideoEncoder's
+    /// hard-cut path uses (see [AndroidTimelineGlesTransitionVideoEncoder]'s
+    /// `computeFitQuadOrNull`), so a cardinal rotation renders correctly;
+    /// any other rotation value still fails closed here rather than risk
     /// wrong output. See [glesTransitionEligible].
     val glesTransitionIneligibleReason: String?
         get() {
@@ -207,7 +212,7 @@ data class ExportRenderScope(
             if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
             if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
-            if (clips.any { it.rotationDegrees != 0 }) return "non_zero_rotation"
+            if (clips.any { it.rotationDegrees !in setOf(0, 90, 180, 270) }) return "unsupported_rotation"
             if (requestedWidth <= 0 || requestedHeight <= 0) return "invalid_output_dimensions"
             return null
         }

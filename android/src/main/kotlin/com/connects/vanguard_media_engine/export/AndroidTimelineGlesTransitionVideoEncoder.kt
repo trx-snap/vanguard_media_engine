@@ -20,7 +20,9 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import kotlin.math.cos
 import kotlin.math.min
+import kotlin.math.sin
 
 // ── AndroidTimelineGlesTransitionVideoEncoder (P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A) ──
 //
@@ -29,8 +31,8 @@ import kotlin.math.min
 // GLES backend for a scope that is
 // [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible]
 // (video-only clips, no reversed clip, no clip-level Beauty V2, no overlays,
-// positive decoded/requested dimensions, zero rotation metadata on every
-// clip) -- AndroidTimelineExportSession only ever constructs this class for
+// positive decoded/requested dimensions, standard 0/90/180/270 rotation
+// metadata on every clip) -- AndroidTimelineExportSession only ever constructs this class for
 // that shape; see its `buildPass1Encoder`. This class defensively
 // re-validates that same narrow shape per clip (see [validateClipShape]) and
 // fails closed with a precise `gles_transition_not_eligible:<reason>` reason
@@ -270,8 +272,8 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         if (clip.isReversed) return "gles_transition_not_eligible:reversed_clip:${clip.sourcePath}"
         if (clip.beautyIntensity != null) return "gles_transition_not_eligible:beauty_clip:${clip.sourcePath}"
         if (clip.colorMatrix != null) return "gles_transition_not_eligible:color_matrix:${clip.sourcePath}"
-        if (clip.rotationDegrees != 0) {
-            return "gles_transition_not_eligible:non_zero_rotation:${clip.rotationDegrees}:${clip.sourcePath}"
+        if (clip.rotationDegrees !in setOf(0, 90, 180, 270)) {
+            return "gles_transition_not_eligible:unsupported_rotation:${clip.rotationDegrees}:${clip.sourcePath}"
         }
         if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) {
             return "gles_transition_invalid_geometry:${clip.sourcePath}"
@@ -279,20 +281,34 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         return null
     }
 
-    /// Centered, aspect-preserving "fit" quad (BL, BR, TL, TR NDC pairs,
-    /// matching the GL_TRIANGLE_STRIP draw order below) for a clip's decoded
-    /// geometry against the fixed output surface. No rotation term -- every
-    /// clip reaching this encoder is defensively re-validated to carry zero
-    /// rotation metadata (see [validateClipShape]); returns null for
-    /// degenerate/invalid geometry rather than throwing.
-    private fun computeFitQuadOrNull(decodedWidth: Int, decodedHeight: Int): FloatArray? {
+    /// Centered, aspect-preserving "fit" quad (BL, BR, TL, TR NDC pairs) rotated by [rotationDegrees].
+    private fun computeFitQuadOrNull(decodedWidth: Int, decodedHeight: Int, rotationDegrees: Int): FloatArray? {
         if (decodedWidth <= 0 || decodedHeight <= 0 || width <= 0 || height <= 0) return null
-        val scale = min(width.toFloat() / decodedWidth, height.toFloat() / decodedHeight)
-        val halfPixelX = decodedWidth * scale / 2f
-        val halfPixelY = decodedHeight * scale / 2f
-        val ndcX = halfPixelX / (width.toFloat() / 2f)
-        val ndcY = halfPixelY / (height.toFloat() / 2f)
-        return floatArrayOf(-ndcX, -ndcY, ndcX, -ndcY, -ndcX, ndcY, ndcX, ndcY)
+        val displayWidth: Float
+        val displayHeight: Float
+        if (rotationDegrees == 90 || rotationDegrees == 270) {
+            displayWidth = decodedHeight.toFloat()
+            displayHeight = decodedWidth.toFloat()
+        } else {
+            displayWidth = decodedWidth.toFloat()
+            displayHeight = decodedHeight.toFloat()
+        }
+        val scale = min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        val halfPixelX = decodedWidth.toFloat() * scale / 2f
+        val halfPixelY = decodedHeight.toFloat() * scale / 2f
+
+        val radians = Math.toRadians(-rotationDegrees.toDouble())
+        val cosR = cos(radians).toFloat()
+        val sinR = sin(radians).toFloat()
+        fun rotatedPixel(x: Float, y: Float) = floatArrayOf(x * cosR - y * sinR, x * sinR + y * cosR)
+        fun toNdc(p: FloatArray) =
+            floatArrayOf(p[0] / (width.toFloat() / 2f), p[1] / (height.toFloat() / 2f))
+
+        val bl = toNdc(rotatedPixel(-halfPixelX, -halfPixelY))
+        val br = toNdc(rotatedPixel(halfPixelX, -halfPixelY))
+        val tl = toNdc(rotatedPixel(-halfPixelX, halfPixelY))
+        val tr = toNdc(rotatedPixel(halfPixelX, halfPixelY))
+        return floatArrayOf(bl[0], bl[1], br[0], br[1], tl[0], tl[1], tr[0], tr[1])
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -303,7 +319,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         val clip = segment.clip
         val shapeFailure = validateClipShape(clip)
         if (shapeFailure != null) return shapeFailure
-        val quad = computeFitQuadOrNull(clip.decodedWidth, clip.decodedHeight)
+        val quad = computeFitQuadOrNull(clip.decodedWidth, clip.decodedHeight, clip.rotationDegrees)
             ?: return "gles_transition_invalid_geometry:${clip.sourcePath}"
 
         val decoder = AndroidTimelineGlesTransitionOverlapDecoder(
@@ -349,10 +365,12 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         val toShapeFailure = validateClipShape(segment.toClip)
         if (toShapeFailure != null) return toShapeFailure
 
-        val fromQuad = computeFitQuadOrNull(segment.fromClip.decodedWidth, segment.fromClip.decodedHeight)
-            ?: return "gles_transition_invalid_geometry:${segment.fromClip.sourcePath}"
-        val toQuad = computeFitQuadOrNull(segment.toClip.decodedWidth, segment.toClip.decodedHeight)
-            ?: return "gles_transition_invalid_geometry:${segment.toClip.sourcePath}"
+        val fromQuad = computeFitQuadOrNull(
+            segment.fromClip.decodedWidth, segment.fromClip.decodedHeight, segment.fromClip.rotationDegrees,
+        ) ?: return "gles_transition_invalid_geometry:${segment.fromClip.sourcePath}"
+        val toQuad = computeFitQuadOrNull(
+            segment.toClip.decodedWidth, segment.toClip.decodedHeight, segment.toClip.rotationDegrees,
+        ) ?: return "gles_transition_invalid_geometry:${segment.toClip.sourcePath}"
 
         val decoder = AndroidTimelineGlesTransitionOverlapDecoder(
             fromSource = AndroidTimelineGlesTransitionOverlapDecoder.Source(
