@@ -16,6 +16,7 @@ import android.opengl.GLES30
 import android.util.Log
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import org.json.JSONObject
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -30,10 +31,12 @@ import kotlin.math.sin
 // timeline, used ONLY when AndroidExportRenderBackendSelector resolves the
 // GLES backend for a scope that is
 // [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible]
-// (video-only clips, no reversed clip, no clip-level Beauty V2,
+// (video-only clips, no reversed clip,
 // positive decoded/requested dimensions, standard 0/90/180/270 rotation
 // metadata on every clip -- overlays are permitted, see the
-// P5-GLES-EXPORT-TRANSITION-OVERLAYS paragraph below) -- AndroidTimelineExportSession
+// P5-GLES-EXPORT-TRANSITION-OVERLAYS paragraph below, and clip-level Beauty
+// V2 is permitted unless paired with overlays, see the
+// P5-GLES-EXPORT-BEAUTY-TRANSITIONS paragraph below) -- AndroidTimelineExportSession
 // only ever constructs this class for that shape; see its `buildPass1Encoder`. This class defensively
 // re-validates that same narrow shape per clip (see [validateClipShape]) and
 // fails closed with a precise `gles_transition_not_eligible:<reason>` reason
@@ -94,11 +97,35 @@ import kotlin.math.sin
 // presentation timestamp is set and it is swapped -- reusing the same GLES
 // overlay compositing route (AndroidTimelineGlesOverlayRenderSession and the
 // native overlay bridge) AndroidTimelineVideoEncoder's hard-cut path already
-// uses, rather than building a new one. Beauty, reversed, still-image, and
+// uses, rather than building a new one. Reversed, still-image, and
 // colorMatrix clips remain outside this route's scope even when overlays are
 // also requested -- [validateClipShape] and
 // [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionIneligibleReason]
 // both still reject those independently of [encode]'s `overlays` argument.
+//
+// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: this class also applies clip-level
+// Beauty V2 for the same narrow scope, now that
+// [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible]
+// no longer excludes it (unless paired with overlays, which remains
+// ineligible with reason `beauty_with_overlays_unsupported` -- gated by the
+// selector before this class is ever constructed for such a scope, not by
+// [validateClipShape] itself). A solo
+// segment whose clip carries a non-null `beautyIntensity` resolves its OES
+// frame to a 2D texture first, then applies the existing native Beauty seam
+// (`VanguardNativeBridge.drawAndroidDagPhase5GlesExportBeautySeam`, the same
+// seam AndroidTimelineVideoEncoder's hard-cut Beauty route uses) directly
+// into the encoder's own default framebuffer -- see [drawSoloFrameFromSlot].
+// An Overlap segment's transition pair applies Beauty per side (when
+// requested) into a dedicated canvas-sized Beauty output texture before
+// handing the active (post-Beauty or plain-resolved) texture ids to the
+// native transition compositor seam -- see [drawTransitionPair] and
+// [applyBeautySeam]. Every rendered frame where Beauty was applied -- one
+// per solo frame, one per transition-pair output frame where either side
+// requested Beauty -- increments [beautyFramesRendered], returned as
+// `EncodeResult.beautyFrameCount`. Requesting Beauty on an ES2-only device
+// (`glMajorVersion < 3`) fails closed with `beauty_v2_gles_es3_required:
+// <version>` before any segment renders, mirroring
+// AndroidTimelineVideoEncoder's own preflight.
 internal class AndroidTimelineGlesTransitionVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -142,6 +169,26 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     private var pendingOverlays: List<AndroidTimelineOverlayDescriptor> = emptyList()
     private var glesOverlaySession: AndroidTimelineGlesOverlayRenderSession? = null
     private var overlayFramesRendered = 0
+
+    // ─── GLES Beauty V2 compositing state (P5-GLES-EXPORT-BEAUTY-TRANSITIONS) ─
+    // [pendingClipsForSetup] is populated by [encode] before [setupGl] runs
+    // (setupGl itself takes no clip argument) purely so setupGl can decide
+    // whether to allocate the Beauty output resources below; reset in
+    // [releaseAll] alongside the other per-call state so a reused encoder
+    // instance never carries over a prior call's clip list. [beautyFromFboId]/
+    // [beautyFromTextureId] and [beautyToFboId]/[beautyToTextureId] are the
+    // canvas-sized post-Beauty output targets for a transition-pair's from/to
+    // side respectively (see [drawTransitionPair]) -- the solo Beauty path
+    // (see [drawSoloFrameFromSlot]) reuses the plain [fromResolveFboId]/
+    // [toResolveFboId] resolve targets as its pre-Beauty source instead of
+    // needing a dedicated pair, since solo and overlap segments never render
+    // concurrently.
+    private var pendingClipsForSetup: List<AndroidTimelineVideoEncoder.ClipInput> = emptyList()
+    private var beautyFramesRendered = 0
+    private var beautyFromTextureId = 0
+    private var beautyToTextureId = 0
+    private var beautyFromFboId = 0
+    private var beautyToFboId = 0
 
     // Single OES program used both for the solo draw (straight to the
     // encoder's EGL surface) and the overlap pre-resolve draw (into an
@@ -203,6 +250,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
         pendingOverlays = overlays
+        pendingClipsForSetup = clips
         var succeeded = false
         var muxerStoppedCleanly = false
         var reason = "not_run"
@@ -213,12 +261,24 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             val plan = AndroidTimelineExportSegmentPlanner.build(clips, transitions, fps)
             if (plan.failureReason != null) {
                 reason = "gles_transition_plan_failed:${plan.failureReason}"
-                return AndroidTimelineVideoEncoder.EncodeResult(false, reason, 0, 0L, glMajorVersion = glMajorVersion)
+                return AndroidTimelineVideoEncoder.EncodeResult(
+                    false, reason, 0, 0L,
+                    beautyFrameCount = beautyFramesRendered, glMajorVersion = glMajorVersion,
+                )
             }
             totalExpectedSamples = plan.expectedSamples
 
             setupEncoderAndMuxer()
             setupGl()
+
+            if (clips.any { it.beautyIntensity != null } && glMajorVersion < 3) {
+                reason = "beauty_v2_gles_es3_required:$glMajorVersion"
+                return AndroidTimelineVideoEncoder.EncodeResult(
+                    false, reason, writtenVideoSamples, 0L,
+                    beautyFrameCount = beautyFramesRendered,
+                    overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
+                )
+            }
 
             if (pendingOverlays.isNotEmpty()) {
                 when (
@@ -228,6 +288,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                         reason = "overlay_prepare_failed:${prepareResult.code}:${prepareResult.message}"
                         return AndroidTimelineVideoEncoder.EncodeResult(
                             false, reason, writtenVideoSamples, 0L,
+                            beautyFrameCount = beautyFramesRendered,
                             overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                         )
                     }
@@ -248,6 +309,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                     reason = failure
                     return AndroidTimelineVideoEncoder.EncodeResult(
                         false, reason, writtenVideoSamples, 0L,
+                        beautyFrameCount = beautyFramesRendered,
                         overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                     )
                 }
@@ -257,6 +319,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 reason = "cancelled"
                 return AndroidTimelineVideoEncoder.EncodeResult(
                     false, reason, writtenVideoSamples, 0L,
+                    beautyFrameCount = beautyFramesRendered,
                     overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
@@ -267,6 +330,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 reason = "encoder_eos_drain_timeout"
                 return AndroidTimelineVideoEncoder.EncodeResult(
                     false, reason, writtenVideoSamples, 0L,
+                    beautyFrameCount = beautyFramesRendered,
                     overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
@@ -275,6 +339,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 reason = "gles_transition_sample_count_mismatch:written=$writtenVideoSamples:rendered=$framesSubmitted"
                 return AndroidTimelineVideoEncoder.EncodeResult(
                     false, reason, writtenVideoSamples, 0L,
+                    beautyFrameCount = beautyFramesRendered,
                     overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
@@ -283,6 +348,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 reason = "no_video_samples_written"
                 return AndroidTimelineVideoEncoder.EncodeResult(
                     false, reason, writtenVideoSamples, 0L,
+                    beautyFrameCount = beautyFramesRendered,
                     overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
@@ -296,6 +362,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 reason = "output_file_empty_or_missing"
                 return AndroidTimelineVideoEncoder.EncodeResult(
                     false, reason, writtenVideoSamples, 0L,
+                    beautyFrameCount = beautyFramesRendered,
                     overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
@@ -306,10 +373,11 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 TAG,
                 "VG_GLES_TRANSITION_ENCODE_RESULT status=success rendered=$framesSubmitted " +
                     "written=$writtenVideoSamples outputSize=$outSize transitions=${nonHardCutTransitions.size} " +
-                    "overlayFrames=$overlayFramesRendered glMajorVersion=$glMajorVersion",
+                    "beautyFrames=$beautyFramesRendered overlayFrames=$overlayFramesRendered glMajorVersion=$glMajorVersion",
             )
             return AndroidTimelineVideoEncoder.EncodeResult(
                 true, reason, writtenVideoSamples, outSize,
+                beautyFrameCount = beautyFramesRendered,
                 overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
             )
         } catch (t: Throwable) {
@@ -317,6 +385,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             Log.e(TAG, "encode failed: $t", t)
             return AndroidTimelineVideoEncoder.EncodeResult(
                 false, reason, writtenVideoSamples, 0L,
+                beautyFrameCount = beautyFramesRendered,
                 overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
             )
         } finally {
@@ -340,7 +409,6 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     private fun validateClipShape(clip: AndroidTimelineVideoEncoder.ClipInput): String? {
         if (clip.mediaKind != "video") return "gles_transition_not_eligible:non_video_clip:${clip.sourcePath}"
         if (clip.isReversed) return "gles_transition_not_eligible:reversed_clip:${clip.sourcePath}"
-        if (clip.beautyIntensity != null) return "gles_transition_not_eligible:beauty_clip:${clip.sourcePath}"
         if (clip.colorMatrix != null) return "gles_transition_not_eligible:color_matrix:${clip.sourcePath}"
         if (clip.rotationDegrees !in setOf(0, 90, 180, 270)) {
             return "gles_transition_not_eligible:unsupported_rotation:${clip.rotationDegrees}:${clip.sourcePath}"
@@ -407,7 +475,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             while (true) {
                 when (val step = decoder.nextStep()) {
                     is AndroidTimelineGlesTransitionOverlapDecoder.Step.Frames -> {
-                        val drawFailure = drawSoloFrameFromSlot(fromSlot, quad)
+                        val drawFailure = drawSoloFrameFromSlot(fromSlot, quad, clip.beautyIntensity)
                         if (drawFailure != null) return drawFailure
                         drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
                         rendered++
@@ -468,12 +536,14 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                         val drawFailure: String?
                         if (step.from != null && step.to != null) {
                             val progress = transition.progressForOverlapFrame(pairsRendered, expectedPairs)
-                            drawFailure = drawTransitionPair(fromQuad, toQuad, progress, transition.type.nativeCode)
+                            drawFailure = drawTransitionPair(
+                                segment.fromClip, segment.toClip, fromQuad, toQuad, progress, transition.type.nativeCode,
+                            )
                             if (drawFailure == null) pairsRendered++
                         } else if (step.from != null) {
-                            drawFailure = drawSoloFrameFromSlot(fromSlot, fromQuad)
+                            drawFailure = drawSoloFrameFromSlot(fromSlot, fromQuad, segment.fromClip.beautyIntensity)
                         } else {
-                            drawFailure = drawSoloFrameFromSlot(toSlot, toQuad)
+                            drawFailure = drawSoloFrameFromSlot(toSlot, toQuad, segment.toClip.beautyIntensity)
                         }
                         if (drawFailure != null) return drawFailure
                         drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
@@ -508,11 +578,31 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     /// through [quad]'s fit geometry, directly into the encoder's own EGL
     /// surface, then presents/swaps -- the plain hard-cut draw path, used for
     /// solo segments and for any unpaired edge frame of an overlap segment.
-    private fun drawSoloFrameFromSlot(slot: AndroidTimelineGlesTransitionDecodeSlot, quad: FloatArray): String? {
+    /// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: when [beautyIntensity] is non-null,
+    /// [slot]'s OES frame is first resolved into that slot's own plain 2D
+    /// resolve target (reused as scratch here since solo and overlap draws
+    /// never run concurrently), then the existing native Beauty seam is
+    /// applied directly into framebuffer 0 via [applyBeautySeam] instead of
+    /// the plain OES draw -- see [drawOesQuad] vs [applyBeautySeam].
+    private fun drawSoloFrameFromSlot(
+        slot: AndroidTimelineGlesTransitionDecodeSlot,
+        quad: FloatArray,
+        beautyIntensity: Double?,
+    ): String? {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-        val drawFailure = drawOesQuad(slot, quad)
-        if (drawFailure != null) return "gles_transition_draw_failed:solo:$drawFailure"
+        if (beautyIntensity != null) {
+            val resolveFboId = if (slot === fromSlot) fromResolveFboId else toResolveFboId
+            val resolveTextureId = if (slot === fromSlot) fromResolveTextureId else toResolveTextureId
+            val resolveFailure = resolveSlotToTexture2d(slot, quad, resolveFboId)
+            if (resolveFailure != null) return "gles_transition_draw_failed:solo:$resolveFailure"
+            val beautyFailure = applyBeautySeam(resolveTextureId, 0, beautyIntensity)
+            if (beautyFailure != null) return "gles_transition_draw_failed:solo:$beautyFailure"
+            beautyFramesRendered++
+        } else {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            val drawFailure = drawOesQuad(slot, quad)
+            if (drawFailure != null) return "gles_transition_draw_failed:solo:$drawFailure"
+        }
 
         val overlayFailure = compositeActiveOverlaysIfPresent()
         if (overlayFailure != null) return overlayFailure
@@ -529,7 +619,19 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     /// transition compositor seam at [transitionTypeCode]
     /// (AndroidTimelineTransitionDescriptor.Type.nativeCode), then
     /// presents/swaps the encoder surface.
+    /// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: when [fromClip]/[toClip] carries a
+    /// non-null `beautyIntensity`, that side's plain-resolved texture is run
+    /// through the existing native Beauty seam into its own dedicated Beauty
+    /// output texture ([beautyFromFboId]/[beautyFromTextureId] or
+    /// [beautyToFboId]/[beautyToTextureId]) via [applyBeautySeam] first, and
+    /// the post-Beauty texture id (rather than the plain resolve texture id)
+    /// is what gets handed to the native transition compositor seam below.
+    /// [beautyFramesRendered] is incremented once per output frame where
+    /// either side requested Beauty, regardless of whether one or both sides
+    /// did.
     private fun drawTransitionPair(
+        fromClip: AndroidTimelineVideoEncoder.ClipInput,
+        toClip: AndroidTimelineVideoEncoder.ClipInput,
         fromQuad: FloatArray,
         toQuad: FloatArray,
         progress: Double,
@@ -542,6 +644,24 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         val toResolveFailure = resolveSlotToTexture2d(toSlot, toQuad, toResolveFboId)
         if (toResolveFailure != null) return "gles_transition_resolve_failed:to:$toResolveFailure"
 
+        var fromActiveTextureId = fromResolveTextureId
+        val fromBeautyIntensity = fromClip.beautyIntensity
+        if (fromBeautyIntensity != null) {
+            val beautyFailure = applyBeautySeam(fromResolveTextureId, beautyFromFboId, fromBeautyIntensity)
+            if (beautyFailure != null) return "gles_transition_beauty_failed:from:$beautyFailure"
+            fromActiveTextureId = beautyFromTextureId
+        }
+        var toActiveTextureId = toResolveTextureId
+        val toBeautyIntensity = toClip.beautyIntensity
+        if (toBeautyIntensity != null) {
+            val beautyFailure = applyBeautySeam(toResolveTextureId, beautyToFboId, toBeautyIntensity)
+            if (beautyFailure != null) return "gles_transition_beauty_failed:to:$beautyFailure"
+            toActiveTextureId = beautyToTextureId
+        }
+        if (fromBeautyIntensity != null || toBeautyIntensity != null) {
+            beautyFramesRendered++
+        }
+
         // Kotlin owns frame clear on the target (encoder) surface -- the
         // native seam never clears the framebuffer itself.
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -550,9 +670,9 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
         val status = nativeBridge.drawAndroidTimelineGlesTransitionExportFrame(
-            fromResolveTextureId,
+            fromActiveTextureId,
             GLES20.GL_TEXTURE_2D,
-            toResolveTextureId,
+            toActiveTextureId,
             GLES20.GL_TEXTURE_2D,
             width,
             height,
@@ -620,6 +740,37 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
 
         val err = GLES20.glGetError()
         return if (err == GLES20.GL_NO_ERROR) null else "gl_error:$err"
+    }
+
+    /// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: applies the existing native Beauty
+    /// V2 seam (`VanguardNativeBridge.drawAndroidDagPhase5GlesExportBeautySeam`
+    /// -- the same seam AndroidTimelineVideoEncoder's hard-cut Beauty route
+    /// uses) to an already-resolved GL_TEXTURE_2D [sourceTextureId], drawing
+    /// into [targetFboId] (0 for the encoder's own default framebuffer, for
+    /// the solo path; one of the dedicated Beauty output FBOs for an overlap
+    /// side). Leaves the default framebuffer bound on return. Returns a
+    /// machine-readable failure reason on any GL/native/parse failure, or
+    /// null on success.
+    private fun applyBeautySeam(sourceTextureId: Int, targetFboId: Int, intensity: Double): String? {
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, targetFboId)
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        val rawStatus = nativeBridge.drawAndroidDagPhase5GlesExportBeautySeam(
+            sourceTextureId, 0, width, height, intensity.toFloat(),
+        )
+        val statusJson = try { JSONObject(rawStatus) } catch (t: Throwable) { null }
+        val pass = statusJson?.optBoolean("pass", false) == true ||
+            statusJson?.optString("status") == "PASS"
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        if (!pass) {
+            val failureDetail = statusJson?.optString("failureReason")?.takeIf { it.isNotEmpty() }
+                ?: statusJson?.optString("status")?.takeIf { it.isNotEmpty() }
+                ?: "unparseable_seam_response"
+            return "beauty_v2_gles_render_failed:$failureDetail"
+        }
+        return null
     }
 
     /// P5-GLES-EXPORT-TRANSITION-OVERLAYS: composites every overlay active
@@ -727,6 +878,25 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         if (fromResolveFboId == 0) throw IllegalStateException("resolve fbo incomplete: from")
         toResolveFboId = createFramebufferForTexture(toResolveTextureId)
         if (toResolveFboId == 0) throw IllegalStateException("resolve fbo incomplete: to")
+
+        // P5-GLES-EXPORT-BEAUTY-TRANSITIONS: only allocated when this call's
+        // clips actually request Beauty V2 -- the ES3 requirement itself is
+        // checked by the caller right after [setupGl] returns (using
+        // [glMajorVersion] negotiated above), so a precise
+        // `beauty_v2_gles_es3_required:<version>` EncodeResult reason can be
+        // returned directly instead of collapsing into a generic thrown-
+        // exception reason.
+        if (pendingClipsForSetup.any { it.beautyIntensity != null }) {
+            beautyFromTextureId = createRgba8Texture(width, height)
+            beautyToTextureId = createRgba8Texture(width, height)
+            if (beautyFromTextureId == 0 || beautyToTextureId == 0) {
+                throw IllegalStateException("beauty texture creation failed")
+            }
+            beautyFromFboId = createFramebufferForTexture(beautyFromTextureId)
+            if (beautyFromFboId == 0) throw IllegalStateException("beauty fbo incomplete: from")
+            beautyToFboId = createFramebufferForTexture(beautyToTextureId)
+            if (beautyToFboId == 0) throw IllegalStateException("beauty fbo incomplete: to")
+        }
     }
 
     private fun setupOesProgram() {
@@ -883,6 +1053,14 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 if (toResolveFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(toResolveFboId), 0)
                 if (fromResolveTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(fromResolveTextureId), 0)
                 if (toResolveTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(toResolveTextureId), 0)
+                // P5-GLES-EXPORT-BEAUTY-TRANSITIONS: deleted before EGL
+                // context destruction below, same as the plain resolve
+                // FBOs/textures above -- a no-op (0) when Beauty was never
+                // requested/allocated for this call.
+                if (beautyFromFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(beautyFromFboId), 0)
+                if (beautyToFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(beautyToFboId), 0)
+                if (beautyFromTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(beautyFromTextureId), 0)
+                if (beautyToTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(beautyToTextureId), 0)
                 fromSlot.release()
                 toSlot.release()
             } catch (_: Throwable) {}
@@ -894,6 +1072,15 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         glesOverlaySession = null
         overlayFramesRendered = 0
         pendingOverlays = emptyList()
+        // P5-GLES-EXPORT-BEAUTY-TRANSITIONS: reset regardless of whether GL
+        // Beauty setup ever ran (or partially ran before a failure) this
+        // call, mirroring the overlay state reset above.
+        beautyFramesRendered = 0
+        pendingClipsForSetup = emptyList()
+        beautyFromTextureId = 0
+        beautyToTextureId = 0
+        beautyFromFboId = 0
+        beautyToFboId = 0
 
         try { encoderInputSurface?.release() } catch (_: Throwable) {}
 

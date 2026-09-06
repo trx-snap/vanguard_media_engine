@@ -166,6 +166,70 @@ void main() {
       },
     );
 
+    test(
+      'runner forwards transitions inside draft alongside top-level '
+      'debugForceRenderBackend and passes a GLES transition+beauty result',
+      () async {
+        Map<Object?, Object?>? seenArgs;
+        _setMockHandler((method, args) async {
+          seenArgs = args as Map<Object?, Object?>;
+          return _successResult(
+            backend: 'gles',
+            duration: 3.5,
+            beautyClipCount: 1,
+            beautyFrameCount: 60,
+          );
+        });
+        final runner = VGTimelineBeautyExportSmokeRunner(
+          channel: _channel,
+          fileExists: (_) => true,
+        );
+        final request = VGTimelineBeautyExportSmokeRequest(
+          laneId: 'beauty-transition-gles',
+          clips: <VGTimelineBeautyExportSmokeClip>[
+            _clip('clip-a', beautyIntensity: 0.5),
+            _clip('clip-b'),
+          ],
+          transitions: const <VGTimelineBeautyExportSmokeTransition>[
+            VGTimelineBeautyExportSmokeTransition(
+              id: 'tr-dissolve',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'clip-a',
+              toClipId: 'clip-b',
+            ),
+          ],
+          outputPath: '/data/local/tmp/out_beauty-transition-gles.mp4',
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCount: 60,
+          ),
+        );
+
+        final report = await runner.run(<VGTimelineBeautyExportSmokeRequest>[
+          request,
+        ]);
+
+        expect(seenArgs!['debugForceRenderBackend'], 'gles');
+        final draft = seenArgs!['draft'] as Map<Object?, Object?>;
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+        final transitions = draft['transitions'] as List<Object?>;
+        expect(transitions, hasLength(1));
+        final transitionMap = transitions.single as Map<Object?, Object?>;
+        expect(transitionMap['id'], 'tr-dissolve');
+        expect(transitionMap['fromClipId'], 'clip-a');
+        expect(transitionMap['toClipId'], 'clip-b');
+
+        expect(report.pass, isTrue);
+        final lane = report.lanes.single;
+        expect(lane.renderBackend, 'gles');
+        expect(lane.beautyClipCount, 1);
+        expect(lane.beautyFrameCount, 60);
+      },
+    );
+
     test('a GLES-backed success fails the positive lane by default', () async {
       _setMockHandler((method, args) async => _successResult(backend: 'gles'));
       final runner = VGTimelineBeautyExportSmokeRunner(

@@ -70,9 +70,11 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // P5-GLES-EXPORT-TRANSITION-OVERLAYS: a scope carrying a
 // non-hard-cut transition no longer unconditionally requires Vulkan -- when
 // [ExportRenderScope.glesTransitionEligible] holds (video-only clips, no
-// reversed clip, no clip-level Beauty V2, positive decoded/
+// reversed clip, positive decoded/
 // requested dimensions, standard 0/90/180/270 rotation metadata on every
-// clip -- overlays no longer excluded, see below), the narrow production
+// clip -- overlays no longer excluded, see below; clip-level Beauty V2 no
+// longer excluded either unless paired with overlays, see
+// P5-GLES-EXPORT-BEAUTY-TRANSITIONS below), the narrow production
 // GLES transition route (AndroidTimelineGlesTransitionVideoEncoder)
 // is an acceptable alternative to Vulkan. Vulkan remains the default/
 // preferred backend regardless (see [select]'s Vulkan-first branch below,
@@ -86,14 +88,24 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // A non-hard-cut transition whose scope is NOT [glesTransitionEligible]
 // still fails closed exactly as before with `transitions_require_vulkan:...`
 // when Vulkan cannot be selected either -- this slice does not implement a
-// GLES route for reversed/beauty/still-image/colorMatrix
-// transition scopes, even when paired with overlays. P5-GLES-EXPORT-TRANSITION-
+// GLES route for reversed/still-image/colorMatrix transition scopes, or for
+// a Beauty scope that also carries overlays. P5-GLES-EXPORT-TRANSITION-
 // OVERLAYS: overlays themselves no longer force this route ineligible -- a
 // video-only, non-hard-cut transition scope that also carries timeline
 // overlays is [glesTransitionEligible] on exactly the same terms as one
 // without overlays, and AndroidTimelineGlesTransitionVideoEncoder composites
 // those overlays itself (reusing AndroidTimelineGlesOverlayRenderSession and
 // the native overlay bridge) instead of requiring Vulkan.
+// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: clip-level Beauty V2 similarly no
+// longer forces this route ineligible on its own -- a video-only,
+// non-hard-cut transition scope that also carries Beauty is
+// [glesTransitionEligible] on exactly the same terms as one without Beauty,
+// and AndroidTimelineGlesTransitionVideoEncoder applies the existing native
+// Beauty seam per solo frame and per transition-pair side (see its own class
+// doc). The one bounded exclusion is Beauty combined with overlays on this
+// route (`beauty_with_overlays_unsupported`) -- that combination still
+// requires Vulkan. See [ExportRenderScope.requiresVulkan] for how Beauty,
+// transitions, and overlays combine.
 // P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE widened the
 // eligible transition family from crossfade-only to every closed-set
 // AndroidTimelineTransitionDescriptor.Type member (crossfade, the four
@@ -240,10 +252,20 @@ data class ExportRenderScope(
     /// since AndroidTimelineGlesTransitionVideoEncoder now composites those
     /// overlays itself (see its overlay-aware `encode` override). See
     /// [glesTransitionEligible].
+    ///
+    /// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: clip-level Beauty V2 is no longer
+    /// categorically excluded here -- AndroidTimelineGlesTransitionVideoEncoder
+    /// now applies the same native Beauty seam
+    /// (drawAndroidDagPhase5GlesExportBeautySeam) AndroidTimelineVideoEncoder's
+    /// hard-cut Beauty route uses, per solo frame and per transition-pair
+    /// side. The one remaining bounded exclusion is Beauty combined with
+    /// timeline overlays on this route: `beauty_with_overlays_unsupported`.
+    /// Beauty without overlays on a non-hard-cut transition scope is exactly
+    /// as eligible as one without Beauty, subject to every other check below.
     val glesTransitionIneligibleReason: String?
         get() {
             if (!hasNonHardCutTransition) return "no_non_hard_cut_transition"
-            if (hasBeautyClip) return "beauty_clip_present"
+            if (hasBeautyClip && hasOverlays) return "beauty_with_overlays_unsupported"
             if (clips.any { it.isReversed }) return "reversed_clip_present"
             if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
@@ -316,9 +338,18 @@ data class ExportRenderScope(
     /// a non-hard-cut transition (it requires `!hasNonHardCutTransition`)
     /// and would otherwise wrongly force Vulkan for an overlay+transition
     /// scope [glesTransitionEligible] already admits.
+    ///
+    /// P5-GLES-EXPORT-BEAUTY-TRANSITIONS: the beauty term is now scoped to
+    /// `!hasNonHardCutTransition` -- when the scope DOES carry a non-hard-cut
+    /// transition, Beauty eligibility is governed entirely by
+    /// [glesTransitionEligible] (via the first term) instead of
+    /// [glesBeautyEligible], since [glesBeautyEligible] is hard-cut-only by
+    /// definition and would otherwise always read false for such a scope,
+    /// wrongly forcing Vulkan for a Beauty+transition combination
+    /// [glesTransitionEligible] already admits.
     val requiresVulkan: Boolean
         get() = (hasNonHardCutTransition && !glesTransitionEligible) ||
-            (hasBeautyClip && !glesBeautyEligible) ||
+            (hasBeautyClip && !hasNonHardCutTransition && !glesBeautyEligible) ||
             (hasOverlays && !hasNonHardCutTransition && !glesOverlayEligible && !glesBeautyEligible)
 }
 

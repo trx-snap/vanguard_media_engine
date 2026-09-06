@@ -15,13 +15,20 @@
 //                                                  second null, no transition -> success,
 //                                                  backend gles, duration ~4.0,
 //                                                  beautyClipCount 1, exact beautyFrameCount 60
-//   Lane forced_gles_beauty_transition_fail_closed: clip_A + clip_A, dissolve 0.5s, first
-//                                                  clip beauty 0.5 -> fails closed before
-//                                                  pass-1 (UNSUPPORTED_EXPORT_FEATURE /
-//                                                  gles_transition_not_eligible -- the
-//                                                  selector's transition-force seam takes
-//                                                  priority for this non-hard-cut-transition
-//                                                  scope, see AndroidExportRenderBackendSelector)
+//   Lane forced_gles_beauty_transition_dissolve_success: clip_A + clip_A copies (zero
+//                                                  rotation), dissolve 0.5s, first clip
+//                                                  beauty 0.5, second clip no beauty ->
+//                                                  success, backend gles, duration ~3.5,
+//                                                  beautyClipCount 1, exact beautyFrameCount 60
+//                                                  (P5-GLES-EXPORT-BEAUTY-TRANSITIONS: Beauty
+//                                                  V2 composited into the narrow production
+//                                                  GLES transition route, see
+//                                                  AndroidTimelineGlesTransitionVideoEncoder)
+//   Lane forced_gles_beauty_transition_dual_beauty_success: clip_A + clip_A copies (zero
+//                                                  rotation), dissolve 0.5s, both clips
+//                                                  beauty 0.5 -> success, backend gles,
+//                                                  duration ~3.5, beautyClipCount 2,
+//                                                  minimum beautyFrameCount 100
 //   Lane forced_gles_beauty_still_fail_closed    : still_C alone, beauty 0.5 -> fails closed
 //                                                  before pass-1 (UNSUPPORTED_EXPORT_FEATURE /
 //                                                  gles_beauty_not_eligible)
@@ -149,6 +156,11 @@ class _AndroidTimelineGlesBeautyExportSmokeAppState
       cleanupTargets.add(File(transitionOutPath));
       cleanupTargets.add(File('$transitionOutPath.roi.json'));
 
+      final dualBeautyTransitionOutPath =
+          '${tempDir.path}/vg_gles_beauty_export_transition_dual_$stamp.mp4';
+      cleanupTargets.add(File(dualBeautyTransitionOutPath));
+      cleanupTargets.add(File('$dualBeautyTransitionOutPath.roi.json'));
+
       final stillOutPath =
           '${tempDir.path}/vg_gles_beauty_export_still_$stamp.mp4';
       cleanupTargets.add(File(stillOutPath));
@@ -188,7 +200,7 @@ class _AndroidTimelineGlesBeautyExportSmokeAppState
           ),
         ),
         VGTimelineBeautyExportSmokeRequest(
-          laneId: 'forced_gles_beauty_transition_fail_closed',
+          laneId: 'forced_gles_beauty_transition_dissolve_success',
           clips: <VGTimelineBeautyExportSmokeClip>[
             videoClip('clip-a', clipA1.path, beautyIntensity: 0.5),
             videoClip('clip-b', clipA3.path),
@@ -205,9 +217,32 @@ class _AndroidTimelineGlesBeautyExportSmokeAppState
           outputPath: transitionOutPath,
           expectedRenderBackend: 'gles',
           debugForceRenderBackend: 'gles',
-          expectation: const VGTimelineBeautyExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: 'gles_transition_not_eligible',
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCount: 60,
+          ),
+        ),
+        VGTimelineBeautyExportSmokeRequest(
+          laneId: 'forced_gles_beauty_transition_dual_beauty_success',
+          clips: <VGTimelineBeautyExportSmokeClip>[
+            videoClip('clip-a', clipA1.path, beautyIntensity: 0.5),
+            videoClip('clip-b', clipA3.path, beautyIntensity: 0.5),
+          ],
+          transitions: const <VGTimelineBeautyExportSmokeTransition>[
+            VGTimelineBeautyExportSmokeTransition(
+              id: 'tr-dissolve-dual-beauty',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'clip-a',
+              toClipId: 'clip-b',
+            ),
+          ],
+          outputPath: dualBeautyTransitionOutPath,
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 2,
+            expectedBeautyFrameCountMin: 100,
           ),
         ),
         VGTimelineBeautyExportSmokeRequest(
