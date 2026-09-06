@@ -48,6 +48,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke",
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
             "runAndroidDagPhase6StreamSourceNodeSmoke",
+            "runAndroidDagPhase3CameraFrameSourceNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -116,6 +117,7 @@ class AndroidDagDiagnosticsCoordinator(
                 runPhase2DecodedMediaFrameSourceNodeSmoke(result)
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
             "runAndroidDagPhase6StreamSourceNodeSmoke" -> runPhase6StreamSourceNodeSmoke(result)
+            "runAndroidDagPhase3CameraFrameSourceNodeSmoke" -> runPhase3CameraFrameSourceNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -443,6 +445,48 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "STREAM_SOURCE_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase6StreamSourceNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P3-CAMERA-FRAME-SOURCE-NODE-A: platform-neutral logical DAG
+    // CameraFrameSourceNode diagnostic. Runs native lanes over the real
+    // CameraFrameSourceNode plus the real PreviewSurfaceSinkNode
+    // (construction validation, identity/port shape, cameraId/orientation/
+    // mirror/live accessors, dimension accessors, timeline-window
+    // semantics, real GraphExecutionPlan source->sink pass). Proof
+    // boundary: platform-neutral logical DAG source - no camera hardware
+    // ownership, no Android lifecycle, no product/app/editor wiring.
+    private fun runPhase3CameraFrameSourceNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase3CameraFrameSourceNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_camera_frame_source_node_logical_dag_source_no_camera_hardware_" +
+                        "ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "CAMERA_FRAME_SOURCE_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase3CameraFrameSourceNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )

@@ -33,10 +33,13 @@ target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 # DecodedAudioPcmSourceNode (owns no decoder/frame buffer/OS resource).
 # P6-STREAM-SOURCE-NODE-A: adds a producer-agnostic streaming ingest source
 # node (owns no network SDK session/decoder/frame buffer/OS resource).
+# P3-CAMERA-FRAME-SOURCE-NODE-A: adds a live camera-frame ingest source node
+# (owns no Camera2 session/HardwareBuffer/frame buffer/OS resource).
 add_library(vanguard_sources STATIC
     "sources/src/hardware_buffer_source_node.cpp"
     "sources/src/decoded_media_frame_source_node.cpp"
     "sources/src/stream_source_node.cpp"
+    "sources/src/camera_frame_source_node.cpp"
 )
 target_include_directories(vanguard_sources PUBLIC "sources/include")
 target_link_libraries(vanguard_sources PRIVATE vanguard_graph vanguard_core)
@@ -382,6 +385,15 @@ if (ANDROID)
     # state, no audio, no rendering, no product/editor/app wiring, no
     # HardwareBuffer ownership.
     "platform/android/src/android_phase6_media3_ingest_stream_source_seam_jni.cpp"
+    # P3-CAMERA-FRAME-SOURCE-NODE-A: platform-neutral logical DAG
+    # CameraFrameSourceNode diagnostic (construction validation,
+    # identity/port shape, cameraId/orientation/mirror/live accessors,
+    # dimension accessors, timeline-window semantics, real
+    # GraphExecutionPlan source->sink pass against the real
+    # PreviewSurfaceSinkNode). Diagnostic-only; no Camera2/NDK session or
+    # hardware buffer ownership, no Android lifecycle, no product/app/editor
+    # wiring.
+    "platform/android/src/android_phase3_camera_frame_source_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
