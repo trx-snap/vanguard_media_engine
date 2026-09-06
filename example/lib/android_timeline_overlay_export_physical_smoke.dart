@@ -1,8 +1,9 @@
 // android_timeline_overlay_export_physical_smoke.dart
-// Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A:
+// Vanguard Media Engine - P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A / P5-GLES-EXPORT-TRANSITION-OVERLAYS:
 // Android production `exportTimeline` static sticker, text, and emoji overlay smoke physical proof.
 //
-// Proof boundary: production_exportTimeline_vulkan_static_sticker_overlay_route_a
+// Proof boundary: production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a
+//   (covers production Vulkan overlay export and forced GLES transition-overlay route)
 //
 // Claims: dynamic keyframed static sticker overlay export
 // (P5-OVERLAYS-DYNAMIC-KEYFRAME-EXPORT), static sticker overlay compositing
@@ -15,12 +16,14 @@
 // (P5-OVERLAYS-BEAUTY-SOLO), text overlay production export via
 // rasterized RGBA texture upload (P5-OVERLAYS-TEXT-PRODUCTION-EXPORT), AND
 // emoji overlay production export via rasterized RGBA texture upload
-// (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT).
+// (P5-OVERLAYS-EMOJI-PRODUCTION-EXPORT), AND forced GLES overlay+transition export
+// (P5-GLES-EXPORT-TRANSITION-OVERLAYS).
 //
 // Strict non-claims:
 //   - All supported Vulkan transition wire types with overlays are physically
 //     proved on SM-A566B; unsupported transitions (e.g. fade) fail closed elsewhere;
-//   - No GLES overlay route;
+//   - GLES overlay export outside supported forced transition overlap scopes
+//     (Beauty/reverse/still-image/colorMatrix in GLES remain excluded/fail closed);
 //   - No realtime playback overlay compositing;
 //   - No playback, app/editor UI, product, iOS, or streaming/cache;
 //   - No fleet coverage beyond attached device;

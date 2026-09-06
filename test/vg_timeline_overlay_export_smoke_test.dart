@@ -56,6 +56,8 @@ VGTimelineOverlayExportSmokeRequest _request({
   List<VGTimelineOverlayExportSmokeTransition>? transitions,
   VGTimelineOverlayExportSmokeExpectation expectation =
       const VGTimelineOverlayExportSmokeExpectation.success(),
+  String expectedRenderBackend = 'vulkan',
+  String? debugForceRenderBackend,
 }) => VGTimelineOverlayExportSmokeRequest(
   laneId: laneId,
   clips: clips ?? <VGTimelineOverlayExportSmokeClip>[_clip('clip-1')],
@@ -63,6 +65,8 @@ VGTimelineOverlayExportSmokeRequest _request({
   transitions: transitions ?? const <VGTimelineOverlayExportSmokeTransition>[],
   outputPath: '/data/local/tmp/out_$laneId.mp4',
   expectation: expectation,
+  expectedRenderBackend: expectedRenderBackend,
+  debugForceRenderBackend: debugForceRenderBackend,
 );
 
 Map<String, Object?> _successResult({
@@ -84,8 +88,7 @@ Map<String, Object?> _successResult({
   'renderBackend': backend,
   'overlayCount': overlayCount,
   'transitionCount': transitionCount,
-  if (renderedOverlayFrameCount != null)
-    'renderedOverlayFrameCount': renderedOverlayFrameCount,
+  'renderedOverlayFrameCount': ?renderedOverlayFrameCount,
   'beautyClipCount': beautyClipCount,
   'beautyFrameCount': beautyFrameCount,
 };
@@ -112,11 +115,11 @@ void main() {
     test('canonical proof boundary and markers match specification', () {
       expect(
         overlayProofBoundary,
-        'production_exportTimeline_vulkan_static_sticker_overlay_route_a',
+        'production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a',
       );
       expect(
         VGTimelineOverlayExportSmokeReport.proofBoundary,
-        'production_exportTimeline_vulkan_static_sticker_overlay_route_a',
+        'production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a',
       );
       expect(
         overlayPassMarker,
@@ -148,7 +151,7 @@ void main() {
       expect(keyframesToken, 'keyframe');
       expect(unreadableAssetToken, 'asset');
 
-      expect(defaultOverlaySmokeLaneIds, hasLength(21));
+      expect(defaultOverlaySmokeLaneIds, hasLength(23));
       expect(defaultOverlaySmokeLaneIds, <String>[
         'single_clip_static_sticker_success',
         'multi_layer_z_order_success',
@@ -171,6 +174,8 @@ void main() {
         'overlays_with_beauty_transition_overlap_success',
         'overlays_with_beauty_solo_success',
         'fail_closed_unreadable_asset',
+        'forced_gles_overlays_with_transition_dissolve_success',
+        'forced_gles_overlays_with_transition_wipe_right_success',
       ]);
     });
   });
@@ -501,6 +506,46 @@ void main() {
         expect(sorted[3].zIndex, 5);
       },
     );
+
+    test(
+      'default request does not emit debugForceRenderBackend and still expects vulkan',
+      () {
+        final request = _request();
+        final args = request.toExportTimelineArguments();
+        final draft = args['draft'] as Map<String, Object?>;
+
+        expect(request.expectedRenderBackend, 'vulkan');
+        expect(request.debugForceRenderBackend, isNull);
+        expect(args.containsKey('debugForceRenderBackend'), isFalse);
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+      },
+    );
+
+    test(
+      "debugForceRenderBackend == 'gles' is emitted as a top-level argument, not inside draft",
+      () {
+        final request = _request(
+          expectedRenderBackend: 'gles',
+          debugForceRenderBackend: 'gles',
+        );
+        final args = request.toExportTimelineArguments();
+        final draft = args['draft'] as Map<String, Object?>;
+
+        expect(request.expectedRenderBackend, 'gles');
+        expect(request.debugForceRenderBackend, 'gles');
+        expect(args['debugForceRenderBackend'], 'gles');
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+      },
+    );
+
+    test(
+      'empty debugForceRenderBackend is omitted from toExportTimelineArguments',
+      () {
+        final request = _request(debugForceRenderBackend: '');
+        final args = request.toExportTimelineArguments();
+        expect(args.containsKey('debugForceRenderBackend'), isFalse);
+      },
+    );
   });
 
   group('lane report from export result', () {
@@ -520,7 +565,7 @@ void main() {
       expect(report.failureReason, isEmpty);
     });
 
-    test('fails when renderBackend is gles', () {
+    test('fails when renderBackend is gles on default vulkan request', () {
       final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
         _request(),
         _successResult(backend: 'gles'),
@@ -529,8 +574,66 @@ void main() {
 
       expect(report.pass, isFalse);
       expect(report.status, 'FAIL');
-      expect(report.failureReason, startsWith('render_backend_not_vulkan'));
+      expect(report.failureReason, 'render_backend_not_vulkan:gles');
     });
+
+    test(
+      'passes when expectedRenderBackend is gles and result reports gles',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectedRenderBackend: 'gles',
+            debugForceRenderBackend: 'gles',
+          ),
+          _successResult(backend: 'gles'),
+          outputExists: true,
+        );
+
+        expect(report.pass, isTrue);
+        expect(report.status, 'PASS');
+        expect(report.renderBackend, 'gles');
+        expect(report.failureReason, isEmpty);
+      },
+    );
+
+    test(
+      'fails when expectedRenderBackend is gles but result reports vulkan',
+      () {
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectedRenderBackend: 'gles',
+            debugForceRenderBackend: 'gles',
+          ),
+          _successResult(backend: 'vulkan'),
+          outputExists: true,
+        );
+
+        expect(report.pass, isFalse);
+        expect(report.status, 'FAIL');
+        expect(report.failureReason, 'render_backend_not_gles:vulkan');
+      },
+    );
+
+    test(
+      'fails when expectedRenderBackend is gles but result reports null backend',
+      () {
+        final resultWithNullBackend = Map<String, Object?>.from(
+          _successResult(),
+        )..['renderBackend'] = null;
+        final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
+          _request(
+            expectedRenderBackend: 'gles',
+            debugForceRenderBackend: 'gles',
+          ),
+          resultWithNullBackend,
+          outputExists: true,
+        );
+
+        expect(report.pass, isFalse);
+        expect(report.status, 'FAIL');
+        expect(report.failureReason, 'render_backend_not_gles:null');
+      },
+    );
 
     test('fails when output file is missing', () {
       final report = VGTimelineOverlayExportSmokeLaneReport.fromExportResult(
@@ -1241,20 +1344,50 @@ void main() {
         );
       },
     );
+
+    test(
+      'runner forwards debugForceRenderBackend at top level and passes GLES result when request expects GLES',
+      () async {
+        Map<Object?, Object?>? seenArgs;
+
+        _setMockHandler((method, args) async {
+          seenArgs = args as Map<Object?, Object?>;
+          return _successResult(backend: 'gles');
+        });
+
+        final runner = VGTimelineOverlayExportSmokeRunner(
+          channel: _channel,
+          fileExists: (_) => true,
+        );
+
+        final report = await runner.run(<VGTimelineOverlayExportSmokeRequest>[
+          _request(
+            expectedRenderBackend: 'gles',
+            debugForceRenderBackend: 'gles',
+          ),
+        ]);
+
+        expect(seenArgs!['debugForceRenderBackend'], 'gles');
+        final draft = seenArgs!['draft'] as Map<Object?, Object?>;
+        expect(draft.containsKey('debugForceRenderBackend'), isFalse);
+        expect(report.pass, isTrue);
+        expect(report.lanes.single.renderBackend, 'gles');
+      },
+    );
   });
 
   group('default suite construction', () {
-    test('buildDefaultOverlayExportSmokeSuite builds all 21 required lanes', () {
+    test('buildDefaultOverlayExportSmokeSuite builds all 23 required lanes', () {
       final suite = buildDefaultOverlayExportSmokeSuite();
 
-      expect(suite, hasLength(21));
+      expect(suite, hasLength(23));
       final laneIds = suite.map((r) => r.laneId).toList();
       expect(laneIds, defaultOverlaySmokeLaneIds);
 
       final successLanes = suite.where((r) => r.expectation.expectsSuccess);
       final failureLanes = suite.where((r) => !r.expectation.expectsSuccess);
 
-      expect(successLanes, hasLength(19));
+      expect(successLanes, hasLength(21));
       expect(failureLanes, hasLength(2));
 
       // Lane 1: single_clip_static_sticker_success
@@ -1410,6 +1543,58 @@ void main() {
       expect(lane21.laneId, 'fail_closed_unreadable_asset');
       expect(lane21.expectation.errorCode, fileUnreadableCode);
       expect(lane21.expectation.messageContains, unreadableAssetToken);
+
+      // Lane 22: forced_gles_overlays_with_transition_dissolve_success
+      final lane22 = suite[21];
+      expect(
+        lane22.laneId,
+        'forced_gles_overlays_with_transition_dissolve_success',
+      );
+      expect(lane22.expectedRenderBackend, 'gles');
+      expect(lane22.debugForceRenderBackend, 'gles');
+      expect(lane22.clips, hasLength(2));
+      expect(lane22.transitions, hasLength(1));
+      expect(lane22.transitions.single.type, 'dissolve');
+      expect(lane22.transitions.single.durationSeconds, 0.5);
+      expect(lane22.overlays, hasLength(1));
+      expect(lane22.overlays.single.startTimeSeconds, 1.5);
+      expect(lane22.overlays.single.durationSeconds, 0.5);
+      expect(lane22.expectation.expectsSuccess, isTrue);
+      expect(lane22.expectation.expectedOverlayCount, 1);
+      expect(lane22.expectation.expectedTransitionCount, 1);
+      expect(lane22.expectation.expectedRenderedOverlayFrameCount, 10);
+      expect(lane22.expectation.expectedBeautyClipCount, 0);
+      expect(lane22.expectation.expectedBeautyFrameCountMin, 0);
+      expect(lane22.expectedDurationSeconds, closeTo(3.5, 1e-9));
+      expect(lane22.expectedTransitionCount, 1);
+      final lane22Args = lane22.toExportTimelineArguments();
+      expect(lane22Args['debugForceRenderBackend'], 'gles');
+
+      // Lane 23: forced_gles_overlays_with_transition_wipe_right_success
+      final lane23 = suite[22];
+      expect(
+        lane23.laneId,
+        'forced_gles_overlays_with_transition_wipe_right_success',
+      );
+      expect(lane23.expectedRenderBackend, 'gles');
+      expect(lane23.debugForceRenderBackend, 'gles');
+      expect(lane23.clips, hasLength(2));
+      expect(lane23.transitions, hasLength(1));
+      expect(lane23.transitions.single.type, 'wipeRight');
+      expect(lane23.transitions.single.durationSeconds, 0.5);
+      expect(lane23.overlays, hasLength(1));
+      expect(lane23.overlays.single.startTimeSeconds, 1.5);
+      expect(lane23.overlays.single.durationSeconds, 0.5);
+      expect(lane23.expectation.expectsSuccess, isTrue);
+      expect(lane23.expectation.expectedOverlayCount, 1);
+      expect(lane23.expectation.expectedTransitionCount, 1);
+      expect(lane23.expectation.expectedRenderedOverlayFrameCount, 10);
+      expect(lane23.expectation.expectedBeautyClipCount, 0);
+      expect(lane23.expectation.expectedBeautyFrameCountMin, 0);
+      expect(lane23.expectedDurationSeconds, closeTo(3.5, 1e-9));
+      expect(lane23.expectedTransitionCount, 1);
+      final lane23Args = lane23.toExportTimelineArguments();
+      expect(lane23Args['debugForceRenderBackend'], 'gles');
     });
   });
 }

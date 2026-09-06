@@ -15,9 +15,13 @@ package com.connects.vanguard_media_engine.export
 // hard cuts. AndroidTimelineVulkanVideoEncoder overrides it with the
 // Vulkan-first positive route; P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A
 // adds a second, narrower override -- AndroidTimelineGlesTransitionVideoEncoder
-// -- used only for the video-only, non-reversed, non-beauty, overlay-free,
-// zero-rotation transition shape AndroidExportRenderBackendSelector.
-// ExportRenderScope.glesTransitionEligible admits.
+// -- used only for the video-only, non-reversed, non-beauty transition shape
+// AndroidExportRenderBackendSelector.
+// ExportRenderScope.glesTransitionEligible admits. P5-GLES-EXPORT-TRANSITION-
+// OVERLAYS: that shape is no longer overlay-free -- AndroidTimelineGlesTransitionVideoEncoder
+// overrides the overlay-aware [encode] overload below itself (rather than
+// inheriting this interface's fail-closed default) to composite timeline
+// overlays on that same eligible shape.
 //
 // P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: the overlay-aware [encode] overload
 // extends the backend-pass seam for timeline overlays. Its default body fails

@@ -1,5 +1,5 @@
 // vg_timeline_overlay_export_smoke.dart
-// vanguard_media_engine -- P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A:
+// vanguard_media_engine -- P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A / P5-GLES-EXPORT-TRANSITION-OVERLAYS:
 // Android production `exportTimeline` static sticker, text, and emoji overlay smoke proof model.
 //
 // Pure Dart typed model + lane runner over the REAL production
@@ -10,7 +10,8 @@
 // (`renderBackend`, `path`, `durationSeconds`, `overlayCount`).
 //
 // Contract:
-//   - Proof boundary: `production_exportTimeline_vulkan_static_sticker_overlay_route_a`;
+//   - Proof boundary: `production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a`
+//     (covering production Vulkan overlay export and forced GLES transition-overlay route);
 //   - Pass marker: `ANDROID_TIMELINE_OVERLAY_EXPORT_PHYSICAL_SMOKE_PASS`;
 //   - Fail marker: `ANDROID_TIMELINE_OVERLAY_EXPORT_PHYSICAL_SMOKE_FAIL`;
 //   - Structured JSON prefix: `ANDROID_TIMELINE_OVERLAY_EXPORT_JSON:`;
@@ -22,17 +23,20 @@
 //     overlay compositing on all supported Vulkan transition overlap frames
 //     (dissolve, crossfade, slideLeft, slideRight, slideUp, slideDown,
 //     wipeLeft, wipeRight, wipeUp, wipeDown) under P5-OVERLAYS-ALL-SUPPORTED-TRANSITION-DIRECTIONS-PROOF
-//     (closing unproved transition directions/types under P5-OVERLAYS-TRANS), and
+//     (closing unproved transition directions/types under P5-OVERLAYS-TRANS),
 //     overlays alongside clip-level Beauty V2 on both transition-overlap frames
 //     (P5-OVERLAYS-BEAUTY-TRANSITION-OVERLAP-ONLY) and solo frames
-//     (P5-OVERLAYS-BEAUTY-SOLO);
+//     (P5-OVERLAYS-BEAUTY-SOLO), and forced GLES transition-overlay export
+//     (P5-GLES-EXPORT-TRANSITION-OVERLAYS);
 //   - Unsupported transition types (e.g. fade) fail closed elsewhere because
 //     fade-through-black semantics are unsupported;
-//   - Strict non-claims: GLES overlay export, realtime playback overlay compositing,
-//     app/editor/product/iOS/streaming-cache, fleet coverage beyond tested device,
-//     or pixel-quality typography/emoji glyph guarantees;
+//   - Strict non-claims: GLES overlay export outside supported forced transition
+//     overlap scopes (Beauty/reverse/still-image/colorMatrix in GLES remain excluded/fail closed),
+//     realtime playback overlay compositing, app/editor/product/iOS/streaming-cache,
+//     fleet coverage beyond tested device, or pixel-quality typography/emoji glyph guarantees;
 //   - Validates success lanes: `success == true`, output file exists,
-//     `renderBackend == 'vulkan'`, duration within 0.25s tolerance (transition-aware:
+//     `renderBackend == expectedRenderBackend` (`'vulkan'` by default or `'gles'` for forced GLES lanes),
+//     duration within 0.25s tolerance (transition-aware:
 //     clip trim-window sum minus non-hard-cut transition overlap durations, unaffected
 //     by overlay intervals), `overlayCount`/`transitionCount` matching expectation when
 //     present, `renderedOverlayFrameCount` meeting a lane's minimum when specified
@@ -51,7 +55,7 @@ import 'package:flutter/services.dart';
 
 /// Canonical proof boundary string.
 const String overlayProofBoundary =
-    'production_exportTimeline_vulkan_static_sticker_overlay_route_a';
+    'production_exportTimeline_vulkan_overlay_and_forced_gles_transition_overlay_route_a';
 
 /// Canonical PASS marker.
 const String overlayPassMarker =
@@ -88,7 +92,8 @@ const String keyframesToken = 'keyframe';
 /// Fail-closed token for unreadable sticker assets.
 const String unreadableAssetToken = 'asset';
 
-/// Default lane IDs for the full Route-A static sticker, text, and emoji overlay smoke suite.
+/// Default lane IDs for the full Route-A static sticker, text, and emoji overlay smoke suite,
+/// including forced-GLES transition+overlay proof lanes (P5-GLES-EXPORT-TRANSITION-OVERLAYS).
 const List<String> defaultOverlaySmokeLaneIds = <String>[
   'single_clip_static_sticker_success',
   'multi_layer_z_order_success',
@@ -111,6 +116,8 @@ const List<String> defaultOverlaySmokeLaneIds = <String>[
   'overlays_with_beauty_transition_overlap_success',
   'overlays_with_beauty_solo_success',
   'fail_closed_unreadable_asset',
+  'forced_gles_overlays_with_transition_dissolve_success',
+  'forced_gles_overlays_with_transition_wipe_right_success',
 ];
 
 /// One clip of a smoke draft (wire shape of VGClipDescriptor.toMap()).
@@ -364,6 +371,8 @@ class VGTimelineOverlayExportSmokeRequest {
     required this.expectation,
     this.overlays = const <VGTimelineOverlayExportSmokeOverlay>[],
     this.transitions = const <VGTimelineOverlayExportSmokeTransition>[],
+    this.expectedRenderBackend = 'vulkan',
+    this.debugForceRenderBackend,
     this.canvasWidth = 720,
     this.canvasHeight = 1280,
     this.fps = 30,
@@ -376,6 +385,17 @@ class VGTimelineOverlayExportSmokeRequest {
   final List<VGTimelineOverlayExportSmokeTransition> transitions;
   final String outputPath;
   final VGTimelineOverlayExportSmokeExpectation expectation;
+
+  /// The `renderBackend` a successful lane must report. Defaults to `'vulkan'`,
+  /// preserving every existing lane's behavior; a GLES proof lane sets this to
+  /// `'gles'` alongside [debugForceRenderBackend].
+  final String expectedRenderBackend;
+
+  /// Optional top-level `debugForceRenderBackend` export argument. Emitted by
+  /// [toExportTimelineArguments] only when non-null and non-empty, and always as a
+  /// top-level argument -- never inside `draft`.
+  final String? debugForceRenderBackend;
+
   final int canvasWidth;
   final int canvasHeight;
   final int fps;
@@ -442,6 +462,8 @@ class VGTimelineOverlayExportSmokeRequest {
     'width': canvasWidth,
     'height': canvasHeight,
     'fps': fps,
+    if (debugForceRenderBackend != null && debugForceRenderBackend!.isNotEmpty)
+      'debugForceRenderBackend': debugForceRenderBackend,
   };
 }
 
@@ -566,8 +588,9 @@ class VGTimelineOverlayExportSmokeLaneReport {
       failure = 'result_path_missing';
     } else if (!outputExists) {
       failure = 'output_file_missing';
-    } else if (backend != 'vulkan') {
-      failure = 'render_backend_not_vulkan:${backend ?? 'null'}';
+    } else if (backend != request.expectedRenderBackend) {
+      failure =
+          'render_backend_not_${request.expectedRenderBackend}:${backend ?? 'null'}';
     } else if (duration == null) {
       failure = 'result_duration_missing';
     } else if ((duration - expectedDuration).abs() >
@@ -914,6 +937,8 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
   required String clipPathB,
   required String stickerAssetPath,
   required String Function(String) outputPath,
+  String expectedRenderBackend = 'vulkan',
+  String? debugForceRenderBackend,
 }) {
   return VGTimelineOverlayExportSmokeRequest(
     laneId: laneId,
@@ -958,6 +983,8 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
       ),
     ],
     outputPath: outputPath(laneId),
+    expectedRenderBackend: expectedRenderBackend,
+    debugForceRenderBackend: debugForceRenderBackend,
     expectation: const VGTimelineOverlayExportSmokeExpectation.success(
       expectedOverlayCount: 1,
       expectedTransitionCount: 1,
@@ -968,7 +995,8 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
   );
 }
 
-/// Builds the default suite of 21 Route-A static sticker, text, and emoji overlay smoke requests:
+/// Builds the default suite of 23 static sticker, text, and emoji overlay smoke requests,
+/// covering Vulkan Route-A and forced GLES transition-overlay scopes (P5-GLES-EXPORT-TRANSITION-OVERLAYS):
 /// 1. `single_clip_static_sticker_success`
 /// 2. `multi_layer_z_order_success`
 /// 3. `time_interval_gating_success`
@@ -990,6 +1018,8 @@ VGTimelineOverlayExportSmokeRequest _buildOverlayTransitionLane({
 /// 19. `overlays_with_beauty_transition_overlap_success`
 /// 20. `overlays_with_beauty_solo_success`
 /// 21. `fail_closed_unreadable_asset`
+/// 22. `forced_gles_overlays_with_transition_dissolve_success`
+/// 23. `forced_gles_overlays_with_transition_wipe_right_success`
 List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
   String clipPathA = '/data/local/tmp/clip_a.mov',
   String clipPathB = '/data/local/tmp/clip_b.mov',
@@ -1584,6 +1614,30 @@ List<VGTimelineOverlayExportSmokeRequest> buildDefaultOverlayExportSmokeSuite({
         errorCode: fileUnreadableCode,
         messageContains: unreadableAssetToken,
       ),
+    ),
+
+    // Lane 22: forced_gles_overlays_with_transition_dissolve_success
+    _buildOverlayTransitionLane(
+      laneId: 'forced_gles_overlays_with_transition_dissolve_success',
+      transitionType: 'dissolve',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+      expectedRenderBackend: 'gles',
+      debugForceRenderBackend: 'gles',
+    ),
+
+    // Lane 23: forced_gles_overlays_with_transition_wipe_right_success
+    _buildOverlayTransitionLane(
+      laneId: 'forced_gles_overlays_with_transition_wipe_right_success',
+      transitionType: 'wipeRight',
+      clipPathA: clipPathA,
+      clipPathB: clipPathB,
+      stickerAssetPath: stickerAssetPath,
+      outputPath: outputPath,
+      expectedRenderBackend: 'gles',
+      debugForceRenderBackend: 'gles',
     ),
   ];
 }

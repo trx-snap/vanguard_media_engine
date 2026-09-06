@@ -30,10 +30,11 @@ import kotlin.math.sin
 // timeline, used ONLY when AndroidExportRenderBackendSelector resolves the
 // GLES backend for a scope that is
 // [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible]
-// (video-only clips, no reversed clip, no clip-level Beauty V2, no overlays,
+// (video-only clips, no reversed clip, no clip-level Beauty V2,
 // positive decoded/requested dimensions, standard 0/90/180/270 rotation
-// metadata on every clip) -- AndroidTimelineExportSession only ever constructs this class for
-// that shape; see its `buildPass1Encoder`. This class defensively
+// metadata on every clip -- overlays are permitted, see the
+// P5-GLES-EXPORT-TRANSITION-OVERLAYS paragraph below) -- AndroidTimelineExportSession
+// only ever constructs this class for that shape; see its `buildPass1Encoder`. This class defensively
 // re-validates that same narrow shape per clip (see [validateClipShape]) and
 // fails closed with a precise `gles_transition_not_eligible:<reason>` reason
 // if it is ever handed something outside it, rather than trusting the caller
@@ -80,6 +81,24 @@ import kotlin.math.sin
 // segment loop checks it between segments, and both
 // [AndroidTimelineGlesTransitionOverlapDecoder]'s pipelines check it on every
 // decode step.
+//
+// P5-GLES-EXPORT-TRANSITION-OVERLAYS: this class also composites static
+// timeline overlays for the same narrow scope, now that
+// [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible]
+// no longer excludes overlays -- see the overlay-aware four-arg [encode]
+// override. Overlay textures are uploaded once via
+// [AndroidTimelineGlesOverlayRenderSession.prepare] right after [setupGl]
+// succeeds (on this class's own EGL context), then composited on top of
+// every solo and transition-pair frame drawn to the encoder's own default
+// framebuffer (see [compositeActiveOverlaysIfPresent]), before that frame's
+// presentation timestamp is set and it is swapped -- reusing the same GLES
+// overlay compositing route (AndroidTimelineGlesOverlayRenderSession and the
+// native overlay bridge) AndroidTimelineVideoEncoder's hard-cut path already
+// uses, rather than building a new one. Beauty, reversed, still-image, and
+// colorMatrix clips remain outside this route's scope even when overlays are
+// also requested -- [validateClipShape] and
+// [AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionIneligibleReason]
+// both still reject those independently of [encode]'s `overlays` argument.
 internal class AndroidTimelineGlesTransitionVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -114,6 +133,15 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var glMajorVersion = 2
+
+    // ─── GLES overlay compositing state (P5-GLES-EXPORT-TRANSITION-OVERLAYS) ─
+    // Populated only by the overlay-aware four-arg [encode] override below,
+    // before setup and per-segment rendering; reset in [releaseAll] so a
+    // reused encoder instance never carries over a prior call's overlay
+    // session or frame count.
+    private var pendingOverlays: List<AndroidTimelineOverlayDescriptor> = emptyList()
+    private var glesOverlaySession: AndroidTimelineGlesOverlayRenderSession? = null
+    private var overlayFramesRendered = 0
 
     // Single OES program used both for the solo draw (straight to the
     // encoder's EGL surface) and the overlap pre-resolve draw (into an
@@ -156,8 +184,25 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         clips: List<AndroidTimelineVideoEncoder.ClipInput>,
         transitions: List<AndroidTimelineTransitionDescriptor>,
         onProgress: ((Double) -> Unit)?,
+    ): AndroidTimelineVideoEncoder.EncodeResult = encode(clips, transitions, emptyList(), onProgress)
+
+    /// P5-GLES-EXPORT-TRANSITION-OVERLAYS: overlay-aware entry point and the
+    /// actual implementation for this encoder -- both the plain hard-cut
+    /// two-arg [encode] overload and the transition-aware three-arg overload
+    /// above delegate here with an empty [overlays] list, so this override
+    /// (rather than [AndroidTimelineVideoPassEncoder]'s fail-closed default)
+    /// is what runs for every call. A non-empty [overlays] is uploaded once
+    /// via [AndroidTimelineGlesOverlayRenderSession.prepare] right after
+    /// [setupGl] succeeds, then composited on top of every solo/transition-
+    /// pair frame (see [compositeActiveOverlaysIfPresent]).
+    override fun encode(
+        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
+        transitions: List<AndroidTimelineTransitionDescriptor>,
+        overlays: List<AndroidTimelineOverlayDescriptor>,
+        onProgress: ((Double) -> Unit)?,
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
+        pendingOverlays = overlays
         var succeeded = false
         var muxerStoppedCleanly = false
         var reason = "not_run"
@@ -175,6 +220,23 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             setupEncoderAndMuxer()
             setupGl()
 
+            if (pendingOverlays.isNotEmpty()) {
+                when (
+                    val prepareResult = AndroidTimelineGlesOverlayRenderSession.prepare(pendingOverlays) { cancelRequested }
+                ) {
+                    is AndroidTimelineGlesOverlayRenderSession.PrepareResult.Failure -> {
+                        reason = "overlay_prepare_failed:${prepareResult.code}:${prepareResult.message}"
+                        return AndroidTimelineVideoEncoder.EncodeResult(
+                            false, reason, writtenVideoSamples, 0L,
+                            overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
+                        )
+                    }
+                    is AndroidTimelineGlesOverlayRenderSession.PrepareResult.Success -> {
+                        glesOverlaySession = prepareResult.session
+                    }
+                }
+            }
+
             for (segment in plan.segments) {
                 if (cancelRequested) break
                 val failure = when (segment) {
@@ -185,7 +247,8 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                     if (cancelRequested) break
                     reason = failure
                     return AndroidTimelineVideoEncoder.EncodeResult(
-                        false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                        false, reason, writtenVideoSamples, 0L,
+                        overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                     )
                 }
             }
@@ -193,7 +256,8 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             if (cancelRequested) {
                 reason = "cancelled"
                 return AndroidTimelineVideoEncoder.EncodeResult(
-                    false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                    false, reason, writtenVideoSamples, 0L,
+                    overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
 
@@ -202,21 +266,24 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             if (!eosObserved) {
                 reason = "encoder_eos_drain_timeout"
                 return AndroidTimelineVideoEncoder.EncodeResult(
-                    false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                    false, reason, writtenVideoSamples, 0L,
+                    overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
 
             if (writtenVideoSamples != framesSubmitted) {
                 reason = "gles_transition_sample_count_mismatch:written=$writtenVideoSamples:rendered=$framesSubmitted"
                 return AndroidTimelineVideoEncoder.EncodeResult(
-                    false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                    false, reason, writtenVideoSamples, 0L,
+                    overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
 
             if (!muxerStarted || writtenVideoSamples <= 0) {
                 reason = "no_video_samples_written"
                 return AndroidTimelineVideoEncoder.EncodeResult(
-                    false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                    false, reason, writtenVideoSamples, 0L,
+                    overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
 
@@ -228,7 +295,8 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             if (outSize <= 0L) {
                 reason = "output_file_empty_or_missing"
                 return AndroidTimelineVideoEncoder.EncodeResult(
-                    false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                    false, reason, writtenVideoSamples, 0L,
+                    overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
                 )
             }
 
@@ -238,16 +306,18 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 TAG,
                 "VG_GLES_TRANSITION_ENCODE_RESULT status=success rendered=$framesSubmitted " +
                     "written=$writtenVideoSamples outputSize=$outSize transitions=${nonHardCutTransitions.size} " +
-                    "glMajorVersion=$glMajorVersion",
+                    "overlayFrames=$overlayFramesRendered glMajorVersion=$glMajorVersion",
             )
             return AndroidTimelineVideoEncoder.EncodeResult(
-                true, reason, writtenVideoSamples, outSize, glMajorVersion = glMajorVersion,
+                true, reason, writtenVideoSamples, outSize,
+                overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
             )
         } catch (t: Throwable) {
             reason = "exception:${t.javaClass.simpleName}"
             Log.e(TAG, "encode failed: $t", t)
             return AndroidTimelineVideoEncoder.EncodeResult(
-                false, reason, writtenVideoSamples, 0L, glMajorVersion = glMajorVersion,
+                false, reason, writtenVideoSamples, 0L,
+                overlayFrameCount = overlayFramesRendered, glMajorVersion = glMajorVersion,
             )
         } finally {
             if (muxerStarted && !muxerStoppedCleanly) {
@@ -444,6 +514,9 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         val drawFailure = drawOesQuad(slot, quad)
         if (drawFailure != null) return "gles_transition_draw_failed:solo:$drawFailure"
 
+        val overlayFailure = compositeActiveOverlaysIfPresent()
+        if (overlayFailure != null) return overlayFailure
+
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, framesSubmitted * frameDurationUs * 1000L)
         framesSubmitted++
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
@@ -489,6 +562,9 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         if (!status.startsWith("status=OK")) {
             return "gles_transition_render_failed:$status"
         }
+
+        val overlayFailure = compositeActiveOverlaysIfPresent()
+        if (overlayFailure != null) return overlayFailure
 
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, framesSubmitted * frameDurationUs * 1000L)
         framesSubmitted++
@@ -544,6 +620,29 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
 
         val err = GLES20.glGetError()
         return if (err == GLES20.GL_NO_ERROR) null else "gl_error:$err"
+    }
+
+    /// P5-GLES-EXPORT-TRANSITION-OVERLAYS: composites every overlay active
+    /// at this frame's timeline instant (`framesSubmitted * frameDurationUs`)
+    /// via [glesOverlaySession], when one is prepared -- a legal no-op when
+    /// it is null (no overlays for this encode call) or when no overlay is
+    /// active at this instant. Callers must invoke this after the base solo
+    /// or transition-pair draw, while framebuffer 0 is still bound/current,
+    /// and before `eglPresentationTimeANDROID`/`framesSubmitted++`/
+    /// `eglSwapBuffers` -- see [drawSoloFrameFromSlot] and
+    /// [drawTransitionPair]. Returns a machine-readable failure reason on
+    /// any failure (the frame is never presented/swapped with a
+    /// silently-dropped overlay), or null on success.
+    private fun compositeActiveOverlaysIfPresent(): String? {
+        val session = glesOverlaySession ?: return null
+        val timelinePtsUs = framesSubmitted.toLong() * frameDurationUs
+        return when (val result = session.drawActiveOverlays(nativeBridge, timelinePtsUs, width, height)) {
+            is AndroidTimelineGlesOverlayRenderSession.DrawResult.Success -> {
+                if (result.activeOverlayCount > 0) overlayFramesRendered++
+                null
+            }
+            is AndroidTimelineGlesOverlayRenderSession.DrawResult.Failure -> "overlay_draw_failed:${result.reason}"
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -775,6 +874,10 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {
             try {
                 EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+                // Close before GL texture/FBO/program teardown --
+                // glesOverlaySession.close() deletes GL textures and
+                // requires this same context still current.
+                glesOverlaySession?.close()
                 if (oesProgram != 0) GLES20.glDeleteProgram(oesProgram)
                 if (fromResolveFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(fromResolveFboId), 0)
                 if (toResolveFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(toResolveFboId), 0)
@@ -784,6 +887,13 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 toSlot.release()
             } catch (_: Throwable) {}
         }
+        // Reset regardless of whether GL setup ever ran this call, so a
+        // reused encoder instance can never composite a stale (already
+        // closed) overlay session or carry over a prior call's overlay
+        // frame count / pending overlay list into its next encode() call.
+        glesOverlaySession = null
+        overlayFramesRendered = 0
+        pendingOverlays = emptyList()
 
         try { encoderInputSurface?.release() } catch (_: Throwable) {}
 
