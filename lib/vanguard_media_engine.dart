@@ -349,6 +349,8 @@ export 'vg_streaming_compatibility_decision_client.dart';
 export 'vg_streaming_preflight_composite_evaluator.dart';
 // P1-GPU-BLACKLIST: GPU driver blacklist rule evaluator.
 export 'src/diagnostics/vg_gpu_driver_blacklist.dart';
+// P1-GLES-CAPABILITY-FLAG-SURFACE-PUBLIC-DART-A: public backend capability diagnostics surface.
+export 'vg_backend_capability_client.dart';
 export 'vg_camerax_thermal_fps_bridge.dart';
 // P3-CAM-THERMAL-ACT-DART-CALLBACK-CAMERAX-WIRING: Dart thermal callback path to verified CameraX FPS actuator coordinator.
 export 'vg_camerax_thermal_load_shedding_coordinator.dart';
