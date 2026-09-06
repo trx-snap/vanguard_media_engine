@@ -55,6 +55,9 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
       final clipBytes = await rootBundle.load(
         'assets/manual_test_clips/clip_B.mov',
       );
+      final reversedClipBytes = await rootBundle.load(
+        'assets/manual_test_clips/clip_A.mov',
+      );
       final stickerBytes = await rootBundle.load(
         'assets/manual_test_clips/still_C.png',
       );
@@ -68,6 +71,15 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
         clipBytes.buffer.asUint8List(
           clipBytes.offsetInBytes,
           clipBytes.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      final reversedVideoFile = File('${tempDir.path}/clip_A.mov');
+      await reversedVideoFile.writeAsBytes(
+        reversedClipBytes.buffer.asUint8List(
+          reversedClipBytes.offsetInBytes,
+          reversedClipBytes.lengthInBytes,
         ),
         flush: true,
       );
@@ -89,6 +101,7 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
             videoPath: videoFile.path,
             stickerPath: stickerFile.path,
             outputDir: outDir.path,
+            reversedVideoPath: reversedVideoFile.path,
             timeout: const Duration(seconds: 30),
           ).timeout(const Duration(seconds: 40));
 
@@ -126,10 +139,22 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
         'stillImageOverlayFrameCount=${report.details['stillImageOverlayFrameCount']}',
       );
       print(
+        '${_logPrefix}_LANE_REVERSED_VIDEO_OVERLAY: reversedVideoOverlayEncodeOk=${report.reversedVideoOverlayEncodePass} '
+        'reversedVideoPath=${report.details['reversedVideoPath']} '
+        'reversedSourceWidth=${report.details['reversedSourceWidth']} '
+        'reversedSourceHeight=${report.details['reversedSourceHeight']} '
+        'reversedSourceRotation=${report.details['reversedSourceRotation']} '
+        'reversedSourceDurationUs=${report.details['reversedSourceDurationUs']} '
+        'reversedOverlayReason=${report.details['reversedOverlayReason']} '
+        'reversedOverlaySamples=${report.details['reversedOverlayWrittenSamples']} '
+        'reversedOverlayFrameCount=${report.details['reversedOverlayFrameCount']}',
+      );
+      print(
         '${_logPrefix}_LANE_GL_MAJOR_VERSION: glMajorVersionOk=${report.glMajorVersionOkPass} '
         'baselineGlMajorVersion=${report.baselineGlMajorVersion} '
         'overlayGlMajorVersion=${report.overlayGlMajorVersion} '
         'stillImageOverlayGlMajorVersion=${report.stillImageOverlayGlMajorVersion} '
+        'reversedOverlayGlMajorVersion=${report.reversedOverlayGlMajorVersion} '
         'expectedPhysicalMinGlMajorVersion=${report.expectedPhysicalMinGlMajorVersion} '
         'details=${report.glMajorVersionDetails}',
       );
@@ -163,7 +188,8 @@ class _AndroidGlesExportOverlayProductionPhysicalSmokeAppState
 
       final payload = <String, dynamic>{
         'unit': 'AndroidGlesExportOverlayProductionSmokeHarness',
-        'slice': 'P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A',
+        'slice':
+            'P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A,P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS',
         'target':
             VGGlesExportOverlayProductionSmokeReport.proofBoundaryConstant,
         'pass': pass,

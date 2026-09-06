@@ -26,9 +26,9 @@
 //   Lane reversed_transition          : a reversed clip alongside a non-empty
 //                                       transition list -> fail closed with
 //                                       UNSUPPORTED_EXPORT_FEATURE.
-//   Lane reversed_overlay             : a reversed clip alongside a sticker
-//                                       overlay -> fail closed with
-//                                       UNSUPPORTED_EXPORT_FEATURE.
+//   Lane reversed_overlay             : a reversed clip (clip_A, zero
+//                                       rotation) alongside a sticker overlay
+//                                       -> success, renderBackend=gles.
 //   Lane reversed_beauty              : a reversed clip with clip-level Beauty V2
 //                                       -> fail closed with
 //                                       UNSUPPORTED_EXPORT_FEATURE.
@@ -218,10 +218,7 @@ class _AndroidTimelineReverseExportSmokeAppState
             ),
           ],
           outputPath: '${workDir.path}/vg_reverse_export_overlay_$stamp.mp4',
-          expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: reversedClipsWithOverlaysToken,
-          ),
+          expectation: const VGTimelineReverseExportSmokeExpectation.success(),
         ),
         VGTimelineReverseExportSmokeRequest(
           laneId: 'reversed_beauty',

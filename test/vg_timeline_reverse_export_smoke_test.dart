@@ -110,7 +110,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedTransition() =>
       ),
     );
 
-// (e) reversed + overlay fail closed.
+// (e) reversed + overlay succeeds via the GLES overlay route.
 VGTimelineReverseExportSmokeRequest _laneReversedOverlay() =>
     VGTimelineReverseExportSmokeRequest(
       laneId: 'reversed_overlay',
@@ -124,10 +124,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedOverlay() =>
         ),
       ],
       outputPath: '/data/local/tmp/out_reversed_overlay.mp4',
-      expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: reversedClipsWithOverlaysToken,
-      ),
+      expectation: const VGTimelineReverseExportSmokeExpectation.success(),
     );
 
 // (f) reversed + beauty fail closed.
@@ -306,6 +303,8 @@ void main() {
     test('(e) reversed + overlay arguments carry a non-empty list', () {
       final args = _laneReversedOverlay().toExportTimelineArguments();
       final draft = args['draft'] as Map<String, Object?>;
+      final clips = draft['clips'] as List<Object?>;
+      expect((clips[0] as Map)['isReversed'], isTrue);
       expect(draft['overlays'], hasLength(1));
       expect((draft['overlays'] as List).single, isA<Map>());
     });
@@ -375,6 +374,22 @@ void main() {
       );
       expect(report.pass, isTrue);
       expect(report.renderBackend, expectedReverseRenderBackend);
+    });
+
+    test('(e) reversed + overlay passes with gles, output exists, duration '
+        'within tolerance', () {
+      final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+        _laneReversedOverlay(),
+        _successResult(
+          duration: 2.0,
+          path: '/data/local/tmp/out_reversed_overlay.mp4',
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, expectedReverseRenderBackend);
+      expect(report.outputExists, isTrue);
     });
 
     test('(g) reversed + audioSidecar with valid timing passes with gles '
@@ -480,16 +495,17 @@ void main() {
       );
     });
 
-    test('(e) reversed + overlay requires the overlays token', () {
-      final report = VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
-        _laneReversedOverlay(),
-        PlatformException(
-          code: unsupportedExportFeatureCode,
-          message:
-              'exportTimeline: reversed clips with overlays are not supported',
-        ),
+    test('(e) reversed + overlay that unexpectedly throws fails', () {
+      final report =
+          VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
+            _laneReversedOverlay(),
+            PlatformException(code: 'EXPORT_FAILED', message: 'pass-1 failed'),
+          );
+      expect(report.pass, isFalse);
+      expect(
+        report.failureReason,
+        'unexpected_platform_exception:EXPORT_FAILED',
       );
-      expect(report.pass, isTrue);
     });
 
     test('(f) reversed + beauty requires the Beauty V2 token', () {

@@ -28,10 +28,14 @@
 //     is simply the sum of every clip's trim window;
 //   - isReversed=true on a non-video (image) clip fails closed with
 //     INVALID_ARG (message contains both "isReversed" and "video");
-//   - a reversed clip alongside any transition, any overlay, or any
-//     clip-level Beauty V2 fails closed with UNSUPPORTED_EXPORT_FEATURE
-//     before pass-1 -- there is no positive production shape for those
-//     combinations in this slice;
+//   - a reversed clip alongside any transition, or any clip-level Beauty V2,
+//     fails closed with UNSUPPORTED_EXPORT_FEATURE before pass-1 -- there is
+//     no positive production shape for those combinations in this slice;
+//   - P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a hard-cut, zero-rotation
+//     reversed video clip alongside timeline overlays is a supported
+//     production shape -- it routes through the same GLES overlay route
+//     (renderBackend == 'gles') a still-image clip with overlays already
+//     uses;
 //   - P5-REVERSE-AUDIO-SIDECAR-EXPORT: a reversed hard-cut timeline
 //     carrying draft.audioSidecar tracks is admitted -- not blanket-
 //     rejected -- when every track's timing fits the reversed timeline's
@@ -71,9 +75,6 @@ const String reversedClipVideoToken = 'video';
 /// Message token for a reversed clip alongside a non-empty transition list.
 const String reversedClipsWithTransitionsToken =
     'reversed clips with transitions';
-
-/// Message token for a reversed clip alongside a non-empty overlay list.
-const String reversedClipsWithOverlaysToken = 'reversed clips with overlays';
 
 /// Message token for a reversed clip alongside clip-level Beauty V2.
 const String reversedClipsWithBeautyToken = 'reversed clips with Beauty V2';
@@ -168,10 +169,10 @@ class VGTimelineReverseExportSmokeTransition {
   };
 }
 
-/// One sticker overlay entry for a fail-closed "reversed + overlays" lane
-/// (wire shape of VGOverlayDescriptor.toMap()) -- this slice never accepts
-/// a non-empty overlay list alongside a reversed clip, so no positive lane
-/// ever carries one.
+/// One sticker overlay entry for a "reversed + overlays" lane (wire shape of
+/// VGOverlayDescriptor.toMap()) -- a hard-cut, zero-rotation reversed video
+/// clip alongside a non-empty overlay list is a supported production shape
+/// (P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS), so a positive lane may carry one.
 @immutable
 class VGTimelineReverseExportSmokeOverlay {
   const VGTimelineReverseExportSmokeOverlay({

@@ -46,11 +46,13 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 //
 // P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A, narrowed by
 // P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A and extended by
-// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: a scope carrying non-empty overlays
+// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS and
+// P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a scope carrying non-empty overlays
 // requires Vulkan UNLESS it is [ExportRenderScope.glesOverlayEligible]
-// (hard-cut-only transitions, no clip-level Beauty V2, no reversed clip,
-// every clip either a video or still-image clip) -- AndroidTimelineVideoEncoder
-// (GLES) composites overlays for that narrow eligible shape via
+// (hard-cut-only transitions, no clip-level Beauty V2, every clip either a
+// video or still-image clip -- a reversed video clip is admitted here) --
+// AndroidTimelineVideoEncoder (GLES) composites overlays for that narrow
+// eligible shape via
 // AndroidTimelineGlesOverlayRenderSession, reusing its existing still-image
 // GL_TEXTURE_2D base draw path for still-image clips. When Vulkan cannot be
 // selected for a scope whose overlays fall outside that eligible shape,
@@ -232,24 +234,43 @@ data class ExportRenderScope(
     val hasOverlays: Boolean get() = overlays.isNotEmpty()
 
     /// P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A, extended by
-    /// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: true when the scope's overlays
+    /// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS and
+    /// P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: true when the scope's overlays
     /// can be composited by the GLES export route
     /// (AndroidTimelineVideoEncoder + AndroidTimelineGlesOverlayRenderSession)
     /// instead of requiring Vulkan -- hard-cut-only transitions, no
-    /// clip-level Beauty V2, no reversed clip, and every clip is either a
-    /// video or still-image clip (AndroidTimelineVideoEncoder reuses its
-    /// existing still-image GL_TEXTURE_2D base draw path and composites
-    /// overlays on top via the same AndroidTimelineGlesOverlayRenderSession
-    /// route video clips use). This predicate is hard-cut-only by
+    /// clip-level Beauty V2, and every clip is either a video or still-image
+    /// clip (AndroidTimelineVideoEncoder reuses its existing still-image
+    /// GL_TEXTURE_2D base draw path and composites overlays on top via the
+    /// same AndroidTimelineGlesOverlayRenderSession route video clips use).
+    /// P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a reversed video clip is no
+    /// longer excluded here -- [AndroidTimelineVideoEncoder]'s
+    /// `renderReversedClipIntoEncoder` shares the same still-image 2D draw
+    /// path ([AndroidTimelineVideoEncoder.drawAndSubmitFrame2D]) and
+    /// [AndroidTimelineVideoEncoder.compositeActiveOverlaysIfPresent] route a
+    /// still-image clip already uses on this GLES encoder, so a hard-cut,
+    /// non-Beauty, video/still-image scope carrying a reversed video clip is
+    /// exactly as eligible as one without. This predicate is hard-cut-only by
     /// definition (`!hasNonHardCutTransition`) and stays that way under
     /// P5-GLES-EXPORT-TRANSITION-OVERLAYS -- a scope whose overlays are
     /// paired with a non-hard-cut transition is instead evaluated via
     /// [glesTransitionEligible], which independently admits overlays for
     /// that shape; see [requiresVulkan] for how the two predicates combine.
+    /// Note that [glesTransitionEligible] and [glesBeautyEligible] still
+    /// exclude a reversed clip via their own
+    /// `clips.any { it.isReversed }` checks -- this slice narrowly widens
+    /// only the hard-cut overlay route, and only for a reversed clip that is
+    /// itself a zero-rotation video clip: a reversed clip is admitted here
+    /// only when its `mediaKind == "video"` AND `rotationDegrees == 0` --
+    /// a reversed still image (already rejected upstream at parse time, but
+    /// checked again here defensively) or a reversed clip carrying rotation
+    /// metadata (AndroidTimelineVideoEncoder.renderReversedClipIntoEncoder
+    /// never applies rotation) must not be silently admitted by this direct
+    /// GLES encoder route.
     val glesOverlayEligible: Boolean
         get() = hasOverlays && !hasNonHardCutTransition && !hasBeautyClip &&
-            clips.none { it.isReversed } &&
-            clips.all { it.mediaKind == "video" || it.mediaKind == "image" }
+            clips.all { it.mediaKind == "video" || it.mediaKind == "image" } &&
+            clips.all { !it.isReversed || (it.mediaKind == "video" && it.rotationDegrees == 0) }
 
     /// P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A, widened by
     /// P5-GLES-EXPORT-TRANSITION-SLIDE-WIPE and

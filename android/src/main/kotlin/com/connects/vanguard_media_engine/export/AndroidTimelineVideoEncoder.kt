@@ -223,13 +223,12 @@ class AndroidTimelineVideoEncoder(
     /// empty [overlays] delegates unchanged to the transition-aware
     /// [encode]. A non-empty [overlays] is accepted only for the narrow
     /// shape [AndroidExportRenderBackendSelector.ExportRenderScope
-    /// .glesOverlayEligible] also requires -- hard-cut-only [transitions],
-    /// no reversed clip, and a non-null [nativeBridge] -- rejecting anything
-    /// wider with a precise machine-readable reason rather than silently
-    /// dropping the overlays. P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: a
-    /// still-image clip is no longer rejected here --
-    /// [renderStillClipIntoEncoder] composites overlays on its existing
-    /// GL_TEXTURE_2D base draw path via
+    /// .glesOverlayEligible] also requires -- hard-cut-only [transitions]
+    /// and a non-null [nativeBridge] -- rejecting anything wider with a
+    /// precise machine-readable reason rather than silently dropping the
+    /// overlays. P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS: a still-image clip is
+    /// no longer rejected here -- [renderStillClipIntoEncoder] composites
+    /// overlays on its existing GL_TEXTURE_2D base draw path via
     /// [drawAndSubmitFrame2D]/[compositeActiveOverlaysIfPresent], the same
     /// route video clips use. P5-GLES-EXPORT-BEAUTY-OVERLAYS: a clip
     /// carrying [ClipInput.beautyIntensity] is no longer rejected here
@@ -239,8 +238,14 @@ class AndroidTimelineVideoEncoder(
     /// [AndroidExportRenderBackendSelector.ExportRenderScope
     /// .glesBeautyEligible] (hard-cut-only, video-only, non-reversed,
     /// colorMatrix-free, zero-rotation) upstream in the selector -- this
-    /// encoder does not re-validate that shape beyond the hard-cut/reversed
-    /// checks already below.
+    /// encoder does not re-validate that shape beyond the hard-cut check
+    /// already below. P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a reversed
+    /// video clip ([ClipInput.isReversed]) is no longer rejected here either
+    /// -- it is rendered by [renderReversedClipIntoEncoder], which draws
+    /// each backwards-walked frame via [drawAndSubmitFrame2D] and then
+    /// composites overlays through that same
+    /// [compositeActiveOverlaysIfPresent] route, exactly like a still-image
+    /// clip.
     override fun encode(
         clips: List<ClipInput>,
         transitions: List<AndroidTimelineTransitionDescriptor>,
@@ -258,11 +263,27 @@ class AndroidTimelineVideoEncoder(
                 0L,
             )
         }
-        if (clips.any { it.isReversed }) {
-            return EncodeResult(false, "overlays_reversed_clip_unsupported", 0, 0L)
-        }
         if (nativeBridge == null) {
             return EncodeResult(false, "overlays_missing_native_bridge", 0, 0L)
+        }
+        // P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: defensive fail-closed check
+        // for reversed overlay shapes AndroidExportRenderBackendSelector
+        // .glesOverlayEligible and AndroidTimelineExportSession should have
+        // already excluded upstream -- a reversed non-video clip, a reversed
+        // clip carrying rotation metadata (this encoder's
+        // [renderReversedClipIntoEncoder] never applies rotation), or a
+        // reversed clip paired with clip-level Beauty V2 (no reversed+Beauty
+        // render route exists). A valid zero-rotation reversed video clip
+        // without Beauty is left untouched and reaches
+        // [renderReversedClipIntoEncoder] below exactly like today.
+        clips.firstOrNull { it.isReversed && it.mediaKind != "video" }?.let {
+            return EncodeResult(false, "reversed_overlay_non_video_unsupported:${it.sourcePath}", 0, 0L)
+        }
+        clips.firstOrNull { it.isReversed && it.rotationDegrees != 0 }?.let {
+            return EncodeResult(false, "reversed_overlay_rotation_unsupported:${it.sourcePath}", 0, 0L)
+        }
+        clips.firstOrNull { it.isReversed && it.beautyIntensity != null }?.let {
+            return EncodeResult(false, "reversed_overlay_beauty_unsupported:${it.sourcePath}", 0, 0L)
         }
         pendingOverlays = overlays
         return encode(clips, onProgress)
@@ -1262,7 +1283,8 @@ class AndroidTimelineVideoEncoder(
                     return "reverse_texture_upload_failed:$texUploadError:frame=$i:${clip.sourcePath}"
                 }
 
-                drawAndSubmitFrame2D(textureId, clip.colorMatrix)
+                val drawFailure = drawAndSubmitFrame2D(textureId, clip.colorMatrix)
+                if (drawFailure != null) return drawFailure
                 drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
                 framesRendered++
             }

@@ -45,12 +45,14 @@ import kotlin.math.floor
 //     fallback (renderReversedClipIntoEncoder) -- reversed clips never
 //     route through Vulkan (AndroidExportRenderBackendSelector /
 //     AndroidTimelineVulkanVideoEncoder both fail closed for them). A
-//     reversed clip alongside a transition, an overlay, or clip-level
-//     Beauty V2 fails closed with UNSUPPORTED_EXPORT_FEATURE before
-//     pass-1; isReversed=true on a non-video clip fails closed with
-//     INVALID_ARG. This route never reads
-//     AndroidReverseSidecarCoordinator/Transcoder output -- those sidecars
-//     remain preview/playback-only.
+//     reversed clip alongside a transition or clip-level Beauty V2 fails
+//     closed with UNSUPPORTED_EXPORT_FEATURE before pass-1; isReversed=true
+//     on a non-video clip fails closed with INVALID_ARG.
+//     P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a reversed clip alongside
+//     timeline overlays is a supported production shape -- see
+//     AndroidExportRenderBackendSelector.glesOverlayEligible. This route
+//     never reads AndroidReverseSidecarCoordinator/Transcoder output -- those
+//     sidecars remain preview/playback-only.
 //   - P5-REVERSE-AUDIO-SIDECAR-EXPORT: a reversed hard-cut timeline carrying
 //     audioSidecar tracks is admitted -- not blanket-rejected -- when every
 //     parsed track's timing is valid on the reversed timeline's total
@@ -445,11 +447,19 @@ class AndroidTimelineExportSession(private val context: Context) {
         // GLES-only production route (see AndroidTimelineVideoEncoder /
         // AndroidExportRenderBackendSelector) -- any scope that mixes a
         // reversed clip with a feature that has no reversed-clip support yet
-        // (transitions, overlays, clip-level Beauty V2) fails closed here,
-        // before transitions/overlays are even parsed, rather than silently
-        // producing wrong output. Rotation metadata on a reversed clip is
-        // checked further below (step 3), once each video clip has been
-        // probed.
+        // (transitions, clip-level Beauty V2) fails closed here, before
+        // transitions/overlays are even parsed, rather than silently
+        // producing wrong output. P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS:
+        // reversed clips with overlays are no longer blanket-rejected here --
+        // a hard-cut, zero-rotation reversed VIDEO clip renders through the
+        // same GLES overlay route a still-image clip already uses (see
+        // AndroidExportRenderBackendSelector.glesOverlayEligible and
+        // AndroidTimelineVideoEncoder.renderReversedClipIntoEncoder). A
+        // reversed non-video clip still fails closed above at parse time
+        // (isReversed is only accepted for mediaKind == "video"), and
+        // rotation metadata on a reversed clip is still checked further below
+        // (step 3), once each video clip has been probed -- both guards apply
+        // regardless of whether overlays are present.
         //
         // P5-REVERSE-AUDIO-SIDECAR-EXPORT: audioSidecar tracks are admitted
         // alongside a reversed hard-cut timeline -- not blanket-rejected --
@@ -464,13 +474,6 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError(
                     "UNSUPPORTED_EXPORT_FEATURE",
                     "exportTimeline: reversed clips with transitions are not supported",
-                )
-                return
-            }
-            if (overlays.isNotEmpty()) {
-                onError(
-                    "UNSUPPORTED_EXPORT_FEATURE",
-                    "exportTimeline: reversed clips with overlays are not supported",
                 )
                 return
             }

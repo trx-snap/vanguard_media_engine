@@ -37,7 +37,15 @@ import kotlin.math.min
  *    reusing [AndroidTimelineVideoEncoder]'s existing still-image GL_TEXTURE_2D base draw path.
  *    Verifies encode success, non-empty output, writtenVideoSamples > 0, and
  *    overlayFrameCount > 0.
- * 7. Guaranteed cleanup of all created output files.
+ * 7. Reversed video overlay lane (P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS): encodes a
+ *    zero-rotation reversed video clip ([reversedVideoPath], falling back to [videoPath])
+ *    with the same overlay set on GLES, reusing
+ *    [AndroidTimelineVideoEncoder]'s `renderReversedClipIntoEncoder` ->
+ *    `drawAndSubmitFrame2D` -> `compositeActiveOverlaysIfPresent` route. Verifies encode
+ *    success, non-empty output, writtenVideoSamples > 0, and overlayFrameCount > 0; fails
+ *    closed with a precise reason if the resolved source has invalid metadata or non-zero
+ *    rotation.
+ * 8. Guaranteed cleanup of all created output files.
  */
 class AndroidGlesExportOverlayProductionSmokeHarness {
 
@@ -65,6 +73,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         stickerPath: String?,
         outputDir: String?,
         nativeBridge: VanguardNativeBridge?,
+        reversedVideoPath: String? = null,
     ): Map<String, Any?> {
         val filesToClean = mutableListOf<File>()
 
@@ -77,6 +86,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         var pixelDeltaOk = false
         var missingBridgeRejectedOk = false
         var stillImageOverlayEncodeOk = false
+        var reversedVideoOverlayEncodeOk = false
         var glMajorVersionOk = false
         var cleanupOk = false
 
@@ -103,6 +113,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    reversedVideoOverlayEncodeOk = false,
                     glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
@@ -123,6 +134,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    reversedVideoOverlayEncodeOk = false,
                     glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
@@ -143,6 +155,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    reversedVideoOverlayEncodeOk = false,
                     glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
@@ -163,6 +176,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    reversedVideoOverlayEncodeOk = false,
                     glMajorVersionOk = false,
                     cleanupOk = true,
                     details = mapOf("error" to firstFailureReason),
@@ -175,61 +189,11 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             details["outputDir"] = outputDir
 
             // ── Gate 2: Source metadata extraction ────────────────────────────────
-            var sourceWidth = 0
-            var sourceHeight = 0
-            var sourceRotation = 0
-            var sourceDurationUs = 0L
-
-            val extractor = MediaExtractor()
-            try {
-                extractor.setDataSource(videoPath)
-                val count = extractor.trackCount
-                for (i in 0 until count) {
-                    val format = extractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("video/")) {
-                        if (format.containsKey(MediaFormat.KEY_WIDTH)) {
-                            sourceWidth = format.getInteger(MediaFormat.KEY_WIDTH)
-                        }
-                        if (format.containsKey(MediaFormat.KEY_HEIGHT)) {
-                            sourceHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
-                        }
-                        if (format.containsKey(MediaFormat.KEY_DURATION)) {
-                            sourceDurationUs = format.getLong(MediaFormat.KEY_DURATION)
-                        }
-                        if (format.containsKey(MediaFormat.KEY_ROTATION)) {
-                            sourceRotation = format.getInteger(MediaFormat.KEY_ROTATION)
-                        }
-                        break
-                    }
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "MediaExtractor read failed on $videoPath: $t")
-            } finally {
-                try { extractor.release() } catch (_: Throwable) {}
-            }
-
-            if (sourceWidth <= 0 || sourceHeight <= 0 || sourceDurationUs <= 0L) {
-                val mmr = MediaMetadataRetriever()
-                try {
-                    mmr.setDataSource(videoPath)
-                    val wStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                    val hStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                    val rotStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
-                    val durStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    if (sourceWidth <= 0 && wStr != null) sourceWidth = wStr.toIntOrNull() ?: 0
-                    if (sourceHeight <= 0 && hStr != null) sourceHeight = hStr.toIntOrNull() ?: 0
-                    if (sourceRotation == 0 && rotStr != null) sourceRotation = rotStr.toIntOrNull() ?: 0
-                    if (sourceDurationUs <= 0L && durStr != null) {
-                        val durMs = durStr.toLongOrNull() ?: 0L
-                        sourceDurationUs = durMs * 1000L
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "MediaMetadataRetriever fallback failed on $videoPath: $t")
-                } finally {
-                    try { mmr.release() } catch (_: Throwable) {}
-                }
-            }
+            val probedSource = probeVideoMetadata(videoPath)
+            val sourceWidth = probedSource.width
+            val sourceHeight = probedSource.height
+            val sourceRotation = probedSource.rotation
+            val sourceDurationUs = probedSource.durationUs
 
             sourceMetadataOk = sourceWidth > 0 && sourceHeight > 0 && sourceDurationUs > 0L
             details["sourceWidth"] = sourceWidth
@@ -251,6 +215,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     pixelDeltaOk = false,
                     missingBridgeRejectedOk = false,
                     stillImageOverlayEncodeOk = false,
+                    reversedVideoOverlayEncodeOk = false,
                     glMajorVersionOk = false,
                     cleanupOk = true,
                     details = details,
@@ -553,14 +518,91 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
                     "overlayFrames=${stillOverlayResult.overlayFrameCount}"
             }
 
-            // ── Gate 10: GL major version negotiation (P5-GLES-EXPORT-ES3-
+            // ── Gate 10: Reversed video clip with overlays succeeds on GLES
+            // (P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS) -- requires a
+            // zero-rotation source, resolved from [reversedVideoPath] when
+            // supplied, falling back to [videoPath] otherwise ─────────────
+            val reversedSourcePath = reversedVideoPath ?: videoPath
+            val reversedProbed = probeVideoMetadata(reversedSourcePath)
+            val reversedSourceMetadataOk = reversedProbed.width > 0 &&
+                reversedProbed.height > 0 &&
+                reversedProbed.durationUs > 0L
+
+            details["reversedVideoPath"] = reversedVideoPath
+            details["reversedSourceWidth"] = reversedProbed.width
+            details["reversedSourceHeight"] = reversedProbed.height
+            details["reversedSourceRotation"] = reversedProbed.rotation
+            details["reversedSourceDurationUs"] = reversedProbed.durationUs
+
+            var reversedOverlayGlMajorVersion = 2
+            val reversedOverlayFile = File(outDirFile, "p5_prod_reversed_overlay_${timestamp}.mp4")
+            filesToClean.add(reversedOverlayFile)
+
+            if (!reversedSourceMetadataOk) {
+                val reason = "reversed_overlay_source_metadata_invalid:w=${reversedProbed.width}," +
+                    "h=${reversedProbed.height},dur=${reversedProbed.durationUs}"
+                details["reversedOverlaySuccess"] = false
+                details["reversedOverlayReason"] = reason
+                if (firstFailureReason == null) firstFailureReason = reason
+            } else if (reversedProbed.rotation != 0) {
+                val reason = "reversed_overlay_source_rotation_unsupported:${reversedProbed.rotation}"
+                details["reversedOverlaySuccess"] = false
+                details["reversedOverlayReason"] = reason
+                if (firstFailureReason == null) firstFailureReason = reason
+            } else {
+                val reversedTrimEndSeconds = min(1.0, reversedProbed.durationUs / 1_000_000.0)
+                val reversedClip = AndroidTimelineVideoEncoder.ClipInput(
+                    sourcePath = reversedSourcePath,
+                    trimStartSeconds = 0.0,
+                    trimEndSeconds = reversedTrimEndSeconds,
+                    decodedWidth = reversedProbed.width,
+                    decodedHeight = reversedProbed.height,
+                    rotationDegrees = reversedProbed.rotation,
+                    mediaKind = "video",
+                    isReversed = true,
+                )
+                val reversedOverlayEncoder = AndroidTimelineVideoEncoder(
+                    outputPath = reversedOverlayFile.absolutePath,
+                    width = encodeWidth,
+                    height = encodeHeight,
+                    fps = fps,
+                    bitrateBps = bitrateBps,
+                    nativeBridge = nativeBridge,
+                )
+                val reversedOverlayResult = reversedOverlayEncoder.encode(
+                    clips = listOf(reversedClip),
+                    transitions = emptyList(),
+                    overlays = overlays,
+                )
+                reversedOverlayGlMajorVersion = reversedOverlayResult.glMajorVersion
+                reversedVideoOverlayEncodeOk = reversedOverlayResult.success &&
+                    reversedOverlayFile.exists() &&
+                    reversedOverlayFile.length() > 0L &&
+                    reversedOverlayResult.writtenVideoSamples > 0 &&
+                    reversedOverlayResult.overlayFrameCount > 0
+                details["reversedOverlaySuccess"] = reversedOverlayResult.success
+                details["reversedOverlayReason"] = reversedOverlayResult.reason
+                details["reversedOverlayWrittenSamples"] = reversedOverlayResult.writtenVideoSamples
+                details["reversedOverlayFrameCount"] = reversedOverlayResult.overlayFrameCount
+                details["reversedOverlaySizeBytes"] = reversedOverlayFile.length()
+
+                if (!reversedVideoOverlayEncodeOk && firstFailureReason == null) {
+                    firstFailureReason = "reversed_overlay_encode_failed:${reversedOverlayResult.success}:" +
+                        "${reversedOverlayResult.reason}:samples=${reversedOverlayResult.writtenVideoSamples}:" +
+                        "overlayFrames=${reversedOverlayResult.overlayFrameCount}"
+                }
+            }
+            details["reversedOverlayGlMajorVersion"] = reversedOverlayGlMajorVersion
+
+            // ── Gate 11: GL major version negotiation (P5-GLES-EXPORT-ES3-
             // CONTEXT-READINESS) ─────────────────────────────────────────────
-            // Proves the baseline, overlay, and still-image-overlay encodes
-            // all negotiated the same GL major version, and that it is at
-            // least [EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION] (3 on the
-            // current SM-A566B physical fleet device) -- a lower-bound
-            // assertion, not exact equality to 3, since a driver may promote
-            // an ES2 context request to an ES3 (or higher) context. An ES2
+            // Proves the baseline, overlay, still-image-overlay, and
+            // reversed-video-overlay encodes all negotiated the same GL
+            // major version, and that it is at least
+            // [EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION] (3 on the current
+            // SM-A566B physical fleet device) -- a lower-bound assertion,
+            // not exact equality to 3, since a driver may promote an ES2
+            // context request to an ES3 (or higher) context. An ES2
             // fallback on this device fails this gate rather than silently
             // passing the physical ES3-readiness proof.
             val baselineGlMajorVersion = baselineResult.glMajorVersion
@@ -569,8 +611,10 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             glMajorVersionOk = baselineEncodeOk &&
                 overlayEncodeOk &&
                 stillImageOverlayEncodeOk &&
+                reversedVideoOverlayEncodeOk &&
                 baselineGlMajorVersion == overlayGlMajorVersion &&
                 baselineGlMajorVersion == stillImageOverlayGlMajorVersion &&
+                baselineGlMajorVersion == reversedOverlayGlMajorVersion &&
                 baselineGlMajorVersion >= EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION
             details["baselineGlMajorVersion"] = baselineGlMajorVersion
             details["overlayGlMajorVersion"] = overlayGlMajorVersion
@@ -579,11 +623,13 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             details["glMajorVersionDetails"] =
                 "baseline=$baselineGlMajorVersion overlay=$overlayGlMajorVersion " +
                     "stillImageOverlay=$stillImageOverlayGlMajorVersion " +
+                    "reversedOverlay=$reversedOverlayGlMajorVersion " +
                     "expectedPhysicalMin=$EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION(SM-A566B)"
 
             if (!glMajorVersionOk && firstFailureReason == null) {
                 firstFailureReason = "gl_major_version_gate_failed:baseline=$baselineGlMajorVersion:" +
                     "overlay=$overlayGlMajorVersion:still=$stillImageOverlayGlMajorVersion:" +
+                    "reversed=$reversedOverlayGlMajorVersion:" +
                     "expectedMin=$EXPECTED_PHYSICAL_MIN_GL_MAJOR_VERSION"
             }
         } catch (t: Throwable) {
@@ -593,7 +639,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             }
             details["exception"] = "${t.javaClass.simpleName}:${t.message}"
         } finally {
-            // ── Gate 11: Cleanup ──────────────────────────────────────────────────
+            // ── Gate 12: Cleanup ──────────────────────────────────────────────────
             for (f in filesToClean) {
                 try {
                     if (f.exists()) f.delete()
@@ -605,7 +651,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             }
         }
 
-        // ── Gate 12: Canonical route verification ─────────────────────────────
+        // ── Gate 13: Canonical route verification ─────────────────────────────
         val canonical = inputValidationOk &&
             sourceMetadataOk &&
             baselineEncodeOk &&
@@ -615,6 +661,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             pixelDeltaOk &&
             missingBridgeRejectedOk &&
             stillImageOverlayEncodeOk &&
+            reversedVideoOverlayEncodeOk &&
             glMajorVersionOk &&
             cleanupOk
 
@@ -633,10 +680,83 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             pixelDeltaOk = pixelDeltaOk,
             missingBridgeRejectedOk = missingBridgeRejectedOk,
             stillImageOverlayEncodeOk = stillImageOverlayEncodeOk,
+            reversedVideoOverlayEncodeOk = reversedVideoOverlayEncodeOk,
             glMajorVersionOk = glMajorVersionOk,
             cleanupOk = cleanupOk,
             details = details,
         )
+    }
+
+    /// Width/height/rotation/duration probed from a video source, via
+    /// [MediaExtractor] first, falling back to [MediaMetadataRetriever] for
+    /// any field [MediaExtractor] could not resolve. Shared by Gate 2 (the
+    /// primary [videoPath] source) and the reversed-video overlay lane (Gate
+    /// 10, [reversedVideoPath] ?: [videoPath]) so both probe identically.
+    private data class ProbedVideoMetadata(
+        val width: Int,
+        val height: Int,
+        val rotation: Int,
+        val durationUs: Long,
+    )
+
+    private fun probeVideoMetadata(path: String): ProbedVideoMetadata {
+        var width = 0
+        var height = 0
+        var rotation = 0
+        var durationUs = 0L
+
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(path)
+            val count = extractor.trackCount
+            for (i in 0 until count) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("video/")) {
+                    if (format.containsKey(MediaFormat.KEY_WIDTH)) {
+                        width = format.getInteger(MediaFormat.KEY_WIDTH)
+                    }
+                    if (format.containsKey(MediaFormat.KEY_HEIGHT)) {
+                        height = format.getInteger(MediaFormat.KEY_HEIGHT)
+                    }
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        durationUs = format.getLong(MediaFormat.KEY_DURATION)
+                    }
+                    if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                        rotation = format.getInteger(MediaFormat.KEY_ROTATION)
+                    }
+                    break
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "MediaExtractor read failed on $path: $t")
+        } finally {
+            try { extractor.release() } catch (_: Throwable) {}
+        }
+
+        if (width <= 0 || height <= 0 || durationUs <= 0L) {
+            val mmr = MediaMetadataRetriever()
+            try {
+                mmr.setDataSource(path)
+                val wStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                val hStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                val rotStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                val durStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                if (width <= 0 && wStr != null) width = wStr.toIntOrNull() ?: 0
+                if (height <= 0 && hStr != null) height = hStr.toIntOrNull() ?: 0
+                if (rotation == 0 && rotStr != null) rotation = rotStr.toIntOrNull() ?: 0
+                if (durationUs <= 0L && durStr != null) {
+                    val durMs = durStr.toLongOrNull() ?: 0L
+                    durationUs = durMs * 1000L
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "MediaMetadataRetriever fallback failed on $path: $t")
+            } finally {
+                try { mmr.release() } catch (_: Throwable) {}
+            }
+        }
+
+        return ProbedVideoMetadata(width, height, rotation, durationUs)
     }
 
     private fun extractFrame(videoPath: String, timeUs: Long): Bitmap? {
@@ -693,6 +813,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         pixelDeltaOk: Boolean,
         missingBridgeRejectedOk: Boolean,
         stillImageOverlayEncodeOk: Boolean,
+        reversedVideoOverlayEncodeOk: Boolean,
         glMajorVersionOk: Boolean,
         cleanupOk: Boolean,
         details: Map<String, Any?>,
@@ -706,6 +827,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
             pixelDeltaOk &&
             missingBridgeRejectedOk &&
             stillImageOverlayEncodeOk &&
+            reversedVideoOverlayEncodeOk &&
             glMajorVersionOk &&
             cleanupOk
 
@@ -725,6 +847,7 @@ class AndroidGlesExportOverlayProductionSmokeHarness {
         map["pixelDeltaOk"] = pixelDeltaOk
         map["missingBridgeRejectedOk"] = missingBridgeRejectedOk
         map["stillImageOverlayEncodeOk"] = stillImageOverlayEncodeOk
+        map["reversedVideoOverlayEncodeOk"] = reversedVideoOverlayEncodeOk
         map["glMajorVersionOk"] = glMajorVersionOk
         map["cleanupOk"] = cleanupOk
         map["canonical"] = canonical

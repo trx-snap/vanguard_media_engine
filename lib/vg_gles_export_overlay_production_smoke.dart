@@ -110,6 +110,12 @@ class VGGlesExportOverlayProductionSmokeReport {
     'stillImageOverlayEncodeOk',
   ];
 
+  /// Reversed video overlay encode gate keys (P5-GLES-EXPORT-REVERSED-CLIP-
+  /// OVERLAYS: positive GLES zero-rotation reversed-video + overlay lane).
+  static const List<String> reversedVideoOverlayGateKeys = <String>[
+    'reversedVideoOverlayEncodeOk',
+  ];
+
   /// GL major version negotiation gate keys
   /// (P5-GLES-EXPORT-ES3-CONTEXT-READINESS: asserts the baseline, overlay,
   /// and still-image-overlay encodes all negotiate the same GL major
@@ -133,6 +139,7 @@ class VGGlesExportOverlayProductionSmokeReport {
     ...pixelGateKeys,
     ...failClosedGateKeys,
     ...stillImageOverlayGateKeys,
+    ...reversedVideoOverlayGateKeys,
     ...glMajorVersionGateKeys,
     ...cleanupGateKeys,
     ...canonicalGateKeys,
@@ -220,6 +227,18 @@ class VGGlesExportOverlayProductionSmokeReport {
   /// Whether every still-image overlay gate passed.
   bool get stillImageOverlayPass => stillImageOverlayGateKeys.every(_gate);
 
+  // -- Reversed video overlay encode gate --------------------------------------
+
+  /// Whether the zero-rotation reversed video clip with overlays succeeded on
+  /// GLES (P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: non-empty output, samples
+  /// > 0, overlayFrameCount > 0).
+  bool get reversedVideoOverlayEncodePass =>
+      _gate('reversedVideoOverlayEncodeOk');
+
+  /// Whether every reversed video overlay gate passed.
+  bool get reversedVideoOverlayPass =>
+      reversedVideoOverlayGateKeys.every(_gate);
+
   // -- GL major version negotiation gate ---------------------------------------
 
   /// Whether the baseline, overlay, and still-image-overlay encodes all
@@ -241,6 +260,10 @@ class VGGlesExportOverlayProductionSmokeReport {
   /// GL major version negotiated by the still-image overlay encode, when reported.
   int? get stillImageOverlayGlMajorVersion =>
       details['stillImageOverlayGlMajorVersion'] as int?;
+
+  /// GL major version negotiated by the reversed video overlay encode, when reported.
+  int? get reversedOverlayGlMajorVersion =>
+      details['reversedOverlayGlMajorVersion'] as int?;
 
   /// Minimum GL major version asserted by the native [glMajorVersionOkPass]
   /// gate for the current SM-A566B physical fleet device -- a lower bound
@@ -468,6 +491,7 @@ class VGGlesExportOverlayProductionSmokeReport {
     required String videoPath,
     required String stickerPath,
     required String outputDir,
+    String? reversedVideoPath,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -477,6 +501,7 @@ class VGGlesExportOverlayProductionSmokeReport {
         'videoPath': videoPath,
         'stickerPath': stickerPath,
         'outputDir': outputDir,
+        'reversedVideoPath': ?reversedVideoPath,
       });
       final raw = timeout != null
           ? await future.timeout(timeout)

@@ -43,7 +43,9 @@ class AndroidGlesExportOverlayProductionSmokeCoordinator(
             "frameExtractOk",
             "pixelDeltaOk",
             "missingBridgeRejectedOk",
-            "stillImageRejectedOk",
+            "stillImageOverlayEncodeOk",
+            "reversedVideoOverlayEncodeOk",
+            "glMajorVersionOk",
             "cleanupOk",
             "canonical",
         )
@@ -92,6 +94,7 @@ class AndroidGlesExportOverlayProductionSmokeCoordinator(
         val videoPath = args?.get("videoPath") as? String
         val stickerPath = args?.get("stickerPath") as? String
         val outputDir = args?.get("outputDir") as? String
+        val reversedVideoPath = args?.get("reversedVideoPath") as? String
         try {
             executor.execute {
                 try {
@@ -103,7 +106,7 @@ class AndroidGlesExportOverlayProductionSmokeCoordinator(
                         codecAdapter = null,
                     )
                     val harness = AndroidGlesExportOverlayProductionSmokeHarness()
-                    val raw = harness.run(videoPath, stickerPath, outputDir, nativeBridge)
+                    val raw = harness.run(videoPath, stickerPath, outputDir, nativeBridge, reversedVideoPath)
                     val payload = parseResult(raw)
                     mainHandler.post { result.success(payload) }
                 } catch (t: Throwable) {

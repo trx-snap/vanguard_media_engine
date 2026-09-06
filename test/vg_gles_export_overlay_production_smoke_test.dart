@@ -26,6 +26,7 @@ const List<String> _gateKeys = <String>[
   'pixelDeltaOk',
   'missingBridgeRejectedOk',
   'stillImageOverlayEncodeOk',
+  'reversedVideoOverlayEncodeOk',
   'glMajorVersionOk',
   'cleanupOk',
   'canonical',
@@ -47,9 +48,10 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) => {
     'baselineGlMajorVersion': 3,
     'overlayGlMajorVersion': 3,
     'stillImageOverlayGlMajorVersion': 3,
+    'reversedOverlayGlMajorVersion': 3,
     'expectedPhysicalMinGlMajorVersion': 3,
     'glMajorVersionDetails':
-        'baseline=3 overlay=3 stillImageOverlay=3 expectedPhysicalMin=3(SM-A566B)',
+        'baseline=3 overlay=3 stillImageOverlay=3 reversedOverlay=3 expectedPhysicalMin=3(SM-A566B)',
   },
   'raw': '{"pass":true,"status":"PASS"}',
   if (overrides != null) ...overrides,
@@ -111,6 +113,12 @@ void main() {
         1,
       );
       expect(
+        VGGlesExportOverlayProductionSmokeReport
+            .reversedVideoOverlayGateKeys
+            .length,
+        1,
+      );
+      expect(
         VGGlesExportOverlayProductionSmokeReport.glMajorVersionGateKeys.length,
         1,
       );
@@ -122,8 +130,8 @@ void main() {
         VGGlesExportOverlayProductionSmokeReport.canonicalGateKeys.length,
         1,
       );
-      expect(_gateKeys.toSet().length, 12, reason: 'unique');
-      expect(_gateKeys.length, 12);
+      expect(_gateKeys.toSet().length, 13, reason: 'unique');
+      expect(_gateKeys.length, 13);
     });
   });
 
@@ -212,11 +220,15 @@ void main() {
       expect(report.stillImageOverlayEncodePass, isTrue);
       expect(report.stillImageOverlayPass, isTrue);
 
+      expect(report.reversedVideoOverlayEncodePass, isTrue);
+      expect(report.reversedVideoOverlayPass, isTrue);
+
       expect(report.glMajorVersionOkPass, isTrue);
       expect(report.glMajorVersionPass, isTrue);
       expect(report.baselineGlMajorVersion, 3);
       expect(report.overlayGlMajorVersion, 3);
       expect(report.stillImageOverlayGlMajorVersion, 3);
+      expect(report.reversedOverlayGlMajorVersion, 3);
       expect(report.expectedPhysicalMinGlMajorVersion, 3);
       expect(report.glMajorVersionDetails, isNotNull);
 
@@ -299,11 +311,19 @@ void main() {
       expect(failClosedFail.failClosedPass, isFalse);
       expect(failClosedFail.cleanupGroupPass, isTrue);
 
+      final reversedVideoOverlayFail = _createSampleReport({
+        'reversedVideoOverlayEncodeOk': false,
+      });
+      expect(reversedVideoOverlayFail.reversedVideoOverlayPass, isFalse);
+      expect(reversedVideoOverlayFail.stillImageOverlayPass, isTrue);
+      expect(reversedVideoOverlayFail.cleanupGroupPass, isTrue);
+
       final glMajorVersionFail = _createSampleReport({
         'glMajorVersionOk': false,
       });
       expect(glMajorVersionFail.glMajorVersionPass, isFalse);
       expect(glMajorVersionFail.stillImageOverlayPass, isTrue);
+      expect(glMajorVersionFail.reversedVideoOverlayPass, isTrue);
       expect(glMajorVersionFail.cleanupGroupPass, isTrue);
       expect(glMajorVersionFail.canonicalPass, isTrue);
       expect(
@@ -385,6 +405,51 @@ void main() {
           expect(args['videoPath'], equals('/path/to/video.mp4'));
           expect(args['stickerPath'], equals('/path/to/sticker.png'));
           expect(args['outputDir'], equals('/path/to/out'));
+          return _createSampleRawMap();
+        }
+        return null;
+      });
+
+      final report =
+          await VGGlesExportOverlayProductionSmokeReport.runAndroidDagPhase5GlesExportOverlayProductionSmoke(
+            videoPath: '/path/to/video.mp4',
+            stickerPath: '/path/to/sticker.png',
+            outputDir: '/path/to/out',
+          );
+
+      expect(report.isVerifiedPass, isTrue);
+    });
+
+    test('forwards reversedVideoPath when supplied', () async {
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (
+        MethodCall call,
+      ) async {
+        if (call.method == _method) {
+          final args = call.arguments as Map<dynamic, dynamic>;
+          expect(args['reversedVideoPath'], equals('/path/to/clip_A.mov'));
+          return _createSampleRawMap();
+        }
+        return null;
+      });
+
+      final report =
+          await VGGlesExportOverlayProductionSmokeReport.runAndroidDagPhase5GlesExportOverlayProductionSmoke(
+            videoPath: '/path/to/video.mp4',
+            stickerPath: '/path/to/sticker.png',
+            outputDir: '/path/to/out',
+            reversedVideoPath: '/path/to/clip_A.mov',
+          );
+
+      expect(report.isVerifiedPass, isTrue);
+    });
+
+    test('omits reversedVideoPath when not supplied', () async {
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (
+        MethodCall call,
+      ) async {
+        if (call.method == _method) {
+          final args = call.arguments as Map<dynamic, dynamic>;
+          expect(args.containsKey('reversedVideoPath'), isFalse);
           return _createSampleRawMap();
         }
         return null;
