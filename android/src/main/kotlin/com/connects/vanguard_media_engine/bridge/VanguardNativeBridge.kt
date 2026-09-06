@@ -1315,6 +1315,18 @@ class VanguardNativeBridge(
     // no Android lifecycle, no product/editor/app/ConnectsApp wiring.
     external fun runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke(): String
 
+    // -- P5-IMAGE-OPTIMIZER-SINK-NODE-A: platform-neutral logical DAG
+    // ImageOptimizerSinkNode diagnostic. Proves construction validation,
+    // identity/port shape, descriptor/target/quality/format/boolean
+    // accessors, timeline-window semantics, a real GraphExecutionPlan
+    // source->sink pass wiring the real ImageTextureSourceNode into this
+    // real sink, and missing-input fail-closed. Diagnostic-only: no
+    // production decoded pixels, Bitmap/ImageDecoder lifecycle, JPEG/PNG/
+    // HEIC encoder lifecycle, output file/path/fd, GPU texture/sampler/
+    // lifecycle ownership, no Android lifecycle, no product/editor/app/
+    // ConnectsApp wiring.
+    external fun runAndroidDagPhase5ImageOptimizerSinkNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real

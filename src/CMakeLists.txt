@@ -27,6 +27,10 @@ add_library(vanguard_sinks STATIC
     # node for offline (pass-2/export) container muxing (owns no MediaMuxer/
     # MediaCodec/PlatformCodecAdapter/file IO/OS resource).
     "sinks/src/offline_media_muxer_sink_node.cpp"
+    # P5-IMAGE-OPTIMIZER-SINK-NODE-A: platform-neutral logical DAG sink node
+    # for downscaled-thumbnail/optimized-JPEG (or PNG/HEIC) output (owns no
+    # decoded pixels/Bitmap/ImageDecoder/encoder/file IO/GPU/OS resource).
+    "sinks/src/image_optimizer_sink_node.cpp"
 )
 target_include_directories(vanguard_sinks PUBLIC "sinks/include")
 target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
@@ -489,6 +493,15 @@ if (ANDROID)
     # texture/GPU ownership, no Android lifecycle, no product/app/editor
     # wiring.
     "platform/android/src/android_phase5_graphic_overlay_compositor_node_jni.cpp"
+    # P5-IMAGE-OPTIMIZER-SINK-NODE-A: platform-neutral logical DAG
+    # ImageOptimizerSinkNode diagnostic (construction validation,
+    # identity/port shape, descriptor/target/quality/format/boolean
+    # accessors, timeline-window semantics, real GraphExecutionPlan
+    # source->sink pass against the real ImageTextureSourceNode,
+    # missing-input fail-closed). Diagnostic-only; no decoded pixels/
+    # Bitmap/ImageDecoder/encoder/file IO/GPU ownership, no Android
+    # lifecycle, no product/app/editor wiring.
+    "platform/android/src/android_phase5_image_optimizer_sink_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

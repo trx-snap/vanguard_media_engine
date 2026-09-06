@@ -55,6 +55,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5SpatialTransformNodeSmoke",
             "runAndroidDagPhase5FilterNodeSmoke",
             "runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke",
+            "runAndroidDagPhase5ImageOptimizerSinkNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -131,6 +132,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5FilterNodeSmoke" -> runPhase5FilterNodeSmoke(result)
             "runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke" ->
                 runPhase5GraphicOverlayCompositorNodeSmoke(result)
+            "runAndroidDagPhase5ImageOptimizerSinkNodeSmoke" -> runPhase5ImageOptimizerSinkNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -716,6 +718,50 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GRAPHIC_OVERLAY_COMPOSITOR_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase5GraphicOverlayCompositorNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P5-IMAGE-OPTIMIZER-SINK-NODE-A: platform-neutral logical DAG
+    // ImageOptimizerSinkNode diagnostic. Runs native lanes over the real
+    // ImageOptimizerSinkNode plus the real ImageTextureSourceNode
+    // (construction validation, identity/port shape, descriptor/target/
+    // quality/format/boolean accessors, timeline-window semantics, real
+    // GraphExecutionPlan source->sink pass, missing-input fail-closed).
+    // Proof boundary: platform-neutral logical DAG sink - no decode, no
+    // downscale, no encode, no file IO, no GPU lifecycle, no product/app/
+    // editor wiring.
+    private fun runPhase5ImageOptimizerSinkNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase5ImageOptimizerSinkNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_image_optimizer_sink_node_logical_dag_sink_no_decode_" +
+                        "no_downscale_no_encode_no_file_io_no_gpu_lifecycle_" +
+                        "no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "IMAGE_OPTIMIZER_SINK_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase5ImageOptimizerSinkNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
