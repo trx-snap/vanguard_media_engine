@@ -267,6 +267,15 @@ if (ANDROID)
     # current-verified ES3 context. This TU creates/destroys no EGL context,
     # texture, or FBO.
     "platform/android/src/android_phase5_gles_export_beauty_seam_jni.cpp"
+    # P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS: diagnostic-only seam
+    # proving two REAL MediaCodec decodes -> two independent SurfaceTexture/
+    # GL_TEXTURE_EXTERNAL_OES frames (both updateTexImage()'d by the Kotlin
+    # harness on its own caller-owned, current-verified ES3 EGL pbuffer
+    # context) still route into the private
+    # GlesTimelineTransitionCompositor::drawTransition helper above at a
+    # fixed crossfade midpoint. This TU creates/destroys no EGL context,
+    # SurfaceTexture, or MediaCodec.
+    "platform/android/src/android_phase5_gles_dual_oes_transition_jni.cpp"
     # P5-BEAUTY-V2-VULKAN-RENDER: VulkanBeautyV2Compositor shader/raster +
     # CPU reference parity diagnostic proof (lane execution extracted into
     # the probe translation unit, mirroring the GLES twin's modularity

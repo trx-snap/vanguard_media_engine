@@ -2478,6 +2478,37 @@ class VanguardNativeBridge(
         intensity: Float,
     ): String
 
+    // -- P5-GLES-EXPORT-DUAL-OES-TRANSITION-READINESS: diagnostic-only seam --
+    // proving two REAL MediaCodec decodes, each feeding its own
+    // SurfaceTexture-backed GL_TEXTURE_EXTERNAL_OES texture and both already
+    // updateTexImage()'d by the caller (AndroidGlesDualOesTransitionSmoke
+    // Harness) on its own current-verified ES3 EGL pbuffer context, can
+    // still route into the private
+    // GlesTimelineTransitionCompositor::drawTransition helper at a fixed
+    // crossfade midpoint (progress 0.5, blendWeightFrom == blendWeightTo ==
+    // 0.5, identity crops/viewports). Creates/destroys no EGL context,
+    // SurfaceTexture, MediaCodec, or Java Surface -- the caller must already
+    // have both OES textures populated and its EGL context current on the
+    // calling thread before invoking this. Validates
+    // fromTextureId/toTextureId/fromTextureTarget/toTextureTarget (must be
+    // GL_TEXTURE_EXTERNAL_OES)/surfaceWidth/surfaceHeight/progress itself,
+    // then draws, reads back a small pixel sample to prove real (non-
+    // sentinel, non-black) decoded content was composited, and re-verifies
+    // GL state restoration before returning. [fromPtsUs]/[toPtsUs] are
+    // echoed into the returned JSON purely for diagnostic telemetry.
+    // Diagnostic only: no production GLES transition export route.
+    external fun drawAndroidDagPhase5GlesDualOesTransition(
+        fromTextureId: Int,
+        fromTextureTarget: Int,
+        toTextureId: Int,
+        toTextureTarget: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        progress: Double,
+        fromPtsUs: Long,
+        toPtsUs: Long,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof diagnostic. Native creates its own temporary
     // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 sampled images,
