@@ -28,6 +28,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C4BRtcJitterBufferSmoke",
             "runAndroidDagPhase6WebRtcIngestStreamSourceSeamSmoke",
             "runAndroidDagPhase6EncodedVideoEgressSeamSmoke",
+            "runAndroidDagPhase6MediaCodecEncoderEgressSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -46,6 +47,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C4BRtcJitterBufferSmoke" -> runRtcJitterBufferSmoke(args, result)
             "runAndroidDagPhase6WebRtcIngestStreamSourceSeamSmoke" -> runWebRtcIngestStreamSourceSeamSmoke(args, result)
             "runAndroidDagPhase6EncodedVideoEgressSeamSmoke" -> runEncodedVideoEgressSeamSmoke(args, result)
+            "runAndroidDagPhase6MediaCodecEncoderEgressSmoke" -> runMediaCodecEncoderEgressSmoke(args, result)
             else -> return false
         }
         return true
@@ -224,6 +226,20 @@ class AndroidRtcVideoCoordinator(
             val smokeResult = RealtimeEncodedVideoOutputSmokeHarness.run(
                 frameCount = frameCount,
             )
+            mainHandler.post {
+                result.success(smokeResult)
+            }
+        }.start()
+    }
+
+    // P6-STREAM-EGRESS-HW-ENCODER-BRIDGE-A: bounded package hardware-encoder-output seam proving
+    // MediaCodecEncodedVideoOutputBridge drives a real hardware MediaCodec AVC encoder end to end
+    // into RealtimeEncodedVideoOutputAdapter / RtcEncodedVideoFramePublisher. No MediaMuxer, no
+    // file IO, no network sockets, no RTMP, no WebRTC/LiveKit SDK, no audio, no product/app/editor
+    // wiring. Closes only the package hardware-encoder-output seam, not network publish.
+    private fun runMediaCodecEncoderEgressSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        Thread {
+            val smokeResult = MediaCodecEncodedVideoOutputSmokeHarness.run()
             mainHandler.post {
                 result.success(smokeResult)
             }
