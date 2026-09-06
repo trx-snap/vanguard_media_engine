@@ -23,6 +23,10 @@ target_link_libraries(vanguard_graph PRIVATE vanguard_core)
 add_library(vanguard_sinks STATIC
     "sinks/src/passthrough_remux_sink_node.cpp"
     "sinks/src/preview_surface_sink_node.cpp"
+    # P2-OFFLINE-MEDIA-MUXER-SINK-NODE-A: platform-neutral logical DAG sink
+    # node for offline (pass-2/export) container muxing (owns no MediaMuxer/
+    # MediaCodec/PlatformCodecAdapter/file IO/OS resource).
+    "sinks/src/offline_media_muxer_sink_node.cpp"
 )
 target_include_directories(vanguard_sinks PUBLIC "sinks/include")
 target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
@@ -408,6 +412,15 @@ if (ANDROID)
     # resource ownership, no Android lifecycle, no product/app/editor
     # wiring.
     "platform/android/src/android_phase1_external_surface_source_node_jni.cpp"
+    # P2-OFFLINE-MEDIA-MUXER-SINK-NODE-A: platform-neutral logical DAG
+    # OfflineMediaMuxerSinkNode diagnostic (construction validation,
+    # identity/port shape, timeline-window semantics, real
+    # GraphExecutionPlan source->sink and audio+video->muxer passes against
+    # the real HardwareBufferSourceNode and DecodedAudioPcmSourceNode,
+    # missing-input fail-closed). Diagnostic-only; no MediaMuxer/MediaCodec/
+    # PlatformCodecAdapter ownership, no file IO, no Android lifecycle, no
+    # product/app/editor wiring.
+    "platform/android/src/android_phase2_offline_media_muxer_sink_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

@@ -1258,6 +1258,18 @@ class VanguardNativeBridge(
     // ConnectsApp wiring.
     external fun runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke(): String
 
+    // -- P2-OFFLINE-MEDIA-MUXER-SINK-NODE-A: platform-neutral logical DAG
+    // OfflineMediaMuxerSinkNode diagnostic. Proves construction validation,
+    // identity/port shape for video-only/audio-only/audio+video track
+    // combinations, hasVideo()/hasAudio() accessors, timeline-window
+    // semantics, real GraphExecutionPlan source->sink and audio+video->
+    // muxer passes using the real HardwareBufferSourceNode and
+    // DecodedAudioPcmSourceNode against this real sink, and missing-input
+    // fail-closed. Diagnostic-only: no production android.media.MediaMuxer/
+    // MediaCodec/PlatformCodecAdapter ownership, no file IO, no Android
+    // lifecycle, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-TOPOLOGY-COMPOSITION: real multi-node DAG topology
     // diagnostic. Proves BuildGraphExecutionPlan() over a real four-node
     // topology - two real HardwareBufferSourceNode instances feeding a real

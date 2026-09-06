@@ -50,6 +50,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase6StreamSourceNodeSmoke",
             "runAndroidDagPhase3CameraFrameSourceNodeSmoke",
             "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke",
+            "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionDispatcherSmoke",
@@ -120,6 +121,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase6StreamSourceNodeSmoke" -> runPhase6StreamSourceNodeSmoke(result)
             "runAndroidDagPhase3CameraFrameSourceNodeSmoke" -> runPhase3CameraFrameSourceNodeSmoke(result)
             "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke" -> runPhase1ExternalSurfaceSourceNodeSmoke(result)
+            "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke" -> runPhase2OfflineMediaMuxerSinkNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke" ->
@@ -531,6 +533,50 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "EXTERNAL_SURFACE_SOURCE_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P2-OFFLINE-MEDIA-MUXER-SINK-NODE-A: platform-neutral logical DAG
+    // OfflineMediaMuxerSinkNode diagnostic. Runs native lanes over the real
+    // OfflineMediaMuxerSinkNode plus the real HardwareBufferSourceNode and
+    // DecodedAudioPcmSourceNode (construction validation, identity/port
+    // shape for video-only/audio-only/audio+video track combinations,
+    // hasVideo()/hasAudio() accessors, timeline-window semantics, real
+    // GraphExecutionPlan source->sink and audio+video->muxer passes,
+    // missing-input fail-closed). Proof boundary: platform-neutral logical
+    // DAG sink - no MediaMuxer/MediaCodec/PlatformCodecAdapter ownership, no
+    // file IO, no Android lifecycle, no product/app/editor wiring.
+    private fun runPhase2OfflineMediaMuxerSinkNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_offline_media_muxer_sink_node_logical_dag_sink_no_muxer_" +
+                        "ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "OFFLINE_MEDIA_MUXER_SINK_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase2OfflineMediaMuxerSinkNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
