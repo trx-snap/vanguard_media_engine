@@ -1075,6 +1075,16 @@ class VanguardNativeBridge(
     // wiring.
     external fun runAndroidDagPhase1HardwareBufferSourceNodeSmoke(): String
 
+    // -- P2-DECODED-MEDIA-FRAME-SOURCE-NODE-A: platform-neutral
+    // logical DAG DecodedMediaFrameSourceNode diagnostic. Proves construction
+    // validation, identity/port shape, dimension accessors, timeline-window
+    // semantics, and a real GraphExecutionPlan source->sink pass using the
+    // real DecodedMediaFrameSourceNode against a TU-local diagnostic sink node.
+    // Diagnostic-only: no production MediaCodec/
+    // MediaExtractor lifecycle, no frame buffer ownership, no Android
+    // lifecycle, no product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke(): String
+
     // -- P1-DAG-MULTINODE-PREVIEW-SURFACE-SINK-NODE: platform-neutral
     // logical DAG PreviewSurfaceSinkNode diagnostic. Proves construction
     // validation, identity/port shape, default timeline semantics, and a

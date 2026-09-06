@@ -29,7 +29,12 @@ target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 
 # P1-DAG-MULTINODE-HARDWARE-BUFFER-SOURCE-NODE: platform-neutral logical DAG
 # source nodes (owns no AHardwareBuffer*/fence/texture/OS resource).
-add_library(vanguard_sources STATIC "sources/src/hardware_buffer_source_node.cpp")
+# P2-DECODED-MEDIA-FRAME-SOURCE-NODE-A: adds the video counterpart to
+# DecodedAudioPcmSourceNode (owns no decoder/frame buffer/OS resource).
+add_library(vanguard_sources STATIC
+    "sources/src/hardware_buffer_source_node.cpp"
+    "sources/src/decoded_media_frame_source_node.cpp"
+)
 target_include_directories(vanguard_sources PUBLIC "sources/include")
 target_link_libraries(vanguard_sources PRIVATE vanguard_graph vanguard_core)
 
@@ -342,6 +347,13 @@ if (ANDROID)
     # ownership, no rendering, no GPU transport, no product/editor/app
     # wiring.
     "platform/android/src/android_phase1_dag_multinode_execution_dispatcher_jni.cpp"
+    # P2-DECODED-MEDIA-FRAME-SOURCE-NODE-A: platform-neutral logical DAG
+    # DecodedMediaFrameSourceNode diagnostic (construction validation,
+    # identity/port shape, dimension accessors, timeline-window semantics,
+    # real GraphExecutionPlan source->sink pass). Diagnostic-only; no
+    # MediaCodec/MediaExtractor lifecycle, no frame buffer ownership, no
+    # Android lifecycle, no product/app/editor wiring.
+    "platform/android/src/android_phase2_decoded_media_frame_source_node_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

@@ -45,6 +45,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1GpuBlacklistNativeSmoke",
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke",
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke",
+            "runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke",
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke",
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke",
             "runAndroidDagPhase1DagMultinodeGpuFrameTokenSmoke",
@@ -110,6 +111,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1GpuBlacklistNativeSmoke" -> runPhase1GpuBlacklistNativeSmoke(result)
             "runAndroidDagPhase1DagMultinodeExecutionPlanSmoke" -> runPhase1DagMultinodeExecutionPlanSmoke(result)
             "runAndroidDagPhase1HardwareBufferSourceNodeSmoke" -> runPhase1HardwareBufferSourceNodeSmoke(result)
+            "runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke" ->
+                runPhase2DecodedMediaFrameSourceNodeSmoke(result)
             "runAndroidDagPhase1PreviewSurfaceSinkNodeSmoke" -> runPhase1PreviewSurfaceSinkNodeSmoke(result)
             "runAndroidDagPhase1DagMultinodeTopologyCompositionSmoke" ->
                 runPhase1DagMultinodeTopologyCompositionSmoke(result)
@@ -313,6 +316,47 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "HARDWARE_BUFFER_SOURCE_NODE_SMOKE_FAILED",
                         "runAndroidDagPhase1HardwareBufferSourceNodeSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- P2-DECODED-MEDIA-FRAME-SOURCE-NODE-A: platform-neutral
+    // logical DAG DecodedMediaFrameSourceNode diagnostic. Runs native lanes over
+    // the real DecodedMediaFrameSourceNode plus a TU-local sink (construction
+    // validation, identity/port shape, dimension accessors, timeline-window
+    // semantics, real GraphExecutionPlan source->sink pass).
+    // Proof boundary: platform-neutral logical DAG source - no decoder/framebuffer
+    // ownership, no Android lifecycle, no product/app/editor wiring.
+    private fun runPhase2DecodedMediaFrameSourceNodeSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val diagnostics = VanguardDiagnostics()
+                val nativeBridge = VanguardNativeBridge(
+                    VanguardLifecycleObserver(diagnostics),
+                    diagnostics,
+                    null,
+                )
+                val raw = nativeBridge.runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke()
+                val pass = raw.startsWith("status=PASS;")
+                val smokeResult = mapOf<String, Any?>(
+                    "pass" to pass,
+                    "raw" to raw,
+                    "proofBoundary" to
+                        "platform_neutral_decoded_media_frame_source_node_logical_dag_source_no_decoder_framebuffer_" +
+                        "ownership_no_android_lifecycle_no_product_app_editor_wiring",
+                    "totalLanes" to parseIntField(raw, "totalLanes="),
+                    "passedLanes" to parseIntField(raw, "passedLanes="),
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "DECODED_MEDIA_FRAME_SOURCE_NODE_SMOKE_FAILED",
+                        "runAndroidDagPhase2DecodedMediaFrameSourceNodeSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
