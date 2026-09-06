@@ -27,6 +27,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C3UProcessedVideoEgressSmoke",
             "runAndroidDagPhase4C4BRtcJitterBufferSmoke",
             "runAndroidDagPhase6WebRtcIngestStreamSourceSeamSmoke",
+            "runAndroidDagPhase6EncodedVideoEgressSeamSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -44,6 +45,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C3UProcessedVideoEgressSmoke" -> runProcessedVideoEgressSmoke(args, result)
             "runAndroidDagPhase4C4BRtcJitterBufferSmoke" -> runRtcJitterBufferSmoke(args, result)
             "runAndroidDagPhase6WebRtcIngestStreamSourceSeamSmoke" -> runWebRtcIngestStreamSourceSeamSmoke(args, result)
+            "runAndroidDagPhase6EncodedVideoEgressSeamSmoke" -> runEncodedVideoEgressSeamSmoke(args, result)
             else -> return false
         }
         return true
@@ -204,6 +206,22 @@ class AndroidRtcVideoCoordinator(
             val smokeResult = NativeStreamSourceRtcIngestSmokeHarness.run(
                 width = width,
                 height = height,
+                frameCount = frameCount,
+            )
+            mainHandler.post {
+                result.success(smokeResult)
+            }
+        }.start()
+    }
+
+    // P6-STREAM-EGRESS-ENCODED-SEAM-A: transport-neutral encoded video egress foundation seam
+    // proving RealtimeEncodedVideoOutputAdapter, RtcEncodedVideoFrame, RtcEncodedVideoFramePublisher,
+    // keyframe gating, scoped-borrow, and backpressure.
+    private fun runEncodedVideoEgressSeamSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 3
+
+        Thread {
+            val smokeResult = RealtimeEncodedVideoOutputSmokeHarness.run(
                 frameCount = frameCount,
             )
             mainHandler.post {
