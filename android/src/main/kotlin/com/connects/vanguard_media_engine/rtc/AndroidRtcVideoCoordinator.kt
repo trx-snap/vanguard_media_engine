@@ -26,6 +26,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C3QRtcFrameValidatorSmoke",
             "runAndroidDagPhase4C3UProcessedVideoEgressSmoke",
             "runAndroidDagPhase4C4BRtcJitterBufferSmoke",
+            "runAndroidDagPhase6WebRtcIngestStreamSourceSeamSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -42,6 +43,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C3QRtcFrameValidatorSmoke" -> runRtcFrameValidatorSmoke(args, result)
             "runAndroidDagPhase4C3UProcessedVideoEgressSmoke" -> runProcessedVideoEgressSmoke(args, result)
             "runAndroidDagPhase4C4BRtcJitterBufferSmoke" -> runRtcJitterBufferSmoke(args, result)
+            "runAndroidDagPhase6WebRtcIngestStreamSourceSeamSmoke" -> runWebRtcIngestStreamSourceSeamSmoke(args, result)
             else -> return false
         }
         return true
@@ -181,6 +183,27 @@ class AndroidRtcVideoCoordinator(
 
         Thread {
             val smokeResult = RtcVideoJitterBufferSmokeHarness.run(
+                frameCount = frameCount,
+            )
+            mainHandler.post {
+                result.success(smokeResult)
+            }
+        }.start()
+    }
+
+    // P6-WEBRTC-INGEST-STREAM-SOURCE-SEAM-A: diagnostic, video-only RTC ingest seam proving
+    // RealtimeVideoInputAdapter/RtcVideoFrameSink can forward frame metadata into a real native
+    // vanguard::sources::StreamSourceNode-backed session. No real WebRTC/LiveKit SDK, no network
+    // room/session, no audio, no rendering, no product/editor/app wiring.
+    private fun runWebRtcIngestStreamSourceSeamSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 3
+
+        Thread {
+            val smokeResult = NativeStreamSourceRtcIngestSmokeHarness.run(
+                width = width,
+                height = height,
                 frameCount = frameCount,
             )
             mainHandler.post {

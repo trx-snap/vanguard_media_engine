@@ -1044,6 +1044,72 @@ class VanguardNativeBridge(
         external fun destroyAsyncRuntimeQueueMultiSourceRealtimeClockSession(
             handle: Long,
         ): String
+
+        // ── P6-WEBRTC-INGEST-STREAM-SOURCE-SEAM-A: diagnostic, video-only RTC ──
+        // ingest seam from RealtimeVideoInputAdapter/RtcVideoFrameSink into a
+        // real vanguard::sources::StreamSourceNode-backed native metadata
+        // session. Native keeps a bounded metadata-only queue (width, height,
+        // ptsUs, rotationDegrees, mirrored, frameIndex); it never retains a
+        // jobject, AHardwareBuffer, JNI global ref, Surface, texture, SDK/
+        // session handle, or network state. Proves the transport-neutral
+        // WebRTC/LiveKit ingress boundary only: no real WebRTC/LiveKit SDK, no
+        // network room/session, no audio, no rendering, no product/editor/app
+        // wiring.
+
+        // Returns an opaque session handle, or 0 on invalid input (blank
+        // streamId, non-positive width/height, durationUs <= 0,
+        // maxQueueCapacity outside [1, 32]) or when the 4-live-session
+        // registry cap is reached.
+        external fun createStreamSourceRtcIngestSession(
+            streamId: String,
+            width: Int,
+            height: Int,
+            durationUs: Long,
+            maxQueueCapacity: Int,
+        ): Long
+
+        // Transitions IDLE/PAUSED -> STARTED (idempotent if already STARTED).
+        // Unknown handle returns status=not_found.
+        external fun startStreamSourceRtcIngestSession(handle: Long): String
+
+        // Transitions STARTED -> PAUSED; idempotent no-op from IDLE/PAUSED.
+        // Unknown handle returns status=not_found.
+        external fun pauseStreamSourceRtcIngestSession(handle: Long): String
+
+        // Ingests primitive video frame metadata only (no pixel buffer, no
+        // jobject). Returns a status string Kotlin maps to
+        // RtcVideoFrameDeliveryStatus: ACCEPTED, DROPPED_BACKPRESSURE (queue
+        // at maxQueueCapacity; never advances acceptedCount/cursor),
+        // DROPPED_NOT_READY (session not STARTED), UNSUPPORTED_FORMAT
+        // (width/height mismatch vs. session dimensions, or invalid
+        // rotationDegrees), or FAILED. Unknown handle returns
+        // status=not_found.
+        external fun ingestStreamSourceRtcIngestMetadata(
+            handle: Long,
+            width: Int,
+            height: Int,
+            ptsUs: Long,
+            rotationDegrees: Int,
+            mirrored: Boolean,
+            frameIndex: Long,
+        ): String
+
+        // Drains up to maxEntries queued metadata entries FIFO, freeing queue
+        // capacity for subsequent ingest calls. Unknown handle returns
+        // status=not_found.
+        external fun drainStreamSourceRtcIngestSession(
+            handle: Long,
+            maxEntries: Int,
+        ): String
+
+        // Returns session state/counters and the real StreamSourceNode's
+        // identity (id, streamId, kind==kSource, type==kStreamSource) as
+        // construction proof. Unknown handle returns status=not_found.
+        external fun snapshotStreamSourceRtcIngestSession(handle: Long): String
+
+        // Any-thread, idempotent erase-once destroy. Second call / unknown
+        // handle returns status=not_found.
+        external fun destroyStreamSourceRtcIngestSession(handle: Long): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport

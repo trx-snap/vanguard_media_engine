@@ -365,6 +365,14 @@ if (ANDROID)
     # LiveKit/Media3 session, no decoder/frame buffer ownership, no Android
     # lifecycle, no product/app/editor wiring.
     "platform/android/src/android_phase6_stream_source_node_jni.cpp"
+    # P6-WEBRTC-INGEST-STREAM-SOURCE-SEAM-A: diagnostic, video-only RTC
+    # ingest seam proving RealtimeVideoInputAdapter/RtcVideoFrameSink can
+    # forward primitive frame metadata (no pixel buffer, no jobject) into a
+    # real vanguard::sources::StreamSourceNode-backed native session with a
+    # small bounded metadata queue. No real WebRTC/LiveKit SDK, no network
+    # room/session, no audio, no rendering, no product/editor/app wiring, no
+    # HardwareBuffer ownership.
+    "platform/android/src/android_phase6_webrtc_ingest_stream_source_seam_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
