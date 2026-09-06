@@ -43,12 +43,17 @@ target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 # source node for externally-produced surface feeds (owns no Android
 # Surface/SurfaceTexture/ANativeWindow/AHardwareBuffer/EGL/GLES/Vulkan/JNI/
 # thread/fd/OS resource).
+# P5-IMAGE-TEXTURE-SOURCE-NODE-A: adds a platform-neutral logical DAG
+# source node for still-image texture feeds (owns no decoded pixels/GL/
+# Vulkan texture handle/file IO/Android Bitmap/ImageDecoder/NDK decoder
+# handle/OS resource).
 add_library(vanguard_sources STATIC
     "sources/src/hardware_buffer_source_node.cpp"
     "sources/src/decoded_media_frame_source_node.cpp"
     "sources/src/stream_source_node.cpp"
     "sources/src/camera_frame_source_node.cpp"
     "sources/src/external_surface_source_node.cpp"
+    "sources/src/image_texture_source_node.cpp"
 )
 target_include_directories(vanguard_sources PUBLIC "sources/include")
 target_link_libraries(vanguard_sources PRIVATE vanguard_graph vanguard_core)
@@ -412,6 +417,15 @@ if (ANDROID)
     # resource ownership, no Android lifecycle, no product/app/editor
     # wiring.
     "platform/android/src/android_phase1_external_surface_source_node_jni.cpp"
+    # P5-IMAGE-TEXTURE-SOURCE-NODE-A: platform-neutral logical DAG
+    # ImageTextureSourceNode diagnostic (construction validation,
+    # identity/port shape, imageId/dimension/orientation accessors,
+    # timeline-window semantics, real GraphExecutionPlan source->sink pass
+    # against the real PreviewSurfaceSinkNode). Diagnostic-only; no decoded
+    # pixels, GL/Vulkan texture handle/sampler, file IO, Android Bitmap/
+    # ImageDecoder/NDK decoder handle ownership, no Android lifecycle, no
+    # product/app/editor wiring.
+    "platform/android/src/android_phase5_image_texture_source_node_jni.cpp"
     # P2-OFFLINE-MEDIA-MUXER-SINK-NODE-A: platform-neutral logical DAG
     # OfflineMediaMuxerSinkNode diagnostic (construction validation,
     # identity/port shape, timeline-window semantics, real

@@ -1258,6 +1258,17 @@ class VanguardNativeBridge(
     // ConnectsApp wiring.
     external fun runAndroidDagPhase1ExternalSurfaceSourceNodeSmoke(): String
 
+    // -- P5-IMAGE-TEXTURE-SOURCE-NODE-A: platform-neutral logical DAG
+    // ImageTextureSourceNode diagnostic. Proves construction validation,
+    // identity/port shape, imageId/dimension/orientation accessors,
+    // timeline-window semantics, and a real GraphExecutionPlan source->sink
+    // pass using the real ImageTextureSourceNode against the real
+    // PreviewSurfaceSinkNode. Diagnostic-only: no production decoded
+    // pixels, GL/Vulkan texture handle/sampler, file IO, Android Bitmap/
+    // ImageDecoder/NDK decoder handle ownership, no Android lifecycle, no
+    // product/editor/app/ConnectsApp wiring.
+    external fun runAndroidDagPhase5ImageTextureSourceNodeSmoke(): String
+
     // -- P2-OFFLINE-MEDIA-MUXER-SINK-NODE-A: platform-neutral logical DAG
     // OfflineMediaMuxerSinkNode diagnostic. Proves construction validation,
     // identity/port shape for video-only/audio-only/audio+video track
