@@ -20,17 +20,20 @@
 // AndroidExportRenderBackendSelector / AndroidTimelineVideoEncoder /
 // AndroidTimelineVulkanVideoEncoder / AndroidTimelineAudioOverlapAdmission:
 //   - accepted: local video clips only, speed == 1.0, trimEnd > trimStart,
-//     one or more hard-cut clips (no transitions) that may be forward or
-//     reversed, with an optional per-clip colorMatrix applied through the
-//     same GLES 2D draw path a still-image clip uses;
+//     one or more hard-cut clips that may be forward or reversed, with an
+//     optional per-clip colorMatrix applied through the same GLES 2D draw
+//     path a still-image clip uses;
 //   - a reversed clip is hard-cut concatenated exactly like a forward clip
-//     -- there is no overlap-shortening in this slice, so expected duration
-//     is simply the sum of every clip's trim window;
+//     when no transitions are present (plain sum of trim windows); for
+//     transition timelines, overlapping non-hard-cut transition durations
+//     are subtracted;
 //   - isReversed=true on a non-video (image) clip fails closed with
 //     INVALID_ARG (message contains both "isReversed" and "video");
-//   - a reversed clip alongside any transition, or any clip-level Beauty V2,
-//     fails closed with UNSUPPORTED_EXPORT_FEATURE before pass-1 -- there is
-//     no positive production shape for those combinations in this slice;
+//   - P5-REVERSE-COMPOSITION-NORMALIZATION-A: reversed video clips combined
+//     with non-hard-cut transitions and/or clip-level Beauty V2 are admitted
+//     and succeed via GLES pass-0 normalization into forward temp clips
+//     before pass-1; non-normalizable reversed clips (e.g. non-video, non-zero
+//     rotation metadata, colorMatrix with transition) still fail closed;
 //   - P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a hard-cut, zero-rotation
 //     reversed video clip alongside timeline overlays is a supported
 //     production shape -- it routes through the same GLES overlay route
@@ -139,10 +142,10 @@ class VGTimelineReverseExportSmokeClip {
   }
 }
 
-/// One transition entry for a fail-closed "reversed + transitions" lane
-/// (wire shape of VGTransitionDescriptor.toMap()) -- this slice never
-/// accepts a non-empty transition list alongside a reversed clip, so no
-/// positive lane ever carries one.
+/// One transition entry of a smoke draft (wire shape of
+/// VGTransitionDescriptor.toMap()). Non-hard-cut transitions alongside
+/// normalizable reversed clips are admitted via pass-0 normalization into
+/// forward temp clips before GLES export.
 @immutable
 class VGTimelineReverseExportSmokeTransition {
   const VGTimelineReverseExportSmokeTransition({
@@ -158,6 +161,9 @@ class VGTimelineReverseExportSmokeTransition {
   final double durationSeconds;
   final String fromClipId;
   final String toClipId;
+
+  /// True when this is not a hard-cut ('none') transition.
+  bool get isNonHardCut => type.trim().toLowerCase() != 'none';
 
   Map<String, Object?> toMap() => <String, Object?>{
     'id': id,
@@ -325,11 +331,24 @@ class VGTimelineReverseExportSmokeRequest {
   final int fps;
   final int bitrateBps;
 
+  /// Number of clips carrying a non-null beautyIntensity.
+  int get expectedBeautyClipCount =>
+      clips.where((c) => c.beautyIntensity != null).length;
+
   /// Expected muxed duration for a positive lane: the sum of every clip's
-  /// trim window. Reversed clips are hard-cut concatenated exactly like
-  /// forward clips -- there is no overlap-shortening in this slice.
-  double get expectedDurationSeconds =>
-      clips.fold<double>(0.0, (sum, c) => sum + c.durationSeconds);
+  /// trim window minus non-hard-cut transition durations. Reversed clips
+  /// concatenated without transitions remain a plain sum; when non-hard-cut
+  /// transitions are present, overlapping transition durations are subtracted.
+  double get expectedDurationSeconds {
+    final clipSum = clips.fold<double>(
+      0.0,
+      (sum, c) => sum + c.durationSeconds,
+    );
+    final transitionSum = transitions
+        .where((t) => t.isNonHardCut)
+        .fold<double>(0.0, (sum, t) => sum + t.durationSeconds);
+    return (clipSum - transitionSum).clamp(0.0, double.infinity);
+  }
 
   /// The exact `exportTimeline` argument map (draft + request keys), matching
   /// the shape VanguardTimelineExporter.exportDraft sends. `audioSidecar` is
@@ -375,6 +394,9 @@ class VGTimelineReverseExportSmokeLaneReport {
     this.outputPath,
     this.outputExists = false,
     this.durationSeconds,
+    this.transitionCount,
+    this.beautyClipCount,
+    this.beautyFrameCount,
     this.errorCode,
     this.errorMessage,
   });
@@ -391,6 +413,9 @@ class VGTimelineReverseExportSmokeLaneReport {
   final String? outputPath;
   final bool outputExists;
   final double? durationSeconds;
+  final int? transitionCount;
+  final int? beautyClipCount;
+  final int? beautyFrameCount;
   final String? errorCode;
   final String? errorMessage;
 
@@ -423,6 +448,9 @@ class VGTimelineReverseExportSmokeLaneReport {
     final path = result['path'] as String?;
     final duration = (result['durationSeconds'] as num?)?.toDouble();
     final backend = result['renderBackend'] as String?;
+    final transitionCount = (result['transitionCount'] as num?)?.toInt();
+    final beautyClipCount = (result['beautyClipCount'] as num?)?.toInt();
+    final beautyFrameCount = (result['beautyFrameCount'] as num?)?.toInt();
 
     String? failure;
     if (!request.expectation.expectsSuccess) {
@@ -442,6 +470,22 @@ class VGTimelineReverseExportSmokeLaneReport {
       failure =
           'duration_mismatch:measured=${duration.toStringAsFixed(3)}:'
           'expected=${expected.toStringAsFixed(3)}';
+    } else if (transitionCount != null &&
+        request.transitions.isNotEmpty &&
+        transitionCount != request.transitions.length) {
+      failure =
+          'transition_count_mismatch:reported=$transitionCount:'
+          'expected=${request.transitions.length}';
+    } else if (beautyClipCount != null &&
+        request.expectedBeautyClipCount > 0 &&
+        beautyClipCount < request.expectedBeautyClipCount) {
+      failure =
+          'beauty_clip_count_mismatch:reported=$beautyClipCount:'
+          'expectedAtLeast=${request.expectedBeautyClipCount}';
+    } else if (beautyFrameCount != null &&
+        request.expectedBeautyClipCount > 0 &&
+        beautyFrameCount <= 0) {
+      failure = 'beauty_frame_count_not_positive:reported=$beautyFrameCount';
     }
     final pass = failure == null;
     return VGTimelineReverseExportSmokeLaneReport(
@@ -455,6 +499,9 @@ class VGTimelineReverseExportSmokeLaneReport {
       outputPath: path,
       outputExists: outputExists,
       durationSeconds: duration,
+      transitionCount: transitionCount,
+      beautyClipCount: beautyClipCount,
+      beautyFrameCount: beautyFrameCount,
     );
   }
 
@@ -515,6 +562,9 @@ class VGTimelineReverseExportSmokeLaneReport {
     'outputExists': outputExists,
     'durationSeconds': durationSeconds,
     'durationDeltaSeconds': durationDeltaSeconds,
+    'transitionCount': transitionCount,
+    'beautyClipCount': beautyClipCount,
+    'beautyFrameCount': beautyFrameCount,
     'errorCode': errorCode,
     'errorMessage': errorMessage,
   };
@@ -535,6 +585,9 @@ class VGTimelineReverseExportSmokeLaneReport {
       outputPath: map['outputPath'] as String?,
       outputExists: map['outputExists'] == true,
       durationSeconds: (map['durationSeconds'] as num?)?.toDouble(),
+      transitionCount: (map['transitionCount'] as num?)?.toInt(),
+      beautyClipCount: (map['beautyClipCount'] as num?)?.toInt(),
+      beautyFrameCount: (map['beautyFrameCount'] as num?)?.toInt(),
       errorCode: map['errorCode'] as String?,
       errorMessage: map['errorMessage'] as String?,
     );

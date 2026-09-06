@@ -40,17 +40,29 @@ Map<String, Object?> _successResult({
   String backend = expectedReverseRenderBackend,
   double duration = 2.0,
   String path = '/data/local/tmp/out.mp4',
-}) => <String, Object?>{
-  'success': true,
-  'path': path,
-  'durationSeconds': duration,
-  'width': 720,
-  'height': 1280,
-  'fps': 30,
-  'exportRoiSidecarPath': '$path.roi.json',
-  'renderBackend': backend,
-  'transitionCount': 0,
-};
+  int transitionCount = 0,
+  int? beautyClipCount,
+  int? beautyFrameCount,
+}) {
+  final map = <String, Object?>{
+    'success': true,
+    'path': path,
+    'durationSeconds': duration,
+    'width': 720,
+    'height': 1280,
+    'fps': 30,
+    'exportRoiSidecarPath': '$path.roi.json',
+    'renderBackend': backend,
+    'transitionCount': transitionCount,
+  };
+  if (beautyClipCount != null) {
+    map['beautyClipCount'] = beautyClipCount;
+  }
+  if (beautyFrameCount != null) {
+    map['beautyFrameCount'] = beautyFrameCount;
+  }
+  return map;
+}
 
 // (a) single reversed clip.
 VGTimelineReverseExportSmokeRequest _laneSingleReversed() =>
@@ -86,7 +98,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedColorMatrix() =>
       expectation: const VGTimelineReverseExportSmokeExpectation.success(),
     );
 
-// (d) reversed + transition fail closed.
+// (d) reversed + transition succeeds via GLES pass-0 normalization.
 VGTimelineReverseExportSmokeRequest _laneReversedTransition() =>
     VGTimelineReverseExportSmokeRequest(
       laneId: 'reversed_transition',
@@ -104,10 +116,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedTransition() =>
         ),
       ],
       outputPath: '/data/local/tmp/out_reversed_transition.mp4',
-      expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: reversedClipsWithTransitionsToken,
-      ),
+      expectation: const VGTimelineReverseExportSmokeExpectation.success(),
     );
 
 // (e) reversed + overlay succeeds via the GLES overlay route.
@@ -127,7 +136,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedOverlay() =>
       expectation: const VGTimelineReverseExportSmokeExpectation.success(),
     );
 
-// (f) reversed + beauty fail closed.
+// (f) reversed + beauty succeeds via GLES pass-0 normalization.
 VGTimelineReverseExportSmokeRequest _laneReversedBeauty() =>
     VGTimelineReverseExportSmokeRequest(
       laneId: 'reversed_beauty',
@@ -135,10 +144,7 @@ VGTimelineReverseExportSmokeRequest _laneReversedBeauty() =>
         _clip('clip-a', isReversed: true, beautyIntensity: 0.5),
       ],
       outputPath: '/data/local/tmp/out_reversed_beauty.mp4',
-      expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-        errorCode: unsupportedExportFeatureCode,
-        messageContains: reversedClipsWithBeautyToken,
-      ),
+      expectation: const VGTimelineReverseExportSmokeExpectation.success(),
     );
 
 // (g) reversed + audioSidecar with valid timing succeeds.
@@ -257,11 +263,16 @@ void main() {
   });
 
   group('request wire shape', () {
-    test('expected duration is the plain sum of clip trim windows', () {
+    test('expected duration is the plain sum of clip trim windows for '
+        'hard-cut lanes, and subtracts non-hard-cut transitions', () {
       expect(_laneSingleReversed().expectedDurationSeconds, closeTo(2.0, 1e-9));
       expect(
         _laneMixedForwardReversed().expectedDurationSeconds,
         closeTo(2.0, 1e-9),
+      );
+      expect(
+        _laneReversedTransition().expectedDurationSeconds,
+        closeTo(3.5, 1e-9),
       );
     });
 
@@ -376,6 +387,25 @@ void main() {
       expect(report.renderBackend, expectedReverseRenderBackend);
     });
 
+    test('(d) reversed + transition passes with gles, output exists, '
+        'duration ~3.5, and matching transitionCount', () {
+      final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+        _laneReversedTransition(),
+        _successResult(
+          duration: 3.5,
+          path: '/data/local/tmp/out_reversed_transition.mp4',
+          transitionCount: 1,
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, expectedReverseRenderBackend);
+      expect(report.outputExists, isTrue);
+      expect(report.durationSeconds, 3.5);
+      expect(report.transitionCount, 1);
+    });
+
     test('(e) reversed + overlay passes with gles, output exists, duration '
         'within tolerance', () {
       final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
@@ -390,6 +420,26 @@ void main() {
       expect(report.status, 'PASS');
       expect(report.renderBackend, expectedReverseRenderBackend);
       expect(report.outputExists, isTrue);
+    });
+
+    test('(f) reversed + beauty passes with gles, output exists, '
+        'duration ~2.0, and positive beauty counts', () {
+      final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+        _laneReversedBeauty(),
+        _successResult(
+          duration: 2.0,
+          path: '/data/local/tmp/out_reversed_beauty.mp4',
+          beautyClipCount: 1,
+          beautyFrameCount: 60,
+        ),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.renderBackend, expectedReverseRenderBackend);
+      expect(report.outputExists, isTrue);
+      expect(report.beautyClipCount, 1);
+      expect(report.beautyFrameCount, 60);
     });
 
     test('(g) reversed + audioSidecar with valid timing passes with gles '
@@ -459,39 +509,62 @@ void main() {
 
     test('a fail-closed lane that succeeded fails', () {
       final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
-        _laneReversedTransition(),
+        _laneImageReversed(),
         _successResult(),
         outputExists: true,
       );
       expect(report.pass, isFalse);
       expect(report.failureReason, 'expected_fail_closed_but_export_succeeded');
     });
+
+    test(
+      'fails when transitionCount mismatches request.transitions.length',
+      () {
+        final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+          _laneReversedTransition(),
+          _successResult(duration: 3.5, transitionCount: 0),
+          outputExists: true,
+        );
+        expect(report.pass, isFalse);
+        expect(report.failureReason, startsWith('transition_count_mismatch'));
+      },
+    );
+
+    test('fails when beautyClipCount is below expectedBeautyClipCount', () {
+      final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+        _laneReversedBeauty(),
+        _successResult(duration: 2.0, beautyClipCount: 0, beautyFrameCount: 60),
+        outputExists: true,
+      );
+      expect(report.pass, isFalse);
+      expect(report.failureReason, startsWith('beauty_clip_count_mismatch'));
+    });
+
+    test('fails when beautyFrameCount is not positive', () {
+      final report = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
+        _laneReversedBeauty(),
+        _successResult(duration: 2.0, beautyClipCount: 1, beautyFrameCount: 0),
+        outputExists: true,
+      );
+      expect(report.pass, isFalse);
+      expect(
+        report.failureReason,
+        startsWith('beauty_frame_count_not_positive'),
+      );
+    });
   });
 
   group('lane report from PlatformException (fail-closed contract)', () {
-    test('(d) reversed + transition requires the transitions token', () {
-      final report = VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
-        _laneReversedTransition(),
-        PlatformException(
-          code: unsupportedExportFeatureCode,
-          message:
-              'exportTimeline: reversed clips with transitions are not supported',
-        ),
-      );
-      expect(report.pass, isTrue);
-
-      final wrongToken =
+    test('(d) reversed + transition that unexpectedly throws fails', () {
+      final report =
           VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
             _laneReversedTransition(),
-            PlatformException(
-              code: unsupportedExportFeatureCode,
-              message: 'exportTimeline: overlays are not supported',
-            ),
+            PlatformException(code: 'EXPORT_FAILED', message: 'pass-1 failed'),
           );
-      expect(wrongToken.pass, isFalse);
+      expect(report.pass, isFalse);
       expect(
-        wrongToken.failureReason,
-        startsWith('error_message_missing_token'),
+        report.failureReason,
+        'unexpected_platform_exception:EXPORT_FAILED',
       );
     });
 
@@ -508,16 +581,17 @@ void main() {
       );
     });
 
-    test('(f) reversed + beauty requires the Beauty V2 token', () {
-      final report = VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
-        _laneReversedBeauty(),
-        PlatformException(
-          code: unsupportedExportFeatureCode,
-          message:
-              'exportTimeline: reversed clips with Beauty V2 are not supported',
-        ),
+    test('(f) reversed + beauty that unexpectedly throws fails', () {
+      final report =
+          VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
+            _laneReversedBeauty(),
+            PlatformException(code: 'EXPORT_FAILED', message: 'pass-1 failed'),
+          );
+      expect(report.pass, isFalse);
+      expect(
+        report.failureReason,
+        'unexpected_platform_exception:EXPORT_FAILED',
       );
-      expect(report.pass, isTrue);
     });
 
     test('(g) reversed + audioSidecar with valid timing that unexpectedly '
@@ -597,7 +671,7 @@ void main() {
     test('wrong error code fails', () {
       final report =
           VGTimelineReverseExportSmokeLaneReport.fromPlatformException(
-            _laneReversedTransition(),
+            _laneImageReversed(),
             PlatformException(code: 'EXPORT_FAILED', message: 'pass-1 failed'),
           );
       expect(report.pass, isFalse);
@@ -651,8 +725,13 @@ void main() {
 
     test('toMap/fromMap round trip preserves lanes and verdict', () {
       final positive = VGTimelineReverseExportSmokeLaneReport.fromExportResult(
-        _laneSingleReversed(),
-        _successResult(duration: 2.0),
+        _laneReversedTransition(),
+        _successResult(
+          duration: 3.5,
+          transitionCount: 1,
+          beautyClipCount: 1,
+          beautyFrameCount: 60,
+        ),
         outputExists: true,
       );
       final report = VGTimelineReverseExportSmokeReport(
@@ -667,9 +746,12 @@ void main() {
       final parsed = VGTimelineReverseExportSmokeReport.fromMap(map);
       expect(parsed.pass, isTrue);
       expect(parsed.lanes, hasLength(1));
-      expect(parsed.lanes.single.laneId, 'single_reversed');
+      expect(parsed.lanes.single.laneId, 'reversed_transition');
       expect(parsed.lanes.single.renderBackend, expectedReverseRenderBackend);
-      expect(parsed.lanes.single.durationSeconds, 2.0);
+      expect(parsed.lanes.single.durationSeconds, 3.5);
+      expect(parsed.lanes.single.transitionCount, 1);
+      expect(parsed.lanes.single.beautyClipCount, 1);
+      expect(parsed.lanes.single.beautyFrameCount, 60);
     });
 
     test('fromMap with malformed lanes yields a failing report', () {
@@ -734,16 +816,72 @@ void main() {
     });
 
     test(
-      'fail-closed PlatformException from native passes the reversed lanes',
+      '(d) reversed + transition passes end to end through runner',
       () async {
         _setMockHandler((method, args) async {
           final draft = (args as Map)['draft'] as Map;
           final transitions = draft['transitions'] as List;
-          if (transitions.isNotEmpty) {
+          expect(transitions, hasLength(1));
+          return _successResult(
+            duration: 3.5,
+            path: '/data/local/tmp/out_reversed_transition.mp4',
+            transitionCount: 1,
+          );
+        });
+        final runner = VGTimelineReverseExportSmokeRunner(
+          channel: _channel,
+          fileExists: (_) => true,
+        );
+        final report = await runner.run(<VGTimelineReverseExportSmokeRequest>[
+          _laneReversedTransition(),
+        ]);
+        expect(report.pass, isTrue);
+        expect(report.lanes.single.renderBackend, expectedReverseRenderBackend);
+        expect(report.lanes.single.durationSeconds, 3.5);
+        expect(report.lanes.single.transitionCount, 1);
+      },
+    );
+
+    test('(f) reversed + beauty passes end to end through runner', () async {
+      _setMockHandler((method, args) async {
+        final draft = (args as Map)['draft'] as Map;
+        final clips = draft['clips'] as List;
+        expect((clips.first as Map)['beautyIntensity'], 0.5);
+        return _successResult(
+          duration: 2.0,
+          path: '/data/local/tmp/out_reversed_beauty.mp4',
+          beautyClipCount: 1,
+          beautyFrameCount: 60,
+        );
+      });
+      final runner = VGTimelineReverseExportSmokeRunner(
+        channel: _channel,
+        fileExists: (_) => true,
+      );
+      final report = await runner.run(<VGTimelineReverseExportSmokeRequest>[
+        _laneReversedBeauty(),
+      ]);
+      expect(report.pass, isTrue);
+      expect(report.lanes.single.renderBackend, expectedReverseRenderBackend);
+      expect(report.lanes.single.beautyClipCount, 1);
+      expect(report.lanes.single.beautyFrameCount, 60);
+    });
+
+    test(
+      'fail-closed PlatformException from native passes fail-closed lanes',
+      () async {
+        _setMockHandler((method, args) async {
+          final draft = (args as Map)['draft'] as Map;
+          final clips = draft['clips'] as List;
+          if (clips.any(
+            (c) =>
+                (c as Map)['mediaKind'] == 'image' && c['isReversed'] == true,
+          )) {
             throw PlatformException(
-              code: unsupportedExportFeatureCode,
+              code: invalidArgExportCode,
               message:
-                  'exportTimeline: reversed clips with transitions are not supported',
+                  "exportTimeline: clip.isReversed is only supported for video "
+                  "clips (mediaKind 'image' with isReversed=true)",
             );
           }
           return _successResult();
@@ -754,11 +892,11 @@ void main() {
         );
         final report = await runner.run(<VGTimelineReverseExportSmokeRequest>[
           _laneSingleReversed(),
-          _laneReversedTransition(),
+          _laneImageReversed(),
         ]);
         expect(report.pass, isTrue);
         expect(report.lanes, hasLength(2));
-        expect(report.lanes[1].errorCode, unsupportedExportFeatureCode);
+        expect(report.lanes[1].errorCode, invalidArgExportCode);
       },
     );
 

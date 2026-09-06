@@ -44,10 +44,26 @@ import kotlin.math.floor
 //     it is rendered exclusively via AndroidTimelineVideoEncoder's GLES
 //     fallback (renderReversedClipIntoEncoder) -- reversed clips never
 //     route through Vulkan (AndroidExportRenderBackendSelector /
-//     AndroidTimelineVulkanVideoEncoder both fail closed for them). A
-//     reversed clip alongside a transition or clip-level Beauty V2 fails
-//     closed with UNSUPPORTED_EXPORT_FEATURE before pass-1; isReversed=true
-//     on a non-video clip fails closed with INVALID_ARG.
+//     AndroidTimelineVulkanVideoEncoder both fail closed for them);
+//     isReversed=true on a non-video clip fails closed with INVALID_ARG.
+//     P5-REVERSE-COMPOSITION-NORMALIZATION-A: a reversed clip alongside a
+//     non-hard-cut transition and/or clip-level Beauty V2 is no longer
+//     rejected up front. Backend selection still runs on the original
+//     (reversed) clips; when it commits GLES for such a scope
+//     (ExportRenderScope.glesReverseNormalizationRequired), a pass-0
+//     (AndroidTimelineReverseNormalizationPrepass) first re-encodes each
+//     reversed clip into an owned forward, video-only temp via the same
+//     GLES reverse renderer, and pass-1 then renders the replacement
+//     forward clips (isReversed=false, trim [0, measured temp duration],
+//     Beauty preserved) through the normal GLES transition/Beauty routes.
+//     Those temps are owned per-export cache files deleted by the same
+//     owned-temp cleanup as every other temp. Progress reserves
+//     [0.0, PASS0_PROGRESS_WEIGHT] for pass-0 in that case and pass-1
+//     sample progress is scaled from that floor. A reversed clip whose
+//     shape is not normalizable (rotation, colorMatrix, non-video, invalid
+//     dimensions) still fails closed with UNSUPPORTED_EXPORT_FEATURE at
+//     backend selection. Hard-cut reversed-only and reversed+overlay-only
+//     scopes never run pass-0.
 //     P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: a reversed clip alongside
 //     timeline overlays is a supported production shape -- see
 //     AndroidExportRenderBackendSelector.glesOverlayEligible. This route
@@ -70,7 +86,8 @@ import kotlin.math.floor
 //     AndroidTimelineVulkanVideoEncoder (Vulkan, preferred/default) or, for
 //     the narrow shape AndroidExportRenderBackendSelector.ExportRenderScope
 //     .glesTransitionEligible admits (P5-GLES-EXPORT-TRANSITION-PRODUCTION-
-//     ROUTE-A: video-only clips, no reversed clip, no clip-level Beauty V2,
+//     ROUTE-A: video-only clips, no non-normalizable reversed clip (see
+//     P5-REVERSE-COMPOSITION-NORMALIZATION-A above), no clip-level Beauty V2,
 //     no overlays, zero rotation metadata, crossfade/dissolve only),
 //     AndroidTimelineGlesTransitionVideoEncoder. When neither backend can
 //     take the scope (Vulkan unselectable and the scope is not GLES-
@@ -136,6 +153,12 @@ class AndroidTimelineExportSession(private val context: Context) {
     @Volatile private var cancelRequested = false
     @Volatile private var activeEncoder: AndroidTimelineVideoPassEncoder? = null
 
+    /// Owned-temp cleanup for the in-flight [run], installed once its temp
+    /// paths are known, so a Throwable escaping [run] (caught in [start])
+    /// still deletes every owned temp -- including pass-0 normalized temps
+    /// -- instead of leaking them in the cache directory.
+    @Volatile private var ownedTempCleanup: (() -> Unit)? = null
+
     /** Requests cancellation of the in-flight export. Thread-safe, non-blocking. */
     fun requestCancel() {
         cancelRequested = true
@@ -145,7 +168,11 @@ class AndroidTimelineExportSession(private val context: Context) {
     /// [onProgress], when non-null, receives overall export progress in
     /// [0.0, 1.0]: pass-1 (video encode) sample progress is mapped into
     /// [0.0, PASS1_PROGRESS_SAMPLE_MAX] (strictly below 0.85) via the
-    /// encoder's own sample-ratio progress; the exact 0.85 checkpoint is
+    /// encoder's own sample-ratio progress -- or, when pass-0 reversed-clip
+    /// normalization runs (P5-REVERSE-COMPOSITION-NORMALIZATION-A), pass-0
+    /// is mapped into [0.0, PASS0_PROGRESS_WEIGHT] and pass-1 into
+    /// [PASS0_PROGRESS_WEIGHT, PASS1_PROGRESS_SAMPLE_MAX], all strictly
+    /// monotonic; the exact 0.85 checkpoint is
     /// emitted exactly once, immediately after pass-1 succeeds and the
     /// following cancel check passes; 0.98 is emitted immediately after
     /// pass-2 succeeds and the following cancel check passes. This session
@@ -163,7 +190,10 @@ class AndroidTimelineExportSession(private val context: Context) {
                 run(args, onSuccess, onError, onProgress)
             } catch (t: Throwable) {
                 Log.e(TAG, "unhandled exception in export session: $t", t)
+                try { ownedTempCleanup?.invoke() } catch (_: Throwable) {}
                 onError("EXPORT_FAILED", t.message ?: t.javaClass.simpleName)
+            } finally {
+                ownedTempCleanup = null
             }
         }.start()
     }
@@ -445,12 +475,16 @@ class AndroidTimelineExportSession(private val context: Context) {
 
         // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips are a narrow,
         // GLES-only production route (see AndroidTimelineVideoEncoder /
-        // AndroidExportRenderBackendSelector) -- any scope that mixes a
-        // reversed clip with a feature that has no reversed-clip support yet
-        // (transitions, clip-level Beauty V2) fails closed here, before
-        // transitions/overlays are even parsed, rather than silently
-        // producing wrong output. P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS:
-        // reversed clips with overlays are no longer blanket-rejected here --
+        // AndroidExportRenderBackendSelector). P5-REVERSE-COMPOSITION-
+        // NORMALIZATION-A: a reversed clip alongside a transition or
+        // clip-level Beauty V2 is no longer rejected here -- that scope is
+        // evaluated by AndroidExportRenderBackendSelector on the original
+        // clips (glesTransitionEligible / glesBeautyEligible admit a
+        // normalizable reversed clip) and, when GLES is committed, pass-0
+        // normalization below re-encodes each reversed clip into a forward
+        // temp before pass-1. A non-normalizable reversed clip still fails
+        // closed at backend selection. P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS:
+        // reversed clips with overlays are not blanket-rejected here either --
         // a hard-cut, zero-rotation reversed VIDEO clip renders through the
         // same GLES overlay route a still-image clip already uses (see
         // AndroidExportRenderBackendSelector.glesOverlayEligible and
@@ -459,7 +493,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         // (isReversed is only accepted for mediaKind == "video"), and
         // rotation metadata on a reversed clip is still checked further below
         // (step 3), once each video clip has been probed -- both guards apply
-        // regardless of whether overlays are present.
+        // regardless of whether overlays/transitions/Beauty are present.
         //
         // P5-REVERSE-AUDIO-SIDECAR-EXPORT: audioSidecar tracks are admitted
         // alongside a reversed hard-cut timeline -- not blanket-rejected --
@@ -467,23 +501,12 @@ class AndroidTimelineExportSession(private val context: Context) {
         // timeline's total duration (sum of each parsed clip's trimEnd -
         // trimStart; reversing a clip's playback direction does not change
         // its duration). An invalid track still fails closed rather than
-        // producing desynchronized output.
+        // producing desynchronized output. When the draft also carries
+        // transitions, this admission is deferred to the transition block
+        // (step 2b) instead, which validates against the overlap-adjusted
+        // duration -- the only duration that is correct for that shape.
         val anyReversed = parsedClips.any { it.isReversed }
-        if (anyReversed) {
-            if (rawTransitions.isNotEmpty()) {
-                onError(
-                    "UNSUPPORTED_EXPORT_FEATURE",
-                    "exportTimeline: reversed clips with transitions are not supported",
-                )
-                return
-            }
-            if (parsedClips.any { it.beautyIntensity != null }) {
-                onError(
-                    "UNSUPPORTED_EXPORT_FEATURE",
-                    "exportTimeline: reversed clips with Beauty V2 are not supported",
-                )
-                return
-            }
+        if (anyReversed && rawTransitions.isEmpty()) {
             if (audioSpecs.isNotEmpty()) {
                 val reverseTimelineDurationSeconds = parsedClips
                     .sumOf { it.trimEnd - it.trimStart }
@@ -670,12 +693,28 @@ class AndroidTimelineExportSession(private val context: Context) {
         val roiSidecarPath = AndroidTimelineRoiSidecarEmitter.sidecarPathForVideoPath(outputPath)
         val roiSidecarTempPath = AndroidTimelineRoiSidecarEmitter.tempPathForSidecarPath(roiSidecarPath)
 
+        // P5-REVERSE-COMPOSITION-NORMALIZATION-A: pass-0 owner. Constructed
+        // unconditionally (it allocates nothing until [run] is invoked) so
+        // its temps are part of this session's single owned-temp cleanup
+        // from the very first exit path below, whether or not pass-0 ends up
+        // running for this export.
+        val reverseNormalization = AndroidTimelineReverseNormalizationPrepass(
+            cacheDir = context.cacheDir,
+            exportId = exportId,
+            fps = requestFps,
+            requestedWidth = requestWidth,
+            requestedHeight = requestHeight,
+            requestedBitrateBps = requestBitrate,
+        )
+
         fun deleteOwnedTemps() {
             try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
             try { File(audioTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
             try { File(finalTmpPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
             try { File(roiSidecarTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            reverseNormalization.deleteOwnedTemps()
         }
+        ownedTempCleanup = { deleteOwnedTemps() }
 
         if (cancelRequested) {
             deleteOwnedTemps()
@@ -796,14 +835,20 @@ class AndroidTimelineExportSession(private val context: Context) {
         val debugForceGlesBeautyExport =
             debugForceGlesRequested && !hasNonHardCutTransitionForEncoder && hasBeautyClip
 
+        // P5-REVERSE-COMPOSITION-NORMALIZATION-A: selection always evaluates
+        // the ORIGINAL clip inputs (reversed flags intact) -- reversed clips
+        // are never rewritten before selection, so Vulkan keeps failing
+        // closed for them and the selector's own normalizability predicates
+        // decide GLES eligibility.
+        val exportScope = ExportRenderScope(
+            clips = clipInputs,
+            requestedWidth = requestWidth,
+            requestedHeight = requestHeight,
+            transitions = transitions,
+            overlays = overlays,
+        )
         val backendDecision = AndroidExportRenderBackendSelector().select(
-            ExportRenderScope(
-                clips = clipInputs,
-                requestedWidth = requestWidth,
-                requestedHeight = requestHeight,
-                transitions = transitions,
-                overlays = overlays,
-            ),
+            exportScope,
             nativeBridge = sessionNativeBridge,
             debugForceGlesTransitionExport = debugForceGlesTransitionExport,
             debugForceGlesBeautyExport = debugForceGlesBeautyExport,
@@ -851,18 +896,98 @@ class AndroidTimelineExportSession(private val context: Context) {
         // after pass-1 reports this value, not the original selector decision.
         var effectiveBackend = backendDecision.actualBackend
 
-        // Pass-1 progress is scaled into [0.0, PASS1_PROGRESS_SAMPLE_MAX]; a
-        // GLES fallback attempt reuses the same scaled callback and restarts
-        // its own sample-ratio progress from 0, so a max-seen clamp is
-        // required to prevent the fallback from regressing progress already
-        // emitted by a partially-progressed Vulkan attempt.
-        var maxPass1ProgressSeen = 0.0
-        fun emitPass1Progress(sampleRatio: Double) {
-            val scaled = (sampleRatio * PASS1_PROGRESS_SAMPLE_MAX).coerceIn(0.0, PASS1_PROGRESS_SAMPLE_MAX)
-            if (scaled > maxPass1ProgressSeen) {
-                maxPass1ProgressSeen = scaled
-                onProgress?.invoke(scaled)
+        // P5-REVERSE-COMPOSITION-NORMALIZATION-A: pass-0 runs only once GLES
+        // is the committed backend for a reversed+transition and/or
+        // reversed+Beauty scope. A reversed scope can never resolve to Vulkan
+        // (AndroidExportRenderBackendSelector.vulkanScopeFailureReason), so
+        // this is equivalent to "GLES was selected for such a scope", but
+        // the backend check is kept explicit rather than assumed.
+        val reverseNormalizationRequired =
+            effectiveBackend == ExportRenderBackend.GLES && exportScope.glesReverseNormalizationRequired
+
+        // Progress is strictly monotonic across pass-0 and pass-1: pass-0
+        // (when it runs) is scaled into [0.0, PASS0_PROGRESS_WEIGHT], and
+        // pass-1 sample progress into [pass1ProgressFloor,
+        // PASS1_PROGRESS_SAMPLE_MAX] where the floor is PASS0_PROGRESS_WEIGHT
+        // when pass-0 ran and 0.0 otherwise -- so every unaffected scope
+        // keeps its exact existing pass-1 mapping. A GLES fallback attempt
+        // reuses the same scaled pass-1 callback and restarts its own
+        // sample-ratio progress from 0, so the max-seen clamp is required
+        // to prevent the fallback (or pass-1 starting after pass-0) from
+        // regressing progress already emitted.
+        var maxProgressSeen = 0.0
+        fun emitMonotonicProgress(value: Double) {
+            if (value > maxProgressSeen) {
+                maxProgressSeen = value
+                onProgress?.invoke(value)
             }
+        }
+        val pass1ProgressFloor = if (reverseNormalizationRequired) PASS0_PROGRESS_WEIGHT else 0.0
+        fun emitPass0Progress(ratio: Double) {
+            emitMonotonicProgress((ratio * PASS0_PROGRESS_WEIGHT).coerceIn(0.0, PASS0_PROGRESS_WEIGHT))
+        }
+        fun emitPass1Progress(sampleRatio: Double) {
+            val span = PASS1_PROGRESS_SAMPLE_MAX - pass1ProgressFloor
+            val scaled = (pass1ProgressFloor + sampleRatio.coerceIn(0.0, 1.0) * span)
+                .coerceIn(pass1ProgressFloor, PASS1_PROGRESS_SAMPLE_MAX)
+            emitMonotonicProgress(scaled)
+        }
+
+        // ── 5a. Pass 0: reversed-clip normalization (GLES composition only) ──
+        // Replaces each reversed clip with a forward clip over an owned temp
+        // (see AndroidTimelineReverseNormalizationPrepass). Every other scope
+        // passes [clipInputs] through untouched.
+        var pass1ClipInputs: List<AndroidTimelineVideoEncoder.ClipInput> = clipInputs
+        if (reverseNormalizationRequired) {
+            if (cancelRequested) {
+                deleteOwnedTemps()
+                logTerminal("cancelled_before_normalization", effectiveBackend)
+                onError("EXPORT_CANCELLED", "exportTimeline: cancelled before reversed-clip normalization")
+                return
+            }
+            Log.i(
+                TAG,
+                "VG_EXPORT_REVERSE_NORMALIZATION_START backend=${effectiveBackend.wireName()} " +
+                    "reversed=${clipInputs.count { it.isReversed }} " +
+                    "transitions=${transitions.count { !it.isHardCut }} beauty=$hasBeautyClip",
+            )
+            when (
+                val normalization = reverseNormalization.run(
+                    clips = clipInputs,
+                    isCancelled = { cancelRequested },
+                    trackActiveEncoder = { enc -> activeEncoder = enc },
+                    onProgress = { ratio -> emitPass0Progress(ratio) },
+                )
+            ) {
+                is AndroidTimelineReverseNormalizationPrepass.Result.Failed -> {
+                    deleteOwnedTemps()
+                    if (normalization.cancelled || cancelRequested) {
+                        logTerminal("cancelled_during_normalization", effectiveBackend)
+                        onError("EXPORT_CANCELLED", "exportTimeline: cancelled during reversed-clip normalization")
+                    } else {
+                        logTerminal("pass0_failed", effectiveBackend)
+                        onError(
+                            "EXPORT_FAILED",
+                            "exportTimeline: pass-0 reversed-clip normalization failed: ${normalization.reason}",
+                        )
+                    }
+                    return
+                }
+                is AndroidTimelineReverseNormalizationPrepass.Result.Normalized -> {
+                    pass1ClipInputs = normalization.clips
+                    Log.i(
+                        TAG,
+                        "VG_EXPORT_REVERSE_NORMALIZATION_DONE normalized=${normalization.normalizedClipCount}",
+                    )
+                }
+            }
+            if (cancelRequested) {
+                deleteOwnedTemps()
+                logTerminal("cancelled_after_normalization", effectiveBackend)
+                onError("EXPORT_CANCELLED", "exportTimeline: cancelled after reversed-clip normalization")
+                return
+            }
+            emitMonotonicProgress(PASS0_PROGRESS_WEIGHT)
         }
 
         // P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A: only a GLES backend
@@ -911,10 +1036,12 @@ class AndroidTimelineExportSession(private val context: Context) {
         // [activeEncoder] is always cleared in `finally`, even if an encoder
         // unexpectedly throws instead of returning a failed EncodeResult, so
         // a later requestCancel() never holds a reference to a dead encoder.
+        // Pass-1 always encodes [pass1ClipInputs] -- identical to
+        // [clipInputs] unless pass-0 normalization replaced reversed clips.
         fun encodeWithActiveTracking(enc: AndroidTimelineVideoPassEncoder): AndroidTimelineVideoEncoder.EncodeResult {
             activeEncoder = enc
             try {
-                return enc.encode(clipInputs, transitions, overlays) { p -> emitPass1Progress(p) }
+                return enc.encode(pass1ClipInputs, transitions, overlays) { p -> emitPass1Progress(p) }
             } finally {
                 activeEncoder = null
             }
@@ -1085,6 +1212,9 @@ class AndroidTimelineExportSession(private val context: Context) {
         }
         try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
         try { File(audioTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+        // P5-REVERSE-COMPOSITION-NORMALIZATION-A: pass-0 temps are owned
+        // per-export cache files and are never part of the finalized output.
+        reverseNormalization.deleteOwnedTemps()
 
         logTerminal("success", effectiveBackend)
         onSuccess(
@@ -1197,6 +1327,14 @@ class AndroidTimelineExportSession(private val context: Context) {
         private const val PASS1_PROGRESS_WEIGHT = 0.85
         private const val PASS1_PROGRESS_SAMPLE_MAX = 0.849999
         private const val PASS2_PROGRESS_CHECKPOINT = 0.98
+
+        /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: progress prefix reserved
+        /// for pass-0 reversed-clip normalization when it runs. Pass-1 sample
+        /// progress is then scaled into [PASS0_PROGRESS_WEIGHT,
+        /// PASS1_PROGRESS_SAMPLE_MAX] instead of [0.0, PASS1_PROGRESS_SAMPLE_MAX];
+        /// the exact PASS1_PROGRESS_WEIGHT checkpoint is unchanged. Not an
+        /// exact-equality checkpoint for AndroidEditorExportCoordinator.
+        private const val PASS0_PROGRESS_WEIGHT = 0.10
 
         // Clip-level wire keys for features not implemented by Unit C's minimal
         // hard-cut passthrough. Presence of any of these (non-null) means the

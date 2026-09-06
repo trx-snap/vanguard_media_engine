@@ -23,15 +23,17 @@
 //   Lane reversed_rotation_fail_closed: a reversed clip with rotation metadata
 //                                       (clip_B) -> fail closed with
 //                                       UNSUPPORTED_EXPORT_FEATURE.
-//   Lane reversed_transition          : a reversed clip alongside a non-empty
-//                                       transition list -> fail closed with
-//                                       UNSUPPORTED_EXPORT_FEATURE.
+//   Lane reversed_transition          : one reversed clip + one forward clip
+//                                       (clip_A, 2.0s each) with a 0.5s dissolve
+//                                       transition -> success, renderBackend=gles,
+//                                       duration ~= 3.5.
 //   Lane reversed_overlay             : a reversed clip (clip_A, zero
 //                                       rotation) alongside a sticker overlay
 //                                       -> success, renderBackend=gles.
 //   Lane reversed_beauty              : a reversed clip with clip-level Beauty V2
-//                                       -> fail closed with
-//                                       UNSUPPORTED_EXPORT_FEATURE.
+//                                       -> success, renderBackend=gles,
+//                                       duration ~= 2.0, beautyClipCount >= 1,
+//                                       beautyFrameCount > 0.
 //   Lane reversed_audio_sidecar       : a reversed clip alongside a
 //                                       draft.audioSidecar track whose timing
 //                                       fits the reversed timeline -> success,
@@ -189,7 +191,7 @@ class _AndroidTimelineReverseExportSmokeAppState
           laneId: 'reversed_transition',
           clips: <VGTimelineReverseExportSmokeClip>[
             videoClip('clip-a', clipA.path, isReversed: true),
-            videoClip('clip-b', clipB.path),
+            videoClip('clip-b', clipA.path),
           ],
           transitions: const <VGTimelineReverseExportSmokeTransition>[
             VGTimelineReverseExportSmokeTransition(
@@ -201,10 +203,7 @@ class _AndroidTimelineReverseExportSmokeAppState
             ),
           ],
           outputPath: '${workDir.path}/vg_reverse_export_transition_$stamp.mp4',
-          expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: reversedClipsWithTransitionsToken,
-          ),
+          expectation: const VGTimelineReverseExportSmokeExpectation.success(),
         ),
         VGTimelineReverseExportSmokeRequest(
           laneId: 'reversed_overlay',
@@ -231,10 +230,7 @@ class _AndroidTimelineReverseExportSmokeAppState
             ),
           ],
           outputPath: '${workDir.path}/vg_reverse_export_beauty_$stamp.mp4',
-          expectation: const VGTimelineReverseExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: reversedClipsWithBeautyToken,
-          ),
+          expectation: const VGTimelineReverseExportSmokeExpectation.success(),
         ),
         VGTimelineReverseExportSmokeRequest(
           laneId: 'reversed_audio_sidecar',

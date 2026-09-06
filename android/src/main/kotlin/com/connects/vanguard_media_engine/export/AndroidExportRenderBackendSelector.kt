@@ -189,6 +189,24 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // non-hard-cut-transition scope (see [select]'s doc); a hard-cut Beauty
 // scope only ever sets the beauty force parameter (see
 // AndroidTimelineExportSession's single top-level debug-force routing).
+//
+// P5-REVERSE-COMPOSITION-NORMALIZATION-A: a reversed video clip no longer
+// categorically fails [ExportRenderScope.glesTransitionEligible] or
+// [ExportRenderScope.glesBeautyEligible]. Both predicates now admit a
+// reversed clip when it is normalizable on GLES
+// ([ExportRenderScope.reversedClipNormalizationIneligibleReason] == null:
+// video, zero rotation, no colorMatrix, positive decoded dimensions) and
+// reject it with `reversed_clip_not_normalizable:<reason>` otherwise.
+// Selection still runs on the ORIGINAL clips (reversed flags intact) --
+// Vulkan keeps failing closed for any reversed clip
+// (`reverse_unsupported_by_vulkan`), so such a scope resolves to GLES or
+// UNAVAILABLE, never Vulkan. Only after the session has committed GLES for a
+// scope where [ExportRenderScope.glesReverseNormalizationRequired] holds
+// does it run AndroidTimelineReverseNormalizationPrepass (pass-0), which
+// re-encodes each reversed clip into an owned forward temp so the GLES
+// pass-1 encoders (whose own isReversed defenses remain untouched) never see
+// a reversed clip. Hard-cut reversed-only and reversed+overlay-only scopes
+// keep their direct GLES reversed render route with no normalization.
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -238,6 +256,46 @@ data class ExportRenderScope(
     /// overlays.
     val hasOverlays: Boolean get() = overlays.isNotEmpty()
 
+    /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: true when any clip is reversed.
+    val hasReversedClip: Boolean get() = clips.any { it.isReversed }
+
+    /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: null when [clip] is not
+    /// reversed, or is a reversed clip AndroidTimelineReverseNormalizationPrepass
+    /// can normalize into a forward temp on GLES (video media kind, zero
+    /// rotation metadata -- the reverse renderer never applies rotation --
+    /// no colorMatrix -- the normalizer strips it and the GLES transition
+    /// route has no colorMatrix path -- and positive decoded dimensions);
+    /// otherwise a precise machine-readable reason.
+    fun reversedClipNormalizationIneligibleReason(clip: AndroidTimelineVideoEncoder.ClipInput): String? {
+        if (!clip.isReversed) return null
+        if (clip.mediaKind != "video") return "reversed_non_video_clip"
+        if (clip.rotationDegrees != 0) return "reversed_non_zero_rotation"
+        if (clip.colorMatrix != null) return "reversed_color_matrix_present"
+        if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return "reversed_invalid_decoded_dimensions"
+        return null
+    }
+
+    /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: the first reversed clip's
+    /// [reversedClipNormalizationIneligibleReason], or null when every
+    /// reversed clip in the scope (if any) is normalizable on GLES.
+    val glesReverseNormalizationIneligibleReason: String?
+        get() = clips.firstNotNullOfOrNull { reversedClipNormalizationIneligibleReason(it) }
+
+    /// True when [glesReverseNormalizationIneligibleReason] is null -- also
+    /// true for a scope with no reversed clip at all.
+    val reversedClipsNormalizableOnGles: Boolean get() = glesReverseNormalizationIneligibleReason == null
+
+    /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: true when a GLES pass-1 for
+    /// this scope must be preceded by reversed-clip normalization (pass-0):
+    /// the scope carries a reversed clip AND a non-hard-cut transition and/or
+    /// clip-level Beauty V2. Deliberately false for hard-cut reversed-only and
+    /// reversed+overlay-only scopes, which keep AndroidTimelineVideoEncoder's
+    /// direct reversed render route. Does not itself check normalizability --
+    /// [glesTransitionEligible]/[glesBeautyEligible] gate that before the
+    /// session ever commits GLES for such a scope.
+    val glesReverseNormalizationRequired: Boolean
+        get() = hasReversedClip && (hasNonHardCutTransition || hasBeautyClip)
+
     /// P5-GLES-EXPORT-OVERLAY-PRODUCTION-ROUTE-A, extended by
     /// P5-GLES-EXPORT-STILL-IMAGE-OVERLAYS and
     /// P5-GLES-EXPORT-REVERSED-CLIP-OVERLAYS: true when the scope's overlays
@@ -261,9 +319,9 @@ data class ExportRenderScope(
     /// paired with a non-hard-cut transition is instead evaluated via
     /// [glesTransitionEligible], which independently admits overlays for
     /// that shape; see [requiresVulkan] for how the two predicates combine.
-    /// Note that [glesTransitionEligible] and [glesBeautyEligible] still
-    /// exclude a reversed clip via their own
-    /// `clips.any { it.isReversed }` checks -- this slice narrowly widens
+    /// Note that [glesTransitionEligible] and [glesBeautyEligible] admit
+    /// normalizable reversed clips for pass-0 and still reject
+    /// non-normalizable reversed clips -- this slice narrowly widens
     /// only the hard-cut overlay route, and only for a reversed clip that is
     /// itself a zero-rotation video clip: a reversed clip is admitted here
     /// only when its `mediaKind == "video"` AND `rotationDegrees == 0` --
@@ -325,7 +383,10 @@ data class ExportRenderScope(
     val glesTransitionIneligibleReason: String?
         get() {
             if (!hasNonHardCutTransition) return "no_non_hard_cut_transition"
-            if (clips.any { it.isReversed }) return "reversed_clip_present"
+            // P5-REVERSE-COMPOSITION-NORMALIZATION-A: a reversed clip is
+            // admitted when pass-0 can normalize it into a forward temp
+            // before AndroidTimelineGlesTransitionVideoEncoder ever sees it.
+            glesReverseNormalizationIneligibleReason?.let { return "reversed_clip_not_normalizable:$it" }
             if (clips.any { it.mediaKind != "video" && it.mediaKind != "image" }) return "unsupported_media_kind_present"
             // P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS: Beauty V2 combined with any
             // still-image clip is out of scope for this route regardless of which
@@ -368,9 +429,11 @@ data class ExportRenderScope(
     /// Beauty route (AndroidTimelineVideoEncoder +
     /// AndroidTimelineGlesBeautyRenderSession), or a precise
     /// machine-readable reason otherwise. Route A only claims hard-cut,
-    /// video-only, non-reversed, colorMatrix-free, zero-rotation timelines
+    /// video-only, colorMatrix-free, zero-rotation timelines
     /// with positive decoded/requested dimensions -- any non-hard-cut
-    /// transition, still-image clip, reversed clip, colorMatrix, non-zero
+    /// transition, still-image clip, non-normalizable reversed clip
+    /// (P5-REVERSE-COMPOSITION-NORMALIZATION-A; see
+    /// [reversedClipNormalizationIneligibleReason]), colorMatrix, non-zero
     /// rotation, or invalid dimension anywhere in the scope fails this
     /// predicate, even when only one clip in an otherwise-eligible mixed
     /// hard-cut timeline carries the offending shape. Overlays no longer
@@ -385,7 +448,10 @@ data class ExportRenderScope(
         get() {
             if (!hasBeautyClip) return "no_beauty_clip"
             if (hasNonHardCutTransition) return "non_hard_cut_transition"
-            if (clips.any { it.isReversed }) return "reversed_clip_present"
+            // P5-REVERSE-COMPOSITION-NORMALIZATION-A: a reversed clip is
+            // admitted when pass-0 can normalize it into a forward temp
+            // before AndroidTimelineVideoEncoder's Beauty path ever sees it.
+            glesReverseNormalizationIneligibleReason?.let { return "reversed_clip_not_normalizable:$it" }
             if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
             if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
