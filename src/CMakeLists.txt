@@ -259,6 +259,14 @@ if (ANDROID)
     # probe translation unit per Constitution modularity pre-authorization).
     "platform/android/src/android_phase5_beauty_v2_gles_render_probe.cpp"
     "platform/android/src/android_phase5_beauty_v2_gles_render_jni.cpp"
+    # P5-GLES-EXPORT-OES-2D-BEAUTY-RESOLVE-READINESS: diagnostic-only seam
+    # proving a real MediaCodec decode -> SurfaceTexture ->
+    # GL_TEXTURE_EXTERNAL_OES frame, resolved by the Kotlin harness to
+    # GL_TEXTURE_2D RGBA8, still routes into the private
+    # GlesBeautyV2Compositor::DrawBeautyV2 helper above on a caller-current,
+    # current-verified ES3 context. This TU creates/destroys no EGL context,
+    # texture, or FBO.
+    "platform/android/src/android_phase5_gles_export_beauty_seam_jni.cpp"
     # P5-BEAUTY-V2-VULKAN-RENDER: VulkanBeautyV2Compositor shader/raster +
     # CPU reference parity diagnostic proof (lane execution extracted into
     # the probe translation unit, mirroring the GLES twin's modularity

@@ -2453,6 +2453,31 @@ class VanguardNativeBridge(
     // SurfaceTexture/OES frame proof, no export session, no product UI.
     external fun runAndroidDagPhase5BeautyV2GlesRenderSmoke(): String
 
+    // -- P5-GLES-EXPORT-OES-2D-BEAUTY-RESOLVE-READINESS: diagnostic-only seam
+    // proving a REAL MediaCodec decode -> SurfaceTexture ->
+    // GL_TEXTURE_EXTERNAL_OES frame, resolved by the caller to a
+    // GL_TEXTURE_2D RGBA8 raster, can still route into the exact same
+    // private GlesBeautyV2Compositor::DrawBeautyV2 helper exercised by the
+    // synthetic-pbuffer P5-BEAUTY-V2-GLES-RENDER diagnostic above.
+    // Creates/destroys no EGL context, texture, or FBO: the caller
+    // (AndroidGlesExportBeautySeamSmokeHarness) must already have its own
+    // current-verified ES3 EGL context current on the calling thread -- with
+    // inputTextureId already holding a resolved GL_RGBA8 raster and
+    // targetFbo already created/complete -- before invoking this. Validates
+    // dimensions/inputTextureId/targetFbo/intensity itself, then derives the
+    // full parameter ramp via ComputeBeautyV2ParametersFromIntensity before
+    // calling DrawBeautyV2. Returns a JSON object string with at least
+    // status/pass/failureReason/width/height/intensity/proofBoundary.
+    // Diagnostic only: no production GLES Beauty export route/session/
+    // backend-selector/encoder change.
+    external fun drawAndroidDagPhase5GlesExportBeautySeam(
+        inputTextureId: Int,
+        targetFbo: Int,
+        width: Int,
+        height: Int,
+        intensity: Float,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof diagnostic. Native creates its own temporary
     // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 sampled images,

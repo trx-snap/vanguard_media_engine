@@ -51,6 +51,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidBeautyV2GlesRenderS
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesExportOverlayProductionSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidGlesExportBeautySeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesExportOverlaySeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
@@ -452,6 +453,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var beautyV2GlesRenderSmokeCoordinator:
         AndroidBeautyV2GlesRenderSmokeCoordinator? = null
 
+    // -- P5-GLES-EXPORT-OES-2D-BEAUTY-RESOLVE-READINESS: diagnostic-only ----
+    // seam proving a real MediaCodec decode -> SurfaceTexture ->
+    // GL_TEXTURE_EXTERNAL_OES frame, resolved to GL_TEXTURE_2D RGBA8, still
+    // routes into the caller-current GlesBeautyV2Compositor::DrawBeautyV2
+    // helper on a current-verified ES3 context.
+    private var glesExportBeautySeamSmokeCoordinator:
+        AndroidGlesExportBeautySeamSmokeCoordinator? = null
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof smoke coordinator.
     private var timelineTransitionVulkanRenderSmokeCoordinator:
@@ -801,6 +810,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         beautyV2GlesRenderSmokeCoordinator = AndroidBeautyV2GlesRenderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        glesExportBeautySeamSmokeCoordinator = AndroidGlesExportBeautySeamSmokeCoordinator(
             mainHandler = mainHandler,
         )
         timelineTransitionVulkanRenderSmokeCoordinator = AndroidTimelineTransitionVulkanRenderSmokeCoordinator(
@@ -1605,6 +1617,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android beauty V2 GLES render smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidGlesExportBeautySeamSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = glesExportBeautySeamSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android GLES export beauty seam smoke coordinator unavailable",
                     null,
                 )
             }
@@ -3262,6 +3288,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // down in the native call before returning.
         beautyV2GlesRenderSmokeCoordinator?.disposeAll()
         beautyV2GlesRenderSmokeCoordinator = null
+        // P5-GLES-EXPORT-OES-2D-BEAUTY-RESOLVE-READINESS: release the smoke
+        // executor. An in-flight run owns its EGL context/textures/
+        // MediaCodec on its own thread and tears them down in the harness
+        // before returning.
+        glesExportBeautySeamSmokeCoordinator?.disposeAll()
+        glesExportBeautySeamSmokeCoordinator = null
         // P5-COMPOSITOR-TRANS (VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
         // them in the native call before returning.
