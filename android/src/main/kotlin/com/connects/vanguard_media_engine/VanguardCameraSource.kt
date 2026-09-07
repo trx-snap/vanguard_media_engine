@@ -49,6 +49,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.MirrorMode
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.SurfaceRequest
@@ -397,7 +398,11 @@ class VanguardCameraSource(
                 )
             )
             .build()
-        val videoCaptureUseCase = VideoCapture.withOutput(recorder)
+        // Front-camera WYSIWYG parity (matches iOS videoMirrored = front):
+        // saved video is mirrored like the preview for FRONT only; BACK stays normal.
+        val videoCaptureUseCase = VideoCapture.Builder(recorder)
+            .setMirrorMode(MirrorMode.MIRROR_MODE_ON_FRONT_ONLY)
+            .build()
             .also { videoCapture = it }
 
         // ── Bind to fake LifecycleOwner ───────────────────────────────────────
@@ -576,7 +581,14 @@ class VanguardCameraSource(
         }
 
         val outputFile = File(outputPath)
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()
+        // Front-camera WYSIWYG parity: saved still is mirrored like the preview
+        // for FRONT only (matches iOS videoMirrored = front); BACK stays normal.
+        val metadata = ImageCapture.Metadata().apply {
+            isReversedHorizontal = lensFacing == CameraSelector.LENS_FACING_FRONT
+        }
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile)
+            .setMetadata(metadata)
+            .build()
 
         capture.takePicture(
             outputOptions,
