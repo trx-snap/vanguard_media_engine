@@ -65,8 +65,9 @@ android {
 }
 
 // ── CameraX dependencies (B2: Android camera pipeline) ───────────────────────
-// Using the stable 1.3.x line — last series with full minSdk 24 support and
-// no CameraX 2.x migration required.
+// CameraX 1.5.3 is the Android 16 KB page-size compatibility baseline currently
+// used for Android camera pipeline, preserving minSdk 24 and avoiding a
+// CameraX 2.x migration.
 //
 // camera-core  : ProcessCameraProvider, CameraSelector, use-case base types
 // camera-camera2 : Camera2 backend implementation (required at runtime)
@@ -75,12 +76,13 @@ android {
 //
 // These are compileOnly in the plugin; the app includes them at link time.
 // If the consuming app targets API 34+ and uses CameraX 1.4+, it must override
-// these versions. For now 1.3.4 is the safest cross-device baseline.
+// these versions. 1.5.3 is the Android 16 KB page-size compatible CameraX 1.x
+// baseline while preserving minSdk 24 APIs.
 dependencies {
-    implementation("androidx.camera:camera-core:1.3.4")
-    implementation("androidx.camera:camera-camera2:1.3.4")
-    implementation("androidx.camera:camera-lifecycle:1.3.4")
-    implementation("androidx.camera:camera-video:1.3.4")
+    implementation("androidx.camera:camera-core:1.5.3")
+    implementation("androidx.camera:camera-camera2:1.5.3")
+    implementation("androidx.camera:camera-lifecycle:1.5.3")
+    implementation("androidx.camera:camera-video:1.5.3")
     // Guava ListenableFuture for ProcessCameraProvider.getInstance()
     implementation("com.google.guava:guava:33.0.0-android")
 
