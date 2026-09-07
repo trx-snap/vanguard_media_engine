@@ -3,6 +3,7 @@ package com.connects.vanguard_media_engine.editor
 import android.content.Context
 import android.os.Handler
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.atomic.AtomicInteger
@@ -28,11 +29,15 @@ class AndroidEditorPlaybackCoordinator(
     private val channel: MethodChannel,
     private val mainHandler: Handler,
     /**
-     * Phase 7.8I-Android: optional application [Context], forwarded to
-     * [AndroidEditorSequentialPlaybackSession] for original-clip audio preview's
-     * [android.media.AudioManager] focus requests only. Defaults to null so existing callers
-     * that do not yet supply it keep compiling and behaving exactly as before (audio focus
-     * management is simply skipped; playback itself does not require a Context).
+     * Optional application [Context]. Used here for the `content://` source readability
+     * preflight ([AndroidUriDataSourceHelper.isReadable]) and forwarded to
+     * [AndroidEditorSequentialPlaybackSession] for `content://`-aware source inspection
+     * (AndroidDagSourceInspector) and original-clip audio preview's
+     * [android.media.AudioManager] focus requests (Phase 7.8I-Android). Defaults to null so
+     * existing callers that do not supply it keep compiling and behaving exactly as before
+     * for plain POSIX paths (audio focus management is simply skipped); a `content://`
+     * source with a null context fails closed with FILE_UNREADABLE before any texture or
+     * session is allocated.
      */
     private val context: Context? = null,
 ) {
@@ -208,8 +213,11 @@ class AndroidEditorPlaybackCoordinator(
                 result.error("FILE_UNREADABLE", "sourcePath is missing or blank", null)
                 return
             }
-            val file = java.io.File(sourcePath)
-            if (!file.exists() || !file.canRead()) {
+            // POSIX paths keep the File.exists()/canRead() check; `content://` URIs are probed
+            // via ContentResolver and fail closed (false) when the context is null or the
+            // provider refuses. No texture/session has been allocated yet, so the caller can
+            // retry with a valid path/URI after a FILE_UNREADABLE error.
+            if (!AndroidUriDataSourceHelper.isReadable(sourcePath, context)) {
                 result.error("FILE_UNREADABLE", "sourcePath is not readable: $sourcePath", null)
                 return
             }
