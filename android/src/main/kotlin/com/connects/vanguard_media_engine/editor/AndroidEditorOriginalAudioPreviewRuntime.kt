@@ -8,7 +8,7 @@ import android.media.MediaPlayer
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
-import java.io.File
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -35,10 +35,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * completing op — a clip with corrupt/unsupported audio, or no audio track at all, never blocks
  * or fails the accompanying video preview.
  *
- * [context] is used only to request/abandon [AudioManager] playback focus as a courtesy to other
- * apps; it is optional because focus is not a precondition for a local-file [MediaPlayer] to
- * actually produce sound. When null, focus management is skipped and playback proceeds
- * unaffected.
+ * [context] is used to request/abandon [AudioManager] playback focus as a courtesy to other
+ * apps, and (reference-import Slice 3A) to open a `content://` source through its
+ * ContentResolver. It is optional because focus is not a precondition for a local-file
+ * [MediaPlayer] to actually produce sound. When null, focus management is skipped, POSIX-path
+ * playback proceeds unaffected, and a `content://` source is treated as unreadable (audio
+ * skipped non-fatally, video activation untouched).
  */
 class AndroidEditorOriginalAudioPreviewRuntime(
     private val context: Context?,
@@ -81,9 +83,16 @@ class AndroidEditorOriginalAudioPreviewRuntime(
             }
             teardownPlayerLocked()
 
-            val file = File(sourcePath)
-            if (!file.exists() || !file.canRead()) {
-                Log.w(TAG, "$LOG_PREFIX prepare_missing_file exist=${file.exists()} canRead=${file.canRead()}")
+            // Slice 3A: POSIX paths keep the File.exists()/canRead() preflight; content://
+            // URIs are probed through the ContentResolver and return false (no throw, no
+            // hang) when unreadable or when context is null. Either way audio is skipped
+            // non-fatally and onDone still fires so video activation never stalls.
+            if (!AndroidUriDataSourceHelper.isReadable(sourcePath, context)) {
+                Log.w(
+                    TAG,
+                    "$LOG_PREFIX prepare_missing_file contentUri=${AndroidUriDataSourceHelper.isContentUri(sourcePath)} " +
+                        "hasContext=${context != null}",
+                )
                 onDone()
                 return@post
             }
@@ -94,7 +103,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
             }
 
             val mp = MediaPlayer()
-            Log.i(TAG, "$LOG_PREFIX prepare_start file=${file.name} initialSourcePtsUs=$initialSourcePtsUs")
+            Log.i(TAG, "$LOG_PREFIX prepare_start file=${sourcePath.substringAfterLast('/')} initialSourcePtsUs=$initialSourcePtsUs")
             try {
                 mp.setOnErrorListener { _, what, extra ->
                     Log.w(TAG, "$LOG_PREFIX prepare_error_listener what=$what extra=$extra")
@@ -129,7 +138,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                         finish()
                     }
                 }
-                mp.setDataSource(sourcePath)
+                AndroidUriDataSourceHelper.setMediaPlayerDataSource(mp, sourcePath, context)
                 mp.prepareAsync()
             } catch (t: Throwable) {
                 Log.w(TAG, "$LOG_PREFIX prepare_setup_error", t)

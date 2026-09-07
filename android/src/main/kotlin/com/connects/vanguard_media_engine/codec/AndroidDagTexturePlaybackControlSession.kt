@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.codec
 
+import android.content.Context
 import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
 import android.media.Image
@@ -45,6 +46,13 @@ class AndroidDagTexturePlaybackControlSession(
      * [reason] is a short diagnostic tag; never null-checked by video logic.
      */
     private val onPlaybackInterrupted: ((reason: String) -> Unit)? = null,
+    /**
+     * Reference-import Slice 3A: optional application [Context], required only to open a
+     * `content://` [videoPath] through a ContentResolver during source inspection. Plain
+     * POSIX paths never touch it. A `content://` path with a null context fails closed in
+     * [prepare] (source inspection reports `content_uri_requires_context`).
+     */
+    private val context: Context? = null,
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
@@ -148,7 +156,7 @@ class AndroidDagTexturePlaybackControlSession(
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
         // Phase 4B2B3A: delegate all source inspection (file preflight, API check,
         // MediaExtractor creation, track selection, metadata extraction) to helper.
-        val inspection = AndroidDagSourceInspector().inspect(videoPath)
+        val inspection = AndroidDagSourceInspector().inspect(videoPath, context)
         if (!inspection.pass) {
             state = AndroidDagPlaybackState.Failed
             onResult(mapOf(

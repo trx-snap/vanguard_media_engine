@@ -1,7 +1,9 @@
 package com.connects.vanguard_media_engine.codec
 
+import android.content.Context
 import android.os.Handler
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 
@@ -9,6 +11,13 @@ class AndroidDagTexturePlaybackCoordinator(
     private val textureRegistry: TextureRegistry,
     private val channel: MethodChannel,
     private val mainHandler: Handler,
+    /**
+     * Reference-import Slice 3A: optional application [Context] threaded into each
+     * [AndroidDagTexturePlaybackControlSession] so a `content://` source path can be
+     * opened through a ContentResolver. Null keeps POSIX-path behaviour unchanged and
+     * makes any `content://` request fail closed at preflight.
+     */
+    private val context: Context? = null,
 ) {
     companion object {
         private const val TAG = "DagTextureCoordinator"
@@ -144,12 +153,13 @@ class AndroidDagTexturePlaybackCoordinator(
             return
         }
 
-        // Preflight: verify the file exists and can be read before allocating any
+        // Preflight: verify the source exists and can be read before allocating any
         // texture resources. MediaExtractor.setDataSource() can hang or throw
         // unpredictably on non-existent paths; this guard guarantees a prompt,
-        // well-formed MethodChannel result for the missing-file case.
-        val fileCheck = java.io.File(path)
-        if (!fileCheck.exists() || !fileCheck.canRead()) {
+        // well-formed MethodChannel result for the missing-file case. POSIX paths
+        // keep the File.exists()/canRead() check; content:// URIs are probed via
+        // ContentResolver and fail closed (false, no hang) when context is null.
+        if (!AndroidUriDataSourceHelper.isReadable(path, context)) {
             Log.w(TAG, "createPhase4B1BPlaybackControlSmoke: file not found or not readable: $path")
             result.success(mapOf(
                 "pass" to false,
@@ -168,6 +178,7 @@ class AndroidDagTexturePlaybackCoordinator(
         val session = AndroidDagTexturePlaybackControlSession(
             videoPath = path,
             surfaceProducer = surfaceProducer,
+            context = context,
         )
 
         val entry = ActiveControlEntry(session, surfaceProducer)

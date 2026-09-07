@@ -62,11 +62,14 @@ class AndroidEditorSequentialPlaybackSession(
     private val onTimelineFrame: (textureId: Long, ptsSeconds: Double, generationId: Long) -> Unit,
     private val onTimelineEOS: (textureId: Long) -> Unit,
     /**
-     * Phase 7.8I-Android: optional application [Context], used only to request/abandon
+     * Phase 7.8I-Android: optional application [Context], used to request/abandon
      * [android.media.AudioManager] playback focus for original-clip audio preview (see
-     * [AndroidEditorOriginalAudioPreviewRuntime]). Focus is a courtesy to other apps, not a
-     * precondition for local-file [android.media.MediaPlayer] output, so a null context simply
-     * skips focus management without otherwise affecting audio or video preview.
+     * [AndroidEditorOriginalAudioPreviewRuntime]) and, since reference-import Slice 3A, to
+     * open `content://` clip sources through a ContentResolver for both source inspection and
+     * the per-clip [AndroidDagTexturePlaybackControlSession]. Focus is a courtesy to other
+     * apps, not a precondition for local-file [android.media.MediaPlayer] output, so a null
+     * context skips focus management without affecting POSIX-path preview; a `content://`
+     * clip with a null context fails closed at [prepare] (clip_inspect_failed).
      */
     private val context: Context? = null,
 ) {
@@ -154,7 +157,7 @@ class AndroidEditorSequentialPlaybackSession(
 
             val hasAudioByIndex = mutableListOf<Boolean>()
             for (spec in clipSpecs) {
-                val inspection = AndroidDagSourceInspector().inspect(spec.sourcePath)
+                val inspection = AndroidDagSourceInspector().inspect(spec.sourcePath, context)
                 try {
                     if (!inspection.pass) {
                         dispose(null)
@@ -460,6 +463,7 @@ class AndroidEditorSequentialPlaybackSession(
                     }
                 }
             },
+            context = context,
         )
 
         activeSession = newSession

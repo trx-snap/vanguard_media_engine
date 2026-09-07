@@ -605,6 +605,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             textureRegistry = binding.textureRegistry,
             channel         = channel,
             mainHandler     = mainHandler,
+            context         = binding.applicationContext,
         )
         camera2TextureSmokeCoordinator = AndroidCamera2TextureSmokeCoordinator(
             context         = binding.applicationContext,
