@@ -102,6 +102,7 @@ import com.connects.vanguard_media_engine.sidecar.AndroidReverseSidecarCoordinat
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidMedia3StreamSourceCoordinator
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -1930,10 +1931,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     result.error("INVALID_ARG", "probeVideoDuration: path required", null)
                     return
                 }
+                // Slice 2: path may be POSIX or content:// — helper picks the overload.
+                val probeContext = context
                 Thread {
                     val retriever = MediaMetadataRetriever()
                     try {
-                        retriever.setDataSource(path)
+                        AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, path, probeContext)
                         val ms = retriever
                             .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                             ?.toLongOrNull() ?: -1L
@@ -1958,10 +1961,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     result.error("INVALID_ARG", "probeVideoInfo: path required", null)
                     return
                 }
+                // Slice 2: path may be POSIX or content:// — helper picks the overload.
+                val probeContext = context
                 Thread {
                     val retriever = MediaMetadataRetriever()
                     try {
-                        retriever.setDataSource(path)
+                        AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, path, probeContext)
                         val ms      = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: -1L
                         val wStr    = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
                         val hStr    = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
@@ -1996,7 +2001,15 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 // Container / kind classification computed up front (extension-based fast
                 // path) so still images can bypass MediaMetadataRetriever/MediaExtractor
                 // entirely below -- neither API can read still-image bounds/EXIF reliably.
-                val ext = path.substringAfterLast('.', "").lowercase()
+                // Slice 2: for content:// derive the extension from the last path segment
+                // only, so provider authorities (e.g. "com.android.providers.media") are
+                // never mistaken for an extension. POSIX derivation is unchanged.
+                val ext = if (AndroidUriDataSourceHelper.isContentUri(path)) {
+                    val lastSegment = android.net.Uri.parse(path).lastPathSegment ?: ""
+                    lastSegment.substringAfterLast('.', "").lowercase()
+                } else {
+                    path.substringAfterLast('.', "").lowercase()
+                }
                 val container = when (ext) {
                     "mp4", "m4v"   -> "mp4"
                     "mov"          -> "mov"
@@ -2090,10 +2103,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     return
                 }
 
+                // Slice 2: video path may be POSIX or content:// — helper picks the
+                // Context+Uri overloads and the resolver-backed size query.
+                val inspectContext = context
                 Thread {
                     val retriever = MediaMetadataRetriever()
                     try {
-                        retriever.setDataSource(path)
+                        AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, path, inspectContext)
 
                         // Duration
                         val ms      = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: -1L
@@ -2170,7 +2186,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                         var audioCodec = ""
                         try {
                             val extractor = android.media.MediaExtractor()
-                            extractor.setDataSource(path)
+                            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, path, inspectContext)
                             for (i in 0 until extractor.trackCount) {
                                 val fmt  = extractor.getTrackFormat(i)
                                 val mime = fmt.getString(android.media.MediaFormat.KEY_MIME) ?: ""
@@ -2206,8 +2222,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                             // "unknown" audioCodec treated as safe (aac assumed) in Dart policy
                         }
 
-                        // File size
-                        val fileSizeBytes = java.io.File(path).length()
+                        // File size (POSIX: File.length(); content://: OpenableColumns.SIZE
+                        // then PFD statSize fallback, cursor/PFD closed by the helper).
+                        val fileSizeBytes = AndroidUriDataSourceHelper.fileSizeBytes(path, inspectContext)
 
                         // MediaKind (ext/container/imageExts/audioExts derived above,
                         // before the still-image bypass check).

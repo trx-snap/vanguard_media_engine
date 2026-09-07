@@ -1,15 +1,18 @@
 package com.connects.vanguard_media_engine.codec
 
+import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.Build
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 
 /**
  * Vanguard Android True-DAG Phase 4B2C: Source Inspector.
  *
  * Encapsulates all source-level preflight and track-selection logic:
- *   - file existence / readability preflight
+ *   - file existence / readability preflight (POSIX path via java.io.File;
+ *     content:// via AndroidUriDataSourceHelper + the optional Context)
  *   - API level check (>= 29)
  *   - MediaExtractor creation, setDataSource, first-video-track selection
  *   - mime / width / height / durationUs extraction
@@ -49,11 +52,22 @@ data class AndroidDagSourceInspectionResult(
 
 class AndroidDagSourceInspector {
 
-    fun inspect(videoPath: String): AndroidDagSourceInspectionResult {
-        // 1. File existence / readability preflight — must happen before setDataSource()
+    /**
+     * @param videoPath POSIX filesystem path or `content://` URI.
+     * @param context Required for `content://` sources (ContentResolver access).
+     *   Ignored for POSIX paths, so existing `inspect(path)` callers are unchanged.
+     *   A `content://` path with a null context fails fast with pass=false.
+     */
+    fun inspect(videoPath: String, context: Context? = null): AndroidDagSourceInspectionResult {
+        // 1. Existence / readability preflight — must happen before setDataSource()
         //    because setDataSource() can hang on some Android versions for missing paths.
-        val file = java.io.File(videoPath)
-        if (!file.exists() || !file.canRead()) {
+        //    POSIX: File.exists/canRead (unchanged). content://: needs a Context and a
+        //    successful openFileDescriptor(uri, "r"), closed immediately by the helper.
+        val isContentUri = AndroidUriDataSourceHelper.isContentUri(videoPath)
+        if (isContentUri && context == null) {
+            return failure("content_uri_requires_context")
+        }
+        if (!AndroidUriDataSourceHelper.isReadable(videoPath, context)) {
             return failure("file_not_found_or_not_readable")
         }
 
@@ -65,7 +79,7 @@ class AndroidDagSourceInspector {
         // 3. Create extractor; any exception from here on releases it before returning.
         val ex = MediaExtractor()
         try {
-            ex.setDataSource(videoPath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(ex, videoPath, context)
 
             // 4. Find first video track. Scans every track (rather than stopping at the
             // first video match) so hasAudio below reflects the whole source, while still
@@ -111,7 +125,7 @@ class AndroidDagSourceInspector {
                     // KEY_ROTATION absent: attempt MMR fallback.
                     val mmr = MediaMetadataRetriever()
                     try {
-                        mmr.setDataSource(videoPath)
+                        AndroidUriDataSourceHelper.setRetrieverDataSource(mmr, videoPath, context)
                         val rotStr = mmr.extractMetadata(
                             MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
                         rotStr?.toIntOrNull() ?: 0
