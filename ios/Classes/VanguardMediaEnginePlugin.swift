@@ -7321,6 +7321,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "exportPhotoVideo":
             videoAssetPickerHandler.handleExportVideo(args: args, result: result)
 
+        // UMF V2: zero-copy PhotoKit reference resolution for reference-only selection.
+        case "resolvePhotoVideoReference":
+            videoAssetPickerHandler.handleResolveVideoReference(args: args, result: result)
+
         case "cancelExportPhotoVideo":
             videoAssetPickerHandler.handleCancelExport(args: args, result: result)
 
@@ -7847,6 +7851,8 @@ private final class _VanguardMC8DiagDelegate: NSObject, VanguardMultiCamMediaSou
 //   - Provide thumbnail image bytes (JPEG) and video duration.
 //   - Export/copy selected asset into local app cache directory as .mov/.mp4.
 //   - Support iCloud-backed assets (isNetworkAccessAllowed = true).
+//   - Resolve a reference-only selection to its local PhotoKit file URL without
+//     copying (isNetworkAccessAllowed = false; iCloud-only assets fail fast).
 //   - Safe cancellation and temp file cleanup on error.
 //   - Thread-safe and dispatches Flutter results on the main queue.
 
@@ -8270,6 +8276,116 @@ final class VGVideoAssetPickerHandler {
         }
         lock.unlock()
         result(true)
+    }
+
+    // ── Resolve Video Reference (zero-copy) ──────────────────────────────────
+    //
+    // Reference-only counterpart to handleExportVideo. Resolves a PhotoKit
+    // localIdentifier to the on-device AVURLAsset file URL so Dart can play the
+    // selection without a cache copy. Network access is disabled so an
+    // iCloud-only asset fails fast (ASSET_IN_ICLOUD) instead of silently
+    // downloading. The request is one-shot: it is never registered in
+    // activeRequestIds / activeExports, so cancelExport and dispose have no
+    // stale entries to clean up, and no temp file is ever created.
+    //
+    // Reply shape (success):
+    //   { assetId, resolvedFilePath, resolvedFileUri, durationSeconds,
+    //     pixelWidth, pixelHeight, creationTimestampMs? }
+    // Errors: INVALID_ARGUMENT, ASSET_NOT_FOUND, ASSET_IN_ICLOUD,
+    //         REFERENCE_UNRESOLVABLE (composition / non-file URL / unreadable).
+
+    func handleResolveVideoReference(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
+            result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
+            return
+        }
+
+        // Exactly one Flutter reply on every terminal path, always on main.
+        var hasResponded = false
+        let respondLock = NSLock()
+        func respond(_ value: Any?) {
+            respondLock.lock()
+            defer { respondLock.unlock() }
+            guard !hasResponded else { return }
+            hasResponded = true
+            DispatchQueue.main.async {
+                result(value)
+            }
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [imageManager = self.imageManager] in
+            let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil)
+            guard let asset = fetchResult.firstObject else {
+                respond(FlutterError(code: "ASSET_NOT_FOUND", message: "Asset with ID \(assetId) not found", details: nil))
+                return
+            }
+            guard asset.mediaType == .video else {
+                respond(FlutterError(code: "REFERENCE_UNRESOLVABLE", message: "Asset \(assetId) is not a video", details: nil))
+                return
+            }
+
+            let options = PHVideoRequestOptions()
+            // Hard requirement: never trigger an iCloud download from this path.
+            options.isNetworkAccessAllowed = false
+            options.version = .current
+            options.deliveryMode = .highQualityFormat
+
+            // Intentionally not stored in activeRequestIds: this is a one-shot
+            // metadata resolution with no cancel surface exposed to Dart.
+            _ = imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, info in
+                let inCloud = (info?[PHImageResultIsInCloudKey] as? Bool) ?? false
+                let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                let requestError = info?[PHImageErrorKey] as? Error
+
+                if cancelled {
+                    respond(FlutterError(code: "REFERENCE_UNRESOLVABLE", message: "Reference resolution was cancelled", details: nil))
+                    return
+                }
+
+                guard let avAsset = avAsset else {
+                    if inCloud {
+                        respond(FlutterError(code: "ASSET_IN_ICLOUD",
+                                             message: "Asset \(assetId) is stored in iCloud and is not available locally",
+                                             details: nil))
+                    } else {
+                        respond(FlutterError(code: "REFERENCE_UNRESOLVABLE",
+                                             message: requestError?.localizedDescription ?? "Could not load AVAsset for video",
+                                             details: nil))
+                    }
+                    return
+                }
+
+                // Compositions (edited / slow-mo / cinematic renders) have no single
+                // backing file; the reference path cannot represent them without a copy.
+                guard let urlAsset = avAsset as? AVURLAsset else {
+                    respond(FlutterError(code: "REFERENCE_UNRESOLVABLE",
+                                         message: "Asset \(assetId) resolves to a composition, not a local file",
+                                         details: nil))
+                    return
+                }
+
+                let url = urlAsset.url
+                guard url.isFileURL, FileManager.default.isReadableFile(atPath: url.path) else {
+                    respond(FlutterError(code: "REFERENCE_UNRESOLVABLE",
+                                         message: "Asset \(assetId) did not resolve to a readable local file",
+                                         details: nil))
+                    return
+                }
+
+                var dict: [String: Any] = [
+                    "assetId": assetId,
+                    "resolvedFilePath": url.path,
+                    "resolvedFileUri": url.absoluteString,
+                    "durationSeconds": asset.duration,
+                    "pixelWidth": asset.pixelWidth,
+                    "pixelHeight": asset.pixelHeight
+                ]
+                if let creationDate = asset.creationDate {
+                    dict["creationTimestampMs"] = Int64(creationDate.timeIntervalSince1970 * 1000)
+                }
+                respond(dict)
+            }
+        }
     }
 
     // ── Open App Settings ───────────────────────────────────────────────────

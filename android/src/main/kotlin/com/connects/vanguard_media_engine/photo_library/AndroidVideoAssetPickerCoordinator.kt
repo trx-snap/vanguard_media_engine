@@ -31,8 +31,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 //
 // Android parity for VGVideoAssetPickerHandler.swift (iOS). Owns the custom
 // video-only gallery picker bridge: permission check/request, paged
-// MediaStore video listing, thumbnail bytes, cache-dir export/cancel, app
-// settings deep link, and the API 34+ limited-library re-picker.
+// MediaStore video listing, thumbnail bytes, cache-dir export/cancel, zero-copy
+// content:// reference resolution, app settings deep link, and the API 34+
+// limited-library re-picker.
 //
 // Asset ids are opaque full content:// URIs (never raw numeric MediaStore
 // row ids) so Dart never observes a platform-specific identifier shape.
@@ -57,6 +58,7 @@ class AndroidVideoAssetPickerCoordinator(
             "fetchPhotoVideos",
             "fetchPhotoVideoThumbnail",
             "exportPhotoVideo",
+            "resolvePhotoVideoReference",
             "cancelExportPhotoVideo",
             "openAppSettings",
             "presentLimitedLibraryPicker",
@@ -122,6 +124,7 @@ class AndroidVideoAssetPickerCoordinator(
             "fetchPhotoVideos" -> handleFetchVideos(args, result)
             "fetchPhotoVideoThumbnail" -> handleFetchThumbnail(args, result)
             "exportPhotoVideo" -> handleExportVideo(args, result)
+            "resolvePhotoVideoReference" -> handleResolveVideoReference(args, result)
             "cancelExportPhotoVideo" -> handleCancelExport(args, result)
             "openAppSettings" -> handleOpenSettings(result)
             "presentLimitedLibraryPicker" -> handlePresentLimitedLibraryPicker(result)
@@ -519,6 +522,94 @@ class AndroidVideoAssetPickerCoordinator(
                 VideoRow(
                     c.getString(c.getColumnIndexOrThrow(MediaStore.Video.Media.MIME_TYPE)),
                     c.getString(c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)),
+                )
+            } else {
+                null
+            }
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    // ── Resolve Video Reference (zero-copy) ──────────────────────────────────
+    //
+    // Reference-only counterpart to exportPhotoVideo. Validates that the id is a
+    // content:// URI backed by a readable MediaStore row and echoes the URI back
+    // with row metadata. No stream is opened, no bytes are copied, and no
+    // cancel flag / executor entry outlives the reply: the request is one-shot.
+    //
+    // Reply shape (success):
+    //   { assetId: <input id>, durationSeconds: Double, pixelWidth: Int,
+    //     pixelHeight: Int, creationTimestampMs: Long? }
+    // Errors: INVALID_ARGUMENT (not a content:// URI), ASSET_NOT_FOUND (row
+    // missing or unreadable), REFERENCE_UNRESOLVABLE (coordinator disposed).
+
+    private fun handleResolveVideoReference(args: Map<*, *>?, result: MethodChannel.Result) {
+        val reply = GuardedReply(result)
+        val idStr = (args?.get("id") as? String)?.trim()
+        val uri = idStr?.let { parseAssetUri(it) }
+        if (idStr.isNullOrEmpty() || uri == null) {
+            reply.error("INVALID_ARGUMENT", "Asset ID must be a content:// URI")
+            return
+        }
+        try {
+            queryExecutor.execute {
+                val row = queryReferenceRowByUri(uri)
+                if (row == null) {
+                    reply.error("ASSET_NOT_FOUND", "Asset with ID $idStr not found")
+                } else {
+                    reply.success(
+                        mapOf(
+                            "assetId" to idStr,
+                            "durationSeconds" to row.durationMs / 1000.0,
+                            "pixelWidth" to row.width,
+                            "pixelHeight" to row.height,
+                            "creationTimestampMs" to row.creationTimestampMs,
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            // Executor rejected the task (disposeAll already ran).
+            reply.error("REFERENCE_UNRESOLVABLE", e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private data class ReferenceRow(
+        val durationMs: Long,
+        val width: Int,
+        val height: Int,
+        val creationTimestampMs: Long?,
+    )
+
+    /** Metadata-only row lookup by content URI; null when the row is missing or the query throws. */
+    private fun queryReferenceRowByUri(uri: Uri): ReferenceRow? = try {
+        context.contentResolver.query(
+            uri,
+            arrayOf(
+                MediaStore.Video.Media.DURATION,
+                MediaStore.Video.Media.WIDTH,
+                MediaStore.Video.Media.HEIGHT,
+                MediaStore.Video.Media.DATE_ADDED,
+                MediaStore.Video.Media.DATE_TAKEN,
+            ),
+            null,
+            null,
+            null,
+        )?.use { c ->
+            if (c.moveToFirst()) {
+                val dateAddedSec = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED))
+                val dateTakenMs = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_TAKEN))
+                val creationTimestampMs: Long? = when {
+                    dateTakenMs > 0L -> dateTakenMs
+                    dateAddedSec > 0L -> dateAddedSec * 1000L
+                    else -> null
+                }
+                ReferenceRow(
+                    durationMs = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)),
+                    width = c.getInt(c.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)),
+                    height = c.getInt(c.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)),
+                    creationTimestampMs = creationTimestampMs,
                 )
             } else {
                 null
