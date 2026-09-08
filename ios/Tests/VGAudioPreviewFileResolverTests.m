@@ -1,8 +1,17 @@
 // VGAudioPreviewFileResolverTests.m
-// Vanguard Media Engine — S-P2 MOV original-audio repair
+// Vanguard Media Engine — S-P2 MOV original-audio repair / Phase 10F Slice 1
 //
 // Deterministic native unit tests for VGAudioPreviewFileResolver.
 // Simulator-safe. No sleeps. Bounded XCTest expectations throughout.
+//
+// Phase 10F Slice 1 cache contract exercised here:
+//   - Completed CAFs are owned by the shared preview cache and SURVIVE
+//     cancelAndCleanupWithCompletion: (T3, T4, T5).
+//   - Resolver cleanup removes only resolver-owned temp/partial files (T3).
+//   - Repeated resolution of the same source yields the same CAF path and the
+//     warm pass is served from cache (T7).
+//   - Two tracks in one plan sharing a source resolve to one CAF URL while
+//     both tracks are preserved (T8).
 //
 // UMF source paths read:
 //   /Users/foxy/connects_app/packages/UMF/ios/Classes/VGAudioSidecarPlan.h
@@ -67,6 +76,83 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
                volumeKeyframes:keyframes
                  waveformCache:waveformCache
          timeRemapAudioPolicy:remapPolicy];
+}
+
+/// Copies the MOV fixture to a uniquely named file in NSTemporaryDirectory.
+/// The cache is keyed by normalized source path (+ size + mtime + schema),
+/// so a fresh copy is a guaranteed cold cache key regardless of what earlier
+/// tests or earlier test runs left in the shared, durable cache. The caller
+/// removes the copy when done. Returns nil and records a failure on error.
+static NSURL * _Nullable VGResolverTest_FreshFixtureCopy(XCTestCase *self) {
+    NSURL *movURL = VGResolverTest_MovFixtureURL(self);
+    if (!movURL) return nil;
+
+    NSString *name = [NSString stringWithFormat:@"vg_resolver_test_%@.mov",
+                      [NSUUID UUID].UUIDString];
+    NSURL *copyURL = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+                      URLByAppendingPathComponent:name isDirectory:NO];
+    NSError *err = nil;
+    if (![[NSFileManager defaultManager] copyItemAtURL:movURL toURL:copyURL error:&err]) {
+        XCTFail(@"could not copy fixture to a fresh temp path: %@",
+                err.localizedDescription);
+        return nil;
+    }
+    return copyURL;
+}
+
+/// Returns YES if any resolver-owned partial for |cafPath| remains in the
+/// cache directory. Partials are named "<key>.<uuid>.partial" and live next
+/// to the published "<key>.caf", so a sibling whose name starts with
+/// "<key>." and ends with ".partial" is a leaked partial for this entry.
+static BOOL VGResolverTest_PartialSiblingExists(NSString *cafPath) {
+    NSString *dir = cafPath.stringByDeletingLastPathComponent;
+    NSString *keyPrefix =
+        [cafPath.lastPathComponent.stringByDeletingPathExtension
+         stringByAppendingString:@"."];
+    NSArray<NSString *> *names =
+        [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    for (NSString *name in names) {
+        if ([name hasPrefix:keyPrefix] &&
+            [[name.pathExtension lowercaseString] isEqualToString:@"partial"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// Resolves |plan| through a fresh resolver, waits (bounded), and returns the
+/// resolved plan (nil on drop/cancel). Elapsed wall-clock milliseconds from
+/// resolvePlan: to completion are written to |outMs|. The resolver is cleaned
+/// up before returning, so any CAF path in the result is cache-owned.
+static VGAudioSidecarPlan * _Nullable VGResolverTest_ResolveOnce(
+    XCTestCase *self, VGAudioSidecarPlan *plan, NSString *label, double *outMs)
+{
+    VGAudioPreviewFileResolver *resolver = [[VGAudioPreviewFileResolver alloc] init];
+
+    XCTestExpectation *resolveExp =
+        [self expectationWithDescription:
+            [NSString stringWithFormat:@"%@ resolve", label]];
+    resolveExp.expectedFulfillmentCount = 1;
+    resolveExp.assertForOverFulfill = YES;
+
+    __block VGAudioSidecarPlan *resolved = nil;
+    __block CFAbsoluteTime endTime = 0;
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    [resolver resolvePlan:plan
+               completion:^(VGAudioSidecarPlan *_Nullable p) {
+        endTime = CFAbsoluteTimeGetCurrent();
+        resolved = p;
+        [resolveExp fulfill];
+    }];
+    [self waitForExpectations:@[resolveExp] timeout:30.0];
+    if (outMs) *outMs = (endTime - startTime) * 1000.0;
+
+    XCTestExpectation *cleanupExp =
+        [self expectationWithDescription:
+            [NSString stringWithFormat:@"%@ cleanup", label]];
+    [resolver cancelAndCleanupWithCompletion:^{ [cleanupExp fulfill]; }];
+    [self waitForExpectations:@[cleanupExp] timeout:5.0];
+    return resolved;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -327,18 +413,24 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S-P2-T3: Successful cleanup removes the extracted CAF
+// S-P2-T3 (Phase 10F): Cleanup preserves the completed cache CAF
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Scenario: after successful extraction, call cancelAndCleanupWithCompletion:.
 //
+// Phase 10F Slice 1 contract: completed CAFs are owned by the shared preview
+// cache, not by the resolver. Resolver cleanup removes only resolver-owned
+// temporary/partial files.
+//
 // Verifies:
 //   - cleanup completion fires exactly once on the main thread.
-//   - the previously extracted CAF file no longer exists after completion.
+//   - the resolved CAF lives in the shared cache directory.
+//   - the CAF still exists and still opens after cleanup completes.
+//   - no resolver-owned partial for that cache entry is left behind.
 //
 // IMPLEMENTED.
 
-- (void)test_SP2T3_cleanupRemovesExtractedCAF {
+- (void)test_SP2T3_cleanupPreservesCompletedCacheCAF {
     NSURL *movURL = VGResolverTest_MovFixtureURL(self);
     if (!movURL) return;
 
@@ -368,6 +460,11 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
 
     XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:cafPath],
                   @"CAF must exist before cleanup");
+    XCTAssertEqualObjects(
+        cafPath.stringByDeletingLastPathComponent.lastPathComponent,
+        @"com.vanguard.audiopreview",
+        @"completed CAF must be published into the shared preview cache "
+        @"directory (Library/Caches/com.vanguard.audiopreview)");
 
     XCTestExpectation *cleanupExp =
         [self expectationWithDescription:@"SP2T3 cleanup"];
@@ -383,8 +480,27 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
 
     XCTAssertTrue(cleanupOnMain,
                   @"cleanup completion must fire on the main thread");
-    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:cafPath],
-                   @"extracted CAF must not exist after cleanup completes");
+
+    // ── Completed cache CAF survives resolver cleanup ────────────────────────
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:cafPath],
+                  @"completed cache CAF must survive cancelAndCleanupWithCompletion:");
+    {
+        NSError *openErr = nil;
+        AVAudioFile *audioFile =
+            [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:cafPath]
+                                          error:&openErr];
+        XCTAssertNotNil(audioFile,
+                        @"cache CAF must still open after cleanup: %@",
+                        openErr.localizedDescription);
+        if (audioFile) {
+            XCTAssertGreaterThan(audioFile.length, (AVAudioFramePosition)0,
+                                 @"cache CAF must still contain audio after cleanup");
+        }
+    }
+
+    // ── Only resolver-owned partials are removed ─────────────────────────────
+    XCTAssertFalse(VGResolverTest_PartialSiblingExists(cafPath),
+                   @"cleanup must leave no resolver-owned .partial for this entry");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,7 +517,8 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
 //   - A third call, issued after both first completions have returned, fires
 //     its completion exactly once on the main thread.
 //   - No crash or timeout at any stage.
-//   - The CAF file is absent after all three completions have fired.
+//   - The completed cache CAF is still present after all three completions
+//     have fired (Phase 10F: cleanup never removes cache-owned entries).
 //
 // NOT_VERIFIED (requires an internal seam):
 //   - Whether both immediate calls were simultaneously pending in the
@@ -491,9 +608,11 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
     [self waitForExpectations:@[cleanup3Exp] timeout:5.0];
     XCTAssertTrue(cleanup3OnMain, @"already-clean third cleanup completion must be on main");
 
-    // Confirm the output file is absent.
-    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:cafPath],
-                   @"output CAF must be absent after all cleanup completions have fired");
+    // Phase 10F: the completed CAF is cache-owned and must survive every
+    // cleanup call, including the repeated and already-clean ones.
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:cafPath],
+                  @"completed cache CAF must still exist after all cleanup "
+                  @"completions have fired");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -507,7 +626,9 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
 // correctly when cancellation is requested immediately after resolution begins.
 // Both completions fire exactly once on the main thread regardless of whether
 // the cancel flag was observed by the extraction loop before or after it ran.
-// No output CAF file is retained after the cleanup completion fires.
+// If extraction completed and published before the cancel flag was observed,
+// the returned CAF is cache-owned and is still present after cleanup fires
+// (Phase 10F: cleanup removes only resolver-owned partials/temp files).
 //
 // NOT_VERIFIED (requires production seam): whether the _cancelled flag was
 // observed in-flight (i.e. during extraction) versus post-completion. The
@@ -563,11 +684,12 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
                   @"cleanup completion must fire on main thread");
 
     // If extraction completed before cancellation was observed, a CAF path was
-    // returned. After cleanup fires, that file must no longer exist.
+    // returned. A non-nil plan is only delivered after the CAF was published
+    // to the shared cache, so cleanup must leave that file in place.
     if (resolvedCafPath.length > 0) {
-        XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:resolvedCafPath],
-                       @"any CAF produced before cancellation was observed must be "
-                       @"removed by cleanup");
+        XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:resolvedCafPath],
+                      @"a CAF published before cancellation was observed is "
+                      @"cache-owned and must survive cleanup");
     }
     // No crash: implicit.
 }
@@ -645,6 +767,170 @@ static VGAudioSidecarPlan *VGResolverTest_PlanForURL(
         @"tracks is empty (NSParameterAssert tracks.count > 0). "
         @"The resolver zero-track branch is unreachable through the public API."
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P10F-T7: Repeated same source → same cached CAF path, warm pass is a hit
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Scenario: resolve a FRESH copy of the MOV fixture twice with two separate
+// resolvers. The fresh copy guarantees the first pass is a cold cache key
+// (the shared cache is durable across tests and test runs, so the bundled
+// fixture path itself may already be warm). The first resolver is cleaned up
+// before the second starts, so the second pass can only succeed if the CAF
+// survived cleanup in the cache.
+//
+// Verifies:
+//   - both passes return a non-nil plan with a .caf URL.
+//   - both passes return the SAME CAF path (cache key is by source identity).
+//   - the CAF exists after both resolvers are cleaned up.
+//   - the warm pass is clearly faster than the cold pass. Threshold: at most
+//     half the cold wall-clock time, with a 150 ms floor so a very fast cold
+//     extraction on a fast machine cannot make the ratio brittle. Cold
+//     extraction decodes the full fixture audio; a hit is a stat + header
+//     open, so this margin is wide.
+//
+// Housekeeping: the temp fixture copy is removed at the end. The cache entry
+// it produced stays cache-owned and is reclaimed by byte-budget LRU eviction.
+
+- (void)test_P10FT7_repeatedSourceReturnsSameCachedCAFAndWarmPassIsHit {
+    NSURL *freshMovURL = VGResolverTest_FreshFixtureCopy(self);
+    if (!freshMovURL) return; // failure already recorded
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // ── Cold pass ────────────────────────────────────────────────────────────
+    double coldMs = 0;
+    VGAudioSidecarPlan *coldPlan = VGResolverTest_ResolveOnce(
+        self, VGResolverTest_PlanForURL(freshMovURL, nil, nil, nil),
+        @"P10FT7 cold", &coldMs);
+    NSString *coldCaf = coldPlan.tracks.firstObject[@"url"];
+
+    XCTAssertNotNil(coldPlan, @"cold pass must resolve the fresh MOV copy");
+    XCTAssertEqualObjects([coldCaf.pathExtension lowercaseString], @"caf",
+                          @"cold pass must rewrite the track url to a CAF");
+    if (coldCaf.length == 0 || ![fm fileExistsAtPath:coldCaf]) {
+        XCTFail(@"P10FT7: cold pass must produce a CAF on disk (prerequisite)");
+        [fm removeItemAtURL:freshMovURL error:nil];
+        return;
+    }
+    XCTAssertTrue([fm fileExistsAtPath:coldCaf],
+                  @"CAF from the cold pass must survive its resolver's cleanup");
+
+    // ── Warm pass (separate resolver, same source) ───────────────────────────
+    double warmMs = 0;
+    VGAudioSidecarPlan *warmPlan = VGResolverTest_ResolveOnce(
+        self, VGResolverTest_PlanForURL(freshMovURL, nil, nil, nil),
+        @"P10FT7 warm", &warmMs);
+    NSString *warmCaf = warmPlan.tracks.firstObject[@"url"];
+
+    XCTAssertNotNil(warmPlan, @"warm pass must resolve the same source");
+    XCTAssertEqualObjects(warmCaf, coldCaf,
+                          @"repeated resolution of the same source must return "
+                          @"the same cached CAF path");
+    XCTAssertTrue([fm fileExistsAtPath:coldCaf],
+                  @"cached CAF must still exist after both resolvers cleaned up");
+
+    // ── Warm pass timing proves a cache hit ──────────────────────────────────
+    double warmBudgetMs = MAX(coldMs * 0.5, 150.0);
+    XCTAssertLessThanOrEqual(warmMs, warmBudgetMs,
+                             @"warm pass (%.1f ms) must be served from cache: "
+                             @"expected <= %.1f ms given cold pass %.1f ms",
+                             warmMs, warmBudgetMs, coldMs);
+    NSLog(@"[VGAudioPreviewFileResolverTests] P10FT7 coldMs=%.1f warmMs=%.1f "
+          @"budgetMs=%.1f caf=%@", coldMs, warmMs, warmBudgetMs,
+          coldCaf.lastPathComponent);
+
+    // ── Housekeeping: remove the temp fixture copy (test-owned) ──────────────
+    [fm removeItemAtURL:freshMovURL error:nil];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P10F-T8: Two tracks sharing a source → one CAF URL, both tracks preserved
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Scenario: one plan with two tracks ("t1" music, "t2" voice) that both point
+// at the MOV fixture. Phase 10F in-plan dedupe resolves the source once and
+// rewrites both tracks to the same CAF path.
+//
+// Verifies:
+//   - resolved plan keeps both tracks, in order, with their own trackIds.
+//   - both track urls are identical, end in .caf, and exist on disk.
+//   - every non-url field of each track is preserved verbatim.
+//   - the CAF survives resolver cleanup (cache-owned).
+
+- (void)test_P10FT8_twoTracksSameSourceShareOneCAFAndBothArePreserved {
+    NSURL *movURL = VGResolverTest_MovFixtureURL(self);
+    if (!movURL) return;
+
+    NSDictionary *track1 = @{
+        @"trackId"         : @"t1",
+        @"role"            : @"music",
+        @"url"             : movURL.path,
+        @"startTime"       : @(0.0),
+        @"sourceTrimStart" : @(0.0),
+        @"duration"        : @(-1.0),
+        @"volume"          : @(0.8),
+        @"customField"     : @"first",
+    };
+    NSDictionary *track2 = @{
+        @"trackId"         : @"t2",
+        @"role"            : @"voice",
+        @"url"             : movURL.path,
+        @"startTime"       : @(1.5),
+        @"sourceTrimStart" : @(0.25),
+        @"duration"        : @(2.0),
+        @"volume"          : @(0.4),
+        @"customField"     : @"second",
+    };
+    VGAudioSidecarPlan *plan =
+        [[VGAudioSidecarPlan alloc] initWithTracks:@[track1, track2]
+                                   volumeKeyframes:nil
+                                     waveformCache:nil
+                             timeRemapAudioPolicy:nil];
+
+    double elapsedMs = 0;
+    VGAudioSidecarPlan *resolved =
+        VGResolverTest_ResolveOnce(self, plan, @"P10FT8", &elapsedMs);
+
+    XCTAssertNotNil(resolved, @"two-track same-source plan must resolve");
+    if (!resolved) return;
+
+    // ── Both tracks preserved, in order ──────────────────────────────────────
+    XCTAssertEqual(resolved.tracks.count, (NSUInteger)2,
+                   @"in-plan dedupe must keep both tracks (dedupe rewrites, "
+                   @"it does not drop)");
+    if (resolved.tracks.count != 2) return;
+
+    NSDictionary *r1 = resolved.tracks[0];
+    NSDictionary *r2 = resolved.tracks[1];
+    XCTAssertEqualObjects(r1[@"trackId"], @"t1", @"first track must stay t1");
+    XCTAssertEqualObjects(r2[@"trackId"], @"t2", @"second track must stay t2");
+
+    // ── Same CAF URL for both ────────────────────────────────────────────────
+    NSString *url1 = r1[@"url"];
+    NSString *url2 = r2[@"url"];
+    XCTAssertEqualObjects([url1.pathExtension lowercaseString], @"caf",
+                          @"t1 url must be rewritten to a CAF");
+    XCTAssertEqualObjects(url1, url2,
+                          @"tracks sharing a source must resolve to the same CAF URL");
+    XCTAssertFalse([url1 isEqualToString:movURL.path],
+                   @"resolved url must differ from the MOV source path");
+    XCTAssertTrue(url1.length > 0 &&
+                  [[NSFileManager defaultManager] fileExistsAtPath:url1],
+                  @"shared CAF must exist on disk and survive resolver cleanup");
+
+    // ── Non-url fields preserved per track ───────────────────────────────────
+    NSArray<NSString *> *preservedKeys = @[
+        @"trackId", @"role", @"startTime", @"sourceTrimStart",
+        @"duration", @"volume", @"customField"
+    ];
+    for (NSString *key in preservedKeys) {
+        XCTAssertEqualObjects(r1[key], track1[key],
+                              @"t1 field '%@' must be preserved unchanged", key);
+        XCTAssertEqualObjects(r2[key], track2[key],
+                              @"t2 field '%@' must be preserved unchanged", key);
+    }
 }
 
 @end

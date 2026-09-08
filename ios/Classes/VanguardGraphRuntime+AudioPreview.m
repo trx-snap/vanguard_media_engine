@@ -339,6 +339,9 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
            @"on the main queue.");
   NSParameterAssert(completion != nil);
 
+  // Phase 10F Slice 1: timing instrumentation (captured by value in blocks).
+  CFAbsoluteTime requestStart = CFAbsoluteTimeGetCurrent();
+
   // ── Gate 1: lifecycle must be Active at entry ──────────────────────────────
   if ([self _graphAudioLifecycleState] != VGGraphAudioLifecycleActive) {
     NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
@@ -415,11 +418,28 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
         [[VGAudioPreviewFileResolver alloc] init];
     [ss _setAudioFileResolver:myResolver];
 
+    // Phase 10F Slice 1: teardown of the previous runtime/resolver is the
+    // time between request entry and this point.
+    CFAbsoluteTime resolveStart = CFAbsoluteTimeGetCurrent();
+    NSUInteger tracksIn = plan.tracks.count;
+    NSLog(@"[VanguardGraphRuntime+AudioPreview][TIMING] beginResolution "
+          @"teardownMs=%d tracksIn=%lu generation=%llu",
+          (int)((resolveStart - requestStart) * 1000.0),
+          (unsigned long)tracksIn, (unsigned long long)myGeneration);
+
     // ── Start resolution ─────────────────────────────────────────────────
     [myResolver
         resolvePlan:plan
          completion:^(VGAudioSidecarPlan *_Nullable resolvedPlan) {
            // Fires on main queue.
+           int resolveMs =
+               (int)((CFAbsoluteTimeGetCurrent() - resolveStart) * 1000.0);
+           NSLog(@"[VanguardGraphRuntime+AudioPreview][TIMING] resolvePlan "
+                 @"elapsedMs=%d tracksIn=%lu tracksOut=%lu generation=%llu",
+                 resolveMs, (unsigned long)tracksIn,
+                 (unsigned long)resolvedPlan.tracks.count,
+                 (unsigned long long)myGeneration);
+
            VanguardGraphRuntime *ss2 = weakSelf;
            if (!ss2) {
              completion();
@@ -482,13 +502,20 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
            // MOV URL which is known to fail AVAudioFile initForReading:.
            VGAudioSidecarPlan *planForPreparation = resolvedPlan;
 
+           CFAbsoluteTime prepareStart = CFAbsoluteTimeGetCurrent();
            VGAudioPreviewPreparationResult result =
                [newRuntime prepareWithSidecarPlan:planForPreparation
                                  timelineDuration:timelineDuration];
+           CFAbsoluteTime prepareEnd = CFAbsoluteTimeGetCurrent();
 
+           // Phase 10F Slice 1: prepareMs covers prepareWithSidecarPlan only;
+           // totalMs covers the whole setAudioSidecarPlan request so far
+           // (old teardown + resolve + prepare).
            NSLog(@"[VanguardGraphRuntime+AudioPreview][D] prepare result=%ld "
-                 @"epoch=%llu",
-                 (long)result, (unsigned long long)epoch);
+                 @"epoch=%llu prepareMs=%d resolveMs=%d totalMs=%d",
+                 (long)result, (unsigned long long)epoch,
+                 (int)((prepareEnd - prepareStart) * 1000.0), resolveMs,
+                 (int)((prepareEnd - requestStart) * 1000.0));
 
            // ── Final guard: if a newer request raced in during prepare ──────
            if ([ss2 _graphAudioLifecycleState] != VGGraphAudioLifecycleActive ||

@@ -597,21 +597,35 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         let capturedSidecar   = audioSidecarPlan
         let capturedDuration  = durationSeconds
 
+        // Phase 10F Slice 1: timing instrumentation only — readiness semantics
+        // are unchanged (result() still waits for setAudioSidecarPlan).
+        let prepareStart = CFAbsoluteTimeGetCurrent()
+        let sidecarTrackCount = audioSidecarPlan?.tracks.count ?? 0
+
         timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
+            let prepareMs = Int((CFAbsoluteTimeGetCurrent() - prepareStart) * 1000)
             if let err = err {
+                NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline failed elapsedMs=%ld error=%@",
+                      prepareMs, err.localizedDescription)
                 result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
                                     message: err.localizedDescription,
                                     details: nil))
                 return
             }
+            NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline ok elapsedMs=%ld textureId=%lld canvas=%ldx%ld sidecarTracks=%ld",
+                  prepareMs, textureId, width, height, sidecarTrackCount)
             // Phase 10-C Slice D: arm the audio preview runtime after the compositor
             // is prepared. result() is deferred until audio setup completes (or
             // silently falls back). Video preview is unaffected by any audio result.
             // FlutterResult is called exactly once — either from the audio completion
             // or from the video failure path above.
+            let audioStart = CFAbsoluteTimeGetCurrent()
             timelineRuntime.setAudioSidecarPlan(capturedSidecar,
                                                 timelineDuration: capturedDuration,
                                                 completion: {
+                let now = CFAbsoluteTimeGetCurrent()
+                NSLog("[VanguardMediaEnginePlugin][TIMING] setAudioSidecarPlan completed elapsedMs=%ld totalMs=%ld sidecarTracks=%ld",
+                      Int((now - audioStart) * 1000), Int((now - prepareStart) * 1000), sidecarTrackCount)
                 result(["textureId": textureId, "width": width, "height": height])
             })
         }
@@ -3245,7 +3259,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             // Tear down existing runtime (MOD-2: tear-down-and-rebuild).
             if let oldRuntime = self._timelineRuntime {
+                // Phase 10F Slice 1: timing instrumentation only.
+                let teardownStart = CFAbsoluteTimeGetCurrent()
                 oldRuntime.invalidateAsync {
+                    NSLog("[VanguardMediaEnginePlugin][TIMING] updateTimeline oldRuntime invalidated elapsedMs=%ld",
+                          Int((CFAbsoluteTimeGetCurrent() - teardownStart) * 1000))
                 }
                 self._timelineRuntime = nil
             }
@@ -3435,6 +3453,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // completion, not a fire-and-forget dispatch.
             if let runtime = self._timelineRuntime {
                 self._timelineRuntime = nil
+                // Phase 10F Slice 1: timing instrumentation only.
+                let disposeStart = CFAbsoluteTimeGetCurrent()
                 runtime.invalidateAsync {
                     // Phase 7.20B: dispose wiring — cancel all in-flight reverse sidecar
                     // transcodes and delete all cached sidecar files. Runs after runtime
@@ -3443,6 +3463,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // and dispatches file deletions asynchronously on a utility queue —
                     // the lock release is immediate.
                     VGReverseSidecarManager.shared().cleanupAllSidecars()
+                    NSLog("[VanguardMediaEnginePlugin][TIMING] disposeTimeline completed elapsedMs=%ld",
+                          Int((CFAbsoluteTimeGetCurrent() - disposeStart) * 1000))
                     result(nil)
                 }
             } else {
@@ -7328,6 +7350,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "cancelExportPhotoVideo":
             videoAssetPickerHandler.handleCancelExport(args: args, result: result)
 
+        // UMF V2: drop the retained PhotoKit asset behind a zero-copy reference
+        // once the editor has finished with its resolvedFilePath.
+        case "releasePhotoVideoReference":
+            videoAssetPickerHandler.handleReleaseVideoReference(args: args, result: result)
+
         case "openAppSettings":
             videoAssetPickerHandler.handleOpenSettings(result: result)
 
@@ -7862,6 +7889,31 @@ final class VGVideoAssetPickerHandler {
     private var activeRequestIds: [String: PHImageRequestID] = [:]
     private var activeExports: [String: AVAssetExportSession] = [:]
 
+    /// PhotoKit reference ownership for zero-copy fast-path resolutions.
+    ///
+    /// `handleResolveVideoReference` replies with the raw POSIX path of the
+    /// AVURLAsset PhotoKit hands back. When that path lives outside the app
+    /// container (Photos library, /private/var/mobile/Media/...), the sandbox
+    /// grant that makes it readable is tied to the lifetime of the AVAsset
+    /// PhotoKit returned. Dart later reopens the path by name (preview,
+    /// trim, export), so the asset must stay alive for the whole editor
+    /// session. Entries are keyed by PhotoKit localIdentifier, stored only for
+    /// successful outside-sandbox fast paths, replaced on re-resolve, and
+    /// removed by `releasePhotoVideoReference`, `cancelExportPhotoVideo`, or
+    /// a failed/cancelled resolve. Temp-export fallbacks are never retained:
+    /// their output is a local file the app owns. Guarded by `lock`.
+    private var retainedReferenceAssets: [String: AVAsset] = [:]
+
+    /// True when [url] is a file URL inside this app's container (tmp or home).
+    /// Paths outside it need the PhotoKit AVAsset retained to stay readable.
+    private func isInsideAppContainer(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        let path = url.standardizedFileURL.path
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).standardizedFileURL.path
+        let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path
+        return path.hasPrefix(tmp) || path.hasPrefix(home)
+    }
+
     // ── Authorization ────────────────────────────────────────────────────────
 
     func handleCheckPermission(result: @escaping FlutterResult) {
@@ -8274,30 +8326,99 @@ final class VGVideoAssetPickerHandler {
         if let exportSession = activeExports.removeValue(forKey: assetId) {
             exportSession.cancelExport()
         }
+        // A cancelled or dismissed selection must not leak a retained
+        // PhotoKit asset from an earlier fast-path resolve of the same id.
+        let droppedRetained = retainedReferenceAssets.removeValue(forKey: assetId) != nil
         lock.unlock()
+        if droppedRetained {
+            NSLog("[UE_IMPORT_DIAG] retainedReference dropped-by-cancel assetId=%@", assetId)
+        }
         result(true)
     }
 
-    // ── Resolve Video Reference (zero-copy) ──────────────────────────────────
+    // ── Release Video Reference ─────────────────────────────────────────────
     //
-    // Reference-only counterpart to handleExportVideo. Resolves a PhotoKit
-    // localIdentifier to the on-device AVURLAsset file URL so Dart can play the
-    // selection without a cache copy. Network access is disabled so an
-    // iCloud-only asset fails fast (ASSET_IN_ICLOUD) instead of silently
-    // downloading. The request is one-shot: it is never registered in
-    // activeRequestIds / activeExports, so cancelExport and dispose have no
-    // stale entries to clean up, and no temp file is ever created.
+    // Idempotently drops the retained PhotoKit AVAsset stored by a zero-copy
+    // fast-path resolve. Called by the editor once its preview/trim teardown
+    // has started and no export can still reopen the path. Never touches
+    // activeRequestIds / activeExports: an in-flight resolve or fallback
+    // export is only aborted through cancelExportPhotoVideo.
+    // Returns true when an entry was removed, false when nothing was retained.
+
+    func handleReleaseVideoReference(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
+            result(false)
+            return
+        }
+        lock.lock()
+        let removed = retainedReferenceAssets.removeValue(forKey: assetId) != nil
+        let remaining = retainedReferenceAssets.count
+        lock.unlock()
+        NSLog("[UE_IMPORT_DIAG] releaseReference assetId=%@ removed=%@ remaining=%d",
+              assetId, removed ? "true" : "false", remaining)
+        result(removed)
+    }
+
+    // ── Resolve Video Reference (zero-copy fast path + fallback export) ─────
+    //
+    // Reference counterpart to handleExportVideo. Resolves a PhotoKit
+    // localIdentifier so Dart can play the selection without a cache copy
+    // whenever PhotoKit hands back a readable AVURLAsset file URL (fast path:
+    // no export, no temp file). Network access is disabled so an iCloud-only
+    // asset fails fast (ASSET_IN_ICLOUD) instead of silently downloading.
+    //
+    // Fast-path lifetime: when the readable URL lives outside the app
+    // container (Photos library, /private/var/mobile/Media/DCIM/...), the
+    // returned AVAsset is retained in `retainedReferenceAssets` before the
+    // reply is sent, because the sandbox grant for that path is tied to the
+    // asset's lifetime and the editor reopens the path by name. Paths inside
+    // tmp/home are app-owned and are not retained. The entry lives until
+    // releasePhotoVideoReference, cancelExportPhotoVideo, or a later
+    // failed/cancelled resolve of the same id removes it; a later successful
+    // resolve of the same id replaces it.
+    //
+    // Fallback: when PhotoKit returns an AVComposition (slow-mo / cinematic /
+    // edited renders) or an unreadable URL, the asset is exported into
+    // FileManager.temporaryDirectory (passthrough first, then HighestQuality;
+    // .mov preferred, .mp4 otherwise) and the reply carries the temp output as
+    // resolvedFilePath / resolvedFileUri. That temp file is intentionally kept
+    // on success so the editor can preview and export it; nothing is retained.
+    //
+    // Cancellation: the PhotoKit request and any fallback export session are
+    // registered under activeRequestIds / activeExports keyed by assetId, so
+    // the existing cancelExportPhotoVideo route aborts whichever phase is in
+    // flight. Every terminal path removes both entries; failure / cancel /
+    // unexpected-status paths also delete partial temp output and drop any
+    // retained asset for this id.
     //
     // Reply shape (success):
     //   { assetId, resolvedFilePath, resolvedFileUri, durationSeconds,
     //     pixelWidth, pixelHeight, creationTimestampMs? }
     // Errors: INVALID_ARGUMENT, ASSET_NOT_FOUND, ASSET_IN_ICLOUD,
-    //         REFERENCE_UNRESOLVABLE (composition / non-file URL / unreadable).
+    //         REFERENCE_UNRESOLVABLE (not a video / cancelled / fallback failed).
 
     func handleResolveVideoReference(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
             result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
             return
+        }
+
+        // ── UE_IMPORT_DIAG: timing-only instrumentation, no behavior change ──
+        let diagStartTime = CFAbsoluteTimeGetCurrent()
+        NSLog("[UE_IMPORT_DIAG] handleResolveVideoReference entry assetId=%@", assetId)
+
+        func diagPathCategory(for url: URL) -> String {
+            guard url.isFileURL else { return "non_file" }
+            let path = url.path
+            if path.hasPrefix(NSTemporaryDirectory()) { return "tmp" }
+            if path.hasPrefix(NSHomeDirectory()) { return "app_sandbox" }
+            if path.contains("/Media/") { return "photos_library" }
+            return "other_absolute"
+        }
+
+        func diagFileSize(_ url: URL) -> Int64? {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
+            return (attrs[.size] as? NSNumber)?.int64Value
         }
 
         // Exactly one Flutter reply on every terminal path, always on main.
@@ -8313,7 +8434,12 @@ final class VGVideoAssetPickerHandler {
             }
         }
 
-        DispatchQueue.global(qos: .userInitiated).async { [imageManager = self.imageManager] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                respond(FlutterError(code: "REFERENCE_UNRESOLVABLE", message: "Picker handler is no longer available", details: nil))
+                return
+            }
+
             let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil)
             guard let asset = fetchResult.firstObject else {
                 respond(FlutterError(code: "ASSET_NOT_FOUND", message: "Asset with ID \(assetId) not found", details: nil))
@@ -8330,48 +8456,76 @@ final class VGVideoAssetPickerHandler {
             options.version = .current
             options.deliveryMode = .highQualityFormat
 
-            // Intentionally not stored in activeRequestIds: this is a one-shot
-            // metadata resolution with no cancel surface exposed to Dart.
-            _ = imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, info in
-                let inCloud = (info?[PHImageResultIsInCloudKey] as? Bool) ?? false
-                let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                let requestError = info?[PHImageErrorKey] as? Error
+            // Fallback export output lives next to handleExportVideo's files but
+            // with its own prefix so the two paths never collide.
+            let outputBase = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ue_ref_\(UUID().uuidString)")
 
-                if cancelled {
-                    respond(FlutterError(code: "REFERENCE_UNRESOLVABLE", message: "Reference resolution was cancelled", details: nil))
+            func removeFallbackOutputs() {
+                for ext in ["mov", "mp4"] {
+                    try? FileManager.default.removeItem(at: outputBase.appendingPathExtension(ext))
+                }
+            }
+
+            // Clears both registration maps for this assetId. Called on every
+            // terminal path so cancelExport never sees a stale entry.
+            // [dropRetained] additionally removes any retained PhotoKit asset
+            // for this id (failure / cancel paths only).
+            func clearRegistrations(dropRetained: Bool) {
+                self.lock.lock()
+                self.activeRequestIds.removeValue(forKey: assetId)
+                self.activeExports.removeValue(forKey: assetId)
+                if dropRetained {
+                    self.retainedReferenceAssets.removeValue(forKey: assetId)
+                }
+                self.lock.unlock()
+            }
+
+            func finishFailure(code: String, message: String) {
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - diagStartTime) * 1000)
+                NSLog("[UE_IMPORT_DIAG] finishFailure assetId=%@ code=%@ elapsedMs=%d", assetId, code, elapsedMs)
+                clearRegistrations(dropRetained: true)
+                removeFallbackOutputs()
+                respond(FlutterError(code: code, message: message, details: nil))
+            }
+
+            func finishCancelled() {
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - diagStartTime) * 1000)
+                NSLog("[UE_IMPORT_DIAG] finishCancelled assetId=%@ elapsedMs=%d", assetId, elapsedMs)
+                finishFailure(code: "REFERENCE_UNRESOLVABLE", message: "Reference resolution was cancelled")
+            }
+
+            // Success terminal. Cancellation wins on every success path
+            // (outside-container fast path, app/tmp fast path, and fallback
+            // export completion): the registration entry is read and cleared
+            // in one lock acquisition, and when cancelExportPhotoVideo already
+            // removed it the reply is the cancelled error, nothing is
+            // retained, and any fallback output is deleted. When [retaining]
+            // is non-nil and the request is still wanted, the asset is stored
+            // (replacing any earlier entry for this id) under that same lock
+            // so a racing cancel either wins cleanly (no success reply,
+            // nothing retained) or loses cleanly (asset retained, reply sent).
+            // Temp-export success passes nil and retains nothing.
+            func finishSuccess(url: URL, retaining: AVAsset?) {
+                self.lock.lock()
+                let stillWanted = self.activeRequestIds[assetId] != nil
+                self.activeRequestIds.removeValue(forKey: assetId)
+                self.activeExports.removeValue(forKey: assetId)
+                if stillWanted, let retained = retaining {
+                    self.retainedReferenceAssets[assetId] = retained
+                }
+                self.lock.unlock()
+                guard stillWanted else {
+                    // finishCancelled -> finishFailure drops any retained
+                    // entry for this id and removes fallback outputs, so a
+                    // cancelled fallback completion leaves no temp file.
+                    finishCancelled()
                     return
                 }
-
-                guard let avAsset = avAsset else {
-                    if inCloud {
-                        respond(FlutterError(code: "ASSET_IN_ICLOUD",
-                                             message: "Asset \(assetId) is stored in iCloud and is not available locally",
-                                             details: nil))
-                    } else {
-                        respond(FlutterError(code: "REFERENCE_UNRESOLVABLE",
-                                             message: requestError?.localizedDescription ?? "Could not load AVAsset for video",
-                                             details: nil))
-                    }
-                    return
+                if retaining != nil {
+                    NSLog("[UE_IMPORT_DIAG] retainedReference stored assetId=%@ pathCategory=%@",
+                          assetId, diagPathCategory(for: url))
                 }
-
-                // Compositions (edited / slow-mo / cinematic renders) have no single
-                // backing file; the reference path cannot represent them without a copy.
-                guard let urlAsset = avAsset as? AVURLAsset else {
-                    respond(FlutterError(code: "REFERENCE_UNRESOLVABLE",
-                                         message: "Asset \(assetId) resolves to a composition, not a local file",
-                                         details: nil))
-                    return
-                }
-
-                let url = urlAsset.url
-                guard url.isFileURL, FileManager.default.isReadableFile(atPath: url.path) else {
-                    respond(FlutterError(code: "REFERENCE_UNRESOLVABLE",
-                                         message: "Asset \(assetId) did not resolve to a readable local file",
-                                         details: nil))
-                    return
-                }
-
                 var dict: [String: Any] = [
                     "assetId": assetId,
                     "resolvedFilePath": url.path,
@@ -8385,6 +8539,155 @@ final class VGVideoAssetPickerHandler {
                 }
                 respond(dict)
             }
+
+            // The registration entry doubles as the cancellation flag: the
+            // existing cancelExportPhotoVideo path removes it under `lock`, so
+            // any phase that finds it missing must treat itself as cancelled
+            // instead of starting (or continuing) work nobody is waiting for.
+            func isStillRegistered() -> Bool {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                return self.activeRequestIds[assetId] != nil
+            }
+
+            // Register a placeholder before issuing the PhotoKit request so a
+            // cancel that races the request start is never lost.
+            self.lock.lock()
+            self.activeRequestIds[assetId] = PHInvalidImageRequestID
+            self.lock.unlock()
+
+            let reqId = self.imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, info in
+                let inCloud = (info?[PHImageResultIsInCloudKey] as? Bool) ?? false
+                let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                let requestError = info?[PHImageErrorKey] as? Error
+
+                let requestElapsedMs = Int((CFAbsoluteTimeGetCurrent() - diagStartTime) * 1000)
+                NSLog("[UE_IMPORT_DIAG] requestAVAsset callback assetId=%@ elapsedMs=%d inCloud=%@ cancelled=%@ hasAsset=%@",
+                      assetId, requestElapsedMs, inCloud ? "true" : "false", cancelled ? "true" : "false", (avAsset != nil) ? "true" : "false")
+
+                if cancelled || !isStillRegistered() {
+                    finishCancelled()
+                    return
+                }
+
+                guard let avAsset = avAsset else {
+                    if inCloud {
+                        finishFailure(code: "ASSET_IN_ICLOUD",
+                                      message: "Asset \(assetId) is stored in iCloud and is not available locally")
+                    } else {
+                        finishFailure(code: "REFERENCE_UNRESOLVABLE",
+                                      message: requestError?.localizedDescription ?? "Could not load AVAsset for video")
+                    }
+                    return
+                }
+
+                // ── Fast path: readable local file, no copy ──────────────────
+                if let urlAsset = avAsset as? AVURLAsset {
+                    let url = urlAsset.url
+                    let diagIsFileURL = url.isFileURL
+                    let diagIsReadable = FileManager.default.isReadableFile(atPath: url.path)
+                    NSLog("[UE_IMPORT_DIAG] fastPathDecision assetId=%@ isFileURL=%@ isReadableFile=%@ pathCategory=%@",
+                          assetId, diagIsFileURL ? "true" : "false", diagIsReadable ? "true" : "false", diagPathCategory(for: url))
+                    if url.isFileURL, FileManager.default.isReadableFile(atPath: url.path) {
+                        // Outside the app container the path is readable only
+                        // for as long as PhotoKit's AVAsset lives; retain it.
+                        // Inside tmp/home the file is app-owned: no retention.
+                        let retaining: AVAsset? = self.isInsideAppContainer(url) ? nil : urlAsset
+                        finishSuccess(url: url, retaining: retaining)
+                        return
+                    }
+                }
+
+                // ── Fallback: composition / external or unreadable URL → temp export
+                // Passthrough first (fast, no re-encode), then HighestQuality
+                // for assets passthrough cannot represent.
+                func makeSession(preset: String) -> (session: AVAssetExportSession, url: URL)? {
+                    guard let session = AVAssetExportSession(asset: avAsset, presetName: preset) else {
+                        return nil
+                    }
+                    let preferred: [AVFileType] = [.mov, .mp4]
+                    guard let chosen = preferred.first(where: { session.supportedFileTypes.contains($0) }) else {
+                        return nil
+                    }
+                    let url = outputBase.appendingPathExtension(chosen == .mp4 ? "mp4" : "mov")
+                    try? FileManager.default.removeItem(at: url)
+                    session.outputURL = url
+                    session.outputFileType = chosen
+                    session.shouldOptimizeForNetworkUse = false
+                    return (session: session, url: url)
+                }
+
+                func runFallback(_ session: AVAssetExportSession, outputURL: URL, isRetry: Bool) {
+                    let fallbackStart = CFAbsoluteTimeGetCurrent()
+                    NSLog("[UE_IMPORT_DIAG] fallbackExport start assetId=%@ preset=%@ outputExt=%@ isRetry=%@",
+                          assetId, session.presetName, outputURL.pathExtension, isRetry ? "true" : "false")
+
+                    // Register under the same lock that cancelExport uses so a
+                    // cancel landing between phases cannot leave an orphaned
+                    // export running against a dismissed sheet.
+                    self.lock.lock()
+                    let stillWanted = self.activeRequestIds[assetId] != nil
+                    if stillWanted {
+                        self.activeExports[assetId] = session
+                    }
+                    self.lock.unlock()
+                    guard stillWanted else {
+                        finishCancelled()
+                        return
+                    }
+
+                    session.exportAsynchronously {
+                        let fallbackElapsedMs = Int((CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000)
+                        switch session.status {
+                        case .completed:
+                            let outputBytes = diagFileSize(outputURL)
+                            NSLog("[UE_IMPORT_DIAG] fallbackExport completed assetId=%@ elapsedMs=%d isRetry=%@ status=%d outputBytes=%@",
+                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue,
+                                  outputBytes.map { String($0) } ?? "unknown")
+                            finishSuccess(url: outputURL, retaining: nil)
+
+                        case .failed:
+                            NSLog("[UE_IMPORT_DIAG] fallbackExport failed assetId=%@ elapsedMs=%d isRetry=%@ status=%d",
+                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue)
+                            try? FileManager.default.removeItem(at: outputURL)
+                            if !isRetry, let hq = makeSession(preset: AVAssetExportPresetHighestQuality) {
+                                runFallback(hq.session, outputURL: hq.url, isRetry: true)
+                            } else {
+                                finishFailure(code: "REFERENCE_UNRESOLVABLE",
+                                              message: session.error?.localizedDescription ?? "Fallback export failed")
+                            }
+
+                        case .cancelled:
+                            NSLog("[UE_IMPORT_DIAG] fallbackExport cancelled assetId=%@ elapsedMs=%d isRetry=%@ status=%d",
+                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue)
+                            finishCancelled()
+
+                        default:
+                            NSLog("[UE_IMPORT_DIAG] fallbackExport unexpected assetId=%@ elapsedMs=%d isRetry=%@ status=%d",
+                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue)
+                            finishFailure(code: "REFERENCE_UNRESOLVABLE",
+                                          message: "Unexpected fallback export status \(session.status.rawValue)")
+                        }
+                    }
+                }
+
+                if let passthrough = makeSession(preset: AVAssetExportPresetPassthrough) {
+                    runFallback(passthrough.session, outputURL: passthrough.url, isRetry: false)
+                } else if let hq = makeSession(preset: AVAssetExportPresetHighestQuality) {
+                    runFallback(hq.session, outputURL: hq.url, isRetry: true)
+                } else {
+                    finishFailure(code: "REFERENCE_UNRESOLVABLE",
+                                  message: "Asset \(assetId) resolves to a composition and no export preset is available")
+                }
+            }
+
+            // Swap the placeholder for the real request id unless the request
+            // already settled (entry cleared) or was cancelled meanwhile.
+            self.lock.lock()
+            if self.activeRequestIds[assetId] != nil {
+                self.activeRequestIds[assetId] = reqId
+            }
+            self.lock.unlock()
         }
     }
 
