@@ -208,6 +208,8 @@ void main() {
         expect(report.diagnostics['hasAudioSidecarPlan'], isTrue);
         expect(report.diagnostics['audioSidecarTrackCount'], 1);
         expect(report.diagnostics['audioSidecarAddedLaneCount'], 1);
+        expect(report.diagnostics['audioSidecarMusicLaneCount'], 1);
+        expect(report.diagnostics['audioSidecarSfxLaneCount'], 0);
       },
     );
 
@@ -262,13 +264,15 @@ void main() {
         expect(report.issues, isEmpty);
         expect(report.diagnostics['audioSidecarTrackCount'], 4);
         expect(report.diagnostics['audioSidecarAddedLaneCount'], 2);
+        expect(report.diagnostics['audioSidecarMusicLaneCount'], 1);
+        expect(report.diagnostics['audioSidecarSfxLaneCount'], 1);
         expect(report.diagnostics['audioSidecarVoiceoverLaneCount'], 1);
         expect(report.diagnostics['audioSidecarOriginalTrackCount'], 1);
       },
     );
 
     test(
-      'same-lane touching endpoints (music [0,2) and sfx [2,3)) are ready',
+      'same-role touching endpoints (music [0,2) and music [2,3)) are ready',
       () {
         final plan = VGAudioSidecarPlan(
           tracks: const [
@@ -280,11 +284,11 @@ void main() {
               role: 'music',
             ),
             VGAudioSidecarTrack(
-              trackId: 'sfx-1',
-              url: '/path/to/sfx.aac',
+              trackId: 'music-2',
+              url: '/path/to/music-2.aac',
               startTime: 2.0,
               duration: 1.0,
-              role: 'sfx',
+              role: 'music',
             ),
           ],
         );
@@ -297,7 +301,39 @@ void main() {
       },
     );
 
-    test('cross-lane overlap between music/sfx and voiceover is ready', () {
+    test(
+      'time-overlapping music and sfx tracks (independent lanes) are ready',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'music-1',
+              url: '/path/to/music.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'music',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'sfx-1',
+              url: '/path/to/sfx.aac',
+              startTime: 4.0,
+              duration: 2.0,
+              role: 'sfx',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+        expect(report.issues, isEmpty);
+        expect(report.diagnostics['audioSidecarMusicLaneCount'], 1);
+        expect(report.diagnostics['audioSidecarSfxLaneCount'], 1);
+      },
+    );
+
+    test('cross-lane overlap between music and voiceover is ready', () {
       final plan = VGAudioSidecarPlan(
         tracks: const [
           VGAudioSidecarTrack(
@@ -384,7 +420,7 @@ void main() {
     );
 
     test(
-      'more than 8 tracks in the added (music/sfx) lane blocks readiness with audioSidecarLaneCapacityExceeded',
+      'more than 8 tracks in the music lane blocks readiness with audioSidecarLaneCapacityExceeded',
       () {
         final tracks = List<VGAudioSidecarTrack>.generate(
           9,
@@ -411,6 +447,39 @@ void main() {
           ),
           isTrue,
         );
+      },
+    );
+
+    test(
+      'more than 8 tracks in the sfx lane blocks readiness with audioSidecarLaneCapacityExceeded '
+      'even though the music lane is independent and empty',
+      () {
+        final tracks = List<VGAudioSidecarTrack>.generate(
+          9,
+          (i) => VGAudioSidecarTrack(
+            trackId: 'sfx-$i',
+            url: '/path/to/sfx-$i.aac',
+            startTime: i * 1.0,
+            duration: 1.0,
+            role: 'sfx',
+          ),
+        );
+        final plan = VGAudioSidecarPlan(tracks: tracks);
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode
+                    .audioSidecarLaneCapacityExceeded,
+          ),
+          isTrue,
+        );
+        expect(report.diagnostics['audioSidecarMusicLaneCount'], 0);
       },
     );
 
@@ -446,7 +515,7 @@ void main() {
     );
 
     test(
-      'overlapping music/sfx same-lane tracks block readiness with audioSidecarLaneOverlap',
+      'overlapping music/music same-role tracks block readiness with audioSidecarLaneOverlap',
       () {
         final plan = VGAudioSidecarPlan(
           tracks: const [
@@ -458,11 +527,85 @@ void main() {
               role: 'music',
             ),
             VGAudioSidecarTrack(
+              trackId: 'music-2',
+              url: '/path/to/music-2.aac',
+              startTime: 4.0,
+              duration: 2.0,
+              role: 'music',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.audioSidecarLaneOverlap,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'overlapping sfx/sfx same-role tracks block readiness with audioSidecarLaneOverlap',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
               trackId: 'sfx-1',
               url: '/path/to/sfx.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'sfx',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'sfx-2',
+              url: '/path/to/sfx-2.aac',
               startTime: 4.0,
               duration: 2.0,
               role: 'sfx',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.audioSidecarLaneOverlap,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'overlapping voiceover/voiceover same-role tracks block readiness with audioSidecarLaneOverlap',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'voiceover-1',
+              url: '/path/to/vo.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'voiceover',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'voiceover-2',
+              url: '/path/to/vo-2.aac',
+              startTime: 4.0,
+              duration: 2.0,
+              role: 'voiceover',
             ),
           ],
         );

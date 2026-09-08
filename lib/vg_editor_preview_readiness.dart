@@ -105,8 +105,8 @@ enum VGEditorPreviewReadinessIssueCode {
   /// reused by more than one track, including across different lanes.
   duplicateAudioSidecarTrackId,
 
-  /// A user-added audio sidecar lane (`music`+`sfx` share one lane;
-  /// `voiceover` is a separate lane) exceeds the 8-track safety cap.
+  /// A user-added audio sidecar lane (`music`, `sfx`, and `voiceover` are
+  /// each their own independent lane) exceeds the 8-track safety cap.
   audioSidecarLaneCapacityExceeded,
 
   /// Two user-added audio sidecar tracks in the same lane overlap in time.
@@ -233,11 +233,12 @@ final class VGEditorPreviewReadinessReport {
 ///     draft. These pass through and are excluded from user-added duplicate
 ///     id and lane checks.
 ///   - User-added tracks: `role` must be `"music"`, `"sfx"`, or `"voiceover"`.
-///     `music` and `sfx` share one added-audio lane; `voiceover` uses a
-///     separate lane. Each lane allows at most 8 tracks. Same-lane tracks
-///     must not overlap in time (half-open `[start, start + duration)`
-///     intervals; touching endpoints are allowed). User-added track ids must
-///     be unique across both lanes.
+///     Each of `music`, `sfx`, and `voiceover` is its own independent lane, so
+///     tracks in different lanes may freely overlap in time. Each lane allows
+///     at most 8 tracks. Same-lane (same-role) tracks must not overlap in
+///     time (half-open `[start, start + duration)` intervals; touching
+///     endpoints are allowed). User-added track ids must be unique across all
+///     lanes.
 ///   - Every track must pass structural validation: non-blank `trackId`/
 ///     `url`; finite `startTime`, `duration`, `volume`, `mixGain`,
 ///     `fadeInSeconds`, `fadeOutSeconds`, `sourceTrimStartSeconds`;
@@ -439,7 +440,12 @@ final class VGEditorPreviewReadinessEvaluator {
       'issueCount': issues.length,
       'hasAudioSidecarPlan': draft.audioSidecarPlan != null,
       'audioSidecarTrackCount': sidecarEvaluation.trackCount,
-      'audioSidecarAddedLaneCount': sidecarEvaluation.addedLaneCount,
+      // Backward-compatible aggregate of the split music/sfx lane counts,
+      // retained for consumers of the pre-Phase-7.8P diagnostics key.
+      'audioSidecarAddedLaneCount':
+          sidecarEvaluation.musicLaneCount + sidecarEvaluation.sfxLaneCount,
+      'audioSidecarMusicLaneCount': sidecarEvaluation.musicLaneCount,
+      'audioSidecarSfxLaneCount': sidecarEvaluation.sfxLaneCount,
       'audioSidecarVoiceoverLaneCount': sidecarEvaluation.voiceoverLaneCount,
       'audioSidecarOriginalTrackCount': sidecarEvaluation.originalTrackCount,
     };
@@ -462,7 +468,8 @@ final class _AudioSidecarEvaluation {
   const _AudioSidecarEvaluation({
     required this.issues,
     required this.trackCount,
-    required this.addedLaneCount,
+    required this.musicLaneCount,
+    required this.sfxLaneCount,
     required this.voiceoverLaneCount,
     required this.originalTrackCount,
   });
@@ -470,13 +477,15 @@ final class _AudioSidecarEvaluation {
   const _AudioSidecarEvaluation.empty()
     : issues = const <VGEditorPreviewReadinessIssue>[],
       trackCount = 0,
-      addedLaneCount = 0,
+      musicLaneCount = 0,
+      sfxLaneCount = 0,
       voiceoverLaneCount = 0,
       originalTrackCount = 0;
 
   final List<VGEditorPreviewReadinessIssue> issues;
   final int trackCount;
-  final int addedLaneCount;
+  final int musicLaneCount;
+  final int sfxLaneCount;
   final int voiceoverLaneCount;
   final int originalTrackCount;
 }
@@ -507,12 +516,14 @@ _AudioSidecarEvaluation _evaluateAudioSidecarPlan(
   final issues = <VGEditorPreviewReadinessIssue>[];
   final sourcePaths = draft.clips.map((clip) => clip.sourcePath).toSet();
 
-  var addedLaneCount = 0;
+  var musicLaneCount = 0;
+  var sfxLaneCount = 0;
   var voiceoverLaneCount = 0;
   var originalTrackCount = 0;
 
   final userAddedTrackIds = <String>{};
-  final addedLane = <_AudioSidecarLaneInterval>[];
+  final musicLane = <_AudioSidecarLaneInterval>[];
+  final sfxLane = <_AudioSidecarLaneInterval>[];
   final voiceoverLane = <_AudioSidecarLaneInterval>[];
 
   for (final track in plan.tracks) {
@@ -562,15 +573,20 @@ _AudioSidecarEvaluation _evaluateAudioSidecarPlan(
       continue;
     }
 
-    // User-added track: music, sfx, or voiceover.
-    final isVoiceover = role == 'voiceover';
-    final lane = isVoiceover ? voiceoverLane : addedLane;
-    final laneName = isVoiceover ? 'voiceover' : 'music/sfx';
-
-    if (isVoiceover) {
-      voiceoverLaneCount++;
+    // User-added track: music, sfx, and voiceover are each their own
+    // independent lane, so only same-role tracks are checked against one
+    // another for capacity/overlap; different-role tracks may freely overlap.
+    final List<_AudioSidecarLaneInterval> lane;
+    final String laneName = role;
+    if (role == 'music') {
+      lane = musicLane;
+      musicLaneCount++;
+    } else if (role == 'sfx') {
+      lane = sfxLane;
+      sfxLaneCount++;
     } else {
-      addedLaneCount++;
+      lane = voiceoverLane;
+      voiceoverLaneCount++;
     }
 
     if (!userAddedTrackIds.add(track.trackId)) {
@@ -623,7 +639,8 @@ _AudioSidecarEvaluation _evaluateAudioSidecarPlan(
   return _AudioSidecarEvaluation(
     issues: issues,
     trackCount: plan.tracks.length,
-    addedLaneCount: addedLaneCount,
+    musicLaneCount: musicLaneCount,
+    sfxLaneCount: sfxLaneCount,
     voiceoverLaneCount: voiceoverLaneCount,
     originalTrackCount: originalTrackCount,
   );
