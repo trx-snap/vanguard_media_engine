@@ -327,13 +327,45 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
 //   the main queue, gates 2–5 are rechecked and a resolver-identity gate
 //   is applied before constructing VanguardAudioPreviewRuntime.
 //
-// Every code path invokes completion exactly once.
+// Every code path invokes completion exactly once with a
+// VGGraphAudioArmOutcome (Phase 10F Slice 3):
+//   - gate rejections, stale generations, resolver-identity loss, graph
+//     shutdown, and a deallocated graph owner report Superseded;
+//   - a prepared runtime reports Ready / Silent / Failed mapped from
+//     VGAudioPreviewPreparationResult (see _armOutcomeForPreparationResult:).
 // No runtime installs after graph shutdown begins.
 // Stale completions never clear or install over a newer runtime/resolver.
+//
+// After installation the new runtime receives one unconditional commandPlay.
+// The runtime's scheduler reads the live VGTimelineStateSnapshot and no-ops
+// unless the timeline is currently playing, so a paused timeline stays silent
+// and a timeline that was already playing (video returned to Flutter before
+// audio finished arming) resyncs audio to the current playhead. No paused-branch
+// commandSeek is issued.
+
+/// Maps a preparation result to the externally visible arming outcome.
+static VGGraphAudioArmOutcome
+_armOutcomeForPreparationResult(VGAudioPreviewPreparationResult result) {
+  switch (result) {
+  case VGAudioPreviewPreparationResultReady:
+    return VGGraphAudioArmOutcomeReady;
+  case VGAudioPreviewPreparationResultSilentNoEligibleTrack:
+    return VGGraphAudioArmOutcomeSilent;
+  case VGAudioPreviewPreparationResultFailedMalformedTrack:
+  case VGAudioPreviewPreparationResultFailedMissingFile:
+  case VGAudioPreviewPreparationResultFailedUnsupportedFormat:
+  case VGAudioPreviewPreparationResultFailedInvalidDuration:
+  case VGAudioPreviewPreparationResultFailedEnginePreparation:
+    return VGGraphAudioArmOutcomeFailed;
+  }
+  // Unknown future result values are treated as failures rather than
+  // silently reporting readiness.
+  return VGGraphAudioArmOutcomeFailed;
+}
 
 - (void)setAudioSidecarPlan:(nullable VGAudioSidecarPlan *)plan
            timelineDuration:(NSTimeInterval)timelineDuration
-                 completion:(dispatch_block_t)completion {
+                 completion:(VGGraphAudioArmCompletion)completion {
   NSAssert([NSThread isMainThread],
            @"setAudioSidecarPlan:timelineDuration:completion: must be called "
            @"on the main queue.");
@@ -346,7 +378,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
   if ([self _graphAudioLifecycleState] != VGGraphAudioLifecycleActive) {
     NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
           @"setAudioSidecarPlan: rejected at gate 1 — graph not active");
-    completion();
+    completion(VGGraphAudioArmOutcomeSuperseded);
     return;
   }
 
@@ -373,7 +405,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
   dispatch_block_t beginResolution = ^{
     VanguardGraphRuntime *ss = weakSelf;
     if (!ss) {
-      completion();
+      completion(VGGraphAudioArmOutcomeSuperseded);
       return;
     }
 
@@ -382,7 +414,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
       NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
             @"setAudioSidecarPlan: rejected at gate 2 — graph shutdown during "
             @"old cleanup");
-      completion();
+      completion(VGGraphAudioArmOutcomeSuperseded);
       return;
     }
 
@@ -390,7 +422,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
     if ([ss _audioReplacementGeneration] != myGeneration) {
       NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
             @"setAudioSidecarPlan: stale at gate 3 — generation mismatch");
-      completion();
+      completion(VGGraphAudioArmOutcomeSuperseded);
       return;
     }
 
@@ -400,7 +432,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
       NSLog(
           @"[VanguardGraphRuntime+AudioPreview][D] "
           @"setAudioSidecarPlan: stale at gate 4 — runtime identity replaced");
-      completion();
+      completion(VGGraphAudioArmOutcomeSuperseded);
       return;
     }
 
@@ -409,7 +441,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
         [ss _audioReplacementGeneration] != myGeneration) {
       NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
             @"setAudioSidecarPlan: stale at gate 5 — pre-resolve check failed");
-      completion();
+      completion(VGGraphAudioArmOutcomeSuperseded);
       return;
     }
 
@@ -442,7 +474,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
 
            VanguardGraphRuntime *ss2 = weakSelf;
            if (!ss2) {
-             completion();
+             completion(VGGraphAudioArmOutcomeSuperseded);
              return;
            }
 
@@ -451,7 +483,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
              NSLog(
                  @"[VanguardGraphRuntime+AudioPreview][D] "
                  @"setAudioSidecarPlan: stale after resolve — graph shutdown");
-             completion();
+             completion(VGGraphAudioArmOutcomeSuperseded);
              return;
            }
 
@@ -460,7 +492,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
              NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
                    @"setAudioSidecarPlan: stale after resolve — generation "
                    @"mismatch");
-             completion();
+             completion(VGGraphAudioArmOutcomeSuperseded);
              return;
            }
 
@@ -472,7 +504,7 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
              NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
                    @"setAudioSidecarPlan: stale after resolve — resolver "
                    @"identity replaced");
-             completion();
+             completion(VGGraphAudioArmOutcomeSuperseded);
              return;
            }
 
@@ -527,13 +559,31 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
                NSLog(@"[VanguardGraphRuntime+AudioPreview][D] stale new "
                      @"runtime invalidated");
              }];
-             completion();
+             completion(VGGraphAudioArmOutcomeSuperseded);
              return;
            }
 
            // ── Install the new runtime ──────────────────────────────────────
            [ss2 _setAudioPreviewRuntime:newRuntime];
-           completion();
+
+           // ── Phase 10F Slice 3: unconditional resync ──────────────────────
+           //
+           // Video was returned to Flutter before audio finished arming, so
+           // the timeline may already be playing. commandPlay dispatches to
+           // the runtime's scheduler queue, which reads the live timeline
+           // snapshot: if the timeline is playing it schedules from the
+           // current playhead; if paused (or the runtime is ReadySilent /
+           // Failed) it no-ops. No commandSeek is issued for the paused case.
+           [newRuntime commandPlay];
+
+           VGGraphAudioArmOutcome outcome =
+               _armOutcomeForPreparationResult(result);
+           NSLog(@"[VanguardGraphRuntime+AudioPreview][TIMING] armed "
+                 @"outcome=%ld epoch=%llu generation=%llu totalMs=%d",
+                 (long)outcome, (unsigned long long)epoch,
+                 (unsigned long long)myGeneration,
+                 (int)((CFAbsoluteTimeGetCurrent() - requestStart) * 1000.0));
+           completion(outcome);
          }];
   };
 

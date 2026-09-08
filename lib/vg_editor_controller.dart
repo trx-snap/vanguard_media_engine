@@ -44,6 +44,21 @@
 // NATIVE CALLBACKS (delegated from owning widget):
 //   onTimelineFrame → handleNativeCallback → updates currentPTS + ptsStream
 //   onTimelineEOS   → handleNativeCallback → sets isPlaying=false + eosStream
+//   onTimelineAudioStateChanged (Phase 10F Slice 3)
+//                   → updates value.audioReadiness when textureId and
+//                     prepareSessionId match the current prepare session
+//
+// AUDIO READINESS (Phase 10F Slice 3):
+//   createTimelineTexture / updateTimeline return the video texture as soon as
+//   the compositor is prepared, plus `prepareSessionId` (monotonic per native
+//   prepare) and `audioPending` (true when sidecar tracks exist and audio is
+//   still arming). The controller sets value.audioReadiness to `pending` only
+//   when audioPending == true, otherwise to the terminal `silent`. The later
+//   onTimelineAudioStateChanged event carries the same textureId and
+//   prepareSessionId; mismatching events (stale session, rebuilt texture,
+//   disposed controller) are dropped. Terminal readiness is sticky.
+//   value.isReady remains video-texture readiness; play/pause/seek/export are
+//   never gated on audio readiness.
 //
 // PAYLOAD CONTRACT (Phase 7.8):
 //   Production routes send: { 'draft': draft.toMap() }
@@ -196,6 +211,17 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Unregistered in [disposeAsync] / [dispose].
   VGTimelineSubscription? _timelineSubscription;
 
+  // ── Phase 10F Slice 3: audio readiness correlation ────────────────────────
+
+  /// The native prepare-session id of the current timeline, taken from the
+  /// `createTimelineTexture` / `updateTimeline` result map. Null while no
+  /// timeline is prepared, while a rebuild is in flight, after teardown, or
+  /// when the native side did not supply one (e.g. older/other platforms).
+  ///
+  /// `onTimelineAudioStateChanged` events are applied only when both their
+  /// textureId and prepareSessionId match the controller's current state.
+  int? _prepareSessionId;
+
   /// Broadcast stream emitting the current playhead position (in seconds) on
   /// every `onTimelineFrame` native callback.
   ///
@@ -295,6 +321,11 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Whether an export is currently in progress.
   bool get isExporting => value.isExporting;
 
+  /// Readiness of the native audio preview runtime (Phase 10F Slice 3).
+  ///
+  /// Independent of [isReady]. Never gates playback, seek, or export.
+  VGAudioReadiness get audioReadiness => value.audioReadiness;
+
   // ── Native callback handling ───────────────────────────────────────────────
 
   /// Handles native → Dart timeline callbacks.
@@ -337,8 +368,73 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         );
         notifyListeners();
         break;
+
+      case 'onTimelineAudioStateChanged':
+        // Phase 10F Slice 3 (legacy delegation path). Same parsing rules as
+        // the dispatcher: malformed payloads are dropped silently.
+        final args = call.arguments as Map?;
+        final textureId = (args?['textureId'] as num?)?.toInt();
+        final prepareSessionId = (args?['prepareSessionId'] as num?)?.toInt();
+        final state = args?['state'] as String?;
+        if (textureId != null && prepareSessionId != null && state != null) {
+          _onTimelineAudioStateChanged(textureId, prepareSessionId, state);
+        }
+        break;
     }
     return null;
+  }
+
+  // ── Phase 10F Slice 3: audio readiness ─────────────────────────────────────
+
+  /// Maps the raw native audio state string to a terminal readiness value.
+  /// Returns null for unknown strings (dropped).
+  static VGAudioReadiness? _parseAudioReadiness(String state) {
+    switch (state) {
+      case 'ready':
+        return VGAudioReadiness.ready;
+      case 'silent':
+        return VGAudioReadiness.silent;
+      case 'failed':
+        return VGAudioReadiness.failed;
+      default:
+        return null;
+    }
+  }
+
+  /// Applies an `onTimelineAudioStateChanged` event.
+  ///
+  /// Drops the event unless [textureId] equals the current [value.textureId]
+  /// and [prepareSessionId] equals the current [_prepareSessionId]. Terminal
+  /// readiness is sticky: once [value.audioReadiness] is terminal for this
+  /// session, further events for the session are ignored (a duplicate of the
+  /// same terminal value is a no-op; nothing can move it back to pending).
+  void _onTimelineAudioStateChanged(
+    int textureId,
+    int prepareSessionId,
+    String state,
+  ) {
+    if (_disposed) return;
+    final currentSession = _prepareSessionId;
+    if (currentSession == null ||
+        prepareSessionId != currentSession ||
+        textureId != value.textureId) {
+      return; // stale session / rebuilt texture — drop
+    }
+    final next = _parseAudioReadiness(state);
+    if (next == null) return; // unknown state string — drop
+    if (value.audioReadiness.isTerminal) return; // sticky terminal state
+    value = value.copyWith(audioReadiness: next);
+    notifyListeners();
+  }
+
+  /// Initial readiness for a freshly prepared timeline, derived from the
+  /// native result map: `pending` only when native reports `audioPending ==
+  /// true`; otherwise the session is terminally `silent`.
+  static VGAudioReadiness _initialAudioReadiness(Map<String, dynamic>? result) {
+    final audioPending = result?['audioPending'];
+    return audioPending == true
+        ? VGAudioReadiness.pending
+        : VGAudioReadiness.silent;
   }
 
   void _onTimelineFrame(double pts, int generation) {
@@ -425,11 +521,15 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (_busy) return;
     _busy = true;
 
+    // Phase 10F Slice 3: no session is current until native replies, so any
+    // in-flight readiness event from a previous prepare is dropped.
+    _prepareSessionId = null;
     value = value.copyWith(
       isReady: false,
       textureId: null,
       renderWidth: null,
       renderHeight: null,
+      audioReadiness: VGAudioReadiness.unknown,
       statusMessage: 'Preparing timeline…',
     );
     notifyListeners();
@@ -457,6 +557,23 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       final width = (result?['width'] as num?)?.toInt();
       final height = (result?['height'] as num?)?.toInt();
 
+      // Phase 10F Slice 3: correlate audio readiness with this prepare.
+      // Session id and initial readiness are committed BEFORE the listener is
+      // registered so that a readiness event drained during registration is
+      // matched against the new session and lands on top of the initial value.
+      _prepareSessionId = (result?['prepareSessionId'] as num?)?.toInt();
+      value = value.copyWith(
+        textureId: id,
+        renderWidth: width,
+        renderHeight: height,
+        isReady: true,
+        currentPTS: 0.0,
+        isPlaying: false,
+        audioReadiness: _initialAudioReadiness(result),
+        statusMessage:
+            'Ready — ${value.draft.durationSeconds.toStringAsFixed(1)}s',
+      );
+
       // Unregister any previous subscription before registering a new one.
       // This prevents stale map entries if initialize() is called more than once.
       final dispatcher = VanguardChannelDispatcher.instance;
@@ -468,18 +585,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         textureId: id,
         onFrame: _onTimelineFrame,
         onEOS: _onTimelineEOS,
+        onAudioStateChanged: _onTimelineAudioStateChanged,
       );
 
-      value = value.copyWith(
-        textureId: id,
-        renderWidth: width,
-        renderHeight: height,
-        isReady: true,
-        currentPTS: 0.0,
-        isPlaying: false,
-        statusMessage:
-            'Ready — ${value.draft.durationSeconds.toStringAsFixed(1)}s',
-      );
       notifyListeners();
     } on PlatformException catch (e) {
       value = value.copyWith(
@@ -668,6 +776,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     final oldSubscription = _timelineSubscription;
 
     _busy = true;
+    // Phase 10F Slice 3: the previous prepare session is no longer current.
+    // Any readiness event still in flight for it is dropped on arrival.
+    _prepareSessionId = null;
     // Clear texture immediately so stale frames disappear.
     value = value.copyWith(
       draft: nextDraft,
@@ -677,6 +788,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       isReady: false,
       currentPTS: 0.0,
       isPlaying: false,
+      audioReadiness: VGAudioReadiness.unknown,
       statusMessage: 'Rebuilding timeline…',
     );
     notifyListeners();
@@ -705,7 +817,25 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       final width = (result?['width'] as num?)?.toInt();
       final height = (result?['height'] as num?)?.toInt();
 
+      // Phase 10F Slice 3: commit the new session and initial readiness
+      // BEFORE the listener handoff so a readiness event drained during
+      // registration is matched against the new session (see initialize).
+      _prepareSessionId = (result?['prepareSessionId'] as num?)?.toInt();
+      value = value.copyWith(
+        textureId: id,
+        renderWidth: width,
+        renderHeight: height,
+        isReady: true,
+        audioReadiness: _initialAudioReadiness(result),
+        statusMessage:
+            'Timeline rebuilt — ${nextDraft.durationSeconds.toStringAsFixed(1)}s',
+      );
+
       // Safe listener handoff: register new before unregistering old to avoid gaps.
+      // When the native side reuses the textureId and the old registration is
+      // still live, it is kept as-is: its audio callback already targets this
+      // controller, and events are matched by prepareSessionId, not by
+      // registration identity.
       final dispatcher = VanguardChannelDispatcher.instance;
       if (oldSubscription == null ||
           oldSubscription.textureId != id ||
@@ -715,6 +845,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
           textureId: id,
           onFrame: _onTimelineFrame,
           onEOS: _onTimelineEOS,
+          onAudioStateChanged: _onTimelineAudioStateChanged,
         );
         _timelineSubscription = newSubscription;
 
@@ -723,14 +854,6 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         }
       }
 
-      value = value.copyWith(
-        textureId: id,
-        renderWidth: width,
-        renderHeight: height,
-        isReady: true,
-        statusMessage:
-            'Timeline rebuilt — ${nextDraft.durationSeconds.toStringAsFixed(1)}s',
-      );
       notifyListeners();
     } on PlatformException catch (e) {
       value = value.copyWith(
@@ -1282,11 +1405,16 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // Unregister timeline subscription so no callbacks arrive after teardown
     // begins. Done synchronously before the MethodChannel call so the
     // subscription cannot deliver frames during the async native call.
+    // Unregistering also purges any buffered audio readiness event for this
+    // textureId in the dispatcher (Phase 10F Slice 3).
     final dispatcher = VanguardChannelDispatcher.instance;
     if (_timelineSubscription != null) {
       dispatcher.unregisterTimelineListener(_timelineSubscription!);
       _timelineSubscription = null;
     }
+    // Phase 10F Slice 3: no session is current once teardown begins, so a
+    // late readiness event routed through handleNativeCallback is dropped.
+    _prepareSessionId = null;
 
     // Store the raw future first. Both fields are set in the same microtask
     // so there is never a window where one is set and the other is not.
@@ -1312,11 +1440,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _disposed = true;
 
     // Unregister timeline subscription if disposeAsync was not called first.
+    // This also purges any buffered audio readiness event for the textureId.
     final dispatcher = VanguardChannelDispatcher.instance;
     if (_timelineSubscription != null) {
       dispatcher.unregisterTimelineListener(_timelineSubscription!);
       _timelineSubscription = null;
     }
+    _prepareSessionId = null;
 
     // Close streams before super.dispose() to avoid adding to closed streams.
     _ptsController.close();
@@ -1588,6 +1718,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       'ready: $isReady, '
       'playing: $isPlaying, '
       'exporting: $isExporting, '
+      'audio: ${audioReadiness.name}, '
+      'session: $_prepareSessionId, '
       'tearingDown: ${_teardownFuture != null}, '
       'disposed: $_disposed)';
 }

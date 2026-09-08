@@ -17,6 +17,9 @@
 //   DISP-13: Malformed payload (missing textureId) is silently dropped.
 //   DISP-14: Replacing an existing timeline subscription removes the old callback.
 //   DISP-15: Progress clamped to [0.0, 1.0] — negative and >1.0 clamped.
+//   DISP-16: onTimelineAudioStateChanged routes to registered timeline listener.
+//   DISP-17: Pre-registration audio state is buffered and drained once on registration.
+//   DISP-18: Pending audio state purged on unregister/reset; malformed payloads dropped.
 //
 // All tests use TestDefaultBinaryMessengerBinding to inject simulated native
 // callbacks without requiring a real device.
@@ -480,6 +483,350 @@ void main() {
       await _invokeNative('onExportProgress', 1.5);
       expect(received, closeTo(1.0, 0.001));
       dispatcher.unregisterExportListener(sub);
+    });
+  });
+
+  // ── DISP-16 ─────────────────────────────────────────────────────────────────
+
+  group('DISP-16: timeline audio readiness routing', () {
+    test(
+      'onTimelineAudioStateChanged delivers directly to registered listener',
+      () async {
+        const tid = 50;
+        const sid = 101;
+        const state = 'ready';
+        int? receivedTid;
+        int? receivedSid;
+        String? receivedState;
+
+        final sub = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) {
+            receivedTid = t;
+            receivedSid = s;
+            receivedState = st;
+          },
+        );
+
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'prepareSessionId': sid,
+          'state': state,
+        });
+
+        expect(receivedTid, tid);
+        expect(receivedSid, sid);
+        expect(receivedState, state);
+
+        dispatcher.unregisterTimelineListener(sub);
+      },
+    );
+
+    test(
+      'onTimelineAudioStateChanged routes only to matching textureId',
+      () async {
+        int? receivedTid1;
+        int? receivedTid2;
+
+        final sub1 = dispatcher.registerTimelineListener(
+          textureId: 10,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) => receivedTid1 = t,
+        );
+        final sub2 = dispatcher.registerTimelineListener(
+          textureId: 20,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) => receivedTid2 = t,
+        );
+
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': 10,
+          'prepareSessionId': 1,
+          'state': 'ready',
+        });
+
+        expect(receivedTid1, 10);
+        expect(receivedTid2, isNull);
+
+        dispatcher.unregisterTimelineListener(sub1);
+        dispatcher.unregisterTimelineListener(sub2);
+      },
+    );
+
+    test(
+      'registered listener without onAudioStateChanged does not throw or buffer',
+      () async {
+        const tid = 30;
+        final sub = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: null,
+        );
+
+        await expectLater(
+          _invokeNative('onTimelineAudioStateChanged', {
+            'textureId': tid,
+            'prepareSessionId': 1,
+            'state': 'ready',
+          }),
+          completes,
+        );
+
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+
+        dispatcher.unregisterTimelineListener(sub);
+      },
+    );
+  });
+
+  // ── DISP-17 ─────────────────────────────────────────────────────────────────
+
+  group('DISP-17: pre-registration audio state buffering and single drain', () {
+    test(
+      'buffers pre-registration audio state and drains once on registration',
+      () async {
+        const tid = 55;
+        const sid = 42;
+        const state = 'ready';
+
+        // Event arrives BEFORE listener registration.
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'prepareSessionId': sid,
+          'state': state,
+        });
+
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isTrue);
+
+        int callCount = 0;
+        int? drainedTid;
+        int? drainedSid;
+        String? drainedState;
+
+        final sub = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) {
+            callCount++;
+            drainedTid = t;
+            drainedSid = s;
+            drainedState = st;
+          },
+        );
+
+        // Synchronously drained during registration.
+        expect(callCount, 1);
+        expect(drainedTid, tid);
+        expect(drainedSid, sid);
+        expect(drainedState, state);
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+
+        // Unregister and re-register: must NOT drain again.
+        dispatcher.unregisterTimelineListener(sub);
+
+        int secondCallCount = 0;
+        final sub2 = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) => secondCallCount++,
+        );
+
+        expect(secondCallCount, 0);
+        dispatcher.unregisterTimelineListener(sub2);
+      },
+    );
+
+    test(
+      'last-value-wins pre-registration buffering for same textureId',
+      () async {
+        const tid = 56;
+
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'prepareSessionId': 1,
+          'state': 'pending',
+        });
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'prepareSessionId': 2,
+          'state': 'ready',
+        });
+
+        int callCount = 0;
+        int? drainedSid;
+        String? drainedState;
+
+        final sub = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) {
+            callCount++;
+            drainedSid = s;
+            drainedState = st;
+          },
+        );
+
+        expect(callCount, 1);
+        expect(drainedSid, 2);
+        expect(drainedState, 'ready');
+
+        dispatcher.unregisterTimelineListener(sub);
+      },
+    );
+
+    test(
+      'registration without onAudioStateChanged drains and discards buffered state',
+      () async {
+        const tid = 57;
+
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'prepareSessionId': 1,
+          'state': 'ready',
+        });
+
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isTrue);
+
+        final sub1 = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+        );
+
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+        dispatcher.unregisterTimelineListener(sub1);
+
+        // Subsequent registration must not receive the discarded state.
+        int laterCallCount = 0;
+        final sub2 = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) => laterCallCount++,
+        );
+        expect(laterCallCount, 0);
+
+        dispatcher.unregisterTimelineListener(sub2);
+      },
+    );
+  });
+
+  // ── DISP-18 ─────────────────────────────────────────────────────────────────
+
+  group('DISP-18: pending audio state purge and malformed payload handling', () {
+    test('purges pending audio state on unregister', () async {
+      const tid = 60;
+      final sub = dispatcher.registerTimelineListener(
+        textureId: tid,
+        onFrame: (pts, gen) {},
+        onEOS: () {},
+      );
+      // Unregister live listener.
+      dispatcher.unregisterTimelineListener(sub);
+
+      // Now buffer an event while unregistered.
+      await _invokeNative('onTimelineAudioStateChanged', {
+        'textureId': tid,
+        'prepareSessionId': 1,
+        'state': 'ready',
+      });
+      expect(dispatcher.hasPendingAudioStateForTesting(tid), isTrue);
+
+      // Calling unregister with the subscription purges buffered state for tid.
+      dispatcher.unregisterTimelineListener(sub);
+      expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+    });
+
+    test('purges pending audio state on resetForTesting', () async {
+      const tid = 61;
+      await _invokeNative('onTimelineAudioStateChanged', {
+        'textureId': tid,
+        'prepareSessionId': 1,
+        'state': 'ready',
+      });
+      expect(dispatcher.hasPendingAudioStateForTesting(tid), isTrue);
+
+      dispatcher.resetForTesting(channel: _kChannel);
+      expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+    });
+
+    test(
+      'malformed onTimelineAudioStateChanged payloads are silently dropped',
+      () async {
+        const tid = 70;
+        int callCount = 0;
+
+        final sub = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, gen) {},
+          onEOS: () {},
+          onAudioStateChanged: (t, s, st) => callCount++,
+        );
+
+        // Missing textureId
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'prepareSessionId': 1,
+          'state': 'ready',
+        });
+        // Missing prepareSessionId
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'state': 'ready',
+        });
+        // Missing state
+        await _invokeNative('onTimelineAudioStateChanged', {
+          'textureId': tid,
+          'prepareSessionId': 1,
+        });
+        // Non-map payload
+        await _invokeNative('onTimelineAudioStateChanged', 'invalid');
+        // Null payload
+        await _invokeNative('onTimelineAudioStateChanged', null);
+
+        expect(callCount, 0);
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+
+        dispatcher.unregisterTimelineListener(sub);
+
+        // Also verify malformed payload does not buffer when no listener is registered
+        await _invokeNative('onTimelineAudioStateChanged', {'state': 'ready'});
+        expect(dispatcher.hasPendingAudioStateForTesting(tid), isFalse);
+      },
+    );
+
+    test('numeric fields tolerate int-as-double', () async {
+      const tid = 80;
+      int? receivedTid;
+      int? receivedSid;
+
+      final sub = dispatcher.registerTimelineListener(
+        textureId: tid,
+        onFrame: (pts, gen) {},
+        onEOS: () {},
+        onAudioStateChanged: (t, s, st) {
+          receivedTid = t;
+          receivedSid = s;
+        },
+      );
+
+      await _invokeNative('onTimelineAudioStateChanged', {
+        'textureId': 80.0,
+        'prepareSessionId': 42.0,
+        'state': 'ready',
+      });
+
+      expect(receivedTid, 80);
+      expect(receivedSid, 42);
+
+      dispatcher.unregisterTimelineListener(sub);
     });
   });
 }

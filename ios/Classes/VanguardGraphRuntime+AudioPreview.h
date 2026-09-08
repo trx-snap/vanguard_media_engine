@@ -22,24 +22,58 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// ─── Phase 10F Slice 3: audio arming outcome ─────────────────────────────────
+//
+// Reported exactly once per setAudioSidecarPlan: request through the
+// completion callback. The Swift plugin is the single choke point that
+// translates this outcome into the `onTimelineAudioStateChanged` MethodChannel
+// event; the ObjC category never talks to Flutter directly.
+//
+//   Ready      — a new VanguardAudioPreviewRuntime was installed with at least
+//                one audible track and is now driven by the timeline snapshot.
+//   Silent     — a new runtime was installed in ReadySilent mode (nil plan, or
+//                no eligible/audible track). Terminal; nothing further arrives.
+//   Failed     — a new runtime was installed but preparation failed
+//                (malformed track, missing file, unsupported format, invalid
+//                duration, engine preparation). Video preview continues.
+//   Superseded — this request was rejected at a lifecycle gate, went stale
+//                because a newer request raced in, or the graph shut down.
+//                Callers must NOT surface this to Dart: a newer request (or a
+//                teardown) owns the observable state.
+typedef NS_ENUM(NSInteger, VGGraphAudioArmOutcome) {
+  VGGraphAudioArmOutcomeReady = 0,
+  VGGraphAudioArmOutcomeSilent = 1,
+  VGGraphAudioArmOutcomeFailed = 2,
+  VGGraphAudioArmOutcomeSuperseded = 3,
+};
+
+/// Completion callback for setAudioSidecarPlan:timelineDuration:completion:.
+/// Invoked exactly once on the main queue.
+typedef void (^VGGraphAudioArmCompletion)(VGGraphAudioArmOutcome outcome);
+
 @interface VanguardGraphRuntime (AudioPreview)
 
 /// Arms the audio preview runtime after the video compositor is ready.
 ///
 /// Tears down any existing audio runtime, constructs a new one, prepares it
-/// from the supplied sidecar plan, and calls |completion| on the main queue
-/// when the runtime is installed (or when silent fallback is applied).
+/// from the supplied sidecar plan, installs it, issues an unconditional
+/// commandPlay (the runtime's own scheduler consults the live timeline
+/// snapshot and no-ops unless the timeline is currently playing), and calls
+/// |completion| on the main queue with the arming outcome.
 ///
 /// Safe to call with nil plan (silent mode). Must be called on the main thread.
 ///
 /// @param plan              Normalized VGAudioSidecarPlan, or nil for silence.
 /// @param timelineDuration  Project duration in seconds
 /// (VGEditorDraft.durationSeconds).
-/// @param completion        Called exactly once on the main queue when audio
-///                          setup is complete (success or silent fallback).
+/// @param completion        Called exactly once on the main queue with a
+///                          VGGraphAudioArmOutcome. Every code path — install,
+///                          silent fallback, preparation failure, lifecycle
+///                          gate rejection, stale generation, graph shutdown —
+///                          reports exactly one outcome.
 - (void)setAudioSidecarPlan:(nullable VGAudioSidecarPlan *)plan
            timelineDuration:(NSTimeInterval)timelineDuration
-                 completion:(dispatch_block_t)completion
+                 completion:(VGGraphAudioArmCompletion)completion
     NS_SWIFT_NAME(setAudioSidecarPlan(_:timelineDuration:completion:));
 
 /// Forwards the Slice N recovery command to the installed audio preview

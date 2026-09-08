@@ -46,6 +46,18 @@ typedef VGTimelineFrameCallback = void Function(double pts, int generation);
 /// Callback type for timeline end-of-stream.
 typedef VGTimelineEOSCallback = void Function();
 
+/// Callback type for timeline audio readiness updates (Phase 10F Slice 3).
+///
+/// Delivered for `onTimelineAudioStateChanged`. [textureId] is the texture the
+/// event was emitted for (always equal to the registration key),
+/// [prepareSessionId] is the native monotonic prepare-session id echoed from
+/// the `createTimelineTexture` / `updateTimeline` result map, and [state] is
+/// the raw native state string (`ready`, `silent`, or `failed`). Consumers
+/// must drop events whose textureId/prepareSessionId do not match their
+/// current state.
+typedef VGTimelineAudioStateCallback =
+    void Function(int textureId, int prepareSessionId, String state);
+
 // ── Subscription tokens ───────────────────────────────────────────────────────
 //
 // All token classes are in this library so that the dispatcher can access
@@ -103,10 +115,23 @@ class _TimelineEntry {
   final Object token;
   final VGTimelineFrameCallback onFrame;
   final VGTimelineEOSCallback onEOS;
+  final VGTimelineAudioStateCallback? onAudioStateChanged;
   _TimelineEntry({
     required this.token,
     required this.onFrame,
     required this.onEOS,
+    this.onAudioStateChanged,
+  });
+}
+
+/// A parsed `onTimelineAudioStateChanged` payload held while no timeline
+/// listener is registered for its textureId (Phase 10F Slice 3).
+class _PendingAudioState {
+  final int prepareSessionId;
+  final String state;
+  const _PendingAudioState({
+    required this.prepareSessionId,
+    required this.state,
   });
 }
 
@@ -134,6 +159,7 @@ class _ExportEntry {
 /// | Category           | Slot policy      | Identity key |
 /// |--------------------|------------------|--------------|
 /// | Timeline           | Per textureId    | textureId    |
+/// | Timeline audio     | Per textureId*   | textureId    |
 /// | Export progress    | LIFO stack       | token        |
 /// | Playback complete  | Single-slot      | token        |
 /// | Duration probed    | Single-slot      | token        |
@@ -147,6 +173,12 @@ class _ExportEntry {
 /// instead of clobbering it permanently. Unregister removes only the entry
 /// matching the given token (wherever it is in the stack); dispatch always
 /// calls the top (most recently registered) entry.
+///
+/// *Timeline audio readiness (`onTimelineAudioStateChanged`, Phase 10F
+/// Slice 3) is an optional callback on the timeline entry. While no timeline
+/// listener is registered for a textureId, the latest event for that
+/// textureId is buffered (last-value-wins, bounded) and drained into the next
+/// registration; it is purged on unregister and on [resetForTesting].
 ///
 /// Stale-token unregister is always a no-op.
 final class VanguardChannelDispatcher {
@@ -165,6 +197,20 @@ final class VanguardChannelDispatcher {
 
   // Timeline: keyed by textureId.
   final Map<int, _TimelineEntry> _timelineListeners = {};
+
+  // Phase 10F Slice 3: audio readiness events that arrived for a textureId
+  // with no registered listener. Last-value-wins per textureId, bounded to
+  // [_kMaxPendingAudioStates] textureIds (oldest entry evicted). Drained on
+  // the next registerTimelineListener for that textureId and purged on
+  // unregister / resetForTesting.
+  //
+  // Native returns the video texture before audio finishes arming, so under
+  // normal ordering the controller has registered before the audio event
+  // arrives. This buffer covers the gap where the Dart result continuation
+  // has not yet run (e.g. a slow microtask queue) so a readiness event is not
+  // lost between the result reply and the registration.
+  static const int _kMaxPendingAudioStates = 8;
+  final Map<int, _PendingAudioState> _pendingAudioStates = {};
 
   // Export progress: LIFO stack — see class docs.
   final List<_ExportEntry> _exportProgressStack = [];
@@ -203,6 +249,10 @@ final class VanguardChannelDispatcher {
 
       case 'onTimelineEOS':
         _dispatchTimelineEOS(call.arguments);
+        break;
+
+      case 'onTimelineAudioStateChanged':
+        _dispatchTimelineAudioState(call.arguments);
         break;
 
       case 'onExportProgress':
@@ -265,6 +315,37 @@ final class VanguardChannelDispatcher {
     entry?.onEOS();
   }
 
+  void _dispatchTimelineAudioState(dynamic arguments) {
+    // Payload: {textureId: num, prepareSessionId: num, state: String}.
+    final args = arguments as Map?;
+    final textureId = (args?['textureId'] as num?)?.toInt();
+    final prepareSessionId = (args?['prepareSessionId'] as num?)?.toInt();
+    final state = args?['state'] as String?;
+    if (textureId == null || prepareSessionId == null || state == null) {
+      return; // malformed — drop silently
+    }
+
+    final entry = _timelineListeners[textureId];
+    if (entry != null) {
+      // A listener owns this textureId: deliver directly (or drop if the
+      // listener did not opt in to audio state). Never buffer while a
+      // listener is registered — buffering would leak the event into a
+      // later, unrelated registration for a reused textureId.
+      entry.onAudioStateChanged?.call(textureId, prepareSessionId, state);
+      return;
+    }
+
+    // No listener yet: hold the latest value for this textureId.
+    _pendingAudioStates.remove(textureId);
+    if (_pendingAudioStates.length >= _kMaxPendingAudioStates) {
+      _pendingAudioStates.remove(_pendingAudioStates.keys.first);
+    }
+    _pendingAudioStates[textureId] = _PendingAudioState(
+      prepareSessionId: prepareSessionId,
+      state: state,
+    );
+  }
+
   // ── Timeline registration ──────────────────────────────────────────────────
 
   /// Registers a timeline callback pair for [textureId].
@@ -272,12 +353,19 @@ final class VanguardChannelDispatcher {
   /// If a registration already exists for [textureId], it is replaced and
   /// a debug diagnostic is emitted.
   ///
+  /// [onAudioStateChanged] (optional, Phase 10F Slice 3) receives
+  /// `onTimelineAudioStateChanged` events for [textureId]. Any audio state
+  /// event that arrived for [textureId] before this registration is drained
+  /// synchronously into [onAudioStateChanged] (last value only) during this
+  /// call, and then discarded regardless of whether a callback was supplied.
+  ///
   /// Returns a [VGTimelineSubscription] that must be passed to
   /// [unregisterTimelineListener] when the consumer is disposed.
   VGTimelineSubscription registerTimelineListener({
     required int textureId,
     required VGTimelineFrameCallback onFrame,
     required VGTimelineEOSCallback onEOS,
+    VGTimelineAudioStateCallback? onAudioStateChanged,
   }) {
     ensureHandlerRegistered();
 
@@ -297,19 +385,34 @@ final class VanguardChannelDispatcher {
       token: token,
       onFrame: onFrame,
       onEOS: onEOS,
+      onAudioStateChanged: onAudioStateChanged,
     );
-    return VGTimelineSubscription._(textureId, token);
+    final subscription = VGTimelineSubscription._(textureId, token);
+
+    // Drain a buffered audio state for this textureId (if any). Removed
+    // before delivery so a re-entrant register/unregister inside the callback
+    // cannot observe or re-deliver it.
+    final pending = _pendingAudioStates.remove(textureId);
+    if (pending != null && onAudioStateChanged != null) {
+      onAudioStateChanged(textureId, pending.prepareSessionId, pending.state);
+    }
+    return subscription;
   }
 
   /// Unregisters a timeline subscription.
   ///
-  /// Stale or already-unregistered tokens are safe no-ops.
+  /// Stale or already-unregistered tokens are safe no-ops. Any buffered
+  /// audio state for the subscription's textureId is purged so it cannot
+  /// leak into a later registration for a reused textureId.
   void unregisterTimelineListener(VGTimelineSubscription subscription) {
     final entry = _timelineListeners[subscription.textureId];
     if (entry != null && identical(entry.token, subscription._token)) {
       _timelineListeners.remove(subscription.textureId);
     }
-    // Stale token: no-op.
+    // Stale token: listener map untouched. The pending buffer is only ever
+    // populated while no listener exists for the textureId, so purging it
+    // here is safe in both the live and stale-token cases.
+    _pendingAudioStates.remove(subscription.textureId);
   }
 
   // ── Export progress registration ──────────────────────────────────────────
@@ -431,6 +534,7 @@ final class VanguardChannelDispatcher {
   @visibleForTesting
   void resetForTesting({MethodChannel? channel}) {
     _timelineListeners.clear();
+    _pendingAudioStates.clear();
     _exportProgressStack.clear();
     _playbackCompleteCallback = null;
     _playbackCompleteToken = null;
@@ -454,4 +558,9 @@ final class VanguardChannelDispatcher {
   /// Whether an export progress listener is currently registered. **Test-only.**
   @visibleForTesting
   bool get hasExportListenerForTesting => _exportProgressStack.isNotEmpty;
+
+  /// Whether an audio state event is buffered for [textureId]. **Test-only.**
+  @visibleForTesting
+  bool hasPendingAudioStateForTesting(int textureId) =>
+      _pendingAudioStates.containsKey(textureId);
 }

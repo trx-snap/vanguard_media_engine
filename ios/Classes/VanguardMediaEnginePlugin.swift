@@ -236,6 +236,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Gated behind VG_USE_V2_GRAPH — nil when VG_USE_V2_GRAPH=0.
     #if VG_USE_V2_GRAPH
     var _timelineRuntime: VanguardGraphRuntime?
+
+    // Phase 10F Slice 3: monotonic prepare-session counter.
+    // Minted once per _prepareTimelineCompositorWithSize call on the main
+    // thread and echoed in both the createTimelineTexture/updateTimeline
+    // result map and the later `onTimelineAudioStateChanged` event so Dart
+    // can correlate an audio outcome with the exact prepare that produced it.
+    private var _prepareSessionCounter: Int64 = 0
     #endif
 
     // Phase 7.x-E: DEV-only runtime for dual-camera texture mount smoke test.
@@ -597,37 +604,80 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         let capturedSidecar   = audioSidecarPlan
         let capturedDuration  = durationSeconds
 
-        // Phase 10F Slice 1: timing instrumentation only — readiness semantics
-        // are unchanged (result() still waits for setAudioSidecarPlan).
+        // Phase 10F Slice 3: mint a monotonic prepare-session id. This helper
+        // always runs on the main thread (MethodChannel handler or an explicit
+        // DispatchQueue.main.async hop), so the counter needs no lock.
+        _prepareSessionCounter += 1
+        let prepareSessionId = _prepareSessionCounter
+
+        // Phase 10F Slice 1/3: timing instrumentation.
         let prepareStart = CFAbsoluteTimeGetCurrent()
         let sidecarTrackCount = audioSidecarPlan?.tracks.count ?? 0
+        let audioPending = sidecarTrackCount > 0
 
-        timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
+        timelineRuntime.prepareTimeline(sourceNode: compositor) { [weak self] textureId, err in
+            // Fires on the main queue (VanguardGraphRuntime.h contract).
             let prepareMs = Int((CFAbsoluteTimeGetCurrent() - prepareStart) * 1000)
             if let err = err {
-                NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline failed elapsedMs=%ld error=%@",
-                      prepareMs, err.localizedDescription)
+                NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline failed elapsedMs=%ld session=%lld error=%@",
+                      prepareMs, prepareSessionId, err.localizedDescription)
                 result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
                                     message: err.localizedDescription,
                                     details: nil))
                 return
             }
-            NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline ok elapsedMs=%ld textureId=%lld canvas=%ldx%ld sidecarTracks=%ld",
-                  prepareMs, textureId, width, height, sidecarTrackCount)
-            // Phase 10-C Slice D: arm the audio preview runtime after the compositor
-            // is prepared. result() is deferred until audio setup completes (or
-            // silently falls back). Video preview is unaffected by any audio result.
-            // FlutterResult is called exactly once — either from the audio completion
-            // or from the video failure path above.
+            NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline ok elapsedMs=%ld textureId=%lld session=%lld canvas=%ldx%ld sidecarTracks=%ld audioPending=%ld",
+                  prepareMs, textureId, prepareSessionId, width, height, sidecarTrackCount, audioPending ? 1 : 0)
+
+            // Phase 10F Slice 3: return the video texture to Flutter immediately.
+            // FlutterResult is called exactly once — here on success, or from the
+            // video failure path above. Audio arming no longer gates this reply.
+            // `audioPending` tells Dart whether an `onTimelineAudioStateChanged`
+            // event will follow for this session (true) or whether the session is
+            // terminally silent (false: no sidecar tracks at all).
+            result([
+                "textureId":        textureId,
+                "width":            width,
+                "height":           height,
+                "prepareSessionId": prepareSessionId,
+                "audioPending":     audioPending,
+            ])
+
+            // Phase 10-C Slice D / 10F Slice 3: arm the audio preview runtime on
+            // a later main-queue turn so the reply above is flushed first and
+            // old-runtime teardown does not run inside the prepare callback.
+            // Video preview is unaffected by any audio outcome.
             let audioStart = CFAbsoluteTimeGetCurrent()
-            timelineRuntime.setAudioSidecarPlan(capturedSidecar,
-                                                timelineDuration: capturedDuration,
-                                                completion: {
-                let now = CFAbsoluteTimeGetCurrent()
-                NSLog("[VanguardMediaEnginePlugin][TIMING] setAudioSidecarPlan completed elapsedMs=%ld totalMs=%ld sidecarTracks=%ld",
-                      Int((now - audioStart) * 1000), Int((now - prepareStart) * 1000), sidecarTrackCount)
-                result(["textureId": textureId, "width": width, "height": height])
-            })
+            DispatchQueue.main.async {
+                timelineRuntime.setAudioSidecarPlan(capturedSidecar,
+                                                    timelineDuration: capturedDuration,
+                                                    completion: { outcome in
+                    // Single choke point (main queue): translate the ObjC arming
+                    // outcome into the Dart readiness event. Superseded outcomes
+                    // belong to a newer prepare or a teardown and are never
+                    // surfaced, so a stale session can never overwrite a newer
+                    // controller's readiness.
+                    let now = CFAbsoluteTimeGetCurrent()
+                    let state: String
+                    switch outcome {
+                    case .ready:      state = "ready"
+                    case .silent:     state = "silent"
+                    case .failed:     state = "failed"
+                    case .superseded: state = "superseded"
+                    @unknown default: state = "failed"
+                    }
+                    NSLog("[VanguardMediaEnginePlugin][TIMING] audio armed state=%@ elapsedMs=%ld totalMs=%ld textureId=%lld session=%lld sidecarTracks=%ld",
+                          state, Int((now - audioStart) * 1000), Int((now - prepareStart) * 1000),
+                          textureId, prepareSessionId, sidecarTrackCount)
+                    if outcome == .superseded { return }
+                    guard let self = self, let channel = self.channel else { return }
+                    channel.invokeMethod("onTimelineAudioStateChanged", arguments: [
+                        "textureId":        textureId,
+                        "prepareSessionId": prepareSessionId,
+                        "state":            state,
+                    ])
+                })
+            }
         }
     }
 

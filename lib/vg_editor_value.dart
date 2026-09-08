@@ -12,6 +12,46 @@
 
 import 'vg_editor_draft.dart';
 
+// ── Phase 10F Slice 3: audio preview readiness ───────────────────────────────
+
+/// Readiness of the native audio preview runtime for the active timeline.
+///
+/// Video readiness ([VGEditorValue.isReady]) is independent of this value:
+/// the native side returns the video texture as soon as the compositor is
+/// prepared and arms audio afterwards, reporting the outcome through the
+/// `onTimelineAudioStateChanged` callback. Playback, seek, and export are
+/// never gated on audio readiness.
+///
+/// Terminal values ([ready], [silent], [failed]) are sticky for a given
+/// prepare session: once reached, later events for the same session cannot
+/// move the value back to [pending].
+enum VGAudioReadiness {
+  /// No timeline has been prepared yet, or a rebuild is in progress.
+  unknown,
+
+  /// The native side reported that audio sidecar tracks exist and is still
+  /// arming the audio runtime. A terminal event will follow.
+  pending,
+
+  /// The audio runtime is installed with at least one audible track and is
+  /// driven by the timeline snapshot.
+  ready,
+
+  /// The timeline has no audible audio (no sidecar tracks, or none eligible).
+  /// Terminal; no further readiness events arrive for this session.
+  silent,
+
+  /// Audio preparation failed (missing file, unsupported format, engine
+  /// preparation error). Video preview continues unaffected.
+  failed;
+
+  /// Whether this value is terminal for the current prepare session.
+  bool get isTerminal =>
+      this == VGAudioReadiness.ready ||
+      this == VGAudioReadiness.silent ||
+      this == VGAudioReadiness.failed;
+}
+
 /// Immutable snapshot of a [VGEditorController]'s observable state.
 ///
 /// [VGEditorController] extends `ValueNotifier<VGEditorValue>`. Every time the
@@ -34,6 +74,7 @@ final class VGEditorValue {
     this.isReady = false,
     this.isExporting = false,
     this.statusMessage,
+    this.audioReadiness = VGAudioReadiness.unknown,
   });
 
   /// Convenience factory for the initial controller state.
@@ -90,6 +131,14 @@ final class VGEditorValue {
   /// Null when idle. Updated by controller lifecycle transitions.
   final String? statusMessage;
 
+  /// Readiness of the native audio preview runtime for the active timeline.
+  ///
+  /// Independent of [isReady] (video-texture readiness). Defaults to
+  /// [VGAudioReadiness.unknown]; set to [VGAudioReadiness.pending] or a
+  /// terminal value by [VGEditorController] after `initialize` /
+  /// `updateDraft` return, then updated from `onTimelineAudioStateChanged`.
+  final VGAudioReadiness audioReadiness;
+
   // ── Derived helpers ────────────────────────────────────────────────────────
 
   /// The total timeline duration from the active draft in seconds.
@@ -133,6 +182,7 @@ final class VGEditorValue {
     bool? isReady,
     bool? isExporting,
     Object? statusMessage = _kNoValue,
+    VGAudioReadiness? audioReadiness,
   }) {
     return VGEditorValue(
       draft: draft ?? this.draft,
@@ -150,6 +200,7 @@ final class VGEditorValue {
       statusMessage: statusMessage == _kNoValue
           ? this.statusMessage
           : statusMessage as String?,
+      audioReadiness: audioReadiness ?? this.audioReadiness,
     );
   }
 
@@ -167,7 +218,8 @@ final class VGEditorValue {
           other.isPlaying == isPlaying &&
           other.isReady == isReady &&
           other.isExporting == isExporting &&
-          other.statusMessage == statusMessage;
+          other.statusMessage == statusMessage &&
+          other.audioReadiness == audioReadiness;
 
   @override
   int get hashCode => Object.hash(
@@ -180,6 +232,7 @@ final class VGEditorValue {
     isReady,
     isExporting,
     statusMessage,
+    audioReadiness,
   );
 
   @override
@@ -192,6 +245,7 @@ final class VGEditorValue {
       'playing: $isPlaying, '
       'ready: $isReady, '
       'exporting: $isExporting, '
+      'audio: ${audioReadiness.name}, '
       'status: $statusMessage)';
 }
 
