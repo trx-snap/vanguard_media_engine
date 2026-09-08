@@ -32,7 +32,6 @@ private let _vgtlamProductionErrorFactory: VGTLAMFlutterErrorFactory = { code, m
 // ─── Error code constants ─────────────────────────────────────────────────────
 
 private let kErrInvalidArg    = "INVALID_ARG"
-private let kErrNoTimeline    = "NO_TIMELINE"
 private let kErrStaleTimeline = "STALE_TIMELINE"
 
 // ─── Lightweight target abstraction ─────────────────────────────────────────
@@ -67,7 +66,9 @@ func vgtlamProductionTarget(
 /// Handles the `timeline_setAudioMixGain` MethodChannel route.
 ///
 /// The plugin retains one instance and provides a target provider closure that
-/// resolves the current `_timelineRuntime` at call time.
+/// resolves the runtime registered for the requested textureId at call time
+/// (Phase 10F Slice 4A addressed routing). A nil target means the requested
+/// session is not active and is reported as `STALE_TIMELINE`.
 ///
 /// **Thread safety**: `handle(args:result:)` may be called from any thread.
 /// If already on the main thread, it proceeds synchronously. If off main, it
@@ -77,9 +78,9 @@ final class VGTimelineAudioMixControlHandler {
 
     // MARK: – Dependencies
 
-    /// Resolves the currently active timeline target at call time.
-    /// Returns `nil` when no timeline is active (`NO_TIMELINE`).
-    private let targetProvider: () -> VGTimelineAudioMixTarget?
+    /// Resolves the timeline target for the requested textureId at call time.
+    /// Returns `nil` when that session is not active (`STALE_TIMELINE`).
+    private let targetProvider: (Int64) -> VGTimelineAudioMixTarget?
 
     /// Produces `FlutterError`-compatible values. Injected for testing.
     private let errorFactory: VGTLAMFlutterErrorFactory
@@ -87,7 +88,7 @@ final class VGTimelineAudioMixControlHandler {
     // MARK: – Init
 
     init(
-        targetProvider: @escaping () -> VGTimelineAudioMixTarget?,
+        targetProvider: @escaping (Int64) -> VGTimelineAudioMixTarget?,
         errorFactory: @escaping VGTLAMFlutterErrorFactory = _vgtlamProductionErrorFactory
     ) {
         self.targetProvider = targetProvider
@@ -187,15 +188,19 @@ final class VGTimelineAudioMixControlHandler {
         }
         let gain = Float(max(0.0, min(1.0, gainNum.doubleValue)))
 
-        // ── 4. Resolve active target ──────────────────────────────────────────
+        // ── 4. Resolve addressed target ───────────────────────────────────────
+        //
+        // Phase 10F Slice 4A: the provider resolves by requested textureId. A
+        // nil result means the addressed session is not active — STALE_TIMELINE.
 
-        guard let target = targetProvider() else {
-            result(errorFactory(kErrNoTimeline,
-                                "timeline_setAudioMixGain: no active timeline target", nil))
+        guard let target = targetProvider(requestedTextureId) else {
+            result(errorFactory(kErrStaleTimeline,
+                                "timeline_setAudioMixGain: textureId \(requestedTextureId) " +
+                                "is not an active timeline session", nil))
             return
         }
 
-        // ── 5. Stale-target check ─────────────────────────────────────────────
+        // ── 5. Stale-target check (defensive; provider already matched) ───────
 
         guard target.textureId == requestedTextureId else {
             result(errorFactory(kErrStaleTimeline,

@@ -36,7 +36,6 @@ private let _vgtlcProductionErrorFactory: VGTLCFlutterErrorFactory = { code, mes
 // ─── Error code constants ─────────────────────────────────────────────────────
 
 private let kErrInvalidArg    = "INVALID_ARG"
-private let kErrNoTimeline    = "NO_TIMELINE"
 private let kErrStaleTimeline = "STALE_TIMELINE"
 private let kErrUnknownFilter = "UNKNOWN_FILTER"
 
@@ -81,7 +80,9 @@ func vgtlcProductionTarget(
 /// Handles the `timeline_setFilterChain` MethodChannel route.
 ///
 /// The plugin retains one instance and provides a target provider closure that
-/// resolves the current `_timelineRuntime` at call time.
+/// resolves the runtime registered for the requested textureId at call time
+/// (Phase 10F Slice 4A addressed routing). A nil target means the requested
+/// session is not active and is reported as `STALE_TIMELINE`.
 ///
 /// **Thread safety**: `handle(call:args:result:)` may be called from any
 /// thread. If already on the main thread, it proceeds synchronously. If off
@@ -91,9 +92,9 @@ final class VGTimelineLiveControlHandler {
 
     // MARK: – Dependencies
 
-    /// Resolves the currently active timeline target at call time.
-    /// Returns `nil` when no timeline is active (`NO_TIMELINE`).
-    private let targetProvider: () -> VGTimelineLiveFilterTarget?
+    /// Resolves the timeline target for the requested textureId at call time.
+    /// Returns `nil` when that session is not active (`STALE_TIMELINE`).
+    private let targetProvider: (Int64) -> VGTimelineLiveFilterTarget?
 
     /// Produces `FlutterError`-compatible values. Injected for testing.
     private let errorFactory: VGTLCFlutterErrorFactory
@@ -103,12 +104,13 @@ final class VGTimelineLiveControlHandler {
     /// Creates a handler.
     ///
     /// - Parameters:
-    ///   - targetProvider: Called on the main thread at handle time to obtain
-    ///     the current timeline target. Must be callable on the main thread.
+    ///   - targetProvider: Called on the main thread at handle time with the
+    ///     strictly parsed requested textureId to obtain the matching timeline
+    ///     target. Must be callable on the main thread.
     ///   - errorFactory: Produces `FlutterError`-compatible values.
     ///     Defaults to the production factory.
     init(
-        targetProvider: @escaping () -> VGTimelineLiveFilterTarget?,
+        targetProvider: @escaping (Int64) -> VGTimelineLiveFilterTarget?,
         errorFactory: @escaping VGTLCFlutterErrorFactory = _vgtlcProductionErrorFactory
     ) {
         self.targetProvider = targetProvider
@@ -229,15 +231,20 @@ final class VGTimelineLiveControlHandler {
             return
         }
 
-        // ── 3. Resolve active target ──────────────────────────────────────────
+        // ── 3. Resolve addressed target ───────────────────────────────────────
+        //
+        // Phase 10F Slice 4A: the provider resolves by requested textureId. A
+        // nil result means the addressed session is not active (never was, or
+        // has since been replaced/disposed) — STALE_TIMELINE, non-destructive.
 
-        guard let target = targetProvider() else {
-            result(errorFactory(kErrNoTimeline,
-                                "timeline_setFilterChain: no active timeline target", nil))
+        guard let target = targetProvider(requestedTextureId) else {
+            result(errorFactory(kErrStaleTimeline,
+                                "timeline_setFilterChain: textureId \(requestedTextureId) " +
+                                "is not an active timeline session", nil))
             return
         }
 
-        // ── 4. Stale-target check ─────────────────────────────────────────────
+        // ── 4. Stale-target check (defensive; provider already matched) ───────
 
         guard target.textureId == requestedTextureId else {
             result(errorFactory(kErrStaleTimeline,

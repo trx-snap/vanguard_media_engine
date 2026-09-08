@@ -625,18 +625,53 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       // compositor does not immediately return EOS on the first frame request.
       final durationSeconds = value.draft.durationSeconds;
       if (durationSeconds > 0.0 && value.currentPTS >= durationSeconds) {
-        await _channel.invokeMethod<void>('timelineSeek', {'seconds': 0.0});
+        await _channel.invokeMethod<void>(
+          'timelineSeek',
+          _addressedArgs({'seconds': 0.0}),
+        );
         value = value.copyWith(currentPTS: 0.0);
       }
 
-      await _channel.invokeMethod<void>('timelinePlay');
+      await _channel.invokeMethod<void>('timelinePlay', _addressedArgs());
       value = value.copyWith(isPlaying: true, statusMessage: 'Playing');
       notifyListeners();
     } on PlatformException catch (e) {
+      if (_handleStaleTimeline(e)) return;
       value = value.copyWith(statusMessage: 'Play error: ${e.message}');
       notifyListeners();
       rethrow;
     }
+  }
+
+  // ── Phase 10F Slice 4A: addressed timeline session routing ─────────────────
+
+  /// Builds MethodChannel args for a timeline command, attaching the current
+  /// [value.textureId] as `textureId` when one is known so native can route
+  /// the command to exactly this controller's session. Without a textureId the
+  /// call is unaddressed and native falls back to its single legacy runtime.
+  Map<String, Object?> _addressedArgs([Map<String, Object?>? base]) {
+    final args = <String, Object?>{...?base};
+    final textureId = value.textureId;
+    if (textureId != null) args['textureId'] = textureId;
+    return args;
+  }
+
+  /// Handles a `STALE_TIMELINE` reply from an addressed play/pause/seek.
+  ///
+  /// Native reports that the session this controller addressed no longer
+  /// exists (a newer runtime replaced it or it was disposed). The command was
+  /// a non-destructive no-op, so the controller marks itself not ready and
+  /// stops rather than propagating an error. Returns `false` for any other
+  /// code so the caller keeps its existing rethrow behaviour.
+  bool _handleStaleTimeline(PlatformException e) {
+    if (e.code != 'STALE_TIMELINE') return false;
+    value = value.copyWith(
+      isReady: false,
+      isPlaying: false,
+      statusMessage: 'Timeline session expired',
+    );
+    notifyListeners();
+    return true;
   }
 
   /// Pauses timeline playback.
@@ -650,13 +685,14 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (!value.isReady || _busy || !value.isPlaying) return;
 
     try {
-      await _channel.invokeMethod<void>('timelinePause');
+      await _channel.invokeMethod<void>('timelinePause', _addressedArgs());
       value = value.copyWith(
         isPlaying: false,
         statusMessage: 'Paused at ${value.currentPTS.toStringAsFixed(2)}s',
       );
       notifyListeners();
     } on PlatformException catch (e) {
+      if (_handleStaleTimeline(e)) return;
       value = value.copyWith(statusMessage: 'Pause error: ${e.message}');
       notifyListeners();
       rethrow;
@@ -678,16 +714,20 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (!value.isReady) return;
 
     try {
-      await _channel.invokeMethod<void>('timelineSeek', {
-        'seconds': seconds,
-        'resumeAfterSeek': resumeAfterSeek,
-      });
+      await _channel.invokeMethod<void>(
+        'timelineSeek',
+        _addressedArgs({
+          'seconds': seconds,
+          'resumeAfterSeek': resumeAfterSeek,
+        }),
+      );
       value = value.copyWith(
         currentPTS: seconds,
         statusMessage: 'Seeked to ${seconds.toStringAsFixed(2)}s',
       );
       notifyListeners();
     } on PlatformException catch (e) {
+      if (_handleStaleTimeline(e)) return;
       value = value.copyWith(statusMessage: 'Seek error: ${e.message}');
       notifyListeners();
       rethrow;
@@ -723,9 +763,11 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _pendingCoalescedSeek = null;
     _coalescedSeekInFlight = true;
     _latestDispatchedGeneration++;
-    // Fire-and-forget: a scrub seek failure is non-fatal.
+    // Fire-and-forget: a scrub seek failure is non-fatal. Addressed with the
+    // current textureId so a stale controller cannot scrub a newer runtime;
+    // a STALE_TIMELINE reply lands in catchError and releases the lock.
     _channel
-        .invokeMethod<void>('timelineSeek', {'seconds': next})
+        .invokeMethod<void>('timelineSeek', _addressedArgs({'seconds': next}))
         .then((_) {
           if (_disposed) {
             _coalescedSeekInFlight = false;
@@ -774,6 +816,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (value.isPlaying) await pause();
 
     final oldSubscription = _timelineSubscription;
+    // Phase 10F Slice 4A: identify the runtime being replaced BEFORE the value
+    // is cleared so native replaces only this controller's session.
+    final replaceTextureId = value.textureId ?? oldSubscription?.textureId;
 
     _busy = true;
     // Phase 10F Slice 3: the previous prepare session is no longer current.
@@ -806,6 +851,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         // The native plugin passes this to VanguardAudioPreviewRuntime so it can
         // compute boundary-timer delays correctly without reading draft internals.
         'durationSeconds': nextDraft.durationSeconds,
+        // Phase 10F Slice 4A: addressed replace. Native fails STALE_TIMELINE
+        // (without touching the active runtime) if this id is no longer live.
+        if (replaceTextureId != null) 'replaceTextureId': replaceTextureId,
       });
 
       final id = (result?['textureId'] as num?)?.toInt();
@@ -1089,6 +1137,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'getTimelineCacheStats',
+        _addressedArgs(),
       );
       if (result == null || result.isEmpty) return const {};
       return result.map((k, v) => MapEntry(k, (v as num).toInt()));
@@ -1112,7 +1161,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   Future<void> clearTimelineCache() async {
     _assertNotDisposed();
     try {
-      await _channel.invokeMethod<void>('clearTimelineCache');
+      await _channel.invokeMethod<void>('clearTimelineCache', _addressedArgs());
     } on PlatformException catch (_) {
       // Best-effort — native may have no active timeline or compositor.
     }
@@ -1407,6 +1456,12 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // subscription cannot deliver frames during the async native call.
     // Unregistering also purges any buffered audio readiness event for this
     // textureId in the dispatcher (Phase 10F Slice 3).
+    // Phase 10F Slice 4A: capture this controller's session id BEFORE
+    // unregistering so the native dispose is addressed. A stale id is a
+    // harmless no-op natively and cannot invalidate a newer runtime.
+    final disposeTextureId =
+        _timelineSubscription?.textureId ?? value.textureId;
+
     final dispatcher = VanguardChannelDispatcher.instance;
     if (_timelineSubscription != null) {
       dispatcher.unregisterTimelineListener(_timelineSubscription!);
@@ -1418,7 +1473,12 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
     // Store the raw future first. Both fields are set in the same microtask
     // so there is never a window where one is set and the other is not.
-    _rawTeardownFuture = _channel.invokeMethod<void>('disposeTimeline');
+    _rawTeardownFuture = _channel.invokeMethod<void>(
+      'disposeTimeline',
+      disposeTextureId == null
+          ? null
+          : <String, Object?>{'textureId': disposeTextureId},
+    );
 
     _teardownFuture = _rawTeardownFuture!.catchError((e) {
       // Best-effort — native may already be gone.

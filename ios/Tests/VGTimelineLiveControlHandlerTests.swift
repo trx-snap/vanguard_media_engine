@@ -26,7 +26,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test1_missingTextureId_returnsInvalidArg() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 42) { _ in (true, nil) }
             },
@@ -49,7 +49,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test2_nonNumberTextureId_returnsInvalidArg() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 42) { _ in (true, nil) }
             },
@@ -72,7 +72,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test3a_swiftBoolTextureId_returnsInvalidArgWithoutCrash() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in (true, nil) }
             },
@@ -96,7 +96,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test3b_nsNumberBoolTextureId_returnsInvalidArgWithoutCrash() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in (true, nil) }
             },
@@ -120,7 +120,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test4_floatAndDoubleTextureId_returnsInvalidArg() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in (true, nil) }
             },
@@ -157,7 +157,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test5_negativeInteger_returnsInvalidArg() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in (true, nil) }
             },
@@ -180,7 +180,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test6a_nsNumberUInt64MaxTextureId_returnsInvalidArgWithoutTruncationOrCrash() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in (true, nil) }
             },
@@ -204,7 +204,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test6b_nsDecimalNumberOverflowTextureId_returnsInvalidArgWithoutCrash() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in (true, nil) }
             },
@@ -229,7 +229,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test7_int64MaxAcceptedWhenMatchingTarget() {
         var applyCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: Int64.max) { _ in
                     applyCalled = true
                     return (true, nil)
@@ -254,7 +254,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test8_missingOrMalformedFilters_returnsInvalidArg() {
         var providerCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCalled = true
                 return VGTimelineLiveFilterTarget(textureId: 10) { _ in (true, nil) }
             },
@@ -291,7 +291,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
     func test9_emptyFilterArrayReachesApplyClosureUnchanged() {
         var receivedSpecs: [[String: Any]]? = nil
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: 10) { specs in
                     receivedSpecs = specs
                     return (true, nil)
@@ -314,10 +314,10 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         XCTAssertEqual(receivedSpecs?.count, 0)
     }
 
-    func test10_noTarget_returnsNoTimeline() {
+    func test10_noTarget_returnsStaleTimeline() {
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
-                return nil // NO_TIMELINE
+            targetProvider: { _ in
+                return nil // STALE_TIMELINE (Phase 10F Slice 4A)
             },
             errorFactory: testFlutterErrorFactory
         )
@@ -331,13 +331,13 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         }
 
         XCTAssertEqual(resultCallCount, 1)
-        XCTAssertEqual(errorCode(receivedResult), "NO_TIMELINE")
+        XCTAssertEqual(errorCode(receivedResult), "STALE_TIMELINE")
     }
 
     func test11_mismatchedTextureId_returnsStaleTimelineAndApplyNotCalled() {
         var applyCalled = false
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: 100) { _ in
                     applyCalled = true
                     return (true, nil)
@@ -364,7 +364,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         var applyCallCount = 0
 
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 let currentId = activeTextureId
                 return VGTimelineLiveFilterTarget(textureId: currentId) { _ in
                     applyCallCount += 1
@@ -407,7 +407,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
 
     func test13_unknownRuntimeResult_returnsUnknownFilterWithoutDuplicateValidationPolicy() {
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: 5) { _ in
                     return (false, "custom_unsupported_filter")
                 }
@@ -436,7 +436,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         var applyCallCount = 0
 
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: 10) { specs in
                     applyCallCount += 1
                     capturedSpecs = specs
@@ -471,7 +471,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
 
     func test15_onMainInvocation_returnsExactlyOnceOnMain() {
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: 10) { _ in (true, nil) }
             },
             errorFactory: testFlutterErrorFactory
@@ -495,7 +495,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         var providerOnMain = false
         var providerCallCount = 0
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCallCount += 1
                 providerOnMain = Thread.isMainThread
                 return VGTimelineLiveFilterTarget(textureId: 10) { _ in (true, nil) }
@@ -533,7 +533,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
 
     func test17_eachErrorBranchReturnsExactlyOnce() {
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 return VGTimelineLiveFilterTarget(textureId: 10) { _ in (false, "unknown") }
             },
             errorFactory: testFlutterErrorFactory
@@ -561,7 +561,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         var applyCallCount = 0
 
         let handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCallCount += 1
                 return VGTimelineLiveFilterTarget(textureId: 10) { _ in
                     applyCallCount += 1
@@ -596,7 +596,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         var providerCallCount = 0
         var applyCallCount = 0
         var handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCallCount += 1
                 return VGTimelineLiveFilterTarget(textureId: 0) { _ in
                     applyCallCount += 1
@@ -622,7 +622,7 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         providerCallCount = 0
         applyCallCount = 0
         handler = VGTimelineLiveControlHandler(
-            targetProvider: {
+            targetProvider: { _ in
                 providerCallCount += 1
                 return VGTimelineLiveFilterTarget(textureId: 1) { _ in
                     applyCallCount += 1

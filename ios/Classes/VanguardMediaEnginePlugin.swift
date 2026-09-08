@@ -186,12 +186,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setFilterChain` route. Plugin provides composition wiring only.
-    // Target provider resolves _timelineRuntime at call time; safely returns nil
-    // when VG_USE_V2_GRAPH=0 (no _timelineRuntime property exists).
+    // Phase 10F Slice 4A: target provider resolves the runtime registered for
+    // the requested textureId (nil → STALE_TIMELINE in the handler); safely
+    // returns nil when VG_USE_V2_GRAPH=0 (no registry exists).
     private lazy var _timelineLiveControlHandler: VGTimelineLiveControlHandler = {
-        VGTimelineLiveControlHandler(targetProvider: { [weak self] in
+        VGTimelineLiveControlHandler(targetProvider: { [weak self] requestedTextureId in
             #if VG_USE_V2_GRAPH
-            guard let runtime = self?._timelineRuntime else { return nil }
+            guard let runtime = self?._timelineRuntimesByTextureId[requestedTextureId] else { return nil }
             return vgtlcProductionTarget(runtime: runtime)
             #else
             return nil
@@ -202,12 +203,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // ── V-B1/V-B2: per-track live audio mix-gain handler ─────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setAudioMixGain` route. Plugin provides composition wiring only.
-    // Target provider resolves _timelineRuntime at call time; safely returns nil
-    // when VG_USE_V2_GRAPH=0 (no _timelineRuntime property exists).
+    // Phase 10F Slice 4A: target provider resolves the runtime registered for
+    // the requested textureId (nil → STALE_TIMELINE in the handler); safely
+    // returns nil when VG_USE_V2_GRAPH=0 (no registry exists).
     private lazy var _mixGainHandler: VGTimelineAudioMixControlHandler = {
-        VGTimelineAudioMixControlHandler(targetProvider: { [weak self] in
+        VGTimelineAudioMixControlHandler(targetProvider: { [weak self] requestedTextureId in
             #if VG_USE_V2_GRAPH
-            guard let runtime = self?._timelineRuntime else { return nil }
+            guard let runtime = self?._timelineRuntimesByTextureId[requestedTextureId] else { return nil }
             return vgtlamProductionTarget(runtime: runtime)
             #else
             return nil
@@ -243,6 +245,126 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // result map and the later `onTimelineAudioStateChanged` event so Dart
     // can correlate an audio outcome with the exact prepare that produced it.
     private var _prepareSessionCounter: Int64 = 0
+
+    // Phase 10F Slice 4A: addressed timeline session registry.
+    // Keyed by the Flutter textureId minted in prepareTimeline. A runtime is
+    // registered only after prepare succeeds and only while it is still the
+    // current `_timelineRuntime`; it is deregistered before every invalidate.
+    // Single-runtime invariant: in 4A this map holds at most one entry, and
+    // that entry is always `_timelineRuntime`. Main-thread only — no lock.
+    private var _timelineRuntimesByTextureId: [Int64: VanguardGraphRuntime] = [:]
+
+    /// Registers `runtime` under its prepared textureId. Main thread only.
+    private func _registerTimelineRuntime(_ runtime: VanguardGraphRuntime) {
+        assert(Thread.isMainThread, "timeline registry mutation off main thread")
+        let id = runtime.textureId
+        guard id >= 0 else { return }
+        _timelineRuntimesByTextureId[id] = runtime
+    }
+
+    /// Removes `runtime` from the registry if it is the entry for its own
+    /// textureId. Safe to call for never-registered or mid-prepare runtimes.
+    private func _deregisterTimelineRuntime(_ runtime: VanguardGraphRuntime) {
+        assert(Thread.isMainThread, "timeline registry mutation off main thread")
+        let id = runtime.textureId
+        guard id >= 0, _timelineRuntimesByTextureId[id] === runtime else { return }
+        _timelineRuntimesByTextureId.removeValue(forKey: id)
+    }
+
+    /// Result of parsing an optional addressed textureId from MethodChannel args.
+    private enum _TimelineTextureIdArg {
+        case absent
+        case value(Int64)
+        case invalid(FlutterError)
+    }
+
+    /// Parses an optional non-negative Int64 textureId from `args[key]`.
+    /// Absent (or explicit null) → `.absent`. Bool, floating-point, negative,
+    /// or non-numeric values → `.invalid(BAD_ARGS)`.
+    private func _parseOptionalTimelineTextureId(
+        _ args: [String: Any]?, key: String = "textureId", route: String
+    ) -> _TimelineTextureIdArg {
+        guard let raw = args?[key], !(raw is NSNull) else { return .absent }
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            return .invalid(FlutterError(
+                code: "BAD_ARGS",
+                message: "\(route): \(key) must be a non-negative integer",
+                details: nil))
+        }
+        let cfType = CFNumberGetType(number as CFNumber)
+        let isFloatingPoint = (cfType == .floatType || cfType == .doubleType ||
+                               cfType == .float32Type || cfType == .float64Type ||
+                               cfType == .cgFloatType)
+        if isFloatingPoint || number.decimalValue < 0 || number.decimalValue > Decimal(Int64.max) {
+            return .invalid(FlutterError(
+                code: "BAD_ARGS",
+                message: "\(route): \(key) must be a non-negative integer",
+                details: nil))
+        }
+        return .value(number.int64Value)
+    }
+
+    /// Resolves the runtime an addressed (or legacy unaddressed) timeline
+    /// command should hit.
+    ///
+    /// - Addressed and registered → that runtime.
+    /// - Addressed and not registered → `STALE_TIMELINE` (non-destructive).
+    /// - Unaddressed with one registered runtime → that runtime (legacy fallback).
+    /// - Unaddressed with none registered → the legacy `_timelineRuntime` owner
+    ///   (nil when no timeline exists), preserving pre-4A semantics exactly,
+    ///   including a runtime whose prepare is still in flight.
+    /// - Unaddressed with several registered → `AMBIGUOUS_TIMELINE_SESSION`
+    ///   (defensive only; 4A never registers more than one).
+    private func _resolveTimelineRuntime(
+        requested: Int64?, route: String
+    ) -> (runtime: VanguardGraphRuntime?, error: FlutterError?) {
+        if let id = requested {
+            if let runtime = _timelineRuntimesByTextureId[id] {
+                return (runtime, nil)
+            }
+            return (nil, FlutterError(
+                code: "STALE_TIMELINE",
+                message: "\(route): textureId \(id) is not an active timeline session",
+                details: nil))
+        }
+        switch _timelineRuntimesByTextureId.count {
+        case 0:  return (_timelineRuntime, nil)
+        case 1:  return (_timelineRuntimesByTextureId.values.first, nil)
+        default:
+            return (nil, FlutterError(
+                code: "AMBIGUOUS_TIMELINE_SESSION",
+                message: "\(route): textureId required when multiple timeline sessions exist",
+                details: nil))
+        }
+    }
+
+    /// Parses `args[key]` and resolves the target runtime in one step.
+    /// Returns `(nil, error)` on BAD_ARGS / STALE_TIMELINE / AMBIGUOUS, or
+    /// `(nil, nil)` when no runtime exists and none was addressed.
+    private func _resolveAddressedTimelineRuntime(
+        _ args: [String: Any]?, key: String = "textureId", route: String
+    ) -> (runtime: VanguardGraphRuntime?, requested: Int64?, error: FlutterError?) {
+        switch _parseOptionalTimelineTextureId(args, key: key, route: route) {
+        case .invalid(let err):
+            return (nil, nil, err)
+        case .absent:
+            let r = _resolveTimelineRuntime(requested: nil, route: route)
+            return (r.runtime, nil, r.error)
+        case .value(let id):
+            let r = _resolveTimelineRuntime(requested: id, route: route)
+            return (r.runtime, id, r.error)
+        }
+    }
+
+    /// Deregisters `runtime` and, when it is the legacy current owner, clears
+    /// `_timelineRuntime`. Call before `invalidateAsync` at every teardown site.
+    private func _releaseTimelineRuntimeOwnership(_ runtime: VanguardGraphRuntime) {
+        _deregisterTimelineRuntime(runtime)
+        if _timelineRuntime === runtime {
+            _timelineRuntime = nil
+        }
+    }
     #endif
 
     // Phase 7.x-E: DEV-only runtime for dual-camera texture mount smoke test.
@@ -621,6 +743,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             if let err = err {
                 NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline failed elapsedMs=%ld session=%lld error=%@",
                       prepareMs, prepareSessionId, err.localizedDescription)
+                // Phase 10F Slice 4A: a failed prepare leaves no registry entry
+                // and releases legacy ownership if this runtime still holds it.
+                if let self = self, self._timelineRuntime === timelineRuntime {
+                    self._timelineRuntime = nil
+                }
                 result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
                                     message: err.localizedDescription,
                                     details: nil))
@@ -628,6 +755,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             NSLog("[VanguardMediaEnginePlugin][TIMING] prepareTimeline ok elapsedMs=%ld textureId=%lld session=%lld canvas=%ldx%ld sidecarTracks=%ld audioPending=%ld",
                   prepareMs, textureId, prepareSessionId, width, height, sidecarTrackCount, audioPending ? 1 : 0)
+
+            // Phase 10F Slice 4A: register the prepared runtime for addressed
+            // routing, but only while it is still the current owner. A runtime
+            // superseded or disposed mid-prepare must never become addressable.
+            if let self = self, textureId >= 0, self._timelineRuntime === timelineRuntime {
+                self._registerTimelineRuntime(timelineRuntime)
+            }
 
             // Phase 10F Slice 3: return the video texture to Flutter immediately.
             // FlutterResult is called exactly once — here on success, or from the
@@ -2917,9 +3051,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "dev_disposeTimeline":
             if let runtime = self._timelineRuntime {
+                self._releaseTimelineRuntimeOwnership(runtime)
                 runtime.invalidateAsync {
                 }
-                self._timelineRuntime = nil
             }
             result(nil)
 
@@ -2967,9 +3101,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Step 1: Invalidate the existing timeline runtime (MOD-2).
             // This tears down the compositor and display link without blocking.
             if let oldRuntime = self._timelineRuntime {
+                self._releaseTimelineRuntimeOwnership(oldRuntime)
                 oldRuntime.invalidateAsync {
                 }
-                self._timelineRuntime = nil
             }
 
             // Step 2: Choose render dimensions matching the source mode.
@@ -3243,10 +3377,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
 
             // Tear down any existing timeline runtime before creating a new one.
+            // Phase 10F Slice 4A: deregister before invalidating so no addressed
+            // command can reach the outgoing runtime.
             if let oldRuntime = self._timelineRuntime {
+                self._releaseTimelineRuntimeOwnership(oldRuntime)
                 oldRuntime.invalidateAsync {
                 }
-                self._timelineRuntime = nil
             }
 
 
@@ -3273,9 +3409,20 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "updateTimeline":
             // Phase 7.8 production route: rebuild timeline from updated VGEditorDraft.
             //
-            // Args: { 'draft': draftMap }
+            // Args: { 'draft': draftMap, optional 'replaceTextureId' | 'textureId' }
             // Returns: { 'textureId': Int64, 'width': Int, 'height': Int }
             // On failure: FlutterError.
+            //
+            // Phase 10F Slice 4A: when the caller addresses the runtime it is
+            // replacing, a stale id fails with STALE_TIMELINE before anything is
+            // torn down, so an old controller can never rebuild over a newer one.
+            let replaceKeyU = args?["replaceTextureId"] != nil ? "replaceTextureId" : "textureId"
+            let resolvedU = _resolveAddressedTimelineRuntime(args, key: replaceKeyU, route: "updateTimeline")
+            if let routeError = resolvedU.error {
+                result(routeError)
+                return
+            }
+
             guard let draftMapU = args?["draft"] as? [String: Any] else {
                 result(FlutterError(
                     code: "MISSING_DRAFT",
@@ -3308,14 +3455,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
 
             // Tear down existing runtime (MOD-2: tear-down-and-rebuild).
-            if let oldRuntime = self._timelineRuntime {
+            // Phase 10F Slice 4A: only the resolved (addressed or legacy) runtime
+            // is replaced; it is deregistered before invalidation.
+            if let oldRuntime = resolvedU.runtime {
+                self._releaseTimelineRuntimeOwnership(oldRuntime)
                 // Phase 10F Slice 1: timing instrumentation only.
                 let teardownStart = CFAbsoluteTimeGetCurrent()
                 oldRuntime.invalidateAsync {
                     NSLog("[VanguardMediaEnginePlugin][TIMING] updateTimeline oldRuntime invalidated elapsedMs=%ld",
                           Int((CFAbsoluteTimeGetCurrent() - teardownStart) * 1000))
                 }
-                self._timelineRuntime = nil
             }
 
 
@@ -3338,7 +3487,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "timelinePlay":
             // Phase 7.8 production route: start timeline playback.
-            guard let runtime = self._timelineRuntime else {
+            // Phase 10F Slice 4A: optional textureId addresses the session;
+            // stale → STALE_TIMELINE, absent → legacy single-runtime fallback.
+            let resolvedPlay = _resolveAddressedTimelineRuntime(args, route: "timelinePlay")
+            if let routeError = resolvedPlay.error {
+                result(routeError)
+                return
+            }
+            guard let runtime = resolvedPlay.runtime else {
                 result(FlutterError(code: "NO_TIMELINE",
                                     message: "timelinePlay: no active timeline runtime",
                                     details: nil))
@@ -3349,7 +3505,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "timelinePause":
             // Phase 7.8 production route: pause timeline playback.
-            guard let runtime = self._timelineRuntime else {
+            let resolvedPause = _resolveAddressedTimelineRuntime(args, route: "timelinePause")
+            if let routeError = resolvedPause.error {
+                result(routeError)
+                return
+            }
+            guard let runtime = resolvedPause.runtime else {
                 result(FlutterError(code: "NO_TIMELINE",
                                     message: "timelinePause: no active timeline runtime",
                                     details: nil))
@@ -3360,8 +3521,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "timelineSeek":
             // Phase 7.8 production route: seek to position in seconds.
+            let resolvedSeek = _resolveAddressedTimelineRuntime(args, route: "timelineSeek")
+            if let routeError = resolvedSeek.error {
+                result(routeError)
+                return
+            }
             guard
-                let runtime = self._timelineRuntime,
+                let runtime = resolvedSeek.runtime,
                 let seconds  = (args?["seconds"] as? NSNumber)?.doubleValue
             else {
                 result(FlutterError(code: "BAD_ARGS",
@@ -3501,8 +3667,35 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // resolves only after native invalidation is fully complete. This ensures
             // the Dart future returned by disposeAsync() reflects actual teardown
             // completion, not a fire-and-forget dispatch.
-            if let runtime = self._timelineRuntime {
-                self._timelineRuntime = nil
+            //
+            // Phase 10F Slice 4A: an addressed dispose whose textureId is no
+            // longer registered is a harmless no-op — it must not invalidate the
+            // current runtime or clean reverse sidecars that the newer session
+            // may still depend on. Unaddressed dispose keeps legacy semantics.
+            let disposeIdArg = _parseOptionalTimelineTextureId(args, route: "disposeTimeline")
+            var disposeTarget: VanguardGraphRuntime? = nil
+            switch disposeIdArg {
+            case .invalid(let err):
+                result(err)
+                return
+            case .value(let id):
+                guard let registered = _timelineRuntimesByTextureId[id] else {
+                    NSLog("[VanguardMediaEnginePlugin] disposeTimeline: stale textureId=%lld ignored", id)
+                    result(nil)
+                    return
+                }
+                disposeTarget = registered
+            case .absent:
+                let resolved = _resolveTimelineRuntime(requested: nil, route: "disposeTimeline")
+                if let routeError = resolved.error {
+                    result(routeError)
+                    return
+                }
+                disposeTarget = resolved.runtime
+            }
+
+            if let runtime = disposeTarget {
+                self._releaseTimelineRuntimeOwnership(runtime)
                 // Phase 10F Slice 1: timing instrumentation only.
                 let disposeStart = CFAbsoluteTimeGetCurrent()
                 runtime.invalidateAsync {
@@ -3537,7 +3730,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "getTimelineCacheStats":
             // Phase 7.18B1: returns live frame cache metrics dictionary.
             // Returns empty dict (not FlutterError) when no timeline is active.
-            if let runtime = self._timelineRuntime {
+            // Phase 10F Slice 4A: an addressed stale textureId → STALE_TIMELINE.
+            let resolvedStats = _resolveAddressedTimelineRuntime(args, route: "getTimelineCacheStats")
+            if let routeError = resolvedStats.error {
+                result(routeError)
+                return
+            }
+            if let runtime = resolvedStats.runtime {
                 result(runtime.timelineCacheStatistics())
             } else {
                 result([String: Any]())
@@ -3545,8 +3744,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "clearTimelineCache":
             // Phase 7.18B1: flush all frame cache entries + reset counters.
-            // Always succeeds (void). Forces cold decode on next scrub.
-            self._timelineRuntime?.flushTimelineCaches()
+            // Succeeds (void) when unaddressed or addressed to a live session.
+            // Phase 10F Slice 4A: an addressed stale textureId → STALE_TIMELINE.
+            let resolvedClear = _resolveAddressedTimelineRuntime(args, route: "clearTimelineCache")
+            if let routeError = resolvedClear.error {
+                result(routeError)
+                return
+            }
+            resolvedClear.runtime?.flushTimelineCaches()
             result(nil)
 
         // ── Phase 7.20B: Reverse Sidecar MethodChannel routes ─────────────────
