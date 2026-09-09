@@ -11,6 +11,9 @@
 //     decoder work runs on a dedicated serial decoderQueue; replies always on main thread.
 //   - Asynchronous decoder release on dispose without blocking the main thread.
 //   - Auto-stop: if trimEnd is reached, enters completed state; stopDuetRecording returns descriptor.
+//   - Slice 4B-B: owns the preview render loop lifecycle (create on attach, start/hold on
+//     record transitions, stop before texture + decoder teardown).  All decoder stepping
+//     for preview goes through the loop; the coordinator never draws or ticks itself.
 
 import AVFoundation
 import Flutter
@@ -71,6 +74,11 @@ final class VGDuetNativeSession {
     var previewWidthPx: Double?
     var previewHeightPx: Double?
     var previewLayoutRects: [String: Any]?
+
+    // Slice 4B-B: compositor render loop bound to previewTexture.
+    // Created after texture registration; stopped before texture invalidation
+    // and before the decoder is released.  nil whenever no texture is attached.
+    var previewRenderLoop: VGDuetPreviewRenderLoop?
 
     init(sessionId: String,
          sourceMap: [String: Any],
@@ -172,7 +180,10 @@ final class VGDuetNativeSessionCoordinator {
 
     /// Releases the preview texture associated with [session] if one is registered.
     /// Must be called on the main thread before clearing activeSession.
+    /// Slice 4B-B: the render loop is stopped first so no present can race the
+    /// texture invalidation / unregister below.
     private func releasePreviewTexture(for session: VGDuetNativeSession) {
+        stopPreviewRenderLoop(for: session)
         guard let tex = session.previewTexture,
               let tid = session.previewTextureId else { return }
         tex.invalidate()
@@ -228,16 +239,36 @@ final class VGDuetNativeSessionCoordinator {
 
         // Compute optional layout rects from the effective layoutConfig.
         let effectiveLayoutMap = layoutConfigMap ?? session.layoutConfigMap
-        let layoutRects = buildLayoutRects(
+        let typedRects = computeLayoutRects(
             layoutConfigMap: effectiveLayoutMap,
             canvasWidth:  CGFloat(width),
             canvasHeight: CGFloat(height)
         )
+        let layoutRects = typedRects.map { serializeLayoutRects($0) }
 
         // Store original values so idempotent re-attach returns them verbatim.
         session.previewWidthPx    = width
         session.previewHeightPx   = height
         session.previewLayoutRects = layoutRects
+
+        // Slice 4B-B: bring up the render loop after registration + rect
+        // computation and draw the held frame (trimStart on a fresh session,
+        // the current clock cursor otherwise).  If the session is already
+        // recording (re-attach mid-take) the loop goes active immediately.
+        let loop = makePreviewRenderLoop(
+            session:      session,
+            texture:      previewTexture,
+            textureId:    textureId,
+            registry:     registry,
+            canvasWidth:  width,
+            canvasHeight: height,
+            rects:        typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
+        )
+        session.previewRenderLoop = loop
+        loop.renderInitialFrame()
+        if session.state == .recording {
+            loop.startActive()
+        }
 
         var map: [String: Any] = [
             "textureId": textureId,
@@ -268,29 +299,23 @@ final class VGDuetNativeSessionCoordinator {
 
     // MARK: - Layout rect builder
 
-    private func buildLayoutRects(
+    /// Typed layout rects (top-left canvas coordinates) for the given layoutConfig.
+    /// nil for unknown modes.  Serialised via serializeLayoutRects for transport.
+    private func computeLayoutRects(
         layoutConfigMap: [String: Any],
         canvasWidth: CGFloat,
         canvasHeight: CGFloat
-    ) -> [String: Any]? {
+    ) -> (source: CGRect, camera: CGRect)? {
         let mode = layoutConfigMap["mode"] as? String ?? "pip"
         switch mode {
         case "splitLeftRight":
             let swapped = layoutConfigMap["isSideSwapped"] as? Bool ?? false
-            let rects = VGDuetLayoutGeometry.splitLeftRight(
+            return VGDuetLayoutGeometry.splitLeftRight(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight, isSwapped: swapped)
-            return [
-                "source": VGDuetLayoutGeometry.rectToMap(rects.source),
-                "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
-            ]
         case "splitTopBottom":
             let swapped = layoutConfigMap["isTopBottomSwapped"] as? Bool ?? false
-            let rects = VGDuetLayoutGeometry.splitTopBottom(
+            return VGDuetLayoutGeometry.splitTopBottom(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight, isSwapped: swapped)
-            return [
-                "source": VGDuetLayoutGeometry.rectToMap(rects.source),
-                "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
-            ]
         case "pip":
             let sourceRect = VGDuetLayoutGeometry.pipSourceRect(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight)
@@ -308,20 +333,91 @@ final class VGDuetNativeSessionCoordinator {
                     normalizedWidth:  CGFloat(nw),
                     normalizedHeight: CGFloat(nh))
             }
-            return [
-                "source": VGDuetLayoutGeometry.rectToMap(sourceRect),
-                "camera": VGDuetLayoutGeometry.rectToMap(cameraRect),
-            ]
+            return (source: sourceRect, camera: cameraRect)
         case "greenScreen":
-            let rects = VGDuetLayoutGeometry.greenScreen(
+            return VGDuetLayoutGeometry.greenScreen(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight)
-            return [
-                "source": VGDuetLayoutGeometry.rectToMap(rects.source),
-                "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
-            ]
         default:
             return nil
         }
+    }
+
+    private func serializeLayoutRects(_ rects: (source: CGRect, camera: CGRect)) -> [String: Any] {
+        return [
+            "source": VGDuetLayoutGeometry.rectToMap(rects.source),
+            "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
+        ]
+    }
+
+    /// Rects used by the render loop when the layout mode is unknown:
+    /// full-canvas source, no camera placeholder.
+    private static func fallbackPreviewRects(canvasWidth: Double, canvasHeight: Double) -> (source: CGRect, camera: CGRect) {
+        return (source: CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight),
+                camera: .zero)
+    }
+
+    // MARK: - Preview render loop helpers (Slice 4B-B)
+
+    /// Stops and drops the session's render loop.  Idempotent; safe when no
+    /// loop exists.  Must run on main before texture invalidation and before
+    /// the decoder release is enqueued.
+    private func stopPreviewRenderLoop(for session: VGDuetNativeSession) {
+        session.previewRenderLoop?.stop()
+        session.previewRenderLoop = nil
+    }
+
+    /// Builds the render loop for [session].  The loop never touches the
+    /// decoder directly: every request is routed through decoderQueue by the
+    /// injected decode handler, and presents go texture → textureFrameAvailable
+    /// on main.  Captures avoid retain cycles (session weak, no self).
+    private func makePreviewRenderLoop(
+        session:      VGDuetNativeSession,
+        texture:      VGDuetPreviewTexture,
+        textureId:    Int64,
+        registry:     FlutterTextureRegistry,
+        canvasWidth:  Double,
+        canvasHeight: Double,
+        rects:        (source: CGRect, camera: CGRect)
+    ) -> VGDuetPreviewRenderLoop {
+        let compositor   = VGDuetPreviewCompositor(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        let clock        = session.previewClock
+        let decoderQueue = self.decoderQueue
+
+        return VGDuetPreviewRenderLoop(
+            compositor:  compositor,
+            trimStartMs: session.trimStartMs,
+            trimEndMs:   session.trimEndMs,
+            sourceRect:  rects.source,
+            cameraRect:  rects.camera,
+            targetPtsProvider: {
+                clock.currentSourcePtsMs()
+            },
+            decodeHandler: { [weak session] request, completion in
+                // Read on main (loop calls us on main); nil once teardown began.
+                guard let decoder = session?.decoder else {
+                    completion(nil)
+                    return
+                }
+                decoderQueue.async {
+                    let buffer: CVPixelBuffer?
+                    switch request {
+                    case .step(let targetPtsMs):
+                        buffer = decoder.stepFrame(targetPtsMs: targetPtsMs)
+                    case .seek(let targetPtsMs):
+                        try? decoder.seek(to: targetPtsMs)
+                        buffer = decoder.lastPixelBuffer
+                    }
+                    completion(VGDuetPreviewDecodedFrame(
+                        pixelBuffer:        buffer,
+                        presentationTimeMs: decoder.lastPresentationTimeMs))
+                }
+            },
+            presentHandler: { pixelBuffer in
+                // Loop invokes this on main, only while not stopped.
+                texture.update(pixelBuffer: pixelBuffer)
+                registry.textureFrameAvailable(textureId)
+            }
+        )
     }
 
     // MARK: - initialize
@@ -509,6 +605,24 @@ final class VGDuetNativeSessionCoordinator {
             }
         }
         session.layoutConfigMap = layoutConfigMap
+
+        // Slice 4B-B: with a texture attached, refresh the stored rects and
+        // redraw the held/current frame under the new geometry.
+        if session.previewTexture != nil,
+           let width  = session.previewWidthPx,
+           let height = session.previewHeightPx {
+            let typedRects = computeLayoutRects(
+                layoutConfigMap: layoutConfigMap,
+                canvasWidth:  CGFloat(width),
+                canvasHeight: CGFloat(height)
+            )
+            session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
+            let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
+            session.previewRenderLoop?.updateLayout(
+                sourceRect:  rects.source,
+                cameraRect:  rects.camera,
+                targetPtsMs: session.previewClock.currentSourcePtsMs())
+        }
         reply(nil, nil)
     }
 
@@ -561,6 +675,7 @@ final class VGDuetNativeSessionCoordinator {
         }
         session.state = .recording
         session.startSegment()
+        session.previewRenderLoop?.startActive()   // Slice 4B-B
         reply(nil, nil)
     }
 
@@ -574,12 +689,8 @@ final class VGDuetNativeSessionCoordinator {
         }
         session.commitSegment()
         session.state = session.previewClock.isAutoStopped ? .completed : .paused
-        let targetPts = session.previewClock.currentSourcePtsMs()
-        if let dec = session.decoder {
-            decoderQueue.async {
-                _ = dec.stepFrame(targetPtsMs: targetPts)
-            }
-        }
+        // Slice 4B-B: the render loop owns decoder stepping; hold the committed cursor frame.
+        session.previewRenderLoop?.pauseAndHold(targetPtsMs: session.previewClock.currentSourcePtsMs())
         reply(nil, nil)
     }
 
@@ -593,6 +704,7 @@ final class VGDuetNativeSessionCoordinator {
         }
         session.state = .recording
         session.startSegment()
+        session.previewRenderLoop?.startActive()   // Slice 4B-B
         reply(nil, nil)
     }
 
@@ -610,10 +722,8 @@ final class VGDuetNativeSessionCoordinator {
         if session.state == .completed {
             session.state = .paused
         }
-        let targetPts = session.previewClock.currentSourcePtsMs()
-        if let dec = session.decoder {
-            decoderQueue.async { try? dec.seek(to: targetPts) }
-        }
+        // Slice 4B-B: the render loop owns decoder seeking; hold the rolled-back cursor frame.
+        session.previewRenderLoop?.seekAndHold(targetPtsMs: session.previewClock.currentSourcePtsMs())
         reply(nil, nil)
     }
 
@@ -631,6 +741,7 @@ final class VGDuetNativeSessionCoordinator {
             reply(nil, invalidState("stopDuetRecording", current: stateName(session.state), expected: "recording, paused, or completed")); return
         }
         session.state = .stopped
+        stopPreviewRenderLoop(for: session)   // Slice 4B-B: loop first, then texture, then decoder
         let dec = session.decoder
         session.decoder = nil
         releasePreviewTexture(for: session)   // Slice 4A: detach before drop
@@ -650,6 +761,7 @@ final class VGDuetNativeSessionCoordinator {
         }
         if let session = activeSession, session.sessionId == sessionId {
             canceledProbeIds.insert(sessionId)
+            stopPreviewRenderLoop(for: session)   // Slice 4B-B: loop first, then texture, then decoder
             let dec = session.decoder
             session.decoder = nil
             releasePreviewTexture(for: session)   // Slice 4A: detach before drop
@@ -668,6 +780,7 @@ final class VGDuetNativeSessionCoordinator {
         }
         if let session = activeSession {
             canceledProbeIds.insert(session.sessionId)
+            stopPreviewRenderLoop(for: session)   // Slice 4B-B: loop first, then texture, then decoder
             let dec = session.decoder
             session.decoder = nil
             releasePreviewTexture(for: session)   // Slice 4A: detach before drop
