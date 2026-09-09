@@ -5,17 +5,20 @@
 // Package-internal only. Do NOT add to public_header_files.
 // Do NOT import from VanguardGraphRuntime.h.
 //
-// Owns an AVAudioEngine and three AVAudioPlayerNodes. Receives coherent
+// Owns an AVAudioEngine and four AVAudioPlayerNodes. Receives coherent
 // VGTimelineStateSnapshot values from VanguardGraphRuntime via the
 // VGTimelineSnapshotProvider block; schedules, pauses, seeks and stops the
 // player nodes in lock-step with the timeline clock.
 //
-// V-B1 three-lane architecture:
-//   _addedAudioSlot  — music / sfx roles
-//   _voiceoverSlot   — voiceover role
+// Four-lane architecture (V-B1 three lanes + SFX lane):
+//   _addedAudioSlot    — music role only
+//   _sfxSlot           — sfx role
+//   _voiceoverSlot     — voiceover role
 //   _originalAudioSlot — original role (video audio)
 // Each slot has its own player, automation coordinator, and scheduled-segment
-// serial. Original tracks no longer compete with music/sfx in _addedAudioSlot.
+// serial. Music and sfx no longer share a lane, so an sfx clip that overlaps
+// music is mixed with it instead of being replaced by it. Within one lane,
+// overlapping same-role descriptors resolve to the latest timelineStart.
 //
 // Thread-safety:
 //   All mutable state is confined to the private serial queue
@@ -195,9 +198,10 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// Package-internal test initialiser. Injects all collaborators.
 /// Pass nil for |timer| to use the production dispatch_source_t boundary timer.
 /// Pass nil for |automationTimer| to use the production automation timer.
-/// The injected |player| is routed to the Added Audio slot; the Voice-over slot
-/// receives the same player (backward-compatible — existing tests continue to
-/// work). The Original slot also receives the same player.
+/// The injected |player| is routed to the Added Audio slot; the SFX,
+/// Voice-over, and Original slots receive the same player (backward-compatible
+/// — existing tests continue to work). The SFX slot also shares
+/// |automationTimer| with the Added Audio slot.
 - (instancetype)
     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
               lifecycleEpoch:(uint64_t)lifecycleEpoch
@@ -211,7 +215,7 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 
 /// Package-internal Slice K test initialiser. Injects separate players and
 /// automation timers for the Added Audio and Voice-over slots, enabling
-/// independent per-slot assertion. The Original slot receives the same
+/// independent per-slot assertion. The SFX and Original slots receive the same
 /// player/timer as Added Audio for backward compatibility.
 /// Pass nil for |timer| to use the production boundary timer.
 /// Pass nil for |addedAudioAutomationTimer| or |voiceoverAutomationTimer| to
@@ -232,7 +236,8 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 
 /// Package-internal V-B1 three-slot test initialiser. Injects separate players
 /// and automation timers for Added Audio, Voice-over, and Original Audio,
-/// enabling full per-slot independent assertion.
+/// enabling per-slot independent assertion. The SFX slot receives the same
+/// player/timer as Added Audio for backward compatibility.
 - (instancetype)
      initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
                lifecycleEpoch:(uint64_t)lifecycleEpoch
@@ -249,6 +254,33 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
              addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
               voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
            originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer;
+
+/// Package-internal four-slot test initialiser. Injects separate players and
+/// automation timers for Added Audio (music), SFX, Voice-over, and Original
+/// Audio, enabling full per-slot independent assertion — including concurrent
+/// music + sfx playback through two distinct players.
+/// Pass nil for |timer| to use the production boundary timer.
+/// Pass nil for any automation timer to use a production automation timer
+/// for that slot.
+- (instancetype)
+        initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
+                  lifecycleEpoch:(uint64_t)lifecycleEpoch
+                           clock:(id<VGAudioPreviewClock>)clock
+                           timer:(nullable id<VGAudioPreviewTimer>)timer
+       addedAudioAutomationTimer:
+           (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
+              sfxAutomationTimer:
+                  (nullable id<VGAudioPreviewAutomationTimer>)sfxAutomationTimer
+        voiceoverAutomationTimer:
+            (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
+    originalAudioAutomationTimer:
+        (nullable id<VGAudioPreviewAutomationTimer>)originalAudioAutomationTimer
+                    fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
+                          engine:(id<VGAudioPreviewEngine>)engine
+                addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+                       sfxPlayer:(id<VGAudioPreviewPlayer>)sfxPlayer
+                 voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
+             originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer;
 
 - (instancetype)init NS_UNAVAILABLE;
 

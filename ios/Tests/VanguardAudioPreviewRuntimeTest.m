@@ -257,6 +257,47 @@ NS_ASSUME_NONNULL_BEGIN
   return rt;
 }
 
+/// Builds a four-slot runtime with independent music, sfx, and voice-over
+/// mock players. _sfxPlayer, _sfxAutomationTimer, _voiceoverPlayer, and
+/// _voiceoverAutomationTimer must be allocated before calling this. The
+/// Original slot reuses _player / _automationTimer (same convention as
+/// makeMultiSlotRuntime).
+- (VanguardAudioPreviewRuntime *)makeFourSlotRuntime {
+  NSAssert(_sfxPlayer != nil,
+           @"makeFourSlotRuntime: _sfxPlayer must be set by the caller");
+  NSAssert(_sfxAutomationTimer != nil,
+           @"makeFourSlotRuntime: _sfxAutomationTimer must be set");
+  NSAssert(_voiceoverPlayer != nil,
+           @"makeFourSlotRuntime: _voiceoverPlayer must be set by the caller");
+  NSAssert(_voiceoverAutomationTimer != nil,
+           @"makeFourSlotRuntime: _voiceoverAutomationTimer must be set");
+
+  __weak typeof(self) weakSelf = self;
+  VGTimelineSnapshotProvider provider = ^VGTimelineStateSnapshot {
+    typeof(self) ss = weakSelf;
+    if (!ss)
+      return (VGTimelineStateSnapshot){.isValid = NO};
+    return ss.stubbedSnapshot;
+  };
+  VanguardAudioPreviewRuntime *rt = [[VanguardAudioPreviewRuntime alloc]
+          initWithSnapshotProvider:provider
+                    lifecycleEpoch:1
+                             clock:_clock
+                             timer:_timer
+         addedAudioAutomationTimer:_automationTimer
+                sfxAutomationTimer:_sfxAutomationTimer
+          voiceoverAutomationTimer:_voiceoverAutomationTimer
+      originalAudioAutomationTimer:_automationTimer
+                      fileProvider:_fileProvider
+                            engine:_engine
+                  addedAudioPlayer:_player
+                         sfxPlayer:_sfxPlayer
+                   voiceoverPlayer:_voiceoverPlayer
+               originalAudioPlayer:_player];
+  _timer.runtime = rt;
+  return rt;
+}
+
 @end
 
 NS_ASSUME_NONNULL_END

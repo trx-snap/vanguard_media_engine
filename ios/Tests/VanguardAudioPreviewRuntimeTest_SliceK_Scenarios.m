@@ -1152,6 +1152,108 @@ NS_ASSUME_NONNULL_BEGIN
   [self invalidateAndWait:rt];
 }
 
+// ─── K-T18: Concurrent music + sfx at one PTS play through two players ───────
+
+/// Music [0,10) + SFX [2,5). PTS=3 lies inside both.
+/// Before the SFX lane existed, music and sfx shared the Added Audio player
+/// and music won, so an sfx overlapping music was silent in preview while the
+/// export (which mixes every track) contained it. Each role now owns a player:
+/// both must schedule and play from one timeline snapshot, each with its own
+/// source-frame mapping and static volume, and a live mix-gain change on the
+/// sfx track must leave the music player untouched. Voice-over stays idle.
+- (void)testK_T18_concurrentMusicAndSfxAtSamePTS_playBothIndependentPlayers {
+  double sr = 44100.0, fileDur = 10.0;
+  NSString *path = [self _setupRealWAVWithDuration:fileDur sampleRate:sr];
+  if (!path) { XCTSkip(@"temp WAV needed"); return; }
+
+  _sfxPlayer = [[VGAPr_MockPlayer alloc] init];
+  _sfxAutomationTimer = [[VGAPr_MockAutomationTimer alloc] init];
+  _voiceoverPlayer = [[VGAPr_MockPlayer alloc] init];
+  _voiceoverAutomationTimer = [[VGAPr_MockAutomationTimer alloc] init];
+  VanguardAudioPreviewRuntime *rt = [self makeFourSlotRuntime];
+
+  // PTS=3: inside music [0,10) and inside sfx [2,5).
+  _stubbedSnapshot = (VGTimelineStateSnapshot){
+      .isValid = YES, .isPlaying = YES, .generation = 1,
+      .playStartPTS = 3.0, .playStartHostTime = 0.0,
+      .timelinePTS = 3.0};
+  _clock.currentTime = 0.0;
+
+  NSDictionary *musicDict = [self musicTrackDictWithId:@"music-K18"
+                                             startTime:0.0
+                                              duration:10.0
+                                                volume:1.0
+                                                   url:path];
+  NSDictionary *sfxDict = [self trackDictWithId:@"sfx-K18"
+                                           role:@"sfx"
+                                      startTime:2.0
+                                       duration:3.0 // [2, 5)
+                                         volume:0.8
+                                            url:path
+                                      keyframes:nil];
+  VGAudioSidecarPlan *plan =
+      [[VGAudioSidecarPlan alloc] initWithTracks:@[musicDict, sfxDict]
+                                 volumeKeyframes:nil
+                                   waveformCache:nil
+                            timeRemapAudioPolicy:nil];
+  VGAudioPreviewPreparationResult res =
+      [rt prepareWithSidecarPlan:plan timelineDuration:12.0];
+  XCTAssertEqual(res, VGAudioPreviewPreparationResultReady,
+                 @"music + sfx plan must yield Ready");
+
+  [rt commandPlay];
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{}];
+
+  // ─── Both lanes schedule and play — sfx is no longer replaced by music ───
+  XCTAssertEqual(_player.scheduleCount, 1,
+                 @"music player must schedule exactly one segment at PTS=3");
+  XCTAssertGreaterThan(_player.playCount, 0, @"music player must play");
+  XCTAssertEqual(_sfxPlayer.scheduleCount, 1,
+                 @"sfx player must schedule exactly one segment at PTS=3 "
+                 @"while music is active — this is the preview/export mismatch");
+  XCTAssertGreaterThan(_sfxPlayer.playCount, 0, @"sfx player must play");
+
+  // ─── Independent source-frame mapping from one snapshot ─────────────────
+  // music: trackRelative = 3.0 - 0.0 → startFrame = 3.0 * sr.
+  // sfx:   trackRelative = 3.0 - 2.0 → startFrame = 1.0 * sr.
+  XCTAssertEqual(_player.lastStartFrame, (AVAudioFramePosition)(3.0 * sr),
+                 @"music must start 3.0 s into its file");
+  XCTAssertEqual(_sfxPlayer.lastStartFrame, (AVAudioFramePosition)(1.0 * sr),
+                 @"sfx must start 1.0 s into its file (PTS 3 - start 2)");
+  // Shared next boundary is the sfx end at 5.0 → both segments span [3, 5).
+  XCTAssertEqual(_player.lastFrameCount, (AVAudioFrameCount)(2.0 * sr),
+                 @"music segment must run to the shared boundary at PTS=5");
+  XCTAssertEqual(_sfxPlayer.lastFrameCount, (AVAudioFrameCount)(2.0 * sr),
+                 @"sfx segment must run to its own end at PTS=5");
+  XCTAssertEqualWithAccuracy(_timer.lastDelay, 2.0, 0.01,
+                             @"shared boundary timer must target sfx end "
+                             @"(5.0 - 3.0 = 2.0 s)");
+
+  // ─── Independent static volume per lane ──────────────────────────────────
+  XCTAssertEqualWithAccuracy(_player.lastVolume, 1.0f, 0.001f,
+                             @"music player must carry music staticVolume");
+  XCTAssertEqualWithAccuracy(_sfxPlayer.lastVolume, 0.8f, 0.001f,
+                             @"sfx player must carry sfx staticVolume");
+
+  // ─── Voice-over lane idle ────────────────────────────────────────────────
+  XCTAssertEqual(_voiceoverPlayer.scheduleCount, 0,
+                 @"Voice-over slot must NOT schedule when no VO track");
+  XCTAssertEqual(_voiceoverPlayer.playCount, 0,
+                 @"Voice-over slot must NOT play when no VO track");
+
+  // ─── Live mix gain on the sfx track touches only the sfx player ─────────
+  [rt setMixGainForTrackId:@"sfx-K18" gain:0.5f];
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{}];
+  XCTAssertEqualWithAccuracy(_sfxPlayer.lastVolume, 0.4f, 0.001f,
+                             @"sfx player volume must be staticVolume(0.8) * "
+                             @"mixGain(0.5)");
+  XCTAssertEqualWithAccuracy(_player.lastVolume, 1.0f, 0.001f,
+                             @"music player volume must be unchanged by the "
+                             @"sfx mix-gain update");
+
+  [self invalidateAndWait:rt];
+}
+
 @end
 
 

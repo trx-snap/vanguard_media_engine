@@ -32,6 +32,12 @@ NS_ASSUME_NONNULL_BEGIN
   // allocate these before calling makeMultiSlotRuntime.
   VGAPr_MockPlayer *_voiceoverPlayer;
   VGAPr_MockAutomationTimer *_voiceoverAutomationTimer;
+
+  // ── SFX slot collaborators ───────────────────────────────────────────────
+  // Used only by makeFourSlotRuntime. Not set by setUp — tests must allocate
+  // these (and the voice-over pair above) before calling makeFourSlotRuntime.
+  VGAPr_MockPlayer *_sfxPlayer;
+  VGAPr_MockAutomationTimer *_sfxAutomationTimer;
 }
 
 /// Mutable snapshot returned by the provider.
@@ -49,6 +55,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// Callers must allocate _voiceoverPlayer and _voiceoverAutomationTimer
 /// before calling this method.
 - (VanguardAudioPreviewRuntime *)makeMultiSlotRuntime;
+
+/// Builds a four-slot runtime with distinct music (_player), sfx (_sfxPlayer),
+/// and voice-over (_voiceoverPlayer) mock players. The Original slot reuses
+/// _player / _automationTimer, matching makeMultiSlotRuntime.
+/// Callers must allocate _sfxPlayer, _sfxAutomationTimer, _voiceoverPlayer,
+/// and _voiceoverAutomationTimer before calling this method.
+- (VanguardAudioPreviewRuntime *)makeFourSlotRuntime;
 
 /// Builds a valid music track dictionary.
 - (NSDictionary<NSString *, id> *)trackDictWithStartTime:(double)start

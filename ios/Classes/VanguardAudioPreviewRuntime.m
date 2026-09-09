@@ -4,11 +4,13 @@
 // Implementation of VanguardAudioPreviewRuntime.
 // See VanguardAudioPreviewRuntime.h for architecture, threading, and API docs.
 //
-// V-B1: three-slot (Added Audio + Voice-over + Original Audio) architecture.
+// Four-slot (Added Audio + SFX + Voice-over + Original Audio) architecture.
 // Original role tracks are routed to _originalAudioSlot, not _addedAudioSlot.
-// Music/SFX go to _addedAudioSlot; voiceover goes to _voiceoverSlot.
+// Music goes to _addedAudioSlot; sfx goes to _sfxSlot; voiceover goes to
+// _voiceoverSlot. Music and sfx therefore mix when they overlap instead of
+// competing for one player.
 // One master boundary timer fires at the earliest next-decision PTS across all
-// three lanes.
+// four lanes.
 
 #import "VanguardAudioPreviewRuntime.h"
 #import "VGAudioPreviewAutomationCoordinator.h"
@@ -26,8 +28,9 @@ NS_ASSUME_NONNULL_BEGIN
 #pragma mark - VGAudioPreviewSlot — per-lane state container
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Bundles all state specific to one scheduling lane (Added Audio or
-// Voice-over). The runtime owns two slots; one master boundary timer is shared.
+// Bundles all state specific to one scheduling lane (Added Audio, SFX,
+// Voice-over, or Original Audio). The runtime owns four slots; one master
+// boundary timer is shared.
 
 @interface VGAudioPreviewSlot : NSObject
 
@@ -108,11 +111,12 @@ NS_ASSUME_NONNULL_BEGIN
   id<VGAudioPreviewFileProvider> _fileProvider;
   id<VGAudioPreviewEngine> _engine;
 
-  // ── V-B1: three-slot architecture ──────────────────────────────────────
+  // ── Four-slot architecture ──────────────────────────────────────────────
   // Each slot bundles its own player, coordinator, active descriptor, and
   // per-slot scheduled-segment serial. The master boundary timer remains
   // shared.
-  VGAudioPreviewSlot *_addedAudioSlot;    ///< music / sfx lane.
+  VGAudioPreviewSlot *_addedAudioSlot;    ///< music lane.
+  VGAudioPreviewSlot *_sfxSlot;           ///< sfx lane.
   VGAudioPreviewSlot *_voiceoverSlot;     ///< voiceover lane.
   VGAudioPreviewSlot *_originalAudioSlot; ///< original/video audio lane.
 
@@ -171,8 +175,9 @@ NS_ASSUME_NONNULL_BEGIN
                     (VGTimelineSnapshotProvider)snapshotProvider
                           lifecycleEpoch:(uint64_t)lifecycleEpoch {
   AVAudioEngine *engine = [[AVAudioEngine alloc] init];
-  // V-B1: three player nodes — Added Audio, Voice-over, and Original Audio.
+  // Four player nodes — Added Audio (music), SFX, Voice-over, Original Audio.
   AVAudioPlayerNode *addedAudioNode = [[AVAudioPlayerNode alloc] init];
+  AVAudioPlayerNode *sfxNode = [[AVAudioPlayerNode alloc] init];
   AVAudioPlayerNode *voiceoverNode = [[AVAudioPlayerNode alloc] init];
   AVAudioPlayerNode *originalAudioNode = [[AVAudioPlayerNode alloc] init];
 
@@ -180,14 +185,20 @@ NS_ASSUME_NONNULL_BEGIN
       [[VGProductionAudioPreviewEngine alloc] initWithEngine:engine];
   id<VGAudioPreviewPlayer> addedAudioAdapter =
       [[VGProductionAudioPreviewPlayer alloc] initWithNode:addedAudioNode];
+  id<VGAudioPreviewPlayer> sfxAdapter =
+      [[VGProductionAudioPreviewPlayer alloc] initWithNode:sfxNode];
   id<VGAudioPreviewPlayer> voiceoverAdapter =
       [[VGProductionAudioPreviewPlayer alloc] initWithNode:voiceoverNode];
   id<VGAudioPreviewPlayer> originalAudioAdapter =
       [[VGProductionAudioPreviewPlayer alloc] initWithNode:originalAudioNode];
 
-  // Wire all three player nodes into the engine before any scheduling arrives.
+  // Wire all four player nodes into the engine's main mixer before any
+  // scheduling arrives. Each lane feeds the mixer independently, so
+  // overlapping music + sfx are summed rather than replaced.
   [engine attachNode:addedAudioNode];
   [engine connect:addedAudioNode to:engine.mainMixerNode format:nil];
+  [engine attachNode:sfxNode];
+  [engine connect:sfxNode to:engine.mainMixerNode format:nil];
   [engine attachNode:voiceoverNode];
   [engine connect:voiceoverNode to:engine.mainMixerNode format:nil];
   [engine attachNode:originalAudioNode];
@@ -199,18 +210,21 @@ NS_ASSUME_NONNULL_BEGIN
                              clock:[[VGProductionAudioPreviewClock alloc] init]
                              timer:nil
          addedAudioAutomationTimer:nil
+                sfxAutomationTimer:nil
           voiceoverAutomationTimer:nil
       originalAudioAutomationTimer:nil
                       fileProvider:[[VGProductionAudioPreviewFileProvider alloc]
                                        init]
                             engine:engineAdapter
                   addedAudioPlayer:addedAudioAdapter
+                         sfxPlayer:sfxAdapter
                    voiceoverPlayer:voiceoverAdapter
                originalAudioPlayer:originalAudioAdapter];
 }
 
-/// Slice K backward-compat two-player trampoline. Passes same player/timer for
-/// Original Audio slot as Added Audio slot.
+/// Slice K backward-compat single-player trampoline. Passes the same player
+/// to all four slots; the injected automation timer is shared by the Added
+/// Audio and SFX slots (sfx historically lived in the Added Audio lane).
 - (instancetype)
     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
               lifecycleEpoch:(uint64_t)lifecycleEpoch
@@ -227,22 +241,25 @@ NS_ASSUME_NONNULL_BEGIN
                              clock:clock
                              timer:timer
          addedAudioAutomationTimer:automationTimer
+                sfxAutomationTimer:automationTimer // same as added — backward
+                                                   // compatible
           voiceoverAutomationTimer:nil // production timer created in designated
                                        // init
       originalAudioAutomationTimer:nil
                       fileProvider:fileProvider
                             engine:engine
                   addedAudioPlayer:player
+                         sfxPlayer:player   // same player — backward compatible
                    voiceoverPlayer:player   // same player — backward compatible
                originalAudioPlayer:player]; // same as added — backward
                                             // compatible
 }
 
 /// Slice K backward-compat two-slot trampoline (separate per-slot players and
-/// automation timers, but no Original Audio slot parameters).
-/// Forwards to the V-B1 three-slot designated initializer using
-/// addedAudioAutomationTimer and addedAudioPlayer for the Original slot so
-/// that existing Slice K tests continue to compile and run unchanged.
+/// automation timers, but no SFX or Original Audio slot parameters).
+/// Forwards to the four-slot designated initializer using
+/// addedAudioAutomationTimer and addedAudioPlayer for the SFX and Original
+/// slots so that existing Slice K tests continue to compile and run unchanged.
 - (instancetype)
      initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
                lifecycleEpoch:(uint64_t)lifecycleEpoch
@@ -272,7 +289,9 @@ NS_ASSUME_NONNULL_BEGIN
                    originalAudioPlayer:addedAudioPlayer];
 }
 
-/// V-B1 three-slot designated initializer.
+/// V-B1 three-slot backward-compat trampoline. Forwards to the four-slot
+/// designated initializer using addedAudioAutomationTimer and addedAudioPlayer
+/// for the SFX slot.
 - (instancetype)
         initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
                   lifecycleEpoch:(uint64_t)lifecycleEpoch
@@ -287,6 +306,45 @@ NS_ASSUME_NONNULL_BEGIN
                     fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
                           engine:(id<VGAudioPreviewEngine>)engine
                 addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+                 voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
+             originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer {
+  return
+      [self initWithSnapshotProvider:snapshotProvider
+                        lifecycleEpoch:lifecycleEpoch
+                                 clock:clock
+                                 timer:timer
+             addedAudioAutomationTimer:addedAudioAutomationTimer
+                    // SFX slot: reuse Added Audio collaborators for backward
+                    // compat.
+                    sfxAutomationTimer:addedAudioAutomationTimer
+              voiceoverAutomationTimer:voiceoverAutomationTimer
+          originalAudioAutomationTimer:originalAudioAutomationTimer
+                          fileProvider:fileProvider
+                                engine:engine
+                      addedAudioPlayer:addedAudioPlayer
+                             sfxPlayer:addedAudioPlayer
+                       voiceoverPlayer:voiceoverPlayer
+                   originalAudioPlayer:originalAudioPlayer];
+}
+
+/// Four-slot designated initializer.
+- (instancetype)
+        initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
+                  lifecycleEpoch:(uint64_t)lifecycleEpoch
+                           clock:(id<VGAudioPreviewClock>)clock
+                           timer:(nullable id<VGAudioPreviewTimer>)timer
+       addedAudioAutomationTimer:
+           (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
+              sfxAutomationTimer:
+                  (nullable id<VGAudioPreviewAutomationTimer>)sfxAutomationTimer
+        voiceoverAutomationTimer:
+            (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
+    originalAudioAutomationTimer:
+        (nullable id<VGAudioPreviewAutomationTimer>)originalAudioAutomationTimer
+                    fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
+                          engine:(id<VGAudioPreviewEngine>)engine
+                addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+                       sfxPlayer:(id<VGAudioPreviewPlayer>)sfxPlayer
                  voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
              originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer {
   self = [super init];
@@ -317,7 +375,7 @@ NS_ASSUME_NONNULL_BEGIN
         [[VGProductionAudioPreviewTimer alloc] initWithQueue:_schedulerQueue];
   }
 
-  // ── V-B1: build Added Audio slot (music/sfx only) ────────────────────────
+  // ── V-B1: build Added Audio slot (music only) ────────────────────────────
   _addedAudioSlot = [[VGAudioPreviewSlot alloc] init];
   _addedAudioSlot.player = addedAudioPlayer;
   {
@@ -349,6 +407,39 @@ NS_ASSUME_NONNULL_BEGIN
                float effective = v * mixGain;
                [ss->_addedAudioSlot.player setVolume:effective];
                ss->_addedAudioSlot.currentVolume = effective;
+             }];
+  }
+
+  // ── Build SFX slot ───────────────────────────────────────────────────────
+  _sfxSlot = [[VGAudioPreviewSlot alloc] init];
+  _sfxSlot.player = sfxPlayer;
+  {
+    id<VGAudioPreviewAutomationTimer> sfxTimer;
+    if (sfxAutomationTimer) {
+      sfxTimer = sfxAutomationTimer;
+    } else {
+      sfxTimer = [[VGProductionAudioPreviewAutomationTimer alloc]
+          initWithQueue:_schedulerQueue];
+    }
+    __weak typeof(self) weakSelf = self;
+    _sfxSlot.coordinator = [[VGAudioPreviewAutomationCoordinator alloc]
+        initWithTimer:sfxTimer
+             gainSink:^(float v) {
+               typeof(self) ss = weakSelf;
+               if (!ss)
+                 return;
+               // v is the raw envelope value — store before mixing.
+               ss->_sfxSlot.currentRawEnvelopeVolume = v;
+               VGAudioPreviewTrackDescriptor *desc =
+                   ss->_sfxSlot.activeDescriptor;
+               NSNumber *stored =
+                   desc ? ss->_mixGainByTrackId[desc.trackId] : nil;
+               float mixGain = stored ? stored.floatValue
+                                      : (desc ? desc.committedMixGain : 1.0f);
+               mixGain = MAX(0.0f, MIN(1.0f, mixGain));
+               float effective = v * mixGain;
+               [ss->_sfxSlot.player setVolume:effective];
+               ss->_sfxSlot.currentVolume = effective;
              }];
   }
 
@@ -508,11 +599,13 @@ NS_ASSUME_NONNULL_BEGIN
     return VGAudioPreviewPreparationResultSilentNoEligibleTrack;
   }
 
-  // Deactivate all three coordinators before replacing descriptor state.
+  // Deactivate all four coordinators before replacing descriptor state.
   [_addedAudioSlot.coordinator deactivate];
+  [_sfxSlot.coordinator deactivate];
   [_voiceoverSlot.coordinator deactivate];
   [_originalAudioSlot.coordinator deactivate];
   _addedAudioSlot.activeDescriptor = nil;
+  _sfxSlot.activeDescriptor = nil;
   _voiceoverSlot.activeDescriptor = nil;
   _originalAudioSlot.activeDescriptor = nil;
   _descriptors = [eligible copy];
@@ -633,7 +726,7 @@ NS_ASSUME_NONNULL_BEGIN
   return res;
 }
 
-/// Cancels the boundary timer, stops all three players, pauses all
+/// Cancels the boundary timer, stops all four players, pauses all
 /// coordinators. Increments commandSerial and updates _activeToken. Per-slot
 /// scheduledSegmentSerials are NOT reset here — they are incremented inside
 /// each _scheduleSegment:inSlot: call so that the per-slot stale guards work
@@ -641,14 +734,17 @@ NS_ASSUME_NONNULL_BEGIN
 - (uint64_t)_cancelAndIncrementSerial:(uint64_t)generation {
   [self assertOnSchedulerQueue];
   [_addedAudioSlot.coordinator pause];
+  [_sfxSlot.coordinator pause];
   [_voiceoverSlot.coordinator pause];
   [_originalAudioSlot.coordinator pause];
   [_boundaryTimer cancel];
   [_addedAudioSlot.player stop];
+  [_sfxSlot.player stop];
   [_voiceoverSlot.player stop];
   [_originalAudioSlot.player stop];
   // Reset scheduled-end tracking so the next play cycle starts fresh.
   _addedAudioSlot.scheduledEndPTS = 0.0;
+  _sfxSlot.scheduledEndPTS = 0.0;
   _voiceoverSlot.scheduledEndPTS = 0.0;
   _originalAudioSlot.scheduledEndPTS = 0.0;
   _commandSerial++;
@@ -662,10 +758,15 @@ NS_ASSUME_NONNULL_BEGIN
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Whether a descriptor belongs to the Added Audio lane.
-/// V-B1: Added Audio lane contains music and sfx ONLY. Original role
-/// has its own dedicated _originalAudioSlot.
+/// Added Audio lane contains music ONLY. Sfx has its own dedicated _sfxSlot;
+/// original role has its own dedicated _originalAudioSlot.
 static BOOL VGIsAddedAudioRole(NSString *role) {
-  return [role isEqualToString:@"music"] || [role isEqualToString:@"sfx"];
+  return [role isEqualToString:@"music"];
+}
+
+/// Whether a descriptor belongs to the SFX lane.
+static BOOL VGIsSfxRole(NSString *role) {
+  return [role isEqualToString:@"sfx"];
 }
 
 /// Whether a descriptor belongs to the Voice-over lane.
@@ -678,15 +779,16 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   return [role isEqualToString:@"original"];
 }
 
-/// Selects the winning descriptor for the Added Audio lane at |pts|.
-/// Priority: music > original/sfx. Among same role: latest timelineStart wins.
-/// Returns nil if no Added Audio descriptor is active at pts.
+/// Selects the winning descriptor for the Added Audio (music) lane at |pts|.
+/// Among overlapping music descriptors: latest timelineStart wins.
+/// Returns nil if no music descriptor is active at pts.
+/// Sfx descriptors are never considered here — they have their own lane, so
+/// there is no longer any music-over-sfx priority.
 - (nullable VGAudioPreviewTrackDescriptor *)_selectAddedAudioDescriptorAtPTS:
     (NSTimeInterval)pts {
   [self assertOnSchedulerQueue];
 
   VGAudioPreviewTrackDescriptor *winner = nil;
-  BOOL winnerIsMusic = NO;
   VGAudioPreviewTrackDescriptor *activeDesc = _addedAudioSlot.activeDescriptor;
 
   for (VGAudioPreviewTrackDescriptor *d in _descriptors) {
@@ -715,20 +817,51 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     if (pts >= trackEnd)
       continue;
 
-    BOOL dIsMusic = [d.role isEqualToString:@"music"];
-    if (winner == nil) {
+    if (winner == nil || d.timelineStart > winner.timelineStart) {
       winner = d;
-      winnerIsMusic = dIsMusic;
-    } else if (dIsMusic && !winnerIsMusic) {
-      winner = d;
-      winnerIsMusic = YES;
-    } else if (!dIsMusic && winnerIsMusic) {
-      // Keep music winner.
+    }
+  }
+  return winner;
+}
+
+/// Selects the winning descriptor for the SFX lane at |pts|.
+/// Among overlapping sfx descriptors: latest timelineStart wins.
+/// Returns nil if no sfx descriptor is active at pts.
+- (nullable VGAudioPreviewTrackDescriptor *)_selectSfxDescriptorAtPTS:
+    (NSTimeInterval)pts {
+  [self assertOnSchedulerQueue];
+
+  VGAudioPreviewTrackDescriptor *winner = nil;
+  VGAudioPreviewTrackDescriptor *activeDesc = _sfxSlot.activeDescriptor;
+
+  for (VGAudioPreviewTrackDescriptor *d in _descriptors) {
+    if (!VGIsSfxRole(d.role))
+      continue;
+    if ([_failedTrackIds containsObject:d.trackId])
+      continue;
+
+    NSTimeInterval ts = MAX(0.0, d.timelineStart);
+    if (pts < ts)
+      continue;
+
+    NSTimeInterval conservativeActiveDuration;
+    if (activeDesc && [d.trackId isEqualToString:activeDesc.trackId]) {
+      conservativeActiveDuration = _sfxSlot.activeDuration;
     } else {
-      if (d.timelineStart > winner.timelineStart) {
-        winner = d;
-        winnerIsMusic = dIsMusic;
+      NSTimeInterval projRem = MAX(0.0, _timelineDuration - ts);
+      if (d.requestedDuration >= 0.0) {
+        conservativeActiveDuration = MIN(d.requestedDuration, projRem);
+      } else {
+        conservativeActiveDuration = projRem;
       }
+    }
+
+    NSTimeInterval trackEnd = ts + conservativeActiveDuration;
+    if (pts >= trackEnd)
+      continue;
+
+    if (winner == nil || d.timelineStart > winner.timelineStart) {
+      winner = d;
     }
   }
   return winner;
@@ -822,7 +955,7 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
 }
 
 /// Returns the next decision boundary PTS after |currentPTS| across ALL
-/// descriptors (all three lanes). This is the earliest point where lane
+/// descriptors (all four lanes). This is the earliest point where lane
 /// selection may change. Returns INFINITY if no future boundary exists.
 - (NSTimeInterval)_computeNextDecisionPTS:(NSTimeInterval)currentPTS {
   [self assertOnSchedulerQueue];
@@ -843,6 +976,9 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     BOOL isAddedActive =
         _addedAudioSlot.activeDescriptor &&
         [d.trackId isEqualToString:_addedAudioSlot.activeDescriptor.trackId];
+    BOOL isSfxActive =
+        _sfxSlot.activeDescriptor &&
+        [d.trackId isEqualToString:_sfxSlot.activeDescriptor.trackId];
     BOOL isVOActive =
         _voiceoverSlot.activeDescriptor &&
         [d.trackId isEqualToString:_voiceoverSlot.activeDescriptor.trackId];
@@ -852,6 +988,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
 
     if (isAddedActive) {
       conservativeActiveDuration = _addedAudioSlot.activeDuration;
+    } else if (isSfxActive) {
+      conservativeActiveDuration = _sfxSlot.activeDuration;
     } else if (isVOActive) {
       conservativeActiveDuration = _voiceoverSlot.activeDuration;
     } else if (isOriginalActive) {
@@ -1038,11 +1176,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
 
   AVAudioFrameCount frameCount = (AVAudioFrameCount)signedFrameCount;
 
-  if ([self _isSliceK]) {
-    NSString *laneName =
-        (slot == _addedAudioSlot) ? @"AddedAudio" : @"Voiceover";
-  }
-
   // Per-slot segment serial.
   slot.scheduledSegmentSerial++;
   slot.scheduledEndPTS = scheduledEndPTS; // track for double-buffer guard
@@ -1120,7 +1253,7 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
 // Shared transition helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Re-evaluates all three lanes at |currentPTS|, activates/schedules/plays each
+/// Re-evaluates all four lanes at |currentPTS|, activates/schedules/plays each
 /// slot independently, and arms the master boundary timer for the earliest next
 /// decision PTS. Sets _runtimeState to Playing, WaitingForTrackStart, or Ended.
 ///
@@ -1131,7 +1264,7 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
                             withToken:capturedToken];
 }
 
-/// Re-evaluates both lanes. |currentPTS| is used for the completing slot
+/// Re-evaluates all lanes. |currentPTS| is used for the completing slot
 /// (may be advanced to capturedScheduledEndPTS via MAX).
 /// |crossLaneActivationFloor| is the authoritative clock PTS and caps which
 /// idle cross-lane slots may be newly started — an idle slot whose
@@ -1144,6 +1277,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
 
   VGAudioPreviewTrackDescriptor *addedWinner =
       [self _selectAddedAudioDescriptorAtPTS:currentPTS];
+  VGAudioPreviewTrackDescriptor *sfxWinner =
+      [self _selectSfxDescriptorAtPTS:currentPTS];
   VGAudioPreviewTrackDescriptor *voWinner =
       [self _selectVoiceoverDescriptorAtPTS:currentPTS];
   VGAudioPreviewTrackDescriptor *origWinner =
@@ -1211,9 +1346,40 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     }
   }
 
+  // Handle SFX slot. Same cross-lane activation floor guard as Voice-over:
+  // an idle sfx slot must not be started by another lane's early
+  // DataConsumed completion before the real playhead reaches its start —
+  // sfx hits are short and their timing is audible.
+  BOOL sfxActive = NO;
+  NSTimeInterval sfxTrackEnd = 0.0;
+  NSTimeInterval suppressedSfxStart = INFINITY;
+  if (sfxWinner) {
+    BOOL sfxSlotCurrentlyIdle = (_sfxSlot.activeDescriptor == nil);
+    NSTimeInterval sfxStart = MAX(0.0, sfxWinner.timelineStart);
+    if (sfxSlotCurrentlyIdle && activationFloor < sfxStart) {
+      suppressedSfxStart = sfxStart;
+      sfxWinner = nil;
+    }
+  }
+  if (sfxWinner) {
+    BOOL activated = [self _activateDescriptor:sfxWinner
+                                         atPTS:currentPTS
+                                        inSlot:_sfxSlot];
+    if (!activated) {
+      // File failed — this sfx track is marked failed; other lanes continue.
+      [_sfxSlot.coordinator deactivate];
+    } else {
+      sfxTrackEnd = [_sfxSlot activeDescriptorTrackEnd];
+      if (currentPTS < sfxTrackEnd)
+        sfxActive = YES;
+      else
+        sfxWinner = nil;
+    }
+  }
+
   // Determine if at least one lane is actively playing (updated at end of
   // method).
-  BOOL hasActiveLane = addedActive || voActive;
+  BOOL hasActiveLane = addedActive || sfxActive || voActive;
 
   // Deferred-termination epsilon: if activationFloor is within 1 ms of
   // scheduledEndPTS the segment is treated as physically finished. 1 ms aligns
@@ -1226,6 +1392,7 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   // rendering. In that case the player must NOT be stopped until the boundary
   // timer fires at the real scheduled end.
   BOOL addedDeferStop = NO;
+  BOOL sfxDeferStop = NO;
   BOOL voDeferStop = NO;
   BOOL origDeferStop = NO;
 
@@ -1258,6 +1425,26 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
       }
       _addedAudioSlot.activeDescriptor = nil;
       _addedAudioSlot.scheduledEndPTS = 0.0;
+    }
+  }
+
+  if (!sfxWinner) {
+    // Deferred-termination guard: mirror of the AddedAudio guard above.
+    if (_sfxSlot.activeDescriptor != nil &&
+        activationFloor < _sfxSlot.scheduledEndPTS - kDeferEpsilon) {
+      sfxDeferStop = YES;
+    } else {
+      // No active SFX descriptor — stop and quiet the slot.
+      [_sfxSlot.coordinator deactivate];
+      // Stop the player node only if another lane remains active.
+      if (hasActiveLane) {
+        [_sfxSlot.player stop];
+        // Increment serial so any in-flight completion block is treated as
+        // stale.
+        _sfxSlot.scheduledSegmentSerial++;
+      }
+      _sfxSlot.activeDescriptor = nil;
+      _sfxSlot.scheduledEndPTS = 0.0;
     }
   }
 
@@ -1329,10 +1516,10 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     }
   }
 
-  // Recompute hasActiveLane now that all three slots are evaluated.
-  hasActiveLane = addedActive || voActive || origActive;
+  // Recompute hasActiveLane now that all four slots are evaluated.
+  hasActiveLane = addedActive || sfxActive || voActive || origActive;
 
-  // Next global decision boundary across all three lanes.
+  // Next global decision boundary across all four lanes.
   NSTimeInterval nextBoundary = [self _computeNextDecisionPTS:currentPTS];
 
   // Schedule and play each active slot independently.
@@ -1370,6 +1557,37 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
         anyScheduled = YES;
       } else {
         addedActive = NO;
+      }
+    }
+  }
+
+  if (sfxActive) {
+    BOOL sfxAlreadyScheduled = (currentPTS < _sfxSlot.scheduledEndPTS);
+    if (sfxAlreadyScheduled) {
+      [_sfxSlot.player play];
+      anyScheduled = YES;
+    } else {
+      NSTimeInterval sfxEndPTS =
+          (isfinite(nextBoundary) && nextBoundary <= sfxTrackEnd)
+              ? nextBoundary
+              : sfxTrackEnd;
+      BOOL scheduled = [self _scheduleSegmentAtPTS:currentPTS
+                                            endPTS:sfxEndPTS
+                                         withToken:capturedToken
+                                            inSlot:_sfxSlot];
+      if (scheduled) {
+        if (_sfxSlot.coordinator.hasActiveEnvelope)
+          [_sfxSlot.coordinator reevaluateAtPTS:currentPTS];
+        [_sfxSlot.player play];
+        if (_sfxSlot.coordinator.hasActiveEnvelope) {
+          dispatch_block_t tickBlock =
+              [self _buildAutomationTickBlockForToken:capturedToken
+                                               inSlot:_sfxSlot];
+          [_sfxSlot.coordinator startPollingWithTickBlock:tickBlock];
+        }
+        anyScheduled = YES;
+      } else {
+        sfxActive = NO;
       }
     }
   }
@@ -1441,16 +1659,20 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   // exists, OR if all lanes are silent but a start boundary is approaching.
   // Deferred slots contribute to hasActiveLane so the runtime keeps Playing
   // state while queued audio renders through the hardware.
-  hasActiveLane = addedActive || voActive || origActive || addedDeferStop ||
-                  voDeferStop || origDeferStop;
+  hasActiveLane = addedActive || sfxActive || voActive || origActive ||
+                  addedDeferStop || sfxDeferStop || voDeferStop ||
+                  origDeferStop;
 
-  // Timer-base correction: when the VO or Original activation floor guard
-  // suppressed an early cross-lane start, evaluationPTS was advanced (MAX)
-  // past that start, so _computeNextDecisionPTS:currentPTS skips it as a
-  // candidate boundary. Fix: use activationFloor as the timer base and MIN in
-  // suppressedStart so the timer fires at the real-time equivalent.
+  // Timer-base correction: when the SFX, VO, or Original activation floor
+  // guard suppressed an early cross-lane start, evaluationPTS was advanced
+  // (MAX) past that start, so _computeNextDecisionPTS:currentPTS skips it as
+  // a candidate boundary. Fix: use activationFloor as the timer base and MIN
+  // in suppressedStart so the timer fires at the real-time equivalent.
   NSTimeInterval timerBase = activationFloor;
   NSTimeInterval timerNextBoundary = nextBoundary;
+  if (isfinite(suppressedSfxStart)) {
+    timerNextBoundary = MIN(timerNextBoundary, suppressedSfxStart);
+  }
   if (isfinite(suppressedVOStart)) {
     timerNextBoundary = MIN(timerNextBoundary, suppressedVOStart);
   }
@@ -1460,6 +1682,9 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   // Deferred-termination cleanup boundaries.
   if (addedDeferStop && _addedAudioSlot.scheduledEndPTS > timerBase) {
     timerNextBoundary = MIN(timerNextBoundary, _addedAudioSlot.scheduledEndPTS);
+  }
+  if (sfxDeferStop && _sfxSlot.scheduledEndPTS > timerBase) {
+    timerNextBoundary = MIN(timerNextBoundary, _sfxSlot.scheduledEndPTS);
   }
   if (voDeferStop && _voiceoverSlot.scheduledEndPTS > timerBase) {
     timerNextBoundary = MIN(timerNextBoundary, _voiceoverSlot.scheduledEndPTS);
@@ -1523,16 +1748,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
         MAX(0.0, [capturedClock currentTime] - snap.playStartHostTime);
     NSTimeInterval pts = MAX(0.0, snap.playStartPTS + elapsed);
     [capturedSlot.coordinator evaluateAtPTS:pts];
-    if ([ss _isSliceK]) {
-      NSString *laneName;
-      if (capturedSlot == ss->_addedAudioSlot) {
-        laneName = @"AddedAudio";
-      } else if (capturedSlot == ss->_voiceoverSlot) {
-        laneName = @"Voiceover";
-      } else {
-        laneName = @"OriginalAudio";
-      }
-    }
   };
 }
 
@@ -1570,6 +1785,7 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   // Capture the shared per-slot serials so that if any slot's completion
   // callback has already advanced that slot, this timer is stale.
   uint64_t capturedAddedSerial = _addedAudioSlot.scheduledSegmentSerial;
+  uint64_t capturedSfxSerial = _sfxSlot.scheduledSegmentSerial;
   uint64_t capturedVOSerial = _voiceoverSlot.scheduledSegmentSerial;
   // V-B1: include original slot serial in stale guard.
   uint64_t capturedOriginalSerial = _originalAudioSlot.scheduledSegmentSerial;
@@ -1592,12 +1808,13 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
                                                  capturedToken))
                  return;
 
-               // Stale guard: if ALL three slots have already advanced past
+               // Stale guard: if ALL four slots have already advanced past
                // the serial captured when the timer was armed, the timer is
                // stale. (Any slot still matching its captured serial means
                // this timer may still need to schedule for that slot.)
                if (ss->_addedAudioSlot.scheduledSegmentSerial !=
                        capturedAddedSerial &&
+                   ss->_sfxSlot.scheduledSegmentSerial != capturedSfxSerial &&
                    ss->_voiceoverSlot.scheduledSegmentSerial !=
                        capturedVOSerial &&
                    // V-B1: include original slot in stale check.
@@ -1608,8 +1825,9 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
                VGTimelineStateSnapshot snap = capturedProvider();
                if (!snap.isValid || !snap.isPlaying) {
                  if (!snap.isValid) {
-                   // V-B1: stop all three players on invalid snapshot.
+                   // Stop all four players on invalid snapshot.
                    [ss->_addedAudioSlot.player stop];
+                   [ss->_sfxSlot.player stop];
                    [ss->_voiceoverSlot.player stop];
                    [ss->_originalAudioSlot.player stop];
                    ss->_runtimeState = VGAudioPreviewRuntimeStatePaused;
@@ -1650,9 +1868,10 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
           @"received — clearing stale scheduling state");
 
     // The engine has stopped and flushed all player-node buffers.
-    // Clear scheduledEndPTS on all three slots so the next scheduling cycle
+    // Clear scheduledEndPTS on all four slots so the next scheduling cycle
     // does not skip re-queuing because it thinks buffers are still present.
     ss->_addedAudioSlot.scheduledEndPTS = 0.0;
+    ss->_sfxSlot.scheduledEndPTS = 0.0;
     ss->_voiceoverSlot.scheduledEndPTS = 0.0;
     ss->_originalAudioSlot.scheduledEndPTS = 0.0;
 
@@ -1920,6 +2139,23 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
       return;
     }
 
+    // If the SFX slot is currently playing this trackId, update player.
+    VGAudioPreviewTrackDescriptor *sfxDesc = ss->_sfxSlot.activeDescriptor;
+    if (sfxDesc && [sfxDesc.trackId isEqualToString:trackId]) {
+      float effective;
+      if (ss->_sfxSlot.coordinator.hasActiveEnvelope) {
+        effective = ss->_sfxSlot.currentRawEnvelopeVolume * clamped;
+      } else {
+        effective = sfxDesc.staticVolume * clamped;
+      }
+      [ss->_sfxSlot.player setVolume:effective];
+      ss->_sfxSlot.currentVolume = effective;
+      NSLog(@"[VanguardAudioPreviewRuntime][V-B] setMixGain: sfx "
+            @"trackId=%@ gain=%.3f effectiveVol=%.3f",
+            trackId, clamped, effective);
+      return;
+    }
+
     // If the Voice-over slot is currently playing this trackId, update player.
     VGAudioPreviewTrackDescriptor *voDesc = ss->_voiceoverSlot.activeDescriptor;
     if (voDesc && [voDesc.trackId isEqualToString:trackId]) {
@@ -2172,9 +2408,10 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
   // Phase A: close command acceptance atomically.
   atomic_store(&_acceptingCommands, NO);
 
-  // Immediate audio quiesce: stop all three players synchronously on calling
+  // Immediate audio quiesce: stop all four players synchronously on calling
   // thread. AVAudioPlayerNode.stop is documented as thread-safe.
   [_addedAudioSlot.player stop];
+  [_sfxSlot.player stop];
   [_voiceoverSlot.player stop];
   // V-B1: quiesce original slot player immediately.
   [_originalAudioSlot.player stop];
@@ -2214,11 +2451,13 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
     // Teardown order: coordinators first, then timer, then players, then
     // engine.
     [strongSelf->_addedAudioSlot.coordinator invalidate];
+    [strongSelf->_sfxSlot.coordinator invalidate];
     [strongSelf->_voiceoverSlot.coordinator invalidate];
     // V-B1: Include original slot in invalidation teardown.
     [strongSelf->_originalAudioSlot.coordinator invalidate];
     [strongSelf->_boundaryTimer cancel];
     [strongSelf->_addedAudioSlot.player stop];
+    [strongSelf->_sfxSlot.player stop];
     [strongSelf->_voiceoverSlot.player stop];
     // V-B1: Stop original slot player during invalidation.
     [strongSelf->_originalAudioSlot.player stop];
@@ -2227,6 +2466,7 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
     [strongSelf->_fileCache removeAllObjects];
     [strongSelf->_failedTrackIds removeAllObjects];
     strongSelf->_addedAudioSlot.activeDescriptor = nil;
+    strongSelf->_sfxSlot.activeDescriptor = nil;
     strongSelf->_voiceoverSlot.activeDescriptor = nil;
     // V-B1: Clear original slot active descriptor.
     strongSelf->_originalAudioSlot.activeDescriptor = nil;
@@ -2248,7 +2488,8 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
     });
   };
 
-  BOOL isOnScheduler = (dispatch_get_specific(_schedulerQueueKey) == (__bridge void *)self);
+  BOOL isOnScheduler =
+      (dispatch_get_specific(_schedulerQueueKey) == (__bridge void *)self);
   if (isOnScheduler) {
     cleanupBlock();
   } else {
@@ -2263,6 +2504,9 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
 - (nullable VGAudioPreviewTrackDescriptor *)activeDescriptor {
   if (_addedAudioSlot.activeDescriptor) {
     return _addedAudioSlot.activeDescriptor;
+  }
+  if (_sfxSlot.activeDescriptor) {
+    return _sfxSlot.activeDescriptor;
   }
   if (_voiceoverSlot.activeDescriptor) {
     return _voiceoverSlot.activeDescriptor;
