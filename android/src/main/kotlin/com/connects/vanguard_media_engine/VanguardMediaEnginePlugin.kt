@@ -103,6 +103,7 @@ import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackC
 import com.connects.vanguard_media_engine.streaming.AndroidMedia3StreamSourceCoordinator
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
+import com.connects.vanguard_media_engine.duet.AndroidDuetMethodHandler
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -559,6 +560,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // slice (startPTS frozen to 0.0; no NO_TIMELINE dependency).
     private var audioRecordingCoordinator: AndroidAudioRecordingCoordinator? = null
 
+    // ── VG-DUET-SLICE-2: Duet session lifecycle / dispatch handler ────────────
+    // Owns all 10 Duet MethodChannel routes. Plugin is a thin router only.
+    // Initialized lazily once mainHandler is available (onAttachedToEngine).
+    private var duetMethodHandler: AndroidDuetMethodHandler? = null
+
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
 
@@ -896,10 +902,25 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
+        // VG-DUET-SLICE-2: initialize Duet handler after mainHandler is available.
+        duetMethodHandler = AndroidDuetMethodHandler(mainHandler)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
         val args = call.arguments as? Map<*, *>
+
+        // ── VG-DUET-SLICE-2: Duet session lifecycle dispatch ──────────────────
+        // Intercept all 10 Duet routes before the main switch. Plugin is a thin
+        // router only — no session logic lives here.
+        if (AndroidDuetMethodHandler.ownsMethod(call.method)) {
+            val handler = duetMethodHandler
+            if (handler != null) {
+                handler.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Duet method handler unavailable", null)
+            }
+            return
+        }
 
         if (AndroidDagTexturePlaybackCoordinator.ownsMethod(call.method)) {
             val coord = dagTexturePlaybackCoordinator
@@ -3438,6 +3459,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // cameraSource (already stopped/nulled above) -- just drop the
         // reference, no disposeAll() to call.
         cameraXThermalActuationRouter = null
+        // VG-DUET-SLICE-2: cancel any in-flight probe and release active session.
+        duetMethodHandler?.disposeAll()
+        duetMethodHandler = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

@@ -183,6 +183,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // ── UMF V2 Slice 2A: photo library save handler ───────────────────────────
     private let photoLibrarySaveHandler = VGPhotoLibrarySaveHandler()
 
+    // ── VG-DUET-SLICE-2: Duet session lifecycle / dispatch handler ────────────
+    // Owns all 10 Duet MethodChannel routes. Plugin is a thin router only.
+    // No camera, no Metal, no recorder lives here.
+    private let duetMethodHandler = VGDuetMethodHandler()
+
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setFilterChain` route. Plugin provides composition wiring only.
@@ -616,6 +621,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         if _streamingPlaybackCoordinatorCreated {
             streamingPlaybackCoordinator.disposeAll()
         }
+        // VG-DUET-SLICE-2: release any active Duet session and cancel in-flight probes.
+        duetMethodHandler.disposeAll()
     }
 
     // Phase 7 Stage 7.5C: shared compositor init + runtime prepare helper.
@@ -1908,7 +1915,15 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             return
         }
 
-        // ── Phase 4C6H: iOS streaming cache routes ────────────────────────────
+        // ── VG-DUET-SLICE-2: Duet session lifecycle dispatch ─────────────────
+        // All 10 Duet routes are owned by VGDuetMethodHandler. Plugin is a thin
+        // router only — no session logic lives here.
+        if VGDuetMethodHandler.ownsMethod(call.method) {
+            duetMethodHandler.handle(method: call.method, args: args, result: result)
+            return
+        }
+
+
         // The five cache MethodChannel routes are forwarded to
         // VGStreamingCacheManager.shared. No cache or lifecycle logic lives here.
         if call.method == "getPlaybackCacheStatus" {
