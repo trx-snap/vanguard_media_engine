@@ -183,10 +183,17 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // ── UMF V2 Slice 2A: photo library save handler ───────────────────────────
     private let photoLibrarySaveHandler = VGPhotoLibrarySaveHandler()
 
-    // ── VG-DUET-SLICE-2: Duet session lifecycle / dispatch handler ────────────
-    // Owns all 10 Duet MethodChannel routes. Plugin is a thin router only.
-    // No camera, no Metal, no recorder lives here.
-    private let duetMethodHandler = VGDuetMethodHandler()
+    // ── VG-DUET-SLICE-4A: Duet session lifecycle / dispatch handler ────────────
+    // Owns all 12 Duet MethodChannel routes (10 original + 2 Slice 4A texture).
+    // Plugin is a thin router only. No camera, no Metal, no recorder lives here.
+    // Lazy so that `registrar` (set in register(with:)) is available at first use.
+    // _duetMethodHandlerCreated: set to true the first time the lazy property is
+    // accessed, so that detachFromEngine does not instantiate just to dispose.
+    private var _duetMethodHandlerCreated = false
+    private lazy var duetMethodHandler: VGDuetMethodHandler = {
+        _duetMethodHandlerCreated = true
+        return VGDuetMethodHandler(textureRegistry: self.registrar.textures())
+    }()
 
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
@@ -621,8 +628,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         if _streamingPlaybackCoordinatorCreated {
             streamingPlaybackCoordinator.disposeAll()
         }
-        // VG-DUET-SLICE-2: release any active Duet session and cancel in-flight probes.
-        duetMethodHandler.disposeAll()
+        // VG-DUET-SLICE-4A: release any active Duet session, texture, and in-flight probes.
+        // Guard with _duetMethodHandlerCreated to avoid force-initialising the lazy handler.
+        if _duetMethodHandlerCreated {
+            duetMethodHandler.disposeAll()
+        }
     }
 
     // Phase 7 Stage 7.5C: shared compositor init + runtime prepare helper.
@@ -1915,9 +1925,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             return
         }
 
-        // ── VG-DUET-SLICE-2: Duet session lifecycle dispatch ─────────────────
-        // All 10 Duet routes are owned by VGDuetMethodHandler. Plugin is a thin
-        // router only — no session logic lives here.
+        // ── VG-DUET-SLICE-4A: Duet session lifecycle dispatch ─────────────────
+        // All 12 Duet routes (10 original + 2 Slice 4A texture) are owned by
+        // VGDuetMethodHandler. Plugin is a thin router only — no session logic
+        // lives here.
         if VGDuetMethodHandler.ownsMethod(call.method) {
             duetMethodHandler.handle(method: call.method, args: args, result: result)
             return

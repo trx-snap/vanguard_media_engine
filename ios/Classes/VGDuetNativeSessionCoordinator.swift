@@ -61,6 +61,17 @@ final class VGDuetNativeSession {
     // Source probe result (recorded for descriptor assembly)
     var probeResult: VGDuetSourceProbeResult?
 
+    // Slice 4A: preview texture attachment.
+    // Registered with Flutter texture registry on attachPreviewTexture,
+    // invalidated and unregistered on detach/stop/dispose.
+    var previewTexture: VGDuetPreviewTexture?
+    var previewTextureId: Int64?
+    // Original dimensions and layout rects stored on first attach;
+    // returned verbatim on repeated (idempotent) attach calls.
+    var previewWidthPx: Double?
+    var previewHeightPx: Double?
+    var previewLayoutRects: [String: Any]?
+
     init(sessionId: String,
          sourceMap: [String: Any],
          trimWindowMap: [String: Any],
@@ -140,11 +151,178 @@ final class VGDuetNativeSessionCoordinator {
     private var pendingSessionId: String?
     private var canceledProbeIds = Set<String>()
 
+    // Slice 4A: Flutter texture registry, injected at init time.
+    // Weak-ish pattern: FlutterTextureRegistry is owned by the registrar which
+    // outlives this coordinator; storing as strong is safe for the plugin lifecycle.
+    private var textureRegistry: FlutterTextureRegistry?
+
     // Serial queues (never block main thread)
     private let probeQueue = DispatchQueue(label: "com.connects.vanguard.duet.probe",
                                            qos: .userInitiated)
     private let decoderQueue = DispatchQueue(label: "com.connects.vanguard.duet.decoder",
                                              qos: .userInitiated)
+
+    // MARK: - Init
+
+    init(textureRegistry: FlutterTextureRegistry? = nil) {
+        self.textureRegistry = textureRegistry
+    }
+
+    // MARK: - Preview texture helpers (Slice 4A)
+
+    /// Releases the preview texture associated with [session] if one is registered.
+    /// Must be called on the main thread before clearing activeSession.
+    private func releasePreviewTexture(for session: VGDuetNativeSession) {
+        guard let tex = session.previewTexture,
+              let tid = session.previewTextureId else { return }
+        tex.invalidate()
+        textureRegistry?.unregisterTexture(tid)
+        session.previewTexture    = nil
+        session.previewTextureId  = nil
+        session.previewWidthPx    = nil
+        session.previewHeightPx   = nil
+        session.previewLayoutRects = nil
+    }
+
+    // MARK: - attachPreviewTexture (Slice 4A)
+
+    func attachPreviewTexture(
+        sessionId:  String,
+        canvasSize: [String: Any],
+        layoutConfigMap: [String: Any]?,
+        reply: @escaping (Any?, FlutterError?) -> Void
+    ) {
+        assert(Thread.isMainThread)
+        guard let session = resolveActiveSession(sessionId: sessionId, reply: reply) else { return }
+
+        // Idempotent: return the ORIGINAL stored descriptor, not dims from the new request.
+        if let existing = session.previewTexture, let tid = session.previewTextureId {
+            var map: [String: Any] = [
+                "textureId": tid,
+                "width":  session.previewWidthPx ?? 1080.0,
+                "height": session.previewHeightPx ?? 1920.0,
+                "state":  "surfaceAvailable",
+            ]
+            if let rects = session.previewLayoutRects { map["layoutRects"] = rects }
+            _ = existing  // keep ref alive for lint
+            reply(map, nil)
+            return
+        }
+
+        guard let registry = textureRegistry else {
+            reply(nil, FlutterError(
+                code:    "composition_failed",
+                message: "attachDuetPreviewTexture: textureRegistry not available.",
+                details: nil))
+            return
+        }
+
+        let width  = (canvasSize["width"]  as? NSNumber)?.doubleValue ?? 1080.0
+        let height = (canvasSize["height"] as? NSNumber)?.doubleValue ?? 1920.0
+
+        let previewTexture = VGDuetPreviewTexture()
+        let textureId = registry.register(previewTexture)
+
+        session.previewTexture   = previewTexture
+        session.previewTextureId = textureId
+
+        // Compute optional layout rects from the effective layoutConfig.
+        let effectiveLayoutMap = layoutConfigMap ?? session.layoutConfigMap
+        let layoutRects = buildLayoutRects(
+            layoutConfigMap: effectiveLayoutMap,
+            canvasWidth:  CGFloat(width),
+            canvasHeight: CGFloat(height)
+        )
+
+        // Store original values so idempotent re-attach returns them verbatim.
+        session.previewWidthPx    = width
+        session.previewHeightPx   = height
+        session.previewLayoutRects = layoutRects
+
+        var map: [String: Any] = [
+            "textureId": textureId,
+            "width":  width,
+            "height": height,
+            // iOS: register() immediately makes the texture valid as a
+            // surfaceAvailable seam (no separate CALayer negotiation required
+            // in this slice).
+            "state": "surfaceAvailable",
+        ]
+        if let rects = layoutRects { map["layoutRects"] = rects }
+        reply(map, nil)
+    }
+
+    // MARK: - detachPreviewTexture (Slice 4A)
+
+    func detachPreviewTexture(
+        sessionId: String,
+        reply: @escaping (Any?, FlutterError?) -> Void
+    ) {
+        assert(Thread.isMainThread)
+        // Unknown session → session_not_found per contract.
+        guard let session = resolveActiveSession(sessionId: sessionId, reply: reply) else { return }
+        // Idempotent if no attachment exists.
+        releasePreviewTexture(for: session)
+        reply(nil, nil)
+    }
+
+    // MARK: - Layout rect builder
+
+    private func buildLayoutRects(
+        layoutConfigMap: [String: Any],
+        canvasWidth: CGFloat,
+        canvasHeight: CGFloat
+    ) -> [String: Any]? {
+        let mode = layoutConfigMap["mode"] as? String ?? "pip"
+        switch mode {
+        case "splitLeftRight":
+            let swapped = layoutConfigMap["isSideSwapped"] as? Bool ?? false
+            let rects = VGDuetLayoutGeometry.splitLeftRight(
+                canvasWidth: canvasWidth, canvasHeight: canvasHeight, isSwapped: swapped)
+            return [
+                "source": VGDuetLayoutGeometry.rectToMap(rects.source),
+                "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
+            ]
+        case "splitTopBottom":
+            let swapped = layoutConfigMap["isTopBottomSwapped"] as? Bool ?? false
+            let rects = VGDuetLayoutGeometry.splitTopBottom(
+                canvasWidth: canvasWidth, canvasHeight: canvasHeight, isSwapped: swapped)
+            return [
+                "source": VGDuetLayoutGeometry.rectToMap(rects.source),
+                "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
+            ]
+        case "pip":
+            let sourceRect = VGDuetLayoutGeometry.pipSourceRect(
+                canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+            var cameraRect = sourceRect
+            if let rectMap = layoutConfigMap["pipNormalizedRect"] as? [String: Any],
+               let nl = (rectMap["left"]   as? NSNumber)?.doubleValue,
+               let nt = (rectMap["top"]    as? NSNumber)?.doubleValue,
+               let nw = (rectMap["width"]  as? NSNumber)?.doubleValue,
+               let nh = (rectMap["height"] as? NSNumber)?.doubleValue {
+                cameraRect = VGDuetLayoutGeometry.pipCameraRect(
+                    canvasWidth:      canvasWidth,
+                    canvasHeight:     canvasHeight,
+                    normalizedLeft:   CGFloat(nl),
+                    normalizedTop:    CGFloat(nt),
+                    normalizedWidth:  CGFloat(nw),
+                    normalizedHeight: CGFloat(nh))
+            }
+            return [
+                "source": VGDuetLayoutGeometry.rectToMap(sourceRect),
+                "camera": VGDuetLayoutGeometry.rectToMap(cameraRect),
+            ]
+        case "greenScreen":
+            let rects = VGDuetLayoutGeometry.greenScreen(
+                canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+            return [
+                "source": VGDuetLayoutGeometry.rectToMap(rects.source),
+                "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
+            ]
+        default:
+            return nil
+        }
+    }
 
     // MARK: - initialize
 
@@ -455,6 +633,7 @@ final class VGDuetNativeSessionCoordinator {
         session.state = .stopped
         let dec = session.decoder
         session.decoder = nil
+        releasePreviewTexture(for: session)   // Slice 4A: detach before drop
         activeSession = nil
         decoderQueue.async { dec?.release() }
         let resultMap = session.buildStopResult()
@@ -473,6 +652,7 @@ final class VGDuetNativeSessionCoordinator {
             canceledProbeIds.insert(sessionId)
             let dec = session.decoder
             session.decoder = nil
+            releasePreviewTexture(for: session)   // Slice 4A: detach before drop
             activeSession = nil
             decoderQueue.async { dec?.release() }
         }
@@ -490,6 +670,7 @@ final class VGDuetNativeSessionCoordinator {
             canceledProbeIds.insert(session.sessionId)
             let dec = session.decoder
             session.decoder = nil
+            releasePreviewTexture(for: session)   // Slice 4A: detach before drop
             decoderQueue.async { dec?.release() }
         }
         activeSession = nil

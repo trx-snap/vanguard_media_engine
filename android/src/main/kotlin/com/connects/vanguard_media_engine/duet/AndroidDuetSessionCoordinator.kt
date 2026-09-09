@@ -4,6 +4,7 @@ import android.media.MediaExtractor
 import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
+import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.UUID
 
@@ -64,6 +65,15 @@ class VGDuetAndroidSession(
     var state: VGDuetSessionState = VGDuetSessionState.INITIALIZED
     var probeResult: VGDuetAndroidSourceProbeResult? = null
 
+    // Slice 4A: preview surface producer attachment.
+    // Allocated on attachDuetPreviewTexture, released on detach/stop/dispose.
+    var previewProducer: AndroidDuetPreviewSurfaceProducer? = null
+    // Original dimensions and layout rects stored on first attach;
+    // returned verbatim on repeated (idempotent) attach calls.
+    var previewWidthPx:    Int? = null
+    var previewHeightPx:   Int? = null
+    var previewLayoutRects: Map<String, Any>? = null
+
     fun startSegment() {
         previewClock.startSegment()
     }
@@ -112,7 +122,10 @@ class VGDuetAndroidSession(
  * All public methods are called on the main thread by AndroidDuetMethodHandler.
  * File probing runs on probeThread; decoder operations run on decoderThread.
  */
-class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
+class AndroidDuetSessionCoordinator(
+    private val mainHandler: Handler,
+    private val textureRegistry: TextureRegistry? = null,
+) {
 
     companion object {
         private val VALID_SPEEDS = setOf(0.3, 0.5, 1.0, 2.0, 3.0)
@@ -491,6 +504,132 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
         reply(null, null)
     }
 
+    // ── attachPreviewTexture (Slice 4A) ───────────────────────────────────────
+
+    fun attachPreviewTexture(
+        sessionId:       String,
+        canvasSizeMap:   Map<String, Any?>,
+        layoutConfigMap: Map<String, Any?>?,
+        reply:           (Any?, String?) -> Unit,
+    ) {
+        val session = resolveSession(sessionId, "attachDuetPreviewTexture", reply) ?: return
+
+        // Idempotent: return the ORIGINAL stored descriptor, not dims from the new request.
+        val existing = session.previewProducer
+        if (existing != null) {
+            val storedWidth  = session.previewWidthPx
+            val storedHeight = session.previewHeightPx
+            if (storedWidth == null || storedHeight == null) {
+                reply(null, errorMsg("composition_failed",
+                    "attachDuetPreviewTexture: preview descriptor missing for existing texture."))
+                return
+            }
+            reply(existing.toResultMap(storedWidth, storedHeight, session.previewLayoutRects), null)
+            return
+        }
+
+        val registry = textureRegistry
+        if (registry == null) {
+            reply(null, errorMsg("composition_failed",
+                "attachDuetPreviewTexture: textureRegistry not available."))
+            return
+        }
+
+        val widthPx  = ((canvasSizeMap["width"]  as? Number)?.toDouble() ?: 1080.0).toInt()
+        val heightPx = ((canvasSizeMap["height"] as? Number)?.toDouble() ?: 1920.0).toInt()
+
+        // Finding #3: wrap producer construction; don't partially attach on failure.
+        val producer = try {
+            AndroidDuetPreviewSurfaceProducer(
+                textureRegistry = registry,
+                mainHandler     = mainHandler,
+                widthPx         = widthPx,
+                heightPx        = heightPx,
+            )
+        } catch (t: Throwable) {
+            reply(null, errorMsg("composition_failed",
+                "attachDuetPreviewTexture: failed to create SurfaceProducer: ${t.message}"))
+            return
+        }
+        session.previewProducer = producer
+
+        // Compute optional layout rects from the effective layoutConfig.
+        val effectiveLayoutMap = layoutConfigMap ?: session.layoutConfigMap
+        val layoutRects = buildLayoutRects(effectiveLayoutMap, widthPx.toDouble(), heightPx.toDouble())
+
+        // Store original values so idempotent re-attach returns them verbatim.
+        session.previewWidthPx    = widthPx
+        session.previewHeightPx   = heightPx
+        session.previewLayoutRects = layoutRects
+
+        reply(producer.toResultMap(widthPx, heightPx, layoutRects), null)
+    }
+
+    // ── detachPreviewTexture (Slice 4A) ───────────────────────────────────────
+
+    fun detachPreviewTexture(sessionId: String, reply: (Any?, String?) -> Unit) {
+        // Unknown session → session_not_found per contract.
+        val session = resolveSession(sessionId, "detachDuetPreviewTexture", reply) ?: return
+        // Idempotent if no attachment exists; helper clears all stored fields.
+        releasePreviewProducer(session)
+        reply(null, null)
+    }
+
+    // ── Preview release helper ────────────────────────────────────────────────
+
+    /** Releases and nulls the session's preview producer if one is attached. */
+    private fun releasePreviewProducer(session: VGDuetAndroidSession) {
+        session.previewProducer?.release()
+        session.previewProducer    = null
+        session.previewWidthPx     = null
+        session.previewHeightPx    = null
+        session.previewLayoutRects = null
+    }
+
+    // ── Layout rect builder ───────────────────────────────────────────────────
+
+    @Suppress("UNCHECKED_CAST")
+    private fun buildLayoutRects(
+        layoutConfigMap: Map<String, Any?>,
+        canvasWidth:  Double,
+        canvasHeight: Double,
+    ): Map<String, Any>? {
+        val mode = layoutConfigMap["mode"] as? String ?: "pip"
+        return when (mode) {
+            "splitLeftRight" -> {
+                val swapped = layoutConfigMap["isSideSwapped"] as? Boolean ?: false
+                val rects = AndroidDuetLayoutGeometry.splitLeftRight(canvasWidth, canvasHeight, swapped)
+                mapOf("source" to rects.source.toMap(), "camera" to rects.camera.toMap())
+            }
+            "splitTopBottom" -> {
+                val swapped = layoutConfigMap["isTopBottomSwapped"] as? Boolean ?: false
+                val rects = AndroidDuetLayoutGeometry.splitTopBottom(canvasWidth, canvasHeight, swapped)
+                mapOf("source" to rects.source.toMap(), "camera" to rects.camera.toMap())
+            }
+            "pip" -> {
+                val sourceRect = AndroidDuetLayoutGeometry.pipSourceRect(canvasWidth, canvasHeight)
+                var cameraRect = sourceRect
+                val rectMap = layoutConfigMap["pipNormalizedRect"] as? Map<*, *>
+                if (rectMap != null) {
+                    val nl = (rectMap["left"]   as? Number)?.toDouble()
+                    val nt = (rectMap["top"]    as? Number)?.toDouble()
+                    val nw = (rectMap["width"]  as? Number)?.toDouble()
+                    val nh = (rectMap["height"] as? Number)?.toDouble()
+                    if (nl != null && nt != null && nw != null && nh != null) {
+                        cameraRect = AndroidDuetLayoutGeometry.pipCameraRect(
+                            canvasWidth, canvasHeight, nl, nt, nw, nh)
+                    }
+                }
+                mapOf("source" to sourceRect.toMap(), "camera" to cameraRect.toMap())
+            }
+            "greenScreen" -> {
+                val rects = AndroidDuetLayoutGeometry.greenScreen(canvasWidth, canvasHeight)
+                mapOf("source" to rects.source.toMap(), "camera" to rects.camera.toMap())
+            }
+            else -> null
+        }
+    }
+
     // ── stopRecording ─────────────────────────────────────────────────────────
 
     fun stopRecording(sessionId: String, reply: (Any?, String?) -> Unit) {
@@ -506,6 +645,7 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
         session.state = VGDuetSessionState.STOPPED
         val dec = session.decoder
         session.decoder = null
+        releasePreviewProducer(session)  // Slice 4A: detach before drop
         activeSession = null
         decoderHandler.post { dec?.release() }
         reply(session.buildStopResult(), null)
@@ -523,6 +663,7 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
             canceledProbeIds += sessionId
             val dec = current.decoder
             current.decoder = null
+            releasePreviewProducer(current)  // Slice 4A: detach before drop
             activeSession = null
             decoderHandler.post { dec?.release() }
         }
@@ -542,6 +683,7 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
             canceledProbeIds += current.sessionId
             val dec = current.decoder
             current.decoder = null
+            releasePreviewProducer(current)  // Slice 4A: detach before drop
             decoderHandler.post { dec?.release() }
         }
         activeSession = null

@@ -1,7 +1,7 @@
 // VGDuetMethodHandler.swift
-// VG-DUET-SLICE-2: Thin dispatch layer from VanguardMediaEnginePlugin to VGDuetNativeSessionCoordinator.
+// VG-DUET-SLICE-2/4A: Thin dispatch layer from VanguardMediaEnginePlugin to VGDuetNativeSessionCoordinator.
 //
-// Owns the 10 MethodChannel route names for Duet.
+// Owns the 12 MethodChannel route names for Duet (10 original + 2 Slice 4A texture routes).
 // Plugin is a thin router only — all session logic lives in VGDuetNativeSessionCoordinator.
 
 import Flutter
@@ -25,6 +25,9 @@ final class VGDuetMethodHandler {
         "deleteLastDuetSegment",
         "stopDuetRecording",
         "disposeDuetSession",
+        // Slice 4A: preview texture lifecycle
+        "attachDuetPreviewTexture",
+        "detachDuetPreviewTexture",
     ]
 
     static func ownsMethod(_ method: String) -> Bool {
@@ -33,7 +36,15 @@ final class VGDuetMethodHandler {
 
     // MARK: - Coordinator
 
-    private let coordinator = VGDuetNativeSessionCoordinator()
+    private let coordinator: VGDuetNativeSessionCoordinator
+
+    // MARK: - Init
+
+    /// Designated initializer.
+    /// [textureRegistry] is passed down to the coordinator for Slice 4A texture allocation.
+    init(textureRegistry: FlutterTextureRegistry? = nil) {
+        coordinator = VGDuetNativeSessionCoordinator(textureRegistry: textureRegistry)
+    }
 
     // MARK: - Dispatch
 
@@ -98,6 +109,27 @@ final class VGDuetMethodHandler {
         case "disposeDuetSession":
             let sid = args?["sessionId"] as? String ?? ""
             coordinator.disposeSession(sessionId: sid) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
+
+        // ── Slice 4A: preview texture ─────────────────────────────────────────
+
+        case "attachDuetPreviewTexture":
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            let canvasSizeMap = args?["canvasSize"] as? [String: Any]
+                ?? ["width": 1080.0, "height": 1920.0]
+            let layoutConfigMap = args?["layoutConfig"] as? [String: Any]
+            coordinator.attachPreviewTexture(
+                sessionId:       sid,
+                canvasSize:      canvasSizeMap,
+                layoutConfigMap: layoutConfigMap
+            ) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
+
+        case "detachDuetPreviewTexture":
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            coordinator.detachPreviewTexture(sessionId: sid) { val, err in
                 self.reply(result: result, value: val, error: err)
             }
 

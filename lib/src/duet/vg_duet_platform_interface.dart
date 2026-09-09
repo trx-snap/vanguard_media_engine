@@ -68,6 +68,26 @@ abstract class VGDuetPlatformInterface {
 
   /// Releases all native resources associated with [sessionId].
   Future<void> disposeSession({required String sessionId});
+
+  /// Attaches a Flutter texture to [sessionId] for true Duet preview.
+  ///
+  /// Returns a [VGDuetPreviewTexture] with the registered [textureId].
+  /// Repeated calls for the same active session are idempotent; the existing
+  /// texture descriptor is returned without allocating a second texture.
+  /// Throws [VGDuetException] with [VGDuetErrorCode.compositionFailed] on
+  /// allocation or layout failure.
+  Future<VGDuetPreviewTexture> attachPreviewTexture({
+    required String sessionId,
+    VGDuetSize canvasSize = const VGDuetSize(1080, 1920),
+    VGDuetLayoutConfig? layoutConfig,
+  });
+
+  /// Detaches and releases the preview texture for [sessionId].
+  ///
+  /// Idempotent: if no preview attachment exists for an otherwise active
+  /// session, succeeds as a no-op. Unknown sessions return
+  /// [VGDuetException] with code 'session_not_found'.
+  Future<void> detachPreviewTexture({required String sessionId});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,6 +351,59 @@ class MethodChannelVGDuetPlatform extends VGDuetPlatformInterface {
       throw VGDuetException(
         code: VGDuetErrorCode.unknown,
         message: e.message ?? 'disposeDuetSession failed.',
+        cause: e,
+      );
+    }
+  }
+
+  // ── attachDuetPreviewTexture ───────────────────────────────────────────────
+  @override
+  Future<VGDuetPreviewTexture> attachPreviewTexture({
+    required String sessionId,
+    VGDuetSize canvasSize = const VGDuetSize(1080, 1920),
+    VGDuetLayoutConfig? layoutConfig,
+  }) async {
+    try {
+      final payload = <String, dynamic>{
+        'sessionId': sessionId,
+        'canvasSize': canvasSize.toMap(),
+        if (layoutConfig != null) 'layoutConfig': layoutConfig.toMap(),
+      };
+      final result = await channel.invokeMethod<Map>(
+        'attachDuetPreviewTexture',
+        payload,
+      );
+      if (result == null) {
+        throw VGDuetException(
+          code: VGDuetErrorCode.compositionFailed,
+          message: 'attachDuetPreviewTexture returned null.',
+        );
+      }
+      return VGDuetPreviewTexture.fromMap(Map<String, dynamic>.from(result));
+    } on VGDuetException {
+      rethrow;
+    } on PlatformException catch (e) {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message: e.message ?? 'attachDuetPreviewTexture failed.',
+        cause: e,
+      );
+    }
+  }
+
+  // ── detachDuetPreviewTexture ───────────────────────────────────────────────
+  @override
+  Future<void> detachPreviewTexture({required String sessionId}) async {
+    try {
+      await channel.invokeMethod<void>(
+        'detachDuetPreviewTexture',
+        <String, dynamic>{'sessionId': sessionId},
+      );
+    } on PlatformException catch (e) {
+      // session_not_found and invalid_state are surfaced as compositionFailed.
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message: e.message ?? 'detachDuetPreviewTexture failed.',
         cause: e,
       );
     }

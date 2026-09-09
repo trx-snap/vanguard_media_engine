@@ -2,20 +2,21 @@ package com.connects.vanguard_media_engine.duet
 
 import android.os.Handler
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.view.TextureRegistry
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VG-DUET-SLICE-2: Android thin dispatch handler for Duet MethodChannel routes.
+// VG-DUET-SLICE-2/4A: Android thin dispatch handler for Duet MethodChannel routes.
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Owns the 10 Duet route names. Plugin is a thin router only —
-// all session logic lives in AndroidDuetSessionCoordinator.
+// Owns the 12 Duet route names (10 original + 2 Slice 4A texture routes).
+// Plugin is a thin router only — all session logic lives in AndroidDuetSessionCoordinator.
 // All public methods are called on the main thread.
 
 /**
  * Thin dispatch handler for all Duet MethodChannel routes.
  * Plugin owns one instance and calls [handleMethodCall] for routes [ownsMethod] returns true for.
  */
-class AndroidDuetMethodHandler(mainHandler: Handler) {
+class AndroidDuetMethodHandler(mainHandler: Handler, textureRegistry: TextureRegistry? = null) {
 
     // ── Owned routes ──────────────────────────────────────────────────────────
 
@@ -31,6 +32,9 @@ class AndroidDuetMethodHandler(mainHandler: Handler) {
             "deleteLastDuetSegment",
             "stopDuetRecording",
             "disposeDuetSession",
+            // Slice 4A: preview texture lifecycle
+            "attachDuetPreviewTexture",
+            "detachDuetPreviewTexture",
         )
 
         @JvmStatic
@@ -39,7 +43,7 @@ class AndroidDuetMethodHandler(mainHandler: Handler) {
 
     // ── Coordinator ───────────────────────────────────────────────────────────
 
-    private val coordinator = AndroidDuetSessionCoordinator(mainHandler)
+    private val coordinator = AndroidDuetSessionCoordinator(mainHandler, textureRegistry)
 
     // ── Dispatch ──────────────────────────────────────────────────────────────
 
@@ -115,6 +119,27 @@ class AndroidDuetMethodHandler(mainHandler: Handler) {
                 // dispose is idempotent — accept empty/unknown sessionId gracefully
                 val sid = safeArgs["sessionId"] as? String ?: ""
                 coordinator.disposeSession(sid) { _, errStr ->
+                    replyFromCoordinator(result, null, errStr)
+                }
+            }
+
+            // ── Slice 4A: preview texture ─────────────────────────────────────
+
+            "attachDuetPreviewTexture" -> {
+                val sid = requireSessionId(safeArgs, method, result) ?: return
+                @Suppress("UNCHECKED_CAST")
+                val canvasSizeMap = safeArgs["canvasSize"] as? Map<String, Any?>
+                    ?: mapOf("width" to 1080.0, "height" to 1920.0)
+                @Suppress("UNCHECKED_CAST")
+                val layoutConfigMap = safeArgs["layoutConfig"] as? Map<String, Any?>
+                coordinator.attachPreviewTexture(sid, canvasSizeMap, layoutConfigMap) { value, errStr ->
+                    replyFromCoordinator(result, value, errStr)
+                }
+            }
+
+            "detachDuetPreviewTexture" -> {
+                val sid = requireSessionId(safeArgs, method, result) ?: return
+                coordinator.detachPreviewTexture(sid) { _, errStr ->
                     replyFromCoordinator(result, null, errStr)
                 }
             }

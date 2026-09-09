@@ -17,7 +17,9 @@ export 'src/duet/vg_duet_models.dart'
         VGDuetTrimWindow,
         VGDuetSegment,
         VGDuetErrorCode,
-        VGDuetException;
+        VGDuetException,
+        VGDuetPreviewTextureState,
+        VGDuetPreviewTexture;
 // VGDuetCompositionDescriptor and VGDuetCaptureResult live in the same file
 // so that VGDuetCaptureResult.compositionDescriptor can be typed correctly.
 export 'src/duet/vg_duet_composition_descriptor.dart'

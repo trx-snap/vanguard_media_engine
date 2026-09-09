@@ -562,3 +562,187 @@ class VGDuetException implements Exception {
       'VGDuetException(code: ${code.name}, message: $message'
       '${cause != null ? ', cause: $cause' : ''})';
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Preview texture lifecycle  (Slice 4A)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The lifecycle state of a Duet preview texture registration.
+///
+/// State machine:
+///   UNATTACHED → attachDuetPreviewTexture → [attachedWaitingSurface] →
+///   surface callback → [surfaceAvailable] ↔ surface cleanup → [surfaceLost]
+///   → detachDuetPreviewTexture / stop / dispose → [detached]
+///   allocation failure → no active attachment (compositionFailed exception)
+enum VGDuetPreviewTextureState {
+  /// Texture registered; waiting for the platform Surface/CALayer to arrive.
+  attachedWaitingSurface,
+
+  /// Surface is ready; a compositor can render frames into the texture.
+  surfaceAvailable,
+
+  /// Surface was lost (e.g. app backgrounded); rendering must pause.
+  surfaceLost,
+
+  /// Texture unregistered; no further rendering is possible.
+  detached,
+}
+
+/// Immutable descriptor returned by [VGDuetPlatformInterface.attachPreviewTexture].
+///
+/// Callers use [textureId] to construct a Flutter [Texture] widget.
+/// The [state] reflects the surface lifecycle at the moment of return.
+/// [layoutRects] carries optional geometry keyed by role when the native
+/// side computed spatial layout at attach time.
+class VGDuetPreviewTexture {
+  /// The Flutter texture registry ID to pass to the [Texture] widget.
+  final int textureId;
+
+  /// Canvas size negotiated with the native engine.
+  final VGDuetSize size;
+
+  /// Lifecycle state at the time this descriptor was constructed.
+  final VGDuetPreviewTextureState state;
+
+  /// Optional layout rects keyed by role (e.g. 'source', 'camera').
+  /// May be null when the native side does not return layout geometry.
+  final Map<String, VGDuetRect>? layoutRects;
+
+  const VGDuetPreviewTexture({
+    required this.textureId,
+    required this.size,
+    required this.state,
+    this.layoutRects,
+  });
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+    'textureId': textureId,
+    'width': size.width,
+    'height': size.height,
+    'state': state.name,
+    if (layoutRects != null)
+      'layoutRects': layoutRects!.map((k, v) => MapEntry(k, v.toMap())),
+  };
+
+  /// Parses the map returned by the native [attachDuetPreviewTexture] reply.
+  ///
+  /// Throws [VGDuetException] with [VGDuetErrorCode.compositionFailed] when
+  /// required keys are missing or have wrong types, so callers see a typed
+  /// error instead of a raw cast exception.
+  factory VGDuetPreviewTexture.fromMap(Map<String, dynamic> map) {
+    final rawId = map['textureId'];
+    if (rawId == null) {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message: 'attachDuetPreviewTexture: missing textureId in native reply.',
+      );
+    }
+    final int textureId;
+    if (rawId is int) {
+      textureId = rawId;
+    } else if (rawId is num) {
+      textureId = rawId.toInt();
+    } else {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message:
+            'attachDuetPreviewTexture: textureId has unexpected type '
+            '${rawId.runtimeType}.',
+      );
+    }
+
+    final rawW = map['width'];
+    final rawH = map['height'];
+    if (rawW == null || rawH == null) {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message:
+            'attachDuetPreviewTexture: missing width/height in native reply.',
+      );
+    }
+    final double w;
+    final double h;
+    if (rawW is num && rawH is num) {
+      w = rawW.toDouble();
+      h = rawH.toDouble();
+    } else {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message:
+            'attachDuetPreviewTexture: width/height have unexpected types.',
+      );
+    }
+
+    final rawState = map['state'];
+    if (rawState is! String) {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message:
+            "attachDuetPreviewTexture: 'state' is missing or not a String.",
+      );
+    }
+    VGDuetPreviewTextureState? parsedState;
+    for (final e in VGDuetPreviewTextureState.values) {
+      if (e.name == rawState) {
+        parsedState = e;
+        break;
+      }
+    }
+    if (parsedState == null) {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message: "attachDuetPreviewTexture: unknown state '$rawState'.",
+      );
+    }
+    final state = parsedState;
+
+    Map<String, VGDuetRect>? layoutRects;
+    final rawRects = map['layoutRects'];
+    if (rawRects is Map) {
+      layoutRects = {};
+      for (final entry in rawRects.entries) {
+        final key = entry.key as String;
+        final val = entry.value;
+        if (val is Map) {
+          layoutRects[key] = VGDuetRect.fromMap(Map<String, dynamic>.from(val));
+        }
+      }
+    }
+
+    return VGDuetPreviewTexture(
+      textureId: textureId,
+      size: VGDuetSize(w, h),
+      state: state,
+      layoutRects: layoutRects?.isEmpty == true ? null : layoutRects,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGDuetPreviewTexture &&
+          textureId == other.textureId &&
+          size == other.size &&
+          state == other.state &&
+          _mapsEqual(layoutRects, other.layoutRects);
+
+  static bool _mapsEqual(
+    Map<String, VGDuetRect>? a,
+    Map<String, VGDuetRect>? b,
+  ) {
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+    for (final key in a.keys) {
+      if (a[key] != b[key]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hash(textureId, size, state);
+
+  @override
+  String toString() =>
+      'VGDuetPreviewTexture(id: $textureId, size: $size, state: ${state.name})';
+}
