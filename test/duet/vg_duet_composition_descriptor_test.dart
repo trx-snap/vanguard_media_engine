@@ -1,0 +1,540 @@
+// Copyright 2026, Connects. All rights reserved.
+import 'package:flutter_test/flutter_test.dart';
+import 'package:vanguard_media_engine/src/duet/vg_duet_source.dart';
+import 'package:vanguard_media_engine/src/duet/vg_duet_models.dart';
+import 'package:vanguard_media_engine/src/duet/vg_duet_composition_descriptor.dart';
+
+VGDuetCompositionDescriptor _makeDescriptor({
+  VGDuetLayoutMode mode = VGDuetLayoutMode.splitLeftRight,
+  bool isSideSwapped = false,
+  bool isTopBottomSwapped = false,
+  VGDuetPiPAnchor? pipAnchor,
+  VGDuetRect? pipNormalizedRect,
+  double initialSpeed = 1.0,
+  double sourceAudioGain = 0.8,
+  double micAudioGain = 0.6,
+  bool sourceAudioMuted = false,
+  bool micAudioMuted = false,
+  List<VGDuetSegment>? segments,
+}) {
+  return VGDuetCompositionDescriptor(
+    source: VGDuetSource.localFile('/tmp/source.mp4'),
+    layoutConfig: VGDuetLayoutConfig(
+      mode: mode,
+      isSideSwapped: isSideSwapped,
+      isTopBottomSwapped: isTopBottomSwapped,
+      pipAnchor: pipAnchor,
+      pipNormalizedRect: pipNormalizedRect,
+    ),
+    trimWindow: VGDuetTrimWindow(startSeconds: 1.0, endSeconds: 10.0),
+    initialSpeed: initialSpeed,
+    segments: segments ?? [],
+    sourceAudioGain: sourceAudioGain,
+    micAudioGain: micAudioGain,
+    sourceAudioMuted: sourceAudioMuted,
+    micAudioMuted: micAudioMuted,
+  );
+}
+
+void main() {
+  group('VGDuetCompositionDescriptor', () {
+    // ── Instantiation ────────────────────────────────────────────────────────
+
+    test('constructs with valid splitLeftRight layout', () {
+      final d = _makeDescriptor();
+      expect(d.layoutConfig.mode, VGDuetLayoutMode.splitLeftRight);
+    });
+
+    test('constructs with splitTopBottom layout', () {
+      final d = _makeDescriptor(mode: VGDuetLayoutMode.splitTopBottom);
+      expect(d.layoutConfig.mode, VGDuetLayoutMode.splitTopBottom);
+    });
+
+    test('constructs with greenScreen layout', () {
+      final d = _makeDescriptor(mode: VGDuetLayoutMode.greenScreen);
+      expect(d.layoutConfig.mode, VGDuetLayoutMode.greenScreen);
+    });
+
+    test('constructs with pip layout', () {
+      final d = _makeDescriptor(
+        mode: VGDuetLayoutMode.pip,
+        pipAnchor: VGDuetPiPAnchor.topRight,
+        pipNormalizedRect: const VGDuetRect(
+          left: 0.63,
+          top: 0.05,
+          width: 0.35,
+          height: 0.35,
+        ),
+      );
+      expect(d.layoutConfig.mode, VGDuetLayoutMode.pip);
+      expect(d.layoutConfig.pipAnchor, VGDuetPiPAnchor.topRight);
+    });
+
+    // ── Speed validation ─────────────────────────────────────────────────────
+
+    test('accepts all valid speed values', () {
+      for (final speed in [0.3, 0.5, 1.0, 2.0, 3.0]) {
+        expect(() => _makeDescriptor(initialSpeed: speed), returnsNormally);
+      }
+    });
+
+    test('throws ArgumentError for invalid speed', () {
+      expect(() => _makeDescriptor(initialSpeed: 1.5), throwsArgumentError);
+    });
+
+    // ── Gain validation ──────────────────────────────────────────────────────
+
+    test('throws ArgumentError for negative sourceAudioGain', () {
+      expect(() => _makeDescriptor(sourceAudioGain: -0.1), throwsArgumentError);
+    });
+
+    test('throws ArgumentError for sourceAudioGain > 1.0', () {
+      expect(() => _makeDescriptor(sourceAudioGain: 1.01), throwsArgumentError);
+    });
+
+    test('accepts boundary gains 0.0 and 1.0', () {
+      expect(
+        () => _makeDescriptor(sourceAudioGain: 0.0, micAudioGain: 1.0),
+        returnsNormally,
+      );
+    });
+
+    // ── Segments list preservation ───────────────────────────────────────────
+
+    test('preserves segment ordering', () {
+      final segs = List.generate(
+        3,
+        (i) => VGDuetSegment(
+          segmentIndex: i,
+          durationMs: 1000 * (i + 1),
+          speedMultiplier: 1.0,
+          sourceStartMs: 0,
+          sourceEndMs: 1000,
+          outputStartMs: 0,
+          outputEndMs: 1000,
+        ),
+      );
+      final d = _makeDescriptor(segments: segs);
+      expect(d.segments.map((s) => s.segmentIndex).toList(), [0, 1, 2]);
+    });
+
+    // ── copyWith ─────────────────────────────────────────────────────────────
+
+    test('copyWith overrides only named fields', () {
+      final d = _makeDescriptor(initialSpeed: 1.0, sourceAudioGain: 0.8);
+      final d2 = d.copyWith(initialSpeed: 2.0);
+      expect(d2.initialSpeed, 2.0);
+      expect(d2.sourceAudioGain, 0.8); // unchanged
+    });
+
+    test('copyWith returns new instance', () {
+      final d = _makeDescriptor();
+      final d2 = d.copyWith();
+      expect(d2, equals(d));
+      expect(identical(d, d2), isFalse);
+    });
+
+    // ── toMap / fromMap round-trip ───────────────────────────────────────────
+
+    test('round-trip splitLeftRight', () {
+      final d = _makeDescriptor(mode: VGDuetLayoutMode.splitLeftRight);
+      final restored = VGDuetCompositionDescriptor.fromMap(d.toMap());
+      expect(restored, equals(d));
+    });
+
+    test('round-trip splitTopBottom with swap', () {
+      final d = _makeDescriptor(
+        mode: VGDuetLayoutMode.splitTopBottom,
+        isTopBottomSwapped: true,
+      );
+      final restored = VGDuetCompositionDescriptor.fromMap(d.toMap());
+      expect(restored.layoutConfig.isTopBottomSwapped, isTrue);
+    });
+
+    test('round-trip pip with normalized rect', () {
+      final d = _makeDescriptor(
+        mode: VGDuetLayoutMode.pip,
+        pipAnchor: VGDuetPiPAnchor.bottomLeft,
+        pipNormalizedRect: const VGDuetRect(
+          left: 0.02,
+          top: 0.6,
+          width: 0.35,
+          height: 0.35,
+        ),
+      );
+      final map = d.toMap();
+      final restored = VGDuetCompositionDescriptor.fromMap(map);
+      expect(restored.layoutConfig.pipAnchor, VGDuetPiPAnchor.bottomLeft);
+      expect(
+        restored.layoutConfig.pipNormalizedRect?.left,
+        closeTo(0.02, 1e-10),
+      );
+    });
+
+    test('round-trip greenScreen', () {
+      final d = _makeDescriptor(mode: VGDuetLayoutMode.greenScreen);
+      final restored = VGDuetCompositionDescriptor.fromMap(d.toMap());
+      expect(restored.layoutConfig.mode, VGDuetLayoutMode.greenScreen);
+    });
+
+    test('round-trip with segments', () {
+      final seg = VGDuetSegment(
+        segmentIndex: 0,
+        durationMs: 2000,
+        speedMultiplier: 0.5,
+        sourceStartMs: 0,
+        sourceEndMs: 4000,
+        outputStartMs: 0,
+        outputEndMs: 2000,
+      );
+      final d = _makeDescriptor(segments: [seg], initialSpeed: 0.5);
+      final restored = VGDuetCompositionDescriptor.fromMap(d.toMap());
+      expect(restored.segments.length, 1);
+      expect(restored.segments.first.speedMultiplier, closeTo(0.5, 0.001));
+    });
+
+    test('round-trip preserves audio gains', () {
+      final d = _makeDescriptor(sourceAudioGain: 0.7, micAudioGain: 0.4);
+      final restored = VGDuetCompositionDescriptor.fromMap(d.toMap());
+      expect(restored.sourceAudioGain, closeTo(0.7, 1e-10));
+      expect(restored.micAudioGain, closeTo(0.4, 1e-10));
+    });
+
+    test('round-trip preserves mute flags', () {
+      final d = _makeDescriptor(sourceAudioMuted: true, micAudioMuted: false);
+      final restored = VGDuetCompositionDescriptor.fromMap(d.toMap());
+      expect(restored.sourceAudioMuted, isTrue);
+      expect(restored.micAudioMuted, isFalse);
+    });
+
+    // ── Value equality ───────────────────────────────────────────────────────
+
+    test('equal descriptors have equal hashCodes', () {
+      final a = _makeDescriptor();
+      final b = _makeDescriptor();
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+    });
+
+    test('descriptors with different speeds are not equal', () {
+      final a = _makeDescriptor(initialSpeed: 1.0);
+      final b = _makeDescriptor(initialSpeed: 2.0);
+      expect(a, isNot(equals(b)));
+    });
+  });
+
+  group('VGDuetTrimWindow', () {
+    test('valid window', () {
+      final tw = VGDuetTrimWindow(startSeconds: 2.0, endSeconds: 10.0);
+      expect(tw.durationSeconds, closeTo(8.0, 1e-10));
+    });
+
+    test('throws if duration < 1.0 s', () {
+      expect(
+        () => VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 0.5),
+        throwsArgumentError,
+      );
+    });
+
+    test('throws if endSeconds <= startSeconds', () {
+      expect(
+        () => VGDuetTrimWindow(startSeconds: 5.0, endSeconds: 5.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('throws if startSeconds < 0', () {
+      expect(
+        () => VGDuetTrimWindow(startSeconds: -1.0, endSeconds: 5.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('round-trip', () {
+      final tw = VGDuetTrimWindow(startSeconds: 1.5, endSeconds: 8.5);
+      final r = VGDuetTrimWindow.fromMap(tw.toMap());
+      expect(r.startSeconds, closeTo(1.5, 1e-10));
+      expect(r.endSeconds, closeTo(8.5, 1e-10));
+    });
+  });
+
+  group('VGDuetSegment', () {
+    test('valid segment', () {
+      final seg = VGDuetSegment(
+        segmentIndex: 0,
+        durationMs: 1500,
+        speedMultiplier: 2.0,
+        sourceStartMs: 0,
+        sourceEndMs: 750,
+        outputStartMs: 0,
+        outputEndMs: 1500,
+      );
+      expect(seg.durationMs, 1500);
+      expect(seg.speedMultiplier, closeTo(2.0, 0.001));
+    });
+
+    test('throws for invalid speed 1.5', () {
+      expect(
+        () => VGDuetSegment(
+          segmentIndex: 0,
+          durationMs: 1000,
+          speedMultiplier: 1.5,
+          sourceStartMs: 0,
+          sourceEndMs: 1000,
+          outputStartMs: 0,
+          outputEndMs: 1000,
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('round-trip', () {
+      final seg = VGDuetSegment(
+        segmentIndex: 1,
+        durationMs: 3000,
+        speedMultiplier: 3.0,
+        sourceStartMs: 500,
+        sourceEndMs: 1500,
+        outputStartMs: 1000,
+        outputEndMs: 4000,
+      );
+      final r = VGDuetSegment.fromMap(seg.toMap());
+      expect(r, equals(seg));
+    });
+  });
+
+  // ── Fix 1: segments list immutability ─────────────────────────────────────
+
+  group('VGDuetCompositionDescriptor segments immutability (Fix 1)', () {
+    test(
+      'mutating original list after construction does not affect descriptor',
+      () {
+        final mutable = <VGDuetSegment>[
+          VGDuetSegment(
+            segmentIndex: 0,
+            durationMs: 1000,
+            speedMultiplier: 1.0,
+            sourceStartMs: 0,
+            sourceEndMs: 1000,
+            outputStartMs: 0,
+            outputEndMs: 1000,
+          ),
+        ];
+        final d = VGDuetCompositionDescriptor(
+          source: VGDuetSource.localFile('/tmp/clip.mp4'),
+          layoutConfig: VGDuetLayoutConfig(
+            mode: VGDuetLayoutMode.splitLeftRight,
+          ),
+          trimWindow: VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 5.0),
+          initialSpeed: 1.0,
+          segments: mutable,
+        );
+        mutable.add(
+          VGDuetSegment(
+            segmentIndex: 1,
+            durationMs: 2000,
+            speedMultiplier: 1.0,
+            sourceStartMs: 0,
+            sourceEndMs: 2000,
+            outputStartMs: 1000,
+            outputEndMs: 3000,
+          ),
+        );
+        // descriptor must still have only 1 segment
+        expect(d.segments.length, 1);
+      },
+    );
+
+    test('descriptor.segments.add throws UnsupportedError', () {
+      final d = _makeDescriptor();
+      expect(
+        () => d.segments.add(
+          VGDuetSegment(
+            segmentIndex: 0,
+            durationMs: 1000,
+            speedMultiplier: 1.0,
+            sourceStartMs: 0,
+            sourceEndMs: 1000,
+            outputStartMs: 0,
+            outputEndMs: 1000,
+          ),
+        ),
+        throwsUnsupportedError,
+      );
+    });
+  });
+
+  // ── Fix 4: VGDuetLayoutConfig PiP validation at construction ─────────────
+
+  group('VGDuetLayoutConfig PiP validation at construction (Fix 4)', () {
+    test(
+      'throws ArgumentError for zero-width pipNormalizedRect in PiP mode',
+      () {
+        expect(
+          () => VGDuetLayoutConfig(
+            mode: VGDuetLayoutMode.pip,
+            pipNormalizedRect: const VGDuetRect(
+              left: 0.0,
+              top: 0.0,
+              width: 0.0,
+              height: 0.3,
+            ),
+          ),
+          throwsArgumentError,
+        );
+      },
+    );
+
+    test('throws for pipNormalizedRect.right > 1.0 in PiP mode', () {
+      expect(
+        () => VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.pip,
+          pipNormalizedRect: const VGDuetRect(
+            left: 0.9,
+            top: 0.0,
+            width: 0.5,
+            height: 0.3,
+          ),
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('throws for negative left in PiP mode', () {
+      expect(
+        () => VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.pip,
+          pipNormalizedRect: const VGDuetRect(
+            left: -0.1,
+            top: 0.0,
+            width: 0.3,
+            height: 0.3,
+          ),
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('does NOT throw for invalid rect when mode is NOT pip', () {
+      // pipNormalizedRect validation is only for pip mode
+      expect(
+        () => VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.splitLeftRight,
+          pipNormalizedRect: const VGDuetRect(
+            left: -1.0,
+            top: -1.0,
+            width: 0.0,
+            height: 0.0,
+          ),
+        ),
+        returnsNormally,
+      );
+    });
+
+    test('valid PiP rect does not throw', () {
+      expect(
+        () => VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.pip,
+          pipAnchor: VGDuetPiPAnchor.topRight,
+          pipNormalizedRect: const VGDuetRect(
+            left: 0.63,
+            top: 0.05,
+            width: 0.35,
+            height: 0.35,
+          ),
+        ),
+        returnsNormally,
+      );
+    });
+
+    test('fromMap throws on invalid PiP rect', () {
+      final invalidMap = {
+        'mode': 'pip',
+        'isSideSwapped': false,
+        'isTopBottomSwapped': false,
+        'pipNormalizedRect': {
+          'left': 0.9,
+          'top': 0.0,
+          'width': 0.5, // right = 1.4 > 1.0
+          'height': 0.3,
+        },
+      };
+      expect(
+        () => VGDuetLayoutConfig.fromMap(Map<String, dynamic>.from(invalidMap)),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  // ── Fix 3: VGDuetCaptureResult typed compositionDescriptor + unmodifiable ─
+
+  group('VGDuetCaptureResult (Fix 3)', () {
+    VGDuetCompositionDescriptor _cd() => _makeDescriptor();
+
+    test('compositionDescriptor is typed VGDuetCompositionDescriptor', () {
+      final result = VGDuetCaptureResult(
+        compositionDescriptor: _cd(),
+        segmentAssets: ['/tmp/seg0.mp4'],
+        totalDurationMs: 5000,
+        segmentCount: 1,
+      );
+      // Compile-time and runtime type check
+      expect(result.compositionDescriptor, isA<VGDuetCompositionDescriptor>());
+    });
+
+    test('segmentAssets is unmodifiable', () {
+      final assets = ['/tmp/seg0.mp4'];
+      final result = VGDuetCaptureResult(
+        compositionDescriptor: _cd(),
+        segmentAssets: assets,
+        totalDurationMs: 2000,
+        segmentCount: 1,
+      );
+      expect(
+        () => result.segmentAssets.add('/tmp/seg1.mp4'),
+        throwsUnsupportedError,
+      );
+    });
+
+    test(
+      'mutating original assets list does not affect result.segmentAssets',
+      () {
+        final assets = ['/tmp/seg0.mp4'];
+        final result = VGDuetCaptureResult(
+          compositionDescriptor: _cd(),
+          segmentAssets: assets,
+          totalDurationMs: 2000,
+          segmentCount: 1,
+        );
+        assets.add('/tmp/seg1.mp4');
+        expect(result.segmentAssets.length, 1);
+      },
+    );
+  });
+
+  // ── Fix 2: VGDuetLayoutConfig.fromMap handles Map<Object?,Object?> ─────────
+
+  group('VGDuetLayoutConfig.fromMap nested Map types (Fix 2)', () {
+    test('parses pipNormalizedRect from Map<Object?, Object?>', () {
+      final map = <String, dynamic>{
+        'mode': 'pip',
+        'isSideSwapped': false,
+        'isTopBottomSwapped': false,
+        'pipAnchor': 'bottomLeft',
+        // Simulate MethodChannel returning untyped Map
+        'pipNormalizedRect': <Object?, Object?>{
+          'left': 0.02,
+          'top': 0.60,
+          'width': 0.35,
+          'height': 0.35,
+        },
+      };
+
+      final cfg = VGDuetLayoutConfig.fromMap(map);
+      expect(cfg.mode, VGDuetLayoutMode.pip);
+      expect(cfg.pipNormalizedRect?.left, closeTo(0.02, 1e-10));
+      expect(cfg.pipNormalizedRect?.width, closeTo(0.35, 1e-10));
+      expect(cfg.pipAnchor, VGDuetPiPAnchor.bottomLeft);
+    });
+  });
+}
