@@ -8583,11 +8583,8 @@ final class VGVideoAssetPickerHandler {
         }
         // A cancelled or dismissed selection must not leak a retained
         // PhotoKit asset from an earlier fast-path resolve of the same id.
-        let droppedRetained = retainedReferenceAssets.removeValue(forKey: assetId) != nil
+        retainedReferenceAssets.removeValue(forKey: assetId)
         lock.unlock()
-        if droppedRetained {
-            NSLog("[UE_IMPORT_DIAG] retainedReference dropped-by-cancel assetId=%@", assetId)
-        }
         result(true)
     }
 
@@ -8607,10 +8604,7 @@ final class VGVideoAssetPickerHandler {
         }
         lock.lock()
         let removed = retainedReferenceAssets.removeValue(forKey: assetId) != nil
-        let remaining = retainedReferenceAssets.count
         lock.unlock()
-        NSLog("[UE_IMPORT_DIAG] releaseReference assetId=%@ removed=%@ remaining=%d",
-              assetId, removed ? "true" : "false", remaining)
         result(removed)
     }
 
@@ -8656,24 +8650,6 @@ final class VGVideoAssetPickerHandler {
         guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
             result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
             return
-        }
-
-        // ── UE_IMPORT_DIAG: timing-only instrumentation, no behavior change ──
-        let diagStartTime = CFAbsoluteTimeGetCurrent()
-        NSLog("[UE_IMPORT_DIAG] handleResolveVideoReference entry assetId=%@", assetId)
-
-        func diagPathCategory(for url: URL) -> String {
-            guard url.isFileURL else { return "non_file" }
-            let path = url.path
-            if path.hasPrefix(NSTemporaryDirectory()) { return "tmp" }
-            if path.hasPrefix(NSHomeDirectory()) { return "app_sandbox" }
-            if path.contains("/Media/") { return "photos_library" }
-            return "other_absolute"
-        }
-
-        func diagFileSize(_ url: URL) -> Int64? {
-            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
-            return (attrs[.size] as? NSNumber)?.int64Value
         }
 
         // Exactly one Flutter reply on every terminal path, always on main.
@@ -8737,16 +8713,12 @@ final class VGVideoAssetPickerHandler {
             }
 
             func finishFailure(code: String, message: String) {
-                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - diagStartTime) * 1000)
-                NSLog("[UE_IMPORT_DIAG] finishFailure assetId=%@ code=%@ elapsedMs=%d", assetId, code, elapsedMs)
                 clearRegistrations(dropRetained: true)
                 removeFallbackOutputs()
                 respond(FlutterError(code: code, message: message, details: nil))
             }
 
             func finishCancelled() {
-                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - diagStartTime) * 1000)
-                NSLog("[UE_IMPORT_DIAG] finishCancelled assetId=%@ elapsedMs=%d", assetId, elapsedMs)
                 finishFailure(code: "REFERENCE_UNRESOLVABLE", message: "Reference resolution was cancelled")
             }
 
@@ -8776,10 +8748,6 @@ final class VGVideoAssetPickerHandler {
                     // cancelled fallback completion leaves no temp file.
                     finishCancelled()
                     return
-                }
-                if retaining != nil {
-                    NSLog("[UE_IMPORT_DIAG] retainedReference stored assetId=%@ pathCategory=%@",
-                          assetId, diagPathCategory(for: url))
                 }
                 var dict: [String: Any] = [
                     "assetId": assetId,
@@ -8816,10 +8784,6 @@ final class VGVideoAssetPickerHandler {
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                 let requestError = info?[PHImageErrorKey] as? Error
 
-                let requestElapsedMs = Int((CFAbsoluteTimeGetCurrent() - diagStartTime) * 1000)
-                NSLog("[UE_IMPORT_DIAG] requestAVAsset callback assetId=%@ elapsedMs=%d inCloud=%@ cancelled=%@ hasAsset=%@",
-                      assetId, requestElapsedMs, inCloud ? "true" : "false", cancelled ? "true" : "false", (avAsset != nil) ? "true" : "false")
-
                 if cancelled || !isStillRegistered() {
                     finishCancelled()
                     return
@@ -8839,10 +8803,6 @@ final class VGVideoAssetPickerHandler {
                 // ── Fast path: readable local file, no copy ──────────────────
                 if let urlAsset = avAsset as? AVURLAsset {
                     let url = urlAsset.url
-                    let diagIsFileURL = url.isFileURL
-                    let diagIsReadable = FileManager.default.isReadableFile(atPath: url.path)
-                    NSLog("[UE_IMPORT_DIAG] fastPathDecision assetId=%@ isFileURL=%@ isReadableFile=%@ pathCategory=%@",
-                          assetId, diagIsFileURL ? "true" : "false", diagIsReadable ? "true" : "false", diagPathCategory(for: url))
                     if url.isFileURL, FileManager.default.isReadableFile(atPath: url.path) {
                         // Outside the app container the path is readable only
                         // for as long as PhotoKit's AVAsset lives; retain it.
@@ -8873,10 +8833,6 @@ final class VGVideoAssetPickerHandler {
                 }
 
                 func runFallback(_ session: AVAssetExportSession, outputURL: URL, isRetry: Bool) {
-                    let fallbackStart = CFAbsoluteTimeGetCurrent()
-                    NSLog("[UE_IMPORT_DIAG] fallbackExport start assetId=%@ preset=%@ outputExt=%@ isRetry=%@",
-                          assetId, session.presetName, outputURL.pathExtension, isRetry ? "true" : "false")
-
                     // Register under the same lock that cancelExport uses so a
                     // cancel landing between phases cannot leave an orphaned
                     // export running against a dismissed sheet.
@@ -8892,18 +8848,11 @@ final class VGVideoAssetPickerHandler {
                     }
 
                     session.exportAsynchronously {
-                        let fallbackElapsedMs = Int((CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000)
                         switch session.status {
                         case .completed:
-                            let outputBytes = diagFileSize(outputURL)
-                            NSLog("[UE_IMPORT_DIAG] fallbackExport completed assetId=%@ elapsedMs=%d isRetry=%@ status=%d outputBytes=%@",
-                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue,
-                                  outputBytes.map { String($0) } ?? "unknown")
                             finishSuccess(url: outputURL, retaining: nil)
 
                         case .failed:
-                            NSLog("[UE_IMPORT_DIAG] fallbackExport failed assetId=%@ elapsedMs=%d isRetry=%@ status=%d",
-                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue)
                             try? FileManager.default.removeItem(at: outputURL)
                             if !isRetry, let hq = makeSession(preset: AVAssetExportPresetHighestQuality) {
                                 runFallback(hq.session, outputURL: hq.url, isRetry: true)
@@ -8913,13 +8862,9 @@ final class VGVideoAssetPickerHandler {
                             }
 
                         case .cancelled:
-                            NSLog("[UE_IMPORT_DIAG] fallbackExport cancelled assetId=%@ elapsedMs=%d isRetry=%@ status=%d",
-                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue)
                             finishCancelled()
 
                         default:
-                            NSLog("[UE_IMPORT_DIAG] fallbackExport unexpected assetId=%@ elapsedMs=%d isRetry=%@ status=%d",
-                                  assetId, fallbackElapsedMs, isRetry ? "true" : "false", session.status.rawValue)
                             finishFailure(code: "REFERENCE_UNRESOLVABLE",
                                           message: "Unexpected fallback export status \(session.status.rawValue)")
                         }
