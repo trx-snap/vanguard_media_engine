@@ -109,6 +109,19 @@ final class VGThermalSubscription {
   VGThermalSubscription._(this._token);
 }
 
+/// Subscription token for iOS PhotoKit iCloud video download progress
+/// callbacks (`onPhotoVideoDownloadProgress`).
+///
+/// Keyed by PhotoKit [assetId] (localIdentifier). Unregister via
+/// [VanguardChannelDispatcher.unregisterPhotoVideoDownloadProgressListener].
+/// Public consumers should go through the `vg_photo_video_download_progress`
+/// library rather than the dispatcher directly.
+final class VGPhotoVideoDownloadProgressSubscription {
+  final String assetId;
+  final Object _token;
+  VGPhotoVideoDownloadProgressSubscription._(this.assetId, this._token);
+}
+
 // ── Internal storage types ────────────────────────────────────────────────────
 
 class _TimelineEntry {
@@ -141,6 +154,12 @@ class _ExportEntry {
   _ExportEntry({required this.token, required this.onProgress});
 }
 
+class _PhotoVideoDownloadEntry {
+  final Object token;
+  final void Function(double progress) onProgress;
+  _PhotoVideoDownloadEntry({required this.token, required this.onProgress});
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 /// The package-level singleton MethodChannel callback router.
@@ -164,6 +183,7 @@ class _ExportEntry {
 /// | Playback complete  | Single-slot      | token        |
 /// | Duration probed    | Single-slot      | token        |
 /// | Thermal state      | Single-slot      | token        |
+/// | iCloud download    | Per assetId      | assetId      |
 ///
 /// Export progress is a stack rather than a single slot so that a
 /// short-lived registration (e.g. a nested [VanguardTimelineExporter]
@@ -226,6 +246,12 @@ final class VanguardChannelDispatcher {
   // Thermal state: single-slot.
   void Function(int rawValue)? _thermalStateCallback;
   Object? _thermalStateToken;
+
+  // iOS PhotoKit iCloud video download progress: keyed by assetId. Events
+  // for an assetId with no registered listener are stale (the consumer has
+  // already unregistered) and are dropped; nothing is buffered.
+  final Map<String, _PhotoVideoDownloadEntry> _photoVideoDownloadListeners =
+      {};
 
   // ── Handler registration ───────────────────────────────────────────────────
 
@@ -290,8 +316,26 @@ final class VanguardChannelDispatcher {
         }
         break;
 
+      case 'onPhotoVideoDownloadProgress':
+        _dispatchPhotoVideoDownloadProgress(call.arguments);
+        break;
+
       // Unknown callbacks are silently dropped — forward compatibility.
     }
+  }
+
+  void _dispatchPhotoVideoDownloadProgress(dynamic arguments) {
+    // Payload: {assetId: String, progress: num} (iOS PhotoKit download).
+    final args = arguments as Map?;
+    final assetId = args?['assetId'];
+    final progress = (args?['progress'] as num?)?.toDouble();
+    if (assetId is! String || assetId.isEmpty || progress == null) {
+      return; // malformed — drop silently
+    }
+    // No listener for this assetId means the consumer already unregistered
+    // (stale event from a cancelled / superseded download): drop it.
+    final entry = _photoVideoDownloadListeners[assetId];
+    entry?.onProgress(progress.clamp(0.0, 1.0));
   }
 
   void _dispatchTimelineFrame(dynamic arguments) {
@@ -525,6 +569,44 @@ final class VanguardChannelDispatcher {
     }
   }
 
+  // ── PhotoKit iCloud download progress registration ────────────────────────
+
+  /// Registers an iOS PhotoKit iCloud download progress listener for
+  /// [assetId] (`onPhotoVideoDownloadProgress`).
+  ///
+  /// Keyed by assetId: a new registration for the same assetId replaces the
+  /// previous one (the previous token becomes stale). Progress values are
+  /// clamped to `[0.0, 1.0]` before delivery. Events for assetIds with no
+  /// registered listener are dropped, never buffered.
+  VGPhotoVideoDownloadProgressSubscription
+      registerPhotoVideoDownloadProgressListener({
+    required String assetId,
+    required void Function(double progress) onProgress,
+  }) {
+    ensureHandlerRegistered();
+    final token = Object();
+    _photoVideoDownloadListeners[assetId] = _PhotoVideoDownloadEntry(
+      token: token,
+      onProgress: onProgress,
+    );
+    return VGPhotoVideoDownloadProgressSubscription._(assetId, token);
+  }
+
+  /// Unregisters a PhotoKit download progress listener.
+  ///
+  /// Removes the entry for the subscription's assetId only when it still
+  /// belongs to [subscription]; stale tokens (superseded by a newer
+  /// registration for the same assetId, or already unregistered) are safe
+  /// no-ops.
+  void unregisterPhotoVideoDownloadProgressListener(
+    VGPhotoVideoDownloadProgressSubscription subscription,
+  ) {
+    final entry = _photoVideoDownloadListeners[subscription.assetId];
+    if (entry != null && identical(entry.token, subscription._token)) {
+      _photoVideoDownloadListeners.remove(subscription.assetId);
+    }
+  }
+
   // ── Testing seam ──────────────────────────────────────────────────────────
 
   /// Resets all dispatcher state. **Test-only — never call in production.**
@@ -542,9 +624,16 @@ final class VanguardChannelDispatcher {
     _durationProbedToken = null;
     _thermalStateCallback = null;
     _thermalStateToken = null;
+    _photoVideoDownloadListeners.clear();
     _handlerRegistered = false;
     _channel = channel ?? const MethodChannel('vanguard_media_engine');
   }
+
+  /// Whether a PhotoKit download progress listener is registered for
+  /// [assetId]. **Test-only.**
+  @visibleForTesting
+  bool hasPhotoVideoDownloadProgressListenerForTesting(String assetId) =>
+      _photoVideoDownloadListeners.containsKey(assetId);
 
   /// Whether the handler has been registered. **Test-only.**
   @visibleForTesting

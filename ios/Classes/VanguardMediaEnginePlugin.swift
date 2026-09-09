@@ -467,6 +467,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         instance.registrar = registrar
         instance.channel   = channel
         registrar.addMethodCallDelegate(instance, channel: channel)
+        // UMF V2: the picker handler emits onPhotoVideoDownloadProgress for
+        // downloadPhotoVideoReference on this channel (weak; plugin owns it).
+        instance.videoAssetPickerHandler.channel = channel
 
         // Phase 4C6H3F: register for UIApplicationDelegate callbacks so
         // application(_:handleEventsForBackgroundURLSession:completionHandler:)
@@ -7602,6 +7605,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "resolvePhotoVideoReference":
             videoAssetPickerHandler.handleResolveVideoReference(args: args, result: result)
 
+        // UMF V2: explicit, user-consented iCloud download counterpart of
+        // resolvePhotoVideoReference (network allowed; progress via
+        // onPhotoVideoDownloadProgress; cancellable via cancelExportPhotoVideo).
+        case "downloadPhotoVideoReference":
+            videoAssetPickerHandler.handleDownloadVideoReference(args: args, result: result)
+
         case "cancelExportPhotoVideo":
             videoAssetPickerHandler.handleCancelExport(args: args, result: result)
 
@@ -8135,29 +8144,178 @@ private final class _VanguardMC8DiagDelegate: NSObject, VanguardMultiCamMediaSou
 //   - Support iCloud-backed assets (isNetworkAccessAllowed = true).
 //   - Resolve a reference-only selection to its local PhotoKit file URL without
 //     copying (isNetworkAccessAllowed = false; iCloud-only assets fail fast).
+//   - Explicit, user-consented iCloud download of a reference selection
+//     (isNetworkAccessAllowed = true) with Flutter-owned progress reporting
+//     via onPhotoVideoDownloadProgress; no native UIKit progress UI.
 //   - Safe cancellation and temp file cleanup on error.
 //   - Thread-safe and dispatches Flutter results on the main queue.
+//
+// Ownership model (UMF V2 token scoping):
+//   Every export / resolve / download invocation mints a private UUID token
+//   and registers it as the owner of the assetId's request slot. All
+//   terminal helpers compare their captured token against the current owner
+//   before clearing activeRequestIds / activeExports / retainedReferenceAssets,
+//   so a stale PhotoKit or AVAssetExportSession completion from an older
+//   invocation (cancelled, then retried for the same assetId) can never
+//   delete the registration or retention that belongs to the newer retry.
+//   cancelExportPhotoVideo stays assetId-keyed: it cancels whichever
+//   invocation currently owns the slot.
 
 final class VGVideoAssetPickerHandler {
     private let imageManager = PHCachingImageManager()
     private let lock = NSLock()
-    private var activeRequestIds: [String: PHImageRequestID] = [:]
-    private var activeExports: [String: AVAssetExportSession] = [:]
+
+    /// Channel used to emit `onPhotoVideoDownloadProgress` for
+    /// downloadPhotoVideoReference. Set by the plugin at registration; weak
+    /// because the plugin instance owns the channel.
+    weak var channel: FlutterMethodChannel?
+
+    /// Per-invocation ownership token (see "Ownership model" above).
+    private typealias VGPickerToken = UUID
+
+    private struct VGOwnedRequest {
+        let token: VGPickerToken
+        var requestId: PHImageRequestID
+    }
+
+    private struct VGOwnedExport {
+        let token: VGPickerToken
+        let session: AVAssetExportSession
+    }
+
+    private struct VGOwnedReference {
+        let token: VGPickerToken
+        let asset: AVAsset
+    }
+
+    /// Current PhotoKit request per assetId, tagged with its owning token.
+    /// Also doubles as the cancellation flag for resolve/download: a missing
+    /// or foreign-token entry means "cancelled / superseded". Guarded by `lock`.
+    private var activeRequestIds: [String: VGOwnedRequest] = [:]
+
+    /// Current fallback / cache export session per assetId, tagged with its
+    /// owning token. Guarded by `lock`.
+    private var activeExports: [String: VGOwnedExport] = [:]
 
     /// PhotoKit reference ownership for zero-copy fast-path resolutions.
     ///
-    /// `handleResolveVideoReference` replies with the raw POSIX path of the
-    /// AVURLAsset PhotoKit hands back. When that path lives outside the app
-    /// container (Photos library, /private/var/mobile/Media/...), the sandbox
-    /// grant that makes it readable is tied to the lifetime of the AVAsset
-    /// PhotoKit returned. Dart later reopens the path by name (preview,
-    /// trim, export), so the asset must stay alive for the whole editor
-    /// session. Entries are keyed by PhotoKit localIdentifier, stored only for
-    /// successful outside-sandbox fast paths, replaced on re-resolve, and
-    /// removed by `releasePhotoVideoReference`, `cancelExportPhotoVideo`, or
-    /// a failed/cancelled resolve. Temp-export fallbacks are never retained:
-    /// their output is a local file the app owns. Guarded by `lock`.
-    private var retainedReferenceAssets: [String: AVAsset] = [:]
+    /// `handleResolveVideoReference` / `handleDownloadVideoReference` reply
+    /// with the raw POSIX path of the AVURLAsset PhotoKit hands back. When
+    /// that path lives outside the app container (Photos library,
+    /// /private/var/mobile/Media/...), the sandbox grant that makes it
+    /// readable is tied to the lifetime of the AVAsset PhotoKit returned.
+    /// Dart later reopens the path by name (preview, trim, export), so the
+    /// asset must stay alive for the whole editor session. Entries are keyed
+    /// by PhotoKit localIdentifier, stored only for successful
+    /// outside-sandbox fast paths, replaced by a later successful resolve of
+    /// the same id, and removed by `releasePhotoVideoReference`,
+    /// `cancelExportPhotoVideo`, or a failed/cancelled resolve **of the same
+    /// owning token** (a stale failure from an older invocation never drops a
+    /// newer retention). Temp-export fallbacks are never retained: their
+    /// output is a local file the app owns. Guarded by `lock`.
+    private var retainedReferenceAssets: [String: VGOwnedReference] = [:]
+
+    // ── Token-scoped ownership helpers (all take `lock` internally) ─────────
+
+    /// Makes [token] the current owner of [assetId]'s request slot with
+    /// [requestId] (PHInvalidImageRequestID as a placeholder is fine). A
+    /// previous owner with a different token is superseded: its PhotoKit
+    /// request and export session are cancelled so only the newest
+    /// invocation keeps doing work; its own terminal callbacks then find a
+    /// foreign token and clear nothing.
+    private func claimRequestSlot(assetId: String, token: VGPickerToken, requestId: PHImageRequestID) {
+        lock.lock()
+        let previousRequest = activeRequestIds[assetId]
+        let previousExport = activeExports[assetId]
+        activeRequestIds[assetId] = VGOwnedRequest(token: token, requestId: requestId)
+        if let previousExport = previousExport, previousExport.token != token {
+            activeExports.removeValue(forKey: assetId)
+        }
+        lock.unlock()
+        if let previousRequest = previousRequest, previousRequest.token != token,
+           previousRequest.requestId != PHInvalidImageRequestID {
+            imageManager.cancelImageRequest(previousRequest.requestId)
+        }
+        if let previousExport = previousExport, previousExport.token != token {
+            previousExport.session.cancelExport()
+        }
+    }
+
+    /// Swaps the placeholder request id for the real one, only while [token]
+    /// still owns the slot (a cancel or supersede in between leaves it alone).
+    private func bindRequestId(assetId: String, token: VGPickerToken, requestId: PHImageRequestID) {
+        lock.lock()
+        if let current = activeRequestIds[assetId], current.token == token {
+            activeRequestIds[assetId] = VGOwnedRequest(token: token, requestId: requestId)
+        }
+        lock.unlock()
+    }
+
+    /// True while [token] is the current owner of [assetId]'s request slot.
+    private func ownsRequestSlot(assetId: String, token: VGPickerToken) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeRequestIds[assetId]?.token == token
+    }
+
+    /// Registers [session] as the export for [assetId] under [token] only
+    /// while [token] still owns the request slot. Returns false (without
+    /// registering) when the invocation was cancelled or superseded meanwhile.
+    private func attachExportIfOwner(assetId: String, token: VGPickerToken, session: AVAssetExportSession) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeRequestIds[assetId]?.token == token else { return false }
+        activeExports[assetId] = VGOwnedExport(token: token, session: session)
+        return true
+    }
+
+    /// Registers [session] as the export for [assetId] under [token]
+    /// unconditionally (legacy exportPhotoVideo path, which has no
+    /// mid-flight cancellation flag semantics of its own).
+    private func attachExport(assetId: String, token: VGPickerToken, session: AVAssetExportSession) {
+        lock.lock()
+        activeExports[assetId] = VGOwnedExport(token: token, session: session)
+        lock.unlock()
+    }
+
+    /// Clears the request / export entries for [assetId] only when they are
+    /// owned by [token]. With [dropRetained], also drops the retained
+    /// reference only when it was retained by [token]. Entries owned by a
+    /// newer invocation are never touched.
+    private func clearOwnedRegistrations(assetId: String, token: VGPickerToken, dropRetained: Bool) {
+        lock.lock()
+        if activeRequestIds[assetId]?.token == token {
+            activeRequestIds.removeValue(forKey: assetId)
+        }
+        if activeExports[assetId]?.token == token {
+            activeExports.removeValue(forKey: assetId)
+        }
+        if dropRetained, retainedReferenceAssets[assetId]?.token == token {
+            retainedReferenceAssets.removeValue(forKey: assetId)
+        }
+        lock.unlock()
+    }
+
+    /// Success terminal bookkeeping, in one lock acquisition: returns whether
+    /// [token] still owned the request slot (cancellation wins otherwise),
+    /// clears the owned entries, and — when still wanted and [retaining] is
+    /// non-nil — stores the retained asset under [token], replacing any
+    /// earlier retention for this id.
+    private func settleOwnedSuccess(assetId: String, token: VGPickerToken, retaining: AVAsset?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let stillWanted = activeRequestIds[assetId]?.token == token
+        if stillWanted {
+            activeRequestIds.removeValue(forKey: assetId)
+        }
+        if activeExports[assetId]?.token == token {
+            activeExports.removeValue(forKey: assetId)
+        }
+        if stillWanted, let retained = retaining {
+            retainedReferenceAssets[assetId] = VGOwnedReference(token: token, asset: retained)
+        }
+        return stillWanted
+    }
 
     /// True when [url] is a file URL inside this app's container (tmp or home).
     /// Paths outside it need the PhotoKit AVAsset retained to stay readable.
@@ -8317,15 +8475,6 @@ final class VGVideoAssetPickerHandler {
 
     // ── Export Video ─────────────────────────────────────────────────────────
 
-    /// Removes the stored PHImageRequestID for [assetId] under the instance lock.
-    /// Called on every terminal path of handleExportVideo so that the dictionary
-    /// does not accumulate stale Int32 entries after a request has already settled.
-    private func clearRequestId(for assetId: String) {
-        lock.lock()
-        activeRequestIds.removeValue(forKey: assetId)
-        lock.unlock()
-    }
-
     func handleExportVideo(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
             result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
@@ -8342,6 +8491,11 @@ final class VGVideoAssetPickerHandler {
         videoOptions.isNetworkAccessAllowed = true
         videoOptions.version = .current
         videoOptions.deliveryMode = .highQualityFormat
+
+        // Ownership token for this invocation: every terminal path below only
+        // clears registrations it owns, so a stale completion can never
+        // clobber a newer export/resolve of the same assetId.
+        let token: VGPickerToken = UUID()
 
         let exportId = UUID().uuidString
         let outputFileName = "ue_video_\(exportId).mov"
@@ -8362,16 +8516,25 @@ final class VGVideoAssetPickerHandler {
             }
         }
 
+        // Claim the slot with a placeholder before issuing the request so a
+        // cancel racing the request start still finds an owner to cancel.
+        claimRequestSlot(assetId: assetId, token: token, requestId: PHInvalidImageRequestID)
+
         let reqId = imageManager.requestAVAsset(forVideo: asset, options: videoOptions) { [weak self] avAsset, audioMix, info in
+            // Clears request + export entries owned by this invocation only.
+            func clearOwn() {
+                self?.clearOwnedRegistrations(assetId: assetId, token: token, dropRetained: false)
+            }
+
             if let error = info?[PHImageErrorKey] as? Error {
-                self?.clearRequestId(for: assetId)
+                clearOwn()
                 try? FileManager.default.removeItem(at: outputURL)
                 sendExportResult(FlutterError(code: "EXPORT_FAILED", message: error.localizedDescription, details: nil))
                 return
             }
 
             guard let avAsset = avAsset else {
-                self?.clearRequestId(for: assetId)
+                clearOwn()
                 try? FileManager.default.removeItem(at: outputURL)
                 sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Could not load AVAsset for video", details: nil))
                 return
@@ -8382,7 +8545,7 @@ final class VGVideoAssetPickerHandler {
                 let sourceURL = urlAsset.url
                 do {
                     try FileManager.default.copyItem(at: sourceURL, to: outputURL)
-                    self?.clearRequestId(for: assetId)
+                    clearOwn()
                     sendExportResult(outputURL.path)
                     return
                 } catch {
@@ -8395,17 +8558,14 @@ final class VGVideoAssetPickerHandler {
             // IMPORTANT: all path reporting uses session.outputURL.path, not the
             // closed-over outputURL, so fallback .mp4 paths are returned correctly.
             func runExport(_ session: AVAssetExportSession, isRetry: Bool) {
-                session.exportAsynchronously { [weak self] in
+                session.exportAsynchronously {
                     // The actual output URL for this session (may differ from
                     // outputURL when fallback chose .mp4).
                     let sessionOutputURL = session.outputURL
 
                     switch session.status {
                     case .completed:
-                        self?.lock.lock()
-                        self?.activeExports.removeValue(forKey: assetId)
-                        self?.lock.unlock()
-                        self?.clearRequestId(for: assetId)
+                        clearOwn()
                         // Return the session's actual output path so .mp4
                         // fallback paths are forwarded correctly to Flutter.
                         sendExportResult(sessionOutputURL?.path)
@@ -8424,10 +8584,7 @@ final class VGVideoAssetPickerHandler {
                                 asset: avAsset,
                                 presetName: AVAssetExportPresetHighestQuality
                             ) else {
-                                self?.lock.lock()
-                                self?.activeExports.removeValue(forKey: assetId)
-                                self?.lock.unlock()
-                                self?.clearRequestId(for: assetId)
+                                clearOwn()
                                 let err = session.error?.localizedDescription ?? "Export failed and fallback unavailable"
                                 sendExportResult(FlutterError(code: "EXPORT_FAILED", message: err, details: nil))
                                 return
@@ -8437,10 +8594,7 @@ final class VGVideoAssetPickerHandler {
                             let preferredTypes: [AVFileType] = [.mov, .mp4]
                             let supportedTypes = fallback.supportedFileTypes
                             guard let chosenType = preferredTypes.first(where: { supportedTypes.contains($0) }) else {
-                                self?.lock.lock()
-                                self?.activeExports.removeValue(forKey: assetId)
-                                self?.lock.unlock()
-                                self?.clearRequestId(for: assetId)
+                                clearOwn()
                                 sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "No compatible output file type", details: nil))
                                 return
                             }
@@ -8456,17 +8610,12 @@ final class VGVideoAssetPickerHandler {
 
                             // Rebind activeExports so cancelExport targets the
                             // active session correctly during the retry.
-                            self?.lock.lock()
-                            self?.activeExports[assetId] = fallback
-                            self?.lock.unlock()
+                            self?.attachExport(assetId: assetId, token: token, session: fallback)
 
                             runExport(fallback, isRetry: true)
                         } else {
                             // HQ retry also failed.
-                            self?.lock.lock()
-                            self?.activeExports.removeValue(forKey: assetId)
-                            self?.lock.unlock()
-                            self?.clearRequestId(for: assetId)
+                            clearOwn()
                             let err = session.error?.localizedDescription ?? "Export session failed"
                             sendExportResult(FlutterError(code: "EXPORT_FAILED", message: err, details: nil))
                         }
@@ -8483,20 +8632,14 @@ final class VGVideoAssetPickerHandler {
                         if let altURL = sessionOutputURL?.deletingPathExtension().appendingPathExtension(altExt) {
                             try? FileManager.default.removeItem(at: altURL)
                         }
-                        self?.lock.lock()
-                        self?.activeExports.removeValue(forKey: assetId)
-                        self?.lock.unlock()
-                        self?.clearRequestId(for: assetId)
+                        clearOwn()
                         sendExportResult(FlutterError(code: "EXPORT_CANCELLED", message: "Export cancelled", details: nil))
 
                     default:
                         if let url = sessionOutputURL {
                             try? FileManager.default.removeItem(at: url)
                         }
-                        self?.lock.lock()
-                        self?.activeExports.removeValue(forKey: assetId)
-                        self?.lock.unlock()
-                        self?.clearRequestId(for: assetId)
+                        clearOwn()
                         sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Unexpected export status \(session.status.rawValue)", details: nil))
                     }
                 }
@@ -8510,14 +8653,14 @@ final class VGVideoAssetPickerHandler {
                     asset: avAsset,
                     presetName: AVAssetExportPresetHighestQuality
                 ) else {
-                    self?.clearRequestId(for: assetId)
+                    clearOwn()
                     try? FileManager.default.removeItem(at: outputURL)
                     sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Failed to create AVAssetExportSession", details: nil))
                     return
                 }
                 let preferredHQ: [AVFileType] = [.mov, .mp4]
                 guard let hqType = preferredHQ.first(where: { hqSession.supportedFileTypes.contains($0) }) else {
-                    self?.clearRequestId(for: assetId)
+                    clearOwn()
                     try? FileManager.default.removeItem(at: outputURL)
                     sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "No compatible output file type for HQ preset", details: nil))
                     return
@@ -8528,9 +8671,7 @@ final class VGVideoAssetPickerHandler {
                 hqSession.outputURL = hqURL
                 hqSession.outputFileType = hqType
                 hqSession.shouldOptimizeForNetworkUse = false
-                self?.lock.lock()
-                self?.activeExports[assetId] = hqSession
-                self?.lock.unlock()
+                self?.attachExport(assetId: assetId, token: token, session: hqSession)
                 runExport(hqSession, isRetry: true)
             }
 
@@ -8553,9 +8694,7 @@ final class VGVideoAssetPickerHandler {
                 passthroughSession.outputURL = ptURL
                 passthroughSession.outputFileType = ptType
                 passthroughSession.shouldOptimizeForNetworkUse = false
-                self?.lock.lock()
-                self?.activeExports[assetId] = passthroughSession
-                self?.lock.unlock()
+                self?.attachExport(assetId: assetId, token: token, session: passthroughSession)
                 runExport(passthroughSession, isRetry: false)
             } else {
                 // Passthrough preset not creatable — go straight to HQ.
@@ -8563,11 +8702,13 @@ final class VGVideoAssetPickerHandler {
             }
         }
 
-        lock.lock()
-        activeRequestIds[assetId] = reqId
-        lock.unlock()
+        bindRequestId(assetId: assetId, token: token, requestId: reqId)
     }
 
+    /// assetId-keyed cancel: aborts whichever invocation currently owns the
+    /// request slot / export for [assetId] (token-agnostic by design) and
+    /// drops any retained reference for it. The cancelled invocation's own
+    /// terminal callback then finds its token missing and clears nothing.
     func handleCancelExport(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let assetId = args?["id"] as? String else {
             result(false)
@@ -8575,16 +8716,18 @@ final class VGVideoAssetPickerHandler {
         }
 
         lock.lock()
-        if let reqId = activeRequestIds.removeValue(forKey: assetId) {
-            imageManager.cancelImageRequest(reqId)
-        }
-        if let exportSession = activeExports.removeValue(forKey: assetId) {
-            exportSession.cancelExport()
-        }
+        let request = activeRequestIds.removeValue(forKey: assetId)
+        let export = activeExports.removeValue(forKey: assetId)
         // A cancelled or dismissed selection must not leak a retained
         // PhotoKit asset from an earlier fast-path resolve of the same id.
         retainedReferenceAssets.removeValue(forKey: assetId)
         lock.unlock()
+        if let request = request, request.requestId != PHInvalidImageRequestID {
+            imageManager.cancelImageRequest(request.requestId)
+        }
+        if let export = export {
+            export.session.cancelExport()
+        }
         result(true)
     }
 
@@ -8634,23 +8777,87 @@ final class VGVideoAssetPickerHandler {
     // on success so the editor can preview and export it; nothing is retained.
     //
     // Cancellation: the PhotoKit request and any fallback export session are
-    // registered under activeRequestIds / activeExports keyed by assetId, so
-    // the existing cancelExportPhotoVideo route aborts whichever phase is in
-    // flight. Every terminal path removes both entries; failure / cancel /
-    // unexpected-status paths also delete partial temp output and drop any
-    // retained asset for this id.
+    // registered under activeRequestIds / activeExports keyed by assetId and
+    // tagged with this invocation's token, so the existing
+    // cancelExportPhotoVideo route aborts whichever phase is in flight.
+    // Every terminal path removes only the entries it owns; failure /
+    // cancel / unexpected-status paths also delete partial temp output and
+    // drop a retained asset only when this token retained it. A stale
+    // completion from an older invocation therefore never clears a newer
+    // retry of the same assetId.
     //
     // Reply shape (success):
     //   { assetId, resolvedFilePath, resolvedFileUri, durationSeconds,
     //     pixelWidth, pixelHeight, creationTimestampMs? }
     // Errors: INVALID_ARGUMENT, ASSET_NOT_FOUND, ASSET_IN_ICLOUD,
     //         REFERENCE_UNRESOLVABLE (not a video / cancelled / fallback failed).
+    //
+    // ── Download Video Reference (explicit, user-consented iCloud fetch) ────
+    //
+    // handleDownloadVideoReference shares the implementation below with
+    // isNetworkAccessAllowed = true. It is only invoked after Dart showed the
+    // "Download from iCloud?" consent (and any mobile-data warning). PhotoKit
+    // download progress is forwarded to Flutter as
+    //   onPhotoVideoDownloadProgress { assetId: String, progress: 0...1 }
+    // (hopped to main, gated by the current token) — the progress UI is
+    // Flutter-owned; no native UIKit progress modal is ever presented.
+    // Differences from the local-only path:
+    //   - avAsset == nil with PHImageResultIsInCloudKey, or a network /
+    //     CloudKit / networkAccessRequired error  → DOWNLOAD_FAILED
+    //     (never ASSET_IN_ICLOUD on this path); other failures stay
+    //     REFERENCE_UNRESOLVABLE.
+    //   - PhotoKit / export cancellation or a missing (superseded) token
+    //     → DOWNLOAD_CANCELLED.
+    // Success retention, temp fallback handling, and the reply shape are
+    // identical to the local-only path.
+    //
+    // FOLLOW-UP (not in this slice): a disk-headroom preflight with
+    // VGStorageHeadroomGuard before starting the iCloud download / temp
+    // fallback export, so a full device fails fast instead of mid-download.
+
+    private enum VGReferenceResolutionMode {
+        /// resolvePhotoVideoReference: isNetworkAccessAllowed = false.
+        case localOnly
+        /// downloadPhotoVideoReference: isNetworkAccessAllowed = true + progress.
+        case download
+    }
 
     func handleResolveVideoReference(args: [String: Any]?, result: @escaping FlutterResult) {
+        resolveVideoReference(args: args, mode: .localOnly, result: result)
+    }
+
+    func handleDownloadVideoReference(args: [String: Any]?, result: @escaping FlutterResult) {
+        resolveVideoReference(args: args, mode: .download, result: result)
+    }
+
+    /// True for errors that indicate the iCloud fetch itself failed (offline,
+    /// CloudKit, or PhotoKit's explicit network-access-required code).
+    private func isNetworkRelatedPhotoKitError(_ error: Error?) -> Bool {
+        guard let error = error else { return false }
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain { return true }
+        if nsError.domain == "CKErrorDomain" { return true }
+        // Podspec deployment target is iOS 14, so PHPhotosError.Code is available.
+        if nsError.domain == PHPhotosErrorDomain,
+           nsError.code == PHPhotosError.Code.networkAccessRequired.rawValue {
+            return true
+        }
+        // PHPhotosError.Code.identifierNotFound / others are not network failures.
+        return false
+    }
+
+    private func resolveVideoReference(args: [String: Any]?,
+                                       mode: VGReferenceResolutionMode,
+                                       result: @escaping FlutterResult) {
         guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
             result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
             return
         }
+
+        // Ownership token for this invocation (see class docs). Every
+        // terminal helper below compares it before clearing any registration.
+        let token: VGPickerToken = UUID()
+        let isDownload = (mode == .download)
 
         // Exactly one Flutter reply on every terminal path, always on main.
         var hasResponded = false
@@ -8682,10 +8889,38 @@ final class VGVideoAssetPickerHandler {
             }
 
             let options = PHVideoRequestOptions()
-            // Hard requirement: never trigger an iCloud download from this path.
-            options.isNetworkAccessAllowed = false
+            // Local-only hard requirement: never trigger an iCloud download.
+            // Download mode is the explicit, user-consented exception.
+            options.isNetworkAccessAllowed = isDownload
             options.version = .current
             options.deliveryMode = .highQualityFormat
+
+            if isDownload {
+                // Flutter-owned progress: forward PhotoKit's download progress
+                // on main, only while this token still owns the slot. Once
+                // cancelled / superseded, stop the underlying fetch as well.
+                //
+                // The token is checked twice on purpose. The background check
+                // stops the fetch early, but a block that already passed it can
+                // still be queued on main when the user cancels and immediately
+                // retries the same assetId. That retry owns the slot under a new
+                // token, so the main-queue re-check drops the stale event instead
+                // of letting attempt 1's progress reach attempt 2's listener.
+                options.progressHandler = { [weak self] progress, _, stop, _ in
+                    guard let self = self, self.ownsRequestSlot(assetId: assetId, token: token) else {
+                        stop.pointee = true
+                        return
+                    }
+                    let clamped = min(max(progress, 0.0), 1.0)
+                    let payload: [String: Any] = ["assetId": assetId, "progress": clamped]
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.ownsRequestSlot(assetId: assetId, token: token) else {
+                            return
+                        }
+                        self.channel?.invokeMethod("onPhotoVideoDownloadProgress", arguments: payload)
+                    }
+                }
+            }
 
             // Fallback export output lives next to handleExportVideo's files but
             // with its own prefix so the two paths never collide.
@@ -8698,54 +8933,40 @@ final class VGVideoAssetPickerHandler {
                 }
             }
 
-            // Clears both registration maps for this assetId. Called on every
-            // terminal path so cancelExport never sees a stale entry.
-            // [dropRetained] additionally removes any retained PhotoKit asset
-            // for this id (failure / cancel paths only).
-            func clearRegistrations(dropRetained: Bool) {
-                self.lock.lock()
-                self.activeRequestIds.removeValue(forKey: assetId)
-                self.activeExports.removeValue(forKey: assetId)
-                if dropRetained {
-                    self.retainedReferenceAssets.removeValue(forKey: assetId)
-                }
-                self.lock.unlock()
-            }
-
             func finishFailure(code: String, message: String) {
-                clearRegistrations(dropRetained: true)
+                // Only this token's entries (and only a retention made by this
+                // token) are dropped; a newer retry's state is untouched.
+                self.clearOwnedRegistrations(assetId: assetId, token: token, dropRetained: true)
                 removeFallbackOutputs()
                 respond(FlutterError(code: code, message: message, details: nil))
             }
 
             func finishCancelled() {
-                finishFailure(code: "REFERENCE_UNRESOLVABLE", message: "Reference resolution was cancelled")
+                if isDownload {
+                    finishFailure(code: "DOWNLOAD_CANCELLED", message: "iCloud download was cancelled")
+                } else {
+                    finishFailure(code: "REFERENCE_UNRESOLVABLE", message: "Reference resolution was cancelled")
+                }
             }
 
             // Success terminal. Cancellation wins on every success path
             // (outside-container fast path, app/tmp fast path, and fallback
-            // export completion): the registration entry is read and cleared
-            // in one lock acquisition, and when cancelExportPhotoVideo already
-            // removed it the reply is the cancelled error, nothing is
-            // retained, and any fallback output is deleted. When [retaining]
-            // is non-nil and the request is still wanted, the asset is stored
-            // (replacing any earlier entry for this id) under that same lock
-            // so a racing cancel either wins cleanly (no success reply,
+            // export completion): ownership is checked and the owned entries
+            // are cleared in one lock acquisition, and when
+            // cancelExportPhotoVideo (or a superseding retry) already took the
+            // slot the reply is the cancelled error, nothing is retained, and
+            // any fallback output is deleted. When [retaining] is non-nil and
+            // the request is still wanted, the asset is stored under this
+            // token (replacing any earlier entry for this id) under that same
+            // lock so a racing cancel either wins cleanly (no success reply,
             // nothing retained) or loses cleanly (asset retained, reply sent).
             // Temp-export success passes nil and retains nothing.
             func finishSuccess(url: URL, retaining: AVAsset?) {
-                self.lock.lock()
-                let stillWanted = self.activeRequestIds[assetId] != nil
-                self.activeRequestIds.removeValue(forKey: assetId)
-                self.activeExports.removeValue(forKey: assetId)
-                if stillWanted, let retained = retaining {
-                    self.retainedReferenceAssets[assetId] = retained
-                }
-                self.lock.unlock()
+                let stillWanted = self.settleOwnedSuccess(assetId: assetId, token: token, retaining: retaining)
                 guard stillWanted else {
-                    // finishCancelled -> finishFailure drops any retained
-                    // entry for this id and removes fallback outputs, so a
-                    // cancelled fallback completion leaves no temp file.
+                    // finishCancelled -> finishFailure removes fallback
+                    // outputs, so a cancelled fallback completion leaves no
+                    // temp file behind.
                     finishCancelled()
                     return
                 }
@@ -8763,34 +8984,43 @@ final class VGVideoAssetPickerHandler {
                 respond(dict)
             }
 
-            // The registration entry doubles as the cancellation flag: the
-            // existing cancelExportPhotoVideo path removes it under `lock`, so
-            // any phase that finds it missing must treat itself as cancelled
-            // instead of starting (or continuing) work nobody is waiting for.
-            func isStillRegistered() -> Bool {
-                self.lock.lock()
-                defer { self.lock.unlock() }
-                return self.activeRequestIds[assetId] != nil
+            // The owned registration entry doubles as the cancellation flag:
+            // cancelExportPhotoVideo removes it (and a newer retry replaces
+            // it) under `lock`, so any phase that no longer owns the slot must
+            // treat itself as cancelled instead of starting (or continuing)
+            // work nobody is waiting for.
+            func isStillOwner() -> Bool {
+                return self.ownsRequestSlot(assetId: assetId, token: token)
             }
 
-            // Register a placeholder before issuing the PhotoKit request so a
-            // cancel that races the request start is never lost.
-            self.lock.lock()
-            self.activeRequestIds[assetId] = PHInvalidImageRequestID
-            self.lock.unlock()
+            // Claim the slot with a placeholder before issuing the PhotoKit
+            // request so a cancel that races the request start is never lost.
+            self.claimRequestSlot(assetId: assetId, token: token, requestId: PHInvalidImageRequestID)
 
             let reqId = self.imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, info in
                 let inCloud = (info?[PHImageResultIsInCloudKey] as? Bool) ?? false
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                 let requestError = info?[PHImageErrorKey] as? Error
 
-                if cancelled || !isStillRegistered() {
+                if cancelled || !isStillOwner() {
                     finishCancelled()
                     return
                 }
 
                 guard let avAsset = avAsset else {
-                    if inCloud {
+                    if isDownload {
+                        // Network access was allowed, so a still-in-cloud or
+                        // network-classified failure means the fetch itself
+                        // failed: never report ASSET_IN_ICLOUD on this path.
+                        if inCloud || self.isNetworkRelatedPhotoKitError(requestError) {
+                            finishFailure(code: "DOWNLOAD_FAILED",
+                                          message: requestError?.localizedDescription
+                                              ?? "Could not download asset \(assetId) from iCloud")
+                        } else {
+                            finishFailure(code: "REFERENCE_UNRESOLVABLE",
+                                          message: requestError?.localizedDescription ?? "Could not load AVAsset for video")
+                        }
+                    } else if inCloud {
                         finishFailure(code: "ASSET_IN_ICLOUD",
                                       message: "Asset \(assetId) is stored in iCloud and is not available locally")
                     } else {
@@ -8835,14 +9065,9 @@ final class VGVideoAssetPickerHandler {
                 func runFallback(_ session: AVAssetExportSession, outputURL: URL, isRetry: Bool) {
                     // Register under the same lock that cancelExport uses so a
                     // cancel landing between phases cannot leave an orphaned
-                    // export running against a dismissed sheet.
-                    self.lock.lock()
-                    let stillWanted = self.activeRequestIds[assetId] != nil
-                    if stillWanted {
-                        self.activeExports[assetId] = session
-                    }
-                    self.lock.unlock()
-                    guard stillWanted else {
+                    // export running against a dismissed sheet. Only the
+                    // current owner may attach; a superseded token bails out.
+                    guard self.attachExportIfOwner(assetId: assetId, token: token, session: session) else {
                         finishCancelled()
                         return
                     }
@@ -8882,12 +9107,9 @@ final class VGVideoAssetPickerHandler {
             }
 
             // Swap the placeholder for the real request id unless the request
-            // already settled (entry cleared) or was cancelled meanwhile.
-            self.lock.lock()
-            if self.activeRequestIds[assetId] != nil {
-                self.activeRequestIds[assetId] = reqId
-            }
-            self.lock.unlock()
+            // already settled (entry cleared), was cancelled, or was
+            // superseded by a newer retry meanwhile.
+            self.bindRequestId(assetId: assetId, token: token, requestId: reqId)
         }
     }
 

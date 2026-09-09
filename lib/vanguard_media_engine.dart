@@ -261,6 +261,9 @@ export 'vg_timeline_exporter.dart';
 export 'vg_image_optimizer.dart';
 // Phase 10-C Slice T: managed, cancellable iOS audio extraction service.
 export 'src/audio_extraction/vg_audio_extraction_service.dart';
+// UMF V2: public iOS PhotoKit iCloud video download progress seam
+// (onPhotoVideoDownloadProgress) for the downloadPhotoVideoReference route.
+export 'vg_photo_video_download_progress.dart';
 // ROI Signal / Server-Ready Sidecar Dart Models (ROI-1A)
 export 'src/roi/vg_roi_models.dart';
 export 'src/roi/vg_roi_coordinate_converter.dart';

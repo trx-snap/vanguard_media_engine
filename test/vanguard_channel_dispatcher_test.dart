@@ -20,6 +20,8 @@
 //   DISP-16: onTimelineAudioStateChanged routes to registered timeline listener.
 //   DISP-17: Pre-registration audio state is buffered and drained once on registration.
 //   DISP-18: Pending audio state purged on unregister/reset; malformed payloads dropped.
+//   DISP-19: onPhotoVideoDownloadProgress routes by assetId, clamps, drops
+//            malformed/stale events, and is silent after unregister.
 //
 // All tests use TestDefaultBinaryMessengerBinding to inject simulated native
 // callbacks without requiring a real device.
@@ -827,6 +829,238 @@ void main() {
       expect(receivedSid, 42);
 
       dispatcher.unregisterTimelineListener(sub);
+    });
+  });
+
+  // ── DISP-19 ─────────────────────────────────────────────────────────────────
+
+  group('DISP-19: PhotoKit iCloud download progress routing', () {
+    const assetA = 'PHASSET-A/L0/001';
+    const assetB = 'PHASSET-B/L0/002';
+
+    test('routes onPhotoVideoDownloadProgress to the listener for its assetId',
+        () async {
+      final eventsA = <double>[];
+      final eventsB = <double>[];
+
+      final subA = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: eventsA.add,
+      );
+      final subB = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetB,
+        onProgress: eventsB.add,
+      );
+      expect(dispatcher.isHandlerRegistered, isTrue);
+
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.25,
+      });
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetB,
+        'progress': 0.5,
+      });
+
+      expect(eventsA, [closeTo(0.25, 0.001)]);
+      expect(eventsB, [closeTo(0.5, 0.001)]);
+
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(subA);
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(subB);
+    });
+
+    test('clamps progress to [0.0, 1.0] and tolerates int payloads', () async {
+      final events = <double>[];
+      final sub = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: events.add,
+      );
+
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': -0.2,
+      });
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 1.7,
+      });
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 1,
+      });
+
+      expect(events, [
+        closeTo(0.0, 0.001),
+        closeTo(1.0, 0.001),
+        closeTo(1.0, 0.001),
+      ]);
+
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(sub);
+    });
+
+    test('drops malformed payloads without throwing', () async {
+      int callCount = 0;
+      final sub = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: (_) => callCount++,
+      );
+
+      // Missing progress.
+      await _invokeNative('onPhotoVideoDownloadProgress', {'assetId': assetA});
+      // Missing assetId.
+      await _invokeNative('onPhotoVideoDownloadProgress', {'progress': 0.5});
+      // Empty assetId.
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': '',
+        'progress': 0.5,
+      });
+      // Non-string assetId.
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': 42,
+        'progress': 0.5,
+      });
+      // Non-numeric progress.
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 'half',
+      });
+      // Non-map / null payloads.
+      await _invokeNative('onPhotoVideoDownloadProgress', 0.5);
+      await _invokeNative('onPhotoVideoDownloadProgress', null);
+
+      expect(callCount, 0);
+
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(sub);
+    });
+
+    test('drops stale events for assetIds with no listener (never buffers)',
+        () async {
+      // No listener registered at all for assetB.
+      dispatcher.ensureHandlerRegistered();
+      await expectLater(
+        _invokeNative('onPhotoVideoDownloadProgress', {
+          'assetId': assetB,
+          'progress': 0.4,
+        }),
+        completes,
+      );
+      expect(
+        dispatcher.hasPhotoVideoDownloadProgressListenerForTesting(assetB),
+        isFalse,
+      );
+
+      // A listener registered afterwards must not receive the earlier event.
+      int lateCount = 0;
+      final sub = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetB,
+        onProgress: (_) => lateCount++,
+      );
+      expect(lateCount, 0);
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(sub);
+    });
+
+    test('no callback after unregister; stale token is a no-op', () async {
+      int oldCount = 0;
+      int newCount = 0;
+
+      final old = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: (_) => oldCount++,
+      );
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(old);
+      expect(
+        dispatcher.hasPhotoVideoDownloadProgressListenerForTesting(assetA),
+        isFalse,
+      );
+
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.3,
+      });
+      expect(oldCount, 0);
+
+      // Re-register (retry) for the same assetId: only the new listener fires.
+      final fresh = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: (_) => newCount++,
+      );
+      // Unregistering the already-stale old token must not remove the
+      // fresh registration.
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(old);
+      expect(
+        dispatcher.hasPhotoVideoDownloadProgressListenerForTesting(assetA),
+        isTrue,
+      );
+
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.6,
+      });
+      expect(oldCount, 0);
+      expect(newCount, 1);
+
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(fresh);
+      expect(
+        dispatcher.hasPhotoVideoDownloadProgressListenerForTesting(assetA),
+        isFalse,
+      );
+
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.9,
+      });
+      expect(newCount, 1);
+    });
+
+    test('replacing a registration for the same assetId supersedes the old one',
+        () async {
+      int oldCount = 0;
+      int newCount = 0;
+
+      final old = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: (_) => oldCount++,
+      );
+      final fresh = dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: (_) => newCount++,
+      );
+
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.5,
+      });
+      expect(oldCount, 0);
+      expect(newCount, 1);
+
+      // Old token unregister is a no-op against the fresh entry.
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(old);
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.8,
+      });
+      expect(newCount, 2);
+
+      dispatcher.unregisterPhotoVideoDownloadProgressListener(fresh);
+    });
+
+    test('resetForTesting clears download progress listeners', () async {
+      int count = 0;
+      dispatcher.registerPhotoVideoDownloadProgressListener(
+        assetId: assetA,
+        onProgress: (_) => count++,
+      );
+      dispatcher.resetForTesting(channel: _kChannel);
+      expect(
+        dispatcher.hasPhotoVideoDownloadProgressListenerForTesting(assetA),
+        isFalse,
+      );
+      dispatcher.ensureHandlerRegistered();
+      await _invokeNative('onPhotoVideoDownloadProgress', {
+        'assetId': assetA,
+        'progress': 0.5,
+      });
+      expect(count, 0);
     });
   });
 }
