@@ -1,15 +1,16 @@
 // VGDuetNativeSessionCoordinator.swift
-// VG-DUET-SLICE-2: Native session lifecycle and local source ingestion validation.
+// VG-DUET-SLICE-3: Native session lifecycle, source validation, clock & decoder integration.
 //
 // Responsibilities:
-//   - Validates local .mp4/.mov source via AVURLAsset (no camera, no Metal, no recorder).
-//   - Manages the Duet session state machine (initialized → recording → paused → stopped).
+//   - Validates local .mp4/.mov source via AVURLAsset.
+//   - Manages the Duet session state machine (initialized → recording → paused / completed → stopped).
+//   - Integrates VGDuetPreviewClock for timing math, speed scaling, trim window cursors, rollback.
+//   - Integrates VGDuetSourceVideoDecoder for preparing, priming at trimStart, and stepping/seeking.
 //   - Enforces single active session invariant.
-//   - Threading: probe runs on a serial DispatchQueue; replies always on main thread.
-//   - Generates wall-clock-based segment records for lifecycle-only proof output.
-//
-// Out of scope: AVCaptureSession, Metal, GLES, Vulkan, real media recording,
-//               Camera2, GPU compositor, Universal Editor wiring.
+//   - Threading: coordinator is main-thread state owner; probing runs on probeQueue;
+//     decoder work runs on a dedicated serial decoderQueue; replies always on main thread.
+//   - Asynchronous decoder release on dispose without blocking the main thread.
+//   - Auto-stop: if trimEnd is reached, enters completed state; stopDuetRecording returns descriptor.
 
 import AVFoundation
 import Flutter
@@ -21,31 +22,8 @@ enum VGDuetSessionState {
     case initialized
     case recording
     case paused
+    case completed
     case stopped
-}
-
-// MARK: - Segment record (wall-clock, lifecycle only)
-
-struct VGDuetSegmentRecord {
-    let index: Int
-    let durationMs: Int
-    let speedMultiplier: Double
-    let sourceStartMs: Int
-    let sourceEndMs: Int
-    let outputStartMs: Int
-    let outputEndMs: Int
-
-    func toMap() -> [String: Any] {
-        return [
-            "segmentIndex":     index,
-            "durationMs":       durationMs,
-            "speedMultiplier":  speedMultiplier,
-            "sourceStartMs":    sourceStartMs,
-            "sourceEndMs":      sourceEndMs,
-            "outputStartMs":    outputStartMs,
-            "outputEndMs":      outputEndMs,
-        ]
-    }
 }
 
 // MARK: - Source probe result
@@ -72,15 +50,13 @@ final class VGDuetNativeSession {
     // State
     var state: VGDuetSessionState = .initialized
 
-    // Segment tracking (wall-clock)
-    private var segments: [VGDuetSegmentRecord] = []
-    private var segmentStartWallMs: Int64 = 0
-    private var outputCursorMs: Int = 0
-    private var sourceCursorMs: Int = 0
-
-    // Trim
+    // Trim window
     let trimStartMs: Int
     let trimEndMs: Int
+
+    // Preview clock & source decoder
+    let previewClock: VGDuetPreviewClock
+    var decoder: VGDuetSourceVideoDecoder?
 
     // Source probe result (recorded for descriptor assembly)
     var probeResult: VGDuetSourceProbeResult?
@@ -93,7 +69,9 @@ final class VGDuetNativeSession {
          sourceGain: Double,
          micGain: Double,
          trimStartMs: Int,
-         trimEndMs: Int) {
+         trimEndMs: Int,
+         previewClock: VGDuetPreviewClock,
+         decoder: VGDuetSourceVideoDecoder?) {
         self.sessionId       = sessionId
         self.sourceMap       = sourceMap
         self.trimWindowMap   = trimWindowMap
@@ -103,47 +81,27 @@ final class VGDuetNativeSession {
         self.micGain         = micGain
         self.trimStartMs     = trimStartMs
         self.trimEndMs       = trimEndMs
+        self.previewClock    = previewClock
+        self.decoder         = decoder
     }
 
     func startSegment() {
-        segmentStartWallMs = Int64(Date().timeIntervalSince1970 * 1000)
+        previewClock.startSegment()
     }
 
     func commitSegment() {
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let wallMs = max(1, Int(nowMs - segmentStartWallMs))
-        let segStartOut = outputCursorMs
-        let segEndOut   = outputCursorMs + wallMs
-        let segStartSrc = sourceCursorMs
-        let segEndSrc   = sourceCursorMs + wallMs
-
-        let rec = VGDuetSegmentRecord(
-            index:           segments.count,
-            durationMs:      wallMs,
-            speedMultiplier: speedMultiplier,
-            sourceStartMs:   segStartSrc,
-            sourceEndMs:     segEndSrc,
-            outputStartMs:   segStartOut,
-            outputEndMs:     segEndOut
-        )
-        segments.append(rec)
-        outputCursorMs = segEndOut
-        sourceCursorMs = segEndSrc
+        previewClock.commitSegment()
     }
 
     func deleteLastSegment() -> Bool {
-        guard !segments.isEmpty else { return false }
-        let removed = segments.removeLast()
-        outputCursorMs = removed.outputStartMs
-        sourceCursorMs = removed.sourceStartMs
-        return true
+        return previewClock.deleteLastSegment()
     }
 
-    func totalDurationMs() -> Int { outputCursorMs }
-    func segmentCount() -> Int { segments.count }
+    func totalDurationMs() -> Int { previewClock.totalDurationMs() }
+    func segmentCount() -> Int { previewClock.segmentCount() }
 
     func buildStopResult() -> [String: Any] {
-        let segmentMaps = segments.map { $0.toMap() }
+        let segmentMaps = previewClock.segments.map { $0.toMap() }
         let descriptor: [String: Any] = [
             "source":           sourceMap,
             "layoutConfig":     layoutConfigMap,
@@ -169,7 +127,7 @@ final class VGDuetNativeSession {
 
 /// Owns the single active Duet session and all lifecycle transitions.
 /// All public methods are called on the main thread by VGDuetMethodHandler.
-/// File probing runs on `probeQueue` and replies on the main thread.
+/// Probing and decoding run on dedicated serial queues and reply on the main thread.
 final class VGDuetNativeSessionCoordinator {
 
     // MARK: Constants
@@ -179,11 +137,14 @@ final class VGDuetNativeSessionCoordinator {
     // MARK: State
 
     private var activeSession: VGDuetNativeSession?
+    private var pendingSessionId: String?
     private var canceledProbeIds = Set<String>()
 
-    // Serial queue for AVURLAsset probing (never blocks main thread)
+    // Serial queues (never block main thread)
     private let probeQueue = DispatchQueue(label: "com.connects.vanguard.duet.probe",
                                            qos: .userInitiated)
+    private let decoderQueue = DispatchQueue(label: "com.connects.vanguard.duet.decoder",
+                                             qos: .userInitiated)
 
     // MARK: - initialize
 
@@ -198,10 +159,10 @@ final class VGDuetNativeSessionCoordinator {
     ) {
         assert(Thread.isMainThread)
 
-        if activeSession != nil {
+        if activeSession != nil || pendingSessionId != nil {
             reply(nil, FlutterError(
                 code:    "session_conflict",
-                message: "A Duet session is already active. Dispose it before initializing a new one.",
+                message: "A Duet session is already active or initializing. Dispose it before initializing a new one.",
                 details: nil))
             return
         }
@@ -244,20 +205,7 @@ final class VGDuetNativeSessionCoordinator {
         }
 
         let sessionId = UUID().uuidString
-        let session = VGDuetNativeSession(
-            sessionId:       sessionId,
-            sourceMap:       sourceMap,
-            trimWindowMap:   trimWindowMap,
-            layoutConfigMap: layoutConfigMap,
-            speedMultiplier: speed,
-            sourceGain:      sourceGain,
-            micGain:         micGain,
-            trimStartMs:     trimStartMs,
-            trimEndMs:       trimEndMs
-        )
-        // Optimistically store; cleared if probe fails or is cancelled
-        activeSession = session
-
+        pendingSessionId = sessionId
         let capturedFilePath    = filePath
         let capturedTrimStartMs = trimStartMs
         let capturedTrimEndMs   = trimEndMs
@@ -267,31 +215,100 @@ final class VGDuetNativeSessionCoordinator {
 
             let probeResult = Self.probeSource(filePath: capturedFilePath)
 
-            DispatchQueue.main.async {
-                // Cancelled by disposeSession while probe was in-flight
-                if self.canceledProbeIds.contains(sessionId) {
-                    self.canceledProbeIds.remove(sessionId)
-                    // Do not reply — dispose already replied
+            switch probeResult {
+            case .failure(let msg):
+                DispatchQueue.main.async {
+                    if self.pendingSessionId == sessionId {
+                        self.pendingSessionId = nil
+                    }
+                    if self.canceledProbeIds.contains(sessionId) {
+                        self.canceledProbeIds.remove(sessionId)
+                        return
+                    }
+                    reply(nil, FlutterError(code: "source_invalid", message: msg, details: nil))
+                }
+
+            case .success(let probe):
+                if let err = Self.validateTrimWindow(
+                    trimStartMs:      capturedTrimStartMs,
+                    trimEndMs:        capturedTrimEndMs,
+                    sourceDurationMs: probe.durationMs
+                ) {
+                    DispatchQueue.main.async {
+                        if self.pendingSessionId == sessionId {
+                            self.pendingSessionId = nil
+                        }
+                        if self.canceledProbeIds.contains(sessionId) {
+                            self.canceledProbeIds.remove(sessionId)
+                            return
+                        }
+                        reply(nil, FlutterError(code: "source_invalid", message: err, details: nil))
+                    }
                     return
                 }
 
-                switch probeResult {
-                case .failure(let msg):
-                    self.activeSession = nil
-                    reply(nil, FlutterError(code: "source_invalid", message: msg, details: nil))
+                // Resolve file URL for decoder
+                let url: URL
+                if capturedFilePath.hasPrefix("file://") {
+                    url = URL(string: capturedFilePath) ?? URL(fileURLWithPath: capturedFilePath)
+                } else {
+                    url = URL(fileURLWithPath: capturedFilePath)
+                }
 
-                case .success(let probe):
-                    if let err = Self.validateTrimWindow(
-                        trimStartMs:      capturedTrimStartMs,
-                        trimEndMs:        capturedTrimEndMs,
-                        sourceDurationMs: probe.durationMs
-                    ) {
-                        self.activeSession = nil
-                        reply(nil, FlutterError(code: "source_invalid", message: err, details: nil))
-                        return
+                // Prime decoder on serial decoderQueue at trimStartMs
+                self.decoderQueue.async {
+                    let decoder = VGDuetSourceVideoDecoder(
+                        url: url,
+                        trimStartMs: capturedTrimStartMs,
+                        trimEndMs: capturedTrimEndMs
+                    )
+
+                    var prepError: String?
+                    do {
+                        try decoder.prepare()
+                    } catch {
+                        prepError = error.localizedDescription
                     }
-                    session.probeResult = probe
-                    reply(sessionId, nil)
+
+                    DispatchQueue.main.async {
+                        if self.pendingSessionId == sessionId {
+                            self.pendingSessionId = nil
+                        }
+                        if self.canceledProbeIds.contains(sessionId) {
+                            self.canceledProbeIds.remove(sessionId)
+                            self.decoderQueue.async { decoder.release() }
+                            return
+                        }
+
+                        if let err = prepError {
+                            self.decoderQueue.async { decoder.release() }
+                            reply(nil, FlutterError(code: "source_invalid", message: err, details: nil))
+                            return
+                        }
+
+                        let clock = VGDuetPreviewClock(
+                            trimStartMs: capturedTrimStartMs,
+                            trimEndMs: capturedTrimEndMs,
+                            initialSpeed: speed
+                        )
+
+                        let session = VGDuetNativeSession(
+                            sessionId:       sessionId,
+                            sourceMap:       sourceMap,
+                            trimWindowMap:   trimWindowMap,
+                            layoutConfigMap: layoutConfigMap,
+                            speedMultiplier: speed,
+                            sourceGain:      sourceGain,
+                            micGain:         micGain,
+                            trimStartMs:     capturedTrimStartMs,
+                            trimEndMs:       capturedTrimEndMs,
+                            previewClock:    clock,
+                            decoder:         decoder
+                        )
+                        session.probeResult = probe
+                        self.activeSession = session
+                        reply(sessionId, nil)
+                    }
                 }
             }
         }
@@ -331,6 +348,7 @@ final class VGDuetNativeSessionCoordinator {
             reply(nil, FlutterError(code: "source_invalid", message: "setDuetRecordingSpeed: speed \(speed) is not one of \(Self.validSpeeds).", details: nil)); return
         }
         session.speedMultiplier = speed
+        session.previewClock.setSpeed(speed)
         reply(nil, nil)
     }
 
@@ -377,7 +395,13 @@ final class VGDuetNativeSessionCoordinator {
             reply(nil, invalidState("pauseDuetRecording", current: stateName(session.state), expected: "recording")); return
         }
         session.commitSegment()
-        session.state = .paused
+        session.state = session.previewClock.isAutoStopped ? .completed : .paused
+        let targetPts = session.previewClock.currentSourcePtsMs()
+        if let dec = session.decoder {
+            decoderQueue.async {
+                _ = dec.stepFrame(targetPtsMs: targetPts)
+            }
+        }
         reply(nil, nil)
     }
 
@@ -405,6 +429,13 @@ final class VGDuetNativeSessionCoordinator {
         default: break
         }
         _ = session.deleteLastSegment()
+        if session.state == .completed {
+            session.state = .paused
+        }
+        let targetPts = session.previewClock.currentSourcePtsMs()
+        if let dec = session.decoder {
+            decoderQueue.async { try? dec.seek(to: targetPts) }
+        }
         reply(nil, nil)
     }
 
@@ -416,13 +447,16 @@ final class VGDuetNativeSessionCoordinator {
         switch session.state {
         case .recording:
             session.commitSegment()
-        case .paused:
+        case .paused, .completed:
             break
         default:
-            reply(nil, invalidState("stopDuetRecording", current: stateName(session.state), expected: "recording or paused")); return
+            reply(nil, invalidState("stopDuetRecording", current: stateName(session.state), expected: "recording, paused, or completed")); return
         }
         session.state = .stopped
+        let dec = session.decoder
+        session.decoder = nil
         activeSession = nil
+        decoderQueue.async { dec?.release() }
         let resultMap = session.buildStopResult()
         reply(resultMap, nil)
     }
@@ -431,9 +465,16 @@ final class VGDuetNativeSessionCoordinator {
 
     func disposeSession(sessionId: String, reply: @escaping (Any?, FlutterError?) -> Void) {
         assert(Thread.isMainThread)
+        if pendingSessionId == sessionId {
+            canceledProbeIds.insert(sessionId)
+            pendingSessionId = nil
+        }
         if let session = activeSession, session.sessionId == sessionId {
             canceledProbeIds.insert(sessionId)
+            let dec = session.decoder
+            session.decoder = nil
             activeSession = nil
+            decoderQueue.async { dec?.release() }
         }
         reply(nil, nil)
     }
@@ -441,8 +482,15 @@ final class VGDuetNativeSessionCoordinator {
     // MARK: - disposeAll (called from detachFromEngine)
 
     func disposeAll() {
+        if let pending = pendingSessionId {
+            canceledProbeIds.insert(pending)
+            pendingSessionId = nil
+        }
         if let session = activeSession {
             canceledProbeIds.insert(session.sessionId)
+            let dec = session.decoder
+            session.decoder = nil
+            decoderQueue.async { dec?.release() }
         }
         activeSession = nil
     }
@@ -472,6 +520,7 @@ final class VGDuetNativeSessionCoordinator {
         case .initialized: return "initialized"
         case .recording:   return "recording"
         case .paused:      return "paused"
+        case .completed:   return "completed"
         case .stopped:     return "stopped"
         }
     }

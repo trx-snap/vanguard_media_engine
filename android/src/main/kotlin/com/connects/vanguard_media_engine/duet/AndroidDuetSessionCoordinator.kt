@@ -4,53 +4,30 @@ import android.media.MediaExtractor
 import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.Looper
 import java.io.File
 import java.util.UUID
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VG-DUET-SLICE-2: Android native session lifecycle and local source ingestion
+// VG-DUET-SLICE-3: Android native session lifecycle, clock & decoder integration
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Responsibilities:
 //   - Validates local .mp4/.mov source via MediaMetadataRetriever / MediaExtractor.
-//   - Manages the Duet session state machine (initialized → recording → paused → stopped).
+//   - Manages the Duet session state machine (initialized → recording → paused / completed → stopped).
+//   - Integrates AndroidDuetPreviewClock for timing math, speed scaling, trim window cursors, rollback.
+//   - Integrates AndroidDuetSourceVideoDecoder for preparing, priming at trimStart, and stepping/seeking.
 //   - Enforces single active session invariant.
-//   - Threading: probe runs on a HandlerThread; replies always on main thread.
-//   - Generates wall-clock-based segment records (no real media).
-//
-// Out of scope: Camera2, GLES, Vulkan, real recording, GPU compositor.
+//   - Threading: probe runs on probeThread; decoder work runs on decoderThread;
+//     replies always on main thread.
+//   - Asynchronous decoder release without blocking the main thread.
+//   - Auto-stop: if trimEnd is reached, enters COMPLETED state; stopDuetRecording returns descriptor.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State machine
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum class VGDuetSessionState {
-    INITIALIZED, RECORDING, PAUSED, STOPPED
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Segment record (wall-clock, lifecycle only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-data class VGDuetAndroidSegmentRecord(
-    val index: Int,
-    val durationMs: Int,
-    val speedMultiplier: Double,
-    val sourceStartMs: Int,
-    val sourceEndMs: Int,
-    val outputStartMs: Int,
-    val outputEndMs: Int,
-) {
-    fun toMap(): Map<String, Any> = mapOf(
-        "segmentIndex"    to index,
-        "durationMs"      to durationMs,
-        "speedMultiplier" to speedMultiplier,
-        "sourceStartMs"   to sourceStartMs,
-        "sourceEndMs"     to sourceEndMs,
-        "outputStartMs"   to outputStartMs,
-        "outputEndMs"     to outputEndMs,
-    )
+    INITIALIZED, RECORDING, PAUSED, COMPLETED, STOPPED
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +54,8 @@ class VGDuetAndroidSession(
     micGainInit: Double,
     val trimStartMs: Int,
     val trimEndMs: Int,
+    val previewClock: AndroidDuetPreviewClock,
+    var decoder: AndroidDuetSourceVideoDecoder?,
 ) {
     var layoutConfigMap: Map<String, Any?> = layoutConfigMapInit
     var speedMultiplier: Double = speedInit
@@ -85,47 +64,23 @@ class VGDuetAndroidSession(
     var state: VGDuetSessionState = VGDuetSessionState.INITIALIZED
     var probeResult: VGDuetAndroidSourceProbeResult? = null
 
-    private val segments = mutableListOf<VGDuetAndroidSegmentRecord>()
-    private var segmentStartWallMs: Long = 0L
-    private var outputCursorMs: Int = 0
-    private var sourceCursorMs: Int = 0
-
     fun startSegment() {
-        segmentStartWallMs = System.currentTimeMillis()
+        previewClock.startSegment()
     }
 
     fun commitSegment() {
-        val wallMs = maxOf(1, (System.currentTimeMillis() - segmentStartWallMs).toInt())
-        val segStartOut = outputCursorMs
-        val segEndOut   = outputCursorMs + wallMs
-        val segStartSrc = sourceCursorMs
-        val segEndSrc   = sourceCursorMs + wallMs
-        segments += VGDuetAndroidSegmentRecord(
-            index           = segments.size,
-            durationMs      = wallMs,
-            speedMultiplier = speedMultiplier,
-            sourceStartMs   = segStartSrc,
-            sourceEndMs     = segEndSrc,
-            outputStartMs   = segStartOut,
-            outputEndMs     = segEndOut,
-        )
-        outputCursorMs = segEndOut
-        sourceCursorMs = segEndSrc
+        previewClock.commitSegment()
     }
 
     fun deleteLastSegment(): Boolean {
-        if (segments.isEmpty()) return false
-        val removed = segments.removeLast()
-        outputCursorMs = removed.outputStartMs
-        sourceCursorMs = removed.sourceStartMs
-        return true
+        return previewClock.deleteLastSegment()
     }
 
-    fun totalDurationMs(): Int = outputCursorMs
-    fun segmentCount(): Int = segments.size
+    fun totalDurationMs(): Int = previewClock.totalDurationMs()
+    fun segmentCount(): Int = previewClock.segmentCount()
 
     fun buildStopResult(): Map<String, Any?> {
-        val segmentMaps = segments.map { it.toMap() }
+        val segmentMaps = previewClock.segments.map { it.toMap() }
         val descriptor: Map<String, Any?> = mapOf(
             "source"           to sourceMap,
             "layoutConfig"     to layoutConfigMap,
@@ -155,7 +110,7 @@ class VGDuetAndroidSession(
  * Owns the single active Duet session and all lifecycle transitions.
  *
  * All public methods are called on the main thread by AndroidDuetMethodHandler.
- * File probing runs on a dedicated HandlerThread and replies on the main thread.
+ * File probing runs on probeThread; decoder operations run on decoderThread.
  */
 class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
 
@@ -273,11 +228,15 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
     // ── State ─────────────────────────────────────────────────────────────────
 
     @Volatile private var activeSession: VGDuetAndroidSession? = null
+    @Volatile private var pendingSessionId: String? = null
     private val canceledProbeIds = mutableSetOf<String>()
 
-    // HandlerThread for off-main probing
+    // Dedicated background threads (never block main thread)
     private val probeThread = HandlerThread("vg.duet.probe").also { it.start() }
     private val probeHandler = Handler(probeThread.looper)
+
+    private val decoderThread = HandlerThread("vg.duet.decoder").also { it.start() }
+    private val decoderHandler = Handler(decoderThread.looper)
 
     // ── initialize ────────────────────────────────────────────────────────────
 
@@ -290,8 +249,7 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
         micGain: Double,
         reply: (String?, String?) -> Unit, // (sessionId?, errorMessage?)
     ) {
-        // Must be called on main thread
-        if (activeSession != null) {
+        if (activeSession != null || pendingSessionId != null) {
             reply(null, errorMsg("session_conflict",
                 "A Duet session is already active. Dispose it before initializing a new one."))
             return
@@ -330,48 +288,92 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
         }
 
         val sessionId = UUID.randomUUID().toString()
-        val session = VGDuetAndroidSession(
-            sessionId        = sessionId,
-            sourceMap        = sourceMap,
-            trimWindowMap    = trimWindowMap,
-            layoutConfigMapInit = layoutConfigMap,
-            speedInit        = speed,
-            sourceGainInit   = sourceGain,
-            micGainInit      = micGain,
-            trimStartMs      = trimStartMs,
-            trimEndMs        = trimEndMs,
-        )
-        activeSession = session
+        pendingSessionId = sessionId
 
         probeHandler.post {
             val probeResult = probeSource(filePath)
 
-            mainHandler.post {
-                // Check cancellation
-                if (canceledProbeIds.contains(sessionId)) {
-                    canceledProbeIds.remove(sessionId)
-                    // Already replied via dispose — do not reply twice
-                    return@post
-                }
-
-                val probVal = probeResult.getOrNull()
-                if (probVal == null) {
-                    activeSession = null
+            val probVal = probeResult.getOrNull()
+            if (probVal == null) {
+                mainHandler.post {
+                    if (pendingSessionId == sessionId) {
+                        pendingSessionId = null
+                    }
+                    if (canceledProbeIds.contains(sessionId)) {
+                        canceledProbeIds.remove(sessionId)
+                        return@post
+                    }
                     val msg = probeResult.exceptionOrNull()?.message
                         ?: "Source probe failed for '$filePath'."
                     reply(null, errorMsg("source_invalid", msg))
-                    return@post
                 }
+                return@post
+            }
 
-                val trimErr = validateTrimWindow(trimStartMs, trimEndMs, probVal.durationMs)
-                if (trimErr != null) {
-                    activeSession = null
+            val trimErr = validateTrimWindow(trimStartMs, trimEndMs, probVal.durationMs)
+            if (trimErr != null) {
+                mainHandler.post {
+                    if (pendingSessionId == sessionId) {
+                        pendingSessionId = null
+                    }
+                    if (canceledProbeIds.contains(sessionId)) {
+                        canceledProbeIds.remove(sessionId)
+                        return@post
+                    }
                     reply(null, errorMsg("source_invalid", trimErr))
-                    return@post
+                }
+                return@post
+            }
+
+            // Prime decoder on decoderHandler at trimStartMs
+            decoderHandler.post {
+                val decoder = AndroidDuetSourceVideoDecoder(filePath = filePath)
+                var prepErr: String? = null
+                try {
+                    decoder.prepare(trimStartMs.toLong())
+                } catch (e: Exception) {
+                    prepErr = e.message ?: "Failed to prepare decoder."
                 }
 
-                session.probeResult = probVal
-                reply(sessionId, null)
+                mainHandler.post {
+                    if (pendingSessionId == sessionId) {
+                        pendingSessionId = null
+                    }
+                    if (canceledProbeIds.contains(sessionId)) {
+                        canceledProbeIds.remove(sessionId)
+                        decoderHandler.post { decoder.release() }
+                        return@post
+                    }
+
+                    if (prepErr != null) {
+                        decoderHandler.post { decoder.release() }
+                        reply(null, errorMsg("source_invalid", prepErr))
+                        return@post
+                    }
+
+                    val clock = AndroidDuetPreviewClock(
+                        trimStartMs = trimStartMs,
+                        trimEndMs   = trimEndMs,
+                        initialSpeed = speed,
+                    )
+
+                    val session = VGDuetAndroidSession(
+                        sessionId           = sessionId,
+                        sourceMap           = sourceMap,
+                        trimWindowMap       = trimWindowMap,
+                        layoutConfigMapInit = layoutConfigMap,
+                        speedInit           = speed,
+                        sourceGainInit      = sourceGain,
+                        micGainInit         = micGain,
+                        trimStartMs         = trimStartMs,
+                        trimEndMs           = trimEndMs,
+                        previewClock        = clock,
+                        decoder             = decoder,
+                    )
+                    session.probeResult = probVal
+                    activeSession = session
+                    reply(sessionId, null)
+                }
             }
         }
     }
@@ -407,6 +409,7 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
                 "setDuetRecordingSpeed: speed $speed is not one of $VALID_SPEEDS.")); return
         }
         session.speedMultiplier = speed
+        session.previewClock.setSpeed(speed)
         reply(null, null)
     }
 
@@ -448,7 +451,12 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
             reply(null, invalidState("pauseDuetRecording", session.state.name, expected = "RECORDING")); return
         }
         session.commitSegment()
-        session.state = VGDuetSessionState.PAUSED
+        session.state = if (session.previewClock.isAutoStopped) VGDuetSessionState.COMPLETED else VGDuetSessionState.PAUSED
+        val targetPts = session.previewClock.currentSourcePtsMs().toLong()
+        val dec = session.decoder
+        if (dec != null) {
+            decoderHandler.post { dec.stepFrame(targetPts) }
+        }
         reply(null, null)
     }
 
@@ -472,6 +480,14 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
             reply(null, invalidState("deleteLastDuetSegment", "STOPPED")); return
         }
         session.deleteLastSegment()
+        if (session.state == VGDuetSessionState.COMPLETED) {
+            session.state = VGDuetSessionState.PAUSED
+        }
+        val targetPts = session.previewClock.currentSourcePtsMs().toLong()
+        val dec = session.decoder
+        if (dec != null) {
+            decoderHandler.post { dec.seekTo(targetPts) }
+        }
         reply(null, null)
     }
 
@@ -481,24 +497,34 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
         val session = resolveSession(sessionId, "stopDuetRecording", reply) ?: return
         when (session.state) {
             VGDuetSessionState.RECORDING -> session.commitSegment()
-            VGDuetSessionState.PAUSED    -> { /* already committed */ }
+            VGDuetSessionState.PAUSED, VGDuetSessionState.COMPLETED -> { /* already committed */ }
             else -> {
-                reply(null, invalidState("stopDuetRecording", session.state.name, expected = "RECORDING or PAUSED"))
+                reply(null, invalidState("stopDuetRecording", session.state.name, expected = "RECORDING, PAUSED, or COMPLETED"))
                 return
             }
         }
         session.state = VGDuetSessionState.STOPPED
+        val dec = session.decoder
+        session.decoder = null
         activeSession = null
+        decoderHandler.post { dec?.release() }
         reply(session.buildStopResult(), null)
     }
 
     // ── disposeSession (idempotent) ────────────────────────────────────────────
 
     fun disposeSession(sessionId: String, reply: (Any?, String?) -> Unit) {
+        if (pendingSessionId == sessionId) {
+            canceledProbeIds += sessionId
+            pendingSessionId = null
+        }
         val current = activeSession
         if (current != null && current.sessionId == sessionId) {
             canceledProbeIds += sessionId
+            val dec = current.decoder
+            current.decoder = null
             activeSession = null
+            decoderHandler.post { dec?.release() }
         }
         reply(null, null)
     }
@@ -506,10 +532,24 @@ class AndroidDuetSessionCoordinator(private val mainHandler: Handler) {
     // ── disposeAll ────────────────────────────────────────────────────────────
 
     fun disposeAll() {
-        activeSession?.let { canceledProbeIds += it.sessionId }
+        val pending = pendingSessionId
+        if (pending != null) {
+            canceledProbeIds += pending
+            pendingSessionId = null
+        }
+        val current = activeSession
+        if (current != null) {
+            canceledProbeIds += current.sessionId
+            val dec = current.decoder
+            current.decoder = null
+            decoderHandler.post { dec?.release() }
+        }
         activeSession = null
         try {
             probeThread.quitSafely()
+        } catch (_: Exception) {}
+        try {
+            decoderThread.quitSafely()
         } catch (_: Exception) {}
     }
 
