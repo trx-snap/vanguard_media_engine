@@ -343,7 +343,9 @@ class AndroidDuetSessionCoordinator(
                 val decoder = AndroidDuetSourceVideoDecoder(filePath = filePath)
                 var prepErr: String? = null
                 try {
-                    decoder.prepare(trimStartMs.toLong())
+                    // Slice 4B-A: headless sink for now; a compositor-owned Surface
+                    // arrives via rebindOutputSurface in a later slice.
+                    decoder.prepare(trimStartMs.toLong(), outputSurface = null)
                 } catch (e: Exception) {
                     prepErr = e.message ?: "Failed to prepare decoder."
                 }
@@ -577,9 +579,19 @@ class AndroidDuetSessionCoordinator(
 
     // ── Preview release helper ────────────────────────────────────────────────
 
-    /** Releases and nulls the session's preview producer if one is attached. */
+    /**
+     * Releases and nulls the session's preview producer if one is attached.
+     *
+     * Slice 4B-A two-phase seam: beginRelease() detaches callbacks and marks DETACHED;
+     * a later compositor stop belongs between the two calls. No compositor exists yet,
+     * so the phases run back to back.
+     */
     private fun releasePreviewProducer(session: VGDuetAndroidSession) {
-        session.previewProducer?.release()
+        val producer = session.previewProducer
+        if (producer != null) {
+            producer.beginRelease()
+            producer.finishRelease()
+        }
         session.previewProducer    = null
         session.previewWidthPx     = null
         session.previewHeightPx    = null

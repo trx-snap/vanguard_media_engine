@@ -1,21 +1,26 @@
 package com.connects.vanguard_media_engine.duet
 
 import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.Surface
+import com.connects.vanguard_media_engine.codec.AndroidDagSurfaceProducerLifecycleAdapter
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.atomic.AtomicBoolean
 
 // VG-DUET-SLICE-4A: SurfaceProducer seam for true Duet preview.
+// VG-DUET-SLICE-4B-A: surface egress seam (acquireSurface, sync lifecycle, two-phase release).
 //
 // Wraps a TextureRegistry.SurfaceProducer and tracks the surface lifecycle.
-// Does NOT start a renderer, GLES context, or retain a Surface reference
-// beyond the state-tracking callback. SurfaceProducer owns producer lifecycle.
+// Does NOT start a renderer or GLES context, and does NOT retain a Surface
+// reference. SurfaceProducer owns producer lifecycle; callers may borrow the
+// Surface via acquireSurface() but must never release it.
 //
 // State machine:
 //   ATTACHED_WAITING_SURFACE → onSurfaceAvailable → SURFACE_AVAILABLE
 //   SURFACE_AVAILABLE → onSurfaceCleanup → SURFACE_LOST
 //   SURFACE_LOST → onSurfaceAvailable → SURFACE_AVAILABLE
-//   any → release() → DETACHED (released exactly once)
+//   any → beginRelease() → DETACHED; finishRelease() releases the producer exactly once
 
 /**
  * Internal state of the Duet preview surface producer.
@@ -32,13 +37,30 @@ enum class DuetSurfaceState {
  * Wraps a [TextureRegistry.SurfaceProducer] and tracks the surface lifecycle
  * without retaining a Surface reference or starting a render loop.
  *
- * All callback and release operations post to [mainHandler] from any thread.
+ * Threading:
+ * - Flutter delivers lifecycle callbacks on the platform (main) thread. State
+ *   transitions and the optional [onSurfaceAvailable] / [onSurfaceLost] hooks run
+ *   synchronously inside that callback, so [DuetSurfaceState.SURFACE_LOST] is
+ *   already set before `onSurfaceCleanup` returns (a later compositor must stop
+ *   submitting to the Surface before that point).
+ * - [acquireSurface] is platform-thread only. A later render thread may receive
+ *   the acquired Surface from the caller but must not call this itself.
+ * - [beginRelease] / [finishRelease] / [release] may be called from any thread;
+ *   producer calls are run inline on the platform thread or posted to [mainHandler].
+ *
+ * Hook contract: [onSurfaceAvailable] / [onSurfaceLost] fire only on real state
+ * transitions driven by Flutter callbacks. The eager availability probe in `init`
+ * never fires a hook (the object is still under construction); callers should
+ * inspect [state] after construction. [beginRelease] does not fire [onSurfaceLost]
+ * either, so the owner can stop a compositor explicitly between the two phases.
  */
 class AndroidDuetPreviewSurfaceProducer(
     textureRegistry: TextureRegistry,
     private val mainHandler: Handler,
     widthPx:  Int,
     heightPx: Int,
+    private val onSurfaceAvailable: (() -> Unit)? = null,
+    private val onSurfaceLost: (() -> Unit)? = null,
 ) {
 
     companion object {
@@ -60,7 +82,17 @@ class AndroidDuetPreviewSurfaceProducer(
 
     val state: DuetSurfaceState get() = _state
 
-    private val released = AtomicBoolean(false)
+    /** Phase 1 of release: callback cleared + DETACHED. */
+    private val releaseBegun = AtomicBoolean(false)
+    /** Phase 2 of release: producer.release() issued. */
+    private val releaseFinished = AtomicBoolean(false)
+
+    // ── Lifecycle adapter ─────────────────────────────────────────────────────
+
+    private val lifecycleAdapter = AndroidDagSurfaceProducerLifecycleAdapter(
+        onAvailable = { handleSurfaceAvailable() },
+        onCleanup   = { handleSurfaceCleanup() },
+    )
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -72,38 +104,10 @@ class AndroidDuetPreviewSurfaceProducer(
             Log.w(TAG, "setSize($widthPx, $heightPx) threw: ${t.message}")
         }
 
-        // Register lifecycle callback using the existing adapter from the codec layer.
-        val callback = object : TextureRegistry.SurfaceProducer.Callback {
-            override fun onSurfaceAvailable() {
-                mainHandler.post {
-                    if (_state != DuetSurfaceState.DETACHED) {
-                        _state = DuetSurfaceState.SURFACE_AVAILABLE
-                        Log.d(TAG, "textureId=$textureId SURFACE_AVAILABLE")
-                    }
-                }
-            }
-
-            override fun onSurfaceCleanup() {
-                mainHandler.post {
-                    if (_state != DuetSurfaceState.DETACHED) {
-                        _state = DuetSurfaceState.SURFACE_LOST
-                        Log.d(TAG, "textureId=$textureId SURFACE_LOST")
-                    }
-                }
-            }
-
-            // Deprecated API compatibility: forward to the same handlers.
-            @Deprecated("Use onSurfaceAvailable", replaceWith = ReplaceWith("onSurfaceAvailable()"))
-            override fun onSurfaceCreated() = onSurfaceAvailable()
-
-            @Deprecated("Use onSurfaceCleanup", replaceWith = ReplaceWith("onSurfaceCleanup()"))
-            override fun onSurfaceDestroyed() = onSurfaceCleanup()
-        }
-
         try {
-            producer.setCallback(callback)
+            producer.setCallback(lifecycleAdapter)
             // After registering the callback the surface may already be available;
-            // probe getSurface() to potentially advance state immediately.
+            // probe getSurface() to advance state immediately. No hook fires here.
             // Do NOT retain the Surface reference; SurfaceProducer owns it.
             val surface = producer.getSurface()
             if (surface != null && surface.isValid) {
@@ -115,33 +119,116 @@ class AndroidDuetPreviewSurfaceProducer(
         }
     }
 
-    // ── Release (idempotent) ──────────────────────────────────────────────────
+    // ── Lifecycle handlers (platform thread, synchronous) ─────────────────────
 
-    /**
-     * Releases the [TextureRegistry.SurfaceProducer] exactly once.
-     * Transitions state to [DuetSurfaceState.DETACHED].
-     * Safe to call from any thread; release is posted to [mainHandler].
-     */
-    fun release() {
-        if (!released.compareAndSet(false, true)) return
-        _state = DuetSurfaceState.DETACHED
-        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-            releaseInternal()
-        } else {
-            mainHandler.post { releaseInternal() }
+    private fun handleSurfaceAvailable() {
+        if (_state == DuetSurfaceState.DETACHED) return
+        val previous = _state
+        _state = DuetSurfaceState.SURFACE_AVAILABLE
+        Log.d(TAG, "textureId=$textureId SURFACE_AVAILABLE (from $previous)")
+        if (previous != DuetSurfaceState.SURFACE_AVAILABLE) {
+            invokeHook("onSurfaceAvailable", onSurfaceAvailable)
         }
     }
 
-    private fun releaseInternal() {
+    private fun handleSurfaceCleanup() {
+        if (_state == DuetSurfaceState.DETACHED) return
+        val previous = _state
+        // Must be set before returning: contract says stop submitting immediately.
+        _state = DuetSurfaceState.SURFACE_LOST
+        Log.d(TAG, "textureId=$textureId SURFACE_LOST (from $previous)")
+        if (previous != DuetSurfaceState.SURFACE_LOST) {
+            invokeHook("onSurfaceLost", onSurfaceLost)
+        }
+    }
+
+    private fun invokeHook(name: String, hook: (() -> Unit)?) {
+        if (hook == null) return
         try {
-            // Null out callback before release per existing pattern.
-            producer.setCallback(null)
-        } catch (_: Throwable) {}
-        try {
-            producer.release()
-            Log.d(TAG, "textureId=$textureId released")
+            hook()
         } catch (t: Throwable) {
-            Log.w(TAG, "producer.release() failed: ${t.message}")
+            Log.e(TAG, "textureId=$textureId $name hook threw", t)
+        }
+    }
+
+    // ── Surface egress ────────────────────────────────────────────────────────
+
+    /**
+     * Returns the producer's current [Surface] for a consumer to render into, or null.
+     *
+     * Non-null only when called on the platform (main) thread, release has not begun,
+     * [state] is [DuetSurfaceState.SURFACE_AVAILABLE], and the Surface is valid.
+     * The returned Surface is owned by the [TextureRegistry.SurfaceProducer]; the
+     * caller must NEVER call `Surface.release()` on it and must stop using it as
+     * soon as [onSurfaceLost] fires or [state] leaves SURFACE_AVAILABLE.
+     */
+    fun acquireSurface(): Surface? {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Log.w(TAG, "textureId=$textureId acquireSurface() called off the platform thread; returning null")
+            return null
+        }
+        if (releaseBegun.get() || _state != DuetSurfaceState.SURFACE_AVAILABLE) return null
+        return try {
+            val surface = producer.getSurface()
+            if (surface != null && surface.isValid) surface else null
+        } catch (t: Throwable) {
+            Log.w(TAG, "textureId=$textureId getSurface() threw: ${t.message}")
+            null
+        }
+    }
+
+    // ── Release (two-phase, idempotent) ───────────────────────────────────────
+
+    /**
+     * Phase 1: clears the lifecycle callback and marks [DuetSurfaceState.DETACHED].
+     * After this, no further lifecycle events or hooks are delivered and
+     * [acquireSurface] returns null. Does not release the producer and does not
+     * fire [onSurfaceLost]; the owner stops any consumer explicitly before
+     * [finishRelease]. Idempotent.
+     */
+    fun beginRelease() {
+        if (!releaseBegun.compareAndSet(false, true)) return
+        _state = DuetSurfaceState.DETACHED
+        runOnPlatformThread {
+            try {
+                // Null out callback before release per existing pattern.
+                producer.setCallback(null)
+            } catch (_: Throwable) {}
+            Log.d(TAG, "textureId=$textureId release begun (DETACHED)")
+        }
+    }
+
+    /**
+     * Phase 2: releases the [TextureRegistry.SurfaceProducer] exactly once.
+     * Calls [beginRelease] first if the owner skipped it. Idempotent.
+     */
+    fun finishRelease() {
+        beginRelease()
+        if (!releaseFinished.compareAndSet(false, true)) return
+        runOnPlatformThread {
+            try {
+                producer.release()
+                Log.d(TAG, "textureId=$textureId released")
+            } catch (t: Throwable) {
+                Log.w(TAG, "producer.release() failed: ${t.message}")
+            }
+        }
+    }
+
+    /**
+     * Single-shot release: [beginRelease] then [finishRelease].
+     * Safe to call from any thread; producer work runs on the platform thread.
+     */
+    fun release() {
+        beginRelease()
+        finishRelease()
+    }
+
+    private fun runOnPlatformThread(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post { block() }
         }
     }
 
