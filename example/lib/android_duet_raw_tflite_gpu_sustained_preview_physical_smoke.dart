@@ -67,6 +67,16 @@ const int kSustainedObservationSeconds = int.fromEnvironment(
 /// How often an observe tick (and eventCount snapshot) is printed.
 const int kObserveTickIntervalSeconds = 5;
 
+/// Debug-only GPU delegate mode for raw_tflite_gpu live sessions.
+/// Valid values: compat_best_or_default, forced_default, sustained_speed,
+/// force_opencl, force_opengl. Invalid values are silently fallen back to
+/// compat_best_or_default by AndroidDuetSessionCoordinator.
+/// Override with `--dart-define=DUET_RAW_TFLITE_GPU_LIVE_DELEGATE_MODE=<mode>`.
+const String kRawTfliteGpuLiveDelegateMode = String.fromEnvironment(
+  'DUET_RAW_TFLITE_GPU_LIVE_DELEGATE_MODE',
+  defaultValue: 'compat_best_or_default',
+);
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const AndroidDuetRawTfliteGpuSustainedPreviewPhysicalSmokeApp());
@@ -244,21 +254,26 @@ class _AndroidDuetRawTfliteGpuSustainedPreviewPhysicalSmokeAppState
         'Attaching preview texture (1080x1920, greenScreen, raw_tflite_gpu opt-in)',
         () async {
           final result = await _withTimeout(
-            _channel.invokeMethod<Map>(
-              'attachDuetPreviewTexture',
-              <String, dynamic>{
-                'sessionId': sessionId!,
-                'canvasSize': <String, dynamic>{'width': 1080, 'height': 1920},
-                'layoutConfig': <String, dynamic>{
-                  'mode': 'greenScreen',
-                  'isSideSwapped': false,
-                  'isTopBottomSwapped': false,
-                  // Debug-only key routed by AndroidDuetSessionCoordinator to
-                  // start the adapter on the raw_tflite_gpu rung.
-                  'debugSegmentationBackend': 'raw_tflite_gpu',
-                },
+            _channel.invokeMethod<Map>('attachDuetPreviewTexture', <
+              String,
+              dynamic
+            >{
+              'sessionId': sessionId!,
+              'canvasSize': <String, dynamic>{'width': 1080, 'height': 1920},
+              'layoutConfig': <String, dynamic>{
+                'mode': 'greenScreen',
+                'isSideSwapped': false,
+                'isTopBottomSwapped': false,
+                // Debug-only key routed by AndroidDuetSessionCoordinator to
+                // start the adapter on the raw_tflite_gpu rung.
+                'debugSegmentationBackend': 'raw_tflite_gpu',
+                // Debug-only GPU delegate mode for the raw_tflite_gpu rung.
+                // Sourced from --dart-define=DUET_RAW_TFLITE_GPU_LIVE_DELEGATE_MODE.
+                // Validated by the coordinator; invalid values fall back to
+                // compat_best_or_default without failing session start.
+                'debugRawTfliteGpuDelegateMode': kRawTfliteGpuLiveDelegateMode,
               },
-            ),
+            }),
             'attachDuetPreviewTexture',
           );
           if (result == null) {
@@ -480,6 +495,7 @@ class _AndroidDuetRawTfliteGpuSustainedPreviewPhysicalSmokeAppState
         ],
         'sessionId': sessionId,
         'textureId': textureId,
+        'rawTfliteGpuDelegateMode': kRawTfliteGpuLiveDelegateMode,
         'duetEvents': duetEvents,
         'stepResults': stepResults,
         'failures': failures,

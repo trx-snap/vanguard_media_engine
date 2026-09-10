@@ -161,6 +161,19 @@ class AndroidDuetSessionCoordinator(
         private val VALID_SPEEDS = setOf(0.3, 0.5, 1.0, 2.0, 3.0)
         private const val SPEED_EPSILON = 0.001
 
+        /**
+         * Allowlist for `layoutConfigMap["debugRawTfliteGpuDelegateMode"]`. Kept in sync
+         * with the backend's internal allowlist. Invalid values are silently fallen back
+         * to `compat_best_or_default`; they must not fail session start.
+         */
+        internal val RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST = setOf(
+            "compat_best_or_default",
+            "forced_default",
+            "sustained_speed",
+            "force_opencl",
+            "force_opengl",
+        )
+
         fun isValidSpeed(speed: Double): Boolean =
             VALID_SPEEDS.any { Math.abs(it - speed) < SPEED_EPSILON }
 
@@ -850,8 +863,6 @@ class AndroidDuetSessionCoordinator(
         if (session.greenScreenAdapter != null) return session.greenScreenAdapter
         val renderLoop = session.previewRenderLoop ?: return null
         return try {
-            val selector = AndroidDuetSegmentationBackendSelector(context)
-
             // Debug-only opt-in: a physical smoke harness can start this session
             // on the raw_tflite_gpu rung by setting
             //   layoutConfigMap["debugSegmentationBackend"] = "raw_tflite_gpu"
@@ -860,6 +871,31 @@ class AndroidDuetSessionCoordinator(
             // The session latch wins over the debug key if already set (degradation
             // never climbs back up within a session).
             val debugBackend = session.layoutConfigMap["debugSegmentationBackend"] as? String
+
+            // Read the raw GPU delegate mode only when the debug backend is raw_tflite_gpu.
+            // Validate against the allowlist; fall back to default on invalid/missing values
+            // without failing session start.
+            val rawGpuDelegateMode: String? = if (debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU) {
+                val rawMode = session.layoutConfigMap["debugRawTfliteGpuDelegateMode"] as? String
+                if (rawMode != null) {
+                    if (rawMode in RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST) {
+                        rawMode
+                    } else {
+                        Log.w("DuetCoordinator",
+                            "debugRawTfliteGpuDelegateMode='$rawMode' is not in allowlist " +
+                                "$RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST; " +
+                                "falling back to compat_best_or_default (session=${session.sessionId})")
+                        null
+                    }
+                } else {
+                    null // absent → backend default (compat_best_or_default)
+                }
+            } else {
+                null
+            }
+
+            val selector = AndroidDuetSegmentationBackendSelector(context, rawGpuDelegateMode)
+
             val initialBackendId: String = when {
                 session.greenScreenLatchedBackendId != null ->
                     session.greenScreenLatchedBackendId!!
@@ -867,7 +903,8 @@ class AndroidDuetSessionCoordinator(
                     selector.supports(DuetSegmentationBackend.RAW_TFLITE_GPU) -> {
                     Log.d("DuetCoordinator",
                         "debugSegmentationBackend=raw_tflite_gpu: starting adapter on raw_tflite_gpu " +
-                            "(session=${session.sessionId})")
+                            "(delegateMode=${rawGpuDelegateMode ?: "compat_best_or_default"}, " +
+                            "session=${session.sessionId})")
                     DuetSegmentationBackend.RAW_TFLITE_GPU
                 }
                 else -> selector.primaryBackendId()

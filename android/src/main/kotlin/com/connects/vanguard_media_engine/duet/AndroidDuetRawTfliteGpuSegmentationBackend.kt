@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.gpu.GpuDelegateFactory
 import java.io.InputStream
@@ -53,8 +54,26 @@ private const val MODEL_C_OUT          = 6
 private const val BACKGROUND_CLASS_IDX = 0
 private const val CLOSE_TIMEOUT_MS     = 2_000L
 
+// Debug-only allowlist for the GPU delegate mode. Invalid values supplied via
+// layoutConfigMap["debugRawTfliteGpuDelegateMode"] fall back to the default
+// and are validated/warned in AndroidDuetSessionCoordinator.
+private val DELEGATE_MODE_ALLOWLIST = setOf(
+    "compat_best_or_default",
+    "forced_default",
+    "sustained_speed",
+    "force_opencl",
+    "force_opengl",
+)
+
 class AndroidDuetRawTfliteGpuSegmentationBackend(
     private val context: Context,
+    /**
+     * Internal debug-only delegate mode, validated against [DELEGATE_MODE_ALLOWLIST].
+     * Controls how [GpuDelegateFactory.Options] are constructed in [initOnOwnedThread].
+     * Default: `"compat_best_or_default"` — same as production behaviour.
+     * Do NOT use to promote raw_tflite_gpu to the production ladder.
+     */
+    private val delegateMode: String = "compat_best_or_default",
 ) : AndroidDuetSegmentationBackend {
 
     override val backendId: String get() = DuetSegmentationBackend.RAW_TFLITE_GPU
@@ -230,9 +249,78 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             )
         }
 
-        // 3. Create GpuDelegate using default options. Per architecture decision,
-        //    we use standalone GpuDelegate even if CompatibilityList reports unsupported.
-        val gpuDel = GpuDelegate(GpuDelegateFactory.Options())
+        // 3. Build GpuDelegateFactory.Options by delegateMode, mirroring the
+        //    verified pattern from TfliteGpuIsolatedProbeService.
+        //    CompatibilityList is queried once then closed; bestDelegateOptions is
+        //    used only for compat_best_or_default when the device is supported.
+        var bestDelegateOptions: GpuDelegateFactory.Options? = null
+        var compatSupported: Boolean? = null
+        try {
+            val compatibilityList = CompatibilityList()
+            try {
+                val supported = compatibilityList.isDelegateSupportedOnThisDevice
+                compatSupported = supported
+                if (supported) {
+                    try {
+                        bestDelegateOptions = compatibilityList.bestOptionsForThisDevice
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "CompatibilityList.bestOptionsForThisDevice threw: ${t.message}")
+                    }
+                }
+            } finally {
+                try { compatibilityList.close() } catch (t: Throwable) {
+                    Log.w(TAG, "CompatibilityList.close() threw: ${t.message}")
+                }
+            }
+        } catch (t: Throwable) {
+            compatSupported = null
+            Log.w(TAG, "CompatibilityList construction failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+
+        val gpuOptions: GpuDelegateFactory.Options
+        val optionsSource: String
+        when (delegateMode) {
+            "compat_best_or_default" -> {
+                if (bestDelegateOptions != null) {
+                    gpuOptions = bestDelegateOptions
+                    optionsSource = "compat_best_options"
+                } else {
+                    gpuOptions = GpuDelegateFactory.Options()
+                    optionsSource = "compat_default_options"
+                }
+            }
+            "forced_default" -> {
+                gpuOptions = GpuDelegateFactory.Options()
+                optionsSource = "forced_default_options"
+            }
+            "sustained_speed" -> {
+                gpuOptions = GpuDelegateFactory.Options().apply {
+                    setInferencePreference(GpuDelegateFactory.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                }
+                optionsSource = "sustained_speed_options"
+            }
+            "force_opencl" -> {
+                gpuOptions = GpuDelegateFactory.Options().apply {
+                    setForceBackend(GpuDelegateFactory.Options.GpuBackend.OPENCL)
+                }
+                optionsSource = "force_opencl_options"
+            }
+            "force_opengl" -> {
+                gpuOptions = GpuDelegateFactory.Options().apply {
+                    setForceBackend(GpuDelegateFactory.Options.GpuBackend.OPENGL)
+                }
+                optionsSource = "force_opengl_options"
+            }
+            else -> {
+                // Should not reach here — coordinator validates against DELEGATE_MODE_ALLOWLIST
+                // before constructing the backend. Defensive fallback.
+                gpuOptions = GpuDelegateFactory.Options()
+                optionsSource = "unknown_fallback_options"
+                Log.w(TAG, "Unknown delegateMode='$delegateMode'; using default GpuDelegateFactory.Options")
+            }
+        }
+
+        val gpuDel = GpuDelegate(gpuOptions)
         gpuDelegate = gpuDel
 
         // 4. Create Interpreter with GpuDelegate.
@@ -296,6 +384,9 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             TAG,
             "ANDROID_DUET_RAW_TFLITE_GPU_READY " +
                 "model=$MODEL_ASSET " +
+                "delegateMode=$delegateMode " +
+                "optionsSource=$optionsSource " +
+                "compatSupported=$compatSupported " +
                 "inputShape=[1,$MODEL_H,$MODEL_W,$MODEL_C_IN] " +
                 "outputShape=[1,$MODEL_H,$MODEL_W,$MODEL_C_OUT]",
         )

@@ -44,6 +44,13 @@ import android.util.Log
 
 class AndroidDuetSegmentationBackendSelector(
     private val context: Context?,
+    /**
+     * Debug-only GPU delegate mode for [DuetSegmentationBackend.RAW_TFLITE_GPU].
+     * Validated against the backend's allowlist by [AndroidDuetSessionCoordinator]
+     * before this selector is constructed. `null` → backend default
+     * (`compat_best_or_default`). Ignored for all other backends.
+     */
+    private val rawGpuDelegateMode: String? = null,
 ) {
 
     /** Context this selector was constructed with, exposed so the adapter can build its adaptive-quality policy. */
@@ -160,6 +167,10 @@ class AndroidDuetSegmentationBackendSelector(
     /**
      * Constructs (but does not open) the backend for [backendId].
      * Throws IllegalArgumentException for unsupported ids.
+     *
+     * For [DuetSegmentationBackend.RAW_TFLITE_GPU], the delegate mode is taken
+     * from [rawGpuDelegateMode] stored at selector construction time (validated
+     * by [AndroidDuetSessionCoordinator]). All other backends ignore it.
      */
     fun createBackend(backendId: String): AndroidDuetSegmentationBackend = when (backendId) {
         DuetSegmentationBackend.MEDIAPIPE_GPU -> {
@@ -176,7 +187,8 @@ class AndroidDuetSegmentationBackendSelector(
         DuetSegmentationBackend.RAW_TFLITE_GPU -> {
             val ctx = context
                 ?: throw IllegalArgumentException("raw_tflite_gpu backend requires a Context")
-            AndroidDuetRawTfliteGpuSegmentationBackend(ctx.applicationContext ?: ctx)
+            val mode = rawGpuDelegateMode ?: "compat_best_or_default"
+            AndroidDuetRawTfliteGpuSegmentationBackend(ctx.applicationContext ?: ctx, mode)
         }
         else -> throw IllegalArgumentException("Unsupported segmentation backend '$backendId'")
     }
