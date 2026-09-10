@@ -1,9 +1,11 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.UUID
@@ -74,6 +76,8 @@ class VGDuetAndroidSession(
     // Slice 4B-C: render loop pumping decoder frames into the producer's Surface.
     // Created alongside previewProducer, stopped and cleared with it.
     var previewRenderLoop: AndroidDuetPreviewRenderLoop? = null
+    // Live camera source for duet preview — started on attach, stopped with renderLoop.
+    var cameraSource: AndroidDuetCameraSource? = null
     // Original dimensions and layout rects stored on first attach;
     // returned verbatim on repeated (idempotent) attach calls.
     var previewWidthPx:    Int? = null
@@ -134,6 +138,7 @@ class VGDuetAndroidSession(
 class AndroidDuetSessionCoordinator(
     private val mainHandler: Handler,
     private val textureRegistry: TextureRegistry? = null,
+    private val context: Context? = null,
 ) {
 
     companion object {
@@ -588,7 +593,18 @@ class AndroidDuetSessionCoordinator(
         }
 
         val renderLoop = try {
-            AndroidDuetPreviewRenderLoop(mainHandler, decoderHandler) { session.decoder }
+            AndroidDuetPreviewRenderLoop(
+                mainHandler     = mainHandler,
+                decoderHandler  = decoderHandler,
+                decoderProvider = { session.decoder },
+                // Defect 1 fix: receive the compositor's cameraInputSurface on the
+                // main thread once the render-thread EGL bootstrap completes, then
+                // call the centralized startCameraSourceIfNeeded — no synchronous
+                // post-attach read of cameraInputSurface.
+                cameraInputSurfaceReady = { camSurface ->
+                    startCameraSourceIfNeeded(session, sessionId, camSurface)
+                },
+            )
         } catch (t: Throwable) {
             producer.release()
             reply(null, errorMsg("composition_failed",
@@ -614,6 +630,8 @@ class AndroidDuetSessionCoordinator(
 
         // The eager probe in the producer's init never fires the availability
         // hook, so bootstrap the render loop here when the surface already exists.
+        // Camera start is handled exclusively via the cameraInputSurfaceReady
+        // callback wired above — no synchronous read of cameraInputSurface here.
         if (producer.state == DuetSurfaceState.SURFACE_AVAILABLE && typedRects != null) {
             val surface = producer.acquireSurface()
             if (surface != null) {
@@ -634,6 +652,13 @@ class AndroidDuetSessionCoordinator(
      * Fires synchronously inside the producer's platform-thread callback when the
      * Flutter surface (re)appears. Re-attaches the render loop's output using the
      * stored attach-time dimensions/layout and the current hold PTS.
+     *
+     * Camera management: [attachOutputSurface] inside the render loop re-fires the
+     * [cameraInputSurfaceReady] callback on the main thread. [startCameraSourceIfNeeded]
+     * is idempotent — it no-ops when cameraSource is already running — so this is
+     * safe for normal re-attaches after output loss. It also enables retry: if a
+     * prior transient CameraX failure nulled cameraSource, the re-fired callback
+     * gives the coordinator a chance to start the camera again.
      */
     private fun handlePreviewSurfaceAvailable(sessionId: String) {
         val session = activeSession ?: return
@@ -662,6 +687,63 @@ class AndroidDuetSessionCoordinator(
         session.previewRenderLoop?.handleOutputSurfaceLost()
     }
 
+    /**
+     * Centralized, idempotent camera-start helper called from the render loop's
+     * [cameraInputSurfaceReady] callback (main thread).
+     *
+     * Idempotent guards (all checked before starting CameraX):
+     *   - [activeSession] is not this exact session object → no-op (session was
+     *     detached/stopped/disposed/disposeAll between when the callback was posted
+     *     on the render thread and when it ran on the main thread).
+     *   - [session.sessionId] != [sessionId] → no-op (same identity check via the
+     *     captured closure argument, belt-and-suspenders).
+     *   - [session.previewRenderLoop] is null → no-op (render loop was released
+     *     before this callback ran; camera must not start against a dead loop).
+     *   - [session.previewProducer] is null → no-op (producer was released; the
+     *     output surface is gone and starting camera would be pointless).
+     *   - [surface.isValid] is false → no-op (compositor's cameraInputSurface was
+     *     already released during teardown before the posted callback ran).
+     *   - [context] is null → no-op (no Context available, cannot create CameraSource).
+     *   - [session.cameraSource] is non-null → no-op (camera already started; camera
+     *     source survives output loss — the compositor Surface lives across re-attaches).
+     *
+     * On start error: stops/nulls the source so a later re-attach or re-callback can retry.
+     */
+    private fun startCameraSourceIfNeeded(
+        session: VGDuetAndroidSession,
+        sessionId: String,
+        surface: android.view.Surface,
+    ) {
+        // Hard lifecycle guards — any of these failing means the session was torn
+        // down between when cameraInputSurfaceReady was posted and when it ran.
+        if (activeSession !== session) return
+        if (session.sessionId != sessionId) return
+        if (session.previewRenderLoop == null) return
+        if (session.previewProducer == null) return
+        if (!surface.isValid) return
+        val ctx = context ?: return
+        // Already started: camera source and its surface survive output loss, so
+        // a repeat callback when cameraSource is non-null correctly does nothing.
+        if (session.cameraSource != null) return
+        val camSource = AndroidDuetCameraSource(ctx)
+        session.cameraSource = camSource
+        camSource.start(
+            targetSurface = surface,
+            onStarted = {
+                Log.d("DuetCoordinator", "Camera source started for session $sessionId")
+            },
+            onError = { e ->
+                Log.w("DuetCoordinator", "Camera source failed for $sessionId: ${e.message}")
+                // Stop any partial CameraX state and null the source so a later
+                // re-attach callback can retry cleanly.
+                camSource.stop()
+                if (session.cameraSource === camSource) {
+                    session.cameraSource = null
+                }
+            },
+        )
+    }
+
     // ── detachPreviewTexture (Slice 4A) ───────────────────────────────────────
 
     fun detachPreviewTexture(sessionId: String, reply: (Any?, String?) -> Unit) {
@@ -675,12 +757,19 @@ class AndroidDuetSessionCoordinator(
     // ── Preview release helper ────────────────────────────────────────────────
 
     /**
-     * Releases and nulls the session's preview producer and render loop.
+     * Releases and nulls the session's preview producer, camera source, and
+     * render loop.
      *
-     * Slice 4B-A two-phase seam, now filled in by 4B-C: beginRelease() detaches
-     * callbacks and marks DETACHED, the render loop stops (blocking, bounded)
-     * between the phases so nothing submits into the dying Surface, then
-     * finishRelease() drops the producer.
+     * Opus P1 stop ordering (prevents CameraX writing into a concurrently
+     * releasing SurfaceTexture or a live drawFrame consuming an OES frame mid-stop):
+     *   1. producer.beginRelease()            — detaches producer callbacks
+     *   2. renderLoop.prepareForCameraStop()  — stops active ticking, stops camera
+     *      idle redraw, sets canSubmit=false and bumps surfaceGeneration so no
+     *      pending swaps continue while CameraX is draining its last OES frame
+     *   3. cameraSource.stop()               — stops CameraX writes into cameraInputSurface
+     *   4. renderLoop.stopBlocking(...)      — unbinds decoder, releases compositor
+     *      (which releases cameraInputSurface in its terminal release())
+     *   5. producer.finishRelease()          — drops the Flutter SurfaceProducer
      *
      * Must be called while session.decoder is still non-null: stopBlocking's
      * unbind reaches the decoder through the loop's decoderProvider.
@@ -688,9 +777,20 @@ class AndroidDuetSessionCoordinator(
     private fun releasePreviewProducer(session: VGDuetAndroidSession) {
         val producer = session.previewProducer
         val renderLoop = session.previewRenderLoop
+        val camSource = session.cameraSource
+        // Phase 1: stop new producer submissions.
         producer?.beginRelease()
+        // Phase 2: halt render-thread ticking and camera-idle redraw, and block
+        // swap acceptance BEFORE CameraX is stopped. This prevents a drawFrame
+        // updateTexImage racing the last CameraX OES write during drain.
+        renderLoop?.prepareForCameraStop()
+        // Phase 3: stop camera — render loop is already quiet, safe to drain.
+        camSource?.stop()
+        // Phase 4: unwind decoder and release compositor (releases cameraInputSurface).
         renderLoop?.stopBlocking(session.previewClock.currentSourcePtsMs().toLong())
+        // Phase 5: drop the Flutter SurfaceProducer.
         producer?.finishRelease()
+        session.cameraSource       = null
         session.previewProducer    = null
         session.previewRenderLoop  = null
         session.previewWidthPx     = null

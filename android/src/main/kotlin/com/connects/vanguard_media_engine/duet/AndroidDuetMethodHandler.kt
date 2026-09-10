@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.content.Context
 import android.os.Handler
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
@@ -16,7 +17,11 @@ import io.flutter.view.TextureRegistry
  * Thin dispatch handler for all Duet MethodChannel routes.
  * Plugin owns one instance and calls [handleMethodCall] for routes [ownsMethod] returns true for.
  */
-class AndroidDuetMethodHandler(mainHandler: Handler, textureRegistry: TextureRegistry? = null) {
+class AndroidDuetMethodHandler(
+    mainHandler: Handler,
+    textureRegistry: TextureRegistry? = null,
+    context: Context? = null,
+) {
 
     // ── Owned routes ──────────────────────────────────────────────────────────
 
@@ -43,7 +48,7 @@ class AndroidDuetMethodHandler(mainHandler: Handler, textureRegistry: TextureReg
 
     // ── Coordinator ───────────────────────────────────────────────────────────
 
-    private val coordinator = AndroidDuetSessionCoordinator(mainHandler, textureRegistry)
+    private val coordinator = AndroidDuetSessionCoordinator(mainHandler, textureRegistry, context)
 
     // ── Dispatch ──────────────────────────────────────────────────────────────
 

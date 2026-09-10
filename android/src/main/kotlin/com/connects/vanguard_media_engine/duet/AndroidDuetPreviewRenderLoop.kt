@@ -50,6 +50,22 @@ class AndroidDuetPreviewRenderLoop(
     private val mainHandler: Handler,
     private val decoderHandler: Handler,
     private val decoderProvider: () -> AndroidDuetSourceVideoDecoder?,
+    /**
+     * Optional callback invoked on the main thread each time [attachOutputSurface]
+     * succeeds and [compositor.cameraInputSurface] is non-null. The surface passed
+     * is compositor-owned (valid for the lifetime of this render loop). The
+     * coordinator uses this to start [AndroidDuetCameraSource] reliably without
+     * relying on an immediate post-attach synchronous read of [cameraInputSurface]
+     * (which would race the async render-thread bootstrap).
+     *
+     * Fired on every successful [attachOutputSurface] where cameraInputSurface is
+     * non-null (not just the first). The coordinator's [startCameraSourceIfNeeded]
+     * is idempotent — it no-ops when cameraSource is already running — so repeat
+     * calls are harmless. Firing on re-attach also gives retry when a prior
+     * transient CameraX failure nulled cameraSource. Never called if the
+     * compositor bootstrap fails.
+     */
+    private val cameraInputSurfaceReady: ((android.view.Surface) -> Unit)? = null,
 ) {
 
     companion object {
@@ -57,6 +73,12 @@ class AndroidDuetPreviewRenderLoop(
 
         /** Active-mode tick cadence (~30 fps preview). */
         private const val TICK_INTERVAL_MS = 33L
+
+        /**
+         * Camera idle redraw cadence (~30 fps) — fires only when camera is
+         * active but the decoder is paused/held so camera frames stay live.
+         */
+        private const val CAMERA_IDLE_REDRAW_MS = 33L
 
         /**
          * When a decoder op reported a newly rendered frame, the present waits
@@ -82,6 +104,18 @@ class AndroidDuetPreviewRenderLoop(
      * tasks, so re-attach after output loss can skip the codec rebuild.
      */
     private var decoderBound = false
+
+    /**
+     * The compositor's camera input surface — allocated inside [compositor]
+     * during the first [attachOutputSurface] call.
+     *
+     * Prefer using the [cameraInputSurfaceReady] constructor callback rather
+     * than polling this property, because the compositor bootstraps EGL
+     * asynchronously on the render thread. The property returns null until
+     * the first render-thread task for [attachOutputSurface] completes.
+     * The callback is the only guaranteed delivery point.
+     */
+    val cameraInputSurface: android.view.Surface? get() = compositor.cameraInputSurface
 
     // -- Submission gating ------------------------------------------------------
 
@@ -144,6 +178,28 @@ class AndroidDuetPreviewRenderLoop(
             if (!compositor.attachOutputSurface(surface, widthPx, heightPx)) return@post
             compositor.setLayout(sourceRect, cameraRect)
             canSubmit.set(true)
+            // Ensure camera idle pump is running so camera frames are presented
+            // even before the decoder binds or active recording starts.
+            startCameraIdleRedraw()
+            // Notify the coordinator that cameraInputSurface is ready.
+            // compositor.attachOutputSurface (which calls ensureCore on the first call)
+            // allocates the camera SurfaceTexture/Surface synchronously on this render
+            // thread. We must post back to mainHandler so the coordinator can start
+            // CameraX (which requires the main thread).
+            //
+            // Fired on every successful attachOutputSurface where cameraInputSurface
+            // is non-null — no once-only flag. The coordinator's startCameraSourceIfNeeded
+            // is idempotent (session-identity, previewRenderLoop/previewProducer non-null,
+            // surface.isValid, and cameraSource non-null guards), so repeat calls when
+            // already running are harmless. Firing on re-attach gives retry after a
+            // transient CameraX failure that nulled cameraSource.
+            val camSurface = compositor.cameraInputSurface
+            if (camSurface != null) {
+                val cb = cameraInputSurfaceReady
+                if (cb != null) {
+                    mainHandler.post { cb(camSurface) }
+                }
+            }
             val input = compositor.decoderInputSurface ?: return@post
             if (!decoderBound) {
                 decoderBound = true
@@ -239,6 +295,7 @@ class AndroidDuetPreviewRenderLoop(
         if (!isStopped.compareAndSet(false, true)) return
         try {
             stopTicking()
+            stopCameraIdleRedraw()
             canSubmit.set(false)
             surfaceGeneration.incrementAndGet()
 
@@ -300,10 +357,75 @@ class AndroidDuetPreviewRenderLoop(
         }
     }
 
+    /**
+     * Camera-only idle redraw: fires on the render thread at ~30 fps when the
+     * decoder is paused/held so camera frames remain live. Does NOT submit
+     * any decoder ops and does NOT queue unbounded work (coalesced: only one
+     * re-post pending at a time). Output surface loss gates the swap inside
+     * drawFrame (returns false when no window surface); the loop keeps running
+     * but swaps silently fail until the output is re-attached.
+     */
+    private val cameraIdleRedrawRunnable = object : Runnable {
+        override fun run() {
+            if (isStopped.get()) return
+            // Only draw if the compositor has a pending camera frame or we have
+            // at least one latched camera frame to re-present.
+            if (canSubmit.get() && compositor.hasPendingCameraFrame) {
+                compositor.drawFrame()
+            }
+            renderHandler.postDelayed(this, CAMERA_IDLE_REDRAW_MS)
+        }
+    }
+
+    private fun startCameraIdleRedraw() {
+        renderHandler.removeCallbacks(cameraIdleRedrawRunnable)
+        renderHandler.post(cameraIdleRedrawRunnable)
+    }
+
+    private fun stopCameraIdleRedraw() {
+        renderHandler.removeCallbacks(cameraIdleRedrawRunnable)
+    }
+
     private fun stopTicking() {
         isActive = false
         activePtsProvider = null
         renderHandler.removeCallbacks(tickRunnable)
+        // Keep camera idle redraw running — camera must remain live during pause.
+        startCameraIdleRedraw()
+    }
+
+    /**
+     * Drains render activity in preparation for [AndroidDuetCameraSource.stop].
+     *
+     * Must be called (on any thread) **before** cameraSource.stop() in the
+     * stop ordering:
+     *   beginRelease → prepareForCameraStop() → cameraSource.stop() →
+     *   stopBlocking(finalPts) → finishRelease
+     *
+     * Effects (idempotent — safe to call when already stopped):
+     *   - Stops the active-mode tick pump (so no new Step ops arrive).
+     *   - Stops the camera-idle redraw loop (so no drawFrame calls are
+     *     scheduled while CameraX is draining its last OES frame).
+     *   - Sets canSubmit=false and bumps surfaceGeneration so any pending
+     *     postPresent tasks that already queued on the render thread drop
+     *     their swap on the generation/canSubmit guard.
+     *
+     * [stopBlocking] is still required afterwards to unbind the decoder and
+     * release the compositor; it is safe to call it after this method
+     * (shutdown steps are idempotent).
+     */
+    fun prepareForCameraStop() {
+        // Stop render-thread tick/redraw pumps immediately from the calling thread.
+        isActive = false
+        activePtsProvider = null
+        renderHandler.removeCallbacks(tickRunnable)
+        renderHandler.removeCallbacks(cameraIdleRedrawRunnable)
+        // Block swap acceptance and bump generation so any already-queued
+        // postPresent tasks (racing on the render thread) see a stale generation
+        // and skip eglSwapBuffers. This prevents a CameraX OES write racing a
+        // concurrent drawFrame → updateTexImage while stop() is in flight.
+        canSubmit.set(false)
+        surfaceGeneration.incrementAndGet()
     }
 
     // -- Decoder op queue -------------------------------------------------------

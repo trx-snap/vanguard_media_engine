@@ -903,7 +903,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         // VG-DUET-SLICE-4A: initialize Duet handler after mainHandler is available, pass textureRegistry.
-        duetMethodHandler = AndroidDuetMethodHandler(mainHandler, binding.textureRegistry)
+        // VG-DUET-LIVE-CAMERA: pass applicationContext for AndroidDuetCameraSource CameraX binding.
+        duetMethodHandler = AndroidDuetMethodHandler(mainHandler, binding.textureRegistry, binding.applicationContext)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {

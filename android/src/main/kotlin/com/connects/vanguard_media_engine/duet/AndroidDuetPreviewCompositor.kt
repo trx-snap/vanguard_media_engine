@@ -59,6 +59,15 @@ class AndroidDuetPreviewCompositor {
         private const val CAMERA_PLACEHOLDER_R = 0.13f
         private const val CAMERA_PLACEHOLDER_G = 0.14f
         private const val CAMERA_PLACEHOLDER_B = 0.17f
+
+        // Deterministic portrait preview buffer size for the camera SurfaceTexture.
+        // CameraX negotiates a real resolution for its Preview use-case, but the
+        // SurfaceTexture needs a non-zero default buffer size up front so it can
+        // export a valid EGLImage from the first onFrameAvailable call. Without this
+        // the first updateTexImage may silently produce a zero-size image.
+        // This is a preview-ingress default only; no recording/export claim.
+        private const val CAMERA_ST_DEFAULT_WIDTH  = 1080
+        private const val CAMERA_ST_DEFAULT_HEIGHT = 1920
     }
 
     // -- EGL core (created lazily on first attach, destroyed only in release) --
@@ -105,6 +114,33 @@ class AndroidDuetPreviewCompositor {
     private var hasTexImage = false
 
     private val stMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+
+    // -- Camera ingest (independent of decoder; survives output loss, released only in release) --
+
+    private var cameraOesTextureId = 0
+    private var cameraSurfaceTexture: SurfaceTexture? = null
+
+    @Volatile
+    private var _cameraInputSurface: Surface? = null
+
+    /**
+     * Surface the camera (AndroidDuetCameraSource) renders into. Owned by
+     * this compositor: allocated on first [attachOutputSurface], released once
+     * in [release]. Null until the first successful [attachOutputSurface].
+     */
+    val cameraInputSurface: Surface? get() = _cameraInputSurface
+
+    /** Set by the camera frame-available callback (any thread), consumed in [drawFrame]. */
+    private val cameraFramePending = AtomicBoolean(false)
+
+    /** True when [drawFrame] has latched at least one real camera frame. */
+    private var hasCameraTexImage = false
+
+    /** True when a new camera frame is waiting to be consumed. */
+    val hasPendingCameraFrame: Boolean get() = cameraFramePending.get()
+
+    private val cameraStMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+
 
     // -- Output / layout state -------------------------------------------------
 
@@ -249,10 +285,19 @@ class AndroidDuetPreviewCompositor {
         try {
             if (!EGL14.eglMakeCurrent(display, window, window, eglContext)) return false
 
+            // Latch source decoder frame if one arrived since last draw.
             if (framePending.compareAndSet(true, false)) {
                 texture.updateTexImage()
                 texture.getTransformMatrix(stMatrix)
                 hasTexImage = true
+            }
+
+            // Latch camera frame if one arrived since last draw.
+            val camSt = cameraSurfaceTexture
+            if (camSt != null && cameraFramePending.compareAndSet(true, false)) {
+                camSt.updateTexImage()
+                camSt.getTransformMatrix(cameraStMatrix)
+                hasCameraTexImage = true
             }
 
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
@@ -263,7 +308,16 @@ class AndroidDuetPreviewCompositor {
             if (hasTexImage) {
                 drawSourceRect(sourceRect ?: fullSurfaceRect())
             }
-            cameraRect?.let { drawCameraPlaceholder(it) }
+
+            // Camera rect: draw live OES frame when available, else placeholder.
+            val cr = cameraRect
+            if (cr != null) {
+                if (hasCameraTexImage) {
+                    drawCameraRect(cr)
+                } else {
+                    drawCameraPlaceholder(cr)
+                }
+            }
 
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
             return EGL14.eglSwapBuffers(display, window)
@@ -285,6 +339,7 @@ class AndroidDuetPreviewCompositor {
         if (!isReleased.compareAndSet(false, true)) return
 
         try { surfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+        try { cameraSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
 
         destroyWindowSurfaceQuietly()
         outputSurface = null
@@ -298,14 +353,24 @@ class AndroidDuetPreviewCompositor {
             try {
                 if (oesTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(oesTextureId), 0)
             } catch (_: Throwable) {}
+            try {
+                if (cameraOesTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(cameraOesTextureId), 0)
+            } catch (_: Throwable) {}
         }
         oesProgram = 0
         oesTextureId = 0
+        cameraOesTextureId = 0
 
         try { _decoderInputSurface?.release() } catch (_: Throwable) {}
         _decoderInputSurface = null
         try { surfaceTexture?.release() } catch (_: Throwable) {}
         surfaceTexture = null
+
+        // Camera ingest teardown — compositor releases the cameraInputSurface here.
+        try { _cameraInputSurface?.release() } catch (_: Throwable) {}
+        _cameraInputSurface = null
+        try { cameraSurfaceTexture?.release() } catch (_: Throwable) {}
+        cameraSurfaceTexture = null
 
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
             try {
@@ -327,6 +392,7 @@ class AndroidDuetPreviewCompositor {
         eglConfig = null
         coreReady = false
         hasTexImage = false
+        hasCameraTexImage = false
     }
 
     // -- EGL core bootstrap ----------------------------------------------------
@@ -398,6 +464,7 @@ class AndroidDuetPreviewCompositor {
 
             setupOesProgram()
             setupDecoderIngest()
+            setupCameraIngest()
 
             coreReady = true
             return true
@@ -425,6 +492,43 @@ class AndroidDuetPreviewCompositor {
         texture.setOnFrameAvailableListener { framePending.set(true) }
         surfaceTexture = texture
         _decoderInputSurface = Surface(texture)
+    }
+
+
+
+
+    /**
+     * Allocates the camera OES texture, SurfaceTexture and [cameraInputSurface]
+     * independently of the decoder ingest. Must be called from [ensureCore] after
+     * the GL context is current.
+     *
+     * Sets a deterministic portrait preview default buffer size (1080×1920) on the
+     * SurfaceTexture before wrapping it in a Surface. The size must be non-zero
+     * before the first camera frame arrives so that updateTexImage produces a valid
+     * image and the OES sampler has a defined texel size. Preview-ingress default
+     * only — no recording/export claim.
+     */
+    private fun setupCameraIngest() {
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        cameraOesTextureId = textures[0]
+        if (cameraOesTextureId == 0) throw IllegalStateException("glGenTextures failed for camera OES texture")
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        val camTexture = SurfaceTexture(cameraOesTextureId)
+        // Set a deterministic non-zero default buffer size before creating the
+        // Surface. A zero default causes the first updateTexImage to return a
+        // zero-size image, breaking the OES sampler. Preview-ingress default only.
+        camTexture.setDefaultBufferSize(CAMERA_ST_DEFAULT_WIDTH, CAMERA_ST_DEFAULT_HEIGHT)
+        // Callback may fire on any looper; only sets the flag — updateTexImage
+        // happens exclusively on the render thread inside drawFrame.
+        camTexture.setOnFrameAvailableListener { cameraFramePending.set(true) }
+        cameraSurfaceTexture = camTexture
+        _cameraInputSurface = Surface(camTexture)
     }
 
     private fun setupOesProgram() {
@@ -521,7 +625,7 @@ class AndroidDuetPreviewCompositor {
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
-    /** Deterministic solid fill over the camera rect (camera arrives in a later slice). */
+    /** Solid fill fallback over the camera rect when no live camera frame has arrived yet. */
     private fun drawCameraPlaceholder(rect: VGDuetPixelRect) {
         val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
         if (scissor.width <= 0 || scissor.height <= 0) return
@@ -529,6 +633,49 @@ class AndroidDuetPreviewCompositor {
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
         GLES20.glClearColor(CAMERA_PLACEHOLDER_R, CAMERA_PLACEHOLDER_G, CAMERA_PLACEHOLDER_B, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    /**
+     * Draws the latched camera OES frame aspect-filled into [rect], mirroring
+     * the structure of [drawSourceRect] but binding [cameraOesTextureId] and
+     * [cameraStMatrix]. Reuses the same OES shader program; camera and decoder
+     * are independent GL textures and transform matrices.
+     *
+     * Aspect-fill uses the 9:16 camera stream aspect (front camera negotiated
+     * resolution). The scissor constrains output to the camera rect bounds.
+     * Camera frames are not aspect-distorted.
+     */
+    private fun drawCameraRect(rect: VGDuetPixelRect) {
+        val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
+        if (scissor.width <= 0 || scissor.height <= 0) return
+
+        // For the camera we don't know the resolved resolution from here, so use
+        // the rect itself as the viewport (aspect-fill via scissor alone is
+        // sufficient for typical 9:16 portrait camera into portrait camera rect).
+        // The SurfaceTexture transform matrix (cameraStMatrix) handles any flip/crop.
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glViewport(scissor.x, scissor.y, scissor.width, scissor.height)
+
+        GLES20.glUseProgram(oesProgram)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
+        GLES20.glUniform1i(sTextureLoc, 0)
+        GLES20.glUniformMatrix4fv(uSTMatrixLoc, 1, false, cameraStMatrix, 0)
+
+        quadPositions.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionLoc)
+        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
+        quadTexCoords.position(0)
+        GLES20.glEnableVertexAttribArray(aTexCoordLoc)
+        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(aPositionLoc)
+        GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
@@ -624,6 +771,13 @@ class AndroidDuetPreviewCompositor {
         surfaceTexture = null
         oesTextureId = 0
         oesProgram = 0
+        // Camera ingest cleanup.
+        try { cameraSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+        try { _cameraInputSurface?.release() } catch (_: Throwable) {}
+        _cameraInputSurface = null
+        try { cameraSurfaceTexture?.release() } catch (_: Throwable) {}
+        cameraSurfaceTexture = null
+        cameraOesTextureId = 0
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
             try {
                 EGL14.eglMakeCurrent(
