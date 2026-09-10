@@ -35,9 +35,34 @@ data class DuetSegmentationProbe(
 ) {
     companion object {
         /**
+         * Probe result describing the mediapipe_gpu rung as EXPERIMENTAL and
+         * NOT production-proven: a physical smoke test on SM-A566B (Android 16)
+         * showed MediaPipe Tasks ImageSegmenter with Delegate.GPU +
+         * outputConfidenceMasks(true) can open() successfully and then native-
+         * abort (SIGABRT, image_frame.cc "Format UNKNOWN") during result
+         * conversion on the first frame — an abort that cannot be caught as a
+         * Kotlin failure. [mediaPipeGpuSupported] is therefore always false
+         * here; this factory exists only for callers investigating the GPU
+         * rung directly, and no production selector/probe path calls it.
+         */
+        fun mediapipeGpu(quality: DuetSegmentationQuality = DuetSegmentationQuality.QUALITY) =
+            DuetSegmentationProbe(
+                isAvailable            = true,
+                selectedBackend        = DuetSegmentationBackend.MEDIAPIPE_GPU,
+                quality                = quality,
+                maxResolution          = 256,
+                supportsRawMask        = true,
+                reason                 = "MediaPipe Tasks Vision ImageSegmenter (GPU, VIDEO mode) is experimental and not production-proven (native abort observed during result conversion); CPU and ML Kit remain the production rungs.",
+                mediaPipeGpuSupported  = false,
+                mediaPipeCpuSupported  = true,
+                mlKitAvailable         = true,
+                analysisMaxResolution  = 256,
+                thermalTier            = "nominal",
+            )
+
+        /**
          * Probe result when MediaPipe Tasks Vision ImageSegmenter (CPU delegate,
          * VIDEO mode) is the primary backend, with ML Kit as the next rung.
-         * GPU is deferred: mediaPipeGpuSupported stays false in this slice.
          */
         fun mediapipeCpu(quality: DuetSegmentationQuality = DuetSegmentationQuality.QUALITY) =
             DuetSegmentationProbe(
@@ -102,6 +127,7 @@ data class DuetSegmentationProbe(
             quality: DuetSegmentationQuality,
         ): DuetSegmentationProbe {
             val base = when (backendId) {
+                DuetSegmentationBackend.MEDIAPIPE_GPU -> mediapipeGpu(quality)
                 DuetSegmentationBackend.MEDIAPIPE_CPU -> mediapipeCpu(quality)
                 DuetSegmentationBackend.MLKIT -> mlkit(quality)
                 else -> return unavailable("Unsupported segmentation backend '$backendId' for dynamic probe")
