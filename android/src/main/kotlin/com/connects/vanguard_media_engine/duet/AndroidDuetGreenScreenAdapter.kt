@@ -176,6 +176,9 @@ class AndroidDuetGreenScreenAdapter(
     /** Single owned adaptive-quality policy: pacing, thermal adaptation, inference-budget monitoring. */
     private val qualityPolicy = AndroidDuetAdaptiveQualityPolicy(selector.hostContext)
 
+    /** Observation-only raw_tflite_gpu inference telemetry; never affects frame handling. */
+    private val rawGpuTelemetry = AndroidDuetSegmentationTelemetry()
+
     // ── Public API ─────────────────────────────────────────────────────────────
 
     /**
@@ -216,6 +219,13 @@ class AndroidDuetGreenScreenAdapter(
         closeAllBackends()
         temporalSmoother.reset()
         qualityPolicy.reset()
+        rawGpuTelemetry.logSummary(
+            finalBackend = _currentBackendId,
+            degraded = degraded.get(),
+            terminal = terminal.get(),
+            quality = qualityPolicy.currentQuality.key,
+            thermal = qualityPolicy.currentThermalTier,
+        )
         Log.d(TAG, "stop() — backends closed")
     }
 
@@ -316,6 +326,13 @@ class AndroidDuetGreenScreenAdapter(
         durationMs: Long,
     ) {
         closer.finish {
+            rawGpuTelemetry.recordCompletion(
+                backendId = backend.backendId,
+                outcome = outcome,
+                durationMs = durationMs,
+                quality = qualityPolicy.currentQuality.key,
+                thermal = qualityPolicy.currentThermalTier,
+            )
             val inferenceDegrade = qualityPolicy.recordInferenceDuration(durationMs)
             when (outcome) {
                 is DuetSegmentationOutcome.Mask -> {
