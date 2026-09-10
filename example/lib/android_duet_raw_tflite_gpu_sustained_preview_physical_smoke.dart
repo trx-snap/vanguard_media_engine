@@ -79,8 +79,10 @@ const String kRawTfliteGpuLiveDelegateMode = String.fromEnvironment(
 
 /// Debug-only model asset path for raw_tflite_gpu live sessions.
 /// Must be a member of AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST
-/// (selfie_multiclass_256x256.tflite, selfie_segmenter.tflite). Invalid values are
-/// silently fallen back to selfie_multiclass_256x256.tflite by AndroidDuetSessionCoordinator.
+/// (selfie_multiclass_256x256.tflite, selfie_segmenter.tflite,
+/// selfie_segmentation.tflite, selfie_segmentation_landscape.tflite). Invalid
+/// values are silently fallen back to selfie_multiclass_256x256.tflite by
+/// AndroidDuetSessionCoordinator.
 /// Override with `--dart-define=DUET_RAW_TFLITE_GPU_LIVE_MODEL_ASSET=<path>`.
 const String kRawTfliteGpuLiveModelAsset = String.fromEnvironment(
   'DUET_RAW_TFLITE_GPU_LIVE_MODEL_ASSET',

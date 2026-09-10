@@ -109,6 +109,8 @@ class AndroidDuetSegmentationBackendSelector(
         val RAW_TFLITE_GPU_MODEL_ALLOWLIST: Set<String> = setOf(
             TFLITE_GPU_MODEL_ASSET_PATH,
             MODEL_ASSET_PATH,
+            "selfie_segmentation.tflite",
+            "selfie_segmentation_landscape.tflite",
         )
     }
 
