@@ -109,6 +109,14 @@ class TfliteGpuIsolatedProbeService : Service() {
             return
         }
         val rawModelAssetPath = msg.data?.getString(KEY_MODEL_ASSET_PATH)
+        val rawDelegateMode = msg.data?.getString(KEY_DELEGATE_MODE)
+        val bundle = msg.data
+        val rawRepeatCount = if (bundle != null && bundle.containsKey(KEY_REPEAT_COUNT)) {
+            bundle.getInt(KEY_REPEAT_COUNT)
+        } else {
+            null
+        }
+
         val modelAssetPath = resolveModelAssetPath(rawModelAssetPath)
         if (modelAssetPath == null) {
             val message = "modelAssetPath failed validation: $rawModelAssetPath"
@@ -120,6 +128,42 @@ class TfliteGpuIsolatedProbeService : Service() {
                     message = message,
                     throwable = null,
                     modelAssetPath = DEFAULT_MODEL_ASSET_PATH,
+                    delegateMode = resolveDelegateMode(rawDelegateMode) ?: DEFAULT_DELEGATE_MODE,
+                    repeatCount = resolveRepeatCount(rawRepeatCount) ?: DEFAULT_REPEAT_COUNT,
+                ),
+            )
+            return
+        }
+        val delegateMode = resolveDelegateMode(rawDelegateMode)
+        if (delegateMode == null) {
+            val message = "delegateMode failed validation: $rawDelegateMode"
+            logFail("invalid_delegate_mode", message)
+            sendResult(
+                replyTo,
+                ProbeRun.failureJson(
+                    code = "invalid_delegate_mode",
+                    message = message,
+                    throwable = null,
+                    modelAssetPath = modelAssetPath,
+                    delegateMode = DEFAULT_DELEGATE_MODE,
+                    repeatCount = resolveRepeatCount(rawRepeatCount) ?: DEFAULT_REPEAT_COUNT,
+                ),
+            )
+            return
+        }
+        val repeatCount = resolveRepeatCount(rawRepeatCount)
+        if (repeatCount == null) {
+            val message = "repeatCount failed validation (expected 1..$MAX_REPEAT_COUNT): $rawRepeatCount"
+            logFail("invalid_repeat_count", message)
+            sendResult(
+                replyTo,
+                ProbeRun.failureJson(
+                    code = "invalid_repeat_count",
+                    message = message,
+                    throwable = null,
+                    modelAssetPath = modelAssetPath,
+                    delegateMode = delegateMode,
+                    repeatCount = DEFAULT_REPEAT_COUNT,
                 ),
             )
             return
@@ -130,17 +174,29 @@ class TfliteGpuIsolatedProbeService : Service() {
                 message = "This service instance already ran its single-shot probe",
                 throwable = null,
                 modelAssetPath = modelAssetPath,
+                delegateMode = delegateMode,
+                repeatCount = repeatCount,
             )
             logFail("probe_already_running", "This service instance already ran its single-shot probe")
             sendResult(replyTo, json)
             return
         }
         try {
-            worker.execute(ProbeRun(applicationContext, replyTo, modelAssetPath))
+            worker.execute(ProbeRun(applicationContext, replyTo, modelAssetPath, delegateMode, repeatCount))
         } catch (e: RejectedExecutionException) {
             val message = "Worker rejected probe task: ${e.message}"
             logFail("worker_rejected", message)
-            sendResult(replyTo, ProbeRun.failureJson("worker_rejected", message, e, modelAssetPath))
+            sendResult(
+                replyTo,
+                ProbeRun.failureJson(
+                    code = "worker_rejected",
+                    message = message,
+                    throwable = e,
+                    modelAssetPath = modelAssetPath,
+                    delegateMode = delegateMode,
+                    repeatCount = repeatCount,
+                ),
+            )
         }
     }
 
@@ -150,6 +206,8 @@ class TfliteGpuIsolatedProbeService : Service() {
         private val context: Context,
         private val replyTo: Messenger,
         private val modelAssetPath: String,
+        private val delegateMode: String,
+        private val repeatCount: Int,
     ) : Runnable {
 
         private class ProbeFailure(
@@ -185,14 +243,33 @@ class TfliteGpuIsolatedProbeService : Service() {
         private var compatError: String? = null
         private var optionsSource: String = "forced_default_options"
         private var precisionLossAllowed: Boolean? = null
+        private var quantizedModelsAllowed: Boolean? = null
         private var inferencePreference: Int? = null
+        private var forceBackend: String? = null
         private var modelBytes: Int = 0
         private var inputShape: IntArray = IntArray(0)
         private var inputType: DataType? = null
         private var outputSpecs: List<OutputSpec> = emptyList()
         private var stats: List<OutputStats> = emptyList()
         private var outputNonZeroTotal: Long = 0L
+
+        // Timing fields (ms)
+        private var modelLoadMs: Long = -1L
+        private var delegateCreateMs: Long = -1L
+        private var interpreterCreateMs: Long = -1L
+        private var tensorInspectMs: Long = -1L
+        private var inputFillMs: Long = -1L
+        private var invokesTotalMs: Long = -1L
+        private var outputStatsMs: Long = -1L
+        private var closeMs: Long = -1L
+
+        // Invoke metrics
+        private var invokeCount: Int = 0
+        private var invokeMinMs: Long = -1L
+        private var invokeAvgMs: Double = -1.0
+        private var invokeMaxMs: Long = -1L
         private var invokeMs: Long = -1L
+
         private var closeOk: Boolean? = null
         private var closeError: String? = null
         private var stage: String = "start"
@@ -204,7 +281,8 @@ class TfliteGpuIsolatedProbeService : Service() {
             val processName = currentProcessName()
             mark(
                 "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_START pid=$pid process=$processName" +
-                    " thread=${Thread.currentThread().name} model=$modelAssetPath forced=true",
+                    " thread=${Thread.currentThread().name} model=$modelAssetPath forced=true" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount",
             )
             sendStarted(pid, processName)
 
@@ -213,11 +291,19 @@ class TfliteGpuIsolatedProbeService : Service() {
                 val totalMs = SystemClock.elapsedRealtime() - startedAt
                 mark(
                     "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_PROBE_PASS" +
+                        " delegateMode=$delegateMode repeatCount=$repeatCount forceBackend=$forceBackend" +
                         " compatSupported=$compatSupported bypass=true" +
                         " inputShape=${formatShape(inputShape)} inputType=$inputType" +
                         " outputShape=${outputSpecs.joinToString("|") { formatShape(it.shape) }}" +
                         " ${formatPrimaryStats(stats)}${formatExtraOutputs(stats)}" +
-                        " outputNonZeroTotal=$outputNonZeroTotal invokeMs=$invokeMs closeOk=$closeOk totalMs=$totalMs",
+                        " outputNonZeroTotal=$outputNonZeroTotal" +
+                        " invokeCount=$invokeCount invokeMinMs=$invokeMinMs" +
+                        " invokeAvgMs=${if (invokeAvgMs >= 0.0) String.format(Locale.US, "%.2f", invokeAvgMs) else "NA"}" +
+                        " invokeMaxMs=$invokeMaxMs invokeMs=$invokeMs invokesTotalMs=$invokesTotalMs" +
+                        " modelLoadMs=$modelLoadMs delegateCreateMs=$delegateCreateMs" +
+                        " interpreterCreateMs=$interpreterCreateMs tensorInspectMs=$tensorInspectMs" +
+                        " inputFillMs=$inputFillMs outputStatsMs=$outputStatsMs closeMs=$closeMs" +
+                        " closeOk=$closeOk totalMs=$totalMs",
                 )
                 buildJson(pass = true, code = "ok", message = "Forced GPU invoke completed", stack = null)
                     .put("totalMs", totalMs)
@@ -225,7 +311,7 @@ class TfliteGpuIsolatedProbeService : Service() {
                 closeAfterFailure()
                 val totalMs = SystemClock.elapsedRealtime() - startedAt
                 logFail(f.code, f.message ?: "", f.cause)
-                markers.add("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_PROBE_FAIL code=${f.code} message=${f.message}")
+                markers.add("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_PROBE_FAIL code=${f.code} message=${f.message} delegateMode=$delegateMode repeatCount=$repeatCount stage=$stage")
                 buildJson(pass = false, code = f.code, message = f.message ?: "", stack = f.cause?.stackTraceToString())
                     .put("totalMs", totalMs)
             } catch (t: Throwable) {
@@ -233,18 +319,22 @@ class TfliteGpuIsolatedProbeService : Service() {
                 val totalMs = SystemClock.elapsedRealtime() - startedAt
                 val message = "Unexpected ${t.javaClass.simpleName} at stage=$stage: ${t.message}"
                 logFail("unexpected", message, t)
-                markers.add("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_PROBE_FAIL code=unexpected message=$message")
+                markers.add("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_PROBE_FAIL code=unexpected message=$message delegateMode=$delegateMode repeatCount=$repeatCount stage=$stage")
                 buildJson(pass = false, code = "unexpected", message = message, stack = t.stackTraceToString())
                     .put("totalMs", totalMs)
             }
 
-            sendResult(replyTo, json)
+            try {
+                sendResult(replyTo, json)
+            } finally {
+                outputSpecs = emptyList()
+            }
         }
 
         private fun execute() {
-            // 1) CompatibilityList: record, then bypass.
+            // 1) CompatibilityList: record, then build Options by delegateMode.
             stage = "compat_check"
-            var delegateOptions: GpuDelegateFactory.Options? = null
+            var bestDelegateOptions: GpuDelegateFactory.Options? = null
             try {
                 val compatibilityList = CompatibilityList()
                 try {
@@ -252,9 +342,7 @@ class TfliteGpuIsolatedProbeService : Service() {
                     compatSupported = supported
                     if (supported) {
                         try {
-                            val best = compatibilityList.bestOptionsForThisDevice
-                            delegateOptions = best
-                            optionsSource = "compat_best_options"
+                            bestDelegateOptions = compatibilityList.bestOptionsForThisDevice
                         } catch (t: Throwable) {
                             compatError = "bestOptionsForThisDevice threw: ${t.message}"
                         }
@@ -270,20 +358,70 @@ class TfliteGpuIsolatedProbeService : Service() {
                 compatSupported = null
                 compatError = "CompatibilityList failed: ${t.javaClass.simpleName}: ${t.message}"
             }
-            val options = delegateOptions ?: GpuDelegateFactory.Options().also {
-                optionsSource = "forced_default_options"
+
+            val options: GpuDelegateFactory.Options
+            when (delegateMode) {
+                "compat_best_or_default" -> {
+                    if (bestDelegateOptions != null) {
+                        options = bestDelegateOptions
+                        optionsSource = "compat_best_options"
+                    } else {
+                        options = GpuDelegateFactory.Options()
+                        optionsSource = "compat_default_options"
+                    }
+                }
+                "forced_default" -> {
+                    options = GpuDelegateFactory.Options()
+                    optionsSource = "forced_default_options"
+                }
+                "sustained_speed" -> {
+                    options = GpuDelegateFactory.Options().apply {
+                        setInferencePreference(GpuDelegateFactory.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                    }
+                    optionsSource = "sustained_speed_options"
+                }
+                "force_opencl" -> {
+                    options = GpuDelegateFactory.Options().apply {
+                        setForceBackend(GpuDelegateFactory.Options.GpuBackend.OPENCL)
+                    }
+                    optionsSource = "force_opencl_options"
+                }
+                "force_opengl" -> {
+                    options = GpuDelegateFactory.Options().apply {
+                        setForceBackend(GpuDelegateFactory.Options.GpuBackend.OPENGL)
+                    }
+                    optionsSource = "force_opengl_options"
+                }
+                else -> {
+                    options = GpuDelegateFactory.Options()
+                    optionsSource = "unknown_default_options"
+                }
             }
             precisionLossAllowed = options.isPrecisionLossAllowed
+            quantizedModelsAllowed = try {
+                val method = options.javaClass.methods.firstOrNull {
+                    it.name == "areQuantizedModelsAllowed" ||
+                        it.name == "isQuantizedModelsAllowed" ||
+                        it.name == "getQuantizedModelsAllowed"
+                }
+                method?.invoke(options) as? Boolean
+            } catch (_: Throwable) {
+                null
+            }
             inferencePreference = options.inferencePreference
+            forceBackend = options.forceBackend?.name
             mark(
                 "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_COMPAT supported=$compatSupported bypass=true" +
-                    " optionsSource=$optionsSource precisionLossAllowed=$precisionLossAllowed" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount" +
+                    " optionsSource=$optionsSource forceBackend=$forceBackend" +
+                    " precisionLossAllowed=$precisionLossAllowed quantizedModelsAllowed=$quantizedModelsAllowed" +
                     " inferencePreference=$inferencePreference" +
                     (compatError?.let { " compatError=$it" } ?: ""),
             )
 
             // 2) Model load into a direct ByteBuffer, verifying the TFL3 identifier.
             stage = "model_load"
+            val tModel0 = SystemClock.elapsedRealtime()
             val model: ByteBuffer
             try {
                 model = loadModelIntoDirectBuffer()
@@ -293,11 +431,14 @@ class TfliteGpuIsolatedProbeService : Service() {
                     "Failed to load $modelAssetPath into a direct ByteBuffer: ${t.message}",
                     t,
                 )
+            } finally {
+                modelLoadMs = SystemClock.elapsedRealtime() - tModel0
             }
             modelBytes = model.capacity()
 
             // 3) Forced GpuDelegate creation (this is the bypass).
             stage = "gpu_delegate_create"
+            val tDelegate0 = SystemClock.elapsedRealtime()
             val delegate: GpuDelegate
             try {
                 delegate = GpuDelegate(options)
@@ -308,11 +449,18 @@ class TfliteGpuIsolatedProbeService : Service() {
                     "Forced GpuDelegate creation failed: ${t.javaClass.simpleName}: ${t.message}",
                     t,
                 )
+            } finally {
+                delegateCreateMs = SystemClock.elapsedRealtime() - tDelegate0
             }
-            mark("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_DELEGATE_CREATED optionsSource=$optionsSource")
+            mark(
+                "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_DELEGATE_CREATED" +
+                    " delegateMode=$delegateMode optionsSource=$optionsSource forceBackend=$forceBackend" +
+                    " delegateCreateMs=$delegateCreateMs",
+            )
 
             // 4) Interpreter with the forced delegate.
             stage = "interpreter_create"
+            val tInterp0 = SystemClock.elapsedRealtime()
             val interp: Interpreter
             try {
                 val interpreterOptions = Interpreter.Options()
@@ -326,48 +474,83 @@ class TfliteGpuIsolatedProbeService : Service() {
                     "Interpreter creation/allocateTensors with forced GpuDelegate failed: ${t.javaClass.simpleName}: ${t.message}",
                     t,
                 )
+            } finally {
+                interpreterCreateMs = SystemClock.elapsedRealtime() - tInterp0
             }
 
             // 5) Tensor layout inspection + buffer allocation.
             stage = "tensor_inspect"
+            val tInspect0 = SystemClock.elapsedRealtime()
             val input: ByteBuffer
             try {
                 input = inspectAndAllocateTensors(interp)
             } catch (t: Throwable) {
                 throw ProbeFailure("tensor_layout_unsupported", "${t.message}", t)
+            } finally {
+                tensorInspectMs = SystemClock.elapsedRealtime() - tInspect0
             }
             mark(
                 "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_INTERPRETER_READY" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount forceBackend=$forceBackend" +
                     " inputShape=${formatShape(inputShape)} inputType=$inputType" +
                     " outputShape=${outputSpecs.joinToString("|") { formatShape(it.shape) }}" +
                     " outputType=${outputSpecs.joinToString("|") { it.type.toString() }}" +
                     " outputCount=${outputSpecs.size} inputBytes=${input.capacity()}" +
                     " outputBytes=${outputSpecs.joinToString("|") { it.expectedBytes.toString() }}" +
-                    " modelBytes=$modelBytes",
+                    " modelBytes=$modelBytes" +
+                    " modelLoadMs=$modelLoadMs delegateCreateMs=$delegateCreateMs" +
+                    " interpreterCreateMs=$interpreterCreateMs tensorInspectMs=$tensorInspectMs",
             )
 
-            // 6) Exactly one synthetic RGB frame through the GPU delegate.
-            stage = "invoke"
+            // 6) Fill synthetic RGB frame.
+            stage = "input_fill"
+            val tFill0 = SystemClock.elapsedRealtime()
             try {
                 fillSyntheticFrame(input, inputShape[2], inputShape[1], inputType ?: DataType.FLOAT32)
-                val outputs = HashMap<Int, Any>(outputSpecs.size)
-                for (spec in outputSpecs) {
-                    spec.buffer.rewind()
-                    outputs[spec.index] = spec.buffer
+            } catch (t: Throwable) {
+                throw ProbeFailure("input_fill_failed", "Synthetic input frame fill failed: ${t.message}", t)
+            } finally {
+                inputFillMs = SystemClock.elapsedRealtime() - tFill0
+            }
+
+            // 7) repeatCount synthetic invokes through the GPU delegate.
+            stage = "invoke"
+            val durations = ArrayList<Long>(repeatCount)
+            val outputs = HashMap<Int, Any>(outputSpecs.size)
+            val inputs = arrayOf<Any>(input)
+            val tInvokesStart = SystemClock.elapsedRealtime()
+            try {
+                for (iter in 1..repeatCount) {
+                    input.rewind()
+                    for (spec in outputSpecs) {
+                        spec.buffer.rewind()
+                        outputs[spec.index] = spec.buffer
+                    }
+                    val tInvoke0 = SystemClock.elapsedRealtime()
+                    interp.runForMultipleInputsOutputs(inputs, outputs)
+                    val dur = SystemClock.elapsedRealtime() - tInvoke0
+                    durations.add(dur)
+                    invokeMs = dur
                 }
-                val t0 = SystemClock.elapsedRealtime()
-                interp.runForMultipleInputsOutputs(arrayOf<Any>(input), outputs)
-                invokeMs = SystemClock.elapsedRealtime() - t0
             } catch (t: Throwable) {
                 throw ProbeFailure(
                     "gpu_invoke_failed",
-                    "Forced GPU invoke failed: ${t.javaClass.simpleName}: ${t.message}",
+                    "Forced GPU invoke failed at iteration ${durations.size + 1}/$repeatCount: ${t.javaClass.simpleName}: ${t.message}",
                     t,
                 )
+            } finally {
+                invokesTotalMs = SystemClock.elapsedRealtime() - tInvokesStart
+                invokeCount = durations.size
+                if (durations.isNotEmpty()) {
+                    invokeMinMs = durations.minOrNull() ?: -1L
+                    invokeMaxMs = durations.maxOrNull() ?: -1L
+                    invokeAvgMs = durations.average()
+                }
             }
 
-            // 7) Output statistics and coverage.
+            // 8) Output statistics and coverage (final outputs only).
             stage = "output_stats"
+            val tStats0 = SystemClock.elapsedRealtime()
             try {
                 val computed = ArrayList<OutputStats>(outputSpecs.size)
                 var total = 0L
@@ -386,10 +569,17 @@ class TfliteGpuIsolatedProbeService : Service() {
                 outputNonZeroTotal = total
             } catch (t: Throwable) {
                 throw ProbeFailure("output_stats_failed", "Output statistics failed: ${t.message}", t)
+            } finally {
+                outputStatsMs = SystemClock.elapsedRealtime() - tStats0
             }
             mark(
-                "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_INVOKE_DONE invokeMs=$invokeMs" +
-                    " ${formatPrimaryStats(stats)}${formatExtraOutputs(stats)} outputNonZeroTotal=$outputNonZeroTotal",
+                "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_INVOKE_DONE" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount forceBackend=$forceBackend" +
+                    " invokeCount=$invokeCount invokeMinMs=$invokeMinMs" +
+                    " invokeAvgMs=${if (invokeAvgMs >= 0.0) String.format(Locale.US, "%.2f", invokeAvgMs) else "NA"}" +
+                    " invokeMaxMs=$invokeMaxMs invokeMs=$invokeMs invokesTotalMs=$invokesTotalMs inputFillMs=$inputFillMs" +
+                    " ${formatPrimaryStats(stats)}${formatExtraOutputs(stats)} outputNonZeroTotal=$outputNonZeroTotal" +
+                    " outputStatsMs=$outputStatsMs",
             )
             if (outputNonZeroTotal <= 0L) {
                 throw ProbeFailure(
@@ -399,9 +589,11 @@ class TfliteGpuIsolatedProbeService : Service() {
                 )
             }
 
-            // 8) Close Interpreter before GpuDelegate, on this worker thread.
+            // 9) Close Interpreter before GpuDelegate, on this worker thread.
             stage = "close"
+            val tClose0 = SystemClock.elapsedRealtime()
             val error = closeTflite()
+            closeMs = SystemClock.elapsedRealtime() - tClose0
             if (error != null) {
                 throw ProbeFailure(
                     "close_failed",
@@ -409,7 +601,10 @@ class TfliteGpuIsolatedProbeService : Service() {
                     error,
                 )
             }
-            mark("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_CLOSE_PASS")
+            mark(
+                "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_CLOSE_PASS" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount closeMs=$closeMs",
+            )
         }
 
         private fun loadModelIntoDirectBuffer(): ByteBuffer {
@@ -622,7 +817,6 @@ class TfliteGpuIsolatedProbeService : Service() {
                 if (error == null) error = t
             }
             gpuDelegate = null
-            outputSpecs = emptyList()
             closeOk = error == null
             closeError = error?.let { "${it.javaClass.simpleName}: ${it.message}" }
             return error
@@ -630,8 +824,15 @@ class TfliteGpuIsolatedProbeService : Service() {
 
         private fun closeAfterFailure() {
             if (interpreter == null && gpuDelegate == null) return
+            val tClose0 = SystemClock.elapsedRealtime()
             val error = closeTflite()
-            mark("ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_CLOSE_AFTER_FAIL ok=${error == null}")
+            if (closeMs < 0L) {
+                closeMs = SystemClock.elapsedRealtime() - tClose0
+            }
+            mark(
+                "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_CLOSE_AFTER_FAIL" +
+                    " ok=${error == null} delegateMode=$delegateMode repeatCount=$repeatCount closeMs=$closeMs",
+            )
         }
 
         private fun sendStarted(pid: Int, processName: String) {
@@ -656,13 +857,22 @@ class TfliteGpuIsolatedProbeService : Service() {
             json.put("workerThread", Thread.currentThread().name)
             json.put("stage", stage)
             json.put("forced", true)
+            json.put("delegateMode", delegateMode)
+            json.put("repeatCount", repeatCount)
+            json.put("precisionLossAllowed", precisionLossAllowed ?: JSONObject.NULL)
+            json.put("quantizedModelsAllowed", quantizedModelsAllowed ?: JSONObject.NULL)
+            json.put("inferencePreference", inferencePreference ?: JSONObject.NULL)
+            json.put("forceBackend", forceBackend ?: JSONObject.NULL)
             val compat = JSONObject()
             compat.put("supported", compatSupported ?: JSONObject.NULL)
             compat.put("bypass", true)
             compat.put("error", compatError ?: JSONObject.NULL)
             compat.put("optionsSource", optionsSource)
+            compat.put("delegateMode", delegateMode)
             compat.put("precisionLossAllowed", precisionLossAllowed ?: JSONObject.NULL)
+            compat.put("quantizedModelsAllowed", quantizedModelsAllowed ?: JSONObject.NULL)
             compat.put("inferencePreference", inferencePreference ?: JSONObject.NULL)
+            compat.put("forceBackend", forceBackend ?: JSONObject.NULL)
             json.put("compat", compat)
             json.put("modelAsset", modelAssetPath)
             json.put("modelBytes", modelBytes)
@@ -695,7 +905,22 @@ class TfliteGpuIsolatedProbeService : Service() {
             }
             json.put("stats", statsArray)
             json.put("outputNonZeroTotal", outputNonZeroTotal)
+
+            json.put("modelLoadMs", modelLoadMs)
+            json.put("delegateCreateMs", delegateCreateMs)
+            json.put("interpreterCreateMs", interpreterCreateMs)
+            json.put("tensorInspectMs", tensorInspectMs)
+            json.put("inputFillMs", inputFillMs)
+            json.put("invokesTotalMs", invokesTotalMs)
+            json.put("outputStatsMs", outputStatsMs)
+            json.put("closeMs", closeMs)
+
+            json.put("invokeCount", invokeCount)
+            json.put("invokeMinMs", invokeMinMs)
+            json.put("invokeAvgMs", if (invokeAvgMs >= 0.0) jsonNumber(invokeAvgMs) else JSONObject.NULL)
+            json.put("invokeMaxMs", invokeMaxMs)
             json.put("invokeMs", invokeMs)
+
             json.put("closeOk", closeOk ?: JSONObject.NULL)
             json.put("closeError", closeError ?: JSONObject.NULL)
             json.put("stack", stack ?: JSONObject.NULL)
@@ -740,6 +965,8 @@ class TfliteGpuIsolatedProbeService : Service() {
                 message: String,
                 throwable: Throwable?,
                 modelAssetPath: String = DEFAULT_MODEL_ASSET_PATH,
+                delegateMode: String = DEFAULT_DELEGATE_MODE,
+                repeatCount: Int = DEFAULT_REPEAT_COUNT,
             ): JSONObject {
                 return JSONObject()
                     .put("pass", false)
@@ -750,8 +977,27 @@ class TfliteGpuIsolatedProbeService : Service() {
                     .put("childProcess", currentProcessName())
                     .put("stage", "pre_run")
                     .put("forced", true)
+                    .put("delegateMode", delegateMode)
+                    .put("repeatCount", repeatCount)
+                    .put("precisionLossAllowed", JSONObject.NULL)
+                    .put("quantizedModelsAllowed", JSONObject.NULL)
+                    .put("inferencePreference", JSONObject.NULL)
+                    .put("forceBackend", JSONObject.NULL)
                     .put("modelAsset", modelAssetPath)
                     .put("outputNonZeroTotal", 0L)
+                    .put("modelLoadMs", -1L)
+                    .put("delegateCreateMs", -1L)
+                    .put("interpreterCreateMs", -1L)
+                    .put("tensorInspectMs", -1L)
+                    .put("inputFillMs", -1L)
+                    .put("invokesTotalMs", -1L)
+                    .put("outputStatsMs", -1L)
+                    .put("closeMs", -1L)
+                    .put("invokeCount", 0)
+                    .put("invokeMinMs", -1L)
+                    .put("invokeAvgMs", JSONObject.NULL)
+                    .put("invokeMaxMs", -1L)
+                    .put("invokeMs", -1L)
                     .put("stack", throwable?.stackTraceToString() ?: JSONObject.NULL)
                     .put("markers", JSONArray())
             }
@@ -774,6 +1020,18 @@ class TfliteGpuIsolatedProbeService : Service() {
         const val KEY_PROCESS_NAME = "processName"
         const val KEY_RESULT_JSON = "resultJson"
         const val KEY_MODEL_ASSET_PATH = "modelAssetPath"
+        const val KEY_DELEGATE_MODE = "delegateMode"
+        const val KEY_REPEAT_COUNT = "repeatCount"
+        const val DEFAULT_DELEGATE_MODE = "compat_best_or_default"
+        const val DEFAULT_REPEAT_COUNT = 5
+        const val MAX_REPEAT_COUNT = 30
+        private val VALID_DELEGATE_MODES = setOf(
+            "compat_best_or_default",
+            "forced_default",
+            "sustained_speed",
+            "force_opencl",
+            "force_opengl",
+        )
 
         /**
          * Relative Android asset path check: non-empty, no leading slash
@@ -792,6 +1050,20 @@ class TfliteGpuIsolatedProbeService : Service() {
             if (path == null) return DEFAULT_MODEL_ASSET_PATH
             if (!isValidModelAssetPath(path)) return null
             return path
+        }
+
+        /** Allowlist resolver: null input defaults, unknown mode is rejected (returns null). */
+        fun resolveDelegateMode(mode: String?): String? {
+            if (mode == null) return DEFAULT_DELEGATE_MODE
+            if (!VALID_DELEGATE_MODES.contains(mode)) return null
+            return mode
+        }
+
+        /** Null input (arg absent) defaults; out-of-range input is rejected (returns null). */
+        fun resolveRepeatCount(count: Int?): Int? {
+            if (count == null) return DEFAULT_REPEAT_COUNT
+            if (count < 1 || count > MAX_REPEAT_COUNT) return null
+            return count
         }
 
         private fun log(line: String) {

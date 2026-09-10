@@ -44,6 +44,10 @@
 //       * parent process survives a child GPU abort (if that mode passes)
 //       * forced raw TFLite GPU delegate ran one synthetic frame (if that
 //         mode passes)
+//       * the isolated child can benchmark delegate mode
+//         (compat_best_or_default / forced_default / sustained_speed /
+//         force_opencl / force_opengl) and repeated synthetic invokes
+//         (invokeMinMs/invokeAvgMs/invokeMaxMs) within one probe run
 //   - Non-claims:
 //       * no production enablement (ladder stays mediapipe_cpu -> mlkit -> none)
 //       * no quality proof (synthetic frame; matte content is not judged)
@@ -51,6 +55,8 @@
 //       * no MLKit fallback wiring proof
 //       * no export/audio/app wiring proof
 //       * no low-end/budget Android proof
+//       * no cross-device or production performance conclusion (isolated
+//         single-process synthetic timings only)
 
 // ignore_for_file: avoid_print
 
@@ -77,6 +83,14 @@ const Duration kProbeTimeout = Duration(seconds: 35);
 const String kModelAssetPath = String.fromEnvironment(
   'DUET_GPU_PROBE_MODEL_ASSET',
   defaultValue: 'selfie_segmenter.tflite',
+);
+const String kDelegateMode = String.fromEnvironment(
+  'DUET_GPU_PROBE_DELEGATE_MODE',
+  defaultValue: 'compat_best_or_default',
+);
+const int kRepeatCount = int.fromEnvironment(
+  'DUET_GPU_PROBE_REPEAT_COUNT',
+  defaultValue: 5,
 );
 
 const String kModeForcedGpuCompleted = 'forced_gpu_completed';
@@ -144,6 +158,8 @@ class _AndroidDuetTfliteGpuIsolatedProbeSmokeAppState
       rawResult = await _channel
           .invokeMethod<dynamic>(kProbeMethod, <String, dynamic>{
             'modelAssetPath': kModelAssetPath,
+            'delegateMode': kDelegateMode,
+            'repeatCount': kRepeatCount,
           })
           .timeout(
             kProbeTimeout,
@@ -230,6 +246,8 @@ class _AndroidDuetTfliteGpuIsolatedProbeSmokeAppState
       'channel': kProbeChannel,
       'method': kProbeMethod,
       'modelAssetPath': kModelAssetPath,
+      'delegateMode': kDelegateMode,
+      'repeatCount': kRepeatCount,
       'passModes': const <String>[
         kModeForcedGpuCompleted,
         kModeChildDiedParentSurvived,
@@ -239,6 +257,7 @@ class _AndroidDuetTfliteGpuIsolatedProbeSmokeAppState
         'no live Duet session, no CameraX',
         'parent process survives a child GPU abort (child_process_died_parent_survived only)',
         'forced raw TFLite GPU delegate ran one synthetic frame (forced_gpu_completed only)',
+        'delegate mode and repeated synthetic invoke benchmarking within the isolated child process (forced_gpu_completed only)',
       ],
       'nonClaims': <String>[
         'no production enablement (ladder stays mediapipe_cpu -> mlkit -> none)',
@@ -247,6 +266,7 @@ class _AndroidDuetTfliteGpuIsolatedProbeSmokeAppState
         'no MLKit fallback wiring proof',
         'no export/audio/app wiring proof',
         'no low-end/budget Android proof',
+        'no cross-device or production performance conclusion',
       ],
       if (rawResult != null) 'nativeResult': rawResult,
       if (errorCode != null) 'errorCode': errorCode,

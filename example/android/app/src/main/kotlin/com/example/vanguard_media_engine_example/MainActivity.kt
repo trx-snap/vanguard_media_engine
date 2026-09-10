@@ -169,6 +169,18 @@ class MainActivity : FlutterActivity() {
         private const val TFLITE_GPU_ISOLATED_METHOD_NAME = "runTfliteGpuIsolatedProbe"
         private const val ISOLATED_ARG_MODEL_ASSET_PATH = "modelAssetPath"
         private const val ISOLATED_DEFAULT_MODEL_ASSET_PATH = "selfie_segmenter.tflite"
+        private const val ISOLATED_ARG_DELEGATE_MODE = "delegateMode"
+        private const val ISOLATED_DEFAULT_DELEGATE_MODE = "compat_best_or_default"
+        private const val ISOLATED_ARG_REPEAT_COUNT = "repeatCount"
+        private const val ISOLATED_DEFAULT_REPEAT_COUNT = 5
+        private const val ISOLATED_MAX_REPEAT_COUNT = 30
+        private val ISOLATED_VALID_DELEGATE_MODES = setOf(
+            "compat_best_or_default",
+            "forced_default",
+            "sustained_speed",
+            "force_opencl",
+            "force_opengl",
+        )
         private const val ISOLATED_PROBE_TIMEOUT_MS = 30_000L
         private const val ISOLATED_MODE_FORCED_GPU_COMPLETED = "forced_gpu_completed"
         private const val ISOLATED_MODE_CHILD_PROBE_FAILED = "child_probe_failed"
@@ -203,6 +215,9 @@ class MainActivity : FlutterActivity() {
             if (path.any { it.isISOControl() }) return false
             return true
         }
+
+        private fun isValidIsolatedDelegateMode(mode: String): Boolean =
+            ISOLATED_VALID_DELEGATE_MODES.contains(mode)
     }
 
     private class ProbeSession(
@@ -1357,7 +1372,8 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        val requestedModelAssetPath = (call.arguments as? Map<*, *>)?.get(ISOLATED_ARG_MODEL_ASSET_PATH) as? String
+        val args = call.arguments as? Map<*, *>
+        val requestedModelAssetPath = args?.get(ISOLATED_ARG_MODEL_ASSET_PATH) as? String
         val modelAssetPath: String
         if (requestedModelAssetPath == null) {
             modelAssetPath = ISOLATED_DEFAULT_MODEL_ASSET_PATH
@@ -1367,6 +1383,35 @@ class MainActivity : FlutterActivity() {
             val message = "modelAssetPath failed validation: $requestedModelAssetPath"
             logIsolatedFail("invalid_model_asset_path", message, null)
             result.error("invalid_model_asset_path", message, null)
+            return
+        }
+
+        val requestedDelegateMode = args?.get(ISOLATED_ARG_DELEGATE_MODE) as? String
+        val delegateMode: String
+        if (requestedDelegateMode == null) {
+            delegateMode = ISOLATED_DEFAULT_DELEGATE_MODE
+        } else if (isValidIsolatedDelegateMode(requestedDelegateMode)) {
+            delegateMode = requestedDelegateMode
+        } else {
+            val message = "delegateMode failed validation: $requestedDelegateMode" +
+                " (expected one of $ISOLATED_VALID_DELEGATE_MODES)"
+            logIsolatedFail("invalid_delegate_mode", message, null)
+            result.error("invalid_delegate_mode", message, null)
+            return
+        }
+
+        val repeatCountArgPresent = args?.containsKey(ISOLATED_ARG_REPEAT_COUNT) == true
+        val requestedRepeatCount = args?.get(ISOLATED_ARG_REPEAT_COUNT) as? Number
+        val repeatCount: Int
+        if (!repeatCountArgPresent) {
+            repeatCount = ISOLATED_DEFAULT_REPEAT_COUNT
+        } else if (requestedRepeatCount != null && requestedRepeatCount.toInt() in 1..ISOLATED_MAX_REPEAT_COUNT) {
+            repeatCount = requestedRepeatCount.toInt()
+        } else {
+            val message = "repeatCount failed validation (expected Number in 1..$ISOLATED_MAX_REPEAT_COUNT): " +
+                "${args?.get(ISOLATED_ARG_REPEAT_COUNT)}"
+            logIsolatedFail("invalid_repeat_count", message, null)
+            result.error("invalid_repeat_count", message, null)
             return
         }
 
@@ -1380,10 +1425,11 @@ class MainActivity : FlutterActivity() {
             "ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_START parentPid=${Process.myPid()}" +
                 " parentProcess=${TfliteGpuIsolatedProbeService.currentProcessName()}" +
                 " service=${TfliteGpuIsolatedProbeService::class.java.name}" +
-                " childProcessSuffix=:gpuprobe timeoutMs=$ISOLATED_PROBE_TIMEOUT_MS model=$modelAssetPath",
+                " childProcessSuffix=:gpuprobe timeoutMs=$ISOLATED_PROBE_TIMEOUT_MS model=$modelAssetPath" +
+                " delegateMode=$delegateMode repeatCount=$repeatCount",
         )
 
-        val session = TfliteGpuIsolatedProbeSession(this, result, modelAssetPath) { finished ->
+        val session = TfliteGpuIsolatedProbeSession(this, result, modelAssetPath, delegateMode, repeatCount) { finished ->
             if (activeTfliteGpuIsolatedSession === finished) {
                 activeTfliteGpuIsolatedSession = null
             }
@@ -1396,6 +1442,8 @@ class MainActivity : FlutterActivity() {
         private val activity: MainActivity,
         private val result: MethodChannel.Result,
         private val modelAssetPath: String,
+        private val delegateMode: String,
+        private val repeatCount: Int,
         private val onFinished: (TfliteGpuIsolatedProbeSession) -> Unit,
     ) {
         private val mainHandler = Handler(Looper.getMainLooper())
@@ -1514,10 +1562,15 @@ class MainActivity : FlutterActivity() {
             command.replyTo = replyMessenger
             command.data = Bundle().apply {
                 putString(TfliteGpuIsolatedProbeService.KEY_MODEL_ASSET_PATH, modelAssetPath)
+                putString(TfliteGpuIsolatedProbeService.KEY_DELEGATE_MODE, delegateMode)
+                putInt(TfliteGpuIsolatedProbeService.KEY_REPEAT_COUNT, repeatCount)
             }
             try {
                 Messenger(binder).send(command)
-                logIsolated("ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_COMMAND_SENT what=MSG_RUN_PROBE model=$modelAssetPath")
+                logIsolated(
+                    "ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_COMMAND_SENT what=MSG_RUN_PROBE model=$modelAssetPath" +
+                        " delegateMode=$delegateMode repeatCount=$repeatCount",
+                )
             } catch (e: DeadObjectException) {
                 handleChildDeath("send_dead_object")
             } catch (e: RemoteException) {
@@ -1578,6 +1631,7 @@ class MainActivity : FlutterActivity() {
             logIsolated(
                 "ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_CHILD_REPLY mode=$mode code=$code" +
                     " childPass=$childPass outputNonZeroTotal=$nonZeroTotal childPid=$reportedChildPid" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount" +
                     " compatSupported=${(child["compat"] as? Map<*, *>)?.get("supported")} bypass=true" +
                     " elapsedMs=${elapsedMs()}",
             )
@@ -1593,6 +1647,8 @@ class MainActivity : FlutterActivity() {
             payload["childProcess"] = childProcess ?: child["childProcess"]
             payload["childStarted"] = childStarted
             payload["childDied"] = false
+            payload["delegateMode"] = delegateMode
+            payload["repeatCount"] = repeatCount
             payload["parentAlive"] = true
             payload["parentAliveMarker"] = ISOLATED_ALIVE_AFTER_RESULT
             payload["elapsedMs"] = elapsedMs()
@@ -1608,6 +1664,7 @@ class MainActivity : FlutterActivity() {
             logIsolated(
                 "ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_CHILD_DIED source=$source childPid=$childPid" +
                     " childProcess=$childProcess childStarted=$childStarted parentPid=$parentPid" +
+                    " delegateMode=$delegateMode repeatCount=$repeatCount" +
                     " thread=${Thread.currentThread().name} elapsedMs=$elapsed",
             )
             val message = "Child process :gpuprobe died before replying (source=$source," +
@@ -1625,6 +1682,8 @@ class MainActivity : FlutterActivity() {
             payload["childStarted"] = childStarted
             payload["childDied"] = true
             payload["deathSource"] = source
+            payload["delegateMode"] = delegateMode
+            payload["repeatCount"] = repeatCount
             payload["parentAlive"] = true
             payload["parentAliveMarker"] = ISOLATED_ALIVE_AFTER_CHILD_DEATH
             payload["elapsedMs"] = elapsed
@@ -1657,6 +1716,8 @@ class MainActivity : FlutterActivity() {
             "childPid" to childPid,
             "childProcess" to childProcess,
             "childStarted" to childStarted,
+            "delegateMode" to delegateMode,
+            "repeatCount" to repeatCount,
             "parentAlive" to true,
             "parentAliveMarker" to ISOLATED_ALIVE_AFTER_CHILD_DEATH,
             "elapsedMs" to elapsedMs(),
