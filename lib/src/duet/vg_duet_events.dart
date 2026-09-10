@@ -10,9 +10,9 @@ import '../channel/vanguard_channel_dispatcher.dart';
 
 /// Duet green-screen degradation/fallback event kinds.
 ///
-/// `green_screen_fallback` is emitted after native has actually switched the
-/// session to safe PiP. `green_screen_degraded` is reserved for a future,
-/// non-terminal degradation signal.
+/// `green_screen_degraded` is emitted when native keeps green screen live after
+/// degrading to a lower rung, e.g. Android MediaPipe CPU -> ML Kit;
+/// `green_screen_fallback` is emitted after native switches to safe PiP.
 enum VGDuetEventType { greenScreenDegraded, greenScreenFallback }
 
 /// A single parsed `onDuetEvent` payload.

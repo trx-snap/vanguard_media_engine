@@ -30,6 +30,26 @@ data class DuetSegmentationProbe(
     val thermalTier: String = "unknown",
 ) {
     companion object {
+        /**
+         * Probe result when MediaPipe Tasks Vision ImageSegmenter (CPU delegate,
+         * VIDEO mode) is the primary backend, with ML Kit as the next rung.
+         * GPU is deferred: mediaPipeGpuSupported stays false in this slice.
+         */
+        fun mediapipeCpu(quality: DuetSegmentationQuality = DuetSegmentationQuality.QUALITY) =
+            DuetSegmentationProbe(
+                isAvailable            = true,
+                selectedBackend        = DuetSegmentationBackend.MEDIAPIPE_CPU,
+                quality                = quality,
+                maxResolution          = 256,
+                supportsRawMask        = true,
+                reason                 = "MediaPipe Tasks Vision ImageSegmenter (CPU, VIDEO mode) selected; ML Kit fallback available.",
+                mediaPipeGpuSupported  = false,
+                mediaPipeCpuSupported  = true,
+                mlKitAvailable         = true,
+                analysisMaxResolution  = 256,
+                thermalTier            = "nominal",
+            )
+
         /** Probe result when ML Kit Selfie Segmentation is the active backend. */
         fun mlkit(quality: DuetSegmentationQuality = DuetSegmentationQuality.BALANCED) =
             DuetSegmentationProbe(

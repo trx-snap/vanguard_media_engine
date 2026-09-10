@@ -82,6 +82,11 @@ class VGDuetAndroidSession(
     // Green-screen segmentation adapter — started when layout mode is greenScreen,
     // stopped on fallback or layout mode switch.
     var greenScreenAdapter: AndroidDuetGreenScreenAdapter? = null
+    // Session-level one-way ladder latch. Set to the rung reached after a
+    // `green_screen_degraded` (e.g. "mlkit") so any later adapter built for this
+    // session (layout switch back to greenScreen) starts there instead of
+    // re-trying MediaPipe — degradation never oscillates within a session.
+    var greenScreenLatchedBackendId: String? = null
     // Original dimensions and layout rects stored on first attach;
     // returned verbatim on repeated (idempotent) attach calls.
     var previewWidthPx:    Int? = null
@@ -464,7 +469,7 @@ class AndroidDuetSessionCoordinator(
                         if (!bound) {
                             Log.w("DuetCoordinator",
                                 "setAnalysisAnalyzer failed during greenScreen switch — PiP fallback")
-                            handleGreenScreenFallback(session, DuetSegmentationBackend.MLKIT,
+                            handleGreenScreenFallback(session, reportedSegmentationBackend(session),
                                 DuetSegmentationBackend.NONE, "bind_failed")
                             reply(null, null)
                             return
@@ -473,7 +478,7 @@ class AndroidDuetSessionCoordinator(
                         // Adapter creation failed — fall back immediately.
                         Log.w("DuetCoordinator",
                             "buildGreenScreenAdapter returned null — PiP fallback")
-                        handleGreenScreenFallback(session, DuetSegmentationBackend.MLKIT,
+                        handleGreenScreenFallback(session, reportedSegmentationBackend(session),
                             DuetSegmentationBackend.NONE, "adapter_creation_failed")
                         reply(null, null)
                         return
@@ -818,7 +823,7 @@ class AndroidDuetSessionCoordinator(
                     if (mode == "greenScreen" && activeSession === session) {
                         Log.w("DuetCoordinator",
                             "greenScreen initial camera bind failed — applying PiP fallback layout")
-                        handleGreenScreenFallback(session, DuetSegmentationBackend.MLKIT,
+                        handleGreenScreenFallback(session, reportedSegmentationBackend(session),
                             DuetSegmentationBackend.NONE, "initial_camera_bind_failed")
                     }
                 }
@@ -832,6 +837,12 @@ class AndroidDuetSessionCoordinator(
      * be passed directly to [AndroidDuetCameraSource.start]. No-ops and returns null
      * if an adapter is already running or if construction/start throws.
      *
+     * Backend ladder: the adapter starts on the session-latched rung when a prior
+     * degradation happened in this session, otherwise on the selector's primary
+     * (`mediapipe_cpu` when the model asset is bundled, else `mlkit`). Backends
+     * open lazily on the analysis thread, so start() here never loads a model on
+     * the main thread.
+     *
      * On any exception: cleans up the partially stored adapter, logs structured
      * fallback metadata, and returns null so callers can apply PiP fallback.
      */
@@ -839,9 +850,21 @@ class AndroidDuetSessionCoordinator(
         if (session.greenScreenAdapter != null) return session.greenScreenAdapter
         val renderLoop = session.previewRenderLoop ?: return null
         return try {
+            val selector = AndroidDuetSegmentationBackendSelector(context)
+            val initialBackendId = session.greenScreenLatchedBackendId ?: selector.primaryBackendId()
+            var adapterRef: AndroidDuetGreenScreenAdapter? = null
             val adapter = AndroidDuetGreenScreenAdapter(
+                selector = selector,
+                initialBackendId = initialBackendId,
                 onMask = { frame ->
                     renderLoop.updateGreenScreenMask(frame)
+                },
+                onDegraded = { prev, next, reason, userMessage ->
+                    Log.w("DuetCoordinator",
+                        "[GreenScreen degraded] $prev->$next ($reason): $userMessage")
+                    mainHandler.post {
+                        handleGreenScreenDegraded(session, adapterRef, prev, next, reason, userMessage)
+                    }
                 },
                 onFallback = { prev, next, reason, userMessage ->
                     Log.w("DuetCoordinator",
@@ -851,13 +874,17 @@ class AndroidDuetSessionCoordinator(
                     }
                 },
             )
+            adapterRef = adapter
             session.greenScreenAdapter = adapter
             adapter.start()
-            Log.d("DuetCoordinator", "Green-screen adapter built and started for session ${session.sessionId}")
+            Log.d("DuetCoordinator",
+                "Green-screen adapter built and started for session ${session.sessionId} " +
+                    "(initial backend=$initialBackendId, latched=${session.greenScreenLatchedBackendId})")
             adapter
         } catch (t: Throwable) {
             Log.w("DuetCoordinator",
-                "[GreenScreen fallback] mlkit->none (adapter_start_failed): ${t.message}")
+                "[GreenScreen fallback] ${reportedSegmentationBackend(session)}->none " +
+                    "(adapter_start_failed): ${t.message}")
             // Ensure no partial adapter reference is left in the session.
             try { session.greenScreenAdapter?.stop() } catch (_: Throwable) {}
             session.greenScreenAdapter = null
@@ -866,7 +893,8 @@ class AndroidDuetSessionCoordinator(
     }
 
     /**
-     * Stops and nulls the session's green-screen adapter (idempotent).
+     * Stops and nulls the session's green-screen adapter (idempotent). The
+     * adapter's stop() closes its active and any fallback backend.
      */
     private fun stopGreenScreenAdapter(session: VGDuetAndroidSession) {
         val adapter = session.greenScreenAdapter ?: return
@@ -876,9 +904,61 @@ class AndroidDuetSessionCoordinator(
     }
 
     /**
-     * Handles an ML Kit failure fallback: switches the session to a safe PiP
-     * layout, stops the adapter, disables green-screen in the render loop, and
-     * updates layout rects. Session is preserved; no restart.
+     * Segmentation backend to report as `previousBackend` when green screen
+     * fails before/outside the adapter's own ladder (bind failures): the live
+     * adapter's rung, else the session latch, else the selector's primary.
+     */
+    private fun reportedSegmentationBackend(session: VGDuetAndroidSession): String =
+        session.greenScreenAdapter?.currentBackendId
+            ?: session.greenScreenLatchedBackendId
+            ?: AndroidDuetSegmentationBackendSelector(context).primaryBackendId()
+
+    /**
+     * Handles a NON-terminal backend degradation (MediaPipe -> ML Kit): green
+     * screen stays live, the layout is untouched, and the reached rung is
+     * latched on the session so no later adapter climbs back up. Emits
+     * `green_screen_degraded` via [onDuetEvent] only when [adapter] is still
+     * the session's current adapter (stale adapters latch but stay silent).
+     *
+     * Called on the main thread from the adapter's onDegraded callback.
+     */
+    private fun handleGreenScreenDegraded(
+        session: VGDuetAndroidSession,
+        adapter: AndroidDuetGreenScreenAdapter?,
+        previousBackend: String,
+        currentBackend: String,
+        reason: String,
+        userMessage: String,
+    ) {
+        if (activeSession !== session) return
+        // Latch regardless of adapter staleness: the degradation really happened.
+        session.greenScreenLatchedBackendId = currentBackend
+        if (adapter == null || session.greenScreenAdapter !== adapter) {
+            Log.d("DuetCoordinator",
+                "Green-screen degrade from a stale adapter latched ($currentBackend) without event")
+            return
+        }
+        Log.w("DuetCoordinator",
+            "Green screen degraded $previousBackend -> $currentBackend ($reason); staying live on $currentBackend")
+        onDuetEvent?.invoke(
+            mapOf(
+                "event" to "green_screen_degraded",
+                "sessionId" to session.sessionId,
+                "previousBackend" to previousBackend,
+                "currentBackend" to currentBackend,
+                "reason" to reason,
+                "userMessage" to userMessage,
+            )
+        )
+    }
+
+    /**
+     * Handles the TERMINAL segmentation fallback (ladder exhausted — ML Kit
+     * failed, or green screen could not be bound at all): switches the session
+     * to a safe PiP layout, stops the adapter (closing every backend), disables
+     * green-screen in the render loop, and updates layout rects. Session is
+     * preserved; no restart. Non-terminal MediaPipe -> ML Kit degradation never
+     * reaches here (see [handleGreenScreenDegraded]).
      *
      * Called on the main thread from the onFallback callback.
      *

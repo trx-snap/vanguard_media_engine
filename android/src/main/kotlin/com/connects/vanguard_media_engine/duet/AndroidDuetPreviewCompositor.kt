@@ -195,6 +195,9 @@ class AndroidDuetPreviewCompositor {
     /** Whether the first mask texture upload diagnostic log has fired. Render-thread only. */
     private var hasLoggedFirstMaskUpload = false
 
+    /** Backend id of the most recently uploaded mask (diagnostic only). Render-thread only. */
+    private var lastUploadedMaskBackend: String? = null
+
     private val quadPositions: FloatBuffer = floatBufferOf(
         -1f, -1f,
          1f, -1f,
@@ -303,6 +306,7 @@ class AndroidDuetPreviewCompositor {
             pendingMaskRef.set(null)
             hasMaskTexture = false
             hasLoggedFirstMaskUpload = false
+            lastUploadedMaskBackend = null
         }
     }
 
@@ -718,8 +722,11 @@ class AndroidDuetPreviewCompositor {
     }
 
     /**
-     * Uploads [frame]'s float32 mask buffer into [maskTextureId] as a LUMINANCE
-     * texture. Allocates the GL texture on first call. Must run on render thread.
+     * Uploads [frame]'s mask buffer into [maskTextureId] as a LUMINANCE texture,
+     * dispatching on [AndroidDuetSegmentationFrame.format]:
+     *   - FLOAT32_CONFIDENCE (ML Kit): float32 stride-4 -> byte pack (unchanged path).
+     *   - UINT8_ALPHA (MediaPipe): stride-1 bytes uploaded as-is, never read as float.
+     * Allocates the GL texture on first call. Must run on render thread.
      */
     private fun uploadMaskTexture(frame: AndroidDuetSegmentationFrame) {
         val w = frame.width
@@ -744,20 +751,42 @@ class AndroidDuetPreviewCompositor {
         } else {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
         }
-        // ML Kit produces float32 confidence values in [0,1]. Upload as LUMINANCE.
-        // ES 2.0 does not support GL_R32F natively; pack float → byte (0–255).
-        // Use a read-only duplicate so we never mutate the frame buffer's position.
-        val buf = frame.maskBytes.asReadOnlyBuffer()
-            .order(java.nio.ByteOrder.nativeOrder())
-        buf.rewind()
-        val capacity = w * h
-        val byteBuffer = java.nio.ByteBuffer.allocateDirect(capacity)
-        for (i in 0 until capacity) {
-            val byteOffset = i * 4
-            val f = if (buf.limit() >= byteOffset + 4) buf.getFloat(byteOffset) else 0f
-            byteBuffer.put((f.coerceIn(0f, 1f) * 255f).toInt().toByte())
+        // Dispatch on the frame's declared byte layout. The two layouts differ in
+        // stride (4 vs 1) and must never be interpreted through each other's path.
+        val byteBuffer: java.nio.ByteBuffer = when (frame.format) {
+            DuetSegmentationMaskFormat.FLOAT32_CONFIDENCE -> {
+                // ML Kit produces float32 confidence values in [0,1]. Upload as LUMINANCE.
+                // ES 2.0 does not support GL_R32F natively; pack float → byte (0–255).
+                // Use a read-only duplicate so we never mutate the frame buffer's position.
+                val buf = frame.maskBytes.asReadOnlyBuffer()
+                    .order(java.nio.ByteOrder.nativeOrder())
+                buf.rewind()
+                val capacity = w * h
+                val packed = java.nio.ByteBuffer.allocateDirect(capacity)
+                for (i in 0 until capacity) {
+                    val byteOffset = i * 4
+                    val f = if (buf.limit() >= byteOffset + 4) buf.getFloat(byteOffset) else 0f
+                    packed.put((f.coerceIn(0f, 1f) * 255f).toInt().toByte())
+                }
+                packed.rewind()
+                packed
+            }
+            DuetSegmentationMaskFormat.UINT8_ALPHA -> {
+                // MediaPipe rung: one byte per pixel already scaled to 0–255 on the
+                // analysis thread. Upload through a read-only view bounded to exactly
+                // w*h bytes — no float reinterpretation, no repack.
+                val required = w * h
+                val view = frame.maskBytes.asReadOnlyBuffer()
+                view.rewind()
+                if (view.capacity() < required) {
+                    Log.w(TAG, "uploadMaskTexture: uint8 mask too small (${view.capacity()} < $required), skipping")
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+                    return
+                }
+                view.limit(required)
+                view
+            }
         }
-        byteBuffer.rewind()
         // GL_UNPACK_ALIGNMENT defaults to 4, which causes row misalignment for
         // single-channel (1 byte/pixel) mask rows whose width is not divisible by
         // 4.  Save the current alignment, force 1, upload, then restore — so we
@@ -778,8 +807,19 @@ class AndroidDuetPreviewCompositor {
         hasMaskTexture = true
         if (!hasLoggedFirstMaskUpload) {
             hasLoggedFirstMaskUpload = true
-            Log.i(TAG, "ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST width=$w height=$h")
+            Log.i(
+                TAG,
+                "ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST width=$w height=$h " +
+                    "format=${frame.format.key} backend=${frame.backend}",
+            )
+        } else if (lastUploadedMaskBackend != null && lastUploadedMaskBackend != frame.backend) {
+            Log.i(
+                TAG,
+                "ANDROID_DUET_GREENSCREEN_MASK_BACKEND_CHANGED from=$lastUploadedMaskBackend " +
+                    "to=${frame.backend} format=${frame.format.key} width=$w height=$h",
+            )
         }
+        lastUploadedMaskBackend = frame.backend
     }
 
     /**

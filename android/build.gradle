@@ -62,6 +62,16 @@ android {
     defaultConfig {
         minSdk = 24
     }
+
+    // ── Duet green-screen: MediaPipe model asset packaging ───────────────────
+    // `src/main/assets/selfie_segmenter.tflite` must stay uncompressed so the
+    // MediaPipe Tasks runtime can map it directly instead of inflating a copy.
+    // AGP applies noCompress at APK packaging time; declaring it here covers
+    // the plugin's own packaging and documents the requirement for consuming
+    // apps, which should carry the same `noCompress "tflite"` entry.
+    androidResources {
+        noCompress "tflite"
+    }
 }
 
 // ── CameraX dependencies (B2: Android camera pipeline) ───────────────────────
@@ -113,8 +123,13 @@ dependencies {
     // Runtime use of HeifWriter itself remains gated to API 28+.
     implementation("androidx.heifwriter:heifwriter:1.0.0")
 
-    // -- Duet green-screen: ML Kit Selfie Segmentation (stream mode, raw mask) --
-    // No MediaPipe/TFLite deps in this slice. beta6 is the current baseline that
-    // ships the raw-mask API (enableRawSizeMask) without pulling in TFLite directly.
+    // -- Duet green-screen: segmentation backend ladder --------------------------
+    // Primary: MediaPipe Tasks Vision ImageSegmenter (CPU delegate, VIDEO running
+    // mode) driven by the bundled `assets/selfie_segmenter.tflite`. Pinned exactly;
+    // GPU delegate is deferred to a later slice.
+    implementation("com.google.mediapipe:tasks-vision:0.10.26.1")
+    // Fallback: ML Kit Selfie Segmentation (stream mode, raw mask). beta6 is the
+    // baseline that ships the raw-mask API (enableRawSizeMask) without pulling in
+    // TFLite directly. Terminal fallback after ML Kit is safe PiP (no segmenter).
     implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 }
