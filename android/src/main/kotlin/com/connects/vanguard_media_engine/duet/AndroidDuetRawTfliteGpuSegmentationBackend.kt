@@ -3,6 +3,7 @@ package com.connects.vanguard_media_engine.duet
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.Interpreter
@@ -60,6 +61,9 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
 
     private val closed    = AtomicBoolean(false)
     private var loggedFirstMask = false
+
+    /** Owned-thread-only phase-latency telemetry; diagnostic only, never affects results. */
+    private val phaseTelemetry = AndroidDuetRawTfliteGpuPhaseTelemetry()
 
     /** Owned single-thread executor; created in open(). */
     @Volatile private var executor: ExecutorService? = null
@@ -323,6 +327,8 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
         @Suppress("UNUSED_PARAMETER") timestampMs: Long,
         completion: (DuetSegmentationOutcome) -> Unit,
     ) {
+        val entryNs = SystemClock.elapsedRealtimeNanos()
+
         val interp = interpreter
         if (interp == null || closed.get()) {
             completion(DuetSegmentationOutcome.Skipped("raw_tflite_gpu_closed"))
@@ -349,6 +355,7 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             )
             return
         }
+        val convertDoneNs = SystemClock.elapsedRealtimeNanos()
 
         // 2. Scale to 256x256 if needed. Keep source bitmap alive until pixel extraction completes.
         val scaled: Bitmap = if (bitmap.width == MODEL_W && bitmap.height == MODEL_H) {
@@ -366,6 +373,7 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             try { scaled.recycle() } catch (_: Throwable) {}
         }
         try { bitmap.recycle() } catch (_: Throwable) {}
+        val scaleAndPixelsDoneNs = SystemClock.elapsedRealtimeNanos()
 
         for (pixel in pixels) {
             val r = ((pixel shr 16) and 0xFF) / 255f
@@ -376,6 +384,7 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             inBuf.putFloat(b)
         }
         inBuf.rewind()
+        val inputFillDoneNs = SystemClock.elapsedRealtimeNanos()
 
         // 4. Run inference.
         outBuf.rewind()
@@ -392,6 +401,7 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             return
         }
         outBuf.rewind()
+        val inferenceDoneNs = SystemClock.elapsedRealtimeNanos()
 
         // 5. Extract background confidence (class 0) and compute person alpha.
         //    Output layout: [1, H, W, 6], stride = 6 floats per pixel.
@@ -435,8 +445,46 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             )
             return
         }
+        val maskExtractDoneNs = SystemClock.elapsedRealtimeNanos()
+
+        recordPhaseTelemetryQuietly(
+            entryNs               = entryNs,
+            convertDoneNs         = convertDoneNs,
+            scaleAndPixelsDoneNs  = scaleAndPixelsDoneNs,
+            inputFillDoneNs       = inputFillDoneNs,
+            inferenceDoneNs       = inferenceDoneNs,
+            maskExtractDoneNs     = maskExtractDoneNs,
+        )
 
         completion(DuetSegmentationOutcome.Mask(frame))
+    }
+
+    /**
+     * Converts monotonic elapsedRealtimeNanos phase marks into per-phase ms
+     * deltas and forwards them to [phaseTelemetry]. Diagnostic only: never
+     * throws back into the hot path, never affects the Mask outcome already
+     * built by the caller.
+     */
+    private fun recordPhaseTelemetryQuietly(
+        entryNs: Long,
+        convertDoneNs: Long,
+        scaleAndPixelsDoneNs: Long,
+        inputFillDoneNs: Long,
+        inferenceDoneNs: Long,
+        maskExtractDoneNs: Long,
+    ) {
+        try {
+            phaseTelemetry.recordMask(
+                convertMs        = (convertDoneNs - entryNs) / 1_000_000L,
+                scaleAndPixelsMs = (scaleAndPixelsDoneNs - convertDoneNs) / 1_000_000L,
+                inputFillMs      = (inputFillDoneNs - scaleAndPixelsDoneNs) / 1_000_000L,
+                inferenceMs      = (inferenceDoneNs - inputFillDoneNs) / 1_000_000L,
+                maskExtractMs    = (maskExtractDoneNs - inferenceDoneNs) / 1_000_000L,
+                totalMs          = (maskExtractDoneNs - entryNs) / 1_000_000L,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "phase telemetry record failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
     }
 
     // ── Owned-thread: close resources ─────────────────────────────────────────
@@ -446,6 +494,10 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
      * tensor buffers. Must run on the owned thread.
      */
     private fun closeOwnedResourcesQuietly() {
+        try { phaseTelemetry.logSummary() } catch (t: Throwable) {
+            Log.w(TAG, "phase telemetry summary failed: ${t.message}")
+        }
+
         val interp = interpreter
         interpreter = null
         if (interp != null) {
