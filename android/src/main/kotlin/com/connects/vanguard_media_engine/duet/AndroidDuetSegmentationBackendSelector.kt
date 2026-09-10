@@ -51,6 +51,13 @@ class AndroidDuetSegmentationBackendSelector(
      * (`compat_best_or_default`). Ignored for all other backends.
      */
     private val rawGpuDelegateMode: String? = null,
+    /**
+     * Debug-only model asset path for [DuetSegmentationBackend.RAW_TFLITE_GPU].
+     * Must be a member of [RAW_TFLITE_GPU_MODEL_ALLOWLIST]; validated by
+     * [AndroidDuetSessionCoordinator] before the selector is constructed.
+     * `null` → default ([TFLITE_GPU_MODEL_ASSET_PATH]). Ignored for all other backends.
+     */
+    private val rawGpuModelAssetPath: String? = null,
 ) {
 
     /** Context this selector was constructed with, exposed so the adapter can build its adaptive-quality policy. */
@@ -90,6 +97,19 @@ class AndroidDuetSegmentationBackendSelector(
             DuetSegmentationBackend.MEDIAPIPE_CPU,
             DuetSegmentationBackend.MLKIT,
         )
+
+        /**
+         * Allowlist of asset-relative model paths accepted by the raw_tflite_gpu
+         * debug backend. Validated by [AndroidDuetSessionCoordinator] before the
+         * selector is constructed; invalid paths fall back to [TFLITE_GPU_MODEL_ASSET_PATH].
+         * [MODEL_ASSET_PATH] (selfie_segmenter.tflite) is included as an opt-in
+         * degrade/negative lane; if the raw interpreter cannot open it due to a custom
+         * op, the existing adapter open-failure fallback handles degradation.
+         */
+        val RAW_TFLITE_GPU_MODEL_ALLOWLIST: Set<String> = setOf(
+            TFLITE_GPU_MODEL_ASSET_PATH,
+            MODEL_ASSET_PATH,
+        )
     }
 
     /**
@@ -110,16 +130,19 @@ class AndroidDuetSegmentationBackendSelector(
     }
 
     /**
-     * True when the raw TFLite multiclass model asset is readable from the
-     * app's merged assets. Checked lazily; used by [supports] for raw_tflite_gpu.
+     * True when the raw TFLite model asset to use is readable from the app's
+     * merged assets. Checks [rawGpuModelAssetPath] if provided and allowlisted,
+     * otherwise falls back to [TFLITE_GPU_MODEL_ASSET_PATH].
+     * Checked lazily; used by [supports] for raw_tflite_gpu.
      */
     val isTfliteGpuModelBundled: Boolean by lazy {
         val ctx = context ?: return@lazy false
+        val assetPath = rawGpuModelAssetPath ?: TFLITE_GPU_MODEL_ASSET_PATH
         try {
-            ctx.assets.open(TFLITE_GPU_MODEL_ASSET_PATH).use { }
+            ctx.assets.open(assetPath).use { }
             true
         } catch (t: Throwable) {
-            Log.w(TAG, "TFLite GPU model asset '$TFLITE_GPU_MODEL_ASSET_PATH' not readable " +
+            Log.w(TAG, "TFLite GPU model asset '$assetPath' not readable " +
                 "(${t.message}); raw_tflite_gpu unsupported")
             false
         }
@@ -168,9 +191,10 @@ class AndroidDuetSegmentationBackendSelector(
      * Constructs (but does not open) the backend for [backendId].
      * Throws IllegalArgumentException for unsupported ids.
      *
-     * For [DuetSegmentationBackend.RAW_TFLITE_GPU], the delegate mode is taken
-     * from [rawGpuDelegateMode] stored at selector construction time (validated
-     * by [AndroidDuetSessionCoordinator]). All other backends ignore it.
+     * For [DuetSegmentationBackend.RAW_TFLITE_GPU], the delegate mode and model
+     * asset path are taken from [rawGpuDelegateMode] and [rawGpuModelAssetPath]
+     * stored at selector construction time (both validated by
+     * [AndroidDuetSessionCoordinator]). All other backends ignore them.
      */
     fun createBackend(backendId: String): AndroidDuetSegmentationBackend = when (backendId) {
         DuetSegmentationBackend.MEDIAPIPE_GPU -> {
@@ -188,7 +212,8 @@ class AndroidDuetSegmentationBackendSelector(
             val ctx = context
                 ?: throw IllegalArgumentException("raw_tflite_gpu backend requires a Context")
             val mode = rawGpuDelegateMode ?: "compat_best_or_default"
-            AndroidDuetRawTfliteGpuSegmentationBackend(ctx.applicationContext ?: ctx, mode)
+            val modelPath = rawGpuModelAssetPath ?: TFLITE_GPU_MODEL_ASSET_PATH
+            AndroidDuetRawTfliteGpuSegmentationBackend(ctx.applicationContext ?: ctx, mode, modelPath)
         }
         else -> throw IllegalArgumentException("Unsupported segmentation backend '$backendId'")
     }

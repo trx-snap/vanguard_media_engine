@@ -77,6 +77,16 @@ const String kRawTfliteGpuLiveDelegateMode = String.fromEnvironment(
   defaultValue: 'compat_best_or_default',
 );
 
+/// Debug-only model asset path for raw_tflite_gpu live sessions.
+/// Must be a member of AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST
+/// (selfie_multiclass_256x256.tflite, selfie_segmenter.tflite). Invalid values are
+/// silently fallen back to selfie_multiclass_256x256.tflite by AndroidDuetSessionCoordinator.
+/// Override with `--dart-define=DUET_RAW_TFLITE_GPU_LIVE_MODEL_ASSET=<path>`.
+const String kRawTfliteGpuLiveModelAsset = String.fromEnvironment(
+  'DUET_RAW_TFLITE_GPU_LIVE_MODEL_ASSET',
+  defaultValue: 'selfie_multiclass_256x256.tflite',
+);
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const AndroidDuetRawTfliteGpuSustainedPreviewPhysicalSmokeApp());
@@ -272,6 +282,11 @@ class _AndroidDuetRawTfliteGpuSustainedPreviewPhysicalSmokeAppState
                 // Validated by the coordinator; invalid values fall back to
                 // compat_best_or_default without failing session start.
                 'debugRawTfliteGpuDelegateMode': kRawTfliteGpuLiveDelegateMode,
+                // Debug-only model asset path for the raw_tflite_gpu rung.
+                // Sourced from --dart-define=DUET_RAW_TFLITE_GPU_LIVE_MODEL_ASSET.
+                // Validated against RAW_TFLITE_GPU_MODEL_ALLOWLIST by the coordinator;
+                // invalid values fall back to selfie_multiclass_256x256.tflite.
+                'debugRawTfliteGpuModelAssetPath': kRawTfliteGpuLiveModelAsset,
               },
             }),
             'attachDuetPreviewTexture',
@@ -496,6 +511,7 @@ class _AndroidDuetRawTfliteGpuSustainedPreviewPhysicalSmokeAppState
         'sessionId': sessionId,
         'textureId': textureId,
         'rawTfliteGpuDelegateMode': kRawTfliteGpuLiveDelegateMode,
+        'rawTfliteGpuModelAsset': kRawTfliteGpuLiveModelAsset,
         'duetEvents': duetEvents,
         'stepResults': stepResults,
         'failures': failures,

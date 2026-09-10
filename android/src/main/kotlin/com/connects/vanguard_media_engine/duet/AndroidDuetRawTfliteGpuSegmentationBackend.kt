@@ -33,10 +33,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 // via the existing adapter/selector ladder (raw_tflite_gpu -> mediapipe_cpu ->
 // mlkit -> none/PiP). Default production ladder is unchanged.
 //
-// Model: selfie_multiclass_256x256.tflite
-//   Input  tensor: [1, 256, 256, 3] float32, RGB normalized [0, 1]
-//   Output tensor: [1, 256, 256, 6] float32, class 0 = background
+// Model: configurable via modelAssetPath (default selfie_multiclass_256x256.tflite)
+//   Default input  tensor: [1, 256, 256, 3] float32, RGB normalized [0, 1]
+//   Default output tensor: [1, 256, 256, 6] float32, class 0 = background
 //   Person alpha:  (1.0f - output[class=0]).coerceIn(0f, 1f) -> uint8 [0,255]
+//   Single-channel models: alpha = value.coerceIn(0,1)*255 (SINGLE_CHANNEL_MASK mode)
 //
 // Threading: one owned single-thread executor for all lifecycle work. GpuDelegate
 // contexts require single-thread affinity; this satisfies that requirement.
@@ -44,15 +45,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 // segment() posts to the worker thread and fires completion exactly once.
 // close() is idempotent, never throws, closes Interpreter before GpuDelegate.
 
-private const val TAG                  = "DuetRawTfliteGpu"
-private const val MODEL_ASSET          = "selfie_multiclass_256x256.tflite"
-private const val TFL3_MAGIC_BYTE0     = 0x18.toByte() // FlatBuffers TFL3 magic
-private const val MODEL_W              = 256
-private const val MODEL_H              = 256
-private const val MODEL_C_IN           = 3
-private const val MODEL_C_OUT          = 6
+private const val TAG                 = "DuetRawTfliteGpu"
+private const val DEFAULT_MODEL_ASSET = "selfie_multiclass_256x256.tflite"
 private const val BACKGROUND_CLASS_IDX = 0
-private const val CLOSE_TIMEOUT_MS     = 2_000L
+private const val CLOSE_TIMEOUT_MS    = 2_000L
 
 // Debug-only allowlist for the GPU delegate mode. Invalid values supplied via
 // layoutConfigMap["debugRawTfliteGpuDelegateMode"] fall back to the default
@@ -65,6 +61,32 @@ private val DELEGATE_MODE_ALLOWLIST = setOf(
     "force_opengl",
 )
 
+/**
+ * How to interpret the float32 output per pixel.
+ *
+ * SINGLE_CHANNEL_MASK: output has 1 channel; alpha = value.coerceIn(0,1)*255.
+ * MULTICLASS_BG_ZERO:  output has >1 channels; alpha = (1 - bgClass0).coerceIn(0,1)*255.
+ *                      This is the default for selfie_multiclass_256x256.tflite (6 classes).
+ */
+private enum class OutputMode {
+    SINGLE_CHANNEL_MASK,
+    MULTICLASS_BG_ZERO,
+}
+
+/**
+ * Owned-thread-only tensor metadata inspected after allocateTensors().
+ * Private to this file; cleared on close. No new file needed.
+ */
+private data class TensorConfig(
+    val inputWidth:     Int,
+    val inputHeight:    Int,
+    val inputChannels:  Int = 3,
+    val outputWidth:    Int,
+    val outputHeight:   Int,
+    val outputChannels: Int,
+    val outputMode:     OutputMode,
+)
+
 class AndroidDuetRawTfliteGpuSegmentationBackend(
     private val context: Context,
     /**
@@ -74,11 +96,17 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
      * Do NOT use to promote raw_tflite_gpu to the production ladder.
      */
     private val delegateMode: String = "compat_best_or_default",
+    /**
+     * Asset-relative path of the TFLite model to load.
+     * Must be a member of [AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST].
+     * Default: [DEFAULT_MODEL_ASSET] ("selfie_multiclass_256x256.tflite").
+     */
+    private val modelAssetPath: String = DEFAULT_MODEL_ASSET,
 ) : AndroidDuetSegmentationBackend {
 
     override val backendId: String get() = DuetSegmentationBackend.RAW_TFLITE_GPU
 
-    private val closed    = AtomicBoolean(false)
+    private val closed          = AtomicBoolean(false)
     private var loggedFirstMask = false
 
     /** Owned-thread-only phase-latency telemetry; diagnostic only, never affects results. */
@@ -96,6 +124,13 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
     private var interpreter:  Interpreter?  = null
     private var inputBuffer:  ByteBuffer?   = null
     private var outputBuffer: ByteBuffer?   = null
+
+    /**
+     * Populated by [initOnOwnedThread] after tensor inspection; cleared in
+     * [closeOwnedResourcesQuietly]. All segment work reads this; if null the
+     * backend was never successfully initialised or has been closed.
+     */
+    private var tensorConfig: TensorConfig? = null
 
     // ── AndroidDuetSegmentationBackend ────────────────────────────────────────
 
@@ -333,72 +368,145 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
         // 5. Allocate tensors.
         interp.allocateTensors()
 
-        // 6. Verify input tensor: [1, 256, 256, 3] float32.
-        val inputTensor = interp.getInputTensor(0)
-        val inputShape  = inputTensor.shape()
-        if (inputShape.size != 4 ||
-            inputShape[0] != 1 ||
-            inputShape[1] != MODEL_H ||
-            inputShape[2] != MODEL_W ||
-            inputShape[3] != MODEL_C_IN
-        ) {
+        // 6. Validate input tensor count and shape dynamically.
+        //    Must be exactly 1 input tensor, NHWC rank-4 [1, h, w, 3], float32 only.
+        //    UINT8 input is rejected for the live GPU path in this slice.
+        val inputTensorCount = interp.inputTensorCount
+        if (inputTensorCount != 1) {
             throw IllegalStateException(
-                "Input tensor shape mismatch: expected [1,$MODEL_H,$MODEL_W,$MODEL_C_IN] " +
-                    "got ${inputShape.toList()}"
+                "Expected 1 input tensor, got $inputTensorCount (model=$modelAssetPath)"
             )
         }
+        val inputTensor = interp.getInputTensor(0)
         if (inputTensor.dataType() != org.tensorflow.lite.DataType.FLOAT32) {
             throw IllegalStateException(
-                "Input tensor dtype mismatch: expected FLOAT32, got ${inputTensor.dataType()}"
+                "Input tensor dtype must be FLOAT32 for the live GPU path; " +
+                    "got ${inputTensor.dataType()} (model=$modelAssetPath). " +
+                    "UINT8 models are not supported in this slice."
+            )
+        }
+        val inputShape = inputTensor.shape()
+        if (inputShape.size != 4 || inputShape[0] != 1 || inputShape[3] != 3) {
+            throw IllegalStateException(
+                "Input tensor must be NHWC rank-4 [1,h,w,3]; " +
+                    "got ${inputShape.toList()} (model=$modelAssetPath)"
+            )
+        }
+        val inputH = inputShape[1]
+        val inputW = inputShape[2]
+        if (inputH <= 0 || inputW <= 0) {
+            throw IllegalStateException(
+                "Input tensor has non-positive spatial dimensions: h=$inputH w=$inputW " +
+                    "(model=$modelAssetPath)"
             )
         }
 
-        // 7. Verify output tensor: [1, 256, 256, 6] float32.
-        val outputTensor = interp.getOutputTensor(0)
-        val outputShape  = outputTensor.shape()
-        if (outputShape.size != 4 ||
-            outputShape[0] != 1 ||
-            outputShape[1] != MODEL_H ||
-            outputShape[2] != MODEL_W ||
-            outputShape[3] != MODEL_C_OUT
-        ) {
+        // 7. Validate output tensor count and shape dynamically.
+        //    Supported output shapes (all float32):
+        //      [1, h, w, 1]   → SINGLE_CHANNEL_MASK (alpha = value)
+        //      [1, h, w, C>1] → MULTICLASS_BG_ZERO  (alpha = 1 - class0)
+        //      [1, h, w]      → implicit single channel → SINGLE_CHANNEL_MASK
+        //    Non-positive dimensions and unsupported rank are rejected.
+        val outputTensorCount = interp.outputTensorCount
+        if (outputTensorCount != 1) {
             throw IllegalStateException(
-                "Output tensor shape mismatch: expected [1,$MODEL_H,$MODEL_W,$MODEL_C_OUT] " +
-                    "got ${outputShape.toList()}"
+                "Expected 1 output tensor, got $outputTensorCount (model=$modelAssetPath)"
             )
         }
+        val outputTensor = interp.getOutputTensor(0)
         if (outputTensor.dataType() != org.tensorflow.lite.DataType.FLOAT32) {
             throw IllegalStateException(
-                "Output tensor dtype mismatch: expected FLOAT32, got ${outputTensor.dataType()}"
+                "Output tensor dtype must be FLOAT32; " +
+                    "got ${outputTensor.dataType()} (model=$modelAssetPath)"
+            )
+        }
+        val outputShape = outputTensor.shape()
+        val outputH: Int
+        val outputW: Int
+        val outputC: Int
+        val outputMode: OutputMode
+        when (outputShape.size) {
+            4 -> {
+                // [1, h, w, C]
+                if (outputShape[0] != 1) {
+                    throw IllegalStateException(
+                        "Output tensor batch dim must be 1; got ${outputShape.toList()} (model=$modelAssetPath)"
+                    )
+                }
+                outputH = outputShape[1]
+                outputW = outputShape[2]
+                outputC = outputShape[3]
+                if (outputH <= 0 || outputW <= 0 || outputC <= 0) {
+                    throw IllegalStateException(
+                        "Output tensor has non-positive dimension(s): " +
+                            "h=$outputH w=$outputW C=$outputC (model=$modelAssetPath)"
+                    )
+                }
+                outputMode = if (outputC == 1) OutputMode.SINGLE_CHANNEL_MASK
+                             else OutputMode.MULTICLASS_BG_ZERO
+            }
+            3 -> {
+                // [1, h, w] — implicit single channel
+                if (outputShape[0] != 1) {
+                    throw IllegalStateException(
+                        "Output tensor batch dim must be 1; got ${outputShape.toList()} (model=$modelAssetPath)"
+                    )
+                }
+                outputH = outputShape[1]
+                outputW = outputShape[2]
+                outputC = 1
+                if (outputH <= 0 || outputW <= 0) {
+                    throw IllegalStateException(
+                        "Output tensor has non-positive spatial dimensions: " +
+                            "h=$outputH w=$outputW (model=$modelAssetPath)"
+                    )
+                }
+                outputMode = OutputMode.SINGLE_CHANNEL_MASK
+            }
+            else -> throw IllegalStateException(
+                "Unsupported output tensor rank ${outputShape.size}; " +
+                    "expected 3 [1,h,w] or 4 [1,h,w,C]; got ${outputShape.toList()} (model=$modelAssetPath)"
             )
         }
 
-        // 8. Allocate direct native-order float32 input and output buffers.
-        val pixelCount = MODEL_H * MODEL_W
-        inputBuffer = ByteBuffer.allocateDirect(pixelCount * MODEL_C_IN * 4)
+        // 8. Store tensor config.
+        val config = TensorConfig(
+            inputWidth     = inputW,
+            inputHeight    = inputH,
+            inputChannels  = 3,
+            outputWidth    = outputW,
+            outputHeight   = outputH,
+            outputChannels = outputC,
+            outputMode     = outputMode,
+        )
+        tensorConfig = config
+
+        // 9. Allocate direct native-order float32 input and output buffers using
+        //    the interpreter's reported byte counts (not fixed constants).
+        inputBuffer = ByteBuffer.allocateDirect(inputTensor.numBytes())
             .apply { order(ByteOrder.nativeOrder()) }
-        outputBuffer = ByteBuffer.allocateDirect(pixelCount * MODEL_C_OUT * 4)
+        outputBuffer = ByteBuffer.allocateDirect(outputTensor.numBytes())
             .apply { order(ByteOrder.nativeOrder()) }
 
         Log.i(
             TAG,
             "ANDROID_DUET_RAW_TFLITE_GPU_READY " +
-                "model=$MODEL_ASSET " +
+                "model=$modelAssetPath " +
                 "delegateMode=$delegateMode " +
                 "optionsSource=$optionsSource " +
                 "compatSupported=$compatSupported " +
-                "inputShape=[1,$MODEL_H,$MODEL_W,$MODEL_C_IN] " +
-                "outputShape=[1,$MODEL_H,$MODEL_W,$MODEL_C_OUT]",
+                "inputShape=${inputShape.toList()} " +
+                "outputShape=${outputShape.toList()}",
         )
     }
 
     private fun loadModelBytes(): ByteBuffer {
         val assetManager = context.applicationContext?.assets ?: context.assets
         val stream: InputStream = try {
-            assetManager.open(MODEL_ASSET)
+            assetManager.open(modelAssetPath)
         } catch (t: Throwable) {
             throw IllegalStateException(
-                "Cannot open model asset '$MODEL_ASSET' from Android assets: ${t.message}", t,
+                "Cannot open model asset '$modelAssetPath' from Android assets: ${t.message}", t,
             )
         }
         return stream.use { s ->
@@ -421,7 +529,8 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
         val entryNs = SystemClock.elapsedRealtimeNanos()
 
         val interp = interpreter
-        if (interp == null || closed.get()) {
+        val config = tensorConfig
+        if (interp == null || config == null || closed.get()) {
             completion(DuetSegmentationOutcome.Skipped("raw_tflite_gpu_closed"))
             return
         }
@@ -448,17 +557,18 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
         }
         val convertDoneNs = SystemClock.elapsedRealtimeNanos()
 
-        // 2. Scale to 256x256 if needed. Keep source bitmap alive until pixel extraction completes.
-        val scaled: Bitmap = if (bitmap.width == MODEL_W && bitmap.height == MODEL_H) {
+        // 2. Scale to config.inputWidth x config.inputHeight if needed.
+        val scaled: Bitmap = if (bitmap.width == config.inputWidth && bitmap.height == config.inputHeight) {
             bitmap
         } else {
-            Bitmap.createScaledBitmap(bitmap, MODEL_W, MODEL_H, true)
+            Bitmap.createScaledBitmap(bitmap, config.inputWidth, config.inputHeight, true)
         }
 
         // 3. Fill float32 RGB input buffer: normalize to [0, 1].
         inBuf.rewind()
-        val pixels = IntArray(MODEL_W * MODEL_H)
-        scaled.getPixels(pixels, 0, MODEL_W, 0, 0, MODEL_W, MODEL_H)
+        val pixelCount = config.inputWidth * config.inputHeight
+        val pixels = IntArray(pixelCount)
+        scaled.getPixels(pixels, 0, config.inputWidth, 0, 0, config.inputWidth, config.inputHeight)
         // Recycle scaled bitmap if it's a different instance from the original.
         if (scaled !== bitmap) {
             try { scaled.recycle() } catch (_: Throwable) {}
@@ -494,17 +604,29 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
         outBuf.rewind()
         val inferenceDoneNs = SystemClock.elapsedRealtimeNanos()
 
-        // 5. Extract background confidence (class 0) and compute person alpha.
-        //    Output layout: [1, H, W, 6], stride = 6 floats per pixel.
-        //    Person alpha = (1.0f - bgConf).coerceIn(0f, 1f) -> uint8 [0,255].
-        val pixelCount = MODEL_W * MODEL_H
-        val maskBuf = ByteBuffer.allocateDirect(pixelCount).apply { order(ByteOrder.nativeOrder()) }
+        // 5. Extract alpha mask using dynamic output config.
+        //    Output layout: [1, outH, outW, outC], stride = outC floats per pixel.
+        //    SINGLE_CHANNEL_MASK: alpha = value.coerceIn(0,1)*255
+        //    MULTICLASS_BG_ZERO:  alpha = (1 - bgClass0).coerceIn(0,1)*255
+        val outPixelCount = config.outputWidth * config.outputHeight
+        val maskBuf = ByteBuffer.allocateDirect(outPixelCount).apply { order(ByteOrder.nativeOrder()) }
         val outFloats = outBuf.asFloatBuffer()
-        for (i in 0 until pixelCount) {
-            val baseIdx = i * MODEL_C_OUT + BACKGROUND_CLASS_IDX
-            val bgConf = outFloats.get(baseIdx).coerceIn(0f, 1f)
-            val alpha = ((1f - bgConf) * 255f).toInt().toByte()
-            maskBuf.put(alpha)
+        when (config.outputMode) {
+            OutputMode.SINGLE_CHANNEL_MASK -> {
+                for (i in 0 until outPixelCount) {
+                    val value = outFloats.get(i).coerceIn(0f, 1f)
+                    val alpha = (value * 255f).toInt().toByte()
+                    maskBuf.put(alpha)
+                }
+            }
+            OutputMode.MULTICLASS_BG_ZERO -> {
+                for (i in 0 until outPixelCount) {
+                    val baseIdx = i * config.outputChannels + BACKGROUND_CLASS_IDX
+                    val bgConf = outFloats.get(baseIdx).coerceIn(0f, 1f)
+                    val alpha = ((1f - bgConf) * 255f).toInt().toByte()
+                    maskBuf.put(alpha)
+                }
+            }
         }
         maskBuf.rewind()
 
@@ -513,15 +635,15 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
             Log.i(
                 TAG,
                 "ANDROID_DUET_GREENSCREEN_RAW_TFLITE_GPU_MASK_FIRST " +
-                    "width=$MODEL_W height=$MODEL_H format=uint8_alpha",
+                    "width=${config.outputWidth} height=${config.outputHeight} format=uint8_alpha",
             )
         }
 
         val frame = try {
             AndroidDuetSegmentationFrame.adoptOwned(
                 ownedBytes  = maskBuf,
-                width       = MODEL_W,
-                height      = MODEL_H,
+                width       = config.outputWidth,
+                height      = config.outputHeight,
                 timestampMs = timestampMs,
                 backend     = backendId,
                 format      = DuetSegmentationMaskFormat.UINT8_ALPHA,
@@ -582,7 +704,7 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
 
     /**
      * Closes Interpreter before GpuDelegate (TFLite contract), then clears
-     * tensor buffers. Must run on the owned thread.
+     * tensor buffers and config. Must run on the owned thread.
      */
     private fun closeOwnedResourcesQuietly() {
         try { phaseTelemetry.logSummary() } catch (t: Throwable) {
@@ -607,6 +729,7 @@ class AndroidDuetRawTfliteGpuSegmentationBackend(
 
         inputBuffer  = null
         outputBuffer = null
+        tensorConfig = null
     }
 
     // ── Frame conversion ──────────────────────────────────────────────────────

@@ -894,7 +894,29 @@ class AndroidDuetSessionCoordinator(
                 null
             }
 
-            val selector = AndroidDuetSegmentationBackendSelector(context, rawGpuDelegateMode)
+            // Read the raw GPU model asset path only when the debug backend is raw_tflite_gpu.
+            // Validate against the model allowlist; warn and fall back to the selector default
+            // (selfie_multiclass_256x256.tflite) on invalid/missing values without failing session start.
+            val rawGpuModelAssetPath: String? = if (debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU) {
+                val rawModel = session.layoutConfigMap["debugRawTfliteGpuModelAssetPath"] as? String
+                if (rawModel != null) {
+                    if (rawModel in AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST) {
+                        rawModel
+                    } else {
+                        Log.w("DuetCoordinator",
+                            "debugRawTfliteGpuModelAssetPath='$rawModel' is not in allowlist " +
+                                "${AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST}; " +
+                                "falling back to default model (session=${session.sessionId})")
+                        null
+                    }
+                } else {
+                    null // absent → selector default (selfie_multiclass_256x256.tflite)
+                }
+            } else {
+                null
+            }
+
+            val selector = AndroidDuetSegmentationBackendSelector(context, rawGpuDelegateMode, rawGpuModelAssetPath)
 
             val initialBackendId: String = when {
                 session.greenScreenLatchedBackendId != null ->
@@ -904,6 +926,7 @@ class AndroidDuetSessionCoordinator(
                     Log.d("DuetCoordinator",
                         "debugSegmentationBackend=raw_tflite_gpu: starting adapter on raw_tflite_gpu " +
                             "(delegateMode=${rawGpuDelegateMode ?: "compat_best_or_default"}, " +
+                            "model=${rawGpuModelAssetPath ?: AndroidDuetSegmentationBackendSelector.TFLITE_GPU_MODEL_ASSET_PATH}, " +
                             "session=${session.sessionId})")
                     DuetSegmentationBackend.RAW_TFLITE_GPU
                 }
