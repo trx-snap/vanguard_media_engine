@@ -122,6 +122,19 @@ final class VGPhotoVideoDownloadProgressSubscription {
   VGPhotoVideoDownloadProgressSubscription._(this.assetId, this._token);
 }
 
+/// Subscription token for Duet green-screen degradation event callbacks
+/// (`onDuetEvent`).
+///
+/// Multi-listener: any number of live subscriptions may exist at once, each
+/// independently unregistered via
+/// [VanguardChannelDispatcher.unregisterDuetEventListener]. Public consumers
+/// should go through the `vg_duet` barrel (`VGDuetEvents.stream`) rather than
+/// the dispatcher directly.
+final class VGDuetEventSubscription {
+  final Object _token;
+  VGDuetEventSubscription._(this._token);
+}
+
 // ── Internal storage types ────────────────────────────────────────────────────
 
 class _TimelineEntry {
@@ -160,6 +173,12 @@ class _PhotoVideoDownloadEntry {
   _PhotoVideoDownloadEntry({required this.token, required this.onProgress});
 }
 
+class _DuetEventEntry {
+  final Object token;
+  final void Function(Map<dynamic, dynamic> payload) onEvent;
+  _DuetEventEntry({required this.token, required this.onEvent});
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 /// The package-level singleton MethodChannel callback router.
@@ -184,6 +203,7 @@ class _PhotoVideoDownloadEntry {
 /// | Duration probed    | Single-slot      | token        |
 /// | Thermal state      | Single-slot      | token        |
 /// | iCloud download    | Per assetId      | assetId      |
+/// | Duet events         | Multi-listener   | token        |
 ///
 /// Export progress is a stack rather than a single slot so that a
 /// short-lived registration (e.g. a nested [VanguardTimelineExporter]
@@ -250,8 +270,12 @@ final class VanguardChannelDispatcher {
   // iOS PhotoKit iCloud video download progress: keyed by assetId. Events
   // for an assetId with no registered listener are stale (the consumer has
   // already unregistered) and are dropped; nothing is buffered.
-  final Map<String, _PhotoVideoDownloadEntry> _photoVideoDownloadListeners =
-      {};
+  final Map<String, _PhotoVideoDownloadEntry> _photoVideoDownloadListeners = {};
+
+  // Duet events: multi-listener — every registered entry receives every
+  // `onDuetEvent` payload. Unkeyed (Duet has a single active session at a
+  // time; consumers filter by sessionId themselves if needed).
+  final Map<Object, _DuetEventEntry> _duetEventListeners = {};
 
   // ── Handler registration ───────────────────────────────────────────────────
 
@@ -320,6 +344,10 @@ final class VanguardChannelDispatcher {
         _dispatchPhotoVideoDownloadProgress(call.arguments);
         break;
 
+      case 'onDuetEvent':
+        _dispatchDuetEvent(call.arguments);
+        break;
+
       // Unknown callbacks are silently dropped — forward compatibility.
     }
   }
@@ -336,6 +364,20 @@ final class VanguardChannelDispatcher {
     // (stale event from a cancelled / superseded download): drop it.
     final entry = _photoVideoDownloadListeners[assetId];
     entry?.onProgress(progress.clamp(0.0, 1.0));
+  }
+
+  void _dispatchDuetEvent(dynamic arguments) {
+    // Payload: {event, sessionId, previousBackend, currentBackend, reason,
+    // userMessage} (all String). Field-level and event-name validation is
+    // the responsibility of the `vg_duet` typed layer (VGDuetEvent.fromMap);
+    // here we only guard the outer shape and drop when nobody is listening.
+    final args = arguments as Map?;
+    if (args == null || _duetEventListeners.isEmpty) {
+      return; // malformed — drop silently
+    }
+    for (final entry in _duetEventListeners.values.toList(growable: false)) {
+      entry.onEvent(args);
+    }
   }
 
   void _dispatchTimelineFrame(dynamic arguments) {
@@ -579,7 +621,7 @@ final class VanguardChannelDispatcher {
   /// clamped to `[0.0, 1.0]` before delivery. Events for assetIds with no
   /// registered listener are dropped, never buffered.
   VGPhotoVideoDownloadProgressSubscription
-      registerPhotoVideoDownloadProgressListener({
+  registerPhotoVideoDownloadProgressListener({
     required String assetId,
     required void Function(double progress) onProgress,
   }) {
@@ -607,6 +649,33 @@ final class VanguardChannelDispatcher {
     }
   }
 
+  // ── Duet event registration ────────────────────────────────────────────────
+
+  /// Registers a Duet green-screen degradation event listener
+  /// (`onDuetEvent`).
+  ///
+  /// Multi-listener: unlike the other single-slot categories, any number of
+  /// listeners may be registered concurrently and every one receives every
+  /// event. Unregistering one subscription never affects the others.
+  VGDuetEventSubscription registerDuetEventListener(
+    void Function(Map<dynamic, dynamic> payload) onEvent,
+  ) {
+    ensureHandlerRegistered();
+    final token = Object();
+    _duetEventListeners[token] = _DuetEventEntry(
+      token: token,
+      onEvent: onEvent,
+    );
+    return VGDuetEventSubscription._(token);
+  }
+
+  /// Unregisters a Duet event listener.
+  ///
+  /// Stale tokens are safe no-ops.
+  void unregisterDuetEventListener(VGDuetEventSubscription subscription) {
+    _duetEventListeners.remove(subscription._token);
+  }
+
   // ── Testing seam ──────────────────────────────────────────────────────────
 
   /// Resets all dispatcher state. **Test-only — never call in production.**
@@ -625,6 +694,7 @@ final class VanguardChannelDispatcher {
     _thermalStateCallback = null;
     _thermalStateToken = null;
     _photoVideoDownloadListeners.clear();
+    _duetEventListeners.clear();
     _handlerRegistered = false;
     _channel = channel ?? const MethodChannel('vanguard_media_engine');
   }
@@ -652,4 +722,8 @@ final class VanguardChannelDispatcher {
   @visibleForTesting
   bool hasPendingAudioStateForTesting(int textureId) =>
       _pendingAudioStates.containsKey(textureId);
+
+  /// Number of currently registered Duet event listeners. **Test-only.**
+  @visibleForTesting
+  int get duetEventListenerCountForTesting => _duetEventListeners.length;
 }

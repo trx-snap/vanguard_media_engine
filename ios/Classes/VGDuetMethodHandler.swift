@@ -42,8 +42,10 @@ final class VGDuetMethodHandler {
 
     /// Designated initializer.
     /// [textureRegistry] is passed down to the coordinator for Slice 4A texture allocation.
-    init(textureRegistry: FlutterTextureRegistry? = nil) {
-        coordinator = VGDuetNativeSessionCoordinator(textureRegistry: textureRegistry)
+    /// [onDuetEvent] is passed down to the coordinator for `onDuetEvent` emission.
+    init(textureRegistry: FlutterTextureRegistry? = nil,
+         onDuetEvent: (([String: Any]) -> Void)? = nil) {
+        coordinator = VGDuetNativeSessionCoordinator(textureRegistry: textureRegistry, onDuetEvent: onDuetEvent)
     }
 
     // MARK: - Dispatch

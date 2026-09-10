@@ -29,3 +29,5 @@ export 'src/duet/vg_duet_export_adapter.dart'
     show VGDuetEditorCompositionNode, VGDuetExportAdapter;
 export 'src/duet/vg_duet_platform_interface.dart'
     show VGDuetPlatformInterface, MethodChannelVGDuetPlatform;
+export 'src/duet/vg_duet_events.dart'
+    show VGDuetEventType, VGDuetEvent, VGDuetEvents;

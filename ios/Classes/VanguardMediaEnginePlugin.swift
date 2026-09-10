@@ -192,7 +192,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     private var _duetMethodHandlerCreated = false
     private lazy var duetMethodHandler: VGDuetMethodHandler = {
         _duetMethodHandlerCreated = true
-        return VGDuetMethodHandler(textureRegistry: self.registrar.textures())
+        return VGDuetMethodHandler(
+            textureRegistry: self.registrar.textures(),
+            onDuetEvent: { [weak self] payload in
+                DispatchQueue.main.async {
+                    self?.channel?.invokeMethod("onDuetEvent", arguments: payload)
+                }
+            })
     }()
 
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────

@@ -178,6 +178,12 @@ final class VGDuetNativeSessionCoordinator {
     // outlives this coordinator; storing as strong is safe for the plugin lifecycle.
     private var textureRegistry: FlutterTextureRegistry?
 
+    /// Emits a Duet degradation/fallback event (`onDuetEvent`) to Dart. Invoked
+    /// from `_handleGreenScreenAdapterFailure` after the safe-PiP layout has
+    /// been applied; the closure itself hops to the main thread before calling
+    /// `channel.invokeMethod`.
+    private var onDuetEvent: (([String: Any]) -> Void)?
+
     // Serial queues (never block main thread)
     private let probeQueue = DispatchQueue(label: "com.connects.vanguard.duet.probe",
                                            qos: .userInitiated)
@@ -186,8 +192,10 @@ final class VGDuetNativeSessionCoordinator {
 
     // MARK: - Init
 
-    init(textureRegistry: FlutterTextureRegistry? = nil) {
+    init(textureRegistry: FlutterTextureRegistry? = nil,
+         onDuetEvent: (([String: Any]) -> Void)? = nil) {
         self.textureRegistry = textureRegistry
+        self.onDuetEvent = onDuetEvent
     }
 
     // MARK: - Preview texture helpers (Slice 4A)
@@ -931,21 +939,34 @@ final class VGDuetNativeSessionCoordinator {
         session.layoutConfigMap = fallbackLayoutConfig
 
         // 3. Recompute rects and update the render loop (if texture is attached).
-        guard let width  = session.previewWidthPx,
-              let height = session.previewHeightPx else { return }
+        if let width  = session.previewWidthPx,
+           let height = session.previewHeightPx {
+            let typedRects = computeLayoutRects(
+                layoutConfigMap: fallbackLayoutConfig,
+                canvasWidth:  CGFloat(width),
+                canvasHeight: CGFloat(height)
+            )
+            session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
+            let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
+            session.previewRenderLoop?.updateLayout(
+                sourceRect:          rects.source,
+                cameraRect:          rects.camera,
+                targetPtsMs:         session.previewClock.currentSourcePtsMs(),
+                isGreenScreenLayout: false)
+        }
 
-        let typedRects = computeLayoutRects(
-            layoutConfigMap: fallbackLayoutConfig,
-            canvasWidth:  CGFloat(width),
-            canvasHeight: CGFloat(height)
-        )
-        session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
-        let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
-        session.previewRenderLoop?.updateLayout(
-            sourceRect:          rects.source,
-            cameraRect:          rects.camera,
-            targetPtsMs:         session.previewClock.currentSourcePtsMs(),
-            isGreenScreenLayout: false)
+        // Emit onDuetEvent only after the PiP fallback layout above has been
+        // applied. currentBackend is always "pip" (the resulting preview
+        // backend); previousBackend is "vision" per the iOS segmentation
+        // adapter, which does not surface a more precise backend name here.
+        onDuetEvent?([
+            "event":           "green_screen_fallback",
+            "sessionId":       session.sessionId,
+            "previousBackend": "vision",
+            "currentBackend":  "pip",
+            "reason":          "adapter_faulted",
+            "userMessage":     "Green screen unavailable. Switched to Picture-in-Picture",
+        ])
     }
 
     // MARK: - Private helpers

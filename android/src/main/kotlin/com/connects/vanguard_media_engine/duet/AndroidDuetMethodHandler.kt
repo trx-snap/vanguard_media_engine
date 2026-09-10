@@ -21,6 +21,7 @@ class AndroidDuetMethodHandler(
     mainHandler: Handler,
     textureRegistry: TextureRegistry? = null,
     context: Context? = null,
+    onDuetEvent: ((Map<String, Any?>) -> Unit)? = null,
 ) {
 
     // ── Owned routes ──────────────────────────────────────────────────────────
@@ -48,7 +49,12 @@ class AndroidDuetMethodHandler(
 
     // ── Coordinator ───────────────────────────────────────────────────────────
 
-    private val coordinator = AndroidDuetSessionCoordinator(mainHandler, textureRegistry, context)
+    private val coordinator = AndroidDuetSessionCoordinator(
+        mainHandler,
+        textureRegistry,
+        context,
+        onDuetEvent,
+    )
 
     // ── Dispatch ──────────────────────────────────────────────────────────────
 

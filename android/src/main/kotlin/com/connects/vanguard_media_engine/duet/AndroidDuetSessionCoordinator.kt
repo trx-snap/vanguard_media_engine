@@ -143,6 +143,13 @@ class AndroidDuetSessionCoordinator(
     private val mainHandler: Handler,
     private val textureRegistry: TextureRegistry? = null,
     private val context: Context? = null,
+    /**
+     * Emits a Duet degradation/fallback event (`onDuetEvent`) to Dart. Invoked
+     * synchronously from [handleGreenScreenFallback] after the safe-PiP layout
+     * has been applied; the closure itself is responsible for hopping to the
+     * main thread before calling `channel.invokeMethod`.
+     */
+    private val onDuetEvent: ((Map<String, Any?>) -> Unit)? = null,
 ) {
 
     companion object {
@@ -811,30 +818,8 @@ class AndroidDuetSessionCoordinator(
                     if (mode == "greenScreen" && activeSession === session) {
                         Log.w("DuetCoordinator",
                             "greenScreen initial camera bind failed — applying PiP fallback layout")
-                        val fallbackLayout: Map<String, Any?> = mapOf(
-                            "mode" to "pip",
-                            "pipNormalizedRect" to mapOf(
-                                "left" to 0.58, "top" to 0.05,
-                                "width" to 0.36, "height" to 0.24,
-                            ),
-                        )
-                        session.layoutConfigMap = fallbackLayout
-                        val wPx = session.previewWidthPx?.toDouble()
-                        val hPx = session.previewHeightPx?.toDouble()
-                        if (wPx != null && hPx != null) {
-                            val typedRects = buildTypedLayoutRects(fallbackLayout, wPx, hPx)
-                            session.previewTypedLayoutRects = typedRects
-                            session.previewLayoutRects = typedRects?.let {
-                                mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
-                            }
-                            if (typedRects != null) {
-                                session.previewRenderLoop?.updateLayout(
-                                    typedRects.source, typedRects.camera,
-                                    session.previewClock.currentSourcePtsMs().toLong(),
-                                )
-                            }
-                        }
-                        session.previewRenderLoop?.setGreenScreenEnabled(false)
+                        handleGreenScreenFallback(session, DuetSegmentationBackend.MLKIT,
+                            DuetSegmentationBackend.NONE, "initial_camera_bind_failed")
                     }
                 }
             },
@@ -929,21 +914,38 @@ class AndroidDuetSessionCoordinator(
         )
         session.layoutConfigMap = fallbackLayout
 
-        val widthPx  = session.previewWidthPx ?: return
-        val heightPx = session.previewHeightPx ?: return
-        val typedRects = buildTypedLayoutRects(fallbackLayout, widthPx.toDouble(), heightPx.toDouble())
-        session.previewTypedLayoutRects = typedRects
-        session.previewLayoutRects = typedRects?.let {
-            mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
-        }
-        if (typedRects != null) {
-            session.previewRenderLoop?.updateLayout(
-                typedRects.source,
-                typedRects.camera,
-                session.previewClock.currentSourcePtsMs().toLong(),
-            )
+        val widthPx  = session.previewWidthPx
+        val heightPx = session.previewHeightPx
+        if (widthPx != null && heightPx != null) {
+            val typedRects = buildTypedLayoutRects(fallbackLayout, widthPx.toDouble(), heightPx.toDouble())
+            session.previewTypedLayoutRects = typedRects
+            session.previewLayoutRects = typedRects?.let {
+                mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
+            }
+            if (typedRects != null) {
+                session.previewRenderLoop?.updateLayout(
+                    typedRects.source,
+                    typedRects.camera,
+                    session.previewClock.currentSourcePtsMs().toLong(),
+                )
+            }
         }
         Log.d("DuetCoordinator", "Green-screen fallback → PiP applied for session ${session.sessionId}")
+
+        // Emit onDuetEvent only after the PiP fallback layout above has been
+        // applied — currentBackend in the event payload is always "pip" (the
+        // resulting preview backend), distinct from the internal segmentation
+        // backend value ("none") passed in as [currentBackend].
+        onDuetEvent?.invoke(
+            mapOf(
+                "event" to "green_screen_fallback",
+                "sessionId" to session.sessionId,
+                "previousBackend" to previousBackend,
+                "currentBackend" to "pip",
+                "reason" to reason,
+                "userMessage" to "Green screen unavailable. Switched to Picture-in-Picture",
+            )
+        )
     }
 
 
