@@ -85,6 +85,42 @@ class MainActivity : FlutterActivity() {
                     result.notImplemented()
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DUET_GLES_PIXEL_PROOF_CHANNEL_NAME)
+            .setMethodCallHandler { call, result ->
+                if (call.method == DUET_GLES_PIXEL_PROOF_METHOD_NAME) {
+                    runAndroidDuetGlesPixelProof(result)
+                } else {
+                    result.notImplemented()
+                }
+            }
+    }
+
+    private fun runAndroidDuetGlesPixelProof(result: MethodChannel.Result) {
+        try {
+            val harness = com.connects.vanguard_media_engine.diagnostics.AndroidDuetGlesPixelProofSmokeHarness()
+            val proofResult = harness.run()
+            result.success(proofResult)
+        } catch (t: Throwable) {
+            val fallback = mapOf(
+                "pass" to false,
+                "marker" to "ANDROID_DUET_GLES_PIXEL_PROOF_PHYSICAL_FAIL",
+                "proofBoundary" to "android_duet_gles_pixel_proof_synthetic_mask_upload_and_blend_only",
+                "failureReason" to "unexpected_exception:${t.javaClass.simpleName}:${t.message}",
+                "tolerance" to 1,
+                "maxDelta" to -1,
+                "sampleCount" to 0,
+                "gates" to emptyMap<String, Boolean>(),
+                "details" to mapOf("error" to (t.message ?: t.toString())),
+                "nonClaims" to listOf(
+                    "No ML human matte quality claim (synthetic mask patterns only)",
+                    "No CameraX or OES external texture claim (sampler2D synthetic camera used)",
+                    "No live preview lifecycle or SurfaceTexture concurrency claim",
+                    "No export MP4, MediaCodec, or A/V sync claim",
+                    "No GPU delegate promotion or TFLite/MediaPipe runtime claim",
+                ),
+            )
+            result.success(fallback)
+        }
     }
 
     private fun runGpuCategoryMaskProbe(result: MethodChannel.Result) {
@@ -142,6 +178,12 @@ class MainActivity : FlutterActivity() {
         private const val MODEL_ASSET_PATH = "selfie_segmenter.tflite"
         private const val TARGET_FRAMES = 30
         private const val PROBE_TIMEOUT_MS = 25_000L
+
+        // Deterministic GLES matte-upload and composited-pixel proof (Stage 1).
+        private const val DUET_GLES_PIXEL_PROOF_CHANNEL_NAME =
+            "vanguard_media_engine_example/duet_gles_pixel_proof"
+        private const val DUET_GLES_PIXEL_PROOF_METHOD_NAME =
+            "runAndroidDuetGlesPixelProof"
 
         // Raw TFLite GPU Interpreter diagnostic probe (example-only).
         private const val TFLITE_TAG = "DuetTfliteGpuProbe"
