@@ -74,6 +74,10 @@ const String kProbeChannel =
     'vanguard_media_engine_example/tflite_gpu_isolated_probe';
 const String kProbeMethod = 'runTfliteGpuIsolatedProbe';
 const Duration kProbeTimeout = Duration(seconds: 35);
+const String kModelAssetPath = String.fromEnvironment(
+  'DUET_GPU_PROBE_MODEL_ASSET',
+  defaultValue: 'selfie_segmenter.tflite',
+);
 
 const String kModeForcedGpuCompleted = 'forced_gpu_completed';
 const String kModeChildDiedParentSurvived =
@@ -138,7 +142,9 @@ class _AndroidDuetTfliteGpuIsolatedProbeSmokeAppState
 
     try {
       rawResult = await _channel
-          .invokeMethod<dynamic>(kProbeMethod)
+          .invokeMethod<dynamic>(kProbeMethod, <String, dynamic>{
+            'modelAssetPath': kModelAssetPath,
+          })
           .timeout(
             kProbeTimeout,
             onTimeout: () => throw TimeoutException(
@@ -223,6 +229,7 @@ class _AndroidDuetTfliteGpuIsolatedProbeSmokeAppState
       'childProcess': ':gpuprobe',
       'channel': kProbeChannel,
       'method': kProbeMethod,
+      'modelAssetPath': kModelAssetPath,
       'passModes': const <String>[
         kModeForcedGpuCompleted,
         kModeChildDiedParentSurvived,

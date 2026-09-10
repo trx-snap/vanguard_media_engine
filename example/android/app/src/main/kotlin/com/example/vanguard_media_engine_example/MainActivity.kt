@@ -9,6 +9,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.Bundle
 import android.os.DeadObjectException
 import android.os.Handler
 import android.os.IBinder
@@ -34,6 +35,7 @@ import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenter
 import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenterResult
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -78,7 +80,7 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, TFLITE_GPU_ISOLATED_CHANNEL_NAME)
             .setMethodCallHandler { call, result ->
                 if (call.method == TFLITE_GPU_ISOLATED_METHOD_NAME) {
-                    runTfliteGpuIsolatedProbe(result)
+                    runTfliteGpuIsolatedProbe(call, result)
                 } else {
                     result.notImplemented()
                 }
@@ -165,6 +167,8 @@ class MainActivity : FlutterActivity() {
         private const val ISOLATED_TAG = "DuetTfliteGpuIsolated"
         private const val TFLITE_GPU_ISOLATED_CHANNEL_NAME = "vanguard_media_engine_example/tflite_gpu_isolated_probe"
         private const val TFLITE_GPU_ISOLATED_METHOD_NAME = "runTfliteGpuIsolatedProbe"
+        private const val ISOLATED_ARG_MODEL_ASSET_PATH = "modelAssetPath"
+        private const val ISOLATED_DEFAULT_MODEL_ASSET_PATH = "selfie_segmenter.tflite"
         private const val ISOLATED_PROBE_TIMEOUT_MS = 30_000L
         private const val ISOLATED_MODE_FORCED_GPU_COMPLETED = "forced_gpu_completed"
         private const val ISOLATED_MODE_CHILD_PROBE_FAILED = "child_probe_failed"
@@ -185,6 +189,19 @@ class MainActivity : FlutterActivity() {
             val line = "ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_FAIL code=$code message=$message"
             Log.e(ISOLATED_TAG, line, throwable)
             println(line)
+        }
+
+        /**
+         * Relative Android asset path check: non-empty, no leading slash
+         * (absolute), no ".." traversal, no backslash, no control characters.
+         */
+        private fun isValidIsolatedModelAssetPath(path: String): Boolean {
+            if (path.isEmpty()) return false
+            if (path.startsWith("/")) return false
+            if (path.contains("..")) return false
+            if (path.contains("\\")) return false
+            if (path.any { it.isISOControl() }) return false
+            return true
         }
     }
 
@@ -1332,11 +1349,24 @@ class MainActivity : FlutterActivity() {
     //   * Parent timeout is ISOLATED_PROBE_TIMEOUT_MS (<= 30 s); Dart waits 35 s.
     //   * After every terminal path the parent logs an ALIVE marker to prove it
     //     survived.
-    private fun runTfliteGpuIsolatedProbe(result: MethodChannel.Result) {
+    private fun runTfliteGpuIsolatedProbe(call: MethodCall, result: MethodChannel.Result) {
         val isDebuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (!isDebuggable) {
             logIsolatedFail("not_debuggable", "Probe rejected: app is not debuggable", null)
             result.error("NOT_DEBUGGABLE", "Probe rejected: app is not debuggable", null)
+            return
+        }
+
+        val requestedModelAssetPath = (call.arguments as? Map<*, *>)?.get(ISOLATED_ARG_MODEL_ASSET_PATH) as? String
+        val modelAssetPath: String
+        if (requestedModelAssetPath == null) {
+            modelAssetPath = ISOLATED_DEFAULT_MODEL_ASSET_PATH
+        } else if (isValidIsolatedModelAssetPath(requestedModelAssetPath)) {
+            modelAssetPath = requestedModelAssetPath
+        } else {
+            val message = "modelAssetPath failed validation: $requestedModelAssetPath"
+            logIsolatedFail("invalid_model_asset_path", message, null)
+            result.error("invalid_model_asset_path", message, null)
             return
         }
 
@@ -1350,10 +1380,10 @@ class MainActivity : FlutterActivity() {
             "ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_START parentPid=${Process.myPid()}" +
                 " parentProcess=${TfliteGpuIsolatedProbeService.currentProcessName()}" +
                 " service=${TfliteGpuIsolatedProbeService::class.java.name}" +
-                " childProcessSuffix=:gpuprobe timeoutMs=$ISOLATED_PROBE_TIMEOUT_MS",
+                " childProcessSuffix=:gpuprobe timeoutMs=$ISOLATED_PROBE_TIMEOUT_MS model=$modelAssetPath",
         )
 
-        val session = TfliteGpuIsolatedProbeSession(this, result) { finished ->
+        val session = TfliteGpuIsolatedProbeSession(this, result, modelAssetPath) { finished ->
             if (activeTfliteGpuIsolatedSession === finished) {
                 activeTfliteGpuIsolatedSession = null
             }
@@ -1365,6 +1395,7 @@ class MainActivity : FlutterActivity() {
     private class TfliteGpuIsolatedProbeSession(
         private val activity: MainActivity,
         private val result: MethodChannel.Result,
+        private val modelAssetPath: String,
         private val onFinished: (TfliteGpuIsolatedProbeSession) -> Unit,
     ) {
         private val mainHandler = Handler(Looper.getMainLooper())
@@ -1481,9 +1512,12 @@ class MainActivity : FlutterActivity() {
 
             val command = Message.obtain(null, TfliteGpuIsolatedProbeService.MSG_RUN_PROBE)
             command.replyTo = replyMessenger
+            command.data = Bundle().apply {
+                putString(TfliteGpuIsolatedProbeService.KEY_MODEL_ASSET_PATH, modelAssetPath)
+            }
             try {
                 Messenger(binder).send(command)
-                logIsolated("ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_COMMAND_SENT what=MSG_RUN_PROBE")
+                logIsolated("ANDROID_DUET_TFLITE_GPU_ISOLATED_PARENT_COMMAND_SENT what=MSG_RUN_PROBE model=$modelAssetPath")
             } catch (e: DeadObjectException) {
                 handleChildDeath("send_dead_object")
             } catch (e: RemoteException) {

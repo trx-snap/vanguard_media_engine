@@ -108,22 +108,39 @@ class TfliteGpuIsolatedProbeService : Service() {
             logFail("missing_reply_to", "MSG_RUN_PROBE arrived without replyTo; cannot report")
             return
         }
+        val rawModelAssetPath = msg.data?.getString(KEY_MODEL_ASSET_PATH)
+        val modelAssetPath = resolveModelAssetPath(rawModelAssetPath)
+        if (modelAssetPath == null) {
+            val message = "modelAssetPath failed validation: $rawModelAssetPath"
+            logFail("invalid_model_asset_path", message)
+            sendResult(
+                replyTo,
+                ProbeRun.failureJson(
+                    code = "invalid_model_asset_path",
+                    message = message,
+                    throwable = null,
+                    modelAssetPath = DEFAULT_MODEL_ASSET_PATH,
+                ),
+            )
+            return
+        }
         if (!started.compareAndSet(false, true)) {
             val json = ProbeRun.failureJson(
                 code = "probe_already_running",
                 message = "This service instance already ran its single-shot probe",
                 throwable = null,
+                modelAssetPath = modelAssetPath,
             )
             logFail("probe_already_running", "This service instance already ran its single-shot probe")
             sendResult(replyTo, json)
             return
         }
         try {
-            worker.execute(ProbeRun(applicationContext, replyTo))
+            worker.execute(ProbeRun(applicationContext, replyTo, modelAssetPath))
         } catch (e: RejectedExecutionException) {
             val message = "Worker rejected probe task: ${e.message}"
             logFail("worker_rejected", message)
-            sendResult(replyTo, ProbeRun.failureJson("worker_rejected", message, e))
+            sendResult(replyTo, ProbeRun.failureJson("worker_rejected", message, e, modelAssetPath))
         }
     }
 
@@ -132,6 +149,7 @@ class TfliteGpuIsolatedProbeService : Service() {
     private class ProbeRun(
         private val context: Context,
         private val replyTo: Messenger,
+        private val modelAssetPath: String,
     ) : Runnable {
 
         private class ProbeFailure(
@@ -186,7 +204,7 @@ class TfliteGpuIsolatedProbeService : Service() {
             val processName = currentProcessName()
             mark(
                 "ANDROID_DUET_TFLITE_GPU_ISOLATED_CHILD_START pid=$pid process=$processName" +
-                    " thread=${Thread.currentThread().name} model=$MODEL_ASSET_PATH forced=true",
+                    " thread=${Thread.currentThread().name} model=$modelAssetPath forced=true",
             )
             sendStarted(pid, processName)
 
@@ -272,7 +290,7 @@ class TfliteGpuIsolatedProbeService : Service() {
             } catch (t: Throwable) {
                 throw ProbeFailure(
                     "model_load_failed",
-                    "Failed to load $MODEL_ASSET_PATH into a direct ByteBuffer: ${t.message}",
+                    "Failed to load $modelAssetPath into a direct ByteBuffer: ${t.message}",
                     t,
                 )
             }
@@ -395,7 +413,7 @@ class TfliteGpuIsolatedProbeService : Service() {
         }
 
         private fun loadModelIntoDirectBuffer(): ByteBuffer {
-            val bytes = context.assets.open(MODEL_ASSET_PATH).use { it.readBytes() }
+            val bytes = context.assets.open(modelAssetPath).use { it.readBytes() }
             if (bytes.size < 8) {
                 throw IllegalStateException("model asset too small (${bytes.size} bytes)")
             }
@@ -646,7 +664,7 @@ class TfliteGpuIsolatedProbeService : Service() {
             compat.put("precisionLossAllowed", precisionLossAllowed ?: JSONObject.NULL)
             compat.put("inferencePreference", inferencePreference ?: JSONObject.NULL)
             json.put("compat", compat)
-            json.put("modelAsset", MODEL_ASSET_PATH)
+            json.put("modelAsset", modelAssetPath)
             json.put("modelBytes", modelBytes)
             json.put("modelIdentifier", if (modelBytes > 0) "TFL3" else JSONObject.NULL)
             json.put("inputShape", JSONArray(inputShape.toList()))
@@ -717,7 +735,12 @@ class TfliteGpuIsolatedProbeService : Service() {
 
         companion object {
             /** Minimal failure JSON for pre-run rejections (no probe state). */
-            fun failureJson(code: String, message: String, throwable: Throwable?): JSONObject {
+            fun failureJson(
+                code: String,
+                message: String,
+                throwable: Throwable?,
+                modelAssetPath: String = DEFAULT_MODEL_ASSET_PATH,
+            ): JSONObject {
                 return JSONObject()
                     .put("pass", false)
                     .put("code", code)
@@ -727,6 +750,7 @@ class TfliteGpuIsolatedProbeService : Service() {
                     .put("childProcess", currentProcessName())
                     .put("stage", "pre_run")
                     .put("forced", true)
+                    .put("modelAsset", modelAssetPath)
                     .put("outputNonZeroTotal", 0L)
                     .put("stack", throwable?.stackTraceToString() ?: JSONObject.NULL)
                     .put("markers", JSONArray())
@@ -740,7 +764,7 @@ class TfliteGpuIsolatedProbeService : Service() {
     companion object {
         private const val TAG = "DuetTfliteGpuIsolated"
         private const val WORKER_THREAD_NAME = "DuetTfliteGpuIsolated-GPU"
-        private const val MODEL_ASSET_PATH = "selfie_segmenter.tflite"
+        const val DEFAULT_MODEL_ASSET_PATH = "selfie_segmenter.tflite"
         const val ROUTE = "raw_tflite_interpreter_forced_gpu_delegate_isolated_process"
 
         // Messenger protocol (example-only).
@@ -749,6 +773,26 @@ class TfliteGpuIsolatedProbeService : Service() {
         const val MSG_PROBE_RESULT = 3
         const val KEY_PROCESS_NAME = "processName"
         const val KEY_RESULT_JSON = "resultJson"
+        const val KEY_MODEL_ASSET_PATH = "modelAssetPath"
+
+        /**
+         * Relative Android asset path check: non-empty, no leading slash
+         * (absolute), no ".." traversal, no backslash, no control characters.
+         */
+        fun isValidModelAssetPath(path: String): Boolean {
+            if (path.isEmpty()) return false
+            if (path.startsWith("/")) return false
+            if (path.contains("..")) return false
+            if (path.contains("\\")) return false
+            if (path.any { it.isISOControl() }) return false
+            return true
+        }
+
+        fun resolveModelAssetPath(path: String?): String? {
+            if (path == null) return DEFAULT_MODEL_ASSET_PATH
+            if (!isValidModelAssetPath(path)) return null
+            return path
+        }
 
         private fun log(line: String) {
             Log.i(TAG, line)
