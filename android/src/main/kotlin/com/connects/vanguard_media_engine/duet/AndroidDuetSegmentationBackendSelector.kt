@@ -24,6 +24,9 @@ class AndroidDuetSegmentationBackendSelector(
     private val context: Context?,
 ) {
 
+    /** Context this selector was constructed with, exposed so the adapter can build its adaptive-quality policy. */
+    val hostContext: Context? get() = context
+
     companion object {
         private const val TAG = "DuetSegSelector"
 
@@ -90,9 +93,18 @@ class AndroidDuetSegmentationBackendSelector(
         else -> throw IllegalArgumentException("Unsupported segmentation backend '$backendId'")
     }
 
-    /** Capability probe describing the rung [primaryBackendId] would start on. */
-    fun probe(): DuetSegmentationProbe = when (primaryBackendId()) {
-        DuetSegmentationBackend.MEDIAPIPE_CPU -> DuetSegmentationProbe.mediapipeCpu()
-        else -> DuetSegmentationProbe.mlkit()
+    /**
+     * Capability probe describing the rung [primaryBackendId] would start on.
+     * Delegates to the dynamic probe so [DuetSegmentationProbe.thermalTier]
+     * reflects the live OS thermal status instead of a static default.
+     */
+    fun probe(): DuetSegmentationProbe {
+        val backendId = primaryBackendId()
+        val quality = if (backendId == DuetSegmentationBackend.MEDIAPIPE_CPU) {
+            DuetSegmentationQuality.QUALITY
+        } else {
+            DuetSegmentationQuality.BALANCED
+        }
+        return DuetSegmentationProbe.probe(context, backendId, quality)
     }
 }

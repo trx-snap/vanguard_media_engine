@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -111,6 +112,9 @@ class AndroidDuetGreenScreenAdapter(
     /** Single owned temporal smoother between backend output and compositor upload. */
     private val temporalSmoother = AndroidDuetMaskTemporalSmoother()
 
+    /** Single owned adaptive-quality policy: pacing, thermal adaptation, inference-budget monitoring. */
+    private val qualityPolicy = AndroidDuetAdaptiveQualityPolicy(selector.hostContext)
+
     // ── Public API ─────────────────────────────────────────────────────────────
 
     /**
@@ -150,12 +154,21 @@ class AndroidDuetGreenScreenAdapter(
         }
         closeAllBackends()
         temporalSmoother.reset()
+        qualityPolicy.reset()
         Log.d(TAG, "stop() — backends closed")
     }
 
     // ── ImageAnalysis.Analyzer ─────────────────────────────────────────────────
 
     override fun analyze(proxy: ImageProxy) {
+        val timestampMs = monotonicTimestampMs(proxy)
+
+        // Adaptive pacing: paced-out frames never enter the in-flight gate at all.
+        if (!qualityPolicy.shouldProcessFrame(timestampMs)) {
+            proxy.close()
+            return
+        }
+
         // Drop stale: if a previous frame is still in flight, close and skip.
         if (!inFlight.compareAndSet(false, true)) {
             Log.v(TAG, "analyze(): frame dropped (previous still in flight)")
@@ -176,13 +189,30 @@ class AndroidDuetGreenScreenAdapter(
             return
         }
 
-        val timestampMs = monotonicTimestampMs(proxy)
         val closer = FrameCloser(proxy)
+
+        val thermalDegrade = qualityPolicy.evaluateThermal()
+        if (thermalDegrade != null) {
+            closer.finish {
+                handleBackendFailure(
+                    backend,
+                    DuetSegmentationOutcome.Failure(
+                        thermalDegrade.reason,
+                        "adaptive quality policy requested degrade (${thermalDegrade.reason})",
+                    ),
+                )
+            }
+            return
+        }
+
+        val segmentStartElapsedMs = SystemClock.elapsedRealtime()
         try {
             backend.segment(proxy, timestampMs) { outcome ->
-                finishFrame(backend, outcome, closer)
+                val durationMs = SystemClock.elapsedRealtime() - segmentStartElapsedMs
+                finishFrame(backend, outcome, closer, durationMs)
             }
         } catch (t: Throwable) {
+            val durationMs = SystemClock.elapsedRealtime() - segmentStartElapsedMs
             finishFrame(
                 backend,
                 DuetSegmentationOutcome.Failure(
@@ -191,6 +221,7 @@ class AndroidDuetGreenScreenAdapter(
                     t,
                 ),
                 closer,
+                durationMs,
             )
         }
     }
@@ -221,8 +252,10 @@ class AndroidDuetGreenScreenAdapter(
         backend: AndroidDuetSegmentationBackend,
         outcome: DuetSegmentationOutcome,
         closer: FrameCloser,
+        durationMs: Long,
     ) {
         closer.finish {
+            val inferenceDegrade = qualityPolicy.recordInferenceDuration(durationMs)
             when (outcome) {
                 is DuetSegmentationOutcome.Mask -> {
                     if (isRunning.get() && !terminal.get()) {
@@ -237,6 +270,17 @@ class AndroidDuetGreenScreenAdapter(
                 is DuetSegmentationOutcome.Failure -> {
                     handleBackendFailure(backend, outcome)
                 }
+            }
+            if (inferenceDegrade != null) {
+                // No-ops if [backend] was already replaced by the Failure branch above
+                // (handleBackendFailure ignores stale backends).
+                handleBackendFailure(
+                    backend,
+                    DuetSegmentationOutcome.Failure(
+                        inferenceDegrade.reason,
+                        "adaptive quality policy requested degrade (${inferenceDegrade.reason})",
+                    ),
+                )
             }
         }
     }
@@ -288,6 +332,7 @@ class AndroidDuetGreenScreenAdapter(
                 val reason = DuetSegmentationFailureReason.initFailed(failedRung)
                 if (next == null) {
                     temporalSmoother.reset()
+                    qualityPolicy.reset()
                     terminal.set(true)
                     _currentBackendId = DuetSegmentationBackend.NONE
                     event = PendingEvent(
@@ -315,6 +360,7 @@ class AndroidDuetGreenScreenAdapter(
             if (failedRung != null && reason != null) {
                 // Exactly one degrade event, emitted only once the lower rung is live.
                 temporalSmoother.reset()
+                qualityPolicy.reset()
                 event = PendingEvent(
                     isTerminal = false,
                     previousBackend = failedRung,
@@ -355,6 +401,7 @@ class AndroidDuetGreenScreenAdapter(
             val next = selector.nextBackendId(failedId)
             if (next == null) {
                 temporalSmoother.reset()
+                qualityPolicy.reset()
                 terminal.set(true)
                 _currentBackendId = DuetSegmentationBackend.NONE
                 event = PendingEvent(
@@ -372,6 +419,7 @@ class AndroidDuetGreenScreenAdapter(
             val replacement = openRungLocked(next)
             if (replacement == null) {
                 temporalSmoother.reset()
+                qualityPolicy.reset()
                 terminal.set(true)
                 _currentBackendId = DuetSegmentationBackend.NONE
                 event = PendingEvent(
@@ -384,6 +432,7 @@ class AndroidDuetGreenScreenAdapter(
                 return@synchronized
             }
             temporalSmoother.reset()
+            qualityPolicy.reset()
             activeBackend = replacement
             _currentBackendId = replacement.backendId
             event = PendingEvent(

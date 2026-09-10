@@ -1,5 +1,9 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.content.Context
+import android.os.Build
+import android.os.PowerManager
+
 // VG-DUET-GREEN-SCREEN: Capability probe + backend/quality enums.
 
 object DuetSegmentationBackend {
@@ -81,6 +85,55 @@ data class DuetSegmentationProbe(
                 analysisMaxResolution  = 0,
                 thermalTier            = "unknown",
             )
+
+        /**
+         * Dynamic probe for [backendId]: same shape as [mediapipeCpu]/[mlkit],
+         * with [thermalTier] read live from [context]'s PowerManager (API 29+)
+         * instead of the static "nominal" default. The recommended [quality]
+         * is downgraded to SURVIVAL when the live tier is serious/critical,
+         * mirroring [AndroidDuetAdaptiveQualityPolicy]'s tier response. Falls
+         * back to the static factories' defaults when [context] is null or the
+         * OS thermal API is unavailable, so existing callers of the zero-arg
+         * factories are unaffected.
+         */
+        fun probe(
+            context: Context?,
+            backendId: String,
+            quality: DuetSegmentationQuality,
+        ): DuetSegmentationProbe {
+            val base = when (backendId) {
+                DuetSegmentationBackend.MEDIAPIPE_CPU -> mediapipeCpu(quality)
+                DuetSegmentationBackend.MLKIT -> mlkit(quality)
+                else -> return unavailable("Unsupported segmentation backend '$backendId' for dynamic probe")
+            }
+            val liveTier = liveThermalTier(context) ?: return base
+            val recommendedQuality = when (liveTier) {
+                "serious", "critical" -> DuetSegmentationQuality.SURVIVAL
+                else -> quality
+            }
+            return base.copy(thermalTier = liveTier, quality = recommendedQuality)
+        }
+
+        private fun liveThermalTier(context: Context?): String? {
+            if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+            val appContext = context.applicationContext ?: context
+            val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                ?: return null
+            return try {
+                when (powerManager.currentThermalStatus) {
+                    PowerManager.THERMAL_STATUS_NONE -> "nominal"
+                    PowerManager.THERMAL_STATUS_LIGHT -> "fair"
+                    PowerManager.THERMAL_STATUS_MODERATE,
+                    PowerManager.THERMAL_STATUS_SEVERE -> "serious"
+                    PowerManager.THERMAL_STATUS_CRITICAL,
+                    PowerManager.THERMAL_STATUS_EMERGENCY,
+                    PowerManager.THERMAL_STATUS_SHUTDOWN -> "critical"
+                    else -> "nominal"
+                }
+            } catch (t: Throwable) {
+                null
+            }
+        }
     }
 
     fun toMap(): Map<String, Any?> = mapOf(
