@@ -108,6 +108,9 @@ class AndroidDuetGreenScreenAdapter(
     /** Analysis-thread-only monotonic timestamp guard (ms, camera clock). */
     private var lastTimestampMs = Long.MIN_VALUE
 
+    /** Single owned temporal smoother between backend output and compositor upload. */
+    private val temporalSmoother = AndroidDuetMaskTemporalSmoother()
+
     // ── Public API ─────────────────────────────────────────────────────────────
 
     /**
@@ -146,6 +149,7 @@ class AndroidDuetGreenScreenAdapter(
             return
         }
         closeAllBackends()
+        temporalSmoother.reset()
         Log.d(TAG, "stop() — backends closed")
     }
 
@@ -222,7 +226,7 @@ class AndroidDuetGreenScreenAdapter(
             when (outcome) {
                 is DuetSegmentationOutcome.Mask -> {
                     if (isRunning.get() && !terminal.get()) {
-                        try { onMask(outcome.frame) } catch (t: Throwable) {
+                        try { onMask(temporalSmoother.smooth(outcome.frame)) } catch (t: Throwable) {
                             Log.w(TAG, "onMask threw: ${t.message}")
                         }
                     }
@@ -283,6 +287,7 @@ class AndroidDuetGreenScreenAdapter(
                 val next = selector.nextBackendId(failedRung)
                 val reason = DuetSegmentationFailureReason.initFailed(failedRung)
                 if (next == null) {
+                    temporalSmoother.reset()
                     terminal.set(true)
                     _currentBackendId = DuetSegmentationBackend.NONE
                     event = PendingEvent(
@@ -309,6 +314,7 @@ class AndroidDuetGreenScreenAdapter(
             val reason = degradeReason
             if (failedRung != null && reason != null) {
                 // Exactly one degrade event, emitted only once the lower rung is live.
+                temporalSmoother.reset()
                 event = PendingEvent(
                     isTerminal = false,
                     previousBackend = failedRung,
@@ -348,6 +354,7 @@ class AndroidDuetGreenScreenAdapter(
 
             val next = selector.nextBackendId(failedId)
             if (next == null) {
+                temporalSmoother.reset()
                 terminal.set(true)
                 _currentBackendId = DuetSegmentationBackend.NONE
                 event = PendingEvent(
@@ -364,6 +371,7 @@ class AndroidDuetGreenScreenAdapter(
             plannedBackendId = next
             val replacement = openRungLocked(next)
             if (replacement == null) {
+                temporalSmoother.reset()
                 terminal.set(true)
                 _currentBackendId = DuetSegmentationBackend.NONE
                 event = PendingEvent(
@@ -375,6 +383,7 @@ class AndroidDuetGreenScreenAdapter(
                 )
                 return@synchronized
             }
+            temporalSmoother.reset()
             activeBackend = replacement
             _currentBackendId = replacement.backendId
             event = PendingEvent(

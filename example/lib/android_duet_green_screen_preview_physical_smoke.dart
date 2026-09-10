@@ -15,12 +15,13 @@
 //       * bounded green-screen preview remains active
 //       * MediaPipe CPU primary (`mediapipe_cpu`) selected when model asset is bundled
 //       * native `ANDROID_DUET_GREENSCREEN_MEDIAPIPE_MASK_FIRST` log may evidence first MediaPipe mask
+//       * native `ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST` log may evidence temporal smoothing
 //       * native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload
 //       * layout update away from greenScreen to PiP works
 //       * stop/detach/dispose/temp cleanup complete
 //   - Non-claims:
 //       * no MediaPipe GPU delegate proof
-//       * no temporal smoothing/adaptive quality proof
+//       * no adaptive quality tier proof
 //       * no low-end/budget Android proof
 //       * no automated pixel/matte quality proof
 //       * no export/audio/speed/app wiring proof
@@ -392,13 +393,14 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
           'bounded green-screen preview remains active',
           'MediaPipe CPU primary (`mediapipe_cpu`) selected when model asset is bundled',
           'native `ANDROID_DUET_GREENSCREEN_MEDIAPIPE_MASK_FIRST` log may evidence first MediaPipe mask',
+          'native `ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST` log may evidence temporal smoothing',
           'native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload',
           'layout update away from greenScreen to PiP works',
           'stop/detach/dispose/temp cleanup complete',
         ],
         'nonClaims': <String>[
           'no MediaPipe GPU delegate proof',
-          'no temporal smoothing/adaptive quality proof',
+          'no adaptive quality tier proof',
           'no low-end/budget Android proof',
           'no automated pixel/matte quality proof',
           'no export/audio/speed/app wiring proof',
