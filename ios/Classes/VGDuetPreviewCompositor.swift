@@ -101,9 +101,14 @@ final class VGDuetPreviewCompositor {
     /// - Parameters:
     ///   - sourceFrame: decoded source frame (BGRA).  nil draws canvas + placeholder only.
     ///   - sourceRect:  top-left-origin canvas rect for the source (aspect-fill).
-    ///   - cameraRect:  top-left-origin canvas rect for the camera placeholder.
+    ///   - cameraRect:  top-left-origin canvas rect for the camera slot.
+    ///   - cameraFrame: live camera frame (BGRA).  When non-nil, aspect-filled into cameraRect.
+    ///                  When nil, the deterministic camera placeholder is drawn instead.
     /// - Returns: a pool-backed BGRA buffer, or nil when the pool is exhausted / unavailable.
-    func composite(sourceFrame: CVPixelBuffer?, sourceRect: CGRect, cameraRect: CGRect) -> CVPixelBuffer? {
+    func composite(sourceFrame: CVPixelBuffer?,
+                   sourceRect: CGRect,
+                   cameraRect: CGRect,
+                   cameraFrame: CVPixelBuffer? = nil) -> CVPixelBuffer? {
         guard let pool = pool else { return nil }
 
         var outBuffer: CVPixelBuffer?
@@ -124,8 +129,15 @@ final class VGDuetPreviewCompositor {
 
         let ciCamera = ciRect(fromTopLeft: cameraRect)
         if !ciCamera.isEmpty {
-            let coversSource = !ciSource.isEmpty && ciCamera.contains(ciSource)
-            image = cameraPlaceholder(in: ciCamera, translucent: coversSource).composited(over: image)
+            if let camFrame = cameraFrame {
+                // Live camera frame: aspect-fill into the camera slot.
+                let camImage = CIImage(cvPixelBuffer: camFrame)
+                image = aspectFill(camImage, into: ciCamera).composited(over: image)
+            } else {
+                // No live frame yet: show deterministic placeholder.
+                let coversSource = !ciSource.isEmpty && ciCamera.contains(ciSource)
+                image = cameraPlaceholder(in: ciCamera, translucent: coversSource).composited(over: image)
+            }
         }
 
         ciContext.render(image, to: output, bounds: bounds, colorSpace: nil)

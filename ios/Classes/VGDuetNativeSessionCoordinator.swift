@@ -37,6 +37,10 @@ struct VGDuetSourceProbeResult {
     let hasAudioTrack: Bool
 }
 
+struct VGDuetSourceProbeFailure: Error {
+    let message: String
+}
+
 // MARK: - Session
 
 final class VGDuetNativeSession {
@@ -79,6 +83,11 @@ final class VGDuetNativeSession {
     // Created after texture registration; stopped before texture invalidation
     // and before the decoder is released.  nil whenever no texture is attached.
     var previewRenderLoop: VGDuetPreviewRenderLoop?
+
+    // Duet camera ingress: front-camera live preview for the camera slot.
+    // Created and started only when a preview texture attaches successfully.
+    // Stopped in releasePreviewTexture before the render loop and texture teardown.
+    var cameraSource: VGDuetCameraSource?
 
     init(sessionId: String,
          sourceMap: [String: Any],
@@ -183,6 +192,10 @@ final class VGDuetNativeSessionCoordinator {
     /// Slice 4B-B: the render loop is stopped first so no present can race the
     /// texture invalidation / unregister below.
     private func releasePreviewTexture(for session: VGDuetNativeSession) {
+        // Camera ingress: stop before the render loop so no frame snapshot is
+        // taken after the loop drains its in-flight pipeline.
+        session.cameraSource?.stop()
+        session.cameraSource = nil
         stopPreviewRenderLoop(for: session)
         guard let tex = session.previewTexture,
               let tid = session.previewTextureId else { return }
@@ -255,6 +268,17 @@ final class VGDuetNativeSessionCoordinator {
         // computation and draw the held frame (trimStart on a fresh session,
         // the current clock cursor otherwise).  If the session is already
         // recording (re-attach mid-take) the loop goes active immediately.
+        //
+        // Camera ingress: create + start the camera source now (not at initializeSession)
+        // because the render loop is what consumes its frames.  Guard idempotency: if a
+        // cameraSource already exists (should not happen given the early-return above),
+        // do not create another.
+        if session.cameraSource == nil {
+            let cam = VGDuetCameraSource()
+            session.cameraSource = cam
+            cam.start()
+        }
+
         let loop = makePreviewRenderLoop(
             session:      session,
             texture:      previewTexture,
@@ -416,6 +440,10 @@ final class VGDuetNativeSessionCoordinator {
                 // Loop invokes this on main, only while not stopped.
                 texture.update(pixelBuffer: pixelBuffer)
                 registry.textureFrameAvailable(textureId)
+            },
+            cameraFrameProvider: { [weak session] in
+                // Called on main or renderQueue; returns nil when camera not yet ready.
+                session?.cameraSource?.snapshotRetained()
             }
         )
     }
@@ -490,7 +518,7 @@ final class VGDuetNativeSessionCoordinator {
             let probeResult = Self.probeSource(filePath: capturedFilePath)
 
             switch probeResult {
-            case .failure(let msg):
+            case .failure(let failure):
                 DispatchQueue.main.async {
                     if self.pendingSessionId == sessionId {
                         self.pendingSessionId = nil
@@ -499,7 +527,7 @@ final class VGDuetNativeSessionCoordinator {
                         self.canceledProbeIds.remove(sessionId)
                         return
                     }
-                    reply(nil, FlutterError(code: "source_invalid", message: msg, details: nil))
+                    reply(nil, FlutterError(code: "source_invalid", message: failure.message, details: nil))
                 }
 
             case .success(let probe):
@@ -821,16 +849,16 @@ final class VGDuetNativeSessionCoordinator {
 
     // MARK: - Source probing (static, off-main)
 
-    static func probeSource(filePath: String) -> Result<VGDuetSourceProbeResult, String> {
+    static func probeSource(filePath: String) -> Result<VGDuetSourceProbeResult, VGDuetSourceProbeFailure> {
         let lower = filePath.lowercased()
         guard lower.hasSuffix(".mp4") || lower.hasSuffix(".mov") else {
-            return .failure("Source file must be .mp4 or .mov (got '\(filePath)')")
+            return .failure(VGDuetSourceProbeFailure(message: "Source file must be .mp4 or .mov (got '\(filePath)')"))
         }
 
         let url: URL
         if filePath.hasPrefix("file://") {
             guard let u = URL(string: filePath) else {
-                return .failure("Invalid file:// URL: '\(filePath)'")
+                return .failure(VGDuetSourceProbeFailure(message: "Invalid file:// URL: '\(filePath)'"))
             }
             url = u
         } else {
@@ -838,20 +866,20 @@ final class VGDuetNativeSessionCoordinator {
         }
 
         guard FileManager.default.fileExists(atPath: url.path) else {
-            return .failure("Source file does not exist at path: '\(url.path)'")
+            return .failure(VGDuetSourceProbeFailure(message: "Source file does not exist at path: '\(url.path)'"))
         }
 
         let asset = AVURLAsset(url: url,
                                options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let duration = asset.duration
         guard duration.isValid && !duration.isIndefinite && duration.seconds > 0 else {
-            return .failure("Source file has zero or invalid duration: '\(filePath)'")
+            return .failure(VGDuetSourceProbeFailure(message: "Source file has zero or invalid duration: '\(filePath)'"))
         }
         let durationMs = Int(duration.seconds * 1000)
 
         let videoTracks = asset.tracks(withMediaType: .video)
         guard !videoTracks.isEmpty else {
-            return .failure("Source file has no video track: '\(filePath)'")
+            return .failure(VGDuetSourceProbeFailure(message: "Source file has no video track: '\(filePath)'"))
         }
 
         let hasAudioTrack = !asset.tracks(withMediaType: .audio).isEmpty

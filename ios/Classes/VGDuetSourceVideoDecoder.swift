@@ -121,7 +121,7 @@ final class VGDuetSourceVideoDecoder: VGDuetFrameProvider {
         }
 
         let startTime = CMTime(value: Int64(startPtsMs), timescale: 1000)
-        reader.timeRange = CMTimeRange(start: startTime, duration: kCMTimePositiveInfinity)
+        reader.timeRange = CMTimeRange(start: startTime, duration: CMTime.positiveInfinity)
 
         guard reader.startReading() else {
             let desc = reader.error?.localizedDescription ?? "unknown error"

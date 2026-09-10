@@ -84,12 +84,19 @@ final class VGDuetPreviewRenderLoop {
     typealias DecodeHandler     = (VGDuetPreviewDecodeRequest, @escaping DecodeCompletion) -> Void
     typealias PresentHandler    = (CVPixelBuffer) -> Void
 
+    /// Returns a *retained* CVPixelBuffer snapshot of the live camera frame, or nil
+    /// when no frame has arrived yet.  The render loop balances the retain after
+    /// compositing.  May be called from the main thread or the render queue.
+    typealias CameraFrameProvider = () -> Unmanaged<CVPixelBuffer>?
+
     private let compositor: VGDuetPreviewCompositor
     private let trimStartMs: Int
     private let trimEndMs: Int
     private let targetPtsProvider: TargetPtsProvider
     private let decodeHandler: DecodeHandler
     private let presentHandler: PresentHandler
+    /// Optional live-camera snapshot provider injected by the coordinator.
+    private let cameraFrameProvider: CameraFrameProvider?
 
     private let renderQueue = DispatchQueue(label: "com.connects.vanguard.duet.preview.render",
                                             qos: .userInteractive)
@@ -134,15 +141,17 @@ final class VGDuetPreviewRenderLoop {
          cameraRect: CGRect,
          targetPtsProvider: @escaping TargetPtsProvider,
          decodeHandler: @escaping DecodeHandler,
-         presentHandler: @escaping PresentHandler) {
-        self.compositor        = compositor
-        self.trimStartMs       = trimStartMs
-        self.trimEndMs         = max(trimStartMs, trimEndMs)
-        self.sourceRect        = sourceRect
-        self.cameraRect        = cameraRect
-        self.targetPtsProvider = targetPtsProvider
-        self.decodeHandler     = decodeHandler
-        self.presentHandler    = presentHandler
+         presentHandler: @escaping PresentHandler,
+         cameraFrameProvider: CameraFrameProvider? = nil) {
+        self.compositor          = compositor
+        self.trimStartMs         = trimStartMs
+        self.trimEndMs           = max(trimStartMs, trimEndMs)
+        self.sourceRect          = sourceRect
+        self.cameraRect          = cameraRect
+        self.targetPtsProvider   = targetPtsProvider
+        self.decodeHandler       = decodeHandler
+        self.presentHandler      = presentHandler
+        self.cameraFrameProvider = cameraFrameProvider
     }
 
     deinit {
@@ -311,8 +320,17 @@ final class VGDuetPreviewRenderLoop {
         let sRect = sourceRect
         let cRect = cameraRect
         let compositor = self.compositor
+        // Snapshot the live camera frame *before* crossing the queue boundary.
+        // snapshotRetained() returns a +1 retain; we release it after compositing.
+        let cameraSnap: Unmanaged<CVPixelBuffer>? = cameraFrameProvider?()
+        let cameraBuffer: CVPixelBuffer? = cameraSnap.map { $0.takeUnretainedValue() }
         renderQueue.async { [weak self] in
-            let output = compositor.composite(sourceFrame: frame, sourceRect: sRect, cameraRect: cRect)
+            let output = compositor.composite(sourceFrame: frame,
+                                              sourceRect: sRect,
+                                              cameraRect: cRect,
+                                              cameraFrame: cameraBuffer)
+            // Release the retained snapshot now that compositing is done.
+            cameraSnap?.release()
             DispatchQueue.main.async {
                 self?.didRender(output)
             }
