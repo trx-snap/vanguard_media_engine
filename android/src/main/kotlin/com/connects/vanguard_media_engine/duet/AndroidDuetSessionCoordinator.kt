@@ -851,7 +851,28 @@ class AndroidDuetSessionCoordinator(
         val renderLoop = session.previewRenderLoop ?: return null
         return try {
             val selector = AndroidDuetSegmentationBackendSelector(context)
-            val initialBackendId = session.greenScreenLatchedBackendId ?: selector.primaryBackendId()
+
+            // Debug-only opt-in: a physical smoke harness can start this session
+            // on the raw_tflite_gpu rung by setting
+            //   layoutConfigMap["debugSegmentationBackend"] = "raw_tflite_gpu"
+            // If the selector does not support that rung (asset missing, no context),
+            // the opt-in is silently ignored and the selector's normal primary is used.
+            // The session latch wins over the debug key if already set (degradation
+            // never climbs back up within a session).
+            val debugBackend = session.layoutConfigMap["debugSegmentationBackend"] as? String
+            val initialBackendId: String = when {
+                session.greenScreenLatchedBackendId != null ->
+                    session.greenScreenLatchedBackendId!!
+                debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU &&
+                    selector.supports(DuetSegmentationBackend.RAW_TFLITE_GPU) -> {
+                    Log.d("DuetCoordinator",
+                        "debugSegmentationBackend=raw_tflite_gpu: starting adapter on raw_tflite_gpu " +
+                            "(session=${session.sessionId})")
+                    DuetSegmentationBackend.RAW_TFLITE_GPU
+                }
+                else -> selector.primaryBackendId()
+            }
+
             var adapterRef: AndroidDuetGreenScreenAdapter? = null
             val adapter = AndroidDuetGreenScreenAdapter(
                 selector = selector,

@@ -132,4 +132,13 @@ dependencies {
     // baseline that ships the raw-mask API (enableRawSizeMask) without pulling in
     // TFLite directly. Terminal fallback after ML Kit is safe PiP (no segmenter).
     implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
+
+    // -- raw_tflite_gpu opt-in backend (debug/smoke only; not default primary) --
+    // Standalone TensorFlow Lite + GPU delegate at the version proven by the
+    // example probe. GpuDelegate (tensorflow-lite-gpu) requires the API jar
+    // (tensorflow-lite-gpu-api) and the core runtime (tensorflow-lite).
+    // These three must be pinned to the exact same patch version.
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
 }

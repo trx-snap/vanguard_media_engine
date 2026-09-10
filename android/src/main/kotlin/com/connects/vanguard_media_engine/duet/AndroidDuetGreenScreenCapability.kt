@@ -7,10 +7,12 @@ import android.os.PowerManager
 // VG-DUET-GREEN-SCREEN: Capability probe + backend/quality enums.
 
 object DuetSegmentationBackend {
-    const val MEDIAPIPE_GPU = "mediapipe_gpu"
-    const val MEDIAPIPE_CPU = "mediapipe_cpu"
-    const val MLKIT        = "mlkit"
-    const val NONE         = "none"
+    const val MEDIAPIPE_GPU  = "mediapipe_gpu"
+    const val MEDIAPIPE_CPU  = "mediapipe_cpu"
+    const val MLKIT          = "mlkit"
+    const val NONE           = "none"
+    /** Standalone TensorFlow Lite GPU delegate backend — debug/smoke opt-in only; not default primary. */
+    const val RAW_TFLITE_GPU = "raw_tflite_gpu"
 }
 
 enum class DuetSegmentationQuality(val key: String) {
@@ -95,6 +97,27 @@ data class DuetSegmentationProbe(
                 thermalTier            = "nominal",
             )
 
+        /**
+         * Probe result when the raw TensorFlow Lite GPU delegate backend is the
+         * active rung (debug/smoke opt-in only; not default production primary).
+         * [mediaPipeGpuSupported] stays false — this backend uses a standalone
+         * GpuDelegate separate from MediaPipe Tasks GPU.
+         */
+        fun rawTfliteGpu(quality: DuetSegmentationQuality = DuetSegmentationQuality.QUALITY) =
+            DuetSegmentationProbe(
+                isAvailable            = true,
+                selectedBackend        = DuetSegmentationBackend.RAW_TFLITE_GPU,
+                quality                = quality,
+                maxResolution          = 256,
+                supportsRawMask        = true,
+                reason                 = "Raw TensorFlow Lite GPU delegate selected (debug/smoke opt-in; degrades to mediapipe_cpu on failure).",
+                mediaPipeGpuSupported  = false,
+                mediaPipeCpuSupported  = true,
+                mlKitAvailable         = true,
+                analysisMaxResolution  = 256,
+                thermalTier            = "nominal",
+            )
+
         /** Probe result when no backend is available; session falls back to PiP. */
         fun unavailable(reason: String) =
             DuetSegmentationProbe(
@@ -127,9 +150,10 @@ data class DuetSegmentationProbe(
             quality: DuetSegmentationQuality,
         ): DuetSegmentationProbe {
             val base = when (backendId) {
-                DuetSegmentationBackend.MEDIAPIPE_GPU -> mediapipeGpu(quality)
-                DuetSegmentationBackend.MEDIAPIPE_CPU -> mediapipeCpu(quality)
-                DuetSegmentationBackend.MLKIT -> mlkit(quality)
+                DuetSegmentationBackend.MEDIAPIPE_GPU  -> mediapipeGpu(quality)
+                DuetSegmentationBackend.MEDIAPIPE_CPU  -> mediapipeCpu(quality)
+                DuetSegmentationBackend.MLKIT          -> mlkit(quality)
+                DuetSegmentationBackend.RAW_TFLITE_GPU -> rawTfliteGpu(quality)
                 else -> return unavailable("Unsupported segmentation backend '$backendId' for dynamic probe")
             }
             val liveTier = liveThermalTier(context) ?: return base

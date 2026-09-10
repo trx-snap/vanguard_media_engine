@@ -61,8 +61,9 @@ sealed class DuetSegmentationOutcome {
  * The `MEDIAPIPE_*` constants (no rung suffix) are the CPU-rung reasons and are
  * kept byte-for-byte for backward compatibility with existing consumers. The
  * `MEDIAPIPE_GPU_*` constants are the GPU-rung equivalents added for the
- * `mediapipe_gpu` rung. The `*Failed`/`*Result`/`*Mismatch` helper functions
- * pick the right constant for whichever MediaPipe rung reports the failure.
+ * `mediapipe_gpu` rung. The `RAW_TFLITE_GPU_*` constants cover the new
+ * standalone TFLite GPU delegate rung. The `*Failed`/`*Result`/`*Mismatch`
+ * helper functions pick the right constant for whichever rung reports the failure.
  */
 object DuetSegmentationFailureReason {
     const val MEDIAPIPE_INIT_FAILED          = "mediapipe_init_failed"
@@ -80,36 +81,53 @@ object DuetSegmentationFailureReason {
     const val MLKIT_INIT_FAILED              = "mlkit_init_failed"
     const val MLKIT_FAILURE                  = "mlkit_failure"
 
+    // ── raw_tflite_gpu rung reasons ───────────────────────────────────────────
+    const val RAW_TFLITE_GPU_INIT_FAILED          = "raw_tflite_gpu_init_failed"
+    const val RAW_TFLITE_GPU_INFERENCE_FAILED     = "raw_tflite_gpu_inference_failed"
+    const val RAW_TFLITE_GPU_FRAME_CONVERT_FAILED = "raw_tflite_gpu_frame_convert_failed"
+    const val RAW_TFLITE_GPU_EMPTY_RESULT         = "raw_tflite_gpu_empty_result"
+    const val RAW_TFLITE_GPU_MASK_SIZE_MISMATCH   = "raw_tflite_gpu_mask_size_mismatch"
+    const val RAW_TFLITE_GPU_TENSOR_MISMATCH      = "raw_tflite_gpu_tensor_mismatch"
+
     /** Reason when a backend's [AndroidDuetSegmentationBackend.segment] throws synchronously. */
     fun segmentThrew(backendId: String): String = "${backendId}_segment_threw"
 
     /** Reason when a backend's [AndroidDuetSegmentationBackend.open] throws. */
     fun initFailed(backendId: String): String = when (backendId) {
-        DuetSegmentationBackend.MEDIAPIPE_GPU -> MEDIAPIPE_GPU_INIT_FAILED
-        DuetSegmentationBackend.MEDIAPIPE_CPU -> MEDIAPIPE_INIT_FAILED
-        DuetSegmentationBackend.MLKIT         -> MLKIT_INIT_FAILED
-        else                                  -> "${backendId}_init_failed"
+        DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_INIT_FAILED
+        DuetSegmentationBackend.MEDIAPIPE_CPU  -> MEDIAPIPE_INIT_FAILED
+        DuetSegmentationBackend.MLKIT          -> MLKIT_INIT_FAILED
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_INIT_FAILED
+        else                                   -> "${backendId}_init_failed"
     }
 
-    /** Reason when [ImageProxy] -> Bitmap/MPImage conversion fails on a MediaPipe rung. */
-    fun frameConvertFailed(backendId: String): String =
-        if (backendId == DuetSegmentationBackend.MEDIAPIPE_GPU) MEDIAPIPE_GPU_FRAME_CONVERT_FAILED
-        else MEDIAPIPE_FRAME_CONVERT_FAILED
+    /** Reason when [ImageProxy] -> Bitmap conversion fails on a MediaPipe or TFLite rung. */
+    fun frameConvertFailed(backendId: String): String = when (backendId) {
+        DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_FRAME_CONVERT_FAILED
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_FRAME_CONVERT_FAILED
+        else                                   -> MEDIAPIPE_FRAME_CONVERT_FAILED
+    }
 
-    /** Reason when `ImageSegmenter.segmentForVideo` throws on a MediaPipe rung. */
-    fun inferenceFailed(backendId: String): String =
-        if (backendId == DuetSegmentationBackend.MEDIAPIPE_GPU) MEDIAPIPE_GPU_INFERENCE_FAILED
-        else MEDIAPIPE_INFERENCE_FAILED
+    /** Reason when inference throws on a segmentation rung. */
+    fun inferenceFailed(backendId: String): String = when (backendId) {
+        DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_INFERENCE_FAILED
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_INFERENCE_FAILED
+        else                                   -> MEDIAPIPE_INFERENCE_FAILED
+    }
 
-    /** Reason when a MediaPipe rung returns no confidence masks. */
-    fun emptyResult(backendId: String): String =
-        if (backendId == DuetSegmentationBackend.MEDIAPIPE_GPU) MEDIAPIPE_GPU_EMPTY_RESULT
-        else MEDIAPIPE_EMPTY_RESULT
+    /** Reason when a rung returns no confidence masks / empty output. */
+    fun emptyResult(backendId: String): String = when (backendId) {
+        DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_EMPTY_RESULT
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_EMPTY_RESULT
+        else                                   -> MEDIAPIPE_EMPTY_RESULT
+    }
 
-    /** Reason when a MediaPipe rung's confidence mask dimensions/buffer are invalid. */
-    fun maskSizeMismatch(backendId: String): String =
-        if (backendId == DuetSegmentationBackend.MEDIAPIPE_GPU) MEDIAPIPE_GPU_MASK_SIZE_MISMATCH
-        else MEDIAPIPE_MASK_SIZE_MISMATCH
+    /** Reason when a rung's output mask dimensions/buffer are invalid. */
+    fun maskSizeMismatch(backendId: String): String = when (backendId) {
+        DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_MASK_SIZE_MISMATCH
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_MASK_SIZE_MISMATCH
+        else                                   -> MEDIAPIPE_MASK_SIZE_MISMATCH
+    }
 }
 
 interface AndroidDuetSegmentationBackend {

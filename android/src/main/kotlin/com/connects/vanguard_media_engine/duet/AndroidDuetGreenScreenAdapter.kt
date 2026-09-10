@@ -20,7 +20,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 //     MediaPipe Tasks GPU + confidence masks can native-abort (SIGABRT) during
 //     result conversion, which cannot be caught as a Kotlin failure; the
 //     selector's `supports`/`primaryBackendId` never route a production
-//     session to it. The gpu/cpu-aware plumbing below (message text, rung
+//     session to it.
+//   - Debug/smoke opt-in ladder: raw_tflite_gpu -> mediapipe_cpu -> mlkit -> none
+//     (safe PiP). A session passes `debugSegmentationBackend = "raw_tflite_gpu"`
+//     in layoutConfigMap; the coordinator starts the adapter on that rung.
+//     Degradation on raw GPU failure: raw_tflite_gpu -> mediapipe_cpu (non-
+//     terminal, green screen stays live). cpu -> mlkit and mlkit -> none are
+//     unchanged. The gpu/cpu-aware plumbing below (message text, rung
 //     constants) is kept latent for a caller that experimentally starts an
 //     adapter on mediapipe_gpu directly. Movement is one-way and latched:
 //       * A MediaPipe rung failure (init or runtime) closes that rung, opens
@@ -28,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 //         green screen stays live). cpu -> mlkit is a non-terminal degrade
 //         (as would gpu -> cpu, if a caller ever started on the experimental
 //         gpu rung).
+//       * raw_tflite_gpu failure -> mediapipe_cpu (non-terminal degrade).
 //       * ML Kit failure (init or runtime) closes ML Kit and emits [onFallback]
 //         (terminal; the coordinator applies safe PiP).
 //   - Backends open lazily on the analysis thread at the first frame, so model
@@ -94,21 +101,38 @@ class AndroidDuetGreenScreenAdapter(
 
         private const val GPU_TO_CPU_DEGRADED_USER_MESSAGE =
             "Green screen switched from GPU to CPU processing; performance may be reduced."
+        private const val RAW_GPU_TO_CPU_DEGRADED_USER_MESSAGE =
+            "Green screen switched from raw GPU segmentation to CPU processing; performance may be reduced."
         private const val DEGRADED_USER_MESSAGE =
             "Green screen switched to the compatibility segmenter (ML Kit); edge quality may be reduced."
         private const val FALLBACK_USER_MESSAGE =
             "Green screen segmentation is unavailable on this device. Falling back to Picture-in-Picture."
 
         /**
-         * Rung-aware degrade message keyed on the *destination* rung: a
-         * transition landing on mediapipe_cpu must not claim ML Kit (this only
-         * fires today for the experimental gpu -> cpu case, since production
-         * sessions never start on mediapipe_gpu); any transition landing on
-         * mlkit (including a multi-hop open-failure walk) keeps the existing
-         * compatibility-segmenter wording other code/tests already depend on.
+         * Rung-aware degrade message keyed on the *destination* rung:
+         * - Landing on mediapipe_cpu from mediapipe_gpu: GPU -> CPU wording.
+         * - Landing on mediapipe_cpu from raw_tflite_gpu: raw GPU -> CPU wording.
+         * - Landing on mlkit (including multi-hop open-failure walk): existing
+         *   compatibility-segmenter wording other code/tests already depend on.
          */
         private fun degradedUserMessage(currentBackend: String): String = when (currentBackend) {
             DuetSegmentationBackend.MEDIAPIPE_CPU -> GPU_TO_CPU_DEGRADED_USER_MESSAGE
+            else -> DEGRADED_USER_MESSAGE
+        }
+
+        /**
+         * Degrade message when [previousBackend] is known. Distinguishes the
+         * raw_tflite_gpu -> mediapipe_cpu case from mediapipe_gpu -> mediapipe_cpu.
+         */
+        internal fun degradedUserMessage(
+            previousBackend: String,
+            currentBackend: String,
+        ): String = when {
+            previousBackend == DuetSegmentationBackend.RAW_TFLITE_GPU &&
+                currentBackend == DuetSegmentationBackend.MEDIAPIPE_CPU ->
+                RAW_GPU_TO_CPU_DEGRADED_USER_MESSAGE
+            currentBackend == DuetSegmentationBackend.MEDIAPIPE_CPU ->
+                GPU_TO_CPU_DEGRADED_USER_MESSAGE
             else -> DEGRADED_USER_MESSAGE
         }
     }
@@ -403,7 +427,7 @@ class AndroidDuetGreenScreenAdapter(
                     previousBackend = failedRung,
                     currentBackend = live.backendId,
                     reason = reason,
-                    userMessage = degradedUserMessage(live.backendId),
+                    userMessage = degradedUserMessage(failedRung, live.backendId),
                 )
             }
             live
@@ -493,7 +517,7 @@ class AndroidDuetGreenScreenAdapter(
                 previousBackend = failedId,
                 currentBackend = replacement.backendId,
                 reason = failure.reason,
-                userMessage = degradedUserMessage(replacement.backendId),
+                userMessage = degradedUserMessage(failedId, replacement.backendId),
             )
         }
         event?.let { emit(it) }

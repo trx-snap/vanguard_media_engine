@@ -22,6 +22,11 @@ import android.util.Log
 //     not offered to any device yet. The GPU backend implementation itself
 //     (AndroidDuetMediaPipeSegmentationBackend.gpu) is kept latent/experimental
 //     for future investigation.
+//   - raw_tflite_gpu is in EXTENDED_LADDER before mediapipe_cpu so that a
+//     session explicitly started on it (via debugSegmentationBackend) degrades
+//     to CPU on failure. It is NEVER in the default production primary path:
+//     [supports] returns true only when context != null AND the Android asset is
+//     readable; [primaryBackendId] never returns it.
 //   - MediaPipe CPU is primary whenever the bundled model asset is readable
 //     from the merged app assets. True CPU delegate support can only be
 //     proven by actually opening the ImageSegmenter (createFromOptions with
@@ -51,11 +56,30 @@ class AndroidDuetSegmentationBackendSelector(
         const val MODEL_ASSET_PATH = "selfie_segmenter.tflite"
 
         /**
+         * Asset-relative path of the bundled raw TFLite multiclass selfie model.
+         * Used by the raw_tflite_gpu backend (debug/smoke opt-in only).
+         */
+        const val TFLITE_GPU_MODEL_ASSET_PATH = "selfie_multiclass_256x256.tflite"
+
+        /**
          * Ordered production ladder, highest proven-safe quality first. `none`
          * is implicit after the last entry. mediapipe_gpu is intentionally
          * absent — see the file header for the physical-crash rationale.
+         * raw_tflite_gpu is also absent here; it is only in EXTENDED_LADDER.
          */
         val LADDER: List<String> = listOf(
+            DuetSegmentationBackend.MEDIAPIPE_CPU,
+            DuetSegmentationBackend.MLKIT,
+        )
+
+        /**
+         * Extended ladder including [DuetSegmentationBackend.RAW_TFLITE_GPU]
+         * before MEDIAPIPE_CPU. Used only when a session explicitly opts in to
+         * raw_tflite_gpu via `debugSegmentationBackend`. Degradation follows:
+         * raw_tflite_gpu -> mediapipe_cpu -> mlkit -> none (safe PiP).
+         */
+        val EXTENDED_LADDER: List<String> = listOf(
+            DuetSegmentationBackend.RAW_TFLITE_GPU,
             DuetSegmentationBackend.MEDIAPIPE_CPU,
             DuetSegmentationBackend.MLKIT,
         )
@@ -79,12 +103,28 @@ class AndroidDuetSegmentationBackendSelector(
     }
 
     /**
+     * True when the raw TFLite multiclass model asset is readable from the
+     * app's merged assets. Checked lazily; used by [supports] for raw_tflite_gpu.
+     */
+    val isTfliteGpuModelBundled: Boolean by lazy {
+        val ctx = context ?: return@lazy false
+        try {
+            ctx.assets.open(TFLITE_GPU_MODEL_ASSET_PATH).use { }
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "TFLite GPU model asset '$TFLITE_GPU_MODEL_ASSET_PATH' not readable " +
+                "(${t.message}); raw_tflite_gpu unsupported")
+            false
+        }
+    }
+
+    /**
      * First rung to try for a fresh adapter (no session latch). CPU is
      * preferred whenever the bundled model asset exists; whether the device
      * actually supports the CPU delegate is proven only by opening it, so a
      * device that can't run MediaPipe CPU simply falls through to mlkit via
-     * the adapter's ordinary open-failure ladder walk. mediapipe_gpu is never
-     * returned here — see the file header for why GPU is not a production rung.
+     * the adapter's ordinary open-failure ladder walk. raw_tflite_gpu and
+     * mediapipe_gpu are never returned here — see the file header.
      */
     fun primaryBackendId(): String =
         if (context != null && isMediaPipeModelBundled) DuetSegmentationBackend.MEDIAPIPE_CPU
@@ -92,32 +132,34 @@ class AndroidDuetSegmentationBackendSelector(
 
     /**
      * Next rung below [backendId], or null when [backendId] is the last
-     * segmentation rung (terminal -> safe PiP).
+     * segmentation rung (terminal -> safe PiP). Searches EXTENDED_LADDER so
+     * that raw_tflite_gpu degrades to mediapipe_cpu.
      */
     fun nextBackendId(backendId: String): String? {
-        val idx = LADDER.indexOf(backendId)
+        val idx = EXTENDED_LADDER.indexOf(backendId)
         if (idx < 0) return null
-        return LADDER.getOrNull(idx + 1)
+        return EXTENDED_LADDER.getOrNull(idx + 1)
     }
 
     /**
-     * True when [backendId] is a rung this selector can construct. Always
-     * false for mediapipe_gpu: it is not a production rung (see file header),
-     * so no production session may construct or open it through this selector.
+     * True when [backendId] is a rung this selector can construct.
+     * - mediapipe_gpu: always false (SIGABRT risk; see file header).
+     * - raw_tflite_gpu: true only when context != null AND the Android asset is
+     *   readable. Debug/smoke opt-in only; never returned by [primaryBackendId].
+     * - mediapipe_cpu: true when context != null.
+     * - mlkit: always true.
      */
     fun supports(backendId: String): Boolean = when (backendId) {
-        DuetSegmentationBackend.MEDIAPIPE_GPU -> false
-        DuetSegmentationBackend.MEDIAPIPE_CPU -> context != null
-        DuetSegmentationBackend.MLKIT         -> true
-        else                                  -> false
+        DuetSegmentationBackend.MEDIAPIPE_GPU  -> false
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> context != null && isTfliteGpuModelBundled
+        DuetSegmentationBackend.MEDIAPIPE_CPU  -> context != null
+        DuetSegmentationBackend.MLKIT          -> true
+        else                                   -> false
     }
 
     /**
      * Constructs (but does not open) the backend for [backendId].
-     * Throws IllegalArgumentException for unsupported ids. mediapipe_gpu is
-     * kept here only as a latent/experimental construction path for manual
-     * investigation; [supports] returns false for it, so the adapter's
-     * production ladder walk never calls this branch.
+     * Throws IllegalArgumentException for unsupported ids.
      */
     fun createBackend(backendId: String): AndroidDuetSegmentationBackend = when (backendId) {
         DuetSegmentationBackend.MEDIAPIPE_GPU -> {
@@ -131,6 +173,11 @@ class AndroidDuetSegmentationBackendSelector(
             AndroidDuetMediaPipeSegmentationBackend.cpu(ctx.applicationContext ?: ctx, MODEL_ASSET_PATH)
         }
         DuetSegmentationBackend.MLKIT -> AndroidDuetMlKitSegmentationBackend()
+        DuetSegmentationBackend.RAW_TFLITE_GPU -> {
+            val ctx = context
+                ?: throw IllegalArgumentException("raw_tflite_gpu backend requires a Context")
+            AndroidDuetRawTfliteGpuSegmentationBackend(ctx.applicationContext ?: ctx)
+        }
         else -> throw IllegalArgumentException("Unsupported segmentation backend '$backendId'")
     }
 
