@@ -165,6 +165,36 @@ class AndroidDuetPreviewCompositor {
     private var uSTMatrixLoc = -1
     private var sTextureLoc = -1
 
+    // -- Green-screen GL state -------------------------------------------------
+
+    /** True when the session is in green-screen layout mode. Render-thread only. */
+    private var greenScreenEnabled = false
+
+    /**
+     * Pending mask data to upload on the next drawFrame. Delivered from the ML
+     * Kit callback (off render thread) via [updateGreenScreenMask]; consumed on
+     * the render thread inside drawFrame. Wrapped in AtomicReference so the
+     * setter (any thread) and getter (render thread) don't race.
+     */
+    private val pendingMaskRef = java.util.concurrent.atomic.AtomicReference<AndroidDuetSegmentationFrame?>(null)
+
+    /** GL texture ID for the single-channel mask (LUMINANCE). 0 = not yet allocated. */
+    private var maskTextureId = 0
+
+    /** GLES program: OES camera + 2D mask → alpha-blended draw. 0 = not yet compiled. */
+    private var greenScreenProgram = 0
+    private var gsAPositionLoc = -1
+    private var gsATexCoordLoc = -1
+    private var gsUSTMatrixLoc = -1
+    private var gsSCameraLoc = -1
+    private var gsUMaskLoc = -1
+
+    /** Whether [maskTextureId] has been uploaded with at least one real mask. */
+    private var hasMaskTexture = false
+
+    /** Whether the first mask texture upload diagnostic log has fired. Render-thread only. */
+    private var hasLoggedFirstMaskUpload = false
+
     private val quadPositions: FloatBuffer = floatBufferOf(
         -1f, -1f,
          1f, -1f,
@@ -260,7 +290,31 @@ class AndroidDuetPreviewCompositor {
         sourceVideoHeightPx = heightPx
     }
 
-    // -- Draw ------------------------------------------------------------------
+    // -- Green-screen controls (render-thread only for enabled; AtomicRef for mask) --
+
+    /**
+     * Enable or disable green-screen compositing. Must be called on the render thread.
+     * When disabled, the camera rect reverts to normal PiP/split drawing behaviour.
+     */
+    fun setGreenScreenEnabled(enabled: Boolean) {
+        greenScreenEnabled = enabled
+        if (!enabled) {
+            // Clear pending mask so stale data is not shown if re-enabled later.
+            pendingMaskRef.set(null)
+            hasMaskTexture = false
+            hasLoggedFirstMaskUpload = false
+        }
+    }
+
+    /**
+     * Delivers a new segmentation mask to be uploaded on the next [drawFrame].
+     * Safe to call from any thread (backed by AtomicReference — latest wins,
+     * stale frames are dropped). ML Kit callback thread → render thread.
+     */
+    fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
+        pendingMaskRef.set(frame)
+    }
+
 
     /**
      * Composites one frame into the attached output surface:
@@ -300,6 +354,14 @@ class AndroidDuetPreviewCompositor {
                 hasCameraTexImage = true
             }
 
+            // Upload latest mask texture when green-screen is active.
+            if (greenScreenEnabled) {
+                val maskFrame = pendingMaskRef.getAndSet(null)
+                if (maskFrame != null) {
+                    uploadMaskTexture(maskFrame)
+                }
+            }
+
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
             GLES20.glViewport(0, 0, outputWidthPx, outputHeightPx)
             GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -309,13 +371,26 @@ class AndroidDuetPreviewCompositor {
                 drawSourceRect(sourceRect ?: fullSurfaceRect())
             }
 
-            // Camera rect: draw live OES frame when available, else placeholder.
+            // Camera rect drawing:
+            // - Green-screen mode: draw camera masked by the segmentation mask.
+            //   If no camera frame has arrived yet or no mask texture is ready,
+            //   leave the source video visible (do NOT draw an opaque placeholder).
+            // - Normal mode: draw live OES frame when available, else placeholder.
             val cr = cameraRect
             if (cr != null) {
-                if (hasCameraTexImage) {
-                    drawCameraRect(cr)
+                if (greenScreenEnabled) {
+                    // Green-screen: only draw when both camera OES and mask are ready.
+                    // Source remains visible underneath (drawn above); no opaque fill.
+                    if (hasCameraTexImage && hasMaskTexture) {
+                        drawCameraGreenScreen(cr)
+                    }
+                    // else: source remains visible, invariant satisfied.
                 } else {
-                    drawCameraPlaceholder(cr)
+                    if (hasCameraTexImage) {
+                        drawCameraRect(cr)
+                    } else {
+                        drawCameraPlaceholder(cr)
+                    }
                 }
             }
 
@@ -326,6 +401,7 @@ class AndroidDuetPreviewCompositor {
             return false
         }
     }
+
 
     // -- Release (terminal, idempotent, never throws) --------------------------
 
@@ -356,10 +432,21 @@ class AndroidDuetPreviewCompositor {
             try {
                 if (cameraOesTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(cameraOesTextureId), 0)
             } catch (_: Throwable) {}
+            // Green-screen GL teardown.
+            try {
+                if (greenScreenProgram != 0) GLES20.glDeleteProgram(greenScreenProgram)
+            } catch (_: Throwable) {}
+            try {
+                if (maskTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(maskTextureId), 0)
+            } catch (_: Throwable) {}
         }
         oesProgram = 0
         oesTextureId = 0
         cameraOesTextureId = 0
+        greenScreenProgram = 0
+        maskTextureId = 0
+        hasMaskTexture = false
+        hasLoggedFirstMaskUpload = false
 
         try { _decoderInputSurface?.release() } catch (_: Throwable) {}
         _decoderInputSurface = null
@@ -572,6 +659,179 @@ class AndroidDuetPreviewCompositor {
         aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTextureCoord")
         uSTMatrixLoc = GLES20.glGetUniformLocation(program, "uSTMatrix")
         sTextureLoc = GLES20.glGetUniformLocation(program, "sTexture")
+    }
+
+    /**
+     * Lazily compiles the green-screen shader program on demand (first time
+     * green-screen draw is requested). Uses OES camera texture + 2D LUMINANCE
+     * mask texture; alpha-blends the camera over the source based on mask.r.
+     */
+    private fun ensureGreenScreenProgram() {
+        if (greenScreenProgram != 0) return
+        val vertexSrc = """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            uniform mat4 uSTMatrix;
+            varying vec2 vTextureCoord;
+            varying vec2 vMaskCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTextureCoord = (uSTMatrix * aTextureCoord).xy;
+                // Mask is in the same [0,1] UV space without an ST matrix.
+                vMaskCoord = aTextureCoord.xy;
+            }
+        """.trimIndent()
+        val fragmentSrc = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vTextureCoord;
+            varying vec2 vMaskCoord;
+            uniform samplerExternalOES sCamera;
+            uniform sampler2D uMask;
+            void main() {
+                vec4 cameraColor = texture2D(sCamera, vTextureCoord);
+                float maskAlpha = texture2D(uMask, vMaskCoord).r;
+                gl_FragColor = vec4(cameraColor.rgb, cameraColor.a * maskAlpha);
+            }
+        """.trimIndent()
+        val vs = compileShader(GLES20.GL_VERTEX_SHADER, vertexSrc)
+        val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSrc)
+        val prog = GLES20.glCreateProgram()
+        GLES20.glAttachShader(prog, vs)
+        GLES20.glAttachShader(prog, fs)
+        GLES20.glLinkProgram(prog)
+        GLES20.glDeleteShader(vs)
+        GLES20.glDeleteShader(fs)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            val log = GLES20.glGetProgramInfoLog(prog)
+            GLES20.glDeleteProgram(prog)
+            throw IllegalStateException("GS program link failed: $log")
+        }
+        greenScreenProgram = prog
+        gsAPositionLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        gsATexCoordLoc = GLES20.glGetAttribLocation(prog, "aTextureCoord")
+        gsUSTMatrixLoc = GLES20.glGetUniformLocation(prog, "uSTMatrix")
+        gsSCameraLoc   = GLES20.glGetUniformLocation(prog, "sCamera")
+        gsUMaskLoc     = GLES20.glGetUniformLocation(prog, "uMask")
+    }
+
+    /**
+     * Uploads [frame]'s float32 mask buffer into [maskTextureId] as a LUMINANCE
+     * texture. Allocates the GL texture on first call. Must run on render thread.
+     */
+    private fun uploadMaskTexture(frame: AndroidDuetSegmentationFrame) {
+        val w = frame.width
+        val h = frame.height
+        if (w <= 0 || h <= 0) {
+            Log.w(TAG, "uploadMaskTexture: invalid dimensions ${w}x$h, skipping")
+            return
+        }
+        if (maskTextureId == 0) {
+            val texIds = IntArray(1)
+            GLES20.glGenTextures(1, texIds, 0)
+            maskTextureId = texIds[0]
+            if (maskTextureId == 0) {
+                Log.w(TAG, "uploadMaskTexture: glGenTextures failed")
+                return
+            }
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        } else {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
+        }
+        // ML Kit produces float32 confidence values in [0,1]. Upload as LUMINANCE.
+        // ES 2.0 does not support GL_R32F natively; pack float → byte (0–255).
+        // Use a read-only duplicate so we never mutate the frame buffer's position.
+        val buf = frame.maskBytes.asReadOnlyBuffer()
+            .order(java.nio.ByteOrder.nativeOrder())
+        buf.rewind()
+        val capacity = w * h
+        val byteBuffer = java.nio.ByteBuffer.allocateDirect(capacity)
+        for (i in 0 until capacity) {
+            val byteOffset = i * 4
+            val f = if (buf.limit() >= byteOffset + 4) buf.getFloat(byteOffset) else 0f
+            byteBuffer.put((f.coerceIn(0f, 1f) * 255f).toInt().toByte())
+        }
+        byteBuffer.rewind()
+        // GL_UNPACK_ALIGNMENT defaults to 4, which causes row misalignment for
+        // single-channel (1 byte/pixel) mask rows whose width is not divisible by
+        // 4.  Save the current alignment, force 1, upload, then restore — so we
+        // don't leave a side-effect on the GL state machine.
+        val prevAlignment = IntArray(1)
+        GLES20.glGetIntegerv(GLES20.GL_UNPACK_ALIGNMENT, prevAlignment, 0)
+        try {
+            GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES20.GL_LUMINANCE,
+                w, h, 0,
+                GLES20.GL_LUMINANCE, GLES20.GL_UNSIGNED_BYTE, byteBuffer,
+            )
+        } finally {
+            GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, prevAlignment[0])
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        hasMaskTexture = true
+        if (!hasLoggedFirstMaskUpload) {
+            hasLoggedFirstMaskUpload = true
+            Log.i(TAG, "ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST width=$w height=$h")
+        }
+    }
+
+    /**
+     * Draws the camera OES frame alpha-blended into [rect] using the current
+     * mask texture. GL_BLEND is enabled around this draw only; source video
+     * underneath shows through where mask alpha is low (background).
+     */
+    private fun drawCameraGreenScreen(rect: VGDuetPixelRect) {
+        val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
+        if (scissor.width <= 0 || scissor.height <= 0) return
+
+        ensureGreenScreenProgram()
+        if (greenScreenProgram == 0) return  // compilation failed; skip silently
+
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glViewport(scissor.x, scissor.y, scissor.width, scissor.height)
+
+        // Enable blending so camera pixels with low mask alpha reveal the source below.
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+        GLES20.glUseProgram(greenScreenProgram)
+
+        // Texture unit 0: camera OES
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
+        GLES20.glUniform1i(gsSCameraLoc, 0)
+        GLES20.glUniformMatrix4fv(gsUSTMatrixLoc, 1, false, cameraStMatrix, 0)
+
+        // Texture unit 1: mask (2D LUMINANCE)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
+        GLES20.glUniform1i(gsUMaskLoc, 1)
+
+        quadPositions.position(0)
+        GLES20.glEnableVertexAttribArray(gsAPositionLoc)
+        GLES20.glVertexAttribPointer(gsAPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
+        quadTexCoords.position(0)
+        GLES20.glEnableVertexAttribArray(gsATexCoordLoc)
+        GLES20.glVertexAttribPointer(gsATexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(gsAPositionLoc)
+        GLES20.glDisableVertexAttribArray(gsATexCoordLoc)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
     private fun compileShader(type: Int, src: String): Int {

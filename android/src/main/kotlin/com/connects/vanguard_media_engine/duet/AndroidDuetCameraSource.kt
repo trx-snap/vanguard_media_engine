@@ -28,18 +28,22 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.util.Log
 import android.util.Range
+import android.util.Size
 import android.view.Surface
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 
 class AndroidDuetCameraSource(private val context: Context) {
 
@@ -76,16 +80,73 @@ class AndroidDuetCameraSource(private val context: Context) {
 
     private val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── ImageAnalysis state (green-screen slice) ───────────────────────────────
+
+    /** Dedicated single-thread executor for the ImageAnalysis use-case. */
+    private var analyzerExecutor: java.util.concurrent.ExecutorService? = null
+
+    /** Currently bound ImageAnalysis use-case, null when not in use. */
+    private var imageAnalysis: ImageAnalysis? = null
 
     /**
-     * Requests the front camera, binds a Preview use-case, and directs frames
-     * into [targetSurface].
+     * The compositor-owned Surface supplied to [start]; stored so [setAnalysisAnalyzer]
+     * can rebind use-cases without the caller needing to re-supply it.
+     * Never released by this class.
+     */
+    private var heldSurface: Surface? = null
+
+
+    /**
+     * Hot-rebinds the analysis use-case (or removes it) without stopping CameraX.
+     *
+     * When [analyzer] is non-null: tears down any existing analysis use-case/executor,
+     * creates a fresh one and binds Preview + ImageAnalysis to the same lifecycle.
+     * When [analyzer] is null: unbinds the analysis use-case only and shuts down
+     * the prior executor; Preview continues undisturbed.
+     *
+     * Returns true on successful bind, false if camera is not running, provider/
+     * surface are null, or [bindPreview] throws. Safe to call on the main thread.
+     */
+    fun setAnalysisAnalyzer(analyzer: ImageAnalysis.Analyzer?): Boolean {
+        if (!_isRunning) {
+            Log.d(TAG, "setAnalysisAnalyzer(): camera not running — ignored")
+            return false
+        }
+        val provider = cameraProvider ?: return false
+        val surface = heldSurface ?: return false
+
+        // Tear down previous analysis use-case and executor.
+        try { imageAnalysis?.clearAnalyzer() } catch (_: Throwable) {}
+        imageAnalysis = null
+        try { analyzerExecutor?.shutdownNow() } catch (_: Throwable) {}
+        analyzerExecutor = null
+
+        Log.d(TAG, "setAnalysisAnalyzer(): rebinding use-cases (analyzer=${analyzer != null})")
+        var bindOk = false
+        bindPreview(
+            provider      = provider,
+            targetSurface = surface,
+            onStarted     = {},  // already running; no callback needed
+            onError       = { e ->
+                Log.w(TAG, "setAnalysisAnalyzer rebind error: ${e.message}")
+            },
+            analyzer      = analyzer,
+            onBindResult  = { ok -> bindOk = ok },
+        )
+        return bindOk
+    }
+
+    /**
+     * Requests the front camera, binds a Preview use-case (and optionally an
+     * ImageAnalysis use-case) and directs frames into [targetSurface].
      *
      * [targetSurface] is compositor-owned: this class never releases it.
+     * [analyzer] is optional. When non-null, an ImageAnalysis use-case is bound
+     *   alongside Preview using STRATEGY_KEEP_ONLY_LATEST and a capped resolution
+     *   of 256 px on the shortest side. Preview never waits for analysis.
      * [onStarted] fires on the main thread when CameraX accepts the surface.
      * [onError] fires on the main thread on any failure (including missing
-     * CAMERA permission, in which case a SecurityException is passed).
+     *   CAMERA permission, in which case a SecurityException is passed).
      *
      * Idempotent: if already running, logs and returns immediately.
      */
@@ -93,6 +154,7 @@ class AndroidDuetCameraSource(private val context: Context) {
         targetSurface: Surface,
         onStarted: () -> Unit = {},
         onError: (Exception) -> Unit = {},
+        analyzer: ImageAnalysis.Analyzer? = null,
     ) {
         if (_isRunning) {
             Log.w(TAG, "start() called while already running — ignored")
@@ -126,7 +188,7 @@ class AndroidDuetCameraSource(private val context: Context) {
                 }
 
                 cameraProvider = provider
-                bindPreview(provider, targetSurface, onStarted, onError)
+                bindPreview(provider, targetSurface, onStarted, onError, analyzer)
             } catch (e: Exception) {
                 Log.e(TAG, "start(): ProcessCameraProvider failed: $e")
                 onError(e)
@@ -134,12 +196,30 @@ class AndroidDuetCameraSource(private val context: Context) {
         }, mainExecutor)
     }
 
+
     /**
      * Stops the camera session. Idempotent. The compositor-owned [targetSurface]
      * passed to [start] is NOT released here; the compositor owns it.
+     *
+     * Stop ordering (green-screen slice):
+     *   1. stopRequested = true
+     *   2. clear analyzer reference (analyzer.clearAnalyzer() / null)
+     *   3. shut down analyzerExecutor (shutdownNow)
+     *   4. lifecycle pause/stop/destroy
+     *   5. provider.unbindAll()
+     *   6. null all state
      */
     fun stop() {
         stopRequested = true
+
+        // Step 2: clear the analyzer reference so no new frames are dispatched
+        // while CameraX is draining its last frame.
+        try { imageAnalysis?.clearAnalyzer() } catch (_: Throwable) {}
+        imageAnalysis = null
+
+        // Step 3: shut down the analysis executor immediately.
+        try { analyzerExecutor?.shutdownNow() } catch (_: Throwable) {}
+        analyzerExecutor = null
 
         if (!_isRunning) {
             // Drive lifecycle to DESTROYED anyway in case stop() races the async
@@ -155,18 +235,23 @@ class AndroidDuetCameraSource(private val context: Context) {
 
         Log.d(TAG, "stop() — unbinding all CameraX use-cases")
 
+        // Step 4: lifecycle teardown.
         try {
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         } catch (_: Throwable) {}
 
+        // Step 5: unbind all CameraX use-cases.
         cameraProvider?.unbindAll()
 
+        // Step 6: null all state.
         cameraProvider = null
         preview = null
+        heldSurface = null
         _isRunning = false
     }
+
 
     // ── Private: bind Preview use-case ────────────────────────────────────────
 
@@ -175,6 +260,9 @@ class AndroidDuetCameraSource(private val context: Context) {
         targetSurface: Surface,
         onStarted: () -> Unit,
         onError: (Exception) -> Unit,
+        analyzer: ImageAnalysis.Analyzer? = null,
+        /** Called synchronously with true after successful bindToLifecycle, false on catch. */
+        onBindResult: (Boolean) -> Unit = {},
     ) {
         try {
             provider.unbindAll()
@@ -197,35 +285,53 @@ class AndroidDuetCameraSource(private val context: Context) {
 
             previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
                 if (stopRequested) {
-                    // We are tearing down; decline the surface request cleanly.
                     request.willNotProvideSurface()
                     return@setSurfaceProvider
                 }
-
-                // Point CameraX at the compositor-owned Surface.
-                // The compositor's cameraInputSurface (backed by cameraTexture's
-                // SurfaceTexture) will receive camera frames via this binding.
-                // The release callback is informational only; DO NOT release
-                // targetSurface here — the compositor owns and releases it in
-                // its terminal release().
                 request.provideSurface(targetSurface, mainExecutor) { result ->
                     Log.d(TAG, "CameraX released compositor surface (resultCode=${result.resultCode})")
                 }
-
                 Log.d(TAG, "provideSurface → compositor cameraInputSurface " +
                     "(${request.resolution.width}×${request.resolution.height})")
-
                 if (!stopRequested) {
                     _isRunning = true
+                    heldSurface = targetSurface
                     onStarted()
                 }
             }
 
-            provider.bindToLifecycle(lifecycleOwner, selector, previewUseCase)
+            val useCases = if (analyzer != null) {
+                val analysisResolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(256, 256),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                        )
+                    )
+                    .build()
+                val analysisUseCase = ImageAnalysis.Builder()
+                    .setResolutionSelector(analysisResolutionSelector)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                    .build()
+                    .also { imageAnalysis = it }
+                val executor = Executors.newSingleThreadExecutor { r ->
+                    Thread(r, "vg.duet.analysis").apply { isDaemon = true }
+                }
+                analyzerExecutor = executor
+                analysisUseCase.setAnalyzer(executor, analyzer)
+                Log.d(TAG, "bindPreview() — ImageAnalysis use-case bound (256px cap, KEEP_ONLY_LATEST)")
+                arrayOf(previewUseCase, analysisUseCase)
+            } else {
+                arrayOf(previewUseCase)
+            }
 
+            provider.bindToLifecycle(lifecycleOwner, selector, *useCases)
             Log.d(TAG, "bindPreview() — front camera Preview use-case bound")
+            onBindResult(true)
         } catch (e: Exception) {
             Log.e(TAG, "bindPreview() threw: $e")
+            onBindResult(false)
             onError(e)
         }
     }

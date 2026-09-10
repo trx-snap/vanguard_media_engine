@@ -71,6 +71,10 @@ final class VGDuetPreviewCompositor {
     /// occluding it with an opaque placeholder.
     private static let overlayAlpha: CGFloat = 0.28
 
+    /// One-time diagnostic marker: set to true after the first successful
+    /// CIBlendWithMask composite.  Guards against log spam on every frame.
+    private var _hasLoggedFirstMaskBlend = false
+
     private static let sharedContext: CIContext = {
         let options: [CIContextOption: Any] = [
             .workingColorSpace: NSNull(),
@@ -150,6 +154,12 @@ final class VGDuetPreviewCompositor {
                 ]
                 if let blended = CIFilter(name: "CIBlendWithMask", parameters: params)?.outputImage {
                     image = blended.cropped(to: bounds)
+                    // One-time diagnostic: log the first frame where a mask was actually blended.
+                    // Grep marker: IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST
+                    if !_hasLoggedFirstMaskBlend {
+                        _hasLoggedFirstMaskBlend = true
+                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame")
+                    }
                 } else {
                     // Filter unavailable (should not happen on supported iOS): fall back to
                     // opaque camera overlay so green-screen does not silently show only source.

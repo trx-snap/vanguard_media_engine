@@ -279,6 +279,35 @@ class AndroidDuetPreviewRenderLoop(
         }
     }
 
+    // -- Green-screen (render thread forwarding) --------------------------------
+
+    /**
+     * Enables or disables green-screen compositing in the compositor. Posts to
+     * the render thread so the compositor's render-thread-only state is always
+     * mutated on the correct thread. No ML inside the loop.
+     */
+    fun setGreenScreenEnabled(enabled: Boolean) {
+        if (isStopped.get()) return
+        renderHandler.post {
+            if (isStopped.get()) return@post
+            compositor.setGreenScreenEnabled(enabled)
+        }
+    }
+
+    /**
+     * Delivers a new segmentation mask to the compositor for the next draw.
+     * Posts to the render thread; the compositor's AtomicReference absorbs
+     * any thread-safety concern between this post and the next drawFrame.
+     * No ML runs inside the render loop.
+     */
+    fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
+        if (isStopped.get()) return
+        renderHandler.post {
+            if (isStopped.get()) return@post
+            compositor.updateGreenScreenMask(frame)
+        }
+    }
+
     /**
      * Terminal teardown, bounded by [timeoutMs] per stage and best-effort
      * throughout (never throws, even on timeout):

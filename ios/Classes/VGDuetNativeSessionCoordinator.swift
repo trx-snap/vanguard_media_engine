@@ -262,6 +262,16 @@ final class VGDuetNativeSessionCoordinator {
 
         // Compute optional layout rects from the effective layoutConfig.
         let effectiveLayoutMap = layoutConfigMap ?? session.layoutConfigMap
+
+        // Persist caller-provided layoutConfig into the session so downstream
+        // code (buildStopResult, updateLayout) sees the attach-time config as
+        // the canonical layout — matches Android attach-time persistence.
+        // Only update when a non-nil config was explicitly supplied; nil means
+        // "keep the current session layout" (idempotent reattach safety).
+        if let callerLayout = layoutConfigMap {
+            session.layoutConfigMap = callerLayout
+        }
+
         let typedRects = computeLayoutRects(
             layoutConfigMap: effectiveLayoutMap,
             canvasWidth:  CGFloat(width),
@@ -888,7 +898,8 @@ final class VGDuetNativeSessionCoordinator {
     /// Deterministically falls back to PiP so the session is never left with an
     /// opaque unkeyed green-screen layout.
     ///
-    /// Fallback PiP rect: left 0.62, top 0.68, width 0.32, height 0.24, pipAnchor bottomRight.
+    /// Fallback PiP rect: left 0.58, top 0.05, width 0.36, height 0.24, pipAnchor topRight.
+    /// These are the cross-platform safe parity values shared with the Android green-screen fallback.
     private func _handleGreenScreenAdapterFailure(session: VGDuetNativeSession) {
         assert(Thread.isMainThread)
 
@@ -905,15 +916,16 @@ final class VGDuetNativeSessionCoordinator {
         session.greenScreenAdapter = nil
 
         // 2. Update the session layout config to the deterministic PiP fallback.
+        //    Safe parity rect — matches Android green-screen fallback geometry.
         let fallbackPipRect: [String: Any] = [
-            "left":   0.62,
-            "top":    0.68,
-            "width":  0.32,
+            "left":   0.58,
+            "top":    0.05,
+            "width":  0.36,
             "height": 0.24,
         ]
         let fallbackLayoutConfig: [String: Any] = [
             "mode":             "pip",
-            "pipAnchor":        "bottomRight",
+            "pipAnchor":        "topRight",
             "pipNormalizedRect": fallbackPipRect,
         ]
         session.layoutConfigMap = fallbackLayoutConfig

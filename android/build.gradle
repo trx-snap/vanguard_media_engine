@@ -112,4 +112,9 @@ dependencies {
     // tools:overrideLibrary rather than by raising this plugin's minSdk 24.
     // Runtime use of HeifWriter itself remains gated to API 28+.
     implementation("androidx.heifwriter:heifwriter:1.0.0")
+
+    // -- Duet green-screen: ML Kit Selfie Segmentation (stream mode, raw mask) --
+    // No MediaPipe/TFLite deps in this slice. beta6 is the current baseline that
+    // ships the raw-mask API (enableRawSizeMask) without pulling in TFLite directly.
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 }
