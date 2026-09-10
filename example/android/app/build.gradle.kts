@@ -38,6 +38,15 @@ android {
         }
     }
 
+    sourceSets {
+        getByName("main") {
+            // Example-only diagnostic asset packaging for the isolated GPU probe.
+            // Points to the existing candidate model in ios/Assets (selfie_multiclass_256x256.tflite)
+            // so it is packaged into the example APK assets without copying the binary.
+            assets.srcDir("../../../ios/Assets")
+        }
+    }
+
     androidResources {
         noCompress += "tflite"
     }
