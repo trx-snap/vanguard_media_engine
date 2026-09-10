@@ -99,16 +99,21 @@ final class VGDuetPreviewCompositor {
     /// Renders one preview frame.
     ///
     /// - Parameters:
-    ///   - sourceFrame: decoded source frame (BGRA).  nil draws canvas + placeholder only.
-    ///   - sourceRect:  top-left-origin canvas rect for the source (aspect-fill).
-    ///   - cameraRect:  top-left-origin canvas rect for the camera slot.
-    ///   - cameraFrame: live camera frame (BGRA).  When non-nil, aspect-filled into cameraRect.
-    ///                  When nil, the deterministic camera placeholder is drawn instead.
+    ///   - sourceFrame:     decoded source frame (BGRA).  nil draws canvas + placeholder only.
+    ///   - sourceRect:      top-left-origin canvas rect for the source (aspect-fill).
+    ///   - cameraRect:      top-left-origin canvas rect for the camera slot.
+    ///   - cameraFrame:     live camera frame (BGRA).  When non-nil, aspect-filled into cameraRect.
+    ///                      When nil, the deterministic camera placeholder is drawn instead.
+    ///   - isGreenScreen:   when true, attempt CIBlendWithMask keying instead of opaque overlay.
+    ///   - greenScreenMask: single-channel (L8) mask buffer; 255 = subject (foreground).
+    ///                      Nil or unavailable falls back to the camera-over-source preview.
     /// - Returns: a pool-backed BGRA buffer, or nil when the pool is exhausted / unavailable.
     func composite(sourceFrame: CVPixelBuffer?,
                    sourceRect: CGRect,
                    cameraRect: CGRect,
-                   cameraFrame: CVPixelBuffer? = nil) -> CVPixelBuffer? {
+                   cameraFrame: CVPixelBuffer? = nil,
+                   isGreenScreen: Bool = false,
+                   greenScreenMask: CVPixelBuffer? = nil) -> CVPixelBuffer? {
         guard let pool = pool else { return nil }
 
         var outBuffer: CVPixelBuffer?
@@ -129,8 +134,30 @@ final class VGDuetPreviewCompositor {
 
         let ciCamera = ciRect(fromTopLeft: cameraRect)
         if !ciCamera.isEmpty {
-            if let camFrame = cameraFrame {
-                // Live camera frame: aspect-fill into the camera slot.
+            if isGreenScreen, let camFrame = cameraFrame, let maskBuffer = greenScreenMask {
+                // Green-screen path: CIBlendWithMask.
+                //   foreground = aspect-filled camera into cameraRect
+                //   background = current composed source canvas (image)
+                //   mask       = aspect-filled segmentation mask into cameraRect
+                // The filter replaces pixels where mask ~= 255 (subject) with the foreground.
+                // Falls through to the opaque-overlay path if the filter is unavailable.
+                let camFilled  = aspectFill(CIImage(cvPixelBuffer: camFrame),   into: ciCamera)
+                let maskFilled = aspectFill(CIImage(cvPixelBuffer: maskBuffer), into: ciCamera)
+                let params: [String: Any] = [
+                    "inputBackgroundImage": image,
+                    "inputImage":           camFilled,
+                    "inputMaskImage":       maskFilled,
+                ]
+                if let blended = CIFilter(name: "CIBlendWithMask", parameters: params)?.outputImage {
+                    image = blended.cropped(to: bounds)
+                } else {
+                    // Filter unavailable (should not happen on supported iOS): fall back to
+                    // opaque camera overlay so green-screen does not silently show only source.
+                    NSLog("[VGDuetPreviewCompositor] CIBlendWithMask unavailable — camera overlay fallback")
+                    image = camFilled.composited(over: image)
+                }
+            } else if let camFrame = cameraFrame {
+                // Live camera frame (non-green-screen, or mask missing): aspect-fill into the slot.
                 let camImage = CIImage(cvPixelBuffer: camFrame)
                 image = aspectFill(camImage, into: ciCamera).composited(over: image)
             } else {

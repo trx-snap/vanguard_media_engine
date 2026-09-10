@@ -14,6 +14,13 @@
 //     passive until asked again.  At trimEnd the target stops changing, so the
 //     loop naturally goes quiet; it never mutates session state.
 //
+// Green-screen seam:
+//   - maskProvider returns a retained mask snapshot (+1) to be released after compositing.
+//   - isGreenScreenLayout is tracked; init from coordinator, updated in updateLayout.
+//   - Each render() call snapshots isGreenScreen + mask before crossing the queue boundary
+//     and passes them to the compositor.  Mask is released after compositing, regardless of
+//     whether the green-screen path was taken.
+//
 // Explicitly NOT here: Flutter imports, session state, decoder ownership,
 // CoreImage drawing (see VGDuetPreviewCompositor).
 //
@@ -89,6 +96,11 @@ final class VGDuetPreviewRenderLoop {
     /// compositing.  May be called from the main thread or the render queue.
     typealias CameraFrameProvider = () -> Unmanaged<CVPixelBuffer>?
 
+    /// Returns a *retained* CVPixelBuffer snapshot of the latest segmentation mask, or nil
+    /// when no mask is available or the mask is stale.  The render loop releases the retain
+    /// after compositing.  May be called from the main thread or the render queue.
+    typealias MaskProvider = () -> Unmanaged<CVPixelBuffer>?
+
     private let compositor: VGDuetPreviewCompositor
     private let trimStartMs: Int
     private let trimEndMs: Int
@@ -97,6 +109,8 @@ final class VGDuetPreviewRenderLoop {
     private let presentHandler: PresentHandler
     /// Optional live-camera snapshot provider injected by the coordinator.
     private let cameraFrameProvider: CameraFrameProvider?
+    /// Optional segmentation mask provider for green-screen keying.
+    private let maskProvider: MaskProvider?
 
     private let renderQueue = DispatchQueue(label: "com.connects.vanguard.duet.preview.render",
                                             qos: .userInteractive)
@@ -113,6 +127,9 @@ final class VGDuetPreviewRenderLoop {
 
     private var sourceRect: CGRect
     private var cameraRect: CGRect
+
+    /// Whether the current layout is greenScreen.  Updated in init and updateLayout.
+    private var isGreenScreenLayout: Bool
 
     private var isStopped = false
     private var isActive  = false
@@ -139,19 +156,23 @@ final class VGDuetPreviewRenderLoop {
          trimEndMs: Int,
          sourceRect: CGRect,
          cameraRect: CGRect,
+         isGreenScreenLayout: Bool = false,
          targetPtsProvider: @escaping TargetPtsProvider,
          decodeHandler: @escaping DecodeHandler,
          presentHandler: @escaping PresentHandler,
-         cameraFrameProvider: CameraFrameProvider? = nil) {
+         cameraFrameProvider: CameraFrameProvider? = nil,
+         maskProvider: MaskProvider? = nil) {
         self.compositor          = compositor
         self.trimStartMs         = trimStartMs
         self.trimEndMs           = max(trimStartMs, trimEndMs)
         self.sourceRect          = sourceRect
         self.cameraRect          = cameraRect
+        self.isGreenScreenLayout = isGreenScreenLayout
         self.targetPtsProvider   = targetPtsProvider
         self.decodeHandler       = decodeHandler
         self.presentHandler      = presentHandler
         self.cameraFrameProvider = cameraFrameProvider
+        self.maskProvider        = maskProvider
     }
 
     deinit {
@@ -199,11 +220,13 @@ final class VGDuetPreviewRenderLoop {
 
     /// Applies new layout rects and redraws the held/current frame.  While
     /// active, subsequent ticks pick up the new rects automatically.
-    func updateLayout(sourceRect: CGRect, cameraRect: CGRect, targetPtsMs: Int) {
+    func updateLayout(sourceRect: CGRect, cameraRect: CGRect, targetPtsMs: Int,
+                      isGreenScreenLayout: Bool = false) {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
-        self.sourceRect = sourceRect
-        self.cameraRect = cameraRect
+        self.sourceRect          = sourceRect
+        self.cameraRect          = cameraRect
+        self.isGreenScreenLayout = isGreenScreenLayout
         submit(.decode(.step(targetPtsMs: clamp(targetPtsMs)), forceRender: true))
     }
 
@@ -317,20 +340,27 @@ final class VGDuetPreviewRenderLoop {
 
     private func render(frame: CVPixelBuffer?) {
         inFlight = true
-        let sRect = sourceRect
-        let cRect = cameraRect
-        let compositor = self.compositor
+        let sRect       = sourceRect
+        let cRect       = cameraRect
+        let isGS        = isGreenScreenLayout
+        let compositor  = self.compositor
         // Snapshot the live camera frame *before* crossing the queue boundary.
         // snapshotRetained() returns a +1 retain; we release it after compositing.
         let cameraSnap: Unmanaged<CVPixelBuffer>? = cameraFrameProvider?()
         let cameraBuffer: CVPixelBuffer? = cameraSnap.map { $0.takeUnretainedValue() }
+        // Snapshot the segmentation mask for green-screen; +1 retain released after compositing.
+        let maskSnap: Unmanaged<CVPixelBuffer>? = isGS ? maskProvider?() : nil
+        let maskBuffer: CVPixelBuffer? = maskSnap.map { $0.takeUnretainedValue() }
         renderQueue.async { [weak self] in
             let output = compositor.composite(sourceFrame: frame,
                                               sourceRect: sRect,
                                               cameraRect: cRect,
-                                              cameraFrame: cameraBuffer)
-            // Release the retained snapshot now that compositing is done.
+                                              cameraFrame: cameraBuffer,
+                                              isGreenScreen: isGS,
+                                              greenScreenMask: maskBuffer)
+            // Release the retained snapshots now that compositing is done.
             cameraSnap?.release()
+            maskSnap?.release()
             DispatchQueue.main.async {
                 self?.didRender(output)
             }

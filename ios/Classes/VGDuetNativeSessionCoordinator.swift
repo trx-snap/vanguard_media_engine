@@ -89,6 +89,11 @@ final class VGDuetNativeSession {
     // Stopped in releasePreviewTexture before the render loop and texture teardown.
     var cameraSource: VGDuetCameraSource?
 
+    // Green-screen adapter: wraps VanguardMLSegmenter for person keying.
+    // Non-nil only when the effective layout at attach time is greenScreen.
+    // Invalidated before cameraSource.stop() in all terminal paths.
+    var greenScreenAdapter: VGDuetGreenScreenAdapter?
+
     init(sessionId: String,
          sourceMap: [String: Any],
          trimWindowMap: [String: Any],
@@ -192,8 +197,13 @@ final class VGDuetNativeSessionCoordinator {
     /// Slice 4B-B: the render loop is stopped first so no present can race the
     /// texture invalidation / unregister below.
     private func releasePreviewTexture(for session: VGDuetNativeSession) {
+        // Green-screen: invalidate adapter before camera stop so no frames are
+        // submitted to the segmenter after teardown begins.
+        session.greenScreenAdapter?.invalidate()
+        session.greenScreenAdapter = nil
         // Camera ingress: stop before the render loop so no frame snapshot is
         // taken after the loop drains its in-flight pipeline.
+        session.cameraSource?.setFrameObserver(nil)
         session.cameraSource?.stop()
         session.cameraSource = nil
         stopPreviewRenderLoop(for: session)
@@ -269,6 +279,23 @@ final class VGDuetNativeSessionCoordinator {
         // the current clock cursor otherwise).  If the session is already
         // recording (re-attach mid-take) the loop goes active immediately.
         //
+        // Green-screen: if the effective layout is greenScreen, create and start
+        // the adapter BEFORE camera start so frames are routed to the segmenter
+        // from the first delivered frame.
+        let effectiveMode = (effectiveLayoutMap["mode"] as? String) ?? "pip"
+        let isGreenScreen = (effectiveMode == "greenScreen")
+
+        if isGreenScreen, session.greenScreenAdapter == nil {
+            let adapter = VGDuetGreenScreenAdapter()
+            session.greenScreenAdapter = adapter
+            // Wire the session-failure handler BEFORE adapter.start().
+            adapter.onSessionFailure = { [weak self, weak session] in
+                guard let self = self, let session = session else { return }
+                self._handleGreenScreenAdapterFailure(session: session)
+            }
+            adapter.start()
+        }
+
         // Camera ingress: create + start the camera source now (not at initializeSession)
         // because the render loop is what consumes its frames.  Guard idempotency: if a
         // cameraSource already exists (should not happen given the early-return above),
@@ -276,17 +303,23 @@ final class VGDuetNativeSessionCoordinator {
         if session.cameraSource == nil {
             let cam = VGDuetCameraSource()
             session.cameraSource = cam
+            if isGreenScreen, let adapter = session.greenScreenAdapter {
+                cam.setFrameObserver { [weak adapter] pixelBuffer, pts in
+                    adapter?.submitFrame(pixelBuffer, presentationTime: pts)
+                }
+            }
             cam.start()
         }
 
         let loop = makePreviewRenderLoop(
-            session:      session,
-            texture:      previewTexture,
-            textureId:    textureId,
-            registry:     registry,
-            canvasWidth:  width,
-            canvasHeight: height,
-            rects:        typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
+            session:             session,
+            texture:             previewTexture,
+            textureId:           textureId,
+            registry:            registry,
+            canvasWidth:         width,
+            canvasHeight:        height,
+            rects:               typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height),
+            isGreenScreenLayout: isGreenScreen
         )
         session.previewRenderLoop = loop
         loop.renderInitialFrame()
@@ -395,24 +428,26 @@ final class VGDuetNativeSessionCoordinator {
     /// injected decode handler, and presents go texture → textureFrameAvailable
     /// on main.  Captures avoid retain cycles (session weak, no self).
     private func makePreviewRenderLoop(
-        session:      VGDuetNativeSession,
-        texture:      VGDuetPreviewTexture,
-        textureId:    Int64,
-        registry:     FlutterTextureRegistry,
-        canvasWidth:  Double,
-        canvasHeight: Double,
-        rects:        (source: CGRect, camera: CGRect)
+        session:             VGDuetNativeSession,
+        texture:             VGDuetPreviewTexture,
+        textureId:           Int64,
+        registry:            FlutterTextureRegistry,
+        canvasWidth:         Double,
+        canvasHeight:        Double,
+        rects:               (source: CGRect, camera: CGRect),
+        isGreenScreenLayout: Bool = false
     ) -> VGDuetPreviewRenderLoop {
         let compositor   = VGDuetPreviewCompositor(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
         let clock        = session.previewClock
         let decoderQueue = self.decoderQueue
 
         return VGDuetPreviewRenderLoop(
-            compositor:  compositor,
-            trimStartMs: session.trimStartMs,
-            trimEndMs:   session.trimEndMs,
-            sourceRect:  rects.source,
-            cameraRect:  rects.camera,
+            compositor:          compositor,
+            trimStartMs:         session.trimStartMs,
+            trimEndMs:           session.trimEndMs,
+            sourceRect:          rects.source,
+            cameraRect:          rects.camera,
+            isGreenScreenLayout: isGreenScreenLayout,
             targetPtsProvider: {
                 clock.currentSourcePtsMs()
             },
@@ -444,6 +479,10 @@ final class VGDuetNativeSessionCoordinator {
             cameraFrameProvider: { [weak session] in
                 // Called on main or renderQueue; returns nil when camera not yet ready.
                 session?.cameraSource?.snapshotRetained()
+            },
+            maskProvider: { [weak session] in
+                // Called on renderQueue when isGreenScreen; returns nil when no fresh mask.
+                session?.greenScreenAdapter?.latestMaskRetained()
             }
         )
     }
@@ -639,6 +678,31 @@ final class VGDuetNativeSessionCoordinator {
         if session.previewTexture != nil,
            let width  = session.previewWidthPx,
            let height = session.previewHeightPx {
+            let newMode      = (layoutConfigMap["mode"] as? String) ?? "pip"
+            let newIsGS      = (newMode == "greenScreen")
+            let currentIsGS  = (session.greenScreenAdapter != nil)
+
+            // Enable adapter when entering greenScreen.
+            if newIsGS && !currentIsGS {
+                let adapter = VGDuetGreenScreenAdapter()
+                session.greenScreenAdapter = adapter
+                adapter.onSessionFailure = { [weak self, weak session] in
+                    guard let self = self, let session = session else { return }
+                    self._handleGreenScreenAdapterFailure(session: session)
+                }
+                adapter.start()
+                session.cameraSource?.setFrameObserver { [weak adapter] pixelBuffer, pts in
+                    adapter?.submitFrame(pixelBuffer, presentationTime: pts)
+                }
+            }
+
+            // Disable adapter when leaving greenScreen.
+            if !newIsGS && currentIsGS {
+                session.cameraSource?.setFrameObserver(nil)
+                session.greenScreenAdapter?.invalidate()
+                session.greenScreenAdapter = nil
+            }
+
             let typedRects = computeLayoutRects(
                 layoutConfigMap: layoutConfigMap,
                 canvasWidth:  CGFloat(width),
@@ -647,9 +711,10 @@ final class VGDuetNativeSessionCoordinator {
             session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
             let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
             session.previewRenderLoop?.updateLayout(
-                sourceRect:  rects.source,
-                cameraRect:  rects.camera,
-                targetPtsMs: session.previewClock.currentSourcePtsMs())
+                sourceRect:          rects.source,
+                cameraRect:          rects.camera,
+                targetPtsMs:         session.previewClock.currentSourcePtsMs(),
+                isGreenScreenLayout: newIsGS)
         }
         reply(nil, nil)
     }
@@ -815,6 +880,60 @@ final class VGDuetNativeSessionCoordinator {
             decoderQueue.async { dec?.release() }
         }
         activeSession = nil
+    }
+
+    // MARK: - Green-screen adapter failure handler
+
+    /// Called on the main thread when VGDuetGreenScreenAdapter observes VanguardMLStateFaulted.
+    /// Deterministically falls back to PiP so the session is never left with an
+    /// opaque unkeyed green-screen layout.
+    ///
+    /// Fallback PiP rect: left 0.62, top 0.68, width 0.32, height 0.24, pipAnchor bottomRight.
+    private func _handleGreenScreenAdapterFailure(session: VGDuetNativeSession) {
+        assert(Thread.isMainThread)
+
+        // Guard: only act if this session is still active and still in greenScreen.
+        guard session === activeSession else { return }
+        let currentMode = (session.layoutConfigMap["mode"] as? String) ?? ""
+        guard currentMode == "greenScreen" else { return }
+
+        NSLog("[VGDuetNativeSessionCoordinator] Green-screen adapter faulted — falling back to PiP")
+
+        // 1. Disable the adapter and clear the camera observer.
+        session.cameraSource?.setFrameObserver(nil)
+        session.greenScreenAdapter?.invalidate()
+        session.greenScreenAdapter = nil
+
+        // 2. Update the session layout config to the deterministic PiP fallback.
+        let fallbackPipRect: [String: Any] = [
+            "left":   0.62,
+            "top":    0.68,
+            "width":  0.32,
+            "height": 0.24,
+        ]
+        let fallbackLayoutConfig: [String: Any] = [
+            "mode":             "pip",
+            "pipAnchor":        "bottomRight",
+            "pipNormalizedRect": fallbackPipRect,
+        ]
+        session.layoutConfigMap = fallbackLayoutConfig
+
+        // 3. Recompute rects and update the render loop (if texture is attached).
+        guard let width  = session.previewWidthPx,
+              let height = session.previewHeightPx else { return }
+
+        let typedRects = computeLayoutRects(
+            layoutConfigMap: fallbackLayoutConfig,
+            canvasWidth:  CGFloat(width),
+            canvasHeight: CGFloat(height)
+        )
+        session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
+        let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
+        session.previewRenderLoop?.updateLayout(
+            sourceRect:          rects.source,
+            cameraRect:          rects.camera,
+            targetPtsMs:         session.previewClock.currentSourcePtsMs(),
+            isGreenScreenLayout: false)
     }
 
     // MARK: - Private helpers
