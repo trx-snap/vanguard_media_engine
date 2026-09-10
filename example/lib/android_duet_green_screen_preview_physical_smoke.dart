@@ -13,14 +13,17 @@
 //       * preview texture attach success
 //       * startRecording activates render loop/camera
 //       * bounded green-screen preview remains active
+//       * MediaPipe CPU primary (`mediapipe_cpu`) selected when model asset is bundled
+//       * native `ANDROID_DUET_GREENSCREEN_MEDIAPIPE_MASK_FIRST` log may evidence first MediaPipe mask
+//       * native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload
 //       * layout update away from greenScreen to PiP works
 //       * stop/detach/dispose/temp cleanup complete
-//       * native log from compositor may additionally evidence that at least one ML Kit mask reached GLES upload
 //   - Non-claims:
-//       * no automated pixel-quality/key-edge proof
-//       * no export MP4 proof
-//       * no mic/audio proof
-//       * no ConnectsApp/Universal Editor/upload wiring
+//       * no MediaPipe GPU delegate proof
+//       * no temporal smoothing/adaptive quality proof
+//       * no low-end/budget Android proof
+//       * no automated pixel/matte quality proof
+//       * no export/audio/speed/app wiring proof
 
 // ignore_for_file: avoid_print
 
@@ -120,7 +123,9 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         if (!failures.contains(failureMsg)) {
           failures.add(failureMsg);
         }
-        print('ANDROID_DUET_GREENSCREEN_PREVIEW_STEP_${stepName}_FAIL: $e\n$st');
+        print(
+          'ANDROID_DUET_GREENSCREEN_PREVIEW_STEP_${stepName}_FAIL: $e\n$st',
+        );
         rethrow;
       }
     }
@@ -131,7 +136,9 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         'STAGE_FIXTURE',
         'Staging clip_A.mov into temp directory',
         () async {
-          tempDir = await Directory.systemTemp.createTemp('duet_greenscreen_smoke_');
+          tempDir = await Directory.systemTemp.createTemp(
+            'duet_greenscreen_smoke_',
+          );
           final targetFile = File('${tempDir!.path}/clip_A.mov');
           final byteData = await rootBundle.load(
             'assets/manual_test_clips/clip_A.mov',
@@ -276,7 +283,9 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
       );
 
       // Step 10: Detach preview texture
-      await runStep<void>('DETACH_PREVIEW', 'Detaching preview texture', () async {
+      await runStep<
+        void
+      >('DETACH_PREVIEW', 'Detaching preview texture', () async {
         try {
           await _withTimeout(
             _platform.detachPreviewTexture(sessionId: sessionId!),
@@ -352,7 +361,9 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
             );
             isDisposed = true;
           } catch (e) {
-            print('ANDROID_DUET_GREENSCREEN_PREVIEW: cleanup disposeSession note: $e');
+            print(
+              'ANDROID_DUET_GREENSCREEN_PREVIEW: cleanup disposeSession note: $e',
+            );
           }
         }
       }
@@ -364,29 +375,33 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
             isFixtureCleaned = true;
           }
         } catch (e) {
-          print('ANDROID_DUET_GREENSCREEN_PREVIEW: cleanup tempDir delete note: $e');
+          print(
+            'ANDROID_DUET_GREENSCREEN_PREVIEW: cleanup tempDir delete note: $e',
+          );
         }
       }
 
       final payload = <String, Object?>{
         'pass': pass,
-        'proofBoundary':
-            'android_duet_green_screen_preview_physical_smoke',
+        'proofBoundary': 'android_duet_green_screen_preview_physical_smoke',
         'claimsAllowed': <String>[
           'local source session init',
           'attach-time greenScreen layout accepted',
           'preview texture attach success',
           'startRecording activates render loop/camera',
           'bounded green-screen preview remains active',
+          'MediaPipe CPU primary (`mediapipe_cpu`) selected when model asset is bundled',
+          'native `ANDROID_DUET_GREENSCREEN_MEDIAPIPE_MASK_FIRST` log may evidence first MediaPipe mask',
+          'native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload',
           'layout update away from greenScreen to PiP works',
           'stop/detach/dispose/temp cleanup complete',
-          'native log from compositor may additionally evidence that at least one ML Kit mask reached GLES upload',
         ],
         'nonClaims': <String>[
-          'no automated pixel-quality/key-edge proof',
-          'no export MP4 proof',
-          'no mic/audio proof',
-          'no ConnectsApp/Universal Editor/upload wiring',
+          'no MediaPipe GPU delegate proof',
+          'no temporal smoothing/adaptive quality proof',
+          'no low-end/budget Android proof',
+          'no automated pixel/matte quality proof',
+          'no export/audio/speed/app wiring proof',
         ],
         'sessionId': sessionId,
         'textureId': textureId,
