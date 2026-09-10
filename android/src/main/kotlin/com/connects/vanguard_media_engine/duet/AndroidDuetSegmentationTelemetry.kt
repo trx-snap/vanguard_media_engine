@@ -4,29 +4,51 @@ import android.os.SystemClock
 import android.util.Log
 
 // -----------------------------------------------------------------------------
-// VG-DUET-GREEN-SCREEN: Lightweight raw_tflite_gpu inference telemetry.
+// VG-DUET-GREEN-SCREEN: Backend-neutral segmentation completion telemetry.
 // -----------------------------------------------------------------------------
 //
-// Scoped to one [AndroidDuetGreenScreenAdapter] lifetime. Only records while
-// the completed callback's backend is [DuetSegmentationBackend.RAW_TFLITE_GPU]
-// (the debug/smoke opt-in rung); every other backend is a no-op. This is a
-// pure observation seam — it never influences frame closing, in-flight
-// release, backend fallback, or mask delivery, and every public method
-// catches and logs its own failures rather than throwing back into the
-// adapter's frame-completion path.
+// Scoped to one [AndroidDuetGreenScreenAdapter] lifetime. Records every
+// completed segmentation callback regardless of backend (production ladder:
+// mediapipe_cpu -> mlkit; debug/smoke ladder additionally includes
+// raw_tflite_gpu). This is a pure observation seam — it never influences
+// frame closing, in-flight release, backend fallback, quality-policy
+// decisions, or mask delivery, and every public method catches and logs its
+// own failures rather than throwing back into the adapter's frame-completion
+// path.
+//
+// [durationMs] passed to [recordCompletion] is the adapter's dispatch-to-
+// completion wall time measured around backend.segment() in
+// AndroidDuetGreenScreenAdapter, not pure model inference time; it may
+// include backend-internal queuing/dispatch overhead.
 
 internal class AndroidDuetSegmentationTelemetry {
 
     companion object {
-        private const val TAG = "DuetRawGpuTelemetry"
+        private const val TAG = "DuetSegmentationTelemetry"
 
-        /** raw_tflite_gpu quality-tier inference budget (ms); mirrors AndroidDuetAdaptiveQualityPolicy's QUALITY_BUDGET_MS. */
-        private const val RAW_GPU_BUDGET_MS = 35L
+        /**
+         * Quality-tier dispatch-to-completion budget (ms); mirrors
+         * AndroidDuetAdaptiveQualityPolicy's QUALITY_BUDGET_MS. Used as a
+         * comparable over-budget threshold across all backends.
+         */
+        private const val QUALITY_BUDGET_MS = 35L
 
         private const val STATS_LOG_INTERVAL = 30
 
-        const val STATS_MARKER = "ANDROID_DUET_RAW_TFLITE_GPU_INFERENCE_STATS"
-        const val SUMMARY_MARKER = "ANDROID_DUET_RAW_TFLITE_GPU_INFERENCE_SUMMARY"
+        /** Backend-neutral periodic stats marker; covers every backend. */
+        const val STATS_MARKER = "ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS"
+
+        /** Backend-neutral end-of-session summary marker; covers every backend. */
+        const val SUMMARY_MARKER = "ANDROID_DUET_GREENSCREEN_SEGMENTATION_SUMMARY"
+
+        /**
+         * Raw raw_tflite_gpu-only markers, kept for backward compatibility with
+         * existing raw GPU proof/log parsers. Logged in addition to the neutral
+         * markers whenever the observed sample/backend path includes
+         * raw_tflite_gpu.
+         */
+        const val RAW_GPU_STATS_MARKER = "ANDROID_DUET_RAW_TFLITE_GPU_INFERENCE_STATS"
+        const val RAW_GPU_SUMMARY_MARKER = "ANDROID_DUET_RAW_TFLITE_GPU_INFERENCE_SUMMARY"
     }
 
     private val lock = Any()
@@ -38,6 +60,11 @@ internal class AndroidDuetSegmentationTelemetry {
     private var maxDurationMs = 0L
     private var overBudget = 0
     private var startedAtElapsedMs: Long? = null
+    private var latestBackendId: String? = null
+    private val observedBackendIds = linkedSetOf<String>()
+
+    /** True once at least one completed callback was recorded for raw_tflite_gpu. */
+    private var sawRawGpu = false
 
     private data class Snapshot(
         val count: Int,
@@ -48,13 +75,17 @@ internal class AndroidDuetSegmentationTelemetry {
         val maxMs: Long,
         val overBudget: Int,
         val elapsedMs: Long,
+        val latestBackendId: String,
+        val backendIds: List<String>,
+        val sawRawGpu: Boolean,
     )
 
     /**
-     * Records one completed segmentation callback for [backendId]. No-op for
-     * any backend other than [DuetSegmentationBackend.RAW_TFLITE_GPU]. Logs a
-     * periodic [STATS_MARKER] line every [STATS_LOG_INTERVAL] completed raw
-     * GPU callbacks. Never throws.
+     * Records one completed segmentation callback for [backendId], whichever
+     * backend produced it (production or debug/smoke ladder alike). Logs a
+     * periodic [STATS_MARKER] line every [STATS_LOG_INTERVAL] completed
+     * callbacks (plus a legacy [RAW_GPU_STATS_MARKER] line when [backendId] is
+     * raw_tflite_gpu). Never throws.
      */
     fun recordCompletion(
         backendId: String,
@@ -63,7 +94,6 @@ internal class AndroidDuetSegmentationTelemetry {
         quality: String,
         thermal: String,
     ) {
-        if (backendId != DuetSegmentationBackend.RAW_TFLITE_GPU) return
         try {
             var dueForStats = false
             synchronized(lock) {
@@ -71,12 +101,15 @@ internal class AndroidDuetSegmentationTelemetry {
                 count += 1
                 totalDurationMs += durationMs
                 if (durationMs > maxDurationMs) maxDurationMs = durationMs
-                if (durationMs > RAW_GPU_BUDGET_MS) overBudget += 1
+                if (durationMs > QUALITY_BUDGET_MS) overBudget += 1
                 when (outcome) {
                     is DuetSegmentationOutcome.Mask -> masks += 1
                     is DuetSegmentationOutcome.Skipped -> skipped += 1
                     is DuetSegmentationOutcome.Failure -> failures += 1
                 }
+                latestBackendId = backendId
+                observedBackendIds.add(backendId)
+                if (backendId == DuetSegmentationBackend.RAW_TFLITE_GPU) sawRawGpu = true
                 dueForStats = count % STATS_LOG_INTERVAL == 0
             }
             if (dueForStats) logStats(quality, thermal)
@@ -86,8 +119,9 @@ internal class AndroidDuetSegmentationTelemetry {
     }
 
     /**
-     * Logs [SUMMARY_MARKER] if at least one raw GPU callback was recorded;
-     * otherwise a no-op. Never throws.
+     * Logs [SUMMARY_MARKER] (plus a legacy [RAW_GPU_SUMMARY_MARKER] line if any
+     * recorded callback was raw_tflite_gpu) if at least one callback was
+     * recorded; otherwise a no-op. Never throws.
      */
     fun logSummary(
         finalBackend: String,
@@ -99,13 +133,25 @@ internal class AndroidDuetSegmentationTelemetry {
         try {
             val snapshot = snapshot()
             if (snapshot.count == 0) return
+            val backends = snapshot.backendIds.joinToString(",")
             Log.i(
                 TAG,
-                "$SUMMARY_MARKER count=${snapshot.count} masks=${snapshot.masks} skipped=${snapshot.skipped} " +
-                    "failures=${snapshot.failures} avgMs=${snapshot.avgMs} maxMs=${snapshot.maxMs} " +
-                    "overBudget=${snapshot.overBudget} elapsedMs=${snapshot.elapsedMs} finalBackend=$finalBackend " +
-                    "degraded=$degraded terminal=$terminal quality=$quality thermal=$thermal",
+                "$SUMMARY_MARKER backends=$backends count=${snapshot.count} masks=${snapshot.masks} " +
+                    "skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
+                    "maxMs=${snapshot.maxMs} overBudget=${snapshot.overBudget} qualityBudgetMs=$QUALITY_BUDGET_MS " +
+                    "elapsedMs=${snapshot.elapsedMs} quality=$quality thermal=$thermal finalBackend=$finalBackend " +
+                    "degraded=$degraded terminal=$terminal",
             )
+            if (snapshot.sawRawGpu) {
+                Log.i(
+                    TAG,
+                    "$RAW_GPU_SUMMARY_MARKER count=${snapshot.count} masks=${snapshot.masks} " +
+                        "skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
+                        "maxMs=${snapshot.maxMs} overBudget=${snapshot.overBudget} elapsedMs=${snapshot.elapsedMs} " +
+                        "finalBackend=$finalBackend degraded=$degraded terminal=$terminal quality=$quality " +
+                        "thermal=$thermal",
+                )
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "logSummary failed: ${t.javaClass.simpleName}: ${t.message}")
         }
@@ -113,17 +159,40 @@ internal class AndroidDuetSegmentationTelemetry {
 
     private fun logStats(quality: String, thermal: String) {
         val snapshot = snapshot()
+        val backends = snapshot.backendIds.joinToString(",")
         Log.i(
             TAG,
-            "$STATS_MARKER count=${snapshot.count} masks=${snapshot.masks} skipped=${snapshot.skipped} " +
-                "failures=${snapshot.failures} avgMs=${snapshot.avgMs} maxMs=${snapshot.maxMs} " +
-                "overBudget=${snapshot.overBudget} elapsedMs=${snapshot.elapsedMs} quality=$quality thermal=$thermal",
+            "$STATS_MARKER backends=$backends count=${snapshot.count} masks=${snapshot.masks} " +
+                "skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
+                "maxMs=${snapshot.maxMs} overBudget=${snapshot.overBudget} qualityBudgetMs=$QUALITY_BUDGET_MS " +
+                "elapsedMs=${snapshot.elapsedMs} quality=$quality thermal=$thermal",
         )
+        if (snapshot.sawRawGpu) {
+            Log.i(
+                TAG,
+                "$RAW_GPU_STATS_MARKER count=${snapshot.count} masks=${snapshot.masks} " +
+                    "skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
+                    "maxMs=${snapshot.maxMs} overBudget=${snapshot.overBudget} elapsedMs=${snapshot.elapsedMs} " +
+                    "quality=$quality thermal=$thermal",
+            )
+        }
     }
 
     private fun snapshot(): Snapshot = synchronized(lock) {
         val avg = if (count > 0) totalDurationMs / count else 0L
         val elapsed = startedAtElapsedMs?.let { SystemClock.elapsedRealtime() - it } ?: 0L
-        Snapshot(count, masks, skipped, failures, avg, maxDurationMs, overBudget, elapsed)
+        Snapshot(
+            count = count,
+            masks = masks,
+            skipped = skipped,
+            failures = failures,
+            avgMs = avg,
+            maxMs = maxDurationMs,
+            overBudget = overBudget,
+            elapsedMs = elapsed,
+            latestBackendId = latestBackendId ?: "",
+            backendIds = observedBackendIds.toList(),
+            sawRawGpu = sawRawGpu,
+        )
     }
 }
