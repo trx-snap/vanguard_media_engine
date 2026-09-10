@@ -22,6 +22,9 @@ import java.util.UUID
 //     replies always on main thread.
 //   - Asynchronous decoder release without blocking the main thread.
 //   - Auto-stop: if trimEnd is reached, enters COMPLETED state; stopDuetRecording returns descriptor.
+//   - Slice 4B-C: wires AndroidDuetPreviewRenderLoop behind the preview texture
+//     lifecycle (attach / surface available / surface lost / detach) and the
+//     recording transport (start/pause/resume/deleteLastSegment/updateLayout).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State machine
@@ -68,11 +71,17 @@ class VGDuetAndroidSession(
     // Slice 4A: preview surface producer attachment.
     // Allocated on attachDuetPreviewTexture, released on detach/stop/dispose.
     var previewProducer: AndroidDuetPreviewSurfaceProducer? = null
+    // Slice 4B-C: render loop pumping decoder frames into the producer's Surface.
+    // Created alongside previewProducer, stopped and cleared with it.
+    var previewRenderLoop: AndroidDuetPreviewRenderLoop? = null
     // Original dimensions and layout rects stored on first attach;
     // returned verbatim on repeated (idempotent) attach calls.
     var previewWidthPx:    Int? = null
     var previewHeightPx:   Int? = null
     var previewLayoutRects: Map<String, Any>? = null
+    // Typed twin of previewLayoutRects, fed to the render loop on (re)attach.
+    // Recomputed by updateLayout while a preview is attached.
+    var previewTypedLayoutRects: VGDuetLayoutRects? = null
 
     fun startSegment() {
         previewClock.startSegment()
@@ -343,8 +352,8 @@ class AndroidDuetSessionCoordinator(
                 val decoder = AndroidDuetSourceVideoDecoder(filePath = filePath)
                 var prepErr: String? = null
                 try {
-                    // Slice 4B-A: headless sink for now; a compositor-owned Surface
-                    // arrives via rebindOutputSurface in a later slice.
+                    // Headless sink until a preview attaches; the render loop then
+                    // rebinds the compositor-owned Surface via rebindOutputSurface.
                     decoder.prepare(trimStartMs.toLong(), outputSurface = null)
                 } catch (e: Exception) {
                     prepErr = e.message ?: "Failed to prepare decoder."
@@ -409,6 +418,24 @@ class AndroidDuetSessionCoordinator(
             }
         }
         session.layoutConfigMap = layoutConfigMap
+        // Slice 4B-C: while a preview is attached, keep the stored rects in sync
+        // and push the new layout (plus the current hold PTS) into the render loop.
+        val widthPx  = session.previewWidthPx
+        val heightPx = session.previewHeightPx
+        if (widthPx != null && heightPx != null) {
+            val typedRects = buildTypedLayoutRects(layoutConfigMap, widthPx.toDouble(), heightPx.toDouble())
+            session.previewTypedLayoutRects = typedRects
+            session.previewLayoutRects = typedRects?.let {
+                mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
+            }
+            if (typedRects != null) {
+                session.previewRenderLoop?.updateLayout(
+                    typedRects.source,
+                    typedRects.camera,
+                    session.previewClock.currentSourcePtsMs().toLong(),
+                )
+            }
+        }
         reply(null, null)
     }
 
@@ -455,6 +482,11 @@ class AndroidDuetSessionCoordinator(
         }
         session.state = VGDuetSessionState.RECORDING
         session.startSegment()
+        // Slice 4B-C: active playback. The provider runs on the main thread only,
+        // so reading the preview clock here is safe.
+        session.previewRenderLoop?.startActive {
+            session.previewClock.currentSourcePtsMs().toLong()
+        }
         reply(null, null)
     }
 
@@ -468,10 +500,7 @@ class AndroidDuetSessionCoordinator(
         session.commitSegment()
         session.state = if (session.previewClock.isAutoStopped) VGDuetSessionState.COMPLETED else VGDuetSessionState.PAUSED
         val targetPts = session.previewClock.currentSourcePtsMs().toLong()
-        val dec = session.decoder
-        if (dec != null) {
-            decoderHandler.post { dec.stepFrame(targetPts) }
-        }
+        session.previewRenderLoop?.pauseAndHold(targetPts)
         reply(null, null)
     }
 
@@ -484,6 +513,9 @@ class AndroidDuetSessionCoordinator(
         }
         session.state = VGDuetSessionState.RECORDING
         session.startSegment()
+        session.previewRenderLoop?.startActive {
+            session.previewClock.currentSourcePtsMs().toLong()
+        }
         reply(null, null)
     }
 
@@ -499,10 +531,7 @@ class AndroidDuetSessionCoordinator(
             session.state = VGDuetSessionState.PAUSED
         }
         val targetPts = session.previewClock.currentSourcePtsMs().toLong()
-        val dec = session.decoder
-        if (dec != null) {
-            decoderHandler.post { dec.seekTo(targetPts) }
-        }
+        session.previewRenderLoop?.seekAndHold(targetPts)
         reply(null, null)
     }
 
@@ -541,30 +570,96 @@ class AndroidDuetSessionCoordinator(
         val heightPx = ((canvasSizeMap["height"] as? Number)?.toDouble() ?: 1920.0).toInt()
 
         // Finding #3: wrap producer construction; don't partially attach on failure.
+        // Slice 4B-C: hooks capture the sessionId only; everything else is
+        // resolved through activeSession when the callback fires.
         val producer = try {
             AndroidDuetPreviewSurfaceProducer(
-                textureRegistry = registry,
-                mainHandler     = mainHandler,
-                widthPx         = widthPx,
-                heightPx        = heightPx,
+                textureRegistry    = registry,
+                mainHandler        = mainHandler,
+                widthPx            = widthPx,
+                heightPx           = heightPx,
+                onSurfaceAvailable = { handlePreviewSurfaceAvailable(sessionId) },
+                onSurfaceLost      = { handlePreviewSurfaceLost(sessionId) },
             )
         } catch (t: Throwable) {
             reply(null, errorMsg("composition_failed",
                 "attachDuetPreviewTexture: failed to create SurfaceProducer: ${t.message}"))
             return
         }
-        session.previewProducer = producer
+
+        val renderLoop = try {
+            AndroidDuetPreviewRenderLoop(mainHandler, decoderHandler) { session.decoder }
+        } catch (t: Throwable) {
+            producer.release()
+            reply(null, errorMsg("composition_failed",
+                "attachDuetPreviewTexture: failed to create render loop: ${t.message}"))
+            return
+        }
+
+        session.previewProducer   = producer
+        session.previewRenderLoop = renderLoop
 
         // Compute optional layout rects from the effective layoutConfig.
         val effectiveLayoutMap = layoutConfigMap ?: session.layoutConfigMap
-        val layoutRects = buildLayoutRects(effectiveLayoutMap, widthPx.toDouble(), heightPx.toDouble())
+        val typedRects = buildTypedLayoutRects(effectiveLayoutMap, widthPx.toDouble(), heightPx.toDouble())
+        val layoutRects = typedRects?.let {
+            mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
+        }
 
         // Store original values so idempotent re-attach returns them verbatim.
         session.previewWidthPx    = widthPx
         session.previewHeightPx   = heightPx
         session.previewLayoutRects = layoutRects
+        session.previewTypedLayoutRects = typedRects
+
+        // The eager probe in the producer's init never fires the availability
+        // hook, so bootstrap the render loop here when the surface already exists.
+        if (producer.state == DuetSurfaceState.SURFACE_AVAILABLE && typedRects != null) {
+            val surface = producer.acquireSurface()
+            if (surface != null) {
+                renderLoop.attachOutputSurface(
+                    surface, widthPx, heightPx,
+                    typedRects.source, typedRects.camera,
+                    session.previewClock.currentSourcePtsMs().toLong(),
+                )
+            }
+        }
 
         reply(producer.toResultMap(widthPx, heightPx, layoutRects), null)
+    }
+
+    // ── Preview surface lifecycle hooks (Slice 4B-C) ──────────────────────────
+
+    /**
+     * Fires synchronously inside the producer's platform-thread callback when the
+     * Flutter surface (re)appears. Re-attaches the render loop's output using the
+     * stored attach-time dimensions/layout and the current hold PTS.
+     */
+    private fun handlePreviewSurfaceAvailable(sessionId: String) {
+        val session = activeSession ?: return
+        if (session.sessionId != sessionId) return
+        val producer   = session.previewProducer   ?: return
+        val renderLoop = session.previewRenderLoop ?: return
+        val widthPx    = session.previewWidthPx    ?: return
+        val heightPx   = session.previewHeightPx   ?: return
+        val typedRects = session.previewTypedLayoutRects ?: return
+        val surface = producer.acquireSurface() ?: return
+        renderLoop.attachOutputSurface(
+            surface, widthPx, heightPx,
+            typedRects.source, typedRects.camera,
+            session.previewClock.currentSourcePtsMs().toLong(),
+        )
+    }
+
+    /**
+     * Fires synchronously inside the producer's platform-thread cleanup callback.
+     * Must not block: the loop gates further submissions immediately and detaches
+     * its EGL surface asynchronously on the render thread.
+     */
+    private fun handlePreviewSurfaceLost(sessionId: String) {
+        val session = activeSession ?: return
+        if (session.sessionId != sessionId) return
+        session.previewRenderLoop?.handleOutputSurfaceLost()
     }
 
     // ── detachPreviewTexture (Slice 4A) ───────────────────────────────────────
@@ -580,43 +675,47 @@ class AndroidDuetSessionCoordinator(
     // ── Preview release helper ────────────────────────────────────────────────
 
     /**
-     * Releases and nulls the session's preview producer if one is attached.
+     * Releases and nulls the session's preview producer and render loop.
      *
-     * Slice 4B-A two-phase seam: beginRelease() detaches callbacks and marks DETACHED;
-     * a later compositor stop belongs between the two calls. No compositor exists yet,
-     * so the phases run back to back.
+     * Slice 4B-A two-phase seam, now filled in by 4B-C: beginRelease() detaches
+     * callbacks and marks DETACHED, the render loop stops (blocking, bounded)
+     * between the phases so nothing submits into the dying Surface, then
+     * finishRelease() drops the producer.
+     *
+     * Must be called while session.decoder is still non-null: stopBlocking's
+     * unbind reaches the decoder through the loop's decoderProvider.
      */
     private fun releasePreviewProducer(session: VGDuetAndroidSession) {
         val producer = session.previewProducer
-        if (producer != null) {
-            producer.beginRelease()
-            producer.finishRelease()
-        }
+        val renderLoop = session.previewRenderLoop
+        producer?.beginRelease()
+        renderLoop?.stopBlocking(session.previewClock.currentSourcePtsMs().toLong())
+        producer?.finishRelease()
         session.previewProducer    = null
+        session.previewRenderLoop  = null
         session.previewWidthPx     = null
         session.previewHeightPx    = null
         session.previewLayoutRects = null
+        session.previewTypedLayoutRects = null
     }
 
     // ── Layout rect builder ───────────────────────────────────────────────────
 
-    @Suppress("UNCHECKED_CAST")
-    private fun buildLayoutRects(
+    /** Typed geometry shared by the MethodChannel reply map and the render loop. */
+    private fun buildTypedLayoutRects(
         layoutConfigMap: Map<String, Any?>,
         canvasWidth:  Double,
         canvasHeight: Double,
-    ): Map<String, Any>? {
+    ): VGDuetLayoutRects? {
         val mode = layoutConfigMap["mode"] as? String ?: "pip"
         return when (mode) {
             "splitLeftRight" -> {
                 val swapped = layoutConfigMap["isSideSwapped"] as? Boolean ?: false
-                val rects = AndroidDuetLayoutGeometry.splitLeftRight(canvasWidth, canvasHeight, swapped)
-                mapOf("source" to rects.source.toMap(), "camera" to rects.camera.toMap())
+                AndroidDuetLayoutGeometry.splitLeftRight(canvasWidth, canvasHeight, swapped)
             }
             "splitTopBottom" -> {
                 val swapped = layoutConfigMap["isTopBottomSwapped"] as? Boolean ?: false
-                val rects = AndroidDuetLayoutGeometry.splitTopBottom(canvasWidth, canvasHeight, swapped)
-                mapOf("source" to rects.source.toMap(), "camera" to rects.camera.toMap())
+                AndroidDuetLayoutGeometry.splitTopBottom(canvasWidth, canvasHeight, swapped)
             }
             "pip" -> {
                 val sourceRect = AndroidDuetLayoutGeometry.pipSourceRect(canvasWidth, canvasHeight)
@@ -632,12 +731,9 @@ class AndroidDuetSessionCoordinator(
                             canvasWidth, canvasHeight, nl, nt, nw, nh)
                     }
                 }
-                mapOf("source" to sourceRect.toMap(), "camera" to cameraRect.toMap())
+                VGDuetLayoutRects(source = sourceRect, camera = cameraRect)
             }
-            "greenScreen" -> {
-                val rects = AndroidDuetLayoutGeometry.greenScreen(canvasWidth, canvasHeight)
-                mapOf("source" to rects.source.toMap(), "camera" to rects.camera.toMap())
-            }
+            "greenScreen" -> AndroidDuetLayoutGeometry.greenScreen(canvasWidth, canvasHeight)
             else -> null
         }
     }
@@ -655,9 +751,11 @@ class AndroidDuetSessionCoordinator(
             }
         }
         session.state = VGDuetSessionState.STOPPED
+        // Slice 4B-C: stop the render loop while the decoder is still reachable,
+        // so its final unbind lands on a live decoder before release is queued.
+        releasePreviewProducer(session)
         val dec = session.decoder
         session.decoder = null
-        releasePreviewProducer(session)  // Slice 4A: detach before drop
         activeSession = null
         decoderHandler.post { dec?.release() }
         reply(session.buildStopResult(), null)
@@ -673,9 +771,10 @@ class AndroidDuetSessionCoordinator(
         val current = activeSession
         if (current != null && current.sessionId == sessionId) {
             canceledProbeIds += sessionId
+            // Slice 4B-C: render loop stops while decoder is still non-null.
+            releasePreviewProducer(current)
             val dec = current.decoder
             current.decoder = null
-            releasePreviewProducer(current)  // Slice 4A: detach before drop
             activeSession = null
             decoderHandler.post { dec?.release() }
         }
@@ -693,9 +792,11 @@ class AndroidDuetSessionCoordinator(
         val current = activeSession
         if (current != null) {
             canceledProbeIds += current.sessionId
+            // Slice 4B-C: stopBlocking inside completes the render-loop unbind
+            // (decoder still non-null) before the decoder thread is quit below.
+            releasePreviewProducer(current)
             val dec = current.decoder
             current.decoder = null
-            releasePreviewProducer(current)  // Slice 4A: detach before drop
             decoderHandler.post { dec?.release() }
         }
         activeSession = null
