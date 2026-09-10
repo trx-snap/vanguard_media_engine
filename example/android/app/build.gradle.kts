@@ -37,8 +37,31 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    androidResources {
+        noCompress += "tflite"
+    }
 }
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation("androidx.camera:camera-core:1.5.3")
+    implementation("androidx.camera:camera-camera2:1.5.3")
+    implementation("androidx.camera:camera-lifecycle:1.5.3")
+    implementation("com.google.guava:guava:33.0.0-android")
+    implementation("com.google.mediapipe:tasks-vision:0.10.26.1")
+
+    // Example-app-only raw TensorFlow Lite GPU Interpreter diagnostic probe
+    // (MainActivity.runTfliteGpuProbe). Diagnostic evidence only; not a
+    // production dependency. The plugin's android/build.gradle is untouched and
+    // the production Duet ladder (mediapipe_cpu -> mlkit) does not use these.
+    // The 2.17.0 artifacts resolve transitively to com.google.ai.edge.litert:*:1.0.1
+    // while keeping the org.tensorflow.lite.* class namespace
+    // (Interpreter, gpu.GpuDelegate, gpu.CompatibilityList).
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
 }
