@@ -8,8 +8,13 @@ import android.media.MediaMetadataRetriever
 import android.os.Handler
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
+import com.connects.vanguard_media_engine.export.AndroidExportRenderBackendSelector
 import com.connects.vanguard_media_engine.export.AndroidTimelineOverlayDescriptor
 import com.connects.vanguard_media_engine.export.AndroidTimelineVideoEncoder
+import com.connects.vanguard_media_engine.export.AndroidTimelineVideoPassEncoder
+import com.connects.vanguard_media_engine.export.AndroidTimelineVulkanVideoEncoder
+import com.connects.vanguard_media_engine.export.ExportRenderBackend
+import com.connects.vanguard_media_engine.export.ExportRenderScope
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.io.File
 import java.io.FileOutputStream
@@ -321,7 +326,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 assetPath        = overlayFile.absolutePath,
             )
 
-            // ── Encode via AndroidTimelineVideoEncoder (clips + overlay) ──────
+            // ── Encode via selector-routed backend (clips + overlay) ──────────
             val fps = 30
             val diagnostics = VanguardDiagnostics()
             val lifecycleObserver = VanguardLifecycleObserver(diagnostics)
@@ -329,14 +334,6 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 lifecycleObserver = lifecycleObserver,
                 diagnostics       = diagnostics,
                 codecAdapter      = null,
-            )
-            val encoder = AndroidTimelineVideoEncoder(
-                outputPath   = tmpPath,
-                width        = params.targetWidth,
-                height       = params.targetHeight,
-                fps          = fps,
-                bitrateBps   = params.videoBitRate,
-                nativeBridge = nativeBridge,
             )
 
             val clip = AndroidTimelineVideoEncoder.ClipInput(
@@ -349,12 +346,66 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 mediaKind        = "video",
             )
 
-            val encodeResult = encoder.encode(
+            val exportScope = ExportRenderScope(
+                clips           = listOf(clip),
+                requestedWidth  = params.targetWidth,
+                requestedHeight = params.targetHeight,
+                transitions     = emptyList(),
+                overlays        = listOf(overlayDescriptor),
+            )
+            val backendDecision = AndroidExportRenderBackendSelector().select(
+                exportScope,
+                nativeBridge = nativeBridge,
+            )
+            if (backendDecision.actualBackend == ExportRenderBackend.UNAVAILABLE) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: export backend unavailable (${backendDecision.reason})")
+            }
+
+            fun buildEncoder(backend: ExportRenderBackend): AndroidTimelineVideoPassEncoder {
+                return if (backend == ExportRenderBackend.VULKAN) {
+                    AndroidTimelineVulkanVideoEncoder(
+                        outputPath   = tmpPath,
+                        width        = params.targetWidth,
+                        height       = params.targetHeight,
+                        fps          = fps,
+                        bitrateBps   = params.videoBitRate,
+                        nativeBridge = nativeBridge,
+                    )
+                } else {
+                    AndroidTimelineVideoEncoder(
+                        outputPath   = tmpPath,
+                        width        = params.targetWidth,
+                        height       = params.targetHeight,
+                        fps          = fps,
+                        bitrateBps   = params.videoBitRate,
+                        nativeBridge = nativeBridge,
+                    )
+                }
+            }
+
+            var effectiveBackend = backendDecision.actualBackend
+            var renderBackendFallbackReason: String? = null
+            var encodeResult = buildEncoder(effectiveBackend).encode(
                 clips       = listOf(clip),
                 transitions = emptyList(),
                 overlays    = listOf(overlayDescriptor),
                 onProgress  = null,
             )
+
+            if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
+                !exportScope.requiresVulkan && encodeResult.reason != "cancelled"
+            ) {
+                renderBackendFallbackReason = encodeResult.reason
+                try { tmpFile.takeIf { it.exists() }?.delete() } catch (_: Exception) {}
+                effectiveBackend = ExportRenderBackend.GLES
+                encodeResult = buildEncoder(effectiveBackend).encode(
+                    clips       = listOf(clip),
+                    transitions = emptyList(),
+                    overlays    = listOf(overlayDescriptor),
+                    onProgress  = null,
+                )
+            }
 
             if (!encodeResult.success) {
                 throw ExportException("composition_failed",
@@ -381,6 +432,12 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 "outputPath"    to params.outputPath,
                 "durationMs"    to durationMs,
                 "fileSizeBytes" to fileSizeBytes,
+                "renderBackend" to effectiveBackend.wireName(),
+                "preferredRenderBackend" to backendDecision.preferredBackend.wireName(),
+                "renderBackendReason" to backendDecision.reason,
+                "renderBackendFallbackReason" to renderBackendFallbackReason,
+                "vulkanSupported" to backendDecision.vulkanSupported,
+                "glesSupported" to backendDecision.glesSupported,
             ))
         } catch (ex: ExportException) {
             safeDelete(tmpFile)

@@ -289,6 +289,57 @@ void main() {
     });
 
     test(
+      'maps native render-backend metadata onto VGDuetExportResult',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/data/out.mp4',
+          'durationMs': 3000,
+          'fileSizeBytes': 800000,
+          'renderBackend': 'vulkan',
+          'preferredRenderBackend': 'vulkan',
+          'renderBackendReason': 'vulkan_preferred_and_supported',
+          'renderBackendFallbackReason': null,
+          'vulkanSupported': true,
+          'glesSupported': true,
+        };
+        final result = await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/data/out.mp4',
+        );
+        expect(result.renderBackend, 'vulkan');
+        expect(result.preferredRenderBackend, 'vulkan');
+        expect(result.renderBackendReason, 'vulkan_preferred_and_supported');
+        expect(result.renderBackendFallbackReason, isNull);
+        expect(result.vulkanSupported, isTrue);
+        expect(result.glesSupported, isTrue);
+      },
+    );
+
+    test(
+      'maps native gles fallback metadata onto VGDuetExportResult',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/data/out.mp4',
+          'durationMs': 3000,
+          'fileSizeBytes': 800000,
+          'renderBackend': 'gles',
+          'preferredRenderBackend': 'vulkan',
+          'renderBackendReason': 'vulkan_preferred_and_supported',
+          'renderBackendFallbackReason': 'vulkan_render_failed',
+          'vulkanSupported': true,
+          'glesSupported': true,
+        };
+        final result = await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/data/out.mp4',
+        );
+        expect(result.renderBackend, 'gles');
+        expect(result.preferredRenderBackend, 'vulkan');
+        expect(result.renderBackendFallbackReason, 'vulkan_render_failed');
+      },
+    );
+
+    test(
       'default targetSize is 1080x1920 and default bitrate is 8 Mbps',
       () async {
         fakeChannel.returnValue = {
@@ -335,7 +386,39 @@ void main() {
       expect(r2.outputPath, r.outputPath);
       expect(r2.durationMs, r.durationMs);
       expect(r2.fileSizeBytes, r.fileSizeBytes);
+      expect(r2.renderBackend, isNull);
+      expect(r2.preferredRenderBackend, isNull);
+      expect(r2.renderBackendReason, isNull);
+      expect(r2.renderBackendFallbackReason, isNull);
+      expect(r2.vulkanSupported, isNull);
+      expect(r2.glesSupported, isNull);
     });
+
+    test(
+      'VGDuetExportResult toMap/fromMap round-trips render-backend metadata',
+      () {
+        final r = VGDuetExportResult(
+          outputPath: '/tmp/round.mp4',
+          durationMs: 7500,
+          fileSizeBytes: 2048000,
+          renderBackend: 'vulkan',
+          preferredRenderBackend: 'vulkan',
+          renderBackendReason: 'vulkan_preferred_and_supported',
+          renderBackendFallbackReason: null,
+          vulkanSupported: true,
+          glesSupported: false,
+        );
+        final map = r.toMap();
+        final r2 = VGDuetExportResult.fromMap(map);
+        expect(r2.renderBackend, 'vulkan');
+        expect(r2.preferredRenderBackend, 'vulkan');
+        expect(r2.renderBackendReason, 'vulkan_preferred_and_supported');
+        expect(r2.renderBackendFallbackReason, isNull);
+        expect(r2.vulkanSupported, isTrue);
+        expect(r2.glesSupported, isFalse);
+        expect(r2, equals(r));
+      },
+    );
 
     test('VGDuetExportResult equality', () {
       final r1 = VGDuetExportResult(
@@ -350,5 +433,24 @@ void main() {
       );
       expect(r1, equals(r2));
     });
+
+    test(
+      'VGDuetExportResult equality distinguishes render-backend metadata',
+      () {
+        final r1 = VGDuetExportResult(
+          outputPath: '/tmp/eq.mp4',
+          durationMs: 1000,
+          fileSizeBytes: 512,
+          renderBackend: 'vulkan',
+        );
+        final r2 = VGDuetExportResult(
+          outputPath: '/tmp/eq.mp4',
+          durationMs: 1000,
+          fileSizeBytes: 512,
+          renderBackend: 'gles',
+        );
+        expect(r1, isNot(equals(r2)));
+      },
+    );
   });
 }

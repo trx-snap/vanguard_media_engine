@@ -7,6 +7,8 @@
 //   - Source video decode/encode path via AndroidTimelineVideoEncoder.
 //   - Synthetic foreground geometry route via AndroidDuetLayoutGeometry.
 //   - Atomic final output (write to tmp, rename on success).
+//   - Selector-driven, vulkan-first Android duet export (render backend
+//     must resolve to vulkan; no silent GLES fallback tolerated here).
 //
 // Non-claims:
 //   - No live camera, no ML/human matte, no audio/mic/sync, no iOS.
@@ -172,6 +174,12 @@ class _AndroidDuetExportCompositionSmokePageState
       'outputPath': result.outputPath,
       'durationMs': result.durationMs,
       'fileSizeBytes': result.fileSizeBytes,
+      'renderBackend': result.renderBackend,
+      'preferredRenderBackend': result.preferredRenderBackend,
+      'renderBackendReason': result.renderBackendReason,
+      'renderBackendFallbackReason': result.renderBackendFallbackReason,
+      'vulkanSupported': result.vulkanSupported,
+      'glesSupported': result.glesSupported,
     });
 
     // ── 5. Assertions ─────────────────────────────────────────────────────────
@@ -229,17 +237,36 @@ class _AndroidDuetExportCompositionSmokePageState
       return;
     }
 
+    // 5g. render backend must be vulkan (selector-driven, vulkan-first route)
+    if (result.renderBackend != 'vulkan') {
+      _fail({
+        'assertion': 'render_backend_not_vulkan',
+        'renderBackend': result.renderBackend,
+        'preferredRenderBackend': result.preferredRenderBackend,
+        'renderBackendReason': result.renderBackendReason,
+        'renderBackendFallbackReason': result.renderBackendFallbackReason,
+      });
+      return;
+    }
+
     // ── 6. Pass ───────────────────────────────────────────────────────────────
     final passPayload = <String, dynamic>{
       'verdict': 'PASS',
       'outputPath': result.outputPath,
       'durationMs': result.durationMs,
       'fileSizeBytes': result.fileSizeBytes,
+      'renderBackend': result.renderBackend,
+      'preferredRenderBackend': result.preferredRenderBackend,
+      'renderBackendReason': result.renderBackendReason,
+      'renderBackendFallbackReason': result.renderBackendFallbackReason,
+      'vulkanSupported': result.vulkanSupported,
+      'glesSupported': result.glesSupported,
       'claims': [
         'descriptor_bound_android_offline_video_only_composited_mp4',
         'source_video_decode_encode_path',
         'synthetic_foreground_geometry_route',
         'atomic_final_output',
+        'selector_driven_vulkan_first_android_duet_export',
       ],
       'nonClaims': [
         'no_live_camera',
