@@ -2886,6 +2886,23 @@ class VanguardNativeBridge(
         decoderHeight: Int,
     ): String
 
+    // ── DUET-VULKAN-PREVIEW-PRESENTATION: Vulkan green-screen SurfaceProducer presentation smoke ───────
+    // Diagnostic only: one real Camera2 YUV HardwareBuffer + one real
+    // MediaCodec PRIVATE HardwareBuffer imported, resolved, and composited
+    // with VulkanGreenScreenCompositor (no-readback), then presented to
+    // an ANativeWindow/VkSurfaceKHR swapchain backed by a Flutter SurfaceProducer Surface.
+    external fun renderAndroidDuetVulkanPreviewPresentation(
+        surface: Surface,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        cameraHardwareBuffer: HardwareBuffer,
+        cameraWidth: Int,
+        cameraHeight: Int,
+        decoderHardwareBuffer: HardwareBuffer,
+        decoderWidth: Int,
+        decoderHeight: Int,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec -> AHB -> Vulkan ──
     // crossfade proof. Kotlin (AndroidTimelineDualDecoderSyncDriver) owns both
     // decoder pipelines and calls this once per overlap frame with one
