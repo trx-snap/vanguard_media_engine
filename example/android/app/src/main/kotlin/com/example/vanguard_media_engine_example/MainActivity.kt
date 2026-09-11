@@ -68,6 +68,15 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    // Diagnostic-only: Android Duet deterministic per-frame GLES mask upload export proof
+    // (see AndroidDuetGlesDynamicMaskExportSmokeCoordinator). Bridge-only wiring;
+    // all harness logic lives in the diagnostics package coordinator/harness pair.
+    private val duetGlesDynamicMaskExportCoordinator by lazy {
+        com.connects.vanguard_media_engine.diagnostics.AndroidDuetGlesDynamicMaskExportSmokeCoordinator(
+            Handler(Looper.getMainLooper()),
+        )
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_NAME)
@@ -106,6 +115,13 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 val args = call.arguments as? Map<*, *>
                 if (!duetGlesExportCompositionCoordinator.handleMethodCall(call.method, args, result)) {
+                    result.notImplemented()
+                }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DUET_GLES_DYNAMIC_MASK_EXPORT_CHANNEL_NAME)
+            .setMethodCallHandler { call, result ->
+                val args = call.arguments as? Map<*, *>
+                if (!duetGlesDynamicMaskExportCoordinator.handleMethodCall(call.method, args, result)) {
                     result.notImplemented()
                 }
             }
@@ -185,6 +201,7 @@ class MainActivity : FlutterActivity() {
         activeTfliteGpuIsolatedSession?.cancel()
         activeTfliteGpuIsolatedSession = null
         duetGlesExportCompositionCoordinator.disposeAll()
+        duetGlesDynamicMaskExportCoordinator.disposeAll()
         super.onDestroy()
     }
 
@@ -207,6 +224,11 @@ class MainActivity : FlutterActivity() {
         // owned by the coordinator itself.
         private const val DUET_GLES_EXPORT_COMPOSITION_CHANNEL_NAME =
             "vanguard_media_engine_example/duet_gles_export_composition"
+
+        // Diagnostic-only Duet GLES dynamic mask export proof (see
+        // AndroidDuetGlesDynamicMaskExportSmokeCoordinator).
+        private const val DUET_GLES_DYNAMIC_MASK_EXPORT_CHANNEL_NAME =
+            "vanguard_media_engine_example/duet_gles_dynamic_mask_export"
 
         // Raw TFLite GPU Interpreter diagnostic probe (example-only).
         private const val TFLITE_TAG = "DuetTfliteGpuProbe"
