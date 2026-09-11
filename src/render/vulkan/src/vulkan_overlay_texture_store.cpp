@@ -61,6 +61,7 @@ struct OverlayTextureRecord {
     VkImageView    view   = VK_NULL_HANDLE;
     uint32_t       width  = 0;
     uint32_t       height = 0;
+    VkFormat       format = VK_FORMAT_UNDEFINED;
 };
 
 void DestroyRecord(VkDevice device, OverlayTextureRecord& record) {
@@ -79,6 +80,34 @@ void DestroyRecord(VkDevice device, OverlayTextureRecord& record) {
     }
 }
 
+struct TextureStoreContext {
+    VkDevice                                            device;
+    VkPhysicalDevice                                    physDev;
+    VkQueue                                             queue;
+    VkCommandPool                                       transientCommandPool;
+    VkSampler                                           sharedSampler;
+    bool                                                initialized;
+    uint64_t&                                           nextHandle;
+    std::unordered_map<uint64_t, OverlayTextureRecord>& records;
+
+    TextureStoreContext(VkDevice dev,
+                        VkPhysicalDevice phys,
+                        VkQueue q,
+                        VkCommandPool pool,
+                        VkSampler sampler,
+                        bool init,
+                        uint64_t& nextH,
+                        std::unordered_map<uint64_t, OverlayTextureRecord>& recs)
+        : device(dev),
+          physDev(phys),
+          queue(q),
+          transientCommandPool(pool),
+          sharedSampler(sampler),
+          initialized(init),
+          nextHandle(nextH),
+          records(recs) {}
+};
+
 } // anonymous namespace
 
 struct VulkanOverlayTextureStore::Impl {
@@ -93,6 +122,351 @@ struct VulkanOverlayTextureStore::Impl {
     uint64_t nextHandle = 1; // 0 == kInvalidOverlayTextureHandle; never reused.
     std::unordered_map<uint64_t, OverlayTextureRecord> records;
 };
+
+namespace {
+
+bool ValidateUploadArgs(uint32_t width, uint32_t height, uint32_t bpp,
+                        uint32_t rowStrideBytes, size_t byteCount,
+                        const VkPhysicalDeviceLimits& limits,
+                        uint64_t* outMinStride, uint64_t* outStride) {
+    if (width == 0 || height == 0) return false;
+    if (width > limits.maxImageDimension2D || height > limits.maxImageDimension2D) {
+        return false;
+    }
+    const uint64_t minStride = static_cast<uint64_t>(width) * static_cast<uint64_t>(bpp);
+    const uint64_t stride = rowStrideBytes == 0 ? minStride : static_cast<uint64_t>(rowStrideBytes);
+    if (stride < minStride) return false;
+    if (stride * static_cast<uint64_t>(height) > static_cast<uint64_t>(byteCount)) return false;
+
+    if (outMinStride) *outMinStride = minStride;
+    if (outStride) *outStride = stride;
+    return true;
+}
+
+bool UploadToImage(VkDevice device,
+                   VkPhysicalDevice physDev,
+                   VkQueue queue,
+                   VkCommandPool transientCommandPool,
+                   const uint8_t* srcData,
+                   uint32_t width,
+                   uint32_t height,
+                   uint64_t minStride,
+                   uint64_t srcStride,
+                   VkImage image) {
+    VkBuffer       stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    void*          stagingMapped = nullptr;
+    VkCommandBuffer cmd          = VK_NULL_HANDLE;
+    VkFence        fence         = VK_NULL_HANDLE;
+
+    auto destroyAll = [&]() {
+        if (fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device, fence, nullptr);
+        }
+        if (cmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device, transientCommandPool, 1, &cmd);
+        }
+        if (stagingMapped != nullptr && stagingMemory != VK_NULL_HANDLE) {
+            vkUnmapMemory(device, stagingMemory);
+        }
+        if (stagingBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device, stagingBuffer, nullptr);
+        }
+        if (stagingMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(device, stagingMemory, nullptr);
+        }
+    };
+
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(physDev, &memProps);
+
+    const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(minStride) * height;
+    VkBufferCreateInfo bufferCI{};
+    bufferCI.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferCI.size        = stagingSize;
+    bufferCI.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bufferCI, nullptr, &stagingBuffer) != VK_SUCCESS) {
+        destroyAll();
+        return false;
+    }
+
+    VkMemoryRequirements bufMemReq{};
+    vkGetBufferMemoryRequirements(device, stagingBuffer, &bufMemReq);
+    bool coherent = true;
+    uint32_t bufTypeIndex = FindMemoryType(
+        memProps, bufMemReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (bufTypeIndex == UINT32_MAX) {
+        coherent = false;
+        bufTypeIndex = FindMemoryType(memProps, bufMemReq.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    }
+    if (bufTypeIndex == UINT32_MAX) {
+        destroyAll();
+        return false;
+    }
+    VkMemoryAllocateInfo bufAlloc{};
+    bufAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bufAlloc.allocationSize  = bufMemReq.size;
+    bufAlloc.memoryTypeIndex = bufTypeIndex;
+    if (vkAllocateMemory(device, &bufAlloc, nullptr, &stagingMemory) != VK_SUCCESS) {
+        stagingMemory = VK_NULL_HANDLE; // Prevent double free
+        destroyAll();
+        return false;
+    }
+    if (vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0) != VK_SUCCESS) {
+        destroyAll();
+        return false;
+    }
+    if (vkMapMemory(device, stagingMemory, 0, stagingSize, 0, &stagingMapped) != VK_SUCCESS) {
+        stagingMapped = nullptr;
+        destroyAll();
+        return false;
+    }
+
+    {
+        uint8_t* dst = static_cast<uint8_t*>(stagingMapped);
+        const uint8_t* src = srcData;
+        const size_t rowBytes = static_cast<size_t>(minStride);
+        const size_t srcStrideBytes = static_cast<size_t>(srcStride);
+        for (uint32_t row = 0; row < height; ++row) {
+            std::memcpy(dst + static_cast<size_t>(row) * rowBytes,
+                        src + static_cast<size_t>(row) * srcStrideBytes,
+                        rowBytes);
+        }
+    }
+
+    if (!coherent) {
+        VkMappedMemoryRange range{};
+        range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = stagingMemory;
+        range.offset = 0;
+        range.size   = VK_WHOLE_SIZE;
+        vkFlushMappedMemoryRanges(device, 1, &range);
+    }
+
+    VkCommandBufferAllocateInfo cmdAI{};
+    cmdAI.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAI.commandPool        = transientCommandPool;
+    cmdAI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAI.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &cmdAI, &cmd) != VK_SUCCESS) {
+        cmd = VK_NULL_HANDLE;
+        destroyAll();
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
+        destroyAll();
+        return false;
+    }
+
+    VkImageMemoryBarrier toTransferDst{};
+    toTransferDst.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransferDst.srcAccessMask               = 0;
+    toTransferDst.dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransferDst.oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED;
+    toTransferDst.newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransferDst.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+    toTransferDst.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+    toTransferDst.image                       = image;
+    toTransferDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransferDst.subresourceRange.levelCount = 1;
+    toTransferDst.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &toTransferDst);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageExtent                 = {width, height, 1};
+    vkCmdCopyBufferToImage(cmd, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &copyRegion);
+
+    VkImageMemoryBarrier toShaderRead = toTransferDst;
+    toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toShaderRead.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toShaderRead.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        destroyAll();
+        return false;
+    }
+
+    VkFenceCreateInfo fenceCI{};
+    fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(device, &fenceCI, nullptr, &fence) != VK_SUCCESS) {
+        fence = VK_NULL_HANDLE;
+        destroyAll();
+        return false;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers    = &cmd;
+    if (vkQueueSubmit(queue, 1, &submitInfo, fence) != VK_SUCCESS) {
+        destroyAll();
+        return false;
+    }
+
+    if (vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        destroyAll();
+        return false;
+    }
+
+    destroyAll();
+    return true;
+}
+
+bool UploadToImage(const TextureStoreContext& ctx,
+                   const uint8_t* srcData,
+                   uint32_t width,
+                   uint32_t height,
+                   uint64_t minStride,
+                   uint64_t srcStride,
+                   VkImage image) {
+    return UploadToImage(ctx.device, ctx.physDev, ctx.queue, ctx.transientCommandPool,
+                         srcData, width, height, minStride, srcStride, image);
+}
+
+bool CreateTextureInternal(TextureStoreContext& s,
+                           const uint8_t* data,
+                           size_t byteCount,
+                           uint32_t width,
+                           uint32_t height,
+                           uint32_t rowStrideBytes,
+                           VkFormat format,
+                           uint32_t bpp,
+                           VulkanOverlayTextureHandle* outHandle,
+                           VulkanOverlayTextureInfo* outInfo) {
+    auto fail = [&]() -> bool {
+        if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
+    };
+
+    if (!s.initialized || s.device == VK_NULL_HANDLE || s.physDev == VK_NULL_HANDLE ||
+        s.queue == VK_NULL_HANDLE) {
+        return fail();
+    }
+    if (!data || !outHandle) {
+        return fail();
+    }
+
+    VkPhysicalDeviceProperties physProps{};
+    vkGetPhysicalDeviceProperties(s.physDev, &physProps);
+
+    uint64_t minStride = 0, srcStride = 0;
+    if (!ValidateUploadArgs(width, height, bpp, rowStrideBytes, byteCount, physProps.limits, &minStride, &srcStride)) {
+        return fail();
+    }
+
+    VkImage        image  = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView    view   = VK_NULL_HANDLE;
+
+    auto destroyAll = [&]() {
+        if (view != VK_NULL_HANDLE) {
+            vkDestroyImageView(s.device, view, nullptr);
+        }
+        if (image != VK_NULL_HANDLE) {
+            vkDestroyImage(s.device, image, nullptr);
+        }
+        if (memory != VK_NULL_HANDLE) {
+            vkFreeMemory(s.device, memory, nullptr);
+        }
+    };
+
+    VkImageCreateInfo imageCI{};
+    imageCI.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageCI.imageType     = VK_IMAGE_TYPE_2D;
+    imageCI.format        = format;
+    imageCI.extent        = {width, height, 1};
+    imageCI.mipLevels     = 1;
+    imageCI.arrayLayers   = 1;
+    imageCI.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imageCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    imageCI.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(s.device, &imageCI, nullptr, &image) != VK_SUCCESS) {
+        return fail();
+    }
+
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(s.physDev, &memProps);
+
+    VkMemoryRequirements imageMemReq{};
+    vkGetImageMemoryRequirements(s.device, image, &imageMemReq);
+    uint32_t imageTypeIndex = FindMemoryType(memProps, imageMemReq.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (imageTypeIndex == UINT32_MAX) {
+        imageTypeIndex = FindMemoryType(memProps, imageMemReq.memoryTypeBits, 0);
+    }
+    if (imageTypeIndex == UINT32_MAX) {
+        destroyAll();
+        return fail();
+    }
+    VkMemoryAllocateInfo imageAlloc{};
+    imageAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    imageAlloc.allocationSize  = imageMemReq.size;
+    imageAlloc.memoryTypeIndex = imageTypeIndex;
+    if (vkAllocateMemory(s.device, &imageAlloc, nullptr, &memory) != VK_SUCCESS) {
+        destroyAll();
+        return fail();
+    }
+    if (vkBindImageMemory(s.device, image, memory, 0) != VK_SUCCESS) {
+        destroyAll();
+        return fail();
+    }
+
+    VkImageViewCreateInfo viewCI{};
+    viewCI.sType                       = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewCI.image                       = image;
+    viewCI.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
+    viewCI.format                      = format;
+    viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewCI.subresourceRange.levelCount = 1;
+    viewCI.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(s.device, &viewCI, nullptr, &view) != VK_SUCCESS) {
+        destroyAll();
+        return fail();
+    }
+
+    if (!UploadToImage(s, data, width, height, minStride, srcStride, image)) {
+        destroyAll();
+        return fail();
+    }
+
+    const VulkanOverlayTextureHandle handle = s.nextHandle++;
+    OverlayTextureRecord record;
+    record.image  = image;
+    record.memory = memory;
+    record.view   = view;
+    record.width  = width;
+    record.height = height;
+    record.format = format;
+    s.records.emplace(handle, record);
+
+    *outHandle = handle;
+    if (outInfo) {
+        outInfo->imageViewHandle = VkHandleToU64(view);
+        outInfo->samplerHandle   = VkHandleToU64(s.sharedSampler);
+        outInfo->width           = width;
+        outInfo->height          = height;
+    }
+    return true;
+}
+
+} // anonymous namespace
 
 VulkanOverlayTextureStore::VulkanOverlayTextureStore()
     : impl_(std::make_unique<Impl>()) {}
@@ -165,322 +539,70 @@ bool VulkanOverlayTextureStore::createTextureRgba8888(
     VulkanOverlayTextureHandle* outHandle,
     VulkanOverlayTextureInfo* outInfo) {
     Impl& s = *impl_;
+    TextureStoreContext ctx(s.device, s.physDev, s.queue, s.transientCommandPool,
+                            s.sharedSampler, s.initialized, s.nextHandle, s.records);
+    return CreateTextureInternal(ctx, rgba, rgbaByteCount, width, height, rowStrideBytes,
+                                 VK_FORMAT_R8G8B8A8_UNORM, 4, outHandle, outInfo);
+}
 
-    auto fail = [&]() -> bool {
-        if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
-        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
-        return false;
-    };
+bool VulkanOverlayTextureStore::createTextureR8(
+    const uint8_t* mask,
+    size_t maskByteCount,
+    uint32_t width,
+    uint32_t height,
+    uint32_t rowStrideBytes,
+    VulkanOverlayTextureHandle* outHandle,
+    VulkanOverlayTextureInfo* outInfo) {
+    Impl& s = *impl_;
+    TextureStoreContext ctx(s.device, s.physDev, s.queue, s.transientCommandPool,
+                            s.sharedSampler, s.initialized, s.nextHandle, s.records);
+    return CreateTextureInternal(ctx, mask, maskByteCount, width, height, rowStrideBytes,
+                                 VK_FORMAT_R8_UNORM, 1, outHandle, outInfo);
+}
 
-    // --- Validation (fails closed, in order, before any Vulkan call) ---
+bool VulkanOverlayTextureStore::updateTextureR8(VulkanOverlayTextureHandle handle,
+                                                const uint8_t* mask,
+                                                size_t maskByteCount,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                uint32_t rowStrideBytes,
+                                                VulkanOverlayTextureInfo* outInfo) {
+    Impl& s = *impl_;
     if (!s.initialized || s.device == VK_NULL_HANDLE || s.physDev == VK_NULL_HANDLE ||
         s.queue == VK_NULL_HANDLE) {
-        return fail();
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
     }
-    if (!rgba || !outHandle) {
-        return fail();
+
+    auto it = s.records.find(handle);
+    if (it == s.records.end() || it->second.format != VK_FORMAT_R8_UNORM ||
+        it->second.width != width || it->second.height != height) {
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
     }
-    if (width == 0 || height == 0) {
-        return fail();
+
+    if (!mask) {
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
     }
 
     VkPhysicalDeviceProperties physProps{};
     vkGetPhysicalDeviceProperties(s.physDev, &physProps);
-    if (width > physProps.limits.maxImageDimension2D ||
-        height > physProps.limits.maxImageDimension2D) {
-        return fail();
+
+    uint64_t minStride = 0, srcStride = 0;
+    if (!ValidateUploadArgs(width, height, 1, rowStrideBytes, maskByteCount, physProps.limits, &minStride, &srcStride)) {
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
     }
 
-    const uint64_t minStride = static_cast<uint64_t>(width) * 4ull;
-    const uint64_t stride = rowStrideBytes == 0 ? minStride : static_cast<uint64_t>(rowStrideBytes);
-    if (stride < minStride) {
-        return fail();
-    }
-    if (stride * static_cast<uint64_t>(height) > static_cast<uint64_t>(rgbaByteCount)) {
-        return fail();
+    if (!UploadToImage(s.device, s.physDev, s.queue, s.transientCommandPool,
+                       mask, width, height, minStride, srcStride, it->second.image)) {
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
     }
 
-    // --- Transient state for this call; destroyAll() reverses whatever of
-    //     this was created so far on any failure path below. ---
-    VkImage        image         = VK_NULL_HANDLE;
-    VkDeviceMemory memory        = VK_NULL_HANDLE;
-    VkImageView    view          = VK_NULL_HANDLE;
-    VkBuffer       stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    void*          stagingMapped = nullptr;
-    VkCommandBuffer cmd          = VK_NULL_HANDLE;
-    VkFence        fence         = VK_NULL_HANDLE;
-
-    auto destroyAll = [&]() {
-        if (fence != VK_NULL_HANDLE) {
-            vkDestroyFence(s.device, fence, nullptr);
-            fence = VK_NULL_HANDLE;
-        }
-        if (cmd != VK_NULL_HANDLE) {
-            vkFreeCommandBuffers(s.device, s.transientCommandPool, 1, &cmd);
-            cmd = VK_NULL_HANDLE;
-        }
-        if (stagingMapped != nullptr && stagingMemory != VK_NULL_HANDLE) {
-            vkUnmapMemory(s.device, stagingMemory);
-            stagingMapped = nullptr;
-        }
-        if (stagingBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(s.device, stagingBuffer, nullptr);
-            stagingBuffer = VK_NULL_HANDLE;
-        }
-        if (stagingMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(s.device, stagingMemory, nullptr);
-            stagingMemory = VK_NULL_HANDLE;
-        }
-        if (view != VK_NULL_HANDLE) {
-            vkDestroyImageView(s.device, view, nullptr);
-            view = VK_NULL_HANDLE;
-        }
-        if (image != VK_NULL_HANDLE) {
-            vkDestroyImage(s.device, image, nullptr);
-            image = VK_NULL_HANDLE;
-        }
-        if (memory != VK_NULL_HANDLE) {
-            vkFreeMemory(s.device, memory, nullptr);
-            memory = VK_NULL_HANDLE;
-        }
-    };
-
-    // --- 1. Persistent device-local sampled image ---
-    VkImageCreateInfo imageCI{};
-    imageCI.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageCI.imageType     = VK_IMAGE_TYPE_2D;
-    imageCI.format        = VK_FORMAT_R8G8B8A8_UNORM;
-    imageCI.extent        = {width, height, 1};
-    imageCI.mipLevels     = 1;
-    imageCI.arrayLayers   = 1;
-    imageCI.samples       = VK_SAMPLE_COUNT_1_BIT;
-    imageCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    imageCI.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    imageCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-    imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(s.device, &imageCI, nullptr, &image) != VK_SUCCESS) {
-        image = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-
-    VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(s.physDev, &memProps);
-
-    VkMemoryRequirements imageMemReq{};
-    vkGetImageMemoryRequirements(s.device, image, &imageMemReq);
-    uint32_t imageTypeIndex = FindMemoryType(memProps, imageMemReq.memoryTypeBits,
-                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (imageTypeIndex == UINT32_MAX) {
-        imageTypeIndex = FindMemoryType(memProps, imageMemReq.memoryTypeBits, 0);
-    }
-    if (imageTypeIndex == UINT32_MAX) {
-        destroyAll();
-        return fail();
-    }
-    VkMemoryAllocateInfo imageAlloc{};
-    imageAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    imageAlloc.allocationSize  = imageMemReq.size;
-    imageAlloc.memoryTypeIndex = imageTypeIndex;
-    if (vkAllocateMemory(s.device, &imageAlloc, nullptr, &memory) != VK_SUCCESS) {
-        memory = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-    if (vkBindImageMemory(s.device, image, memory, 0) != VK_SUCCESS) {
-        destroyAll();
-        return fail();
-    }
-
-    VkImageViewCreateInfo viewCI{};
-    viewCI.sType                       = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewCI.image                       = image;
-    viewCI.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
-    viewCI.format                      = VK_FORMAT_R8G8B8A8_UNORM;
-    viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewCI.subresourceRange.levelCount = 1;
-    viewCI.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(s.device, &viewCI, nullptr, &view) != VK_SUCCESS) {
-        view = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-
-    // --- 2. Host-visible tightly packed staging buffer ---
-    // Copy row-by-row from `rgba` (read at `stride` bytes/row, never past
-    // rgbaByteCount) into a tightly packed (`minStride` bytes/row) buffer.
-    const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(minStride) * height;
-    VkBufferCreateInfo bufferCI{};
-    bufferCI.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferCI.size        = stagingSize;
-    bufferCI.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bufferCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(s.device, &bufferCI, nullptr, &stagingBuffer) != VK_SUCCESS) {
-        stagingBuffer = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-
-    VkMemoryRequirements bufMemReq{};
-    vkGetBufferMemoryRequirements(s.device, stagingBuffer, &bufMemReq);
-    bool coherent = true;
-    uint32_t bufTypeIndex = FindMemoryType(
-        memProps, bufMemReq.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (bufTypeIndex == UINT32_MAX) {
-        coherent = false;
-        bufTypeIndex = FindMemoryType(memProps, bufMemReq.memoryTypeBits,
-                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    }
-    if (bufTypeIndex == UINT32_MAX) {
-        destroyAll();
-        return fail();
-    }
-    VkMemoryAllocateInfo bufAlloc{};
-    bufAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    bufAlloc.allocationSize  = bufMemReq.size;
-    bufAlloc.memoryTypeIndex = bufTypeIndex;
-    if (vkAllocateMemory(s.device, &bufAlloc, nullptr, &stagingMemory) != VK_SUCCESS) {
-        stagingMemory = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-    if (vkBindBufferMemory(s.device, stagingBuffer, stagingMemory, 0) != VK_SUCCESS) {
-        destroyAll();
-        return fail();
-    }
-    if (vkMapMemory(s.device, stagingMemory, 0, stagingSize, 0, &stagingMapped) != VK_SUCCESS) {
-        stagingMapped = nullptr;
-        destroyAll();
-        return fail();
-    }
-
-    {
-        uint8_t* dst = static_cast<uint8_t*>(stagingMapped);
-        const uint8_t* src = rgba;
-        const size_t rowBytes = static_cast<size_t>(minStride);
-        const size_t srcStride = static_cast<size_t>(stride);
-        for (uint32_t row = 0; row < height; ++row) {
-            std::memcpy(dst + static_cast<size_t>(row) * rowBytes,
-                        src + static_cast<size_t>(row) * srcStride,
-                        rowBytes);
-        }
-    }
-
-    if (!coherent) {
-        VkMappedMemoryRange range{};
-        range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        range.memory = stagingMemory;
-        range.offset = 0;
-        range.size   = VK_WHOLE_SIZE;
-        vkFlushMappedMemoryRanges(s.device, 1, &range);
-    }
-
-    // --- 3. Record + submit the upload on this store's own transient
-    //        command pool, waited on a fresh per-call fence. ---
-    VkCommandBufferAllocateInfo cmdAI{};
-    cmdAI.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAI.commandPool        = s.transientCommandPool;
-    cmdAI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAI.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(s.device, &cmdAI, &cmd) != VK_SUCCESS) {
-        cmd = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-        destroyAll();
-        return fail();
-    }
-
-    VkImageMemoryBarrier toTransferDst{};
-    toTransferDst.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    toTransferDst.srcAccessMask               = 0;
-    toTransferDst.dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toTransferDst.oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED;
-    toTransferDst.newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toTransferDst.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-    toTransferDst.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-    toTransferDst.image                       = image;
-    toTransferDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    toTransferDst.subresourceRange.levelCount = 1;
-    toTransferDst.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &toTransferDst);
-
-    VkBufferImageCopy copyRegion{};
-    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copyRegion.imageSubresource.layerCount = 1;
-    copyRegion.imageExtent                 = {width, height, 1};
-    vkCmdCopyBufferToImage(cmd, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           1, &copyRegion);
-
-    VkImageMemoryBarrier toShaderRead = toTransferDst;
-    toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    toShaderRead.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toShaderRead.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
-
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        destroyAll();
-        return fail();
-    }
-
-    VkFenceCreateInfo fenceCI{};
-    fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (vkCreateFence(s.device, &fenceCI, nullptr, &fence) != VK_SUCCESS) {
-        fence = VK_NULL_HANDLE;
-        destroyAll();
-        return fail();
-    }
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers    = &cmd;
-    if (vkQueueSubmit(s.queue, 1, &submitInfo, fence) != VK_SUCCESS) {
-        destroyAll();
-        return fail();
-    }
-
-    if (vkWaitForFences(s.device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        destroyAll();
-        return fail();
-    }
-
-    // Upload complete; release the transient upload-only objects. Only the
-    // persistent image/memory/view survive past this call.
-    vkDestroyFence(s.device, fence, nullptr);
-    fence = VK_NULL_HANDLE;
-    vkFreeCommandBuffers(s.device, s.transientCommandPool, 1, &cmd);
-    cmd = VK_NULL_HANDLE;
-    vkUnmapMemory(s.device, stagingMemory);
-    stagingMapped = nullptr;
-    vkDestroyBuffer(s.device, stagingBuffer, nullptr);
-    stagingBuffer = VK_NULL_HANDLE;
-    vkFreeMemory(s.device, stagingMemory, nullptr);
-    stagingMemory = VK_NULL_HANDLE;
-
-    // --- 4. Store the persistent record under a fresh, never-reused handle ---
-    const VulkanOverlayTextureHandle handle = s.nextHandle++;
-    OverlayTextureRecord record;
-    record.image  = image;
-    record.memory = memory;
-    record.view   = view;
-    record.width  = width;
-    record.height = height;
-    s.records.emplace(handle, record);
-
-    *outHandle = handle;
     if (outInfo) {
-        outInfo->imageViewHandle = VkHandleToU64(view);
+        outInfo->imageViewHandle = VkHandleToU64(it->second.view);
         outInfo->samplerHandle   = VkHandleToU64(s.sharedSampler);
         outInfo->width           = width;
         outInfo->height          = height;
@@ -564,6 +686,21 @@ bool VulkanOverlayTextureStore::createTextureRgba8888(
     const uint8_t*, size_t, uint32_t, uint32_t, uint32_t,
     VulkanOverlayTextureHandle* outHandle, VulkanOverlayTextureInfo* outInfo) {
     if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+    if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+    return false;
+}
+
+bool VulkanOverlayTextureStore::createTextureR8(
+    const uint8_t*, size_t, uint32_t, uint32_t, uint32_t,
+    VulkanOverlayTextureHandle* outHandle, VulkanOverlayTextureInfo* outInfo) {
+    if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+    if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+    return false;
+}
+
+bool VulkanOverlayTextureStore::updateTextureR8(
+    VulkanOverlayTextureHandle, const uint8_t*, size_t, uint32_t, uint32_t, uint32_t,
+    VulkanOverlayTextureInfo* outInfo) {
     if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
     return false;
 }

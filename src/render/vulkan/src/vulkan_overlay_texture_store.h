@@ -3,17 +3,18 @@
 // sub-slice N4: private helper - VulkanOverlayTextureStore.
 //
 // Backend-owned Vulkan texture store for static sticker overlay RGBA8888
-// pixels. Callers upload once via createTextureRgba8888() and receive a
-// stable VulkanOverlayTextureHandle plus the VkImageView/VkSampler pair (as
-// uint64_t) needed to populate a VulkanOverlayFrameDraw
-// (imageViewHandle/samplerHandle); this store never records draws itself and
-// is not wired into VulkanFrameRenderer, VulkanOverlayFrameRenderer, JNI, or
-// Kotlin by this sub-slice.
+// pixels and dynamic R8 masks (for future Android Duet Vulkan green-screen
+// preview). Callers upload once via createTextureRgba8888() or
+// createTextureR8() and receive a stable VulkanOverlayTextureHandle plus the
+// VkImageView/VkSampler pair (as uint64_t) needed to populate a
+// VulkanOverlayFrameDraw (imageViewHandle/samplerHandle); this store never
+// records draws itself and is not wired into VulkanFrameRenderer,
+// VulkanOverlayFrameRenderer, JNI, or Kotlin by this sub-slice.
 //
 // Each created texture is a persistent, device-local, optimally-tiled
-// VK_FORMAT_R8G8B8A8_UNORM VkImage (TRANSFER_DST | SAMPLED usage) left in
-// VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, with its own VkImageView. Every
-// texture created by this store shares one LINEAR-filtered,
+// VK_FORMAT_R8G8B8A8_UNORM (or VK_FORMAT_R8_UNORM) VkImage (TRANSFER_DST |
+// SAMPLED usage) left in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, with its
+// own VkImageView. Every texture created by this store shares one LINEAR-filtered,
 // CLAMP_TO_BORDER / transparent-black VkSampler created once by initialize()
 // and destroyed by clear() -- the sampler is never per-texture.
 //
@@ -115,6 +116,28 @@ public:
                                uint32_t rowStrideBytes,
                                VulkanOverlayTextureHandle* outHandle,
                                VulkanOverlayTextureInfo* outInfo);
+
+    // Uploads `mask` into a brand-new persistent, sampled R8 texture and returns
+    // its handle plus info. Same fail-closed style and semantics as createTextureRgba8888.
+    bool createTextureR8(const uint8_t* mask,
+                         size_t maskByteCount,
+                         uint32_t width,
+                         uint32_t height,
+                         uint32_t rowStrideBytes,
+                         VulkanOverlayTextureHandle* outHandle,
+                         VulkanOverlayTextureInfo* outInfo);
+
+    // Updates an existing R8 texture in-place with new `mask` pixels. Fails closed
+    // without modifying the image if handle is unknown, format is not R8, size
+    // mismatches the existing texture, or parameters are invalid. Do not recreate
+    // the image; it uploads to the existing one.
+    bool updateTextureR8(VulkanOverlayTextureHandle handle,
+                         const uint8_t* mask,
+                         size_t maskByteCount,
+                         uint32_t width,
+                         uint32_t height,
+                         uint32_t rowStrideBytes,
+                         VulkanOverlayTextureInfo* outInfo = nullptr);
 
     // Waits for device idle, then destroys handle's VkImageView/VkImage/
     // VkDeviceMemory and forgets the handle. Returns false (no-op) for an
