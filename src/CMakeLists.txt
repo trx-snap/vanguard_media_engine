@@ -160,6 +160,12 @@ add_library(vanguard_render_vulkan STATIC
     # sticker overlay pixels. Not yet wired into VulkanFrameRenderer / JNI /
     # Kotlin.
     "render/vulkan/src/vulkan_overlay_texture_store.cpp"
+    # DUET-VULKAN-GREENSCREEN-PIXEL-PROOF: private three-texture mask-blend
+    # helper (background/foreground RGBA8_UNORM + R8_UNORM mask sampled at a
+    # shared normalized coordinate, fixed-function blend disabled, readback).
+    # Diagnostic-only in this slice; not wired into production Duet
+    # preview/export.
+    "render/vulkan/src/vulkan_greenscreen_compositor.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
@@ -502,6 +508,13 @@ if (ANDROID)
     # Bitmap/ImageDecoder/encoder/file IO/GPU ownership, no Android
     # lifecycle, no product/app/editor wiring.
     "platform/android/src/android_phase5_image_optimizer_sink_node_jni.cpp"
+    # DUET-VULKAN-GREENSCREEN-PIXEL-PROOF: diagnostic-only Android Vulkan
+    # green-screen mask-blend pixel proof harness for the private
+    # VulkanGreenScreenCompositor helper above (temporary VkInstance/VkDevice/
+    # VkQueue/VkCommandPool, synthetic sampled images, offscreen attachment,
+    # readback buffer, CPU-reference parity). Not wired into production Duet
+    # preview/export.
+    "platform/android/src/android_vulkan_duet_greenscreen_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

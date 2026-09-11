@@ -2850,6 +2850,29 @@ class VanguardNativeBridge(
     // session, no production VulkanBackend mutation, no product UI.
     external fun runAndroidDagPhase5BeautyV2VulkanRenderSmoke(): String
 
+    // ── DUET-VULKAN-GREENSCREEN-PIXEL-PROOF: VulkanGreenScreenCompositor ──────
+    // mask-blend pixel proof diagnostic. Native creates its own temporary
+    // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8_UNORM
+    // background/foreground sampled images and an R8_UNORM mask sampled image
+    // (17x19, deliberately smaller than the 64x48 output so the mask
+    // sampler's scaling path is exercised) with clamp-to-edge samplers, a
+    // 64x48 offscreen color attachment and a host-visible readback buffer on
+    // the calling thread, calls the private Vulkan green-screen helper once
+    // (existing AOT passthrough vertex SPIR-V + new greenscreen_blend
+    // fragment SPIR-V, fixed-function blend disabled), reads the pixels
+    // back, compares every output pixel against the helper's own pure CPU
+    // reference (alpha 0 reproduces background exactly, alpha 255 reproduces
+    // foreground exactly, fractional alpha values are a true blend within
+    // tolerance), proves the helper's fail-closed input validation rejects
+    // bad targets/images/mask sizes before any Vulkan object is created,
+    // proves helper temporary object created == released, and destroys
+    // everything before returning a JSON object string. Reports status
+    // "UNSUPPORTED" (never crashes) when no usable Vulkan device/driver
+    // exists. Diagnostic-only: no camera, no MediaCodec decode, no
+    // AHardwareBuffer import, no production Duet preview/export route, no
+    // production VulkanBackend mutation, no product UI.
+    external fun runAndroidDuetVulkanPixelProofSmoke(): String
+
     // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec -> AHB -> Vulkan ──
     // crossfade proof. Kotlin (AndroidTimelineDualDecoderSyncDriver) owns both
     // decoder pipelines and calls this once per overlap frame with one
