@@ -657,6 +657,12 @@ class AndroidDuetSessionCoordinator(
             return
         }
 
+        // Compute the effective layoutConfig up front (before the render loop is
+        // constructed) so it can both select the diagnostic preview backend and
+        // drive the layout-rect computation below without a second declaration.
+        val effectiveLayoutMap = layoutConfigMap ?: session.layoutConfigMap
+        val backendSelection = AndroidDuetPreviewBackendFactory.selectForLayoutConfig(effectiveLayoutMap)
+
         val renderLoop = try {
             AndroidDuetPreviewRenderLoop(
                 mainHandler     = mainHandler,
@@ -669,6 +675,7 @@ class AndroidDuetSessionCoordinator(
                 cameraInputSurfaceReady = { camSurface ->
                     startCameraSourceIfNeeded(session, sessionId, camSurface)
                 },
+                backendSelection = backendSelection,
             )
         } catch (t: Throwable) {
             producer.release()
@@ -680,8 +687,6 @@ class AndroidDuetSessionCoordinator(
         session.previewProducer   = producer
         session.previewRenderLoop = renderLoop
 
-        // Compute optional layout rects from the effective layoutConfig.
-        val effectiveLayoutMap = layoutConfigMap ?: session.layoutConfigMap
         // Persist the caller-supplied layout so startCameraSourceIfNeeded sees the
         // correct mode (e.g. "greenScreen") when its cameraInputSurfaceReady callback
         // fires.  We only overwrite when a layoutConfigMap was explicitly passed in;

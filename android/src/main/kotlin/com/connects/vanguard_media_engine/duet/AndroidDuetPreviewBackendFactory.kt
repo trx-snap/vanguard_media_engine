@@ -22,6 +22,22 @@ object AndroidDuetPreviewBackendFactory {
         return AndroidDuetPreviewBackendSelector.select(AndroidDuetPreviewBackendId.GLES)
     }
 
+    /**
+     * Diagnostic-only selection: requests VULKAN when the native layoutConfigMap
+     * opts in explicitly via `mode == "greenScreen"` and
+     * `debugPreviewBackend == "vulkan"`. Every other combination (including
+     * PiP/split layouts and normal greenScreen without the debug key) requests
+     * GLES, matching [selectDefault]. Vulkan capability failure still falls
+     * back to GLES via [AndroidDuetPreviewBackendSelector.select].
+     */
+    fun selectForLayoutConfig(layoutConfigMap: Map<String, Any?>?): AndroidDuetPreviewBackendSelection {
+        val mode = layoutConfigMap?.get("mode") as? String
+        val debugPreviewBackend = layoutConfigMap?.get("debugPreviewBackend") as? String
+        val requestVulkan = mode == "greenScreen" && debugPreviewBackend == "vulkan"
+        if (!requestVulkan) return selectDefault()
+        return AndroidDuetPreviewBackendSelector.select(AndroidDuetPreviewBackendId.VULKAN)
+    }
+
     fun create(
         selection: AndroidDuetPreviewBackendSelection = selectDefault(),
     ): AndroidDuetPreviewBackend {

@@ -3,28 +3,44 @@
 //
 // Frozen Android Duet green-screen preview physical smoke harness.
 //
+// This harness exercises the OPT-IN Vulkan preview diagnostic route: the
+// attach-time layoutConfig sets `debugPreviewBackend: "vulkan"` (a native-only
+// debug key not exposed by the public `VGDuetLayoutConfig` Dart model, sent
+// via a raw `MethodChannel("vanguard_media_engine")` call for the attach step
+// only) alongside `mode: "greenScreen"`, which is the only combination that
+// makes `AndroidDuetPreviewBackendFactory.selectForLayoutConfig` request the
+// Vulkan preview backend. If the native Vulkan capability probe fails, the
+// existing selector falls back to GLES automatically; either outcome is
+// logged once via `ANDROID_DUET_PREVIEW_BACKEND_SELECTED`. Production
+// PiP/split layouts and normal greenScreen (without this debug key) are
+// unaffected and keep using GLES.
+//
 // Proof boundary:
 //   - Device requirement: Android physical device with camera permission available.
 //   - Harness command:
 //       cd packages/vanguard_media_engine/example && flutter run -d <deviceId> -t lib/android_duet_green_screen_preview_physical_smoke.dart
 //   - Claims allowed:
 //       * local source session init
-//       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup
+//       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup, with the opt-in `debugPreviewBackend: "vulkan"` diagnostic key present in the raw attach payload
 //       * attach-time native layout rect for creatorOverlay was returned and matched expected geometry
 //       * preview texture attach success
+//       * native `ANDROID_DUET_PREVIEW_BACKEND_SELECTED requested=vulkan ...` log evidences the diagnostic route was requested (actual may still be gles on probe failure — fallback is expected behavior, not a defect)
 //       * startRecording activates render loop/camera
 //       * bounded green-screen preview remains active
 //       * MediaPipe CPU primary (`mediapipe_cpu`) selected when model asset is bundled
 //       * native `ANDROID_DUET_GREENSCREEN_MEDIAPIPE_MASK_FIRST` log may evidence first MediaPipe mask
 //       * native `ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST` log may evidence temporal smoothing
 //       * native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload
-//       * layout update away from greenScreen to PiP works
+//       * native `ANDROID_DUET_VULKAN_MASK_UPLOAD_FIRST` / `ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST` logs may evidence a first successful Vulkan mask upload / composited frame, only when the actual backend selected is vulkan
 //       * stop/detach/dispose/temp cleanup complete
 //   - Non-claims:
+//       * no production-default backend claim: this route is opt-in only via `debugPreviewBackend: "vulkan"`; the default selection (no debug key) remains GLES for all layout modes, including greenScreen
+//       * no PiP layout-switch claim: this harness does not switch layout to PiP mid-session, so it never exercises `updateDuetLayout` to `pip` (previous revisions of this harness did; removed so the diagnostic route stays active for the full recording window)
 //       * no MediaPipe GPU delegate proof
 //       * no adaptive quality tier proof
 //       * no low-end/budget Android proof
 //       * no rendered pixel / visual placement proof (rendered pixels not measured)
+//       * no pixel-quality proof: Vulkan-composited frame visual/matte quality is not evaluated, only that the render path executes and emits the expected native logs
 //       * no matte quality proof
 //       * no export/audio/speed/app wiring proof
 
@@ -46,6 +62,12 @@ const String kSmokeFailMarker =
     'ANDROID_DUET_GREENSCREEN_PREVIEW_PHYSICAL_FAIL';
 const String kSmokeJsonPrefix =
     'ANDROID_DUET_GREENSCREEN_PREVIEW_PHYSICAL_JSON:';
+
+/// Raw channel used ONLY for the attach step, so the layoutConfig map can
+/// carry the `debugPreviewBackend` diagnostic key that `VGDuetLayoutConfig`
+/// does not expose through the public Dart API. Every other platform call in
+/// this harness goes through the typed [VGDuetPlatformInterface] as before.
+const MethodChannel _rawDuetChannel = MethodChannel('vanguard_media_engine');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -177,21 +199,39 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 3: Attach preview texture (1080x1920, greenScreen creatorOverlay)
+      // Step 3: Attach preview texture (1080x1920, greenScreen creatorOverlay,
+      // opt-in debugPreviewBackend="vulkan" diagnostic route). Uses the raw
+      // MethodChannel directly (not VGDuetPlatformInterface) so the
+      // native-only debugPreviewBackend key can ride alongside the existing
+      // greenScreen creatorOverlay fields.
       await runStep<VGDuetPreviewTexture>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen creatorOverlay)',
+        'Attaching preview texture (1080x1920, greenScreen creatorOverlay, debugPreviewBackend=vulkan)',
         () async {
-          final preview = await _withTimeout(
-            _platform.attachPreviewTexture(
-              sessionId: sessionId!,
-              canvasSize: const VGDuetSize(1080, 1920),
-              layoutConfig: VGDuetLayoutConfig(
-                mode: VGDuetLayoutMode.greenScreen,
-                foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
-              ),
+          final rawResult = await _withTimeout(
+            _rawDuetChannel.invokeMethod<Map>(
+              'attachDuetPreviewTexture',
+              <String, dynamic>{
+                'sessionId': sessionId!,
+                'canvasSize': const VGDuetSize(1080, 1920).toMap(),
+                'layoutConfig': <String, dynamic>{
+                  'mode': 'greenScreen',
+                  'isSideSwapped': false,
+                  'isTopBottomSwapped': false,
+                  'foregroundTransform': VGDuetForegroundTransform
+                      .creatorOverlay
+                      .toMap(),
+                  'debugPreviewBackend': 'vulkan',
+                },
+              },
             ),
             'attachPreviewTexture',
+          );
+          if (rawResult == null) {
+            throw StateError('attachDuetPreviewTexture returned null result');
+          }
+          final preview = VGDuetPreviewTexture.fromMap(
+            Map<String, dynamic>.from(rawResult),
           );
           if (preview.textureId < 0) {
             throw StateError('Invalid textureId: ${preview.textureId}');
@@ -250,46 +290,9 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 6: Update layout to PiP (safe PiP rect left 0.58 top 0.05 width 0.36 height 0.24)
-      await runStep<void>(
-        'UPDATE_LAYOUT_PIP',
-        'Updating layout to PiP (safe rect: left 0.58, top 0.05, width 0.36, height 0.24)',
-        () async {
-          final pipConfig = VGDuetLayoutConfig(
-            mode: VGDuetLayoutMode.pip,
-            pipAnchor: VGDuetPiPAnchor.topRight,
-            pipNormalizedRect: const VGDuetRect(
-              left: 0.58,
-              top: 0.05,
-              width: 0.36,
-              height: 0.24,
-            ),
-          );
-          await _withTimeout(
-            _platform.updateLayout(
-              sessionId: sessionId!,
-              layoutConfig: pipConfig,
-            ),
-            'updateLayout',
-          );
-          if (mounted) {
-            setState(() {
-              _layoutMode = 'pip (safe)';
-            });
-          }
-        },
-      );
-
-      // Step 7: Wait 1.5 seconds with PiP preview active
-      await runStep<void>(
-        'PIP_PREVIEW_ACTIVE',
-        'Observing PiP preview active (1.5s)',
-        () async {
-          await Future<void>.delayed(const Duration(milliseconds: 1500));
-        },
-      );
-
-      // Step 8: Pause recording
+      // Step 6: Pause recording
+      // (No PiP layout switch: the Vulkan diagnostic route stays active for
+      // the full recording window — see file header non-claims.)
       await runStep<void>('PAUSE_RECORDING', 'Pausing recording', () async {
         await _withTimeout(
           _platform.pauseRecording(sessionId: sessionId!),
@@ -297,7 +300,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         );
       });
 
-      // Step 9: Stop recording
+      // Step 7: Stop recording
       captureResult = await runStep<VGDuetCaptureResult>(
         'STOP_RECORDING',
         'Stopping recording and retrieving capture result',
@@ -309,7 +312,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 10: Detach preview texture
+      // Step 8: Detach preview texture
       await runStep<
         void
       >('DETACH_PREVIEW', 'Detaching preview texture', () async {
@@ -336,7 +339,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         isDetached = true;
       });
 
-      // Step 11: Dispose session
+      // Step 9: Dispose session
       await runStep<void>(
         'DISPOSE_SESSION',
         'Disposing native Duet session',
@@ -349,7 +352,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 12: Cleanup temp fixture directory
+      // Step 10: Cleanup temp fixture directory
       await runStep<void>(
         'CLEANUP_TEMP_FIXTURE',
         'Deleting staged fixture temp directory',
@@ -413,23 +416,27 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         'proofBoundary': 'android_duet_green_screen_preview_physical_smoke',
         'claimsAllowed': <String>[
           'local source session init',
-          'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup',
+          'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup, with the opt-in `debugPreviewBackend: "vulkan"` diagnostic key present in the raw attach payload',
           'attach-time native layout rect for creatorOverlay was returned and matched expected geometry',
           'preview texture attach success',
+          'native `ANDROID_DUET_PREVIEW_BACKEND_SELECTED requested=vulkan ...` log evidences the diagnostic route was requested (actual may still be gles on probe failure — fallback is expected behavior, not a defect)',
           'startRecording activates render loop/camera',
           'bounded green-screen preview remains active',
           'MediaPipe CPU primary (`mediapipe_cpu`) selected when model asset is bundled',
           'native `ANDROID_DUET_GREENSCREEN_MEDIAPIPE_MASK_FIRST` log may evidence first MediaPipe mask',
           'native `ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST` log may evidence temporal smoothing',
           'native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload',
-          'layout update away from greenScreen to PiP works',
+          'native `ANDROID_DUET_VULKAN_MASK_UPLOAD_FIRST` / `ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST` logs may evidence a first successful Vulkan mask upload / composited frame, only when the actual backend selected is vulkan',
           'stop/detach/dispose/temp cleanup complete',
         ],
         'nonClaims': <String>[
+          'no production-default backend claim: this route is opt-in only via `debugPreviewBackend: "vulkan"`; the default selection (no debug key) remains GLES for all layout modes, including greenScreen',
+          'no PiP layout-switch claim: this harness does not switch layout to PiP mid-session',
           'no MediaPipe GPU delegate proof',
           'no adaptive quality tier proof',
           'no low-end/budget Android proof',
           'no rendered pixel / visual placement proof (rendered pixels not measured)',
+          'no pixel-quality proof: Vulkan-composited frame visual/matte quality is not evaluated',
           'no matte quality proof',
           'no export/audio/speed/app wiring proof',
         ],

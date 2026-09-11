@@ -46,6 +46,11 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     private var sourceVideoWidthPx = 0
     private var sourceVideoHeightPx = 0
 
+    // One-shot diagnostic logs, emitted only after the corresponding native
+    // call reports success for the first time (never on a false/failed call).
+    private val maskUploadLoggedOnce = AtomicBoolean(false)
+    private val previewFrameLoggedOnce = AtomicBoolean(false)
+
     override val cameraInputSurface: Surface?
         get() = fallbackDelegate?.cameraInputSurface ?: cameraReader?.surface
 
@@ -129,7 +134,7 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                     throw IllegalStateException("ImageReader HardwareBuffer usage requires API >= Q")
                 }
-                val usage = HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
+                val usage = HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
                 if (cameraReader == null) {
                     cameraReader = ImageReader.newInstance(
                         CAMERA_DEFAULT_WIDTH,
@@ -261,7 +266,14 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         packed.rewind()
 
         try {
-            VanguardNativeBridge.updateAndroidDuetVulkanPreviewMask(nativeSessionHandle, packed, width, height)
+            val success = VanguardNativeBridge.updateAndroidDuetVulkanPreviewMask(nativeSessionHandle, packed, width, height)
+            if (success && maskUploadLoggedOnce.compareAndSet(false, true)) {
+                Log.i(
+                    TAG,
+                    "ANDROID_DUET_VULKAN_MASK_UPLOAD_FIRST width=$width height=$height " +
+                        "format=${frame.format.name.lowercase()}",
+                )
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "Exception updating native Vulkan preview mask", t)
         }
@@ -303,9 +315,13 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         // from latchedDecoderImage/latchedCameraImage; they must be closed here
         // regardless of native outcome, without touching the latched Images.
         return try {
-            VanguardNativeBridge.renderAndroidDuetVulkanPreviewFrame(
+            val success = VanguardNativeBridge.renderAndroidDuetVulkanPreviewFrame(
                 nativeSessionHandle, decoderBuffer, cameraBuffer,
             )
+            if (success && previewFrameLoggedOnce.compareAndSet(false, true)) {
+                Log.i(TAG, "ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST")
+            }
+            success
         } catch (t: Throwable) {
             Log.w(TAG, "Exception rendering native Vulkan preview frame", t)
             false

@@ -66,6 +66,12 @@ class AndroidDuetPreviewRenderLoop(
      * compositor bootstrap fails.
      */
     private val cameraInputSurfaceReady: ((android.view.Surface) -> Unit)? = null,
+    /**
+     * Diagnostic-only backend selection, computed by
+     * [AndroidDuetPreviewBackendFactory.selectForLayoutConfig] from the
+     * attach-time layoutConfigMap. Defaults to the production GLES selection.
+     */
+    private val backendSelection: AndroidDuetPreviewBackendSelection = AndroidDuetPreviewBackendFactory.selectDefault(),
 ) {
 
     companion object {
@@ -96,7 +102,17 @@ class AndroidDuetPreviewRenderLoop(
     private val renderHandler = Handler(renderThread.looper)
 
     /** Render-thread-only; every touch happens via [renderHandler]. */
-    private val compositor: AndroidDuetPreviewBackend = AndroidDuetPreviewBackendFactory.create()
+    private val compositor: AndroidDuetPreviewBackend = AndroidDuetPreviewBackendFactory.create(backendSelection)
+
+    init {
+        Log.i(
+            TAG,
+            "ANDROID_DUET_PREVIEW_BACKEND_SELECTED " +
+                "requested=${backendSelection.requested.name.lowercase()} " +
+                "actual=${backendSelection.actual.name.lowercase()} " +
+                "fallbackReason=${backendSelection.fallbackReason ?: "none"}",
+        )
+    }
 
     /**
      * Whether the decoder has been (re)bound to [compositor]'s decoder input
