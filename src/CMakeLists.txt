@@ -166,6 +166,7 @@ add_library(vanguard_render_vulkan STATIC
     # Diagnostic-only in this slice; not wired into production Duet
     # preview/export.
     "render/vulkan/src/vulkan_greenscreen_compositor.cpp"
+    "render/vulkan/src/vulkan_greenscreen_frame_renderer.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
