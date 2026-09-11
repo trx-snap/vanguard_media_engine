@@ -49,7 +49,7 @@ import kotlin.math.roundToInt
 // (which may fire on any looper and therefore only sets [framePending]) and
 // the decoder writing into [decoderInputSurface] on the decoder thread.
 
-class AndroidDuetPreviewCompositor {
+class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     companion object {
         private const val TAG = "DuetPreviewComp"
@@ -98,7 +98,7 @@ class AndroidDuetPreviewCompositor {
      * across output loss and is released exactly once in [release]. Null until
      * the first successful [attachOutputSurface].
      */
-    val decoderInputSurface: Surface? get() = _decoderInputSurface
+    override val decoderInputSurface: Surface? get() = _decoderInputSurface
 
     /** Set by the frame-available callback (any thread), consumed in [drawFrame]. */
     private val framePending = AtomicBoolean(false)
@@ -108,7 +108,7 @@ class AndroidDuetPreviewCompositor {
      * not yet consumed via updateTexImage. Lets the render loop wait (without
      * blocking) for an expected frame before presenting.
      */
-    val hasPendingSourceFrame: Boolean get() = framePending.get()
+    override val hasPendingSourceFrame: Boolean get() = framePending.get()
 
     /** True once updateTexImage has latched at least one real source frame. */
     private var hasTexImage = false
@@ -128,7 +128,7 @@ class AndroidDuetPreviewCompositor {
      * this compositor: allocated on first [attachOutputSurface], released once
      * in [release]. Null until the first successful [attachOutputSurface].
      */
-    val cameraInputSurface: Surface? get() = _cameraInputSurface
+    override val cameraInputSurface: Surface? get() = _cameraInputSurface
 
     /** Set by the camera frame-available callback (any thread), consumed in [drawFrame]. */
     private val cameraFramePending = AtomicBoolean(false)
@@ -137,7 +137,7 @@ class AndroidDuetPreviewCompositor {
     private var hasCameraTexImage = false
 
     /** True when a new camera frame is waiting to be consumed. */
-    val hasPendingCameraFrame: Boolean get() = cameraFramePending.get()
+    override val hasPendingCameraFrame: Boolean get() = cameraFramePending.get()
 
     private val cameraStMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
@@ -223,7 +223,7 @@ class AndroidDuetPreviewCompositor {
      * previous window surface first. Returns false (leaving no window surface
      * bound) when released, [surface] is invalid, or any EGL step fails.
      */
-    fun attachOutputSurface(surface: Surface, widthPx: Int, heightPx: Int): Boolean {
+    override fun attachOutputSurface(surface: Surface, widthPx: Int, heightPx: Int): Boolean {
         if (isReleased.get()) return false
         if (!surface.isValid || widthPx <= 0 || heightPx <= 0) {
             Log.w(TAG, "attachOutputSurface rejected: valid=${surface.isValid} ${widthPx}x$heightPx")
@@ -268,7 +268,7 @@ class AndroidDuetPreviewCompositor {
      * decoder remains bound for a later re-attach. Tolerates every EGL
      * teardown error; never throws. Idempotent.
      */
-    fun detachOutputSurface() {
+    override fun detachOutputSurface() {
         destroyWindowSurfaceQuietly()
         outputSurface = null
         outputWidthPx = 0
@@ -278,7 +278,7 @@ class AndroidDuetPreviewCompositor {
     // -- Layout / video size ---------------------------------------------------
 
     /** Canvas-pixel rects (top-left origin) for the source video and camera placeholder. */
-    fun setLayout(sourceRect: VGDuetPixelRect, cameraRect: VGDuetPixelRect) {
+    override fun setLayout(sourceRect: VGDuetPixelRect, cameraRect: VGDuetPixelRect) {
         this.sourceRect = sourceRect
         this.cameraRect = cameraRect
     }
@@ -288,7 +288,7 @@ class AndroidDuetPreviewCompositor {
      * Read off the decoder (on the decoder thread) by the render loop and
      * forwarded here. Unknown (<= 0) falls back to a plain stretch fill.
      */
-    fun setSourceVideoSize(widthPx: Int, heightPx: Int) {
+    override fun setSourceVideoSize(widthPx: Int, heightPx: Int) {
         sourceVideoWidthPx = widthPx
         sourceVideoHeightPx = heightPx
     }
@@ -299,7 +299,7 @@ class AndroidDuetPreviewCompositor {
      * Enable or disable green-screen compositing. Must be called on the render thread.
      * When disabled, the camera rect reverts to normal PiP/split drawing behaviour.
      */
-    fun setGreenScreenEnabled(enabled: Boolean) {
+    override fun setGreenScreenEnabled(enabled: Boolean) {
         greenScreenEnabled = enabled
         if (!enabled) {
             // Clear pending mask so stale data is not shown if re-enabled later.
@@ -315,7 +315,7 @@ class AndroidDuetPreviewCompositor {
      * Safe to call from any thread (backed by AtomicReference — latest wins,
      * stale frames are dropped). ML Kit callback thread → render thread.
      */
-    fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
+    override fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
         pendingMaskRef.set(frame)
     }
 
@@ -332,7 +332,7 @@ class AndroidDuetPreviewCompositor {
      * Returns false (without throwing) when released, no output is attached,
      * or EGL rejects the frame (e.g. surface torn down mid-draw).
      */
-    fun drawFrame(): Boolean {
+    override fun drawFrame(): Boolean {
         if (isReleased.get() || !coreReady) return false
         val display = eglDisplay
         val window = eglWindowSurface
@@ -415,7 +415,7 @@ class AndroidDuetPreviewCompositor {
      * must have unbound the decoder first via rebindOutputSurface(null, ..)),
      * then the EGL context/display. Tolerates every EGL/GL error.
      */
-    fun release() {
+    override fun release() {
         if (!isReleased.compareAndSet(false, true)) return
 
         try { surfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}

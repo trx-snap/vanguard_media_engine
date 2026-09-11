@@ -96,7 +96,7 @@ class AndroidDuetPreviewRenderLoop(
     private val renderHandler = Handler(renderThread.looper)
 
     /** Render-thread-only; every touch happens via [renderHandler]. */
-    private val compositor = AndroidDuetPreviewCompositor()
+    private val compositor: AndroidDuetPreviewBackend = AndroidDuetPreviewCompositor()
 
     /**
      * Whether the decoder has been (re)bound to [compositor]'s decoder input
