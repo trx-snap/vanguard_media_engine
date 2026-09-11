@@ -6,11 +6,13 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VG-DUET-SLICE-2/4A: Android thin dispatch handler for Duet MethodChannel routes.
+// VG-DUET-SLICE-2/4A/5B-A: Android thin dispatch handler for Duet MethodChannel routes.
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Owns the 12 Duet route names (10 original + 2 Slice 4A texture routes).
-// Plugin is a thin router only — all session logic lives in AndroidDuetSessionCoordinator.
+// Owns the 13 Duet route names (10 original + 2 Slice 4A texture routes +
+// 1 Slice 5B-A descriptor-bound offline export route).
+// Plugin is a thin router only — all session logic lives in AndroidDuetSessionCoordinator
+// and all export logic lives in AndroidDuetExportSession.
 // All public methods are called on the main thread.
 
 /**
@@ -18,7 +20,7 @@ import io.flutter.view.TextureRegistry
  * Plugin owns one instance and calls [handleMethodCall] for routes [ownsMethod] returns true for.
  */
 class AndroidDuetMethodHandler(
-    mainHandler: Handler,
+    private val mainHandler: Handler,
     textureRegistry: TextureRegistry? = null,
     context: Context? = null,
     onDuetEvent: ((Map<String, Any?>) -> Unit)? = null,
@@ -41,6 +43,8 @@ class AndroidDuetMethodHandler(
             // Slice 4A: preview texture lifecycle
             "attachDuetPreviewTexture",
             "detachDuetPreviewTexture",
+            // Slice 5B-A: descriptor-bound offline export
+            "exportDuetComposition",
         )
 
         @JvmStatic
@@ -55,6 +59,11 @@ class AndroidDuetMethodHandler(
         context,
         onDuetEvent,
     )
+
+    // ── Export session (Slice 5B-A) ───────────────────────────────────────────
+    // One instance per handler; one export active at a time (enforced inside).
+
+    private val exportSession = AndroidDuetExportSession(mainHandler)
 
     // ── Dispatch ──────────────────────────────────────────────────────────────
 
@@ -155,6 +164,16 @@ class AndroidDuetMethodHandler(
                 }
             }
 
+            // ── Slice 5B-A: descriptor-bound offline export ───────────────────
+            // Handler is thin: all argument extraction and validation live in
+            // AndroidDuetExportSession.startExportFromArgs().
+
+            "exportDuetComposition" -> {
+                exportSession.startExportFromArgs(safeArgs) { value, errStr ->
+                    replyFromCoordinator(result, value, errStr)
+                }
+            }
+
             else -> result.notImplemented()
         }
     }
@@ -163,6 +182,7 @@ class AndroidDuetMethodHandler(
 
     fun disposeAll() {
         coordinator.disposeAll()
+        exportSession.disposeAll()
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

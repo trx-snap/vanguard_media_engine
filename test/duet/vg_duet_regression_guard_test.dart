@@ -38,7 +38,9 @@ import 'package:vanguard_media_engine/vg_duet.dart'
         VGDuetException,
         VGDuetErrorCode,
         VGDuetForegroundTransform,
-        VGDuetPoint;
+        VGDuetPoint,
+        // Slice 5B-A: offline export result type.
+        VGDuetExportResult;
 
 void main() {
   group('Regression guard: existing public classes remain importable', () {
@@ -158,6 +160,17 @@ void main() {
       const transform = VGDuetForegroundTransform.creatorOverlay;
       expect(transform.scale, 0.62);
       expect(transform.offset, const VGDuetPoint(0.0, 0.22));
+    });
+
+    test('VGDuetExportResult is accessible and constructable (Slice 5B-A)', () {
+      final result = VGDuetExportResult(
+        outputPath: '/tmp/test.mp4',
+        durationMs: 1000,
+        fileSizeBytes: 2048,
+      );
+      expect(result.outputPath, '/tmp/test.mp4');
+      expect(result.durationMs, 1000);
+      expect(result.fileSizeBytes, 2048);
     });
   });
 }

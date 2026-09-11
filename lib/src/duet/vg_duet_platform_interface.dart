@@ -4,6 +4,7 @@
 import 'package:flutter/services.dart';
 
 import 'vg_duet_composition_descriptor.dart';
+import 'vg_duet_export.dart';
 import 'vg_duet_models.dart';
 import 'vg_duet_source.dart';
 
@@ -88,6 +89,32 @@ abstract class VGDuetPlatformInterface {
   /// session, succeeds as a no-op. Unknown sessions return
   /// [VGDuetException] with code 'session_not_found'.
   Future<void> detachPreviewTexture({required String sessionId});
+
+  // ── Slice 5B-A: descriptor-bound offline export ───────────────────────────
+
+  /// Exports a Duet composition offline, descriptor-bound (no sessionId).
+  ///
+  /// Encodes a video-only MP4 to [outputPath] from [descriptor]. The output
+  /// file is written atomically: the engine writes to a temp path and renames
+  /// on success; failure deletes the temp. Fails with
+  /// [VGDuetException(code: compositionFailed)] if [outputPath] already exists,
+  /// if encoding fails, or if another export is already active
+  /// (`export_busy` from the platform maps to [VGDuetErrorCode.compositionFailed]).
+  ///
+  /// Only one Duet export may be active at a time on Android.
+  ///
+  /// Parameters:
+  /// - [descriptor]: full composition descriptor; must have a valid local
+  ///   source file path reachable on disk.
+  /// - [outputPath]: absolute path for the final MP4 output.
+  /// - [targetSize]: output video dimensions (default 1080×1920).
+  /// - [videoBitRate]: encoding bit rate in bits/s (default 8 Mbps).
+  Future<VGDuetExportResult> exportDuetComposition({
+    required VGDuetCompositionDescriptor descriptor,
+    required String outputPath,
+    VGDuetSize targetSize = const VGDuetSize(1080, 1920),
+    int videoBitRate = 8000000,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -404,6 +431,49 @@ class MethodChannelVGDuetPlatform extends VGDuetPlatformInterface {
       throw VGDuetException(
         code: VGDuetErrorCode.compositionFailed,
         message: e.message ?? 'detachDuetPreviewTexture failed.',
+        cause: e,
+      );
+    }
+  }
+
+  // ── exportDuetComposition (Slice 5B-A) ────────────────────────────────────
+
+  /// Native method name: `exportDuetComposition`
+  ///
+  /// Payload keys: `descriptor` (Map), `outputPath` (String),
+  ///   `targetSize` (Map{width, height}), `videoBitRate` (int).
+  ///
+  /// Success reply: Map with keys `outputPath`, `durationMs`, `fileSizeBytes`.
+  /// Error codes from native: `export_busy`, `source_invalid`, `disk_full`, etc.
+  /// All native errors are wrapped in [VGDuetException(code: compositionFailed)].
+  @override
+  Future<VGDuetExportResult> exportDuetComposition({
+    required VGDuetCompositionDescriptor descriptor,
+    required String outputPath,
+    VGDuetSize targetSize = const VGDuetSize(1080, 1920),
+    int videoBitRate = 8000000,
+  }) async {
+    try {
+      final result = await channel
+          .invokeMethod<Map>('exportDuetComposition', <String, dynamic>{
+            'descriptor': descriptor.toMap(),
+            'outputPath': outputPath,
+            'targetSize': targetSize.toMap(),
+            'videoBitRate': videoBitRate,
+          });
+      if (result == null) {
+        throw VGDuetException(
+          code: VGDuetErrorCode.compositionFailed,
+          message: 'exportDuetComposition returned null result.',
+        );
+      }
+      return VGDuetExportResult.fromMap(Map<String, dynamic>.from(result));
+    } on VGDuetException {
+      rethrow;
+    } on PlatformException catch (e) {
+      throw VGDuetException(
+        code: VGDuetErrorCode.compositionFailed,
+        message: e.message ?? 'exportDuetComposition failed.',
         cause: e,
       );
     }

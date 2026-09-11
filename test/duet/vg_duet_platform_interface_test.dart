@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_source.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_models.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_composition_descriptor.dart';
+import 'package:vanguard_media_engine/src/duet/vg_duet_export.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_platform_interface.dart';
 
 const _channelName = 'vanguard_media_engine';
@@ -144,7 +145,7 @@ void main() {
   group('stopRecording (Fix 1)', () {
     /// Minimal fake compositionDescriptor map that round-trips through
     /// VGDuetCompositionDescriptor.fromMap.
-    Map<String, dynamic> _descriptorMap() => {
+    Map<String, dynamic> descriptorMap() => {
       'source': {'filePath': '/tmp/source.mp4'},
       'layoutConfig': {
         'mode': 'splitLeftRight',
@@ -164,7 +165,7 @@ void main() {
       'uses native segmentCount when present, ignores top-level segments',
       () async {
         fakeChannel.returnValue = {
-          'compositionDescriptor': _descriptorMap(),
+          'compositionDescriptor': descriptorMap(),
           'segmentAssets': ['/tmp/seg0.mp4', '/tmp/seg1.mp4', '/tmp/seg2.mp4'],
           'totalDurationMs': 6000,
           'segmentCount': 3, // native-provided; no top-level segments key
@@ -187,7 +188,7 @@ void main() {
       'falls back to segmentAssets.length when segmentCount absent',
       () async {
         fakeChannel.returnValue = {
-          'compositionDescriptor': _descriptorMap(),
+          'compositionDescriptor': descriptorMap(),
           'segmentAssets': ['/tmp/seg0.mp4', '/tmp/seg1.mp4'],
           'totalDurationMs': 4000,
           // no segmentCount key
@@ -202,7 +203,7 @@ void main() {
       'throws VGDuetException when segmentCount absent and no assets/segments',
       () async {
         fakeChannel.returnValue = {
-          'compositionDescriptor': _descriptorMap(),
+          'compositionDescriptor': descriptorMap(),
           'segmentAssets': [],
           'totalDurationMs': 1000,
           // no segmentCount, no segments, no assets
@@ -214,5 +215,140 @@ void main() {
         );
       },
     );
+  });
+
+  // ── Slice 5B-A: exportDuetComposition ────────────────────────────────────
+
+  group('exportDuetComposition (Slice 5B-A)', () {
+    VGDuetCompositionDescriptor makeDescriptor() {
+      return VGDuetCompositionDescriptor(
+        source: VGDuetSource.localFile('/tmp/source.mp4'),
+        layoutConfig: VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
+        ),
+        trimWindow: VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 5.0),
+        initialSpeed: 1.0,
+        segments: [],
+      );
+    }
+
+    test('calls exportDuetComposition native method', () async {
+      fakeChannel.returnValue = {
+        'outputPath': '/tmp/out.mp4',
+        'durationMs': 5000,
+        'fileSizeBytes': 1024 * 1024,
+      };
+      await platform.exportDuetComposition(
+        descriptor: makeDescriptor(),
+        outputPath: '/tmp/out.mp4',
+      );
+      expect(fakeChannel.lastMethod, 'exportDuetComposition');
+    });
+
+    test(
+      'payload contains descriptor, outputPath, targetSize, videoBitRate',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 4000,
+          'fileSizeBytes': 512000,
+        };
+        const size = VGDuetSize(720, 1280);
+        await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/out.mp4',
+          targetSize: size,
+          videoBitRate: 4000000,
+        );
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        expect(args['outputPath'], '/tmp/out.mp4');
+        expect((args['targetSize'] as Map)['width'], closeTo(720, 1e-10));
+        expect((args['targetSize'] as Map)['height'], closeTo(1280, 1e-10));
+        expect(args['videoBitRate'], 4000000);
+        // descriptor must include source filePath
+        final descMap = args['descriptor'] as Map;
+        expect((descMap['source'] as Map)['filePath'], '/tmp/source.mp4');
+      },
+    );
+
+    test('maps native result to VGDuetExportResult', () async {
+      fakeChannel.returnValue = {
+        'outputPath': '/data/out.mp4',
+        'durationMs': 3000,
+        'fileSizeBytes': 800000,
+      };
+      final result = await platform.exportDuetComposition(
+        descriptor: makeDescriptor(),
+        outputPath: '/data/out.mp4',
+      );
+      expect(result, isA<VGDuetExportResult>());
+      expect(result.outputPath, '/data/out.mp4');
+      expect(result.durationMs, 3000);
+      expect(result.fileSizeBytes, 800000);
+    });
+
+    test(
+      'default targetSize is 1080x1920 and default bitrate is 8 Mbps',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/x.mp4',
+          'durationMs': 2000,
+          'fileSizeBytes': 100000,
+        };
+        await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/x.mp4',
+        );
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        expect((args['targetSize'] as Map)['width'], closeTo(1080, 1e-10));
+        expect((args['targetSize'] as Map)['height'], closeTo(1920, 1e-10));
+        expect(args['videoBitRate'], 8000000);
+      },
+    );
+
+    test('wraps null result in VGDuetException(compositionFailed)', () {
+      fakeChannel.returnValue = null; // null triggers VGDuetException
+      expect(
+        () => platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/out.mp4',
+        ),
+        throwsA(
+          isA<VGDuetException>().having(
+            (e) => e.code,
+            'code',
+            VGDuetErrorCode.compositionFailed,
+          ),
+        ),
+      );
+    });
+
+    test('VGDuetExportResult toMap/fromMap round-trips', () {
+      final r = VGDuetExportResult(
+        outputPath: '/tmp/round.mp4',
+        durationMs: 7500,
+        fileSizeBytes: 2048000,
+      );
+      final map = r.toMap();
+      final r2 = VGDuetExportResult.fromMap(map);
+      expect(r2.outputPath, r.outputPath);
+      expect(r2.durationMs, r.durationMs);
+      expect(r2.fileSizeBytes, r.fileSizeBytes);
+    });
+
+    test('VGDuetExportResult equality', () {
+      final r1 = VGDuetExportResult(
+        outputPath: '/tmp/eq.mp4',
+        durationMs: 1000,
+        fileSizeBytes: 512,
+      );
+      final r2 = VGDuetExportResult(
+        outputPath: '/tmp/eq.mp4',
+        durationMs: 1000,
+        fileSizeBytes: 512,
+      );
+      expect(r1, equals(r2));
+    });
   });
 }

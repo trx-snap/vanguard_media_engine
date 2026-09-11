@@ -1,5 +1,5 @@
 // Copyright 2026, Connects. All rights reserved.
-// Barrel file: exports all public Vanguard Duet contracts (Slice 1).
+// Barrel file: exports all public Vanguard Duet contracts (Slice 1+).
 //
 // Pure-Dart Duet foundation — no native implementation in this barrel.
 // Universal Editor export integration is deferred to a later slice.
@@ -32,3 +32,5 @@ export 'src/duet/vg_duet_platform_interface.dart'
     show VGDuetPlatformInterface, MethodChannelVGDuetPlatform;
 export 'src/duet/vg_duet_events.dart'
     show VGDuetEventType, VGDuetEvent, VGDuetEvents;
+// Slice 5B-A: descriptor-bound offline export result type.
+export 'src/duet/vg_duet_export.dart' show VGDuetExportResult;
