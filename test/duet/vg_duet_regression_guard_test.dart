@@ -36,7 +36,9 @@ import 'package:vanguard_media_engine/vg_duet.dart'
         VGDuetPlatformInterface,
         MethodChannelVGDuetPlatform,
         VGDuetException,
-        VGDuetErrorCode;
+        VGDuetErrorCode,
+        VGDuetForegroundTransform,
+        VGDuetPoint;
 
 void main() {
   group('Regression guard: existing public classes remain importable', () {
@@ -150,6 +152,12 @@ void main() {
 
     test('VGDuetCaptureResult is accessible', () {
       expect(VGDuetCaptureResult, isNotNull);
+    });
+
+    test('VGDuetForegroundTransform is accessible', () {
+      const transform = VGDuetForegroundTransform.creatorOverlay;
+      expect(transform.scale, 0.62);
+      expect(transform.offset, const VGDuetPoint(0.0, 0.22));
     });
   });
 }

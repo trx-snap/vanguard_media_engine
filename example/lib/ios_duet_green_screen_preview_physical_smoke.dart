@@ -8,7 +8,7 @@
 //     local fixture and native green-screen layout attachment.
 //   - Claims allowed:
 //       * local source session initialization
-//       * preview texture attach with greenScreen layout persists canonical layoutConfig
+//       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup
 //       * startRecording activates render loop with green-screen compositor
 //       * green-screen preview remains active for bounded wait (5 s)
 //       * layout update to safe-parity PiP rect works while active
@@ -18,8 +18,8 @@
 //       * native IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST may evidence a mask reached CoreImage blend
 //   - Non-claims:
 //       * no Dart frame counter
-//       * no automated pixel proof
-//       * no green-screen keying quality proof (VanguardMLSegmenter faults are tolerated)
+//       * no automated pixel/layout-position proof (visual placement not measured)
+//       * no matte quality proof (VanguardMLSegmenter faults are tolerated)
 //       * no export MP4 proof
 //       * no mic/audio proof
 //       * no speed control proof
@@ -37,12 +37,9 @@ import 'package:vanguard_media_engine/vg_duet.dart';
 
 const String kSmokeStartMarker =
     'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_SMOKE_START';
-const String kSmokePassMarker =
-    'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_PASS';
-const String kSmokeFailMarker =
-    'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_FAIL';
-const String kSmokeJsonPrefix =
-    'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_JSON:';
+const String kSmokePassMarker = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_PASS';
+const String kSmokeFailMarker = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_FAIL';
+const String kSmokeJsonPrefix = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_JSON:';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -169,10 +166,10 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 3: ATTACH_PREVIEW_GREENSCREEN — canvas 1080x1920 with greenScreen layout
+      // Step 3: ATTACH_PREVIEW_GREENSCREEN — canvas 1080x1920 with greenScreen creatorOverlay layout
       await runStep<VGDuetPreviewTexture>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen)',
+        'Attaching preview texture (1080x1920, greenScreen creatorOverlay)',
         () async {
           final preview = await _withTimeout(
             _platform.attachPreviewTexture(
@@ -180,6 +177,7 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
               canvasSize: const VGDuetSize(1080, 1920),
               layoutConfig: VGDuetLayoutConfig(
                 mode: VGDuetLayoutMode.greenScreen,
+                foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
               ),
             ),
             'attachPreviewTexture (greenScreen)',
@@ -380,7 +378,7 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         'proofBoundary': 'ios_duet_green_screen_preview_physical_smoke',
         'claimsAllowed': <String>[
           'local source session initialization',
-          'preview texture attach with greenScreen layout persists canonical layoutConfig',
+          'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup',
           'startRecording activates render loop with green-screen compositor',
           'green-screen preview remains active for bounded wait (5 s)',
           'layout update to safe-parity PiP rect works while active',
@@ -391,8 +389,8 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         ],
         'nonClaims': <String>[
           'no Dart frame counter',
-          'no automated pixel proof',
-          'no green-screen keying quality proof (VanguardMLSegmenter faults are tolerated)',
+          'no automated pixel/layout-position proof (visual placement not measured)',
+          'no matte quality proof (VanguardMLSegmenter faults are tolerated)',
           'no export MP4 proof',
           'no mic/audio proof',
           'no speed control proof',

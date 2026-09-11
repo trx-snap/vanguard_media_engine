@@ -11,6 +11,7 @@ export 'src/duet/vg_duet_models.dart'
         VGDuetPoint,
         VGDuetRect,
         VGDuetInsets,
+        VGDuetForegroundTransform,
         VGDuetLayoutMode,
         VGDuetPiPAnchor,
         VGDuetLayoutConfig,

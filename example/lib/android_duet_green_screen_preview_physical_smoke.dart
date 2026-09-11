@@ -9,7 +9,7 @@
 //       cd packages/vanguard_media_engine/example && flutter run -d <deviceId> -t lib/android_duet_green_screen_preview_physical_smoke.dart
 //   - Claims allowed:
 //       * local source session init
-//       * attach-time greenScreen layout accepted
+//       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup
 //       * preview texture attach success
 //       * startRecording activates render loop/camera
 //       * bounded green-screen preview remains active
@@ -23,7 +23,8 @@
 //       * no MediaPipe GPU delegate proof
 //       * no adaptive quality tier proof
 //       * no low-end/budget Android proof
-//       * no automated pixel/matte quality proof
+//       * no automated pixel/layout-position proof (visual placement not measured)
+//       * no matte quality proof
 //       * no export/audio/speed/app wiring proof
 
 // ignore_for_file: avoid_print
@@ -174,10 +175,10 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 3: Attach preview texture (1080x1920, greenScreen)
+      // Step 3: Attach preview texture (1080x1920, greenScreen creatorOverlay)
       await runStep<VGDuetPreviewTexture>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen)',
+        'Attaching preview texture (1080x1920, greenScreen creatorOverlay)',
         () async {
           final preview = await _withTimeout(
             _platform.attachPreviewTexture(
@@ -185,6 +186,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
               canvasSize: const VGDuetSize(1080, 1920),
               layoutConfig: VGDuetLayoutConfig(
                 mode: VGDuetLayoutMode.greenScreen,
+                foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
               ),
             ),
             'attachPreviewTexture',
@@ -387,7 +389,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         'proofBoundary': 'android_duet_green_screen_preview_physical_smoke',
         'claimsAllowed': <String>[
           'local source session init',
-          'attach-time greenScreen layout accepted',
+          'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup',
           'preview texture attach success',
           'startRecording activates render loop/camera',
           'bounded green-screen preview remains active',
@@ -402,7 +404,8 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
           'no MediaPipe GPU delegate proof',
           'no adaptive quality tier proof',
           'no low-end/budget Android proof',
-          'no automated pixel/matte quality proof',
+          'no automated pixel/layout-position proof (visual placement not measured)',
+          'no matte quality proof',
           'no export/audio/speed/app wiring proof',
         ],
         'sessionId': sessionId,

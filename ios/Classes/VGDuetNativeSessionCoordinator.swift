@@ -410,8 +410,11 @@ final class VGDuetNativeSessionCoordinator {
             }
             return (source: sourceRect, camera: cameraRect)
         case "greenScreen":
+            let fgTransform = parseForegroundTransform(layoutConfigMap)
             return VGDuetLayoutGeometry.greenScreen(
-                canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+                canvasWidth:  canvasWidth,
+                canvasHeight: canvasHeight,
+                transform:    fgTransform)
         default:
             return nil
         }
@@ -422,6 +425,36 @@ final class VGDuetNativeSessionCoordinator {
             "source": VGDuetLayoutGeometry.rectToMap(rects.source),
             "camera": VGDuetLayoutGeometry.rectToMap(rects.camera),
         ]
+    }
+
+    /// Parses a `NativeForegroundTransform` from a layout config map.
+    ///
+    /// Reads the nested `foregroundTransform` map with keys:
+    ///   `scale`, `offset` (`x`, `y`), `anchor` (`x`, `y`).
+    ///
+    /// Returns nil when the map is absent, has invalid types, or has a
+    /// non-positive or non-finite scale — all degrade to the full-canvas identity.
+    private func parseForegroundTransform(_ layoutConfigMap: [String: Any]) -> NativeForegroundTransform? {
+        guard let fgMap = layoutConfigMap["foregroundTransform"] as? [String: Any] else { return nil }
+        guard let rawScale = (fgMap["scale"] as? NSNumber)?.doubleValue else { return nil }
+        guard rawScale.isFinite && rawScale > 0.0 else { return nil }
+        let offsetMap = fgMap["offset"] as? [String: Any]
+        let anchorMap = fgMap["anchor"] as? [String: Any]
+        let rawOffsetX = (offsetMap?["x"] as? NSNumber)?.doubleValue ?? Double.nan
+        let rawOffsetY = (offsetMap?["y"] as? NSNumber)?.doubleValue ?? Double.nan
+        let rawAnchorX = (anchorMap?["x"] as? NSNumber)?.doubleValue ?? Double.nan
+        let rawAnchorY = (anchorMap?["y"] as? NSNumber)?.doubleValue ?? Double.nan
+        let offsetX = rawOffsetX.isFinite ? rawOffsetX : 0.0
+        let offsetY = rawOffsetY.isFinite ? rawOffsetY : 0.0
+        let anchorX = rawAnchorX.isFinite ? rawAnchorX : 0.5
+        let anchorY = rawAnchorY.isFinite ? rawAnchorY : 0.5
+        return NativeForegroundTransform(
+            scale:   CGFloat(rawScale),
+            offsetX: CGFloat(offsetX),
+            offsetY: CGFloat(offsetY),
+            anchorX: CGFloat(anchorX),
+            anchorY: CGFloat(anchorY)
+        )
     }
 
     /// Rects used by the render loop when the layout mode is unknown:

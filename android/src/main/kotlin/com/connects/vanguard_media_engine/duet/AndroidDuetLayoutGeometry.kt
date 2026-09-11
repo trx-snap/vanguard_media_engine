@@ -115,4 +115,87 @@ object AndroidDuetLayoutGeometry {
         val full = VGDuetPixelRect(0.0, 0.0, canvasWidth, canvasHeight)
         return VGDuetLayoutRects(source = full, camera = full)
     }
+
+    /**
+     * Returns rects for the Green Screen layout with an optional foreground transform.
+     *
+     * When [transform] is null or has scale == 1.0, returns the full-canvas identity
+     * (backwards compatible with existing green-screen sessions without a transform).
+     *
+     * Transform semantics (v1 — shrink/reposition only):
+     * - scale is clamped to [0.25, 1.0] before rect math.
+     * - offset is a normalized canvas-center translation, clamped to [-1.0, 1.0].
+     * - anchor is the point within the scaled rect that maps to canvas-center + offset,
+     *   clamped to [0.0, 1.0].
+     *
+     * Rect math:
+     *   scaledW = canvasWidth  * clampedScale
+     *   scaledH = canvasHeight * clampedScale
+     *   canvasCx = canvasWidth  / 2.0
+     *   canvasCy = canvasHeight / 2.0
+     *   targetX  = canvasCx + clampedOffsetX * canvasCx  // anchor maps here
+     *   targetY  = canvasCy + clampedOffsetY * canvasCy
+     *   left     = targetX - clampedAnchorX * scaledW
+     *   top      = targetY - clampedAnchorY * scaledH
+     *   then clamp rect fully inside [0, canvasWidth] x [0, canvasHeight].
+     */
+    fun greenScreen(
+        canvasWidth:  Double,
+        canvasHeight: Double,
+        transform:    NativeForegroundTransform?,
+    ): VGDuetLayoutRects {
+        val full = VGDuetPixelRect(0.0, 0.0, canvasWidth, canvasHeight)
+        val source = full
+
+        if (transform == null) {
+            return VGDuetLayoutRects(source = source, camera = full)
+        }
+
+        // Clamp inputs.
+        val scale   = transform.scale.coerceIn(0.25, 1.0)
+        val offsetX = transform.offsetX.coerceIn(-1.0, 1.0)
+        val offsetY = transform.offsetY.coerceIn(-1.0, 1.0)
+        val anchorX = transform.anchorX.coerceIn(0.0, 1.0)
+        val anchorY = transform.anchorY.coerceIn(0.0, 1.0)
+
+        // Identity short-circuit: scale 1.0 with centered anchor and no offset
+        // returns full canvas without any rect math.
+        if (scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0) {
+            return VGDuetLayoutRects(source = source, camera = full)
+        }
+
+        val scaledW = canvasWidth  * scale
+        val scaledH = canvasHeight * scale
+
+        // Canvas center and target point in canvas coordinates.
+        val canvasCx = canvasWidth  / 2.0
+        val canvasCy = canvasHeight / 2.0
+        val targetX  = canvasCx + offsetX * canvasCx
+        val targetY  = canvasCy + offsetY * canvasCy
+
+        // Unclamped rect with anchor mapping to target.
+        var left = targetX - anchorX * scaledW
+        var top  = targetY - anchorY * scaledH
+
+        // Clamp rect fully inside canvas; size is fixed by scale.
+        left = left.coerceIn(0.0, canvasWidth  - scaledW)
+        top  = top.coerceIn(0.0, canvasHeight - scaledH)
+
+        val camera = VGDuetPixelRect(left, top, scaledW, scaledH)
+        return VGDuetLayoutRects(source = source, camera = camera)
+    }
 }
+
+/**
+ * Parsed foreground camera-layer transform for native geometry computation.
+ *
+ * All fields are raw (pre-clamp) values from the layout config map;
+ * clamping is performed inside [AndroidDuetLayoutGeometry.greenScreen].
+ */
+data class NativeForegroundTransform(
+    val scale:   Double,
+    val offsetX: Double,
+    val offsetY: Double,
+    val anchorX: Double,
+    val anchorY: Double,
+)

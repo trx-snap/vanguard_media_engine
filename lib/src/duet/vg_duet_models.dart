@@ -191,6 +191,153 @@ class VGDuetInsets {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Foreground camera-layer transform (Slice 5A)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Optional affine transform for the green-screen foreground camera layer.
+///
+/// Semantics (v1 — shrink / reposition only):
+/// - [scale]: uniform scale of the camera rect in `(0, 1]`. Clamped to
+///   `[0.25, 1.0]` by native geometry before rect computation. A scale of 1.0
+///   produces the full-canvas identity.
+/// - [offset]: normalized canvas-center translation. `(0, 0)` keeps the rect
+///   centered; `(1, 0)` shifts one full half-canvas width to the right.
+///   Clamped to `[-1.0, 1.0]` per axis.
+/// - [anchor]: the point within the scaled rect that maps to the canvas center
+///   plus the offset translation. `(0.5, 0.5)` is the rect center. Clamped to
+///   `[0.0, 1.0]` per axis.
+///
+/// This class is only meaningful when the layout mode is
+/// [VGDuetLayoutMode.greenScreen]; it is harmlessly serialized for other modes
+/// when present.
+class VGDuetForegroundTransform {
+  /// Uniform scale of the camera layer rect. Must be finite and positive.
+  /// Native geometry clamps to `[0.25, 1.0]`.
+  final double scale;
+
+  /// Normalized canvas-center translation. Clamped to `[-1.0, 1.0]` by native
+  /// geometry.
+  final VGDuetPoint offset;
+
+  /// The point within the scaled rect that anchors to canvas-center + offset.
+  /// Clamped to `[0.0, 1.0]` by native geometry.
+  final VGDuetPoint anchor;
+
+  /// Identity transform: full-canvas rect, no offset, centered anchor.
+  static const VGDuetForegroundTransform identity = VGDuetForegroundTransform(
+    scale: 1.0,
+    offset: VGDuetPoint.zero,
+    anchor: VGDuetPoint(0.5, 0.5),
+  );
+
+  /// Product/app convenience preset for a green-screen creator overlay: a
+  /// smaller foreground camera rect repositioned toward the lower portion of
+  /// the canvas. This is not the engine default — [identity] remains that —
+  /// and apps are free to supply their own [VGDuetForegroundTransform] values
+  /// instead (e.g. computed live from pinch/drag gestures on a creator
+  /// overlay control).
+  static const VGDuetForegroundTransform creatorOverlay =
+      VGDuetForegroundTransform(
+        scale: 0.62,
+        offset: VGDuetPoint(0.0, 0.22),
+        anchor: VGDuetPoint(0.5, 0.5),
+      );
+
+  /// Constructs a [VGDuetForegroundTransform].
+  ///
+  /// Only the [scale] positivity is checked at construction time (via assert).
+  /// Offset and anchor range clamping is deferred to native geometry to avoid
+  /// rejecting semantically reasonable inputs.
+  const VGDuetForegroundTransform({
+    required this.scale,
+    required this.offset,
+    required this.anchor,
+  }) : assert(scale > 0.0, 'scale must be positive');
+
+  /// Constructs a [VGDuetForegroundTransform] with runtime validation.
+  ///
+  /// Throws [ArgumentError] if [scale] is not finite or is not positive.
+  factory VGDuetForegroundTransform.validated({
+    required double scale,
+    required VGDuetPoint offset,
+    required VGDuetPoint anchor,
+  }) {
+    if (!scale.isFinite) {
+      throw ArgumentError.value(scale, 'scale', 'Must be finite.');
+    }
+    if (scale <= 0.0) {
+      throw ArgumentError.value(scale, 'scale', 'Must be positive.');
+    }
+    return VGDuetForegroundTransform(
+      scale: scale,
+      offset: offset,
+      anchor: anchor,
+    );
+  }
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+    'scale': scale,
+    'offset': offset.toMap(),
+    'anchor': anchor.toMap(),
+  };
+
+  /// Parses a [VGDuetForegroundTransform] from a map.
+  ///
+  /// Invalid or missing values degrade to [identity] (for bad scale) or to
+  /// per-field defaults (offset → zero, anchor → center) rather than throwing.
+  /// No path through this factory throws for malformed foregroundTransform input.
+  factory VGDuetForegroundTransform.fromMap(Map<String, dynamic> map) {
+    final rawScale = (map['scale'] as num?)?.toDouble() ?? 1.0;
+    if (!rawScale.isFinite || rawScale <= 0.0) {
+      return VGDuetForegroundTransform.identity;
+    }
+
+    // Parse offset x/y defensively: missing, non-numeric, or non-finite → 0.0.
+    final offsetMap = map['offset'];
+    double offsetX = 0.0;
+    double offsetY = 0.0;
+    if (offsetMap is Map) {
+      final rx = (offsetMap['x'] as num?)?.toDouble() ?? double.nan;
+      final ry = (offsetMap['y'] as num?)?.toDouble() ?? double.nan;
+      if (rx.isFinite) offsetX = rx;
+      if (ry.isFinite) offsetY = ry;
+    }
+
+    // Parse anchor x/y defensively: missing, non-numeric, or non-finite → 0.5.
+    final anchorMap = map['anchor'];
+    double anchorX = 0.5;
+    double anchorY = 0.5;
+    if (anchorMap is Map) {
+      final rx = (anchorMap['x'] as num?)?.toDouble() ?? double.nan;
+      final ry = (anchorMap['y'] as num?)?.toDouble() ?? double.nan;
+      if (rx.isFinite) anchorX = rx;
+      if (ry.isFinite) anchorY = ry;
+    }
+
+    return VGDuetForegroundTransform(
+      scale: rawScale,
+      offset: VGDuetPoint(offsetX, offsetY),
+      anchor: VGDuetPoint(anchorX, anchorY),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGDuetForegroundTransform &&
+          scale == other.scale &&
+          offset == other.offset &&
+          anchor == other.anchor;
+
+  @override
+  int get hashCode => Object.hash(scale, offset, anchor);
+
+  @override
+  String toString() =>
+      'VGDuetForegroundTransform(scale: $scale, offset: $offset, anchor: $anchor)';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Layout enums
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -238,6 +385,13 @@ class VGDuetLayoutConfig {
   /// Only meaningful in [VGDuetLayoutMode.pip].
   final VGDuetRect? pipNormalizedRect;
 
+  /// Optional camera-layer transform for green-screen mode.
+  ///
+  /// Only meaningful when [mode] is [VGDuetLayoutMode.greenScreen]; harmlessly
+  /// serialized when present for other modes. When `null`, the full-canvas
+  /// identity rect is used (backwards-compatible default).
+  final VGDuetForegroundTransform? foregroundTransform;
+
   /// Constructs a [VGDuetLayoutConfig].
   ///
   /// Throws [ArgumentError] immediately if [mode] is [VGDuetLayoutMode.pip]
@@ -249,6 +403,7 @@ class VGDuetLayoutConfig {
     this.isTopBottomSwapped = false,
     this.pipAnchor,
     this.pipNormalizedRect,
+    this.foregroundTransform,
   }) {
     _validatePiPRect(mode, pipNormalizedRect);
   }
@@ -287,8 +442,10 @@ class VGDuetLayoutConfig {
     bool? isTopBottomSwapped,
     VGDuetPiPAnchor? pipAnchor,
     VGDuetRect? pipNormalizedRect,
+    VGDuetForegroundTransform? foregroundTransform,
     bool clearPipAnchor = false,
     bool clearPipRect = false,
+    bool clearForegroundTransform = false,
   }) {
     return VGDuetLayoutConfig(
       mode: mode ?? this.mode,
@@ -298,6 +455,9 @@ class VGDuetLayoutConfig {
       pipNormalizedRect: clearPipRect
           ? null
           : (pipNormalizedRect ?? this.pipNormalizedRect),
+      foregroundTransform: clearForegroundTransform
+          ? null
+          : (foregroundTransform ?? this.foregroundTransform),
     );
   }
 
@@ -308,6 +468,8 @@ class VGDuetLayoutConfig {
     if (pipAnchor != null) 'pipAnchor': pipAnchor!.name,
     if (pipNormalizedRect != null)
       'pipNormalizedRect': pipNormalizedRect!.toMap(),
+    if (foregroundTransform != null)
+      'foregroundTransform': foregroundTransform!.toMap(),
   };
 
   factory VGDuetLayoutConfig.fromMap(Map<String, dynamic> map) {
@@ -329,12 +491,20 @@ class VGDuetLayoutConfig {
     if (rectMap is Map) {
       pipRect = VGDuetRect.fromMap(Map<String, dynamic>.from(rectMap));
     }
+    VGDuetForegroundTransform? foregroundTransform;
+    final fgMap = map['foregroundTransform'];
+    if (fgMap is Map) {
+      foregroundTransform = VGDuetForegroundTransform.fromMap(
+        Map<String, dynamic>.from(fgMap),
+      );
+    }
     return VGDuetLayoutConfig(
       mode: mode,
       isSideSwapped: map['isSideSwapped'] as bool? ?? false,
       isTopBottomSwapped: map['isTopBottomSwapped'] as bool? ?? false,
       pipAnchor: pipAnchor,
       pipNormalizedRect: pipRect,
+      foregroundTransform: foregroundTransform,
     );
   }
 
@@ -346,7 +516,8 @@ class VGDuetLayoutConfig {
           isSideSwapped == other.isSideSwapped &&
           isTopBottomSwapped == other.isTopBottomSwapped &&
           pipAnchor == other.pipAnchor &&
-          pipNormalizedRect == other.pipNormalizedRect;
+          pipNormalizedRect == other.pipNormalizedRect &&
+          foregroundTransform == other.foregroundTransform;
 
   @override
   int get hashCode => Object.hash(
@@ -355,12 +526,14 @@ class VGDuetLayoutConfig {
     isTopBottomSwapped,
     pipAnchor,
     pipNormalizedRect,
+    foregroundTransform,
   );
 
   @override
   String toString() =>
       'VGDuetLayoutConfig(mode: ${mode.name}, swap: $isSideSwapped, '
-      'tbSwap: $isTopBottomSwapped, pipAnchor: ${pipAnchor?.name})';
+      'tbSwap: $isTopBottomSwapped, pipAnchor: ${pipAnchor?.name}, '
+      'foregroundTransform: $foregroundTransform)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

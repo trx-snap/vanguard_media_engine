@@ -10,6 +10,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
   bool isTopBottomSwapped = false,
   VGDuetPiPAnchor? pipAnchor,
   VGDuetRect? pipNormalizedRect,
+  VGDuetForegroundTransform? foregroundTransform,
   double initialSpeed = 1.0,
   double sourceAudioGain = 0.8,
   double micAudioGain = 0.6,
@@ -25,6 +26,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
       isTopBottomSwapped: isTopBottomSwapped,
       pipAnchor: pipAnchor,
       pipNormalizedRect: pipNormalizedRect,
+      foregroundTransform: foregroundTransform,
     ),
     trimWindow: VGDuetTrimWindow(startSeconds: 1.0, endSeconds: 10.0),
     initialSpeed: initialSpeed,
@@ -469,11 +471,11 @@ void main() {
   // ── Fix 3: VGDuetCaptureResult typed compositionDescriptor + unmodifiable ─
 
   group('VGDuetCaptureResult (Fix 3)', () {
-    VGDuetCompositionDescriptor _cd() => _makeDescriptor();
+    VGDuetCompositionDescriptor cd() => _makeDescriptor();
 
     test('compositionDescriptor is typed VGDuetCompositionDescriptor', () {
       final result = VGDuetCaptureResult(
-        compositionDescriptor: _cd(),
+        compositionDescriptor: cd(),
         segmentAssets: ['/tmp/seg0.mp4'],
         totalDurationMs: 5000,
         segmentCount: 1,
@@ -485,7 +487,7 @@ void main() {
     test('segmentAssets is unmodifiable', () {
       final assets = ['/tmp/seg0.mp4'];
       final result = VGDuetCaptureResult(
-        compositionDescriptor: _cd(),
+        compositionDescriptor: cd(),
         segmentAssets: assets,
         totalDurationMs: 2000,
         segmentCount: 1,
@@ -501,7 +503,7 @@ void main() {
       () {
         final assets = ['/tmp/seg0.mp4'];
         final result = VGDuetCaptureResult(
-          compositionDescriptor: _cd(),
+          compositionDescriptor: cd(),
           segmentAssets: assets,
           totalDurationMs: 2000,
           segmentCount: 1,
@@ -536,5 +538,122 @@ void main() {
       expect(cfg.pipNormalizedRect?.width, closeTo(0.35, 1e-10));
       expect(cfg.pipAnchor, VGDuetPiPAnchor.bottomLeft);
     });
+  });
+
+  // ── Green-screen foregroundTransform contract ─────────────────────────────
+
+  group('VGDuetLayoutConfig green-screen foregroundTransform', () {
+    test(
+      'greenScreen descriptor with creatorOverlay round-trips preserving scale, offset, anchor, and equality',
+      () {
+        final d = _makeDescriptor(
+          mode: VGDuetLayoutMode.greenScreen,
+          foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
+        );
+        final map = d.toMap();
+        final restored = VGDuetCompositionDescriptor.fromMap(map);
+
+        expect(restored, equals(d));
+        final ft = restored.layoutConfig.foregroundTransform;
+        expect(ft, isNotNull);
+        expect(ft!.scale, closeTo(0.62, 1e-10));
+        expect(ft.offset, equals(const VGDuetPoint(0.0, 0.22)));
+        expect(ft.anchor, equals(const VGDuetPoint(0.5, 0.5)));
+        expect(ft, equals(VGDuetForegroundTransform.creatorOverlay));
+      },
+    );
+
+    test(
+      'greenScreen layout with no foregroundTransform leaves it null after round-trip and does not serialize the key',
+      () {
+        final d = _makeDescriptor(mode: VGDuetLayoutMode.greenScreen);
+        expect(d.layoutConfig.foregroundTransform, isNull);
+
+        final descriptorMap = d.toMap();
+        final layoutConfigMap =
+            descriptorMap['layoutConfig'] as Map<String, dynamic>;
+        expect(layoutConfigMap.containsKey('foregroundTransform'), isFalse);
+
+        final restored = VGDuetCompositionDescriptor.fromMap(descriptorMap);
+        expect(restored.layoutConfig.foregroundTransform, isNull);
+
+        final layoutMap = d.layoutConfig.toMap();
+        expect(layoutMap.containsKey('foregroundTransform'), isFalse);
+        final restoredLayout = VGDuetLayoutConfig.fromMap(layoutMap);
+        expect(restoredLayout.foregroundTransform, isNull);
+      },
+    );
+
+    test(
+      'VGDuetLayoutConfig.fromMap with invalid/non-finite/non-positive scale in foregroundTransform does not throw and returns identity',
+      () {
+        final invalidScales = [
+          0.0,
+          -1.0,
+          double.nan,
+          double.infinity,
+          double.negativeInfinity,
+        ];
+        for (final scale in invalidScales) {
+          final map = <String, dynamic>{
+            'mode': 'greenScreen',
+            'foregroundTransform': <String, dynamic>{
+              'scale': scale,
+              'offset': {'x': 0.1, 'y': 0.2},
+              'anchor': {'x': 0.3, 'y': 0.4},
+            },
+          };
+
+          expect(() => VGDuetLayoutConfig.fromMap(map), returnsNormally);
+          final cfg = VGDuetLayoutConfig.fromMap(map);
+          expect(
+            cfg.foregroundTransform,
+            equals(VGDuetForegroundTransform.identity),
+            reason: 'Scale $scale should degrade to identity',
+          );
+        }
+      },
+    );
+
+    test(
+      'VGDuetLayoutConfig.fromMap with valid scale but malformed/missing/non-finite offset/anchor values does not throw and defaults defensively',
+      () {
+        final testCases = <Map<String, dynamic>>[
+          // Missing offset and anchor maps
+          {'scale': 0.75},
+          // Malformed offset and anchor values (not Map)
+          {'scale': 0.75, 'offset': 'invalid_offset', 'anchor': 12345},
+          // Non-finite coordinates in offset and anchor
+          {
+            'scale': 0.75,
+            'offset': {'x': double.nan, 'y': double.infinity},
+            'anchor': {'x': double.negativeInfinity, 'y': double.nan},
+          },
+          // Empty coordinate maps
+          {
+            'scale': 0.75,
+            'offset': <String, dynamic>{},
+            'anchor': <String, dynamic>{},
+          },
+        ];
+
+        for (final fgMap in testCases) {
+          final map = <String, dynamic>{
+            'mode': 'greenScreen',
+            'foregroundTransform': fgMap,
+          };
+
+          expect(() => VGDuetLayoutConfig.fromMap(map), returnsNormally);
+          final cfg = VGDuetLayoutConfig.fromMap(map);
+          expect(cfg.foregroundTransform, isNotNull);
+          expect(cfg.foregroundTransform!.scale, closeTo(0.75, 1e-10));
+          expect(cfg.foregroundTransform!.offset, equals(VGDuetPoint.zero));
+          expect(
+            cfg.foregroundTransform!.anchor,
+            equals(const VGDuetPoint(0.5, 0.5)),
+          );
+        }
+      },
+    );
   });
 }

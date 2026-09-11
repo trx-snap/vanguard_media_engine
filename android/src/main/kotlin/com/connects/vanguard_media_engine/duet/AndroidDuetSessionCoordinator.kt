@@ -1204,9 +1204,47 @@ class AndroidDuetSessionCoordinator(
                 }
                 VGDuetLayoutRects(source = sourceRect, camera = cameraRect)
             }
-            "greenScreen" -> AndroidDuetLayoutGeometry.greenScreen(canvasWidth, canvasHeight)
+            "greenScreen" -> {
+                val fgTransform = parseForegroundTransform(layoutConfigMap)
+                AndroidDuetLayoutGeometry.greenScreen(canvasWidth, canvasHeight, fgTransform)
+            }
             else -> null
         }
+    }
+
+    /**
+     * Parses a [NativeForegroundTransform] from a layout config map.
+     *
+     * Reads the nested `foregroundTransform` map with keys:
+     *   `scale` (Double), `offset.x`, `offset.y`, `anchor.x`, `anchor.y`.
+     *
+     * Returns null when the map is absent, has invalid types, or has a
+     * non-positive / non-finite scale — all degrade to full-canvas identity.
+     */
+    private fun parseForegroundTransform(layoutConfigMap: Map<String, Any?>): NativeForegroundTransform? {
+        @Suppress("UNCHECKED_CAST")
+        val fgMap = layoutConfigMap["foregroundTransform"] as? Map<*, *> ?: return null
+        val scale = (fgMap["scale"] as? Number)?.toDouble() ?: return null
+        if (!scale.isFinite() || scale <= 0.0) return null
+        @Suppress("UNCHECKED_CAST")
+        val offsetMap = fgMap["offset"] as? Map<*, *>
+        @Suppress("UNCHECKED_CAST")
+        val anchorMap = fgMap["anchor"] as? Map<*, *>
+        val rawOffsetX = (offsetMap?.get("x") as? Number)?.toDouble() ?: Double.NaN
+        val rawOffsetY = (offsetMap?.get("y") as? Number)?.toDouble() ?: Double.NaN
+        val rawAnchorX = (anchorMap?.get("x") as? Number)?.toDouble() ?: Double.NaN
+        val rawAnchorY = (anchorMap?.get("y") as? Number)?.toDouble() ?: Double.NaN
+        val offsetX = if (rawOffsetX.isFinite()) rawOffsetX else 0.0
+        val offsetY = if (rawOffsetY.isFinite()) rawOffsetY else 0.0
+        val anchorX = if (rawAnchorX.isFinite()) rawAnchorX else 0.5
+        val anchorY = if (rawAnchorY.isFinite()) rawAnchorY else 0.5
+        return NativeForegroundTransform(
+            scale   = scale,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            anchorX = anchorX,
+            anchorY = anchorY,
+        )
     }
 
     // ── stopRecording ─────────────────────────────────────────────────────────
