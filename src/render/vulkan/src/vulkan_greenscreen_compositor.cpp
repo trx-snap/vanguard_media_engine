@@ -72,10 +72,18 @@ bool TargetHandlesNull(const vanguard::render::VulkanGreenScreenRenderTarget& t)
 #if defined(__ANDROID__)
     return t.device == VK_NULL_HANDLE || t.queue == VK_NULL_HANDLE ||
            t.commandPool == VK_NULL_HANDLE || t.colorImage == VK_NULL_HANDLE ||
-           t.colorImageView == VK_NULL_HANDLE || t.readbackBuffer == VK_NULL_HANDLE;
+           t.colorImageView == VK_NULL_HANDLE;
 #else
     return t.device == nullptr || t.queue == nullptr || t.commandPool == nullptr ||
-           t.colorImage == nullptr || t.colorImageView == nullptr || t.readbackBuffer == nullptr;
+           t.colorImage == nullptr || t.colorImageView == nullptr;
+#endif
+}
+
+bool ReadbackBufferNull(const vanguard::render::VulkanGreenScreenRenderTarget& t) {
+#if defined(__ANDROID__)
+    return t.readbackBuffer == VK_NULL_HANDLE;
+#else
+    return t.readbackBuffer == nullptr;
 #endif
 }
 
@@ -142,12 +150,22 @@ bool VulkanGreenScreenPixelWithinTolerance(const uint8_t actual[4],
 bool ValidateVulkanGreenScreenInputs(const VulkanGreenScreenRenderTarget& target,
                                      const VulkanGreenScreenInputs& inputs,
                                      std::string* outError) {
-    const uint64_t requiredReadbackBytes =
-        static_cast<uint64_t>(target.extentWidth) * static_cast<uint64_t>(target.extentHeight) * 4ull;
-    if (TargetHandlesNull(target) || target.extentWidth == 0 || target.extentHeight == 0 ||
-        static_cast<uint64_t>(target.readbackBufferSizeBytes) < requiredReadbackBytes) {
+    if (TargetHandlesNull(target) || target.extentWidth == 0 || target.extentHeight == 0) {
         SetError(outError, kErrInvalidArgument);
         return false;
+    }
+    if (target.readbackEnabled) {
+        const uint64_t requiredReadbackBytes =
+            static_cast<uint64_t>(target.extentWidth) * static_cast<uint64_t>(target.extentHeight) * 4ull;
+        if (ReadbackBufferNull(target) ||
+            static_cast<uint64_t>(target.readbackBufferSizeBytes) < requiredReadbackBytes) {
+            SetError(outError, kErrInvalidArgument);
+            return false;
+        }
+        if (static_cast<uint32_t>(target.finalLayout) != kVulkanGreenScreenTransferSrcOptimalLayoutValue) {
+            SetError(outError, kErrInvalidArgument);
+            return false;
+        }
     }
     if (static_cast<uint32_t>(target.colorFormat) != kVulkanGreenScreenColorFormatValue) {
         SetError(outError, kErrInvalidFormat);
@@ -360,8 +378,9 @@ bool CreateDescriptorObjects(Temporaries& t,
     return true;
 }
 
-// Single-attachment render pass (clear -> store, UNDEFINED ->
-// TRANSFER_SRC_OPTIMAL) plus the framebuffer over the caller's color view.
+// Single-attachment render pass (clear -> store, UNDEFINED -> target.finalLayout,
+// VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL by default for the readback path) plus
+// the framebuffer over the caller's color view.
 bool CreateRenderPassObjects(Temporaries& t,
                              const VulkanGreenScreenRenderTarget& target,
                              std::string* outError) {
@@ -373,7 +392,7 @@ bool CreateRenderPassObjects(Temporaries& t,
     color.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     color.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout    = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    color.finalLayout    = target.finalLayout;
 
     VkAttachmentReference colorRef{};
     colorRef.attachment = 0;
@@ -384,19 +403,32 @@ bool CreateRenderPassObjects(Temporaries& t,
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments    = &colorRef;
 
+    // deps[0] (external -> subpass 0) and deps[1] (subpass 0 -> external):
+    // the readback path (unchanged) also waits on / signals the transfer-read
+    // copy that RecordCommands appends after the render pass. The no-readback
+    // path never appends that copy, so it must not encode a transfer-read
+    // dependency the caller's next use may not honor; it only guarantees the
+    // color attachment write completes before anything downstream runs.
     VkSubpassDependency deps[2]{};
-    deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
-    deps[0].dstSubpass    = 0;
-    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
     deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[1].srcSubpass    = 0;
-    deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].dstStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
     deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    if (target.readbackEnabled) {
+        deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        deps[1].dstStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    } else {
+        deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstStageMask  = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        deps[1].dstAccessMask = 0;
+    }
 
     VkRenderPassCreateInfo rpCI{};
     rpCI.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -527,8 +559,8 @@ VideoTransformFullPushConstants IdentityPushConstants() {
 }
 
 // Allocates + records the whole command buffer: clear render pass with one
-// full-viewport fullscreen-triangle draw, then the image-to-buffer copy and
-// host-read barrier.
+// full-viewport fullscreen-triangle draw. The image-to-buffer copy and
+// host-read barrier are recorded only when target.readbackEnabled is true.
 bool RecordCommands(Temporaries& t,
                     const VulkanGreenScreenRenderTarget& target,
                     std::string* outError) {
@@ -587,30 +619,32 @@ bool RecordCommands(Temporaries& t,
     vkCmdDraw(t.commandBuffer, 3, 1, 0, 0);
     vkCmdEndRenderPass(t.commandBuffer);
 
-    VkBufferImageCopy region{};
-    region.bufferOffset                    = 0;
-    region.bufferRowLength                 = 0; // tightly packed
-    region.bufferImageHeight               = 0;
-    region.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel       = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount     = 1;
-    region.imageOffset                     = {0, 0, 0};
-    region.imageExtent                     = {target.extentWidth, target.extentHeight, 1};
-    vkCmdCopyImageToBuffer(t.commandBuffer, target.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           target.readbackBuffer, 1, &region);
+    if (target.readbackEnabled) {
+        VkBufferImageCopy region{};
+        region.bufferOffset                    = 0;
+        region.bufferRowLength                 = 0; // tightly packed
+        region.bufferImageHeight               = 0;
+        region.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel       = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount     = 1;
+        region.imageOffset                     = {0, 0, 0};
+        region.imageExtent                     = {target.extentWidth, target.extentHeight, 1};
+        vkCmdCopyImageToBuffer(t.commandBuffer, target.colorImage, target.finalLayout,
+                               target.readbackBuffer, 1, &region);
 
-    VkBufferMemoryBarrier hostBarrier{};
-    hostBarrier.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    hostBarrier.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-    hostBarrier.dstAccessMask       = VK_ACCESS_HOST_READ_BIT;
-    hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hostBarrier.buffer              = target.readbackBuffer;
-    hostBarrier.offset              = 0;
-    hostBarrier.size                = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(t.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                         0, 0, nullptr, 1, &hostBarrier, 0, nullptr);
+        VkBufferMemoryBarrier hostBarrier{};
+        hostBarrier.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        hostBarrier.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        hostBarrier.dstAccessMask       = VK_ACCESS_HOST_READ_BIT;
+        hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostBarrier.buffer              = target.readbackBuffer;
+        hostBarrier.offset              = 0;
+        hostBarrier.size                = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(t.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, nullptr, 1, &hostBarrier, 0, nullptr);
+    }
 
     if (vkEndCommandBuffer(t.commandBuffer) != VK_SUCCESS) {
         SetError(outError, kErrCommandBuffer);

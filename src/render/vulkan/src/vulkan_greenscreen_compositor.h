@@ -75,7 +75,23 @@
 // pitch = extentWidth * 4). The caller maps / invalidates the readback memory
 // itself. Sampled images must already be in
 // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; the attachment is left in
-// VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.
+// target.finalLayout (VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL by default).
+//
+// Render target modes (VulkanGreenScreenRenderTarget::readbackEnabled): by
+// default (readbackEnabled == true, the only behavior in prior slices) the
+// call copies the rendered attachment into readbackBuffer, waits, and leaves
+// the image in finalLayout (default VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+// this path and its pixel-parity contract are unchanged by the addition
+// below. When the caller sets readbackEnabled = false, readbackBuffer may be
+// VK_NULL_HANDLE / nullptr and readbackBufferSizeBytes may be 0: no
+// vkCmdCopyImageToBuffer or host-read barrier is recorded, and the render
+// pass's attachment final layout is exactly the caller-supplied finalLayout
+// (e.g. VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) instead of the readback
+// default. This no-readback mode exists only so a future preview/swapchain-
+// style caller can reuse this blend without paying for a host-visible copy;
+// adding it here does not itself wire up, enable, or promote the production
+// Duet preview route (AndroidDuetPreviewCompositor / AndroidDuetExportSession
+// remain untouched and unreferenced by this file).
 //
 // Private source: this header is confined to the private Vulkan render
 // backend implementation. On Android it includes <vulkan/vulkan.h>; on
@@ -108,6 +124,12 @@ namespace render {
 constexpr uint32_t kVulkanGreenScreenColorFormatValue = 37u; // VK_FORMAT_R8G8B8A8_UNORM
 constexpr uint32_t kVulkanGreenScreenMaskFormatValue  = 9u;  // VK_FORMAT_R8_UNORM
 
+// Default VulkanGreenScreenRenderTarget::finalLayout numeric value (readback
+// mode, unchanged default): VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL. Host builds
+// use this literal directly; Android builds are static_assert-ed against it
+// below.
+constexpr uint32_t kVulkanGreenScreenTransferSrcOptimalLayoutValue = 6u; // VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+
 constexpr const char* kVulkanGreenScreenColorFormatName = "VK_FORMAT_R8G8B8A8_UNORM";
 constexpr const char* kVulkanGreenScreenMaskFormatName  = "VK_FORMAT_R8_UNORM";
 
@@ -135,6 +157,9 @@ static_assert(static_cast<uint32_t>(kVulkanGreenScreenColorFormat) == kVulkanGre
               "pinned RGBA8_UNORM format value drifted");
 static_assert(static_cast<uint32_t>(kVulkanGreenScreenMaskFormat) == kVulkanGreenScreenMaskFormatValue,
               "pinned R8_UNORM format value drifted");
+static_assert(static_cast<uint32_t>(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) ==
+                  kVulkanGreenScreenTransferSrcOptimalLayoutValue,
+              "pinned TRANSFER_SRC_OPTIMAL layout value drifted");
 #endif
 
 // ── Caller-owned inputs / target ────────────────────────────────────────────
@@ -174,19 +199,37 @@ struct VulkanGreenScreenRenderTarget {
     VkCommandPool commandPool = VK_NULL_HANDLE;
     // Color attachment image: 2D, must be VK_FORMAT_R8G8B8A8_UNORM (the
     // pinned contract rejects any other format, including *_SRGB), single
-    // mip / layer, usage must include COLOR_ATTACHMENT_BIT |
-    // TRANSFER_SRC_BIT. Cleared to `clearColor` (every pixel is then
-    // overwritten by the fullscreen draw) and left in
-    // VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL after every successful render.
+    // mip / layer. COLOR_ATTACHMENT_BIT is always required; TRANSFER_SRC_BIT
+    // and TRANSFER_SRC_OPTIMAL final layout are required only when
+    // readbackEnabled is true; no-readback callers provide their own
+    // finalLayout. Cleared to `clearColor` (every pixel is then overwritten
+    // by the fullscreen draw).
     VkImage       colorImage     = VK_NULL_HANDLE;
     VkImageView   colorImageView = VK_NULL_HANDLE;
     VkFormat      colorFormat    = VK_FORMAT_R8G8B8A8_UNORM;
     VkClearColorValue clearColor = {{0.0f, 0.0f, 0.0f, 1.0f}};
     // Host-visible readback buffer with usage TRANSFER_DST_BIT and size of at
     // least extentWidth * extentHeight * 4 bytes (declared by the caller in
-    // readbackBufferSizeBytes; validated, not queried).
+    // readbackBufferSizeBytes; validated, not queried). Required only when
+    // readbackEnabled is true; ignored (may be VK_NULL_HANDLE / 0) otherwise.
     VkBuffer      readbackBuffer          = VK_NULL_HANDLE;
     VkDeviceSize  readbackBufferSizeBytes = 0;
+    // When true (default, unchanged prior behavior), blendGreenScreen() copies
+    // the rendered attachment into readbackBuffer and waits. When false, no
+    // copy / host barrier is recorded and readbackBuffer / readbackBufferSizeBytes
+    // are not validated or used: intended for a future preview/swapchain-style
+    // caller that wants the blend rendered straight into its own color target
+    // (see the file header; this does not itself enable production preview).
+    bool          readbackEnabled = true;
+    // Render pass color attachment final layout the image is left in after a
+    // successful call. Defaults to the readback path's contract layout;
+    // no-readback callers should set the layout their own next use requires
+    // (e.g. VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL). When readbackEnabled is
+    // true this must stay VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL -
+    // ValidateVulkanGreenScreenInputs rejects any other value with
+    // kErrInvalidArgument, since RecordCommands() copies the attachment out
+    // of this layout.
+    VkImageLayout finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 #else
     void*    device      = nullptr;
     void*    queue       = nullptr;
@@ -197,6 +240,8 @@ struct VulkanGreenScreenRenderTarget {
     float    clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     void*    readbackBuffer          = nullptr;
     uint64_t readbackBufferSizeBytes = 0;
+    bool     readbackEnabled = true;
+    uint32_t finalLayout     = kVulkanGreenScreenTransferSrcOptimalLayoutValue;
 #endif
     uint32_t extentWidth  = 0;
     uint32_t extentHeight = 0;
@@ -242,8 +287,14 @@ bool VulkanGreenScreenPixelWithinTolerance(const uint8_t actual[4],
 // inputs. Evaluates in exactly this order, returning false and setting
 // *outError to the first failure:
 //   "vulkan_greenscreen_compositor_invalid_argument"  - null device/queue/
-//        commandPool/colorImage/colorImageView/readbackBuffer, zero extent,
-//        or readbackBufferSizeBytes < extentWidth*extentHeight*4
+//        commandPool/colorImage/colorImageView, zero extent, or (only when
+//        target.readbackEnabled is true) a null readbackBuffer,
+//        readbackBufferSizeBytes < extentWidth*extentHeight*4, or
+//        finalLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+//        (kVulkanGreenScreenTransferSrcOptimalLayoutValue on host builds);
+//        RecordCommands() copies the attachment out of target.finalLayout,
+//        so a readback-enabled call with any other final layout would
+//        vkCmdCopyImageToBuffer from a non-transfer-source layout
 //   "vulkan_greenscreen_compositor_invalid_format"    - colorFormat is not
 //        VK_FORMAT_R8G8B8A8_UNORM (pinned contract; *_SRGB is rejected)
 //   "vulkan_greenscreen_compositor_invalid_image"     - any of the three

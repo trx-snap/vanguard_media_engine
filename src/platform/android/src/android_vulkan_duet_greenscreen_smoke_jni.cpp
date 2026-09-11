@@ -17,8 +17,10 @@
 // own header exposes; no duplicate math), proves the compositor's own
 // fail-closed ValidateVulkanGreenScreenInputs rejects bad input before any
 // Vulkan object is created, proves helper temporary object created ==
-// released, and destroys every Vulkan object it created before returning a
-// single flat JSON string.
+// released, additionally calls blendGreenScreen once more into a second,
+// caller-owned color target with readbackEnabled=false (no readback buffer /
+// copy) to prove the no-readback render target path, and destroys every
+// Vulkan object it created before returning a single flat JSON string.
 //
 // Runtime support: Android guarantees libvulkan from API 24 but not a usable
 // GPU driver, so vkCreateInstance failure, zero physical devices, no
@@ -668,12 +670,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     bool cpuReferenceParityOk = false;
     bool colorContractPinnedOk = false;
     bool capabilityFallbackReportedOk = false;
+    bool noReadbackRenderOk = false;
     bool cleanupOk = false;
     bool canonical = false;
     bool unsupported = false;
 
     VulkanScratch vk;
-    ScratchImage backgroundImg, foregroundImg, maskImg, colorTarget;
+    ScratchImage backgroundImg, foregroundImg, maskImg, colorTarget, noReadbackColorTarget;
     ScratchBuffer readback;
 
     {
@@ -711,6 +714,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                   CreateDeviceImage(vk, kColorFormat, kOutputWidth, kOutputHeight,
                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                     colorTarget, &err) &&
+                  CreateDeviceImage(vk, kColorFormat, kOutputWidth, kOutputHeight,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                    noReadbackColorTarget, &err) &&
                   CreateHostBuffer(vk, kReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback, &err);
         if (ok) {
             std::vector<uint8_t> maskPixels(static_cast<size_t>(kMaskWidth) * kMaskHeight);
@@ -769,6 +775,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             t = target; t.extentWidth = 0;
             ok = ok && ExpectRejected(compositor, t, inputs, kErrInvalidArgument, &actual);
             t = target; t.readbackBufferSizeBytes = kReadbackBytes - 4;
+            ok = ok && ExpectRejected(compositor, t, inputs, kErrInvalidArgument, &actual);
+            t = target; t.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             ok = ok && ExpectRejected(compositor, t, inputs, kErrInvalidArgument, &actual);
             t = target; t.colorFormat = VK_FORMAT_R8G8B8A8_SRGB;
             ok = ok && ExpectRejected(compositor, t, inputs, kErrInvalidFormat, &actual);
@@ -869,6 +877,30 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             if (!alphaFractionalBlendOk) fail("alpha_fractional_blend_failed");
             if (!maskResolutionMismatchOk) fail("mask_resolution_mismatch_lane_failed");
         }
+
+        // ── No-readback render target lane: proves blendGreenScreen() accepts
+        // a caller-owned color target with readbackEnabled=false (no readback
+        // buffer / copy), for future preview/swapchain-style callers. This
+        // does not itself wire up or promote the production Duet preview
+        // route (AndroidDuetPreviewCompositor / AndroidDuetExportSession are
+        // never referenced). ──
+        {
+            VulkanGreenScreenRenderTarget noReadbackTarget = target;
+            noReadbackTarget.colorImage              = noReadbackColorTarget.image;
+            noReadbackTarget.colorImageView          = noReadbackColorTarget.view;
+            noReadbackTarget.readbackEnabled         = false;
+            noReadbackTarget.readbackBuffer          = VK_NULL_HANDLE;
+            noReadbackTarget.readbackBufferSizeBytes = 0;
+            noReadbackTarget.finalLayout             = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            std::string noReadbackErr;
+            noReadbackRenderOk = compositor.blendGreenScreen(noReadbackTarget, inputs, &noReadbackErr);
+            details.Bool("noReadbackRenderOk", noReadbackRenderOk);
+            if (!noReadbackRenderOk) {
+                fail("no_readback_render_failed:" + noReadbackErr);
+                details.Str("noReadbackRenderError", noReadbackErr);
+            }
+        }
     }
 
     // ── Teardown: every object this diagnostic created ─────────────────────
@@ -877,6 +909,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     }
     readback.Destroy(vk.device);
     colorTarget.Destroy(vk.device);
+    noReadbackColorTarget.Destroy(vk.device);
     maskImg.Destroy(vk.device);
     foregroundImg.Destroy(vk.device);
     backgroundImg.Destroy(vk.device);
@@ -890,7 +923,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     details.Bool("teardownWaitIdleOk", vk.teardownWaitIdleOk);
     const bool allHandlesNull =
         vk.AllHandlesNull() && readback.IsNull() && colorTarget.IsNull() &&
-        maskImg.IsNull() && foregroundImg.IsNull() && backgroundImg.IsNull();
+        noReadbackColorTarget.IsNull() && maskImg.IsNull() && foregroundImg.IsNull() &&
+        backgroundImg.IsNull();
     details.Bool("teardownHandlesNull", allHandlesNull);
 
     cleanupOk = (!hadDevice) ||
@@ -908,7 +942,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const bool lanesPass =
         vulkanCoreReady && maskUploadOk && maskResolutionMismatchOk &&
         alphaZeroPreservesBackgroundOk && alphaFullForegroundOk && alphaFractionalBlendOk &&
-        cpuReferenceParityOk && colorContractPinnedOk && capabilityFallbackReportedOk && cleanupOk;
+        cpuReferenceParityOk && colorContractPinnedOk && capabilityFallbackReportedOk &&
+        noReadbackRenderOk && cleanupOk;
     canonical = lanesPass && failureReason.empty();
     const bool allNativeLanesPass = canonical;
 
@@ -930,6 +965,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "\"cpuReferenceParityOk\":" << BoolStr(cpuReferenceParityOk) << ","
         << "\"colorContractPinnedOk\":" << BoolStr(colorContractPinnedOk) << ","
         << "\"capabilityFallbackReportedOk\":" << BoolStr(capabilityFallbackReportedOk) << ","
+        << "\"noReadbackRenderOk\":" << BoolStr(noReadbackRenderOk) << ","
         << "\"cleanupOk\":" << BoolStr(cleanupOk) << ","
         << "\"canonical\":" << BoolStr(canonical) << ","
         << "\"allNativeLanesPass\":" << BoolStr(allNativeLanesPass) << ","

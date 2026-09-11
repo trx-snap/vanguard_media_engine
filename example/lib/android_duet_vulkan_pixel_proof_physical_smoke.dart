@@ -26,10 +26,14 @@
 //   Lane 6: smoke report capabilityPass == true (capabilityFallbackReportedOk:
 //           device capability facts honestly reported, or a non-empty
 //           fallback reason on UNSUPPORTED).
-//   Lane 7: smoke report resourceLifecyclePass == true (cleanupOk: helper
+//   Lane 7: smoke report noReadbackPass == true (noReadbackRenderOk:
+//           blendGreenScreen accepted caller-owned color target with
+//           readbackEnabled=false, proving caller-owned no-readback render
+//           target path, not production preview/export wiring).
+//   Lane 8: smoke report resourceLifecyclePass == true (cleanupOk: helper
 //           temporary object created == released, diagnostic teardown with
 //           device wait idle and all handles nulled).
-//   Lane 8: smoke report isPass == true && allNativeLanesPass ==
+//   Lane 9: smoke report isPass == true && allNativeLanesPass ==
 //           nativeAllLanesPass && canonical && canonical PASS marker &&
 //           canonical proof boundary && output/mask sizes differ (details
 //           outputWidth/outputHeight != maskWidth/maskHeight) && toMap()
@@ -94,6 +98,7 @@ class _AndroidDuetVulkanPixelProofPhysicalSmokeAppState
     var lane6Pass = false;
     var lane7Pass = false;
     var lane8Pass = false;
+    var lane9Pass = false;
 
     try {
       report =
@@ -172,9 +177,15 @@ class _AndroidDuetVulkanPixelProofPhysicalSmokeAppState
         'capabilityFallbackReportedOk=${report.capabilityFallbackReportedPass}',
       );
 
-      lane7Pass = report.resourceLifecyclePass;
+      lane7Pass = report.noReadbackPass;
       print(
-        '${_logPrefix}_LANE_7: pass=$lane7Pass resourceLifecyclePass=$lane7Pass '
+        '${_logPrefix}_LANE_7: pass=$lane7Pass noReadbackPass=$lane7Pass '
+        'noReadbackRenderOk=${report.noReadbackRenderPass}',
+      );
+
+      lane8Pass = report.resourceLifecyclePass;
+      print(
+        '${_logPrefix}_LANE_8: pass=$lane8Pass resourceLifecyclePass=$lane8Pass '
         'cleanupOk=${report.cleanupPass} '
         'helperTemporaryObjectsCreated=${report.details['helperTemporaryObjectsCreated']} '
         'helperTemporaryObjectsReleased=${report.details['helperTemporaryObjectsReleased']} '
@@ -197,7 +208,7 @@ class _AndroidDuetVulkanPixelProofPhysicalSmokeAppState
       final map = report.toMap();
       final roundTrip = VGDuetVulkanPixelProofSmokeReport.fromMap(map);
       final mapMatches = roundTrip == report;
-      lane8Pass =
+      lane9Pass =
           report.isPass &&
           report.allNativeLanesPass == report.nativeAllLanesPass &&
           report.canonical &&
@@ -206,7 +217,7 @@ class _AndroidDuetVulkanPixelProofPhysicalSmokeAppState
           sizesDiffer &&
           mapMatches;
       print(
-        '${_logPrefix}_LANE_8: pass=$lane8Pass isPass=${report.isPass} '
+        '${_logPrefix}_LANE_9: pass=$lane9Pass isPass=${report.isPass} '
         'allNativeLanesPass=${report.allNativeLanesPass} '
         'nativeAllLanesPass=${report.nativeAllLanesPass} '
         'canonical=${report.canonical} '
@@ -231,6 +242,7 @@ class _AndroidDuetVulkanPixelProofPhysicalSmokeAppState
           lane6Pass &&
           lane7Pass &&
           lane8Pass &&
+          lane9Pass &&
           topLevelError == null;
 
       final payload = <String, dynamic>{
@@ -256,12 +268,18 @@ class _AndroidDuetVulkanPixelProofPhysicalSmokeAppState
             'pass': lane6Pass,
             'capabilityPass': report?.capabilityPass,
           },
-          'lane7_lifecycle': {
+          'lane7_no_readback': {
             'pass': lane7Pass,
+            'noReadbackPass': report?.noReadbackPass,
+            'noReadbackRenderPass': report?.noReadbackRenderPass,
+            'noReadbackRenderOk': report?.details['noReadbackRenderOk'],
+          },
+          'lane8_lifecycle': {
+            'pass': lane8Pass,
             'resourceLifecyclePass': report?.resourceLifecyclePass,
           },
-          'lane8_telemetry': {
-            'pass': lane8Pass,
+          'lane9_telemetry': {
+            'pass': lane9Pass,
             'isPass': report?.isPass,
             'allNativeLanesPass': report?.allNativeLanesPass,
             'nativeAllLanesPass': report?.nativeAllLanesPass,

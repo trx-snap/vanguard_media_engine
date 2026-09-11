@@ -10,7 +10,9 @@
 // fails closed on invalid target/image/mask input before any Vulkan object is
 // created, blends alpha 0 (exact background), alpha 255 (exact foreground)
 // and fractional alpha (true blend) pixels matching the pure CPU reference
-// within the pinned tolerance, releases every temporary Vulkan object, and
+// within the pinned tolerance, proves a caller-owned no-readback render target
+// path (blendGreenScreen with readbackEnabled=false without production preview
+// or export wiring), releases every temporary Vulkan object, and
 // tears itself down. No camera, no decode, no export session, no production
 // VulkanBackend mutation, and no production Duet preview/export route. A
 // device without a usable Vulkan driver reports status `UNSUPPORTED`.
@@ -123,6 +125,10 @@ class VGDuetVulkanPixelProofSmokeReport {
     'capabilityFallbackReportedOk',
   ];
 
+  /// Caller-owned no-readback render target gate keys. Proves a caller-owned
+  /// no-readback render target path, not production preview/export wiring.
+  static const List<String> noReadbackGateKeys = <String>['noReadbackRenderOk'];
+
   /// Resource lifecycle / teardown gate keys.
   static const List<String> cleanupGateKeys = <String>['cleanupOk'];
 
@@ -137,6 +143,7 @@ class VGDuetVulkanPixelProofSmokeReport {
     ...alphaGateKeys,
     ...contractGateKeys,
     ...capabilityGateKeys,
+    ...noReadbackGateKeys,
     ...cleanupGateKeys,
     ...canonicalGateKeys,
   ];
@@ -246,6 +253,16 @@ class VGDuetVulkanPixelProofSmokeReport {
 
   /// Whether every capability gate passed.
   bool get capabilityPass => capabilityGateKeys.every(_gate);
+
+  // ── Caller-owned no-readback render target ───────────────────────────────
+
+  /// Whether blendGreenScreen() accepted a caller-owned color target with
+  /// readbackEnabled=false (no readback buffer/copy). Proves a caller-owned
+  /// no-readback render target path, not production preview/export wiring.
+  bool get noReadbackRenderPass => _gate('noReadbackRenderOk');
+
+  /// Whether every no-readback gate passed.
+  bool get noReadbackPass => noReadbackGateKeys.every(_gate);
 
   // ── Resource lifecycle & teardown ───────────────────────────────────────
 
