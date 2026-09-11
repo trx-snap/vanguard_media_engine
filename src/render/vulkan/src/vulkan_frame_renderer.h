@@ -213,6 +213,21 @@ public:
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
 
+    struct VulkanGreenScreenMaskInfo {
+        uint64_t imageViewHandle = 0;
+        uint64_t samplerHandle = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
+    RenderFrameResult renderDuetGreenScreenFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        HardwareBufferHandle backgroundHandle,
+        HardwareBufferHandle foregroundHandle,
+        const VulkanGreenScreenMaskInfo& maskInfo);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

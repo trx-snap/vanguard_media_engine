@@ -241,6 +241,13 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
     return RenderFrameResult::kUnavailable;
 }
 
+RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(
+    HardwareBufferHandle /*backgroundHandle*/,
+    HardwareBufferHandle /*foregroundHandle*/,
+    VulkanOverlayTextureHandle /*maskHandle*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
 // ---------------------------------------------------------------------------
 // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
 // sub-slice N4: overlay texture store stubs - host build.
@@ -255,6 +262,27 @@ bool VulkanBackend::createOverlayTextureRgba8888(const uint8_t* /*rgba*/,
                                                  VulkanOverlayTextureInfo* outInfo) {
     if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
     if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+    return false;
+}
+
+bool VulkanBackend::createOverlayTextureR8(const uint8_t* /*r8*/,
+                                           size_t /*r8ByteCount*/,
+                                           uint32_t /*width*/,
+                                           uint32_t /*height*/,
+                                           uint32_t /*rowStrideBytes*/,
+                                           VulkanOverlayTextureHandle* outHandle,
+                                           VulkanOverlayTextureInfo* outInfo) {
+    if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+    if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+    return false;
+}
+
+bool VulkanBackend::updateOverlayTextureR8(VulkanOverlayTextureHandle /*handle*/,
+                                           const uint8_t* /*r8*/,
+                                           size_t /*r8ByteCount*/,
+                                           uint32_t /*width*/,
+                                           uint32_t /*height*/,
+                                           uint32_t /*rowStrideBytes*/) {
     return false;
 }
 
@@ -1196,6 +1224,50 @@ bool VulkanBackend::createOverlayTextureRgba8888(const uint8_t* rgba,
         rgba, rgbaByteCount, width, height, rowStrideBytes, outHandle, outInfo);
 }
 
+bool VulkanBackend::createOverlayTextureR8(const uint8_t* r8,
+                                           size_t r8ByteCount,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t rowStrideBytes,
+                                           VulkanOverlayTextureHandle* outHandle,
+                                           VulkanOverlayTextureInfo* outInfo) {
+    if (!impl_ || !impl_->initialized) {
+        if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
+    }
+    Impl& s = *impl_;
+    if (!s.overlayTextureStore) {
+        s.overlayTextureStore = std::make_unique<VulkanOverlayTextureStore>();
+        if (!s.overlayTextureStore->initialize(static_cast<void*>(s.device),
+                                               static_cast<void*>(s.physDev),
+                                               static_cast<void*>(s.queue),
+                                               s.queueFamilyIndex)) {
+            s.overlayTextureStore.reset();
+        }
+    }
+    if (!s.overlayTextureStore) {
+        if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
+    }
+    return s.overlayTextureStore->createTextureR8(
+        r8, r8ByteCount, width, height, rowStrideBytes, outHandle, outInfo);
+}
+
+bool VulkanBackend::updateOverlayTextureR8(VulkanOverlayTextureHandle handle,
+                                           const uint8_t* r8,
+                                           size_t r8ByteCount,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t rowStrideBytes) {
+    if (!impl_ || !impl_->initialized || !impl_->overlayTextureStore) {
+        return false;
+    }
+    return impl_->overlayTextureStore->updateTextureR8(
+        handle, r8, r8ByteCount, width, height, rowStrideBytes, nullptr);
+}
+
 bool VulkanBackend::releaseOverlayTexture(VulkanOverlayTextureHandle handle) {
     if (!impl_ || !impl_->initialized || !impl_->overlayTextureStore) {
         return false;
@@ -1217,6 +1289,44 @@ void VulkanBackend::clearOverlayTextures() {
         return;
     }
     impl_->overlayTextureStore->clear();
+}
+
+RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle backgroundHandle,
+                                                            HardwareBufferHandle foregroundHandle,
+                                                            VulkanOverlayTextureHandle maskHandle) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || backgroundHandle == foregroundHandle ||
+        !hasHardwareBuffer(backgroundHandle) || s.ahbImports->getImage(backgroundHandle) == nullptr ||
+        !hasHardwareBuffer(foregroundHandle) || s.ahbImports->getImage(foregroundHandle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    VulkanOverlayTextureInfo overlayInfo{};
+    if (!getOverlayTextureInfo(maskHandle, &overlayInfo)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!s.frameRenderer) {
+        return RenderFrameResult::kUnavailable;
+    }
+
+    VulkanFrameRenderer::VulkanGreenScreenMaskInfo maskInfo{};
+    maskInfo.imageViewHandle = overlayInfo.imageViewHandle;
+    maskInfo.samplerHandle = overlayInfo.samplerHandle;
+    maskInfo.width = overlayInfo.width;
+    maskInfo.height = overlayInfo.height;
+
+    return s.frameRenderer->renderDuetGreenScreenFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        backgroundHandle,
+        foregroundHandle,
+        maskInfo);
 }
 
 #endif // __ANDROID__

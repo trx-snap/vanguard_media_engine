@@ -143,6 +143,10 @@ public:
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
 
+    RenderFrameResult renderDuetGreenScreenFrame(HardwareBufferHandle backgroundHandle,
+                                                 HardwareBufferHandle foregroundHandle,
+                                                 VulkanOverlayTextureHandle maskHandle);
+
     // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
     // sub-slice N4: backend-owned Vulkan overlay texture store for static
     // sticker RGBA pixels (see the private VulkanOverlayTextureStore
@@ -173,6 +177,21 @@ public:
                                       uint32_t rowStrideBytes,
                                       VulkanOverlayTextureHandle* outHandle,
                                       VulkanOverlayTextureInfo* outInfo = nullptr);
+
+    bool createOverlayTextureR8(const uint8_t* r8,
+                                size_t r8ByteCount,
+                                uint32_t width,
+                                uint32_t height,
+                                uint32_t rowStrideBytes,
+                                VulkanOverlayTextureHandle* outHandle,
+                                VulkanOverlayTextureInfo* outInfo = nullptr);
+
+    bool updateOverlayTextureR8(VulkanOverlayTextureHandle handle,
+                                const uint8_t* r8,
+                                size_t r8ByteCount,
+                                uint32_t width,
+                                uint32_t height,
+                                uint32_t rowStrideBytes);
 
     // Destroys handle's texture. Returns false (no-op) for an unknown or
     // already-released handle.
