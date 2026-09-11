@@ -10,6 +10,7 @@
 //   - Claims allowed:
 //       * local source session init
 //       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup
+//       * attach-time native layout rect for creatorOverlay was returned and matched expected geometry
 //       * preview texture attach success
 //       * startRecording activates render loop/camera
 //       * bounded green-screen preview remains active
@@ -23,7 +24,7 @@
 //       * no MediaPipe GPU delegate proof
 //       * no adaptive quality tier proof
 //       * no low-end/budget Android proof
-//       * no automated pixel/layout-position proof (visual placement not measured)
+//       * no rendered pixel / visual placement proof (rendered pixels not measured)
 //       * no matte quality proof
 //       * no export/audio/speed/app wiring proof
 
@@ -99,6 +100,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
     bool pass = false;
     String? sessionId;
     int? textureId;
+    Map<String, dynamic>? creatorOverlayCameraRect;
     VGDuetCaptureResult? captureResult;
     Directory? tempDir;
     bool isDetached = false;
@@ -194,6 +196,28 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
           if (preview.textureId < 0) {
             throw StateError('Invalid textureId: ${preview.textureId}');
           }
+          final cameraRect = preview.layoutRects?['camera'];
+          if (cameraRect == null) {
+            throw StateError(
+              'Missing preview.layoutRects["camera"] in attachPreviewTexture reply',
+            );
+          }
+          const expectedLeft = 205.2;
+          const expectedTop = 576.0;
+          const expectedWidth = 669.6;
+          const expectedHeight = 1190.4;
+          const tolerance = 0.5;
+          if ((cameraRect.left - expectedLeft).abs() > tolerance ||
+              (cameraRect.top - expectedTop).abs() > tolerance ||
+              (cameraRect.width - expectedWidth).abs() > tolerance ||
+              (cameraRect.height - expectedHeight).abs() > tolerance) {
+            throw StateError(
+              'Mismatched creatorOverlay camera rect: got $cameraRect, '
+              'expected left=$expectedLeft, top=$expectedTop, '
+              'width=$expectedWidth, height=$expectedHeight (tolerance=$tolerance)',
+            );
+          }
+          creatorOverlayCameraRect = cameraRect.toMap();
           textureId = preview.textureId;
           if (mounted) {
             setState(() {
@@ -390,6 +414,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         'claimsAllowed': <String>[
           'local source session init',
           'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup',
+          'attach-time native layout rect for creatorOverlay was returned and matched expected geometry',
           'preview texture attach success',
           'startRecording activates render loop/camera',
           'bounded green-screen preview remains active',
@@ -404,12 +429,13 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
           'no MediaPipe GPU delegate proof',
           'no adaptive quality tier proof',
           'no low-end/budget Android proof',
-          'no automated pixel/layout-position proof (visual placement not measured)',
+          'no rendered pixel / visual placement proof (rendered pixels not measured)',
           'no matte quality proof',
           'no export/audio/speed/app wiring proof',
         ],
         'sessionId': sessionId,
         'textureId': textureId,
+        'creatorOverlayCameraRect': ?creatorOverlayCameraRect,
         'stepResults': stepResults,
         'failures': failures,
         if (captureResult != null)

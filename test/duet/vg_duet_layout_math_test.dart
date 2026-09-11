@@ -319,4 +319,179 @@ void main() {
       expect(restored.height, closeTo(normalized.height, _eps));
     });
   });
+
+  group('VGDuetLayoutMath.computeGreenScreenRects', () {
+    test('null transform => full source and camera rect', () {
+      final rects = VGDuetLayoutMath.computeGreenScreenRects(
+        canvasSize: _canvas,
+        transform: null,
+      );
+      final sourceRect = rects[0];
+      final cameraRect = rects[1];
+
+      expect(sourceRect.left, closeTo(0.0, _eps));
+      expect(sourceRect.top, closeTo(0.0, _eps));
+      expect(sourceRect.width, closeTo(_canvas.width, _eps));
+      expect(sourceRect.height, closeTo(_canvas.height, _eps));
+
+      expect(cameraRect.left, closeTo(0.0, _eps));
+      expect(cameraRect.top, closeTo(0.0, _eps));
+      expect(cameraRect.width, closeTo(_canvas.width, _eps));
+      expect(cameraRect.height, closeTo(_canvas.height, _eps));
+    });
+
+    test('creatorOverlay preset on 1080x1920 canvas', () {
+      final rects = VGDuetLayoutMath.computeGreenScreenRects(
+        canvasSize: _canvas,
+        transform: VGDuetForegroundTransform.creatorOverlay,
+      );
+      final sourceRect = rects[0];
+      final cameraRect = rects[1];
+
+      // Source is full canvas
+      expect(sourceRect.left, closeTo(0.0, _eps));
+      expect(sourceRect.top, closeTo(0.0, _eps));
+      expect(sourceRect.width, closeTo(1080.0, _eps));
+      expect(sourceRect.height, closeTo(1920.0, _eps));
+
+      // Camera: left 205.2, top 576.0, width 669.6, height 1190.4
+      expect(cameraRect.left, closeTo(205.2, _eps));
+      expect(cameraRect.top, closeTo(576.0, _eps));
+      expect(cameraRect.width, closeTo(669.6, _eps));
+      expect(cameraRect.height, closeTo(1190.4, _eps));
+    });
+
+    test(
+      'right/left/top/bottom offset clamps for scale 0.62 anchor center',
+      () {
+        // Right clamp: offset x > 1.0 (e.g. 2.0) clamps to 1.0
+        // Left = canvasWidth - scaledWidth = 1080 - 669.6 = 410.4
+        final rightRects = VGDuetLayoutMath.computeGreenScreenRects(
+          canvasSize: _canvas,
+          transform: const VGDuetForegroundTransform(
+            scale: 0.62,
+            offset: VGDuetPoint(2.0, 0.0),
+            anchor: VGDuetPoint(0.5, 0.5),
+          ),
+        );
+        expect(rightRects[1].left, closeTo(410.4, _eps));
+        expect(rightRects[1].width, closeTo(669.6, _eps));
+
+        // Left clamp: offset x < -1.0 (e.g. -2.0) clamps to -1.0
+        // Left = 0.0
+        final leftRects = VGDuetLayoutMath.computeGreenScreenRects(
+          canvasSize: _canvas,
+          transform: const VGDuetForegroundTransform(
+            scale: 0.62,
+            offset: VGDuetPoint(-2.0, 0.0),
+            anchor: VGDuetPoint(0.5, 0.5),
+          ),
+        );
+        expect(leftRects[1].left, closeTo(0.0, _eps));
+        expect(leftRects[1].width, closeTo(669.6, _eps));
+
+        // Top clamp: offset y < -1.0 (e.g. -2.0) clamps to -1.0
+        // Top = 0.0
+        final topRects = VGDuetLayoutMath.computeGreenScreenRects(
+          canvasSize: _canvas,
+          transform: const VGDuetForegroundTransform(
+            scale: 0.62,
+            offset: VGDuetPoint(0.0, -2.0),
+            anchor: VGDuetPoint(0.5, 0.5),
+          ),
+        );
+        expect(topRects[1].top, closeTo(0.0, _eps));
+        expect(topRects[1].height, closeTo(1190.4, _eps));
+
+        // Bottom clamp: offset y > 1.0 (e.g. 2.0) clamps to 1.0
+        // Top = canvasHeight - scaledHeight = 1920 - 1190.4 = 729.6
+        final bottomRects = VGDuetLayoutMath.computeGreenScreenRects(
+          canvasSize: _canvas,
+          transform: const VGDuetForegroundTransform(
+            scale: 0.62,
+            offset: VGDuetPoint(0.0, 2.0),
+            anchor: VGDuetPoint(0.5, 0.5),
+          ),
+        );
+        expect(bottomRects[1].top, closeTo(729.6, _eps));
+        expect(bottomRects[1].height, closeTo(1190.4, _eps));
+      },
+    );
+
+    test('scale min clamp for 0.1 => width 270, height 480', () {
+      final rects = VGDuetLayoutMath.computeGreenScreenRects(
+        canvasSize: _canvas,
+        transform: const VGDuetForegroundTransform(
+          scale: 0.1,
+          offset: VGDuetPoint.zero,
+          anchor: VGDuetPoint(0.5, 0.5),
+        ),
+      );
+      final cameraRect = rects[1];
+      expect(cameraRect.width, closeTo(270.0, _eps));
+      expect(cameraRect.height, closeTo(480.0, _eps));
+    });
+
+    test(
+      'scale identity clamp/short-circuit for 1.0 offset zero => full canvas',
+      () {
+        // Exactly 1.0 with zero offset
+        final rects = VGDuetLayoutMath.computeGreenScreenRects(
+          canvasSize: _canvas,
+          transform: VGDuetForegroundTransform.identity,
+        );
+        expect(rects[1].left, closeTo(0.0, _eps));
+        expect(rects[1].top, closeTo(0.0, _eps));
+        expect(rects[1].width, closeTo(_canvas.width, _eps));
+        expect(rects[1].height, closeTo(_canvas.height, _eps));
+
+        // Scale > 1.0 (clamps to 1.0) with zero offset
+        final rectsOverOne = VGDuetLayoutMath.computeGreenScreenRects(
+          canvasSize: _canvas,
+          transform: const VGDuetForegroundTransform(
+            scale: 1.5,
+            offset: VGDuetPoint.zero,
+            anchor: VGDuetPoint(0.5, 0.5),
+          ),
+        );
+        expect(rectsOverOne[1].left, closeTo(0.0, _eps));
+        expect(rectsOverOne[1].top, closeTo(0.0, _eps));
+        expect(rectsOverOne[1].width, closeTo(_canvas.width, _eps));
+        expect(rectsOverOne[1].height, closeTo(_canvas.height, _eps));
+      },
+    );
+
+    test('non-finite offset/anchor fallback and invalid scale identity', () {
+      // Invalid scale: non-finite (infinity) degrades to identity full canvas
+      final infScaleRects = VGDuetLayoutMath.computeGreenScreenRects(
+        canvasSize: _canvas,
+        transform: const VGDuetForegroundTransform(
+          scale: double.infinity,
+          offset: VGDuetPoint.zero,
+          anchor: VGDuetPoint(0.5, 0.5),
+        ),
+      );
+      expect(infScaleRects[1].left, closeTo(0.0, _eps));
+      expect(infScaleRects[1].top, closeTo(0.0, _eps));
+      expect(infScaleRects[1].width, closeTo(_canvas.width, _eps));
+      expect(infScaleRects[1].height, closeTo(_canvas.height, _eps));
+
+      // Non-finite offset (NaN) defaults to 0.0
+      // Non-finite anchor (NaN) defaults to 0.5
+      // With scale 0.62, centered: left 205.2, top 364.8, width 669.6, height 1190.4
+      final nanTransformRects = VGDuetLayoutMath.computeGreenScreenRects(
+        canvasSize: _canvas,
+        transform: const VGDuetForegroundTransform(
+          scale: 0.62,
+          offset: VGDuetPoint(double.nan, double.nan),
+          anchor: VGDuetPoint(double.nan, double.nan),
+        ),
+      );
+      final cameraRect = nanTransformRects[1];
+      expect(cameraRect.left, closeTo(205.2, _eps));
+      expect(cameraRect.top, closeTo(364.8, _eps));
+      expect(cameraRect.width, closeTo(669.6, _eps));
+      expect(cameraRect.height, closeTo(1190.4, _eps));
+    });
+  });
 }

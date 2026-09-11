@@ -60,6 +60,84 @@ abstract final class VGDuetLayoutMath {
         : [topRect, botRect];
   }
 
+  // ── Green screen layout rects ──────────────────────────────────────────────
+
+  /// Returns `[sourceRect, cameraRect]` for a green-screen composition.
+  ///
+  /// The source rect is always full canvas.
+  /// When [transform] is null, the camera rect is also full canvas (identity).
+  ///
+  /// When [transform] is non-null:
+  /// - scale is clamped to `[0.25, 1.0]`. If scale is non-finite or `<= 0.0`,
+  ///   it degrades to identity (full canvas camera rect).
+  /// - offset is clamped to `[-1.0, 1.0]`. Non-finite offset components default to 0.0.
+  /// - anchor is clamped to `[0.0, 1.0]`. Non-finite anchor components default to 0.5.
+  /// - If clamped scale >= 1.0 and offset is (0.0, 0.0), camera rect is full canvas.
+  /// - Otherwise, camera rect is scaled, positioned relative to canvas center + offset,
+  ///   and clamped fully inside the canvas bounds.
+  static List<VGDuetRect> computeGreenScreenRects({
+    required VGDuetSize canvasSize,
+    VGDuetForegroundTransform? transform,
+  }) {
+    final full = VGDuetRect(
+      left: 0.0,
+      top: 0.0,
+      width: canvasSize.width,
+      height: canvasSize.height,
+    );
+    final sourceRect = full;
+
+    if (transform == null) {
+      return [sourceRect, full];
+    }
+
+    final rawScale = transform.scale;
+    if (!rawScale.isFinite || rawScale <= 0.0) {
+      return [sourceRect, full];
+    }
+
+    final scale = rawScale.clamp(0.25, 1.0);
+
+    final rawOffsetX = transform.offset.x;
+    final rawOffsetY = transform.offset.y;
+    final offsetX = (rawOffsetX.isFinite ? rawOffsetX : 0.0).clamp(-1.0, 1.0);
+    final offsetY = (rawOffsetY.isFinite ? rawOffsetY : 0.0).clamp(-1.0, 1.0);
+
+    final rawAnchorX = transform.anchor.x;
+    final rawAnchorY = transform.anchor.y;
+    final anchorX = (rawAnchorX.isFinite ? rawAnchorX : 0.5).clamp(0.0, 1.0);
+    final anchorY = (rawAnchorY.isFinite ? rawAnchorY : 0.5).clamp(0.0, 1.0);
+
+    if (scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0) {
+      return [sourceRect, full];
+    }
+
+    final scaledW = canvasSize.width * scale;
+    final scaledH = canvasSize.height * scale;
+
+    final cx = canvasSize.width / 2.0;
+    final cy = canvasSize.height / 2.0;
+    final targetX = cx + offsetX * cx;
+    final targetY = cy + offsetY * cy;
+
+    var left = targetX - anchorX * scaledW;
+    var top = targetY - anchorY * scaledH;
+
+    final maxLeft = (canvasSize.width - scaledW).clamp(0.0, double.infinity);
+    final maxTop = (canvasSize.height - scaledH).clamp(0.0, double.infinity);
+    left = left.clamp(0.0, maxLeft);
+    top = top.clamp(0.0, maxTop);
+
+    final cameraRect = VGDuetRect(
+      left: left,
+      top: top,
+      width: scaledW,
+      height: scaledH,
+    );
+
+    return [sourceRect, cameraRect];
+  }
+
   // ── PiP layout ─────────────────────────────────────────────────────────────
 
   /// Computes the PiP window rect in canvas-pixel coordinates.

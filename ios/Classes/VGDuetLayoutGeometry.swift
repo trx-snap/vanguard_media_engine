@@ -101,14 +101,17 @@ enum VGDuetLayoutGeometry {
 
     /// Returns rects for the Green Screen layout with an optional foreground transform.
     ///
-    /// When `transform` is nil, returns the full-canvas identity (backwards compatible
-    /// with existing green-screen sessions without a transform).
+    /// When `transform` is nil or has non-finite/non-positive scale, returns the
+    /// full-canvas identity (backwards compatible with existing green-screen sessions
+    /// without a transform).
     ///
     /// Transform semantics (v1 — shrink/reposition only):
-    /// - `scale` is clamped to [0.25, 1.0] before rect math.
-    /// - `offset` is a normalized canvas-center translation, clamped to [-1.0, 1.0].
+    /// - `scale` is clamped to [0.25, 1.0] before rect math; malformed scale degrades
+    ///   to the full-canvas identity.
+    /// - `offset` is a normalized canvas-center translation, defaulting non-finite
+    ///   values to 0.0 before clamping to [-1.0, 1.0].
     /// - `anchor` maps a point within the scaled rect to canvas-center + offset,
-    ///   clamped to [0.0, 1.0].
+    ///   defaulting non-finite values to 0.5 before clamping to [0.0, 1.0].
     ///
     /// Rect math (mirrors AndroidDuetLayoutGeometry exactly):
     ///   scaledW  = canvasWidth  * clampedScale
@@ -131,12 +134,21 @@ enum VGDuetLayoutGeometry {
             return (source: source, camera: full)
         }
 
-        // Clamp inputs.
-        let scale   = min(max(t.scale,   0.25), 1.0)
-        let offsetX = min(max(t.offsetX, -1.0), 1.0)
-        let offsetY = min(max(t.offsetY, -1.0), 1.0)
-        let anchorX = min(max(t.anchorX, 0.0), 1.0)
-        let anchorY = min(max(t.anchorY, 0.0), 1.0)
+        let rawScale = t.scale
+        if !rawScale.isFinite || rawScale <= 0.0 {
+            return (source: source, camera: full)
+        }
+
+        // Normalize and clamp inputs.
+        let scale = min(max(rawScale, 0.25), 1.0)
+        let rawOffsetX = t.offsetX
+        let rawOffsetY = t.offsetY
+        let offsetX = min(max(rawOffsetX.isFinite ? rawOffsetX : 0.0, -1.0), 1.0)
+        let offsetY = min(max(rawOffsetY.isFinite ? rawOffsetY : 0.0, -1.0), 1.0)
+        let rawAnchorX = t.anchorX
+        let rawAnchorY = t.anchorY
+        let anchorX = min(max(rawAnchorX.isFinite ? rawAnchorX : 0.5, 0.0), 1.0)
+        let anchorY = min(max(rawAnchorY.isFinite ? rawAnchorY : 0.5, 0.0), 1.0)
 
         // Identity short-circuit: scale 1.0 with no offset → full canvas.
         if scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0 {

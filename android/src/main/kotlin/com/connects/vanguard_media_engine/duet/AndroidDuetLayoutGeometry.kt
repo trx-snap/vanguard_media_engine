@@ -119,14 +119,17 @@ object AndroidDuetLayoutGeometry {
     /**
      * Returns rects for the Green Screen layout with an optional foreground transform.
      *
-     * When [transform] is null or has scale == 1.0, returns the full-canvas identity
-     * (backwards compatible with existing green-screen sessions without a transform).
+     * When [transform] is null or has non-finite/non-positive scale, returns the
+     * full-canvas identity (backwards compatible with existing green-screen sessions
+     * without a transform).
      *
      * Transform semantics (v1 — shrink/reposition only):
-     * - scale is clamped to [0.25, 1.0] before rect math.
-     * - offset is a normalized canvas-center translation, clamped to [-1.0, 1.0].
+     * - scale is clamped to [0.25, 1.0] before rect math; malformed scale degrades
+     *   to the full-canvas identity.
+     * - offset is a normalized canvas-center translation, defaulting non-finite
+     *   values to 0.0 before clamping to [-1.0, 1.0].
      * - anchor is the point within the scaled rect that maps to canvas-center + offset,
-     *   clamped to [0.0, 1.0].
+     *   defaulting non-finite values to 0.5 before clamping to [0.0, 1.0].
      *
      * Rect math:
      *   scaledW = canvasWidth  * clampedScale
@@ -151,15 +154,24 @@ object AndroidDuetLayoutGeometry {
             return VGDuetLayoutRects(source = source, camera = full)
         }
 
-        // Clamp inputs.
-        val scale   = transform.scale.coerceIn(0.25, 1.0)
-        val offsetX = transform.offsetX.coerceIn(-1.0, 1.0)
-        val offsetY = transform.offsetY.coerceIn(-1.0, 1.0)
-        val anchorX = transform.anchorX.coerceIn(0.0, 1.0)
-        val anchorY = transform.anchorY.coerceIn(0.0, 1.0)
+        val rawScale = transform.scale
+        if (!rawScale.isFinite() || rawScale <= 0.0) {
+            return VGDuetLayoutRects(source = source, camera = full)
+        }
 
-        // Identity short-circuit: scale 1.0 with centered anchor and no offset
-        // returns full canvas without any rect math.
+        // Normalize and clamp inputs.
+        val scale = rawScale.coerceIn(0.25, 1.0)
+        val rawOffsetX = transform.offsetX
+        val rawOffsetY = transform.offsetY
+        val offsetX = (if (rawOffsetX.isFinite()) rawOffsetX else 0.0).coerceIn(-1.0, 1.0)
+        val offsetY = (if (rawOffsetY.isFinite()) rawOffsetY else 0.0).coerceIn(-1.0, 1.0)
+        val rawAnchorX = transform.anchorX
+        val rawAnchorY = transform.anchorY
+        val anchorX = (if (rawAnchorX.isFinite()) rawAnchorX else 0.5).coerceIn(0.0, 1.0)
+        val anchorY = (if (rawAnchorY.isFinite()) rawAnchorY else 0.5).coerceIn(0.0, 1.0)
+
+        // Identity short-circuit: scale 1.0 with no offset returns full canvas
+        // without any rect math.
         if (scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0) {
             return VGDuetLayoutRects(source = source, camera = full)
         }
