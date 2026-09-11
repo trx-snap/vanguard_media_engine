@@ -28,6 +28,8 @@ final class VGDuetMethodHandler {
         // Slice 4A: preview texture lifecycle
         "attachDuetPreviewTexture",
         "detachDuetPreviewTexture",
+        // Diagnostic-only: deterministic CoreImage matte-blend pixel proof.
+        "runIosDuetPixelProof",
     ]
 
     static func ownsMethod(_ method: String) -> Bool {
@@ -134,6 +136,13 @@ final class VGDuetMethodHandler {
             coordinator.detachPreviewTexture(sessionId: sid) { val, err in
                 self.reply(result: result, value: val, error: err)
             }
+
+        // ── Diagnostic-only: deterministic CoreImage matte-blend pixel proof ──────
+        // Simulator-safe; synthetic buffers only. Never throws — always replies with
+        // a fail-shaped map on any internal failure. See
+        // VGDuetPreviewCompositor.runDeterministicPixelProof().
+        case "runIosDuetPixelProof":
+            result(VGDuetPreviewCompositor.runDeterministicPixelProof())
 
         default:
             result(FlutterMethodNotImplemented)
