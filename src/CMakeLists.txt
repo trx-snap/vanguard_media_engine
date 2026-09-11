@@ -517,6 +517,9 @@ if (ANDROID)
     "platform/android/src/android_vulkan_duet_greenscreen_smoke_jni.cpp"
     "platform/android/src/android_duet_vulkan_preview_ingest_combined_jni.cpp"
     "platform/android/src/android_duet_vulkan_preview_presentation_smoke_jni.cpp"
+    "platform/android/src/android_duet_vulkan_preview_session.cpp"
+    "platform/android/src/android_duet_vulkan_preview_session_jni.cpp"
+
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

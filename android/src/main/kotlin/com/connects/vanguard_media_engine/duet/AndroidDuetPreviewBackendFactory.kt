@@ -12,12 +12,14 @@ data class AndroidDuetPreviewBackendSelection(
 )
 
 object AndroidDuetPreviewBackendFactory {
+    /**
+     * Default production preview selection remains GLES while the Vulkan preview
+     * backend is foundation-only (non-presenting). Explicit VULKAN selection can
+     * be requested via [AndroidDuetPreviewBackendSelector.select] for diagnostics
+     * or foundation testing.
+     */
     fun selectDefault(): AndroidDuetPreviewBackendSelection {
-        return AndroidDuetPreviewBackendSelection(
-            requested = AndroidDuetPreviewBackendId.GLES,
-            actual = AndroidDuetPreviewBackendId.GLES,
-            fallbackReason = null,
-        )
+        return AndroidDuetPreviewBackendSelector.select(AndroidDuetPreviewBackendId.GLES)
     }
 
     fun create(
@@ -25,10 +27,7 @@ object AndroidDuetPreviewBackendFactory {
     ): AndroidDuetPreviewBackend {
         return when (selection.actual) {
             AndroidDuetPreviewBackendId.GLES -> AndroidDuetPreviewCompositor()
-            AndroidDuetPreviewBackendId.VULKAN -> {
-                // Fail closed by returning GLES compositor for now and do not throw.
-                AndroidDuetPreviewCompositor()
-            }
+            AndroidDuetPreviewBackendId.VULKAN -> AndroidDuetVulkanPreviewCompositor()
         }
     }
 }

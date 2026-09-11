@@ -1174,6 +1174,17 @@ class VanguardNativeBridge(
         // Any-thread, idempotent erase-once destroy. Second call / unknown
         // handle returns status=not_found.
         external fun destroyStreamSourceMedia3IngestSession(handle: Long): String
+
+        // ── P5-ANDROID-DUET-VULKAN-PREVIEW ──
+        // Native session lifecycle for Android Duet Vulkan preview foundation.
+        // Foundation only: attach/detach/destroy surface lifecycle. Per-frame
+        // Vulkan presentation rendering is deferred to a future slice; no
+        // diagnostic per-frame JNI path is used in production preview.
+        external fun createAndroidDuetVulkanPreviewSession(): Long
+        external fun attachAndroidDuetVulkanPreviewSurface(handle: Long, surface: android.view.Surface, widthPx: Int, heightPx: Int): Boolean
+        external fun detachAndroidDuetVulkanPreviewSurface(handle: Long)
+        external fun destroyAndroidDuetVulkanPreviewSession(handle: Long)
+
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
