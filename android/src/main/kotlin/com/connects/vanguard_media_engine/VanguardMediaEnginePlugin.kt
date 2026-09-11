@@ -89,6 +89,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionV
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineOverlayVulkanRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidBeautyV2VulkanRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPixelProofSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -503,6 +504,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var duetVulkanPixelProofSmokeCoordinator:
         AndroidDuetVulkanPixelProofSmokeCoordinator? = null
 
+    // ── DUET-VULKAN-PREVIEW-INGEST-COMBINED: camera + decoder to Vulkan ───────
+    private var duetVulkanPreviewIngestCombinedSmokeCoordinator:
+        AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator? = null
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent ingest smoke ────────
     private var camera2ConcurrentSmokeCoordinator: AndroidCamera2ConcurrentSmokeCoordinator? = null
 
@@ -861,6 +866,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         duetVulkanPixelProofSmokeCoordinator = AndroidDuetVulkanPixelProofSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        duetVulkanPreviewIngestCombinedSmokeCoordinator = AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator(
+            context = binding.applicationContext,
             mainHandler = mainHandler,
         )
         camera2ConcurrentSmokeCoordinator = AndroidCamera2ConcurrentSmokeCoordinator(
@@ -1754,6 +1763,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android beauty V2 Vulkan render smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = duetVulkanPreviewIngestCombinedSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator missing",
                     null,
                 )
             }
@@ -3440,6 +3463,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // destroys them in the native call before returning.
         duetVulkanPixelProofSmokeCoordinator?.disposeAll()
         duetVulkanPixelProofSmokeCoordinator = null
+        duetVulkanPreviewIngestCombinedSmokeCoordinator?.disposeAll()
+        duetVulkanPreviewIngestCombinedSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
         editorExportCoordinator?.disposeAll()

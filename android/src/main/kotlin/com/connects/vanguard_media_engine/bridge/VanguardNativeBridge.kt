@@ -2873,6 +2873,19 @@ class VanguardNativeBridge(
     // production VulkanBackend mutation, no product UI.
     external fun runAndroidDuetVulkanPixelProofSmoke(): String
 
+    // ── DUET-VULKAN-PREVIEW-INGEST-COMBINED: camera + decoder to Vulkan ───────
+    // Diagnostic only: one real Camera2 YUV HardwareBuffer + one real
+    // MediaCodec PRIVATE HardwareBuffer imported, resolved, and composited
+    // with VulkanGreenScreenCompositor.
+    external fun renderAndroidDuetVulkanPreviewIngestCombined(
+        cameraHardwareBuffer: HardwareBuffer,
+        cameraWidth: Int,
+        cameraHeight: Int,
+        decoderHardwareBuffer: HardwareBuffer,
+        decoderWidth: Int,
+        decoderHeight: Int,
+    ): String
+
     // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec -> AHB -> Vulkan ──
     // crossfade proof. Kotlin (AndroidTimelineDualDecoderSyncDriver) owns both
     // decoder pipelines and calls this once per overlap frame with one
