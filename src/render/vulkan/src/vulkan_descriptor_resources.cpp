@@ -17,12 +17,100 @@
 #if defined(__ANDROID__)
 
 #include <android/log.h>
+#include <inttypes.h>
+
+#include <cstring>
 
 #define VGLOG_DESC(...) \
     __android_log_print(ANDROID_LOG_DEBUG, "VanguardDescriptorRes", __VA_ARGS__)
 
 namespace vanguard {
 namespace render {
+
+namespace {
+
+// Portable helper: encode a Vulkan non-dispatchable handle as uint64_t for
+// logging. Non-dispatchable handles are uint64_t on 32-bit Android and
+// pointer-sized opaque structs on 64-bit Android, so %p/void* casts do not
+// compile on 32-bit; this memcpy-based encoding is safe on both ABIs.
+template <typename VkHandle>
+static inline uint64_t vkHandleToU64(VkHandle h) {
+    static_assert(sizeof(VkHandle) <= sizeof(uint64_t),
+                  "VkHandle too large for uint64_t");
+    uint64_t v = 0;
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    std::memcpy(&v, &h, sizeof(VkHandle));
+    return v;
+}
+
+} // namespace
+
+HardwareBufferImportResult CreateSharedDescriptorLayouts(
+    VkDevice device,
+    VkSampler immutableSampler,
+    VkDescriptorSetLayout* outSetLayout,
+    VkPipelineLayout* outPipelineLayout)
+{
+    *outSetLayout      = VK_NULL_HANDLE;
+    *outPipelineLayout = VK_NULL_HANDLE;
+
+    if (device == VK_NULL_HANDLE || immutableSampler == VK_NULL_HANDLE) {
+        VGLOG_DESC("CreateSharedDescriptorLayouts: invalid argument");
+        return HardwareBufferImportResult::kInvalidArgument;
+    }
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding            = 0;
+    binding.descriptorType     = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount    = 1;
+    binding.stageFlags         = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+    binding.pImmutableSamplers = &immutableSampler;
+
+    VkDescriptorSetLayoutCreateInfo layoutCI{};
+    layoutCI.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutCI.pNext        = nullptr;
+    layoutCI.flags        = 0;
+    layoutCI.bindingCount = 1;
+    layoutCI.pBindings    = &binding;
+
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkResult vr = vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &setLayout);
+    if (vr != VK_SUCCESS) {
+        VGLOG_DESC("CreateSharedDescriptorLayouts: vkCreateDescriptorSetLayout failed: %d",
+                   static_cast<int>(vr));
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushConstantRange.offset     = 0;
+    pushConstantRange.size       = sizeof(vanguard::render::VideoTransformFullPushConstants);
+
+    VkPipelineLayoutCreateInfo plCI{};
+    plCI.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plCI.pNext                  = nullptr;
+    plCI.flags                  = 0;
+    plCI.setLayoutCount         = 1;
+    plCI.pSetLayouts            = &setLayout;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges    = &pushConstantRange;
+
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    vr = vkCreatePipelineLayout(device, &plCI, nullptr, &pipelineLayout);
+    if (vr != VK_SUCCESS) {
+        VGLOG_DESC("CreateSharedDescriptorLayouts: vkCreatePipelineLayout failed: %d",
+                   static_cast<int>(vr));
+        vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    *outSetLayout      = setLayout;
+    *outPipelineLayout = pipelineLayout;
+    VGLOG_DESC("CreateSharedDescriptorLayouts: created setLayout=0x%" PRIx64
+               " pipelineLayout=0x%" PRIx64,
+               vkHandleToU64(setLayout), vkHandleToU64(pipelineLayout));
+    return HardwareBufferImportResult::kSuccess;
+}
 
 HardwareBufferImportResult VulkanDescriptorResources::create(
     VkDevice device,
@@ -170,6 +258,89 @@ HardwareBufferImportResult VulkanDescriptorResources::create(
     return HardwareBufferImportResult::kSuccess;
 }
 
+HardwareBufferImportResult VulkanDescriptorResources::createWithSharedLayout(
+    VkDevice device,
+    VkDescriptorSetLayout sharedSetLayout,
+    VkPipelineLayout sharedPipelineLayout,
+    VkImageView imageView)
+{
+    if (device == VK_NULL_HANDLE ||
+        sharedSetLayout == VK_NULL_HANDLE ||
+        sharedPipelineLayout == VK_NULL_HANDLE ||
+        imageView == VK_NULL_HANDLE) {
+        VGLOG_DESC("createWithSharedLayout: invalid argument - device=%p, "
+                   "sharedSetLayout/sharedPipelineLayout/imageView is VK_NULL_HANDLE",
+                   static_cast<void*>(device));
+        return HardwareBufferImportResult::kInvalidArgument;
+    }
+
+    // Borrow the shared layout objects. ownsLayouts = false is set before any
+    // Vulkan call below so that a failure-path destroy(device) call never
+    // destroys the shared handles.
+    descriptorSetLayout = sharedSetLayout;
+    pipelineLayout       = sharedPipelineLayout;
+    ownsLayouts          = false;
+
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSize.descriptorCount = 1;
+
+    VkDescriptorPoolCreateInfo poolCI{};
+    poolCI.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolCI.pNext         = nullptr;
+    poolCI.flags         = 0; // no FREE_DESCRIPTOR_SET_BIT
+    poolCI.maxSets       = 1;
+    poolCI.poolSizeCount = 1;
+    poolCI.pPoolSizes    = &poolSize;
+
+    VkResult vr = vkCreateDescriptorPool(device, &poolCI, nullptr, &descriptorPool);
+    if (vr != VK_SUCCESS) {
+        VGLOG_DESC("createWithSharedLayout: vkCreateDescriptorPool failed: %d",
+                   static_cast<int>(vr));
+        destroy(device);
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.pNext              = nullptr;
+    allocInfo.descriptorPool     = descriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts        = &descriptorSetLayout;
+
+    vr = vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet);
+    if (vr != VK_SUCCESS) {
+        VGLOG_DESC("createWithSharedLayout: vkAllocateDescriptorSets failed: %d",
+                   static_cast<int>(vr));
+        destroy(device);
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.sampler     = VK_NULL_HANDLE; // immutable sampler baked into shared layout
+    imageInfo.imageView   = imageView;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.pNext            = nullptr;
+    write.dstSet           = descriptorSet;
+    write.dstBinding       = 0;
+    write.dstArrayElement  = 0;
+    write.descriptorCount  = 1;
+    write.descriptorType   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo       = &imageInfo;
+    write.pBufferInfo      = nullptr;
+    write.pTexelBufferView = nullptr;
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+    // Per-frame success log elided: fires every rendered frame and dominated
+    // render-thread log volume.
+
+    return HardwareBufferImportResult::kSuccess;
+}
+
 void VulkanDescriptorResources::destroy(VkDevice device)
 {
     // Destroying the pool implicitly frees descriptorSet; null it immediately
@@ -183,14 +354,19 @@ void VulkanDescriptorResources::destroy(VkDevice device)
     // pipelineLayout must be destroyed before descriptorSetLayout because the
     // layout was used to create it. Both are safe to destroy after the pool
     // (which only references descriptorSetLayout indirectly via the set).
-    if (pipelineLayout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-        pipelineLayout = VK_NULL_HANDLE;
+    // Skipped entirely when ownsLayouts is false: the handles were borrowed
+    // from a shared cache (or another import) that still owns them.
+    if (ownsLayouts) {
+        if (pipelineLayout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        }
+        if (descriptorSetLayout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+        }
     }
-    if (descriptorSetLayout != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
-        descriptorSetLayout = VK_NULL_HANDLE;
-    }
+    pipelineLayout      = VK_NULL_HANDLE;
+    descriptorSetLayout = VK_NULL_HANDLE;
+    ownsLayouts         = true;
 }
 
 } // namespace render

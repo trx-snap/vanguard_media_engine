@@ -35,11 +35,38 @@
 namespace vanguard {
 namespace render {
 
+// Builds descriptorSetLayout (binding 0, COMBINED_IMAGE_SAMPLER, immutable
+// sampler baked in) and pipelineLayout (one set layout + the video-transform
+// push-constant range) from immutableSampler alone, with no descriptor pool,
+// set, or imageView involved.
+//
+// Used by VulkanHardwareBufferImports::Impl to build the session/import-table
+// -scoped shared layout objects that multiple per-import
+// VulkanDescriptorResources instances subsequently bind against via
+// createWithSharedLayout(), instead of every import creating its own
+// descriptorSetLayout/pipelineLayout (the per-frame churn that causes
+// VulkanFrameRenderer's pipeline-layout mismatch check to fire every frame).
+//
+// On any failure all partially created objects are destroyed and both
+// outputs are set to VK_NULL_HANDLE.
+HardwareBufferImportResult CreateSharedDescriptorLayouts(
+    VkDevice device,
+    VkSampler immutableSampler,
+    VkDescriptorSetLayout* outSetLayout,
+    VkPipelineLayout* outPipelineLayout);
+
 struct VulkanDescriptorResources {
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool      descriptorPool      = VK_NULL_HANDLE;
     VkDescriptorSet       descriptorSet       = VK_NULL_HANDLE;
     VkPipelineLayout      pipelineLayout      = VK_NULL_HANDLE;
+
+    // True when descriptorSetLayout/pipelineLayout are owned by this instance
+    // (created via create()) and must be destroyed by destroy(). False when
+    // they were borrowed from a shared cache via createWithSharedLayout(); in
+    // that case destroy() must leave them untouched since other imports and
+    // the shared cache itself are still using the same handles.
+    bool ownsLayouts = true;
 
     VulkanDescriptorResources() = default;
 
@@ -51,11 +78,13 @@ struct VulkanDescriptorResources {
         : descriptorSetLayout(other.descriptorSetLayout),
           descriptorPool(other.descriptorPool),
           descriptorSet(other.descriptorSet),
-          pipelineLayout(other.pipelineLayout) {
+          pipelineLayout(other.pipelineLayout),
+          ownsLayouts(other.ownsLayouts) {
         other.descriptorSetLayout = VK_NULL_HANDLE;
         other.descriptorPool      = VK_NULL_HANDLE;
         other.descriptorSet       = VK_NULL_HANDLE;
         other.pipelineLayout      = VK_NULL_HANDLE;
+        other.ownsLayouts         = true;
     }
 
     VulkanDescriptorResources& operator=(VulkanDescriptorResources&& other) noexcept {
@@ -64,11 +93,13 @@ struct VulkanDescriptorResources {
             descriptorPool      = other.descriptorPool;
             descriptorSet       = other.descriptorSet;
             pipelineLayout      = other.pipelineLayout;
+            ownsLayouts         = other.ownsLayouts;
 
             other.descriptorSetLayout = VK_NULL_HANDLE;
             other.descriptorPool      = VK_NULL_HANDLE;
             other.descriptorSet       = VK_NULL_HANDLE;
             other.pipelineLayout      = VK_NULL_HANDLE;
+            other.ownsLayouts         = true;
         }
         return *this;
     }
@@ -79,14 +110,34 @@ struct VulkanDescriptorResources {
     // The supplied immutableSampler is baked into the layout at binding 0;
     // consequently the VkWriteDescriptorSet uses sampler = VK_NULL_HANDLE.
     // On any failure all partially created resources are destroyed and
-    // kVulkanFailure is returned.
+    // kVulkanFailure is returned. ownsLayouts is true after success.
     HardwareBufferImportResult create(VkDevice device,
                                       VkSampler immutableSampler,
                                       VkImageView imageView);
 
-    // Destroys descriptorPool (which implicitly frees descriptorSet), then
-    // pipelineLayout, then descriptorSetLayout.
-    // Sets all handles to VK_NULL_HANDLE. Idempotent (null-handle guards).
+    // Shared-layout path: borrows an existing descriptorSetLayout and
+    // pipelineLayout (created via CreateSharedDescriptorLayouts and owned by
+    // a shared cache) and creates only descriptorPool, descriptorSet, and the
+    // descriptor write for imageView. sampler = VK_NULL_HANDLE in the write
+    // because the immutable sampler is already baked into sharedSetLayout.
+    // ownsLayouts is set to false immediately so destroy() never destroys the
+    // borrowed layout objects, even on a partial-failure cleanup path.
+    // On any failure the owned descriptorPool/descriptorSet are destroyed and
+    // kVulkanFailure is returned; sharedSetLayout/sharedPipelineLayout are
+    // never touched.
+    HardwareBufferImportResult createWithSharedLayout(
+        VkDevice device,
+        VkDescriptorSetLayout sharedSetLayout,
+        VkPipelineLayout sharedPipelineLayout,
+        VkImageView imageView);
+
+    // Destroys descriptorPool (which implicitly frees descriptorSet).
+    // Destroys pipelineLayout and descriptorSetLayout only when ownsLayouts
+    // is true; when false (shared-layout path) those handles are simply
+    // cleared without being destroyed, since a shared cache or other imports
+    // still reference them.
+    // Sets all handles to VK_NULL_HANDLE and ownsLayouts back to true.
+    // Idempotent (null-handle guards).
     void destroy(VkDevice device);
 };
 

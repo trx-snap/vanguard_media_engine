@@ -31,6 +31,46 @@
 namespace vanguard {
 namespace render {
 
+// Session/import-table-scoped shared external-format sampling resources.
+// Owned by VulkanHardwareBufferImports::Impl's shared resource cache, keyed
+// by the external-format conversion parameters (resolved image format /
+// externalFormat, suggested YCbCr model/range/components, chroma offsets,
+// and layer count). Every VulkanHardwareBufferImage import whose AHB probes
+// to an identical key borrows these same four Vulkan objects instead of
+// creating its own, so frames sharing a conversion configuration also share
+// one VkPipelineLayout and stop causing per-frame pipeline-layout churn in
+// VulkanFrameRenderer.
+//
+// Outlives every per-import VulkanHardwareBufferImage that borrows it;
+// destroyed only at VulkanHardwareBufferImports::shutdown(), after all
+// active and retired import records have already been destroyed.
+struct VulkanSharedExternalSampling {
+    VkSamplerYcbcrConversion conversion          = VK_NULL_HANDLE;
+    VkSampler                sampler             = VK_NULL_HANDLE;
+    VkDescriptorSetLayout    descriptorSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout         pipelineLayout      = VK_NULL_HANDLE;
+};
+
+// Builds a VkSamplerYcbcrConversion and matching VkSampler from the given
+// external-format Android hardware buffer format properties.
+//
+// Used by VulkanHardwareBufferImports::Impl to build a
+// VulkanSharedExternalSampling cache entry for a given conversion key. The
+// per-import, non-shared path in VulkanHardwareBufferImage::create() keeps
+// its own inline conversion/sampler creation unchanged for imports that do
+// not use a shared cache entry.
+//
+// On any failure any partially created object is destroyed (via
+// fnDestroyYcbcr for the conversion) and both outputs are set to
+// VK_NULL_HANDLE.
+HardwareBufferImportResult CreateExternalYcbcrConversionAndSampler(
+    VkDevice device,
+    PFN_vkCreateSamplerYcbcrConversion fnCreateYcbcr,
+    PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr,
+    const VkAndroidHardwareBufferFormatPropertiesANDROID& fmtProps,
+    VkSamplerYcbcrConversion* outConversion,
+    VkSampler* outSampler);
+
 struct VulkanHardwareBufferImage {
     VkImage                  image            = VK_NULL_HANDLE;
     VkDeviceMemory           memory           = VK_NULL_HANDLE;
@@ -68,6 +108,14 @@ struct VulkanHardwareBufferImage {
     // architecture.
     VulkanDescriptorResources descriptorResources;
 
+    // True when ycbcrConversion / sampler were borrowed from a
+    // VulkanSharedExternalSampling cache entry (shared-layout path) rather
+    // than created and owned by this import. When true, destroy() must not
+    // call fnDestroyYcbcr / vkDestroySampler on them; the shared cache (or
+    // another import still using the same handles) owns that lifetime.
+    bool ycbcrConversionBorrowed = false;
+    bool samplerBorrowed         = false;
+
     VulkanHardwareBufferImage() = default;
 
     // Move-only: raw Vulkan handles must not be copied.
@@ -86,7 +134,9 @@ struct VulkanHardwareBufferImage {
           cachedFormat(other.cachedFormat),
           cachedExternalFormat(other.cachedExternalFormat),
           cachedLayerCount(other.cachedLayerCount),
-          descriptorResources(std::move(other.descriptorResources)) {
+          descriptorResources(std::move(other.descriptorResources)),
+          ycbcrConversionBorrowed(other.ycbcrConversionBorrowed),
+          samplerBorrowed(other.samplerBorrowed) {
         other.image = VK_NULL_HANDLE;
         other.memory = VK_NULL_HANDLE;
         other.ycbcrConversion = VK_NULL_HANDLE;
@@ -98,6 +148,8 @@ struct VulkanHardwareBufferImage {
         other.cachedFormat = VK_FORMAT_UNDEFINED;
         other.cachedExternalFormat = 0;
         other.cachedLayerCount = 1;
+        other.ycbcrConversionBorrowed = false;
+        other.samplerBorrowed = false;
     }
 
     VulkanHardwareBufferImage& operator=(VulkanHardwareBufferImage&& other) noexcept {
@@ -114,6 +166,8 @@ struct VulkanHardwareBufferImage {
             cachedExternalFormat = other.cachedExternalFormat;
             cachedLayerCount = other.cachedLayerCount;
             descriptorResources = std::move(other.descriptorResources);
+            ycbcrConversionBorrowed = other.ycbcrConversionBorrowed;
+            samplerBorrowed = other.samplerBorrowed;
 
             other.image = VK_NULL_HANDLE;
             other.memory = VK_NULL_HANDLE;
@@ -126,6 +180,8 @@ struct VulkanHardwareBufferImage {
             other.cachedFormat = VK_FORMAT_UNDEFINED;
             other.cachedExternalFormat = 0;
             other.cachedLayerCount = 1;
+            other.ycbcrConversionBorrowed = false;
+            other.samplerBorrowed = false;
         }
         return *this;
     }
@@ -149,6 +205,15 @@ struct VulkanHardwareBufferImage {
     // VkSamplerYcbcrConversion (if external format), VkImageView, and VkSampler.
     // On any failure, all partially created Vulkan resources are destroyed in
     // strict Phase 2D teardown order and an appropriate error code is returned.
+    //
+    // sharedExternal: optional. When non-null AND this buffer resolves to an
+    // external format, the supplied VkSamplerYcbcrConversion is used for
+    // VkImageView creation, the supplied VkSampler is used for descriptor
+    // resources (via VulkanDescriptorResources::createWithSharedLayout), and
+    // neither is destroyed by destroy() (ycbcrConversionBorrowed/
+    // samplerBorrowed are set to true). When null, or when the buffer is not
+    // external format, behavior is unchanged: this import creates and owns
+    // its own conversion, sampler, and descriptor/pipeline layout objects.
     HardwareBufferImportResult create(
         VkDevice device,
         VkPhysicalDevice physDev,
@@ -156,7 +221,8 @@ struct VulkanHardwareBufferImage {
         const AHardwareBuffer_Desc& desc,
         PFN_vkGetAndroidHardwareBufferPropertiesANDROID fnGetAHBProps,
         PFN_vkCreateSamplerYcbcrConversion fnCreateYcbcr,
-        PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr);
+        PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr,
+        const VulkanSharedExternalSampling* sharedExternal = nullptr);
 
     // Destroys all owned Vulkan resources in teardown order:
     //   vkDestroySemaphore (acquireSemaphore, Phase 2G)

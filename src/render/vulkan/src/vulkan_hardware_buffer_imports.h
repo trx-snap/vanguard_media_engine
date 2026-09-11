@@ -24,6 +24,20 @@
 // waitForFrameFence(slot) confirms GPU completion for that slot.
 // drainAllRetired() is used by shutdown/failClosed after a global idle wait.
 // Compute-pipeline deferral is not implemented in this phase.
+//
+// Shared external-format sampling/layout cache: Impl also owns a small,
+// session/import-table-scoped cache of VulkanSharedExternalSampling entries
+// (VkSamplerYcbcrConversion + VkSampler + VkDescriptorSetLayout +
+// VkPipelineLayout), keyed by the external-format conversion parameters
+// (resolved format/externalFormat, suggested YCbCr model/range/components,
+// chroma offsets, and layer count). External-format imports that resolve to
+// an existing key borrow that entry's Vulkan objects instead of creating
+// their own, so repeated frames with identical conversion parameters bind
+// the same VkPipelineLayout and stop causing per-frame pipeline-layout churn
+// in VulkanFrameRenderer. Per-import resources (VkImage, VkDeviceMemory,
+// VkImageView, descriptor pool/set, acquire semaphore) are unaffected and
+// remain owned by each ImportRecord. The cache is destroyed only in
+// shutdown(), after all active and retired records have been destroyed.
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"

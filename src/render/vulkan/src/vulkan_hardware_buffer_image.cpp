@@ -12,12 +12,113 @@
 #if defined(__ANDROID__)
 
 #include <android/log.h>
+#include <inttypes.h>
+
+#include <cstring>
 
 #define VGLOG_AHB(...) \
     __android_log_print(ANDROID_LOG_DEBUG, "VanguardAHBImport", __VA_ARGS__)
 
 namespace vanguard {
 namespace render {
+
+namespace {
+
+// Portable helper: encode a Vulkan non-dispatchable handle as uint64_t for
+// logging. Non-dispatchable handles are uint64_t on 32-bit Android and
+// pointer-sized opaque structs on 64-bit Android, so %p/void* casts do not
+// compile on 32-bit; this memcpy-based encoding is safe on both ABIs.
+template <typename VkHandle>
+static inline uint64_t vkHandleToU64(VkHandle h) {
+    static_assert(sizeof(VkHandle) <= sizeof(uint64_t),
+                  "VkHandle too large for uint64_t");
+    uint64_t v = 0;
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    std::memcpy(&v, &h, sizeof(VkHandle));
+    return v;
+}
+
+} // namespace
+
+HardwareBufferImportResult CreateExternalYcbcrConversionAndSampler(
+    VkDevice device,
+    PFN_vkCreateSamplerYcbcrConversion fnCreateYcbcr,
+    PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr,
+    const VkAndroidHardwareBufferFormatPropertiesANDROID& fmtProps,
+    VkSamplerYcbcrConversion* outConversion,
+    VkSampler* outSampler)
+{
+    *outConversion = VK_NULL_HANDLE;
+    *outSampler    = VK_NULL_HANDLE;
+
+    VkExternalFormatANDROID convExtFmt{};
+    convExtFmt.sType          = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
+    convExtFmt.pNext          = nullptr;
+    convExtFmt.externalFormat = fmtProps.externalFormat;
+
+    VkSamplerYcbcrConversionCreateInfo ycbcrCI{};
+    ycbcrCI.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
+    ycbcrCI.pNext      = &convExtFmt;
+    ycbcrCI.format     = VK_FORMAT_UNDEFINED; // must match image format
+    ycbcrCI.ycbcrModel = fmtProps.suggestedYcbcrModel;
+    ycbcrCI.ycbcrRange = fmtProps.suggestedYcbcrRange;
+    ycbcrCI.components = fmtProps.samplerYcbcrConversionComponents;
+    ycbcrCI.xChromaOffset               = fmtProps.suggestedXChromaOffset;
+    ycbcrCI.yChromaOffset               = fmtProps.suggestedYChromaOffset;
+    ycbcrCI.chromaFilter                = VK_FILTER_NEAREST; // conservative
+    ycbcrCI.forceExplicitReconstruction = VK_FALSE;
+
+    VkSamplerYcbcrConversion conversion = VK_NULL_HANDLE;
+    VkResult vr = fnCreateYcbcr(device, &ycbcrCI, nullptr, &conversion);
+    if (vr != VK_SUCCESS) {
+        VGLOG_AHB("CreateExternalYcbcrConversionAndSampler: "
+                  "vkCreateSamplerYcbcrConversion failed: %d", static_cast<int>(vr));
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    VkSamplerYcbcrConversionInfo samplerYcbcrInfo{};
+    samplerYcbcrInfo.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+    samplerYcbcrInfo.pNext      = nullptr;
+    samplerYcbcrInfo.conversion = conversion;
+
+    VkSamplerCreateInfo samplerCI{};
+    samplerCI.sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerCI.pNext            = &samplerYcbcrInfo;
+    samplerCI.magFilter        = VK_FILTER_NEAREST;
+    samplerCI.minFilter        = VK_FILTER_NEAREST;
+    samplerCI.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerCI.addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.mipLodBias       = 0.0f;
+    samplerCI.anisotropyEnable = VK_FALSE;
+    samplerCI.maxAnisotropy    = 1.0f;
+    samplerCI.compareEnable    = VK_FALSE;
+    samplerCI.compareOp        = VK_COMPARE_OP_ALWAYS;
+    samplerCI.minLod           = 0.0f;
+    samplerCI.maxLod           = 0.0f;
+    samplerCI.borderColor      = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    samplerCI.unnormalizedCoordinates = VK_FALSE;
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    vr = vkCreateSampler(device, &samplerCI, nullptr, &sampler);
+    if (vr != VK_SUCCESS) {
+        VGLOG_AHB("CreateExternalYcbcrConversionAndSampler: vkCreateSampler failed: %d",
+                  static_cast<int>(vr));
+        if (fnDestroyYcbcr) {
+            fnDestroyYcbcr(device, conversion, nullptr);
+        }
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    *outConversion = conversion;
+    *outSampler    = sampler;
+    VGLOG_AHB("CreateExternalYcbcrConversionAndSampler: created conversion=0x%" PRIx64
+              " sampler=0x%" PRIx64 " externalFormat=%" PRIu64,
+              vkHandleToU64(conversion), vkHandleToU64(sampler),
+              static_cast<uint64_t>(fmtProps.externalFormat));
+    return HardwareBufferImportResult::kSuccess;
+}
 
 HardwareBufferImportResult VulkanHardwareBufferImage::create(
     VkDevice device,
@@ -26,7 +127,8 @@ HardwareBufferImportResult VulkanHardwareBufferImage::create(
     const AHardwareBuffer_Desc& desc,
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID fnGetAHBProps,
     PFN_vkCreateSamplerYcbcrConversion fnCreateYcbcr,
-    PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr)
+    PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr,
+    const VulkanSharedExternalSampling* sharedExternal)
 {
     // --- Query Vulkan AHardwareBuffer properties ---
     VkAndroidHardwareBufferFormatPropertiesANDROID fmtProps{};
@@ -145,7 +247,24 @@ HardwareBufferImportResult VulkanHardwareBufferImage::create(
 
     vr = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
     if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkAllocateMemory failed: %d", static_cast<int>(vr));
+        // Diagnostic-only: dump the source AHB descriptor and the driver-reported
+        // import properties so a physical failure can be diagnosed from logcat.
+        VGLOG_AHB("vkAllocateMemory failed: %d"
+                  " desc={w=%u h=%u layers=%u format=%u usage=0x%" PRIx64 " stride=%u}"
+                  " ahb={allocationSize=%" PRIu64 " memoryTypeBits=0x%x}"
+                  " memTypeIndex=%u"
+                  " fmt={format=%d externalFormat=%" PRIu64 " formatFeatures=0x%x}"
+                  " isExternal=%d",
+                  static_cast<int>(vr),
+                  desc.width, desc.height, desc.layers, desc.format,
+                  static_cast<uint64_t>(desc.usage), desc.stride,
+                  static_cast<uint64_t>(ahbProps.allocationSize),
+                  ahbProps.memoryTypeBits,
+                  memTypeIndex,
+                  static_cast<int>(fmtProps.format),
+                  static_cast<uint64_t>(fmtProps.externalFormat),
+                  static_cast<uint32_t>(fmtProps.formatFeatures),
+                  isExternal ? 1 : 0);
         destroy(device, fnDestroyYcbcr);
         return HardwareBufferImportResult::kVulkanFailure;
     }
@@ -162,35 +281,44 @@ HardwareBufferImportResult VulkanHardwareBufferImage::create(
     // -------------------------------------------------------------------------
 
     if (isExternal) {
-        // External-format (e.g., YUV/YCbCr hardware codec planes):
-        // VkSamplerYcbcrConversionCreateInfo requires VkExternalFormatANDROID
-        // chained in pNext with the driver opaque externalFormat value.
-        // Spec: when format == VK_FORMAT_UNDEFINED, components/model/range/
-        // chroma offsets come from fmtProps; chroma filter must be NEAREST
-        // for conservative compatibility.
-        VkExternalFormatANDROID convExtFmt{};
-        convExtFmt.sType          = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
-        convExtFmt.pNext          = nullptr;
-        convExtFmt.externalFormat = fmtProps.externalFormat;
+        if (sharedExternal != nullptr) {
+            // Borrow the session-scoped shared conversion instead of creating
+            // a new one; destroy() must not destroy it (ycbcrConversionBorrowed).
+            ycbcrConversion = sharedExternal->conversion;
+            ycbcrConversionBorrowed = true;
+            // Per-frame success log elided: fires every rendered frame and
+            // dominated render-thread log volume.
+        } else {
+            // External-format (e.g., YUV/YCbCr hardware codec planes):
+            // VkSamplerYcbcrConversionCreateInfo requires VkExternalFormatANDROID
+            // chained in pNext with the driver opaque externalFormat value.
+            // Spec: when format == VK_FORMAT_UNDEFINED, components/model/range/
+            // chroma offsets come from fmtProps; chroma filter must be NEAREST
+            // for conservative compatibility.
+            VkExternalFormatANDROID convExtFmt{};
+            convExtFmt.sType          = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
+            convExtFmt.pNext          = nullptr;
+            convExtFmt.externalFormat = fmtProps.externalFormat;
 
-        VkSamplerYcbcrConversionCreateInfo ycbcrCI{};
-        ycbcrCI.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
-        ycbcrCI.pNext      = &convExtFmt;
-        ycbcrCI.format     = VK_FORMAT_UNDEFINED; // must match image format
-        ycbcrCI.ycbcrModel = fmtProps.suggestedYcbcrModel;
-        ycbcrCI.ycbcrRange = fmtProps.suggestedYcbcrRange;
-        ycbcrCI.components = fmtProps.samplerYcbcrConversionComponents;
-        ycbcrCI.xChromaOffset             = fmtProps.suggestedXChromaOffset;
-        ycbcrCI.yChromaOffset             = fmtProps.suggestedYChromaOffset;
-        ycbcrCI.chromaFilter              = VK_FILTER_NEAREST; // conservative
-        ycbcrCI.forceExplicitReconstruction = VK_FALSE;
+            VkSamplerYcbcrConversionCreateInfo ycbcrCI{};
+            ycbcrCI.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
+            ycbcrCI.pNext      = &convExtFmt;
+            ycbcrCI.format     = VK_FORMAT_UNDEFINED; // must match image format
+            ycbcrCI.ycbcrModel = fmtProps.suggestedYcbcrModel;
+            ycbcrCI.ycbcrRange = fmtProps.suggestedYcbcrRange;
+            ycbcrCI.components = fmtProps.samplerYcbcrConversionComponents;
+            ycbcrCI.xChromaOffset             = fmtProps.suggestedXChromaOffset;
+            ycbcrCI.yChromaOffset             = fmtProps.suggestedYChromaOffset;
+            ycbcrCI.chromaFilter              = VK_FILTER_NEAREST; // conservative
+            ycbcrCI.forceExplicitReconstruction = VK_FALSE;
 
-        vr = fnCreateYcbcr(device, &ycbcrCI, nullptr, &ycbcrConversion);
-        if (vr != VK_SUCCESS) {
-            VGLOG_AHB("vkCreateSamplerYcbcrConversion failed: %d",
-                      static_cast<int>(vr));
-            destroy(device, fnDestroyYcbcr);
-            return HardwareBufferImportResult::kVulkanFailure;
+            vr = fnCreateYcbcr(device, &ycbcrCI, nullptr, &ycbcrConversion);
+            if (vr != VK_SUCCESS) {
+                VGLOG_AHB("vkCreateSamplerYcbcrConversion failed: %d",
+                          static_cast<int>(vr));
+                destroy(device, fnDestroyYcbcr);
+                return HardwareBufferImportResult::kVulkanFailure;
+            }
         }
     }
 
@@ -234,53 +362,78 @@ HardwareBufferImportResult VulkanHardwareBufferImage::create(
         return HardwareBufferImportResult::kVulkanFailure;
     }
 
-    // --- Create VkSampler ---
+    // --- Create or borrow VkSampler ---
     // For external-format images: chain VkSamplerYcbcrConversionInfo.
     // Common settings: clamp-to-edge, normalized coordinates, no anisotropy,
     // no compare, nearest filtering, nearest mipmap (conservative).
+    if (isExternal && sharedExternal != nullptr) {
+        // Borrow the session-scoped shared sampler; destroy() must not
+        // destroy it (samplerBorrowed).
+        sampler = sharedExternal->sampler;
+        samplerBorrowed = true;
+        // Per-frame success log elided: fires every rendered frame and
+        // dominated render-thread log volume.
+    } else {
+        VkSamplerYcbcrConversionInfo samplerYcbcrInfo{};
+        samplerYcbcrInfo.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+        samplerYcbcrInfo.pNext      = nullptr;
+        samplerYcbcrInfo.conversion = ycbcrConversion; // VK_NULL_HANDLE if non-external
 
-    VkSamplerYcbcrConversionInfo samplerYcbcrInfo{};
-    samplerYcbcrInfo.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
-    samplerYcbcrInfo.pNext      = nullptr;
-    samplerYcbcrInfo.conversion = ycbcrConversion; // VK_NULL_HANDLE if non-external
+        VkSamplerCreateInfo samplerCI{};
+        samplerCI.sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerCI.pNext            = isExternal
+                                         ? static_cast<void*>(&samplerYcbcrInfo)
+                                         : nullptr;
+        samplerCI.magFilter        = VK_FILTER_NEAREST;
+        samplerCI.minFilter        = VK_FILTER_NEAREST;
+        samplerCI.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerCI.addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCI.addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCI.addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCI.mipLodBias       = 0.0f;
+        samplerCI.anisotropyEnable = VK_FALSE;
+        samplerCI.maxAnisotropy    = 1.0f;
+        samplerCI.compareEnable    = VK_FALSE;
+        samplerCI.compareOp        = VK_COMPARE_OP_ALWAYS;
+        samplerCI.minLod           = 0.0f;
+        samplerCI.maxLod           = 0.0f;
+        samplerCI.borderColor      = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        samplerCI.unnormalizedCoordinates = VK_FALSE;
 
-    VkSamplerCreateInfo samplerCI{};
-    samplerCI.sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    samplerCI.pNext            = isExternal
-                                     ? static_cast<void*>(&samplerYcbcrInfo)
-                                     : nullptr;
-    samplerCI.magFilter        = VK_FILTER_NEAREST;
-    samplerCI.minFilter        = VK_FILTER_NEAREST;
-    samplerCI.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerCI.addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerCI.addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerCI.addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerCI.mipLodBias       = 0.0f;
-    samplerCI.anisotropyEnable = VK_FALSE;
-    samplerCI.maxAnisotropy    = 1.0f;
-    samplerCI.compareEnable    = VK_FALSE;
-    samplerCI.compareOp        = VK_COMPARE_OP_ALWAYS;
-    samplerCI.minLod           = 0.0f;
-    samplerCI.maxLod           = 0.0f;
-    samplerCI.borderColor      = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    samplerCI.unnormalizedCoordinates = VK_FALSE;
-
-    vr = vkCreateSampler(device, &samplerCI, nullptr, &sampler);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkCreateSampler failed: %d", static_cast<int>(vr));
-        destroy(device, fnDestroyYcbcr);
-        return HardwareBufferImportResult::kVulkanFailure;
+        vr = vkCreateSampler(device, &samplerCI, nullptr, &sampler);
+        if (vr != VK_SUCCESS) {
+            VGLOG_AHB("vkCreateSampler failed: %d", static_cast<int>(vr));
+            destroy(device, fnDestroyYcbcr);
+            return HardwareBufferImportResult::kVulkanFailure;
+        }
     }
 
     // -------------------------------------------------------------------------
     // Phase 2H/2I: Create descriptor and pipeline-layout resources (layout /
     // pool / set / pipelineLayout) using immutable sampler and imageView.
+    // When sharedExternal is supplied for an external-format image, bind
+    // against its shared descriptorSetLayout/pipelineLayout instead of
+    // creating new per-import layout objects -- this is the change that
+    // eliminates per-frame pipeline-layout churn in VulkanFrameRenderer.
     // -------------------------------------------------------------------------
     {
-        HardwareBufferImportResult dr =
-            descriptorResources.create(device, sampler, imageView);
+        HardwareBufferImportResult dr;
+        if (isExternal && sharedExternal != nullptr) {
+            dr = descriptorResources.createWithSharedLayout(
+                device,
+                sharedExternal->descriptorSetLayout,
+                sharedExternal->pipelineLayout,
+                imageView);
+            if (dr != HardwareBufferImportResult::kSuccess) {
+                VGLOG_AHB("VulkanDescriptorResources::createWithSharedLayout failed");
+            }
+        } else {
+            dr = descriptorResources.create(device, sampler, imageView);
+            if (dr != HardwareBufferImportResult::kSuccess) {
+                VGLOG_AHB("VulkanDescriptorResources::create failed");
+            }
+        }
         if (dr != HardwareBufferImportResult::kSuccess) {
-            VGLOG_AHB("VulkanDescriptorResources::create failed");
             destroy(device, fnDestroyYcbcr);
             return HardwareBufferImportResult::kVulkanFailure;
         }
@@ -307,16 +460,24 @@ void VulkanHardwareBufferImage::destroy(
     // sampler/imageView, which the descriptor layout references via the
     // immutable sampler.
     descriptorResources.destroy(device);
+    // samplerBorrowed/ycbcrConversionBorrowed: when set, these handles were
+    // borrowed from a shared VulkanSharedExternalSampling cache entry (or
+    // another import still using it); only clear the member, never destroy
+    // the underlying Vulkan object here.
     if (sampler != VK_NULL_HANDLE) {
-        vkDestroySampler(device, sampler, nullptr);
+        if (!samplerBorrowed) {
+            vkDestroySampler(device, sampler, nullptr);
+        }
         sampler = VK_NULL_HANDLE;
     }
     if (imageView != VK_NULL_HANDLE) {
         vkDestroyImageView(device, imageView, nullptr);
         imageView = VK_NULL_HANDLE;
     }
-    if (ycbcrConversion != VK_NULL_HANDLE && fnDestroyYcbcr) {
-        fnDestroyYcbcr(device, ycbcrConversion, nullptr);
+    if (ycbcrConversion != VK_NULL_HANDLE) {
+        if (!ycbcrConversionBorrowed && fnDestroyYcbcr) {
+            fnDestroyYcbcr(device, ycbcrConversion, nullptr);
+        }
         ycbcrConversion = VK_NULL_HANDLE;
     }
     if (image != VK_NULL_HANDLE) {
@@ -331,6 +492,8 @@ void VulkanHardwareBufferImage::destroy(
     cachedExternalFormat = 0;
     cachedLayerCount     = 1; // Phase 2F
     currentLayout        = VK_IMAGE_LAYOUT_UNDEFINED; // Phase 2O2B4
+    ycbcrConversionBorrowed = false;
+    samplerBorrowed         = false;
 }
 
 // Phase 2F: Records one VkImageMemoryBarrier via vkCmdPipelineBarrier.

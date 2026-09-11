@@ -47,12 +47,31 @@
 #include <atomic>
 #include <utility>
 #include <vector>
+#include <deque>
 
 #define VGLOG_AHB(...) \
     __android_log_print(ANDROID_LOG_DEBUG, "VanguardAHBImport", __VA_ARGS__)
 
 namespace vanguard {
 namespace render {
+
+namespace {
+
+// Portable helper: encode a Vulkan non-dispatchable handle as uint64_t for
+// logging. Non-dispatchable handles are uint64_t on 32-bit Android and
+// pointer-sized opaque structs on 64-bit Android, so %p/void* casts do not
+// compile on 32-bit; this memcpy-based encoding is safe on both ABIs.
+template <typename VkHandle>
+static inline uint64_t vkHandleToU64(VkHandle h) {
+    static_assert(sizeof(VkHandle) <= sizeof(uint64_t),
+                  "VkHandle too large for uint64_t");
+    uint64_t v = 0;
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    memcpy(&v, &h, sizeof(VkHandle));
+    return v;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // AHardwareBuffer function pointer typedefs (loaded from libandroid.so).
@@ -101,6 +120,47 @@ struct RetiredRecord {
 };
 
 // ---------------------------------------------------------------------------
+// Shared external-format sampling/layout cache
+//
+// Key: the exact set of external-format conversion parameters that determine
+// the VkSamplerYcbcrConversionCreateInfo/VkSamplerCreateInfo used to build a
+// VulkanSharedExternalSampling entry. Two imports with an identical key are
+// guaranteed by the Vulkan/Android AHB contract to require an identical
+// conversion, so they can safely share one VkSamplerYcbcrConversion,
+// VkSampler, VkDescriptorSetLayout, and VkPipelineLayout.
+// ---------------------------------------------------------------------------
+
+struct SharedExternalSamplingKey {
+    VkFormat                      format         = VK_FORMAT_UNDEFINED;
+    uint64_t                      externalFormat = 0;
+    VkSamplerYcbcrModelConversion model          = VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+    VkSamplerYcbcrRange           range          = VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
+    VkComponentMapping            components{};
+    VkChromaLocation              xChromaOffset  = VK_CHROMA_LOCATION_COSITED_EVEN;
+    VkChromaLocation              yChromaOffset  = VK_CHROMA_LOCATION_COSITED_EVEN;
+    uint32_t                      layers         = 1;
+
+    bool operator==(const SharedExternalSamplingKey& o) const {
+        return format == o.format &&
+               externalFormat == o.externalFormat &&
+               model == o.model &&
+               range == o.range &&
+               components.r == o.components.r &&
+               components.g == o.components.g &&
+               components.b == o.components.b &&
+               components.a == o.components.a &&
+               xChromaOffset == o.xChromaOffset &&
+               yChromaOffset == o.yChromaOffset &&
+               layers == o.layers;
+    }
+};
+
+struct SharedExternalSamplingEntry {
+    SharedExternalSamplingKey    key;
+    VulkanSharedExternalSampling resources;
+};
+
+// ---------------------------------------------------------------------------
 // Impl
 // ---------------------------------------------------------------------------
 
@@ -134,6 +194,13 @@ struct VulkanHardwareBufferImports::Impl {
     // Phase 2P2: Retired records pending frame-fence confirmation before destroy.
     std::vector<RetiredRecord> retired;
 
+    // Session/import-table-scoped shared external-format sampling/layout
+    // cache. A std::deque is used (rather than std::vector) so that pointers
+    // returned by findOrCreateSharedExternalSampling() and handed to
+    // VulkanHardwareBufferImage::create() stay valid even if a later import
+    // in the same session appends another entry.
+    std::deque<SharedExternalSamplingEntry> sharedExternalSampling;
+
     bool initialized = false;
 
     // Destroy a single record.  Does NOT remove it from any container.
@@ -154,6 +221,86 @@ struct VulkanHardwareBufferImports::Impl {
             fnRelease(rec.ahbPtr);
             rec.ahbPtr = nullptr;
         }
+    }
+
+    // Returns the cached shared entry matching key, or creates and caches a
+    // new one on a cache miss. Returns nullptr only on Vulkan failure while
+    // creating a new entry; the caller falls back to the existing per-import
+    // owned conversion/sampler/layout path in that case instead of failing
+    // the whole import.
+    const VulkanSharedExternalSampling* findOrCreateSharedExternalSampling(
+        const SharedExternalSamplingKey& key,
+        const VkAndroidHardwareBufferFormatPropertiesANDROID& fmtProps) {
+        for (const auto& entry : sharedExternalSampling) {
+            if (entry.key == key) {
+                // Per-frame success log elided: cache HIT fires every rendered
+                // frame and dominated render-thread log volume.
+                return &entry.resources;
+            }
+        }
+
+        VGLOG_AHB("sharedExternalSampling: cache MISS externalFormat=%" PRIu64
+                  " layers=%u; creating", key.externalFormat, key.layers);
+
+        VulkanSharedExternalSampling created{};
+        HardwareBufferImportResult r = CreateExternalYcbcrConversionAndSampler(
+            device, fnCreateYcbcr, fnDestroyYcbcr, fmtProps,
+            &created.conversion, &created.sampler);
+        if (r != HardwareBufferImportResult::kSuccess) {
+            VGLOG_AHB("sharedExternalSampling: conversion/sampler creation failed "
+                      "externalFormat=%" PRIu64, key.externalFormat);
+            return nullptr;
+        }
+
+        r = CreateSharedDescriptorLayouts(
+            device, created.sampler, &created.descriptorSetLayout, &created.pipelineLayout);
+        if (r != HardwareBufferImportResult::kSuccess) {
+            VGLOG_AHB("sharedExternalSampling: descriptor/pipeline layout creation "
+                      "failed externalFormat=%" PRIu64, key.externalFormat);
+            if (created.sampler != VK_NULL_HANDLE) {
+                vkDestroySampler(device, created.sampler, nullptr);
+            }
+            if (created.conversion != VK_NULL_HANDLE && fnDestroyYcbcr) {
+                fnDestroyYcbcr(device, created.conversion, nullptr);
+            }
+            return nullptr;
+        }
+
+        VGLOG_AHB("sharedExternalSampling: created conversion=0x%" PRIx64
+                  " sampler=0x%" PRIx64
+                  " setLayout=0x%" PRIx64 " pipelineLayout=0x%" PRIx64
+                  " externalFormat=%" PRIu64 " layers=%u",
+                  vkHandleToU64(created.conversion), vkHandleToU64(created.sampler),
+                  vkHandleToU64(created.descriptorSetLayout),
+                  vkHandleToU64(created.pipelineLayout),
+                  key.externalFormat, key.layers);
+
+        sharedExternalSampling.push_back(SharedExternalSamplingEntry{key, created});
+        return &sharedExternalSampling.back().resources;
+    }
+
+    // Destroys every cached shared entry. Must be called only after all
+    // active and retired ImportRecords have already been destroyed (they may
+    // hold borrowed references to these Vulkan objects), and while device and
+    // fnDestroyYcbcr are still valid.
+    void destroySharedExternalSampling() {
+        for (auto& entry : sharedExternalSampling) {
+            if (entry.resources.pipelineLayout != VK_NULL_HANDLE) {
+                vkDestroyPipelineLayout(device, entry.resources.pipelineLayout, nullptr);
+            }
+            if (entry.resources.descriptorSetLayout != VK_NULL_HANDLE) {
+                vkDestroyDescriptorSetLayout(device, entry.resources.descriptorSetLayout, nullptr);
+            }
+            if (entry.resources.sampler != VK_NULL_HANDLE) {
+                vkDestroySampler(device, entry.resources.sampler, nullptr);
+            }
+            if (entry.resources.conversion != VK_NULL_HANDLE && fnDestroyYcbcr) {
+                fnDestroyYcbcr(device, entry.resources.conversion, nullptr);
+            }
+            VGLOG_AHB("sharedExternalSampling: destroyed externalFormat=%" PRIu64 " layers=%u",
+                      entry.key.externalFormat, entry.key.layers);
+        }
+        sharedExternalSampling.clear();
     }
 };
 
@@ -276,6 +423,11 @@ void VulkanHardwareBufferImports::shutdown() {
     }
     s.retired.clear();
 
+    // Shared external-format sampling/layout cache: destroyed only after all
+    // active and retired records (which may hold borrowed references into
+    // it) are gone, and while device/fnDestroyYcbcr are still valid.
+    s.destroySharedExternalSampling();
+
     if (s.libAndroid) {
         dlclose(s.libAndroid);
         s.libAndroid = nullptr;
@@ -366,6 +518,48 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
         return fail(HardwareBufferImportResult::kIncompatibleBuffer, ahbRef);
     }
 
+    // -------------------------------------------------------------------------
+    // Shared external-format sampling/layout cache lookup.
+    //
+    // Query format properties here (in addition to VulkanHardwareBufferImage's
+    // own internal query below) purely to determine whether this buffer is
+    // external-format and, if so, compute the shared-cache key. A cache hit
+    // means this import binds the SAME VkSamplerYcbcrConversion / VkSampler /
+    // VkDescriptorSetLayout / VkPipelineLayout objects as every other frame
+    // with identical conversion parameters, which is what eliminates the
+    // per-frame pipeline-layout churn that caused playback jitter. A query
+    // failure or non-external result simply leaves sharedExternal null and
+    // the import falls back to the existing owned per-import path.
+    // -------------------------------------------------------------------------
+    const VulkanSharedExternalSampling* sharedExternal = nullptr;
+    {
+        VkAndroidHardwareBufferFormatPropertiesANDROID keyFmtProps{};
+        keyFmtProps.sType =
+            VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+        keyFmtProps.pNext = nullptr;
+
+        VkAndroidHardwareBufferPropertiesANDROID keyAhbProps{};
+        keyAhbProps.sType =
+            VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+        keyAhbProps.pNext = &keyFmtProps;
+
+        if (s.fnGetAHBProps(s.device, ahbRef, &keyAhbProps) == VK_SUCCESS &&
+            keyFmtProps.format == VK_FORMAT_UNDEFINED &&
+            keyFmtProps.externalFormat != 0) {
+            SharedExternalSamplingKey key{};
+            key.format         = keyFmtProps.format;
+            key.externalFormat = keyFmtProps.externalFormat;
+            key.model          = keyFmtProps.suggestedYcbcrModel;
+            key.range          = keyFmtProps.suggestedYcbcrRange;
+            key.components     = keyFmtProps.samplerYcbcrConversionComponents;
+            key.xChromaOffset  = keyFmtProps.suggestedXChromaOffset;
+            key.yChromaOffset  = keyFmtProps.suggestedYChromaOffset;
+            key.layers         = desc.layers;
+
+            sharedExternal = s.findOrCreateSharedExternalSampling(key, keyFmtProps);
+        }
+    }
+
     // --- Create Vulkan image and sampling resources via modular component ---
     VulkanHardwareBufferImage vkImage;
     HardwareBufferImportResult imgResult = vkImage.create(
@@ -375,7 +569,8 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
         desc,
         s.fnGetAHBProps,
         s.fnCreateYcbcr,
-        s.fnDestroyYcbcr);
+        s.fnDestroyYcbcr,
+        sharedExternal);
 
     if (imgResult != HardwareBufferImportResult::kSuccess) {
         return fail(imgResult, ahbRef);
@@ -470,14 +665,8 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
     outDescriptor->stride = desc.stride;
     outDescriptor->usage  = desc.usage;
 
-    VGLOG_AHB("importBuffer: handle=%" PRIu64
-              " ahb=%p externalFmt=%s ycbcr=%s layers=%u acqSem=%s",
-              static_cast<uint64_t>(handle),
-              static_cast<void*>(ahbRef),
-              isExternal ? "yes" : "no",
-              hasYcbcr ? "yes" : "no",
-              desc.layers,
-              hasAcquireSem ? "yes" : "no");
+    // Per-frame success log elided: fires every rendered frame and dominated
+    // render-thread log volume.
 
     return HardwareBufferImportResult::kSuccess;
 }
@@ -544,8 +733,8 @@ HardwareBufferImportResult VulkanHardwareBufferImports::releaseBuffer(
         rr.record    = std::move(movedRec);
         rr.frameSlot = submittedSlot;
         s.retired.push_back(std::move(rr));
-        VGLOG_AHB("releaseBuffer: handle=%" PRIu64 " retired (frameSlot=%u, retiredCount=%zu)",
-                  static_cast<uint64_t>(handle), submittedSlot, s.retired.size());
+        // Per-frame success log elided: fires every rendered frame and
+        // dominated render-thread log volume.
     }
 
     return HardwareBufferImportResult::kSuccess;
@@ -673,8 +862,8 @@ void VulkanHardwareBufferImports::drainRetiredForFrame(uint32_t frameSlot) {
             ++i;
         }
     }
-    VGLOG_AHB("drainRetiredForFrame: slot=%u done (remaining=%zu)",
-               frameSlot, s.retired.size());
+    // Per-frame success log elided: fires every rendered frame and dominated
+    // render-thread log volume.
 }
 
 // ---------------------------------------------------------------------------
