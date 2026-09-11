@@ -147,6 +147,29 @@ public:
                                                  HardwareBufferHandle foregroundHandle,
                                                  VulkanOverlayTextureHandle maskHandle);
 
+    // ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame (PiP /
+    // split, and the green-screen terminal fallback to safe PiP). The
+    // background/source import [sourceHandle] is aspect-filled into
+    // [sourceRect] first, then the foreground/camera import [cameraHandle]
+    // is aspect-filled into [cameraRect] over it; both rects are canvas pixel
+    // rects (top-left origin, Y-down, width/height > 0). The buffer
+    // dimensions are each import's content size used for the aspect-fill
+    // crop (0 on either axis stretches that layer to its rect instead). Same
+    // swapchain acquire / submit / present lifecycle and post-submit import
+    // bookkeeping (both imports marked submitted, a release sync-fd stored on
+    // each) as renderDuetGreenScreenFrame. Not part of the shared
+    // RenderBackend interface (no `override`); host builds return
+    // kUnavailable. Invalid geometry fails closed with kVulkanFailure before
+    // the swapchain is touched.
+    RenderFrameResult renderDuetLayoutFrame(HardwareBufferHandle sourceHandle,
+                                            HardwareBufferHandle cameraHandle,
+                                            const RenderDestinationRect& sourceRect,
+                                            const RenderDestinationRect& cameraRect,
+                                            uint32_t sourceBufferWidth,
+                                            uint32_t sourceBufferHeight,
+                                            uint32_t cameraBufferWidth,
+                                            uint32_t cameraBufferHeight);
+
     // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
     // sub-slice N4: backend-owned Vulkan overlay texture store for static
     // sticker RGBA pixels (see the private VulkanOverlayTextureStore

@@ -15,6 +15,16 @@
 // PiP/split layouts and normal greenScreen (without this debug key) are
 // unaffected and keep using GLES.
 //
+// ANDROID-DUET-VULKAN-LAYOUT: after the bounded greenScreen window this
+// harness switches the layout mid-session to `pip` and then to
+// `splitTopBottom` via the typed `updateDuetLayout` call. Backend selection is
+// attach-time only (updateDuetLayout never re-selects or rebuilds the render
+// loop), so the attach-time Vulkan diagnostic backend stays in effect and the
+// switches exercise the Vulkan compositor's non-green-screen layout render
+// path (`ANDROID_DUET_VULKAN_LAYOUT_FRAME_FIRST`) whenever the actual backend
+// selected was vulkan. When the actual backend fell back to GLES the same
+// switches exercise the production GLES PiP/split path instead.
+//
 // Proof boundary:
 //   - Device requirement: Android physical device with camera permission available.
 //   - Harness command:
@@ -32,10 +42,13 @@
 //       * native `ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST` log may evidence temporal smoothing
 //       * native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload
 //       * native `ANDROID_DUET_VULKAN_MASK_UPLOAD_FIRST` / `ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST` logs may evidence a first successful Vulkan mask upload / composited frame, only when the actual backend selected is vulkan
+//       * mid-session `updateDuetLayout` to `pip` (safe rect) and then `splitTopBottom` is accepted by the platform while the attach-time backend selection (Vulkan diagnostic when the probe passed) stays in effect, each followed by a bounded active window
+//       * native `ANDROID_DUET_VULKAN_LAYOUT_FRAME_FIRST` log may evidence a first successful Vulkan non-green-screen (PiP / split) layout frame, only when the actual backend selected is vulkan
 //       * stop/detach/dispose/temp cleanup complete
 //   - Non-claims:
-//       * no production-default backend claim: this route is opt-in only via `debugPreviewBackend: "vulkan"`; the default selection (no debug key) remains GLES for all layout modes, including greenScreen
-//       * no PiP layout-switch claim: this harness does not switch layout to PiP mid-session, so it never exercises `updateDuetLayout` to `pip` (previous revisions of this harness did; removed so the diagnostic route stays active for the full recording window)
+//       * no production-default backend claim: this route is opt-in only via `debugPreviewBackend: "vulkan"`; the default selection (no debug key) remains GLES for all layout modes, including greenScreen, PiP and split
+//       * no Vulkan layout production claim: PiP/split attach without the debug key still selects GLES; the Vulkan layout path is only reachable mid-session after a Vulkan diagnostic greenScreen attach
+//       * no Vulkan layout pixel proof: PiP / splitTopBottom placement, aspect-fill crop and rendered pixels are not measured, only that the layout switch is accepted and the native layout render path may emit its first-frame log
 //       * no MediaPipe GPU delegate proof
 //       * no adaptive quality tier proof
 //       * no low-end/budget Android proof
@@ -290,9 +303,83 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 6: Pause recording
-      // (No PiP layout switch: the Vulkan diagnostic route stays active for
-      // the full recording window — see file header non-claims.)
+      // Step 6: Switch layout to PiP mid-session (safe PiP rect left 0.58,
+      // top 0.05, width 0.36, height 0.24). Backend selection is attach-time
+      // only, so the attach-time Vulkan diagnostic backend (when the probe
+      // passed) keeps rendering, now through its non-green-screen layout path.
+      await runStep<void>(
+        'UPDATE_LAYOUT_PIP_VULKAN',
+        'Switching layout to PiP mid-session (safe rect: left 0.58, top 0.05, width 0.36, height 0.24) on the attach-time Vulkan diagnostic backend',
+        () async {
+          final pipConfig = VGDuetLayoutConfig(
+            mode: VGDuetLayoutMode.pip,
+            pipAnchor: VGDuetPiPAnchor.topRight,
+            pipNormalizedRect: const VGDuetRect(
+              left: 0.58,
+              top: 0.05,
+              width: 0.36,
+              height: 0.24,
+            ),
+          );
+          await _withTimeout(
+            _platform.updateLayout(
+              sessionId: sessionId!,
+              layoutConfig: pipConfig,
+            ),
+            'updateLayout(pip)',
+          );
+          print('ANDROID_DUET_VULKAN_LAYOUT_SMOKE_SWITCHED mode=pip');
+          if (mounted) {
+            setState(() {
+              _layoutMode = 'pip (vulkan diagnostic)';
+            });
+          }
+        },
+      );
+
+      // Step 7: Bounded wait with PiP layout active
+      await runStep<void>(
+        'PIP_VULKAN_LAYOUT_ACTIVE',
+        'Observing PiP layout active on the Vulkan diagnostic route (1.5s)',
+        () async {
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+        },
+      );
+
+      // Step 8: Switch layout to splitTopBottom mid-session
+      await runStep<void>(
+        'UPDATE_LAYOUT_SPLIT_TOP_BOTTOM_VULKAN',
+        'Switching layout to splitTopBottom mid-session on the attach-time Vulkan diagnostic backend',
+        () async {
+          final splitConfig = VGDuetLayoutConfig(
+            mode: VGDuetLayoutMode.splitTopBottom,
+          );
+          await _withTimeout(
+            _platform.updateLayout(
+              sessionId: sessionId!,
+              layoutConfig: splitConfig,
+            ),
+            'updateLayout(splitTopBottom)',
+          );
+          print('ANDROID_DUET_VULKAN_LAYOUT_SMOKE_SWITCHED mode=splitTopBottom');
+          if (mounted) {
+            setState(() {
+              _layoutMode = 'splitTopBottom (vulkan diagnostic)';
+            });
+          }
+        },
+      );
+
+      // Step 9: Bounded wait with splitTopBottom layout active
+      await runStep<void>(
+        'SPLIT_TOP_BOTTOM_VULKAN_LAYOUT_ACTIVE',
+        'Observing splitTopBottom layout active on the Vulkan diagnostic route (1.5s)',
+        () async {
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+        },
+      );
+
+      // Step 10: Pause recording
       await runStep<void>('PAUSE_RECORDING', 'Pausing recording', () async {
         await _withTimeout(
           _platform.pauseRecording(sessionId: sessionId!),
@@ -300,7 +387,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         );
       });
 
-      // Step 7: Stop recording
+      // Step 11: Stop recording
       captureResult = await runStep<VGDuetCaptureResult>(
         'STOP_RECORDING',
         'Stopping recording and retrieving capture result',
@@ -312,7 +399,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 8: Detach preview texture
+      // Step 12: Detach preview texture
       await runStep<
         void
       >('DETACH_PREVIEW', 'Detaching preview texture', () async {
@@ -339,7 +426,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         isDetached = true;
       });
 
-      // Step 9: Dispose session
+      // Step 13: Dispose session
       await runStep<void>(
         'DISPOSE_SESSION',
         'Disposing native Duet session',
@@ -352,7 +439,7 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 10: Cleanup temp fixture directory
+      // Step 14: Cleanup temp fixture directory
       await runStep<void>(
         'CLEANUP_TEMP_FIXTURE',
         'Deleting staged fixture temp directory',
@@ -427,11 +514,14 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
           'native `ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST` log may evidence temporal smoothing',
           'native `ANDROID_DUET_GREENSCREEN_MASK_UPLOAD_FIRST ... format=uint8_alpha backend=mediapipe_cpu` log may evidence GLES upload',
           'native `ANDROID_DUET_VULKAN_MASK_UPLOAD_FIRST` / `ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST` logs may evidence a first successful Vulkan mask upload / composited frame, only when the actual backend selected is vulkan',
+          'mid-session `updateDuetLayout` to `pip` (safe rect) and then `splitTopBottom` is accepted by the platform while the attach-time backend selection (Vulkan diagnostic when the probe passed) stays in effect, each followed by a bounded active window',
+          'native `ANDROID_DUET_VULKAN_LAYOUT_FRAME_FIRST` log may evidence a first successful Vulkan non-green-screen (PiP / split) layout frame, only when the actual backend selected is vulkan',
           'stop/detach/dispose/temp cleanup complete',
         ],
         'nonClaims': <String>[
-          'no production-default backend claim: this route is opt-in only via `debugPreviewBackend: "vulkan"`; the default selection (no debug key) remains GLES for all layout modes, including greenScreen',
-          'no PiP layout-switch claim: this harness does not switch layout to PiP mid-session',
+          'no production-default backend claim: this route is opt-in only via `debugPreviewBackend: "vulkan"`; the default selection (no debug key) remains GLES for all layout modes, including greenScreen, PiP and split',
+          'no Vulkan layout production claim: PiP/split attach without the debug key still selects GLES; the Vulkan layout path is only reachable mid-session after a Vulkan diagnostic greenScreen attach',
+          'no Vulkan layout pixel proof: PiP / splitTopBottom placement, aspect-fill crop and rendered pixels are not measured, only that the layout switch is accepted and the native layout render path may emit its first-frame log',
           'no MediaPipe GPU delegate proof',
           'no adaptive quality tier proof',
           'no low-end/budget Android proof',
@@ -443,6 +533,18 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         'sessionId': sessionId,
         'textureId': textureId,
         'creatorOverlayCameraRect': ?creatorOverlayCameraRect,
+        'vulkanLayoutRoute': <String, Object?>{
+          'layoutSwitchSequence': <String>['greenScreen', 'pip', 'splitTopBottom'],
+          'pipSwitchStep': stepResults['UPDATE_LAYOUT_PIP_VULKAN'],
+          'pipActiveStep': stepResults['PIP_VULKAN_LAYOUT_ACTIVE'],
+          'splitTopBottomSwitchStep':
+              stepResults['UPDATE_LAYOUT_SPLIT_TOP_BOTTOM_VULKAN'],
+          'splitTopBottomActiveStep':
+              stepResults['SPLIT_TOP_BOTTOM_VULKAN_LAYOUT_ACTIVE'],
+          'backendSelectionAttachTimeOnly': true,
+          'pixelProof': false,
+          'productionGatingUnchanged': true,
+        },
         'stepResults': stepResults,
         'failures': failures,
         if (captureResult != null)

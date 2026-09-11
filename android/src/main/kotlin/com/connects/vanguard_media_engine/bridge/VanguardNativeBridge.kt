@@ -1200,9 +1200,19 @@ class VanguardNativeBridge(
             height: Int,
         ): Boolean
 
-        // Composites decoderHardwareBuffer (background) and
-        // cameraHardwareBuffer (foreground) through the session's current
-        // mask texture and presents the result to the attached surface.
+        // Presents one Duet frame from decoderHardwareBuffer (background /
+        // source) and cameraHardwareBuffer (foreground / camera) onto the
+        // attached surface:
+        //   * greenScreenEnabled == true: composites them through the
+        //     session's current mask texture (full-canvas; the rects are
+        //     ignored),
+        //   * greenScreenEnabled == false (ANDROID-DUET-VULKAN-LAYOUT: PiP /
+        //     split / green-screen terminal fallback): draws the decoder
+        //     aspect-filled into the source rect, then the camera
+        //     aspect-filled into the camera rect over it (opaque).
+        // Rects are canvas pixel rects (top-left origin, Y-down) already
+        // rounded and clamped to the attached canvas by the caller; a
+        // non-positive layout rect size returns false without rendering.
         // Returns false (with the session left intact for retry) when no
         // surface is attached, either buffer fails to import, or the render
         // itself fails; never retains either HardwareBuffer beyond the call.
@@ -1210,6 +1220,15 @@ class VanguardNativeBridge(
             handle: Long,
             decoderHardwareBuffer: HardwareBuffer,
             cameraHardwareBuffer: HardwareBuffer,
+            greenScreenEnabled: Boolean,
+            sourceX: Int,
+            sourceY: Int,
+            sourceWidth: Int,
+            sourceHeight: Int,
+            cameraX: Int,
+            cameraY: Int,
+            cameraWidth: Int,
+            cameraHeight: Int,
         ): Boolean
 
     }

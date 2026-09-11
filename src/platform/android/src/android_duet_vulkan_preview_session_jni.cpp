@@ -64,9 +64,23 @@ namespace {
         return ok ? JNI_TRUE : JNI_FALSE;
     }
 
+    // ANDROID-DUET-VULKAN-LAYOUT: greenScreenEnabled selects the session's
+    // mask-composite path (rects ignored) or the opaque two-layer layout path
+    // (decoder aspect-filled into the source rect, camera into the camera
+    // rect). Rects are canvas pixel rects already rounded / clamped by the
+    // Kotlin compositor; a non-positive layout rect size fails closed here
+    // without touching the session.
     jboolean RenderFrameImpl(
-        JNIEnv* env, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer) {
+        JNIEnv* env, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer,
+        jboolean greenScreenEnabled,
+        jint sourceX, jint sourceY, jint sourceWidth, jint sourceHeight,
+        jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight) {
         if (!decoderHardwareBuffer || !cameraHardwareBuffer) {
+            return JNI_FALSE;
+        }
+        const bool layoutMode = greenScreenEnabled == JNI_FALSE;
+        if (layoutMode &&
+            (sourceWidth <= 0 || sourceHeight <= 0 || cameraWidth <= 0 || cameraHeight <= 0)) {
             return JNI_FALSE;
         }
 
@@ -84,8 +98,20 @@ namespace {
             return JNI_FALSE;
         }
 
+        vanguard::android::AndroidDuetVulkanPreviewLayoutRect sourceRect;
+        sourceRect.x = static_cast<int32_t>(sourceX);
+        sourceRect.y = static_cast<int32_t>(sourceY);
+        sourceRect.width = static_cast<int32_t>(sourceWidth);
+        sourceRect.height = static_cast<int32_t>(sourceHeight);
+        vanguard::android::AndroidDuetVulkanPreviewLayoutRect cameraRect;
+        cameraRect.x = static_cast<int32_t>(cameraX);
+        cameraRect.y = static_cast<int32_t>(cameraY);
+        cameraRect.width = static_cast<int32_t>(cameraWidth);
+        cameraRect.height = static_cast<int32_t>(cameraHeight);
+
         const bool ok = session->RenderFrame(
-            static_cast<void*>(decoderBuffer), static_cast<void*>(cameraBuffer));
+            static_cast<void*>(decoderBuffer), static_cast<void*>(cameraBuffer),
+            !layoutMode, sourceRect, cameraRect);
         return ok ? JNI_TRUE : JNI_FALSE;
     }
 
@@ -179,8 +205,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_renderAndroidDuetVulkanPreviewFrame(
-    JNIEnv* env, jobject /*companion*/, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer) {
-    return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer);
+    JNIEnv* env, jobject /*companion*/, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer,
+    jboolean greenScreenEnabled,
+    jint sourceX, jint sourceY, jint sourceWidth, jint sourceHeight,
+    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight) {
+    return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer,
+                           greenScreenEnabled,
+                           sourceX, sourceY, sourceWidth, sourceHeight,
+                           cameraX, cameraY, cameraWidth, cameraHeight);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +250,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_updateAndr
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDuetVulkanPreviewFrame(
-    JNIEnv* env, jclass /*clazz*/, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer) {
-    return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer);
+    JNIEnv* env, jclass /*clazz*/, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer,
+    jboolean greenScreenEnabled,
+    jint sourceX, jint sourceY, jint sourceWidth, jint sourceHeight,
+    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight) {
+    return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer,
+                           greenScreenEnabled,
+                           sourceX, sourceY, sourceWidth, sourceHeight,
+                           cameraX, cameraY, cameraWidth, cameraHeight);
 }

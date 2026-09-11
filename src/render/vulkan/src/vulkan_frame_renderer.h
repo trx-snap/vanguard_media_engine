@@ -228,6 +228,42 @@ public:
         HardwareBufferHandle foregroundHandle,
         const VulkanGreenScreenMaskInfo& maskInfo);
 
+    // ANDROID-DUET-VULKAN-LAYOUT: one opaque Duet layout layer. [rect] is the
+    // canvas pixel rect (top-left origin, Y-down, width/height > 0) the
+    // layer aspect-fills; [bufferWidth]/[bufferHeight] are the imported
+    // buffer's content dimensions used for the aspect-fill crop (0 on either
+    // axis stretches the layer to the rect instead).
+    struct DuetLayoutLayer {
+        HardwareBufferHandle handle = kInvalidHardwareBufferHandle;
+        RenderDestinationRect rect;
+        uint32_t bufferWidth = 0;
+        uint32_t bufferHeight = 0;
+    };
+
+    // ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame (PiP /
+    // split, and the green-screen terminal fallback to safe PiP): [source]
+    // (decoder) is drawn first, then [camera] over it, each aspect-filled
+    // into its own rect through its import's own descriptor resources and
+    // the core passthrough shaders -- the same per-import-layout pipelines
+    // the solo / transition paths use, so external-format YCbCr imports
+    // sample correctly. Same acquire / frame fence / imageAvailable +
+    // presentReady semaphore / pending AHB acquire semaphore wait /
+    // release-fence export / present protocol as renderDuetGreenScreenFrame,
+    // including marking both imports submitted and storing a release sync-fd
+    // on each. The two per-layer pipelines are cached against (pipeline
+    // layout, render pass) and rebuilt after a device idle wait only when
+    // either changes. Invalid geometry (see
+    // ResolveVulkanDuetLayoutLayerPlacement) fails closed with
+    // kVulkanFailure before the swapchain is touched; any later failure
+    // fails closed with no partial present.
+    RenderFrameResult renderDuetLayoutFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        const DuetLayoutLayer& source,
+        const DuetLayoutLayer& camera);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

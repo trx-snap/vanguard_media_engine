@@ -9,6 +9,17 @@ struct ANativeWindow;
 namespace vanguard {
 namespace android {
 
+// ANDROID-DUET-VULKAN-LAYOUT: canvas pixel rect (top-left origin, Y-down) of
+// one Duet layout layer, as already rounded / clamped by the Kotlin
+// compositor. Kept as a plain struct so this header stays free of render
+// headers; RenderFrame converts it to the backend's RenderDestinationRect.
+struct AndroidDuetVulkanPreviewLayoutRect {
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+};
+
 class AndroidDuetVulkanPreviewSession {
 public:
     AndroidDuetVulkanPreviewSession();
@@ -35,14 +46,25 @@ public:
     bool UpdateMask(const uint8_t* r8, size_t r8ByteCount, uint32_t width, uint32_t height);
 
     // Imports decoderBuffer/cameraBuffer (each a non-null AHardwareBuffer*
-    // cast to void*) as the background/foreground layers respectively,
-    // composites them with the session's current mask via
-    // VulkanBackend::renderDuetGreenScreenFrame onto the attached surface,
-    // then releases both imports (draining and closing any release fence)
-    // before returning, on every path. Returns false without importing
-    // anything when no surface is attached. Never retains either pointer
-    // beyond this call.
-    bool RenderFrame(void* decoderBuffer, void* cameraBuffer);
+    // cast to void*) as the background/foreground layers respectively and
+    // presents one frame onto the attached surface:
+    //   * greenScreenEnabled == true: composites them with the session's
+    //     current mask via VulkanBackend::renderDuetGreenScreenFrame
+    //     (full-canvas; sourceRect/cameraRect are ignored),
+    //   * greenScreenEnabled == false (PiP / split / green-screen terminal
+    //     fallback): draws the decoder aspect-filled into sourceRect, then
+    //     the camera aspect-filled into cameraRect over it, via
+    //     VulkanBackend::renderDuetLayoutFrame using each import's own
+    //     buffer dimensions for the crop.
+    // Both imports are released (draining and closing any release fence)
+    // before returning, on every path after import. Returns false without
+    // importing anything when no surface is attached. Never retains either
+    // pointer beyond this call.
+    bool RenderFrame(void* decoderBuffer,
+                     void* cameraBuffer,
+                     bool greenScreenEnabled,
+                     const AndroidDuetVulkanPreviewLayoutRect& sourceRect,
+                     const AndroidDuetVulkanPreviewLayoutRect& cameraRect);
 
 private:
     struct Impl;

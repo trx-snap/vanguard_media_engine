@@ -167,6 +167,11 @@ add_library(vanguard_render_vulkan STATIC
     # preview/export.
     "render/vulkan/src/vulkan_greenscreen_compositor.cpp"
     "render/vulkan/src/vulkan_greenscreen_frame_renderer.cpp"
+    # ANDROID-DUET-VULKAN-LAYOUT: private layout-mode (PiP / split) helpers for
+    # VulkanFrameRenderer::renderDuetLayoutFrame (per-layer viewport /
+    # scissor / aspect-fill UV placement math on every platform; draw-list
+    # construction over the existing transition pass recorder, Android only).
+    "render/vulkan/src/vulkan_duet_layout_frame_renderer.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp

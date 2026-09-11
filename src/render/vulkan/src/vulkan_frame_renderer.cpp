@@ -21,6 +21,7 @@
 #include "vulkan_hardware_buffer_imports.h"
 #include "vulkan_overlay_frame_renderer.h"
 #include "vulkan_greenscreen_frame_renderer.h"
+#include "vulkan_duet_layout_frame_renderer.h"
 #include "vulkan_shader_module.h"
 #include "vulkan_transition_frame_renderer.h"
 #include "vanguard/render/render_transform.h"
@@ -322,6 +323,39 @@ struct VulkanFrameRenderer::Impl {
     std::unique_ptr<VulkanOverlayFrameRenderer> overlayRenderer;
     std::unique_ptr<VulkanGreenScreenFrameRenderer> greenScreenRenderer;
 
+    // ANDROID-DUET-VULKAN-LAYOUT: the two per-layer opaque pipelines of the
+    // Duet layout frame, cached against the (per-import pipeline layout,
+    // render pass) pair each was built for. Unlike the transition pipelines
+    // above they are NOT rebuilt per frame: the AHB import table shares one
+    // pipeline layout per external-format conversion configuration, so the
+    // decoder and camera layouts are stable across frames and a rebuild only
+    // happens on the first layout frame, after a swapchain re-attach, or if
+    // a producer's format changes. Destroyed (after the caller's device idle
+    // wait) by invalidateDuetLayoutPipelines() / invalidatePipeline().
+    std::unique_ptr<VulkanGraphicsPipeline> duetLayoutSourcePipeline;
+    std::unique_ptr<VulkanGraphicsPipeline> duetLayoutCameraPipeline;
+    VkPipelineLayout duetLayoutSourceLayout = VK_NULL_HANDLE;
+    VkPipelineLayout duetLayoutCameraLayout = VK_NULL_HANDLE;
+    uint64_t duetLayoutRenderPassHandle = 0;
+
+    bool hasDuetLayoutPipelines() const {
+        return duetLayoutSourcePipeline != nullptr || duetLayoutCameraPipeline != nullptr;
+    }
+
+    void invalidateDuetLayoutPipelines() {
+        if (duetLayoutSourcePipeline) {
+            duetLayoutSourcePipeline->destroy(device);
+            duetLayoutSourcePipeline.reset();
+        }
+        if (duetLayoutCameraPipeline) {
+            duetLayoutCameraPipeline->destroy(device);
+            duetLayoutCameraPipeline.reset();
+        }
+        duetLayoutSourceLayout = VK_NULL_HANDLE;
+        duetLayoutCameraLayout = VK_NULL_HANDLE;
+        duetLayoutRenderPassHandle = 0;
+    }
+
     // Torn down only on shutdown()/failClosed() (never from the routine
     // invalidatePipeline() hot path) so beauty's cached geometry/pipelines
     // survive ordinary per-frame pipeline-layout churn.
@@ -390,6 +424,7 @@ struct VulkanFrameRenderer::Impl {
         activePipelineLayout = VK_NULL_HANDLE;
         activeRenderPassHandle = 0;
         invalidateTransitionPipelines();
+        invalidateDuetLayoutPipelines();
         // The overlay helper's cached pipeline is built against the same
         // render pass as graphicsPipeline above, so it must be invalidated
         // here too rather than left dangling until shutdown().
@@ -615,11 +650,12 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const bool pipelineMismatch =
         !hasActivePipeline || pipelineCompatibilityMismatch;
     if (pipelineMismatch) {
-        // A previous transition or green-screen pipeline may still be in flight on
-        // the other frame slot; they are destroyed by invalidatePipeline()
-        // below, so the device must be idle first in that case too.
+        // A previous transition, green-screen or Duet layout pipeline may
+        // still be in flight on the other frame slot; they are destroyed by
+        // invalidatePipeline() below, so the device must be idle first in
+        // that case too.
         if ((pipelineCompatibilityMismatch || s.hasTransitionPipelines() ||
-             s.greenScreenRenderer != nullptr) &&
+             s.hasDuetLayoutPipelines() || s.greenScreenRenderer != nullptr) &&
             vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
             return RenderFrameResult::kVulkanFailure;
         }
@@ -974,11 +1010,12 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const bool pipelineMismatch =
         !hasActivePipeline || pipelineCompatibilityMismatch;
     if (pipelineMismatch) {
-        // A previous transition or green-screen pipeline may still be in flight on
-        // the other frame slot; they are destroyed by invalidatePipeline()
-        // below, so the device must be idle first in that case too.
+        // A previous transition, green-screen or Duet layout pipeline may
+        // still be in flight on the other frame slot; they are destroyed by
+        // invalidatePipeline() below, so the device must be idle first in
+        // that case too.
         if ((pipelineCompatibilityMismatch || s.hasTransitionPipelines() ||
-             s.greenScreenRenderer != nullptr) &&
+             s.hasDuetLayoutPipelines() || s.greenScreenRenderer != nullptr) &&
             vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
             return RenderFrameResult::kVulkanFailure;
         }
@@ -3148,6 +3185,337 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     if (!backgroundReleaseStored || !foregroundReleaseStored) {
         ahbImports.setLatestReleaseFenceFd(backgroundHandle, -1);
         ahbImports.setLatestReleaseFenceFd(foregroundHandle, -1);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle, presentReadySemaphoreHandle, imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+}
+
+// ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame. Mirrors
+// renderDuetGreenScreenFrame above's entire acquire / frame-fence /
+// imageAvailable + presentReady semaphore / pending AHB acquire semaphore
+// wait / release-fence export (one export, dup'd to the second import) /
+// present protocol and its post-submit bookkeeping for both imports, but
+// records the frame through VulkanGraphicsCommandRecorder::recordTransitionPass
+// (optional source layout transitions, one clear render pass, the source
+// draw then the camera draw) with each layer's viewport / scissor / UV crop
+// resolved by the private vulkan_duet_layout_frame_renderer helper, using
+// each import's own descriptor resources and the core passthrough shaders
+// exactly like a solo / transition frame.
+RenderFrameResult VulkanFrameRenderer::renderDuetLayoutFrame(
+    void* queueHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& coreShaders,
+    const DuetLayoutLayer& source,
+    const DuetLayoutLayer& camera) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
+        s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (source.handle == camera.handle) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    const VulkanHardwareBufferImage* sourceImage = ahbImports.getImage(source.handle);
+    const VulkanHardwareBufferImage* cameraImage = ahbImports.getImage(camera.handle);
+    if (!ahbImports.hasBuffer(source.handle) || sourceImage == nullptr ||
+        !ahbImports.hasBuffer(camera.handle) || cameraImage == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (sourceImage->image == VK_NULL_HANDLE || cameraImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame = s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    const VkPipelineLayout sourceLayout = sourceImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet sourceSet = sourceImage->descriptorResources.descriptorSet;
+    const VkPipelineLayout cameraLayout = cameraImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet cameraSet = cameraImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        sourceLayout == VK_NULL_HANDLE || sourceSet == VK_NULL_HANDLE ||
+        cameraLayout == VK_NULL_HANDLE || cameraSet == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass = u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    // Geometry is pure math; resolve (and fail closed) before any Vulkan
+    // state is touched so an invalid rect never reaches the swapchain.
+    VulkanDuetLayoutLayerGeometry sourceGeometry;
+    sourceGeometry.rect = source.rect;
+    sourceGeometry.bufferWidth = source.bufferWidth;
+    sourceGeometry.bufferHeight = source.bufferHeight;
+    VulkanDuetLayoutLayerGeometry cameraGeometry;
+    cameraGeometry.rect = camera.rect;
+    cameraGeometry.bufferWidth = camera.bufferWidth;
+    cameraGeometry.bufferHeight = camera.bufferHeight;
+    VulkanDuetLayoutLayerPlacement sourcePlacement;
+    VulkanDuetLayoutLayerPlacement cameraPlacement;
+    if (!ResolveVulkanDuetLayoutLayerPlacement(sourceGeometry, extentWidth, extentHeight,
+                                               &sourcePlacement) ||
+        !ResolveVulkanDuetLayoutLayerPlacement(cameraGeometry, extentWidth, extentHeight,
+                                               &cameraPlacement)) {
+        VGLOG_VFR("renderDuetLayoutFrame: invalid layer rect (source %d,%d %dx%d camera "
+                  "%d,%d %dx%d extent %ux%u); failing closed",
+                  source.rect.x, source.rect.y, source.rect.width, source.rect.height,
+                  camera.rect.x, camera.rect.y, camera.rect.width, camera.rect.height,
+                  extentWidth, extentHeight);
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Pipelines are per import pipeline layout (the external-format YCbCr
+    // sampler is an immutable sampler baked into the import's descriptor set
+    // layout) and per render pass; both are cached and rebuilt only when
+    // either changes. The previous pair may still be in flight on the other
+    // frame slot, so idle the device before destroying it. Only this path's
+    // own pair is invalidated: the green-screen helper's cached pipeline is
+    // left intact so a green-screen <-> layout toggle never churns it.
+    const bool duetPipelinesValid =
+        s.duetLayoutSourcePipeline && s.duetLayoutSourcePipeline->isValid() &&
+        s.duetLayoutCameraPipeline && s.duetLayoutCameraPipeline->isValid();
+    const bool duetPipelinesMismatch =
+        !duetPipelinesValid ||
+        s.duetLayoutSourceLayout != sourceLayout ||
+        s.duetLayoutCameraLayout != cameraLayout ||
+        s.duetLayoutRenderPassHandle != renderPassHandle;
+    if (duetPipelinesMismatch) {
+        if (vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.invalidateDuetLayoutPipelines();
+        s.duetLayoutSourcePipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.duetLayoutSourcePipeline->create(s.device, sourceLayout, renderPass,
+                                                coreShaders.vertex.get(),
+                                                coreShaders.fragment.get())) {
+            s.invalidateDuetLayoutPipelines();
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.duetLayoutCameraPipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.duetLayoutCameraPipeline->create(s.device, cameraLayout, renderPass,
+                                                coreShaders.vertex.get(),
+                                                coreShaders.fragment.get())) {
+            s.invalidateDuetLayoutPipelines();
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.duetLayoutSourceLayout = sourceLayout;
+        s.duetLayoutCameraLayout = cameraLayout;
+        s.duetLayoutRenderPassHandle = renderPassHandle;
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore), 0, &imageIndex, UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle = swapchain.getFramebufferHandle(imageIndex);
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (framebufferHandle == 0 || presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer = u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VulkanTransitionPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    passParams.fromImage = sourceImage;
+    passParams.fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionFromImage =
+        ahbImports.getImageLayout(source.handle) ==
+        static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED);
+    passParams.toImage = cameraImage;
+    passParams.toOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionToImage =
+        ahbImports.getImageLayout(camera.handle) ==
+        static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED);
+
+    VulkanTransitionLayerResources sourceRes;
+    sourceRes.pipeline = s.duetLayoutSourcePipeline->get();
+    sourceRes.pipelineLayout = sourceLayout;
+    sourceRes.descriptorSet = sourceSet;
+    VulkanTransitionLayerResources cameraRes;
+    cameraRes.pipeline = s.duetLayoutCameraPipeline->get();
+    cameraRes.pipelineLayout = cameraLayout;
+    cameraRes.descriptorSet = cameraSet;
+    if (!AppendVulkanDuetLayoutLayer(&passParams, sourceRes, sourcePlacement) ||
+        !AppendVulkanDuetLayoutLayer(&passParams, cameraRes, cameraPlacement)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    // recordTransitionPass validates every handle / extent / scissor before
+    // recording anything (nothing is recorded on a validation failure) and
+    // begins / ends the command buffer itself.
+    if (!VulkanGraphicsCommandRecorder::recordTransitionPass(passParams)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VkSemaphore waitSemaphores[3] = {
+        frame->imageAvailableSemaphore, VK_NULL_HANDLE, VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[3] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t sourcePendingAcquire =
+        ahbImports.getPendingAcquireSemaphoreHandle(source.handle);
+    const uint64_t cameraPendingAcquire =
+        ahbImports.getPendingAcquireSemaphoreHandle(camera.handle);
+    if (sourcePendingAcquire != 0) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(sourcePendingAcquire);
+    }
+    if (cameraPendingAcquire != 0 && cameraPendingAcquire != sourcePendingAcquire) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(cameraPendingAcquire);
+    }
+
+    const bool canExportRelease =
+        frame->releaseFenceSemaphore != VK_NULL_HANDLE && s.pfnGetSemaphoreFd != nullptr;
+    VkSemaphore signalSemaphores[2] = {presentReadySemaphore, VK_NULL_HANDLE};
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+    const VkResult submitResult = vkQueueSubmit(
+        static_cast<VkQueue>(queueHandle), 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports,
+            submitResult == VK_ERROR_DEVICE_LOST
+                ? RenderFrameResult::kDeviceLost : RenderFrameResult::kVulkanFailure);
+    }
+
+    // Both imports now belong to this submission, even if later bookkeeping fails.
+    const bool sourceAcquireMarked = sourcePendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(source.handle);
+    const bool cameraAcquireMarked = cameraPendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(camera.handle);
+    const bool sourceSubmitted = ahbImports.markBufferSubmitted(source.handle, s.currentFrameIndex);
+    const bool cameraSubmitted = ahbImports.markBufferSubmitted(camera.handle, s.currentFrameIndex);
+    const bool sourceLayoutSet = ahbImports.setImageLayout(
+        source.handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    const bool cameraLayoutSet = ahbImports.setImageLayout(
+        camera.handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    if (!sourceAcquireMarked || !cameraAcquireMarked ||
+        !sourceSubmitted || !cameraSubmitted ||
+        !sourceLayoutSet || !cameraLayoutSet) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    int sourceReleaseFd = -1;
+    int cameraReleaseFd = -1;
+    if (canExportRelease) {
+        VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+        semGetFdInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+        semGetFdInfo.semaphore = frame->releaseFenceSemaphore;
+        semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        const VkResult exportResult =
+            s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &sourceReleaseFd);
+        if (exportResult != VK_SUCCESS) {
+            VGLOG_VFR("duet layout vkGetSemaphoreFdKHR failed: %d", static_cast<int>(exportResult));
+            if (sourceReleaseFd >= 0) ::close(sourceReleaseFd);
+            ahbImports.setLatestReleaseFenceFd(source.handle, -1);
+            ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+        // Export consumes the semaphore payload: share that single sync-fd with both inputs.
+        if (sourceReleaseFd >= 0) {
+            cameraReleaseFd = ::dup(sourceReleaseFd);
+            if (cameraReleaseFd < 0) {
+                VGLOG_VFR("duet layout release sync-fd dup failed; failing closed");
+                ::close(sourceReleaseFd);
+                ahbImports.setLatestReleaseFenceFd(source.handle, -1);
+                ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+    }
+    // Each setter consumes its fd even on failure; attempt both without short-circuiting.
+    // With no export support (or an empty sync-fd), -1 clears both stale stored fds.
+    const bool sourceReleaseStored =
+        ahbImports.setLatestReleaseFenceFd(source.handle, sourceReleaseFd);
+    const bool cameraReleaseStored =
+        ahbImports.setLatestReleaseFenceFd(camera.handle, cameraReleaseFd);
+    if (!sourceReleaseStored || !cameraReleaseStored) {
+        ahbImports.setLatestReleaseFenceFd(source.handle, -1);
+        ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 

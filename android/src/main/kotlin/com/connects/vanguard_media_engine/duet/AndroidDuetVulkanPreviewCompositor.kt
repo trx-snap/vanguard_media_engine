@@ -11,6 +11,9 @@ import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     companion object {
@@ -19,7 +22,47 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         private const val CAMERA_DEFAULT_HEIGHT = 1920
         private const val DECODER_DEFAULT_WIDTH = 1080
         private const val DECODER_DEFAULT_HEIGHT = 1920
+
+        /**
+         * ANDROID-DUET-VULKAN-LAYOUT: converts a canvas-pixel [rect] (Double,
+         * top-left origin) into the integer rect handed to native. Fails
+         * closed (null) when any component is non-finite or the size is not
+         * strictly positive; otherwise rounds every edge to the nearest
+         * pixel, clamps the result to the [canvasWidth] x [canvasHeight]
+         * canvas from attach, and fails closed again if nothing of the rect
+         * remains on-canvas after clamping.
+         */
+        internal fun toNativeLayoutRect(
+            rect: VGDuetPixelRect,
+            canvasWidth: Int,
+            canvasHeight: Int,
+        ): NativeLayoutRect? {
+            if (canvasWidth <= 0 || canvasHeight <= 0) return null
+            if (!rect.left.isFinite() || !rect.top.isFinite() ||
+                !rect.width.isFinite() || !rect.height.isFinite()
+            ) {
+                return null
+            }
+            if (rect.width <= 0.0 || rect.height <= 0.0) return null
+            // Round the edges (not the size) so adjacent split halves stay
+            // seamless and rounding never produces a one-pixel overlap/gap.
+            val left = rect.left.roundToInt()
+            val top = rect.top.roundToInt()
+            val right = (rect.left + rect.width).roundToInt()
+            val bottom = (rect.top + rect.height).roundToInt()
+            val clampedLeft = max(0, min(left, canvasWidth))
+            val clampedTop = max(0, min(top, canvasHeight))
+            val clampedRight = max(0, min(right, canvasWidth))
+            val clampedBottom = max(0, min(bottom, canvasHeight))
+            val width = clampedRight - clampedLeft
+            val height = clampedBottom - clampedTop
+            if (width <= 0 || height <= 0) return null
+            return NativeLayoutRect(clampedLeft, clampedTop, width, height)
+        }
     }
+
+    /** Integer canvas-pixel rect (top-left origin) as passed to native. */
+    internal data class NativeLayoutRect(val x: Int, val y: Int, val width: Int, val height: Int)
 
     private var nativeSessionHandle: Long = 0
     private var isReleased = false
@@ -40,6 +83,15 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
 
     private var greenScreenEnabled = false
 
+    // ANDROID-DUET-VULKAN-LAYOUT: latest layout rects from setLayout (canvas
+    // pixel space, top-left origin) and the canvas dimensions from the last
+    // successful native attach. Render-thread-confined like the rest of the
+    // compositor state.
+    private var sourceRect: VGDuetPixelRect? = null
+    private var cameraRect: VGDuetPixelRect? = null
+    private var outputWidthPx = 0
+    private var outputHeightPx = 0
+
     private var fallbackDelegate: AndroidDuetPreviewCompositor? = null
     private var isBound = false
 
@@ -50,6 +102,9 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     // call reports success for the first time (never on a false/failed call).
     private val maskUploadLoggedOnce = AtomicBoolean(false)
     private val previewFrameLoggedOnce = AtomicBoolean(false)
+    private val layoutFrameLoggedOnce = AtomicBoolean(false)
+    // Rate limit for the invalid-layout-rect warning (drawFrame runs ~30 fps).
+    private val invalidLayoutRectLoggedOnce = AtomicBoolean(false)
 
     override val cameraInputSurface: Surface?
         get() = fallbackDelegate?.cameraInputSurface ?: cameraReader?.surface
@@ -159,6 +214,8 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                 }
                 isBound = true
                 isAttached = true
+                outputWidthPx = widthPx
+                outputHeightPx = heightPx
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to bootstrap ImageReaders after native attach", e)
                 try {
@@ -177,6 +234,8 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
             }
         } else {
             isAttached = true
+            outputWidthPx = widthPx
+            outputHeightPx = heightPx
         }
 
         return true
@@ -190,6 +249,8 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         }
         if (nativeSessionHandle != 0L && isAttached) {
             isAttached = false
+            outputWidthPx = 0
+            outputHeightPx = 0
             try {
                 VanguardNativeBridge.detachAndroidDuetVulkanPreviewSurface(nativeSessionHandle)
             } catch (t: Throwable) {
@@ -198,12 +259,21 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         }
     }
 
+    /**
+     * Canvas-pixel rects (top-left origin) for the source video and camera
+     * layers. Latest wins; consumed by [drawFrame]'s non-green-screen layout
+     * path (PiP / split / green-screen terminal fallback) after rounding and
+     * clamping to the attached canvas. Ignored by the green-screen path,
+     * which is always full-canvas.
+     */
     override fun setLayout(sourceRect: VGDuetPixelRect, cameraRect: VGDuetPixelRect) {
         fallbackDelegate?.let {
             it.setLayout(sourceRect, cameraRect)
             return
         }
-        // Retained for layout; foundation-only (not plumbed to native in this slice)
+        this.sourceRect = sourceRect
+        this.cameraRect = cameraRect
+        invalidLayoutRectLoggedOnce.set(false)
     }
 
     override fun setSourceVideoSize(widthPx: Int, heightPx: Int) {
@@ -283,11 +353,16 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
      * Always drains both readers first (latest-wins latch; the previous
      * Image is closed only once a newer one is acquired) to keep the
      * decoder/camera producers from stalling, regardless of attach or
-     * green-screen state. Only calls the native green-screen render when
-     * attached, green-screen is enabled, and both a decoder and a camera
-     * frame have been latched at least once; the native session always has a
-     * valid mask handle (a default 1x1 zero mask from session creation until
-     * the first real segmentation mask arrives).
+     * green-screen state. Renders only when attached and both a decoder and
+     * a camera frame have been latched at least once:
+     *   * green-screen enabled: native mask composite (the native session
+     *     always has a valid mask handle — a default 1x1 zero mask from
+     *     session creation until the first real segmentation mask arrives);
+     *   * green-screen disabled (ANDROID-DUET-VULKAN-LAYOUT: PiP / split /
+     *     green-screen terminal fallback): native opaque two-layer layout
+     *     frame using the latest [setLayout] rects, rounded and clamped to
+     *     the attached canvas; an unset or invalid rect fails this draw
+     *     (false, nothing rendered, no crash) rather than reaching native.
      */
     override fun drawFrame(): Boolean {
         if (isReleased) return false
@@ -298,7 +373,38 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         latchDecoderImageIfAvailable()
         latchCameraImageIfAvailable()
 
-        if (!isAttached || !greenScreenEnabled) return false
+        if (!isAttached) return false
+
+        val canvasWidth = outputWidthPx
+        val canvasHeight = outputHeightPx
+        if (canvasWidth <= 0 || canvasHeight <= 0) return false
+
+        // Resolve the layout rects before touching any HardwareBuffer so an
+        // invalid layout never costs a wrapper open/close. The green-screen
+        // path is full-canvas and ignores the rects natively, so it falls
+        // back to the full canvas instead of failing when they are unset.
+        val nativeSourceRect: NativeLayoutRect
+        val nativeCameraRect: NativeLayoutRect
+        if (greenScreenEnabled) {
+            val fullCanvas = NativeLayoutRect(0, 0, canvasWidth, canvasHeight)
+            nativeSourceRect = sourceRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) } ?: fullCanvas
+            nativeCameraRect = cameraRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) } ?: fullCanvas
+        } else {
+            val source = sourceRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) }
+            val camera = cameraRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) }
+            if (source == null || camera == null) {
+                if (invalidLayoutRectLoggedOnce.compareAndSet(false, true)) {
+                    Log.w(
+                        TAG,
+                        "drawFrame skipped: invalid layout rect for ${canvasWidth}x$canvasHeight canvas " +
+                            "(source=$sourceRect camera=$cameraRect)",
+                    )
+                }
+                return false
+            }
+            nativeSourceRect = source
+            nativeCameraRect = camera
+        }
 
         val decoderImage = latchedDecoderImage ?: return false
         val cameraImage = latchedCameraImage ?: return false
@@ -315,11 +421,25 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         // from latchedDecoderImage/latchedCameraImage; they must be closed here
         // regardless of native outcome, without touching the latched Images.
         return try {
+            val greenScreen = greenScreenEnabled
             val success = VanguardNativeBridge.renderAndroidDuetVulkanPreviewFrame(
                 nativeSessionHandle, decoderBuffer, cameraBuffer,
+                greenScreen,
+                nativeSourceRect.x, nativeSourceRect.y, nativeSourceRect.width, nativeSourceRect.height,
+                nativeCameraRect.x, nativeCameraRect.y, nativeCameraRect.width, nativeCameraRect.height,
             )
-            if (success && previewFrameLoggedOnce.compareAndSet(false, true)) {
+            if (success && greenScreen && previewFrameLoggedOnce.compareAndSet(false, true)) {
                 Log.i(TAG, "ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST")
+            }
+            if (success && !greenScreen && layoutFrameLoggedOnce.compareAndSet(false, true)) {
+                Log.i(
+                    TAG,
+                    "ANDROID_DUET_VULKAN_LAYOUT_FRAME_FIRST canvas=${canvasWidth}x$canvasHeight " +
+                        "source=${nativeSourceRect.x},${nativeSourceRect.y} " +
+                        "${nativeSourceRect.width}x${nativeSourceRect.height} " +
+                        "camera=${nativeCameraRect.x},${nativeCameraRect.y} " +
+                        "${nativeCameraRect.width}x${nativeCameraRect.height}",
+                )
             }
             success
         } catch (t: Throwable) {
@@ -400,6 +520,8 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                     VanguardNativeBridge.detachAndroidDuetVulkanPreviewSurface(nativeSessionHandle)
                 } catch (_: Throwable) {}
                 isAttached = false
+                outputWidthPx = 0
+                outputHeightPx = 0
             }
             try {
                 VanguardNativeBridge.destroyAndroidDuetVulkanPreviewSession(nativeSessionHandle)

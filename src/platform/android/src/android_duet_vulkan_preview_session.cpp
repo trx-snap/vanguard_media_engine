@@ -118,9 +118,22 @@ bool AndroidDuetVulkanPreviewSession::UpdateMask(const uint8_t* r8, size_t r8Byt
     return true;
 }
 
-bool AndroidDuetVulkanPreviewSession::RenderFrame(void* decoderBuffer, void* cameraBuffer) {
+bool AndroidDuetVulkanPreviewSession::RenderFrame(
+    void* decoderBuffer,
+    void* cameraBuffer,
+    bool greenScreenEnabled,
+    const AndroidDuetVulkanPreviewLayoutRect& sourceRect,
+    const AndroidDuetVulkanPreviewLayoutRect& cameraRect) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (!impl_->backend || !impl_->hasSurface || !decoderBuffer || !cameraBuffer) {
+        return false;
+    }
+    // Layout geometry is validated before anything is imported so an invalid
+    // rect never costs an import/release round trip (the backend fails closed
+    // on it anyway).
+    if (!greenScreenEnabled &&
+        (sourceRect.width <= 0 || sourceRect.height <= 0 ||
+         cameraRect.width <= 0 || cameraRect.height <= 0)) {
         return false;
     }
 
@@ -143,8 +156,27 @@ bool AndroidDuetVulkanPreviewSession::RenderFrame(void* decoderBuffer, void* cam
         return false;
     }
 
-    const render::RenderFrameResult renderResult = impl_->backend->renderDuetGreenScreenFrame(
-        decoderHandle, cameraHandle, impl_->maskHandle);
+    render::RenderFrameResult renderResult = render::RenderFrameResult::kVulkanFailure;
+    if (greenScreenEnabled) {
+        renderResult = impl_->backend->renderDuetGreenScreenFrame(
+            decoderHandle, cameraHandle, impl_->maskHandle);
+    } else {
+        render::RenderDestinationRect sourceDestination{};
+        sourceDestination.x = sourceRect.x;
+        sourceDestination.y = sourceRect.y;
+        sourceDestination.width = sourceRect.width;
+        sourceDestination.height = sourceRect.height;
+        render::RenderDestinationRect cameraDestination{};
+        cameraDestination.x = cameraRect.x;
+        cameraDestination.y = cameraRect.y;
+        cameraDestination.width = cameraRect.width;
+        cameraDestination.height = cameraRect.height;
+        renderResult = impl_->backend->renderDuetLayoutFrame(
+            decoderHandle, cameraHandle,
+            sourceDestination, cameraDestination,
+            decoderDescriptor.width, decoderDescriptor.height,
+            cameraDescriptor.width, cameraDescriptor.height);
+    }
 
     int decoderReleaseFenceFd = -1;
     impl_->backend->releaseHardwareBuffer(decoderHandle, &decoderReleaseFenceFd);

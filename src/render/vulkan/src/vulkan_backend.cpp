@@ -249,6 +249,22 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(
 }
 
 // ---------------------------------------------------------------------------
+// ANDROID-DUET-VULKAN-LAYOUT: renderDuetLayoutFrame stub - host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderDuetLayoutFrame(
+    HardwareBufferHandle /*sourceHandle*/,
+    HardwareBufferHandle /*cameraHandle*/,
+    const RenderDestinationRect& /*sourceRect*/,
+    const RenderDestinationRect& /*cameraRect*/,
+    uint32_t /*sourceBufferWidth*/,
+    uint32_t /*sourceBufferHeight*/,
+    uint32_t /*cameraBufferWidth*/,
+    uint32_t /*cameraBufferHeight*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
 // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
 // sub-slice N4: overlay texture store stubs - host build.
 // ---------------------------------------------------------------------------
@@ -1327,6 +1343,59 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle
         backgroundHandle,
         foregroundHandle,
         maskInfo);
+}
+
+// ---------------------------------------------------------------------------
+// ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame. Validates
+// the same backend / surface / import preconditions as
+// renderDuetGreenScreenFrame above, then delegates to VulkanFrameRenderer::
+// renderDuetLayoutFrame with the core passthrough shaders (each layer draws
+// through its import's own descriptor resources, like a solo frame).
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderDuetLayoutFrame(HardwareBufferHandle sourceHandle,
+                                                       HardwareBufferHandle cameraHandle,
+                                                       const RenderDestinationRect& sourceRect,
+                                                       const RenderDestinationRect& cameraRect,
+                                                       uint32_t sourceBufferWidth,
+                                                       uint32_t sourceBufferHeight,
+                                                       uint32_t cameraBufferWidth,
+                                                       uint32_t cameraBufferHeight) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || sourceHandle == cameraHandle ||
+        !hasHardwareBuffer(sourceHandle) || s.ahbImports->getImage(sourceHandle) == nullptr ||
+        !hasHardwareBuffer(cameraHandle) || s.ahbImports->getImage(cameraHandle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+
+    VulkanFrameRenderer::DuetLayoutLayer source;
+    source.handle = sourceHandle;
+    source.rect = sourceRect;
+    source.bufferWidth = sourceBufferWidth;
+    source.bufferHeight = sourceBufferHeight;
+
+    VulkanFrameRenderer::DuetLayoutLayer camera;
+    camera.handle = cameraHandle;
+    camera.rect = cameraRect;
+    camera.bufferWidth = cameraBufferWidth;
+    camera.bufferHeight = cameraBufferHeight;
+
+    return s.frameRenderer->renderDuetLayoutFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        source,
+        camera);
 }
 
 #endif // __ANDROID__
