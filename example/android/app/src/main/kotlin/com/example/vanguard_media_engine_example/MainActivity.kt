@@ -59,6 +59,15 @@ class MainActivity : FlutterActivity() {
     private var activeTfliteGpuSession: TfliteGpuProbeSession? = null
     private var activeTfliteGpuIsolatedSession: TfliteGpuIsolatedProbeSession? = null
 
+    // Diagnostic-only: Android Duet deterministic GLES export composition proof
+    // (see AndroidDuetGlesExportCompositionSmokeCoordinator). Bridge-only wiring;
+    // all harness logic lives in the diagnostics package coordinator/harness pair.
+    private val duetGlesExportCompositionCoordinator by lazy {
+        com.connects.vanguard_media_engine.diagnostics.AndroidDuetGlesExportCompositionSmokeCoordinator(
+            Handler(Looper.getMainLooper()),
+        )
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_NAME)
@@ -90,6 +99,13 @@ class MainActivity : FlutterActivity() {
                 if (call.method == DUET_GLES_PIXEL_PROOF_METHOD_NAME) {
                     runAndroidDuetGlesPixelProof(result)
                 } else {
+                    result.notImplemented()
+                }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DUET_GLES_EXPORT_COMPOSITION_CHANNEL_NAME)
+            .setMethodCallHandler { call, result ->
+                val args = call.arguments as? Map<*, *>
+                if (!duetGlesExportCompositionCoordinator.handleMethodCall(call.method, args, result)) {
                     result.notImplemented()
                 }
             }
@@ -168,6 +184,7 @@ class MainActivity : FlutterActivity() {
         activeTfliteGpuSession = null
         activeTfliteGpuIsolatedSession?.cancel()
         activeTfliteGpuIsolatedSession = null
+        duetGlesExportCompositionCoordinator.disposeAll()
         super.onDestroy()
     }
 
@@ -184,6 +201,12 @@ class MainActivity : FlutterActivity() {
             "vanguard_media_engine_example/duet_gles_pixel_proof"
         private const val DUET_GLES_PIXEL_PROOF_METHOD_NAME =
             "runAndroidDuetGlesPixelProof"
+
+        // Diagnostic-only Duet GLES export composition proof (see
+        // AndroidDuetGlesExportCompositionSmokeCoordinator); the method name is
+        // owned by the coordinator itself.
+        private const val DUET_GLES_EXPORT_COMPOSITION_CHANNEL_NAME =
+            "vanguard_media_engine_example/duet_gles_export_composition"
 
         // Raw TFLite GPU Interpreter diagnostic probe (example-only).
         private const val TFLITE_TAG = "DuetTfliteGpuProbe"
