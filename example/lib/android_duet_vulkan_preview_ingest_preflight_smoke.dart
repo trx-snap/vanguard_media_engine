@@ -1,20 +1,20 @@
 // android_duet_vulkan_preview_ingest_preflight_smoke.dart
 // Vanguard Media Engine - DUET-VULKAN-PREVIEW-INGEST-PREFLIGHT: Android
 // physical preflight readiness smoke stitching existing Vulkan mask-blend pixel
-// proof and dual decoder AHB Vulkan render proof.
+// proof, real single-camera AHB Vulkan spatial render proof, and dual decoder
+// AHB Vulkan render proof.
 //
 // Target / proof boundary:
-//   duet_vulkan_preview_ingest_preflight_existing_mask_blend_and_dual_decoder_ahb_vulkan_proofs_no_camera_decoder_combined_seam_no_production_preview
+//   duet_vulkan_preview_ingest_preflight_existing_camera_ahb_mask_blend_and_dual_decoder_ahb_vulkan_proofs_no_combined_native_seam_no_production_preview
 //
 // Claims allowed:
-//   This preflight proves existing Vulkan mask-blend helper and existing dual
-//   decoder AHB Vulkan render proof are both physically runnable in one Duet
-//   readiness lane.
+//   This preflight proves existing real single-camera AHB Vulkan render proof plus
+//   existing dual-decoder AHB Vulkan proof plus Vulkan mask-blend helper are
+//   physically runnable in one Duet readiness lane.
 //
 // Non-claims:
-//   No live camera AHB, no combined camera+decoder AHB in the same native
-//   pass, no production Duet preview replacement, no CameraX path, no export,
-//   no app/product UI.
+//   No combined camera+decoder AHB in the same native pass, no production Duet
+//   preview replacement, no CameraX path, no export, no app/product UI.
 
 // ignore_for_file: avoid_print
 
@@ -25,16 +25,17 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vg_duet_vulkan_pixel_proof_smoke.dart';
+import 'package:vanguard_media_engine/vg_single_cam_ingest_vulkan_spatial_render_smoke.dart';
 import 'package:vanguard_media_engine/vg_timeline_dual_decoder_sync_smoke.dart';
 
 const String _proofBoundaryConstant =
-    'duet_vulkan_preview_ingest_preflight_existing_mask_blend_and_dual_decoder_ahb_vulkan_proofs_no_camera_decoder_combined_seam_no_production_preview';
+    'duet_vulkan_preview_ingest_preflight_existing_camera_ahb_mask_blend_and_dual_decoder_ahb_vulkan_proofs_no_combined_native_seam_no_production_preview';
 
 const String _claimsAllowed =
-    'This preflight proves existing Vulkan mask-blend helper and existing dual decoder AHB Vulkan render proof are both physically runnable in one Duet readiness lane.';
+    'This preflight proves existing real single-camera AHB Vulkan render proof plus existing dual-decoder AHB Vulkan proof plus Vulkan mask-blend helper are physically runnable in one Duet readiness lane.';
 
 const String _nonClaims =
-    'No live camera AHB, no combined camera+decoder AHB in the same native pass, no production Duet preview replacement, no CameraX path, no export, no app/product UI.';
+    'No combined camera+decoder AHB in the same native pass, no production Duet preview replacement, no CameraX path, no export, no app/product UI.';
 
 const String _passMarker = 'ANDROID_DUET_VULKAN_PREVIEW_INGEST_PREFLIGHT_PASS';
 const String _failMarker = 'ANDROID_DUET_VULKAN_PREVIEW_INGEST_PREFLIGHT_FAIL';
@@ -98,11 +99,14 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
     String? topLevelError;
     String? step1Error;
     String? step2Error;
+    String? step3Error;
 
     VGDuetVulkanPixelProofSmokeReport? duetReport;
+    VGSingleCamIngestVulkanSpatialRenderSmokeReport? cameraReport;
     VGTimelineDualDecoderSyncSmokeReport? decoderReport;
 
     var duetPixelProofPass = false;
+    var singleCameraAhbVulkanPass = false;
     var dualDecoderAhbVulkanPass = false;
 
     File? clip0;
@@ -150,8 +154,51 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
         'failureReason=${duetReport?.failureReason}',
       );
 
-      // Step 2: Copy fixtures and run Dual Decoder sync smoke with 100s-ish timeout.
-      print('${_logPrefix}_STEP_2_DUAL_DECODER_SYNC_START');
+      // Step 2: Run Single-Camera Ingest Vulkan Spatial Render proof with 25-30s timeout.
+      print('${_logPrefix}_STEP_2_SINGLE_CAM_VULKAN_START');
+      if (mounted) {
+        setState(() {
+          _status = 'Running Single Camera AHB Vulkan Spatial Render Proof...';
+        });
+      }
+
+      try {
+        cameraReport =
+            await VGSingleCamIngestVulkanSpatialRenderSmokeReport.runAndroidDagPhase3SingleCamIngestVulkanSpatialRenderSmoke(
+              descriptor:
+                  VGMultiCamDynamicDescriptorSpatialRenderInput.freeFloatingPip(),
+              timeout: const Duration(seconds: 25),
+            ).timeout(const Duration(seconds: 30));
+      } catch (e, st) {
+        step2Error =
+            'Single camera AHB Vulkan spatial render exception: $e\n$st';
+        print('${_logPrefix}_STEP_2_EXCEPTION: $step2Error');
+      }
+
+      final cameraBoundaryMatches =
+          cameraReport != null &&
+          cameraReport.proofBoundary ==
+              VGSingleCamIngestVulkanSpatialRenderSmokeReport
+                  .proofBoundaryConstant;
+      singleCameraAhbVulkanPass =
+          cameraReport != null &&
+          cameraReport.isPass &&
+          cameraBoundaryMatches &&
+          step2Error == null;
+
+      print(
+        '${_logPrefix}_STEP_2_SINGLE_CAM_VULKAN_RESULT: '
+        'pass=$singleCameraAhbVulkanPass '
+        'reportPass=${cameraReport?.pass} '
+        'status=${cameraReport?.status} '
+        'marker=${cameraReport?.marker} '
+        'proofBoundary=${cameraReport?.proofBoundary} '
+        'boundaryMatches=$cameraBoundaryMatches '
+        'failureReason=${cameraReport?.failureReason}',
+      );
+
+      // Step 3: Copy fixtures and run Dual Decoder sync smoke with 100s-ish timeout.
+      print('${_logPrefix}_STEP_3_DUAL_DECODER_SYNC_START');
       if (mounted) {
         setState(() {
           _status = 'Running Dual Decoder Sync Smoke...';
@@ -180,8 +227,8 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
               timeout: const Duration(seconds: 90),
             ).timeout(const Duration(seconds: 100));
       } catch (e, st) {
-        step2Error = 'Dual decoder sync exception: $e\n$st';
-        print('${_logPrefix}_STEP_2_EXCEPTION: $step2Error');
+        step3Error = 'Dual decoder sync exception: $e\n$st';
+        print('${_logPrefix}_STEP_3_EXCEPTION: $step3Error');
       }
 
       final decoderBoundaryMatches =
@@ -192,10 +239,10 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
           decoderReport != null &&
           decoderReport.isVerifiedPass &&
           decoderBoundaryMatches &&
-          step2Error == null;
+          step3Error == null;
 
       print(
-        '${_logPrefix}_STEP_2_DUAL_DECODER_SYNC_RESULT: '
+        '${_logPrefix}_STEP_3_DUAL_DECODER_SYNC_RESULT: '
         'pass=$dualDecoderAhbVulkanPass '
         'reportPass=${decoderReport?.pass} '
         'status=${decoderReport?.status} '
@@ -213,9 +260,11 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
 
       final allPass =
           duetPixelProofPass &&
+          singleCameraAhbVulkanPass &&
           dualDecoderAhbVulkanPass &&
           step1Error == null &&
           step2Error == null &&
+          step3Error == null &&
           topLevelError == null;
 
       String? failureReason;
@@ -230,6 +279,13 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
             : 'duet_pixel_proof_failed_or_boundary_mismatch';
       } else if (step2Error != null) {
         failureReason = step2Error;
+      } else if (!singleCameraAhbVulkanPass) {
+        final reason = cameraReport?.failureReason;
+        failureReason = (reason != null && reason.isNotEmpty)
+            ? 'single_camera_ahb_vulkan: $reason'
+            : 'single_camera_ahb_vulkan_failed_or_boundary_mismatch';
+      } else if (step3Error != null) {
+        failureReason = step3Error;
       } else if (!dualDecoderAhbVulkanPass) {
         final reason = decoderReport?.failureReason;
         failureReason = (reason != null && reason.isNotEmpty)
@@ -243,10 +299,13 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
         'claimsAllowed': _claimsAllowed,
         'nonClaims': _nonClaims,
         'duetPixelProofPass': duetPixelProofPass,
+        'singleCameraAhbVulkanPass': singleCameraAhbVulkanPass,
         'dualDecoderAhbVulkanPass': dualDecoderAhbVulkanPass,
         'duetPixelProofStatus': duetReport?.status ?? 'UNKNOWN',
+        'singleCameraStatus': cameraReport?.status ?? 'UNKNOWN',
         'dualDecoderStatus': decoderReport?.status ?? 'UNKNOWN',
         'duetPixelProofBoundary': duetReport?.proofBoundary ?? '',
+        'singleCameraBoundary': cameraReport?.proofBoundary ?? '',
         'dualDecoderBoundary': decoderReport?.proofBoundary ?? '',
         'fixtureAsset': _fixtureAsset,
         'clip0Path': clip0?.path,
@@ -255,6 +314,7 @@ class _AndroidDuetVulkanPreviewIngestPreflightSmokeAppState
         'clip1Bytes': clip1Bytes,
         'failureReason': failureReason,
         'duetReport': duetReport?.toMap(),
+        'singleCameraReport': cameraReport?.toMap(),
         'dualDecoderReport': decoderReport?.toMap(),
       };
 
