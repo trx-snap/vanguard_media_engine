@@ -2,11 +2,15 @@ package com.connects.vanguard_media_engine.duet
 
 import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
+import android.media.Image
 import android.media.ImageReader
 import android.os.Build
 import android.util.Log
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     companion object {
@@ -24,6 +28,18 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     private var cameraReader: ImageReader? = null
     private var decoderReader: ImageReader? = null
 
+    // Layer mapping is mandatory: decoder/source video is background,
+    // camera/live subject is foreground. Latest-wins latches — the previous
+    // Image is closed only after a newer one is successfully acquired, so a
+    // reader with no new frame this draw keeps presenting its last one.
+    private var latchedDecoderImage: Image? = null
+    private var latchedCameraImage: Image? = null
+
+    private val decoderFramePending = AtomicBoolean(false)
+    private val cameraFramePending = AtomicBoolean(false)
+
+    private var greenScreenEnabled = false
+
     private var fallbackDelegate: AndroidDuetPreviewCompositor? = null
     private var isBound = false
 
@@ -37,10 +53,10 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         get() = fallbackDelegate?.decoderInputSurface ?: decoderReader?.surface
 
     override val hasPendingSourceFrame: Boolean
-        get() = fallbackDelegate?.hasPendingSourceFrame ?: false
+        get() = fallbackDelegate?.hasPendingSourceFrame ?: decoderFramePending.get()
 
     override val hasPendingCameraFrame: Boolean
-        get() = fallbackDelegate?.hasPendingCameraFrame ?: false
+        get() = fallbackDelegate?.hasPendingCameraFrame ?: cameraFramePending.get()
 
     init {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -121,7 +137,9 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                         ImageFormat.PRIVATE,
                         3,
                         usage,
-                    )
+                    ).also {
+                        it.setOnImageAvailableListener({ cameraFramePending.set(true) }, null)
+                    }
                 }
                 if (decoderReader == null) {
                     decoderReader = ImageReader.newInstance(
@@ -130,7 +148,9 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                         ImageFormat.PRIVATE,
                         3,
                         usage,
-                    )
+                    ).also {
+                        it.setOnImageAvailableListener({ decoderFramePending.set(true) }, null)
+                    }
                 }
                 isBound = true
                 isAttached = true
@@ -197,20 +217,65 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
             it.setGreenScreenEnabled(enabled)
             return
         }
+        greenScreenEnabled = enabled
     }
 
+    /**
+     * Packs [frame] into a tightly packed direct R8 ByteBuffer and uploads it
+     * to the native session's mask texture. Runs synchronously on the calling
+     * thread (the render thread, per [AndroidDuetPreviewRenderLoop]'s posting
+     * discipline) rather than deferring to [drawFrame], since the native
+     * session mutex makes the upload safe to perform immediately. Incomplete
+     * or invalid frames are ignored safely.
+     */
     override fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
         fallbackDelegate?.let {
             it.updateGreenScreenMask(frame)
             return
         }
+        if (nativeSessionHandle == 0L) return
+        val width = frame.width
+        val height = frame.height
+        if (width <= 0 || height <= 0 || !frame.isComplete) return
+
+        val pixelCount = width * height
+        val packed = ByteBuffer.allocateDirect(pixelCount)
+        when (frame.format) {
+            DuetSegmentationMaskFormat.FLOAT32_CONFIDENCE -> {
+                val src = frame.maskBytes.asReadOnlyBuffer().order(ByteOrder.nativeOrder())
+                src.rewind()
+                for (i in 0 until pixelCount) {
+                    val byteOffset = i * 4
+                    val value = if (src.limit() >= byteOffset + 4) src.getFloat(byteOffset) else 0f
+                    packed.put((value.coerceIn(0f, 1f) * 255f).toInt().toByte())
+                }
+            }
+            DuetSegmentationMaskFormat.UINT8_ALPHA -> {
+                val src = frame.maskBytes.asReadOnlyBuffer()
+                src.rewind()
+                if (src.capacity() < pixelCount) return
+                src.limit(pixelCount)
+                packed.put(src)
+            }
+        }
+        packed.rewind()
+
+        try {
+            VanguardNativeBridge.updateAndroidDuetVulkanPreviewMask(nativeSessionHandle, packed, width, height)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Exception updating native Vulkan preview mask", t)
+        }
     }
 
     /**
-     * Foundation-only preview backend: does not present real frames yet.
-     * Drains incoming camera and decoder images to prevent pipeline stalls,
-     * but returns false to honestly indicate non-presenting foundation status.
-     * No diagnostic per-frame JNI path is used.
+     * Always drains both readers first (latest-wins latch; the previous
+     * Image is closed only once a newer one is acquired) to keep the
+     * decoder/camera producers from stalling, regardless of attach or
+     * green-screen state. Only calls the native green-screen render when
+     * attached, green-screen is enabled, and both a decoder and a camera
+     * frame have been latched at least once; the native session always has a
+     * valid mask handle (a default 1x1 zero mask from session creation until
+     * the first real segmentation mask arrives).
      */
     override fun drawFrame(): Boolean {
         if (isReleased) return false
@@ -218,19 +283,72 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
 
         if (nativeSessionHandle == 0L) return false
 
-        try {
-            cameraReader?.acquireLatestImage()?.close()
-        } catch (_: Throwable) {}
+        latchDecoderImageIfAvailable()
+        latchCameraImageIfAvailable()
 
-        try {
-            decoderReader?.acquireLatestImage()?.close()
-        } catch (_: Throwable) {}
+        if (!isAttached || !greenScreenEnabled) return false
 
-        Log.w(
-            TAG,
-            "drawFrame(): foundation-only non-presenting backend (real Vulkan compositing deferred to future slice)",
-        )
-        return false
+        val decoderImage = latchedDecoderImage ?: return false
+        val cameraImage = latchedCameraImage ?: return false
+        val decoderBuffer = decoderImage.hardwareBuffer ?: return false
+        val cameraBuffer = cameraImage.hardwareBuffer
+        if (cameraBuffer == null) {
+            try {
+                decoderBuffer.close()
+            } catch (_: Throwable) {}
+            return false
+        }
+
+        // decoderBuffer/cameraBuffer are temporary HardwareBuffer wrappers distinct
+        // from latchedDecoderImage/latchedCameraImage; they must be closed here
+        // regardless of native outcome, without touching the latched Images.
+        return try {
+            VanguardNativeBridge.renderAndroidDuetVulkanPreviewFrame(
+                nativeSessionHandle, decoderBuffer, cameraBuffer,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Exception rendering native Vulkan preview frame", t)
+            false
+        } finally {
+            try {
+                decoderBuffer.close()
+            } catch (_: Throwable) {}
+            try {
+                cameraBuffer.close()
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun latchDecoderImageIfAvailable() {
+        if (!decoderFramePending.compareAndSet(true, false)) return
+        val next = try {
+            decoderReader?.acquireLatestImage()
+        } catch (t: Throwable) {
+            Log.w(TAG, "acquireLatestImage(decoder) threw", t)
+            null
+        }
+        if (next != null) {
+            try {
+                latchedDecoderImage?.close()
+            } catch (_: Throwable) {}
+            latchedDecoderImage = next
+        }
+    }
+
+    private fun latchCameraImageIfAvailable() {
+        if (!cameraFramePending.compareAndSet(true, false)) return
+        val next = try {
+            cameraReader?.acquireLatestImage()
+        } catch (t: Throwable) {
+            Log.w(TAG, "acquireLatestImage(camera) threw", t)
+            null
+        }
+        if (next != null) {
+            try {
+                latchedCameraImage?.close()
+            } catch (_: Throwable) {}
+            latchedCameraImage = next
+        }
     }
 
     override fun release() {
@@ -239,6 +357,16 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
 
         fallbackDelegate?.release()
         fallbackDelegate = null
+
+        try {
+            latchedDecoderImage?.close()
+        } catch (_: Throwable) {}
+        latchedDecoderImage = null
+
+        try {
+            latchedCameraImage?.close()
+        } catch (_: Throwable) {}
+        latchedCameraImage = null
 
         try {
             cameraReader?.close()

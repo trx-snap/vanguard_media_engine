@@ -1176,14 +1176,41 @@ class VanguardNativeBridge(
         external fun destroyStreamSourceMedia3IngestSession(handle: Long): String
 
         // ── P5-ANDROID-DUET-VULKAN-PREVIEW ──
-        // Native session lifecycle for Android Duet Vulkan preview foundation.
-        // Foundation only: attach/detach/destroy surface lifecycle. Per-frame
-        // Vulkan presentation rendering is deferred to a future slice; no
-        // diagnostic per-frame JNI path is used in production preview.
+        // Native session lifecycle for the Android Duet Vulkan preview,
+        // plus the production per-frame green-screen mask update/render seam.
+        // The session owns one backend-resident R8 mask texture (a default
+        // 1x1 zero mask exists from createAndroidDuetVulkanPreviewSession()
+        // onward, so a render before the first mask update never observes an
+        // invalid mask handle) and composites decoder (background) +
+        // camera (foreground) HardwareBuffers through it on every render call.
         external fun createAndroidDuetVulkanPreviewSession(): Long
         external fun attachAndroidDuetVulkanPreviewSurface(handle: Long, surface: android.view.Surface, widthPx: Int, heightPx: Int): Boolean
         external fun detachAndroidDuetVulkanPreviewSurface(handle: Long)
         external fun destroyAndroidDuetVulkanPreviewSession(handle: Long)
+
+        // Uploads a tightly packed single-channel R8 mask (maskBytes must be
+        // a direct ByteBuffer of at least width*height bytes) into the
+        // session's mask texture, creating it on first call or on a size
+        // change. Returns false (leaving any previously valid mask in place)
+        // on invalid input or native upload failure.
+        external fun updateAndroidDuetVulkanPreviewMask(
+            handle: Long,
+            maskBytes: java.nio.ByteBuffer,
+            width: Int,
+            height: Int,
+        ): Boolean
+
+        // Composites decoderHardwareBuffer (background) and
+        // cameraHardwareBuffer (foreground) through the session's current
+        // mask texture and presents the result to the attached surface.
+        // Returns false (with the session left intact for retry) when no
+        // surface is attached, either buffer fails to import, or the render
+        // itself fails; never retains either HardwareBuffer beyond the call.
+        external fun renderAndroidDuetVulkanPreviewFrame(
+            handle: Long,
+            decoderHardwareBuffer: HardwareBuffer,
+            cameraHardwareBuffer: HardwareBuffer,
+        ): Boolean
 
     }
 
