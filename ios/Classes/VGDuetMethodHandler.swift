@@ -30,6 +30,8 @@ final class VGDuetMethodHandler {
         "detachDuetPreviewTexture",
         // Diagnostic-only: deterministic CoreImage matte-blend pixel proof.
         "runIosDuetPixelProof",
+        // Slice 5B-A: descriptor-bound offline export (no sessionId required).
+        "exportDuetComposition",
     ]
 
     static func ownsMethod(_ method: String) -> Bool {
@@ -39,6 +41,11 @@ final class VGDuetMethodHandler {
     // MARK: - Coordinator
 
     private let coordinator: VGDuetNativeSessionCoordinator
+
+    // MARK: - Slice 5B-A: Export session
+
+    /// Descriptor-bound offline export lifecycle. Router only — no session id.
+    private let exportSession = VGDuetExportSession()
 
     // MARK: - Init
 
@@ -144,6 +151,11 @@ final class VGDuetMethodHandler {
         case "runIosDuetPixelProof":
             result(VGDuetPreviewCompositor.runDeterministicPixelProof())
 
+        // ── Slice 5B-A: descriptor-bound offline export ───────────────────────
+        // No sessionId — route directly to VGDuetExportSession.
+        case "exportDuetComposition":
+            exportSession.export(args: args, result: result)
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -153,6 +165,7 @@ final class VGDuetMethodHandler {
 
     func disposeAll() {
         coordinator.disposeAll()
+        exportSession.disposeAll()
     }
 
     // MARK: - Helpers
