@@ -672,8 +672,8 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
         // render thread before the next mask is extracted.
         private var alphaByteScratch: ByteArray? = null
         private val pictureBackgroundLoadFailed = AtomicBoolean(false)
-        private val confidenceAlphaLut = IntArray(256) { index ->
-            buildConfidenceDisplayAlpha(index.toFloat() / 255f)
+        private val confidenceAlphaLut = ByteArray(256) { index ->
+            buildConfidenceDisplayAlpha(index.toFloat() / 255f).toByte()
         }
         private val drawPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         private val maskPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
@@ -698,6 +698,7 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
         private val maskDebugDraws = AtomicLong(0L)
         private val unkeyedDraws = AtomicLong(0L)
         private val containerDiffers = AtomicLong(0L)
+        private val timestampMismatches = AtomicLong(0L)
         private val failures = AtomicLong(0L)
         private val skippedNotReady = AtomicLong(0L)
         private val inflightTimeouts = AtomicLong(0L)
@@ -1082,8 +1083,26 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
                 closeResultQuietly(result)
                 return
             }
+            val resultTimestampMs = result.timestampMs()
+            if (resultTimestampMs != frame.timestampMs) {
+                val count = timestampMismatches.incrementAndGet()
+                if (count <= 3L || count % 200L == 0L) {
+                    Log.w(
+                        TAG,
+                        "result timestamp differs from in-flight frame seq=${frame.seq} " +
+                            "resultTimestampMs=$resultTimestampMs frameTimestampMs=${frame.timestampMs} " +
+                            "(count=$count)",
+                    )
+                }
+                closeResultQuietly(result)
+                inFlight.compareAndSet(frame, null)
+                frame.release()
+                return
+            }
             if (frame.mpImage !== input) {
-                // Telemetry only: MediaPipe handed back a different container.
+                // MediaPipe Tasks can return a distinct MPImage wrapper for an otherwise
+                // valid in-flight result. Keep this as telemetry until a timestamp/keyed
+                // result identity is available; object identity rejected every physical frame.
                 val count = containerDiffers.incrementAndGet()
                 if (count <= 3L || count % 200L == 0L) {
                     Log.w(TAG, "result input container differs from in-flight frame seq=${frame.seq} (count=$count)")
@@ -1149,7 +1168,7 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
         private fun confidenceToDisplayAlpha(confidence: Float): Int {
             val c = if (confidence.isNaN()) 0f else confidence.coerceIn(0f, 1f)
             val index = (c * 255f).roundToInt().coerceIn(0, 255)
-            return confidenceAlphaLut[index]
+            return confidenceAlphaLut[index].toInt() and 0xFF
         }
 
         private fun shouldRecordWarmStats(): Boolean =
@@ -1271,14 +1290,21 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
             val floatScratch = confidenceScratch(count)
             floats.get(floatScratch, 0, count)
             val alpha = alphaScratch(count)
+            val lut = confidenceAlphaLut
             var minV = Float.MAX_VALUE
             var maxV = -Float.MAX_VALUE
             var sum = 0.0
             val logLayout = !firstMaskLogged.get()
             for (i in 0 until count) {
                 val f = floatScratch[i]
-                val c = if (f.isNaN()) 0f else f.coerceIn(0f, 1f)
-                alpha[i] = confidenceToDisplayAlpha(c).toByte()
+                val c = when {
+                    f.isNaN() -> 0f
+                    f <= 0f -> 0f
+                    f >= 1f -> 1f
+                    else -> f
+                }
+                val index = (c * 255f + 0.5f).toInt()
+                alpha[i] = lut[index]
                 if (logLayout) {
                     if (c < minV) minV = c
                     if (c > maxV) maxV = c
@@ -1924,6 +1950,7 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
                 "maskDebugDraws" to maskDebugV,
                 "unkeyedDraws" to unkeyedDraws.get(),
                 "containerDiffers" to containerDiffers.get(),
+                "timestampMismatches" to timestampMismatches.get(),
                 "failures" to failuresV,
                 "skippedNotReady" to skippedNotReady.get(),
                 "inflightTimeouts" to inflightTimeouts.get(),
