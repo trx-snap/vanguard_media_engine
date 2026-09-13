@@ -159,6 +159,20 @@ class AndroidDuetPreviewRenderLoop(
     /** One-shot diagnostic latch for the startActive idle-redraw suppression marker. */
     private val activeIdleRedrawSuppressionLogged = AtomicBoolean(false)
 
+    /**
+     * Whether the current green-screen background needs source-video
+     * decoding ([AndroidDuetGreenScreenBackground.usesSourceVideo]). Read by
+     * [startActive] and [tickRunnable] indirectly via [setGreenScreenBackground]
+     * to decide whether active playback should drive the decoder at all.
+     * Written from any thread that calls [setGreenScreenBackground]; only ever
+     * read on the render thread, so plain volatile is enough.
+     */
+    @Volatile
+    private var backgroundUsesSourceVideo = true
+
+    /** One-shot diagnostic latch for the static-background no-decoder-ticks marker. */
+    private val staticBackgroundNoDecoderTicksLogged = AtomicBoolean(false)
+
     // -- Decoder op queue: one in flight, one coalesced pending -----------------
 
     private sealed class DecoderOp {
@@ -261,6 +275,17 @@ class AndroidDuetPreviewRenderLoop(
         if (isStopped.get()) return
         activePtsProvider = targetPtsProvider
         isActive = true
+        if (!backgroundUsesSourceVideo) {
+            // Static (solid color / image) background: no source frame will
+            // ever be drawn, so sustained decoder Step ticks would only churn
+            // the codec for a frame nothing shows. The camera idle redraw pump
+            // already drives ~30 fps drawFrame calls (background + masked
+            // camera), so it takes over from the decoder tick loop.
+            logStaticBackgroundNoDecoderTicksOnce()
+            renderHandler.removeCallbacks(tickRunnable)
+            startCameraIdleRedraw()
+            return
+        }
         // Active decoder-driven presentation owns drawFrame while active. The
         // camera idle redraw must not run concurrently: its drawFrame consumes
         // the compositor's pending source frame before postPresentAttempt sees
@@ -274,6 +299,12 @@ class AndroidDuetPreviewRenderLoop(
         }
         renderHandler.removeCallbacks(tickRunnable)
         renderHandler.post(tickRunnable)
+    }
+
+    private fun logStaticBackgroundNoDecoderTicksOnce() {
+        if (staticBackgroundNoDecoderTicksLogged.compareAndSet(false, true)) {
+            Log.i(TAG, "ANDROID_DUET_GREENSCREEN_STATIC_BACKGROUND_NO_DECODER_TICKS")
+        }
     }
 
     /** Leaves active playback, then steps to and presents [targetPtsMs] as the held frame. */
@@ -386,6 +417,36 @@ class AndroidDuetPreviewRenderLoop(
         renderHandler.post {
             if (isStopped.get()) return@post
             compositor.setGreenScreenBackgroundMode(mode)
+        }
+    }
+
+    /**
+     * Forwards a new green-screen background spec to the compositor. When
+     * this changes whether the background needs source-video decoding
+     * ([AndroidDuetGreenScreenBackground.usesSourceVideo]) while active
+     * playback is running, switches the active pump accordingly: static
+     * backgrounds hand off to the camera idle redraw pump (see [startActive]);
+     * switching back to video resumes decoder-driven ticking.
+     */
+    fun setGreenScreenBackground(background: AndroidDuetGreenScreenBackground) {
+        if (isStopped.get()) return
+        val wasUsingSourceVideo = backgroundUsesSourceVideo
+        val usesSourceVideo = background.usesSourceVideo
+        backgroundUsesSourceVideo = usesSourceVideo
+        renderHandler.post {
+            if (isStopped.get()) return@post
+            compositor.setGreenScreenBackground(background)
+        }
+        if (isActive && wasUsingSourceVideo != usesSourceVideo) {
+            if (!usesSourceVideo) {
+                logStaticBackgroundNoDecoderTicksOnce()
+                renderHandler.removeCallbacks(tickRunnable)
+                startCameraIdleRedraw()
+            } else {
+                stopCameraIdleRedraw()
+                renderHandler.removeCallbacks(tickRunnable)
+                renderHandler.post(tickRunnable)
+            }
         }
     }
 

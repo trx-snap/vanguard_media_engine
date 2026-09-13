@@ -480,6 +480,9 @@ class AndroidDuetSessionCoordinator(
         session.previewRenderLoop?.setGreenScreenBackgroundMode(
             layoutConfigMap["debugGreenScreenBackgroundMode"] as? String
         )
+        session.previewRenderLoop?.setGreenScreenBackground(
+            AndroidDuetGreenScreenBackground.parse(layoutConfigMap["greenScreenBackground"] as? Map<*, *>)
+        )
         val newMode = layoutConfigMap["mode"] as? String ?: "pip"
         // Slice green-screen: handle mode switch without restarting the whole session.
         val widthPx  = session.previewWidthPx
@@ -843,6 +846,9 @@ class AndroidDuetSessionCoordinator(
         // the very first attach without waiting for a later updateLayout.
         renderLoop.setGreenScreenDebugView(effectiveLayoutMap["debugGreenScreenView"] as? String)
         renderLoop.setGreenScreenBackgroundMode(effectiveLayoutMap["debugGreenScreenBackgroundMode"] as? String)
+        renderLoop.setGreenScreenBackground(
+            AndroidDuetGreenScreenBackground.parse(effectiveLayoutMap["greenScreenBackground"] as? Map<*, *>)
+        )
 
         // Persist the caller-supplied layout so startCameraSourceIfNeeded sees the
         // correct mode (e.g. "greenScreen") when its cameraInputSurfaceReady callback

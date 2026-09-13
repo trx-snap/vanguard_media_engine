@@ -338,6 +338,107 @@ class VGDuetForegroundTransform {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Green-screen background models
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The type of background displayed beneath the green-screen camera layer.
+enum VGDuetGreenScreenBackgroundType {
+  /// The source video as the background (default).
+  video,
+
+  /// A solid ARGB color fill.
+  solidColor,
+
+  /// A static image file from local storage.
+  image,
+}
+
+/// Scaling mode for static green-screen backgrounds.
+enum VGDuetBackgroundScaleMode {
+  /// Aspect fill: fills the entire rect, cropping overflow.
+  aspectFill,
+
+  /// Aspect fit: fits inside the rect, letterboxing/pillarboxing with black.
+  aspectFit,
+}
+
+/// Immutable specification of the background layer in green-screen layout mode.
+class VGDuetGreenScreenBackground {
+  final VGDuetGreenScreenBackgroundType type;
+  final int? argbColor;
+  final String? filePath;
+  final VGDuetBackgroundScaleMode? scaleMode;
+
+  const VGDuetGreenScreenBackground.video()
+    : type = VGDuetGreenScreenBackgroundType.video,
+      argbColor = null,
+      filePath = null,
+      scaleMode = null;
+
+  const VGDuetGreenScreenBackground.solidColor(int this.argbColor)
+    : type = VGDuetGreenScreenBackgroundType.solidColor,
+      filePath = null,
+      scaleMode = null;
+
+  const VGDuetGreenScreenBackground.imageFile(
+    String this.filePath, {
+    VGDuetBackgroundScaleMode this.scaleMode =
+        VGDuetBackgroundScaleMode.aspectFill,
+  }) : type = VGDuetGreenScreenBackgroundType.image,
+       argbColor = null;
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+    'type': type.name,
+    if (argbColor != null) 'argbColor': argbColor,
+    if (filePath != null) 'filePath': filePath,
+    if (scaleMode != null) 'scaleMode': scaleMode!.name,
+  };
+
+  factory VGDuetGreenScreenBackground.fromMap(Map<String, dynamic> map) {
+    final typeName = map['type'] as String?;
+    final type = VGDuetGreenScreenBackgroundType.values.firstWhere(
+      (e) => e.name == typeName,
+      orElse: () => VGDuetGreenScreenBackgroundType.video,
+    );
+    switch (type) {
+      case VGDuetGreenScreenBackgroundType.video:
+        return const VGDuetGreenScreenBackground.video();
+      case VGDuetGreenScreenBackgroundType.solidColor:
+        final color = (map['argbColor'] as num?)?.toInt() ?? 0xFF000000;
+        return VGDuetGreenScreenBackground.solidColor(color);
+      case VGDuetGreenScreenBackgroundType.image:
+        final path = map['filePath'] as String? ?? '';
+        final scaleName = map['scaleMode'] as String?;
+        final scaleMode = VGDuetBackgroundScaleMode.values.firstWhere(
+          (e) => e.name == scaleName,
+          orElse: () => VGDuetBackgroundScaleMode.aspectFill,
+        );
+        return VGDuetGreenScreenBackground.imageFile(
+          path,
+          scaleMode: scaleMode,
+        );
+    }
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGDuetGreenScreenBackground &&
+          type == other.type &&
+          argbColor == other.argbColor &&
+          filePath == other.filePath &&
+          scaleMode == other.scaleMode;
+
+  @override
+  int get hashCode => Object.hash(type, argbColor, filePath, scaleMode);
+
+  @override
+  String toString() =>
+      'VGDuetGreenScreenBackground(type: ${type.name}, argbColor: $argbColor, '
+      'filePath: $filePath, scaleMode: ${scaleMode?.name})';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Layout enums
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -392,6 +493,12 @@ class VGDuetLayoutConfig {
   /// identity rect is used (backwards-compatible default).
   final VGDuetForegroundTransform? foregroundTransform;
 
+  /// Optional green-screen background.
+  ///
+  /// Only meaningful when [mode] is [VGDuetLayoutMode.greenScreen].
+  /// When `null`, the default source video background is used.
+  final VGDuetGreenScreenBackground? greenScreenBackground;
+
   /// Constructs a [VGDuetLayoutConfig].
   ///
   /// Throws [ArgumentError] immediately if [mode] is [VGDuetLayoutMode.pip]
@@ -404,6 +511,7 @@ class VGDuetLayoutConfig {
     this.pipAnchor,
     this.pipNormalizedRect,
     this.foregroundTransform,
+    this.greenScreenBackground,
   }) {
     _validatePiPRect(mode, pipNormalizedRect);
   }
@@ -443,9 +551,11 @@ class VGDuetLayoutConfig {
     VGDuetPiPAnchor? pipAnchor,
     VGDuetRect? pipNormalizedRect,
     VGDuetForegroundTransform? foregroundTransform,
+    VGDuetGreenScreenBackground? greenScreenBackground,
     bool clearPipAnchor = false,
     bool clearPipRect = false,
     bool clearForegroundTransform = false,
+    bool clearGreenScreenBackground = false,
   }) {
     return VGDuetLayoutConfig(
       mode: mode ?? this.mode,
@@ -458,6 +568,9 @@ class VGDuetLayoutConfig {
       foregroundTransform: clearForegroundTransform
           ? null
           : (foregroundTransform ?? this.foregroundTransform),
+      greenScreenBackground: clearGreenScreenBackground
+          ? null
+          : (greenScreenBackground ?? this.greenScreenBackground),
     );
   }
 
@@ -470,6 +583,8 @@ class VGDuetLayoutConfig {
       'pipNormalizedRect': pipNormalizedRect!.toMap(),
     if (foregroundTransform != null)
       'foregroundTransform': foregroundTransform!.toMap(),
+    if (greenScreenBackground != null)
+      'greenScreenBackground': greenScreenBackground!.toMap(),
   };
 
   factory VGDuetLayoutConfig.fromMap(Map<String, dynamic> map) {
@@ -498,6 +613,13 @@ class VGDuetLayoutConfig {
         Map<String, dynamic>.from(fgMap),
       );
     }
+    VGDuetGreenScreenBackground? greenScreenBackground;
+    final bgMap = map['greenScreenBackground'];
+    if (bgMap is Map) {
+      greenScreenBackground = VGDuetGreenScreenBackground.fromMap(
+        Map<String, dynamic>.from(bgMap),
+      );
+    }
     return VGDuetLayoutConfig(
       mode: mode,
       isSideSwapped: map['isSideSwapped'] as bool? ?? false,
@@ -505,6 +627,7 @@ class VGDuetLayoutConfig {
       pipAnchor: pipAnchor,
       pipNormalizedRect: pipRect,
       foregroundTransform: foregroundTransform,
+      greenScreenBackground: greenScreenBackground,
     );
   }
 
@@ -517,7 +640,8 @@ class VGDuetLayoutConfig {
           isTopBottomSwapped == other.isTopBottomSwapped &&
           pipAnchor == other.pipAnchor &&
           pipNormalizedRect == other.pipNormalizedRect &&
-          foregroundTransform == other.foregroundTransform;
+          foregroundTransform == other.foregroundTransform &&
+          greenScreenBackground == other.greenScreenBackground;
 
   @override
   int get hashCode => Object.hash(
@@ -527,13 +651,15 @@ class VGDuetLayoutConfig {
     pipAnchor,
     pipNormalizedRect,
     foregroundTransform,
+    greenScreenBackground,
   );
 
   @override
   String toString() =>
       'VGDuetLayoutConfig(mode: ${mode.name}, swap: $isSideSwapped, '
       'tbSwap: $isTopBottomSwapped, pipAnchor: ${pipAnchor?.name}, '
-      'foregroundTransform: $foregroundTransform)';
+      'foregroundTransform: $foregroundTransform, '
+      'greenScreenBackground: $greenScreenBackground)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

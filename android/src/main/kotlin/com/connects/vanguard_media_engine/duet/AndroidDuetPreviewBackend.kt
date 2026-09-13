@@ -81,6 +81,15 @@ interface AndroidDuetPreviewBackend {
     fun setGreenScreenBackgroundMode(mode: String?) {}
 
     /**
+     * Sets the static background composited beneath the masked camera layer
+     * in green-screen mode (video / solid color / image). Only meaningful
+     * while green-screen compositing is enabled; harmless to call otherwise.
+     * Backends that do not support this (the default here) no-op, so the
+     * source video remains the only background.
+     */
+    fun setGreenScreenBackground(background: AndroidDuetGreenScreenBackground) {}
+
+    /**
      * GPU-resident green-screen mask update: [hardwareBuffer] already
      * contains an R8/RGBA mask produced on GPU (e.g. by a future MediaPipe
      * GPU graph), so a backend that supports it can composite directly from

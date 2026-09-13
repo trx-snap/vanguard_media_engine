@@ -229,6 +229,28 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private var latestMaskWidth = 0
     private var latestMaskHeight = 0
 
+    // -- Green-screen static background GL state -------------------------------
+
+    /** Current background spec. Render-thread only; default preserves prior behavior. */
+    private var greenScreenBackground: AndroidDuetGreenScreenBackground = AndroidDuetGreenScreenBackground.VIDEO
+
+    /** GL texture id for a decoded [AndroidDuetGreenScreenBackgroundType.IMAGE] background. 0 = none loaded. */
+    private var backgroundImageTextureId = 0
+    private var backgroundImageWidthPx = 0
+    private var backgroundImageHeightPx = 0
+
+    /** File path the currently-loaded [backgroundImageTextureId] was decoded from, if any. */
+    private var backgroundImageLoadedPath: String? = null
+
+    /** True once decode/texture upload has failed for [backgroundImageLoadedPath]; stops retrying every frame. */
+    private var backgroundImageDecodeFailed = false
+
+    /** GLES program: plain 2D texture sampler used to draw a static image background. 0 = not yet compiled. */
+    private var backgroundImageProgram = 0
+    private var bgImageAPositionLoc = -1
+    private var bgImageATexCoordLoc = -1
+    private var bgImageSTextureLoc = -1
+
     private val quadPositions: FloatBuffer = floatBufferOf(
         -1f, -1f,
          1f, -1f,
@@ -373,6 +395,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         }
     }
 
+    /**
+     * Stores the new background spec; render-thread only (posted here by the
+     * render loop). The actual image decode/texture (re)load is deferred to
+     * [ensureBackgroundImageTexture] inside [drawFrame], mirroring how
+     * [updateGreenScreenMask] defers its GL upload to [uploadMaskTexture] —
+     * both need the EGL context current, which is only guaranteed there.
+     */
+    override fun setGreenScreenBackground(background: AndroidDuetGreenScreenBackground) {
+        greenScreenBackground = background
+    }
+
 
     /**
      * Composites one frame into the attached output surface:
@@ -425,7 +458,13 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             GLES20.glClearColor(0f, 0f, 0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-            if (hasTexImage) {
+            // Background: in green-screen mode, the background may be the
+            // source video (default, unchanged behavior), a solid color, or a
+            // static image — drawn before the masked camera. Every other
+            // layout mode keeps the unconditional source-video draw.
+            if (greenScreenEnabled) {
+                drawGreenScreenBackground(sourceRect ?: fullSurfaceRect())
+            } else if (hasTexImage) {
                 drawSourceRect(sourceRect ?: fullSurfaceRect())
             }
 
@@ -497,6 +536,12 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             try {
                 if (maskTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(maskTextureId), 0)
             } catch (_: Throwable) {}
+            try {
+                if (backgroundImageProgram != 0) GLES20.glDeleteProgram(backgroundImageProgram)
+            } catch (_: Throwable) {}
+            try {
+                if (backgroundImageTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(backgroundImageTextureId), 0)
+            } catch (_: Throwable) {}
         }
         oesProgram = 0
         oesTextureId = 0
@@ -507,6 +552,12 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         hasLoggedFirstMaskUpload = false
         latestMaskWidth = 0
         latestMaskHeight = 0
+        backgroundImageProgram = 0
+        backgroundImageTextureId = 0
+        backgroundImageWidthPx = 0
+        backgroundImageHeightPx = 0
+        backgroundImageLoadedPath = null
+        backgroundImageDecodeFailed = false
 
         try { _decoderInputSurface?.release() } catch (_: Throwable) {}
         _decoderInputSurface = null
@@ -1041,6 +1092,247 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
         GLES20.glDisable(GLES20.GL_BLEND)
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    // -- Green-screen static background draws -----------------------------------
+
+    /**
+     * Draws the background layer beneath the masked camera in green-screen
+     * mode, dispatching on [greenScreenBackground]'s type. [VIDEO] preserves
+     * the exact prior behavior (source drawn only once a real frame has
+     * latched); [SOLID_COLOR] and [IMAGE] never touch the decoder.
+     */
+    private fun drawGreenScreenBackground(rect: VGDuetPixelRect) {
+        when (greenScreenBackground.type) {
+            AndroidDuetGreenScreenBackgroundType.VIDEO -> {
+                releaseBackgroundImageTextureQuietly()
+                if (hasTexImage) drawSourceRect(rect)
+            }
+            AndroidDuetGreenScreenBackgroundType.SOLID_COLOR -> {
+                releaseBackgroundImageTextureQuietly()
+                drawSolidColorBackground(rect, greenScreenBackground.argbColor)
+            }
+            AndroidDuetGreenScreenBackgroundType.IMAGE -> {
+                ensureBackgroundImageTexture(greenScreenBackground)
+                if (backgroundImageTextureId != 0) {
+                    drawImageBackground(rect)
+                } else {
+                    // Missing path or decode failure: opaque black fallback.
+                    drawSolidColorBackground(rect, AndroidDuetGreenScreenBackground.VIDEO.argbColor)
+                }
+            }
+        }
+    }
+
+    /** Solid ARGB scissor-clear of [rect]. Used for [SOLID_COLOR] and as the IMAGE fallback. */
+    private fun drawSolidColorBackground(rect: VGDuetPixelRect, argbColor: Int) {
+        val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
+        if (scissor.width <= 0 || scissor.height <= 0) return
+        val a = ((argbColor ushr 24) and 0xFF) / 255f
+        val r = ((argbColor ushr 16) and 0xFF) / 255f
+        val g = ((argbColor ushr 8) and 0xFF) / 255f
+        val b = (argbColor and 0xFF) / 255f
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glClearColor(r, g, b, a)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    /**
+     * Lazily (re)loads [bg]'s image file into [backgroundImageTextureId].
+     * No-ops once a texture matching [bg]'s filePath is already loaded, or
+     * once decode/upload has already failed for that path (never retries
+     * every frame). Releases a stale texture from a previous path first.
+     * Must run on the render thread with the EGL context current (called
+     * from inside [drawFrame]).
+     */
+    private fun ensureBackgroundImageTexture(bg: AndroidDuetGreenScreenBackground) {
+        if (backgroundImageTextureId != 0 && backgroundImageLoadedPath == bg.filePath) return
+        if (backgroundImageLoadedPath != bg.filePath) {
+            releaseBackgroundImageTextureQuietly()
+            // A prior failure was scoped to the old path; a new path deserves
+            // its own decode attempt rather than inheriting that failure.
+            backgroundImageDecodeFailed = false
+        }
+        backgroundImageLoadedPath = bg.filePath
+        if (backgroundImageDecodeFailed) return
+
+        val path = bg.filePath
+        if (path == null) {
+            backgroundImageDecodeFailed = true
+            Log.w(TAG, "ANDROID_DUET_GREENSCREEN_BACKGROUND_IMAGE_FALLBACK reason=missing_path path=")
+            return
+        }
+        val bitmap = try {
+            android.graphics.BitmapFactory.decodeFile(path)
+        } catch (t: Throwable) {
+            null
+        }
+        if (bitmap == null) {
+            backgroundImageDecodeFailed = true
+            Log.w(TAG, "ANDROID_DUET_GREENSCREEN_BACKGROUND_IMAGE_FALLBACK reason=decode_failed path=$path")
+            return
+        }
+        try {
+            val texIds = IntArray(1)
+            GLES20.glGenTextures(1, texIds, 0)
+            val texId = texIds[0]
+            if (texId == 0) {
+                backgroundImageDecodeFailed = true
+                Log.w(TAG, "ANDROID_DUET_GREENSCREEN_BACKGROUND_IMAGE_FALLBACK reason=texture_alloc_failed path=$path")
+                return
+            }
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            backgroundImageTextureId = texId
+            backgroundImageWidthPx = bitmap.width
+            backgroundImageHeightPx = bitmap.height
+            backgroundImageDecodeFailed = false
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    /**
+     * Releases the current background image texture and its cached path/failure
+     * state (idempotent). Clearing [backgroundImageLoadedPath] and
+     * [backgroundImageDecodeFailed] here ensures switching away to VIDEO/SOLID_COLOR
+     * never leaves stale state that would block a later reload of the same path.
+     * Render-thread only.
+     */
+    private fun releaseBackgroundImageTextureQuietly() {
+        if (backgroundImageTextureId != 0) {
+            try { GLES20.glDeleteTextures(1, intArrayOf(backgroundImageTextureId), 0) } catch (_: Throwable) {}
+        }
+        backgroundImageTextureId = 0
+        backgroundImageWidthPx = 0
+        backgroundImageHeightPx = 0
+        backgroundImageLoadedPath = null
+        backgroundImageDecodeFailed = false
+    }
+
+    /**
+     * Draws [backgroundImageTextureId] into [rect] using [greenScreenBackground]'s
+     * scale mode. Letterbox/pillarbox area (aspectFit) is cleared to black first.
+     */
+    private fun drawImageBackground(rect: VGDuetPixelRect) {
+        val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
+        if (scissor.width <= 0 || scissor.height <= 0) return
+        ensureBackgroundImageProgram()
+        if (backgroundImageProgram == 0) {
+            drawSolidColorBackground(rect, AndroidDuetGreenScreenBackground.VIDEO.argbColor)
+            return
+        }
+
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        val viewport = backgroundImageAspectViewport(rect)
+        GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
+
+        GLES20.glUseProgram(backgroundImageProgram)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, backgroundImageTextureId)
+        GLES20.glUniform1i(bgImageSTextureLoc, 0)
+
+        quadPositions.position(0)
+        GLES20.glEnableVertexAttribArray(bgImageAPositionLoc)
+        GLES20.glVertexAttribPointer(bgImageAPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
+        quadTexCoords.position(0)
+        GLES20.glEnableVertexAttribArray(bgImageATexCoordLoc)
+        GLES20.glVertexAttribPointer(bgImageATexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(bgImageAPositionLoc)
+        GLES20.glDisableVertexAttribArray(bgImageATexCoordLoc)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    /**
+     * Viewport for the background image inside [rect], per [greenScreenBackground]'s
+     * scale mode: aspectFill (cover, overflow cropped by the scissor already set)
+     * or aspectFit (contain, remaining area stays the black clear from [drawImageBackground]).
+     * Unknown image size degrades to the rect itself (stretch).
+     */
+    private fun backgroundImageAspectViewport(rect: VGDuetPixelRect): GlRect {
+        val rectW = rect.width
+        val rectH = rect.height
+        if (backgroundImageWidthPx <= 0 || backgroundImageHeightPx <= 0 || rectW <= 0.0 || rectH <= 0.0) {
+            return toGlRect(rect.left, rect.top, rectW, rectH)
+        }
+        val imageAspect = backgroundImageWidthPx.toDouble() / backgroundImageHeightPx.toDouble()
+        val rectAspect = rectW / rectH
+        val cover = greenScreenBackground.scaleMode != AndroidDuetBackgroundScaleMode.ASPECT_FIT
+        val matchHeightBasis = if (cover) imageAspect > rectAspect else imageAspect <= rectAspect
+        val drawnW: Double
+        val drawnH: Double
+        if (matchHeightBasis) {
+            drawnH = rectH
+            drawnW = rectH * imageAspect
+        } else {
+            drawnW = rectW
+            drawnH = rectW / imageAspect
+        }
+        return toGlRect(
+            rect.left - (drawnW - rectW) / 2.0,
+            rect.top - (drawnH - rectH) / 2.0,
+            drawnW,
+            drawnH,
+        )
+    }
+
+    /** Lazily compiles the plain 2D-texture shader used to draw a static image background. */
+    private fun ensureBackgroundImageProgram() {
+        if (backgroundImageProgram != 0) return
+        val vertexSrc = """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            varying vec2 vTextureCoord;
+            void main() {
+                gl_Position = aPosition;
+                // Flip V: glTexImage2D uploads Bitmap row 0 (the image's top
+                // row) first, which OpenGL treats as v=0. Without this flip
+                // the image would be drawn upside down.
+                vTextureCoord = vec2(aTextureCoord.x, 1.0 - aTextureCoord.y);
+            }
+        """.trimIndent()
+        val fragmentSrc = """
+            precision mediump float;
+            varying vec2 vTextureCoord;
+            uniform sampler2D sTexture;
+            void main() {
+                gl_FragColor = texture2D(sTexture, vTextureCoord);
+            }
+        """.trimIndent()
+        val vs = compileShader(GLES20.GL_VERTEX_SHADER, vertexSrc)
+        val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSrc)
+        val prog = GLES20.glCreateProgram()
+        GLES20.glAttachShader(prog, vs)
+        GLES20.glAttachShader(prog, fs)
+        GLES20.glLinkProgram(prog)
+        GLES20.glDeleteShader(vs)
+        GLES20.glDeleteShader(fs)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            val log = GLES20.glGetProgramInfoLog(prog)
+            GLES20.glDeleteProgram(prog)
+            Log.w(TAG, "background image GL program link failed: $log")
+            return
+        }
+        backgroundImageProgram = prog
+        bgImageAPositionLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        bgImageATexCoordLoc = GLES20.glGetAttribLocation(prog, "aTextureCoord")
+        bgImageSTextureLoc = GLES20.glGetUniformLocation(prog, "sTexture")
     }
 
     private fun compileShader(type: Int, src: String): Int {
