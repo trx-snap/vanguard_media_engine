@@ -3,6 +3,7 @@ package com.connects.vanguard_media_engine.duet
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.view.Surface
 import java.util.concurrent.CountDownLatch
@@ -155,6 +156,9 @@ class AndroidDuetPreviewRenderLoop(
     @Volatile
     private var activePtsProvider: (() -> Long)? = null
 
+    /** One-shot diagnostic latch for the startActive idle-redraw suppression marker. */
+    private val activeIdleRedrawSuppressionLogged = AtomicBoolean(false)
+
     // -- Decoder op queue: one in flight, one coalesced pending -----------------
 
     private sealed class DecoderOp {
@@ -257,6 +261,17 @@ class AndroidDuetPreviewRenderLoop(
         if (isStopped.get()) return
         activePtsProvider = targetPtsProvider
         isActive = true
+        // Active decoder-driven presentation owns drawFrame while active. The
+        // camera idle redraw must not run concurrently: its drawFrame consumes
+        // the compositor's pending source frame before postPresentAttempt sees
+        // it, forcing the present to wait out its bounded retry budget and
+        // presenting decoded frames late/unevenly. Every active tick ends in a
+        // present that draws the camera too, so the camera stays live without
+        // it. Idle redraw resumes on pause/hold via stopTicking().
+        stopCameraIdleRedraw()
+        if (activeIdleRedrawSuppressionLogged.compareAndSet(false, true)) {
+            Log.d(TAG, "ANDROID_DUET_RENDER_LOOP_ACTIVE_IDLE_REDRAW_SUPPRESSED")
+        }
         renderHandler.removeCallbacks(tickRunnable)
         renderHandler.post(tickRunnable)
     }
@@ -311,6 +326,21 @@ class AndroidDuetPreviewRenderLoop(
     }
 
     /**
+     * Debug/opt-in seam (Camera2 GPU green-screen source): forwards the live
+     * camera feed's normalized display rotation and mirror state to the
+     * compositor. Posts to the render thread, mirroring [setGreenScreenEnabled]'s
+     * posting style so the compositor's render-thread-only state is always
+     * mutated on the correct thread.
+     */
+    fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean) {
+        if (isStopped.get()) return
+        renderHandler.post {
+            if (isStopped.get()) return@post
+            compositor.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
+        }
+    }
+
+    /**
      * Delivers a new segmentation mask to the compositor for the next draw.
      * Posts to the render thread; the compositor's AtomicReference absorbs
      * any thread-safety concern between this post and the next drawFrame.
@@ -321,6 +351,97 @@ class AndroidDuetPreviewRenderLoop(
         renderHandler.post {
             if (isStopped.get()) return@post
             compositor.updateGreenScreenMask(frame)
+        }
+    }
+
+    /**
+     * Debug-only (RND diagnostic): forwards a raw mask visualization mode
+     * ("mask_direct" | "mask_mapped" | "mask_direct_mirror_x" |
+     * "mask_direct_flip_y", or null/anything else to disable) to the
+     * compositor. Posts to the render thread, mirroring
+     * [setGreenScreenEnabled]'s posting style so the compositor's
+     * render-thread-only state is always mutated on the correct thread. Safe
+     * to call after [stopBlocking] — checked before posting and again inside
+     * the posted task, matching every other post in this class.
+     */
+    fun setGreenScreenDebugView(view: String?) {
+        if (isStopped.get()) return
+        renderHandler.post {
+            if (isStopped.get()) return@post
+            compositor.setGreenScreenDebugView(view)
+        }
+    }
+
+    /**
+     * Debug-only (RND diagnostic): forwards a static solid-color background
+     * mode (e.g. "solid_teal", or null/anything else to disable) to the
+     * compositor. Posts to the render thread, mirroring
+     * [setGreenScreenDebugView]'s posting style so the compositor's
+     * render-thread-only state is always mutated on the correct thread. Safe
+     * to call after [stopBlocking] — checked before posting and again inside
+     * the posted task, matching every other post in this class.
+     */
+    fun setGreenScreenBackgroundMode(mode: String?) {
+        if (isStopped.get()) return
+        renderHandler.post {
+            if (isStopped.get()) return@post
+            compositor.setGreenScreenBackgroundMode(mode)
+        }
+    }
+
+    /**
+     * Delivers a GPU-resident (HardwareBuffer-backed) segmentation mask to
+     * the compositor on the SAME serialized render lane as every other
+     * compositor call, mirroring [updateGreenScreenMask]. Ownership of
+     * [hardwareBuffer] transfers to this call regardless of outcome (see
+     * [AndroidDuetPreviewBackend.updateGreenScreenMaskHardwareBuffer]): if
+     * the loop is stopped, or the post fails because the render looper has
+     * already quit, [hardwareBuffer] is closed here so it is never leaked.
+     */
+    fun updateGreenScreenMaskHardwareBuffer(
+        hardwareBuffer: android.hardware.HardwareBuffer,
+        widthPx: Int,
+        heightPx: Int,
+        timestampUs: Long,
+        onReleased: ((android.hardware.HardwareBuffer) -> Unit)? = null,
+        acquireFenceFd: Int = -1,
+    ) {
+        if (isStopped.get()) {
+            closeFenceFdQuietly(acquireFenceFd)
+            releaseGpuMaskBuffer(hardwareBuffer, onReleased)
+            return
+        }
+        val posted = renderHandler.post {
+            if (isStopped.get()) {
+                closeFenceFdQuietly(acquireFenceFd)
+                releaseGpuMaskBuffer(hardwareBuffer, onReleased)
+                return@post
+            }
+            compositor.updateGreenScreenMaskHardwareBuffer(
+                hardwareBuffer, widthPx, heightPx, timestampUs, onReleased, acquireFenceFd,
+            )
+        }
+        if (!posted) {
+            closeFenceFdQuietly(acquireFenceFd)
+            releaseGpuMaskBuffer(hardwareBuffer, onReleased)
+        }
+    }
+
+    private fun closeFenceFdQuietly(fd: Int) {
+        if (fd < 0) return
+        try {
+            ParcelFileDescriptor.adoptFd(fd).close()
+        } catch (_: Throwable) {}
+    }
+
+    private fun releaseGpuMaskBuffer(
+        hardwareBuffer: android.hardware.HardwareBuffer,
+        onReleased: ((android.hardware.HardwareBuffer) -> Unit)?,
+    ) {
+        if (onReleased != null) {
+            onReleased(hardwareBuffer)
+        } else {
+            try { hardwareBuffer.close() } catch (_: Throwable) {}
         }
     }
 
@@ -568,29 +689,29 @@ class AndroidDuetPreviewRenderLoop(
             renderHandler.post { decoderBound = false }
             return
         }
-        postPresent(op.generation, expectNewFrame = true, decoder!!.videoWidth, decoder.videoHeight)
+        postPresent(op.generation, expectNewFrame = true, decoder!!.videoWidth, decoder.videoHeight, decoder.videoRotationDegrees)
     }
 
     private fun runStepOp(op: DecoderOp.Step) {
         if (isStopped.get()) return
         val decoder = decoderProvider()
         if (decoder == null) {
-            postPresent(op.generation, expectNewFrame = false, 0, 0)
+            postPresent(op.generation, expectNewFrame = false, 0, 0, 0)
             return
         }
         val result = decoder.stepFrame(op.targetPtsMs)
-        postPresent(op.generation, result.advancedToNewFrame, decoder.videoWidth, decoder.videoHeight)
+        postPresent(op.generation, result.advancedToNewFrame, decoder.videoWidth, decoder.videoHeight, decoder.videoRotationDegrees)
     }
 
     private fun runSeekOp(op: DecoderOp.Seek) {
         if (isStopped.get()) return
         val decoder = decoderProvider()
         if (decoder == null) {
-            postPresent(op.generation, expectNewFrame = false, 0, 0)
+            postPresent(op.generation, expectNewFrame = false, 0, 0, 0)
             return
         }
         val reached = decoder.seekTo(op.targetPtsMs)
-        postPresent(op.generation, expectNewFrame = reached, decoder.videoWidth, decoder.videoHeight)
+        postPresent(op.generation, expectNewFrame = reached, decoder.videoWidth, decoder.videoHeight, decoder.videoRotationDegrees)
     }
 
     private fun runUnbindOp(op: DecoderOp.Unbind) {
@@ -605,8 +726,14 @@ class AndroidDuetPreviewRenderLoop(
 
     // -- Present (render thread only) -------------------------------------------
 
-    private fun postPresent(generation: Int, expectNewFrame: Boolean, videoWidthPx: Int, videoHeightPx: Int) {
-        postPresentAttempt(generation, expectNewFrame, videoWidthPx, videoHeightPx, attempt = 0, delayMs = 0L)
+    private fun postPresent(
+        generation: Int,
+        expectNewFrame: Boolean,
+        videoWidthPx: Int,
+        videoHeightPx: Int,
+        videoRotationDegrees: Int,
+    ) {
+        postPresentAttempt(generation, expectNewFrame, videoWidthPx, videoHeightPx, videoRotationDegrees, attempt = 0, delayMs = 0L)
     }
 
     private fun postPresentAttempt(
@@ -614,21 +741,22 @@ class AndroidDuetPreviewRenderLoop(
         expectNewFrame: Boolean,
         videoWidthPx: Int,
         videoHeightPx: Int,
+        videoRotationDegrees: Int,
         attempt: Int,
         delayMs: Long,
     ) {
         val task = Runnable {
             if (isStopped.get()) return@Runnable
-            // Video size applies regardless of generation: it describes the
-            // source stream, which survives output loss.
+            // Video size/rotation applies regardless of generation: it
+            // describes the source stream, which survives output loss.
             if (videoWidthPx > 0 && videoHeightPx > 0) {
-                compositor.setSourceVideoSize(videoWidthPx, videoHeightPx)
+                compositor.setSourceVideoMetadata(videoWidthPx, videoHeightPx, videoRotationDegrees)
             }
             if (generation != surfaceGeneration.get() || !canSubmit.get()) return@Runnable
             if (expectNewFrame && !compositor.hasPendingSourceFrame && attempt < MAX_PRESENT_WAIT_ATTEMPTS) {
                 // Decoder rendered but the frame-available signal has not
                 // arrived yet; re-post instead of blocking the render thread.
-                postPresentAttempt(generation, true, 0, 0, attempt + 1, PRESENT_WAIT_DELAY_MS)
+                postPresentAttempt(generation, true, 0, 0, 0, attempt + 1, PRESENT_WAIT_DELAY_MS)
                 return@Runnable
             }
             compositor.drawFrame()

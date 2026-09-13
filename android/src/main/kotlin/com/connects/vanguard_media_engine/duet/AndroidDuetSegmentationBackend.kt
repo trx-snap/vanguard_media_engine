@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.hardware.HardwareBuffer
 import androidx.camera.core.ImageProxy
 
 // -----------------------------------------------------------------------------
@@ -35,6 +36,32 @@ import androidx.camera.core.ImageProxy
 sealed class DuetSegmentationOutcome {
     /** A mask the adapter may forward to the compositor. */
     class Mask(val frame: AndroidDuetSegmentationFrame) : DuetSegmentationOutcome()
+
+    /**
+     * A GPU-resident mask backed by an owned [HardwareBuffer], for a future
+     * GPU segmentation backend (e.g. a MediaPipe GPU graph) that produces its
+     * result directly on the GPU instead of a CPU-readable mask buffer.
+     *
+     * Ownership: the backend transfers ownership of [hardwareBuffer] to this
+     * outcome the moment it is constructed and passed to `completion`. From
+     * that point, exactly one of the following must happen to [hardwareBuffer]:
+     *   - it is handed off exactly once to
+     *     [AndroidDuetGreenScreenAdapter]'s `onGpuMask` callback (which in turn
+     *     hands it to [AndroidDuetPreviewRenderLoop.updateGreenScreenMaskHardwareBuffer],
+     *     which always takes ownership — closing it itself on every
+     *     stopped/failed-post path), or
+     *   - it is closed directly by the adapter if the adapter is not in a
+     *     state to deliver it (stopped/terminal).
+     * No code path may both deliver and close it, and no path may do neither.
+     * GPU masks never pass through [AndroidDuetMaskTemporalSmoother]; temporal
+     * smoothing operates on CPU [Mask] frames only.
+     */
+    class GpuMask(
+        val hardwareBuffer: HardwareBuffer,
+        val widthPx: Int,
+        val heightPx: Int,
+        val timestampUs: Long,
+    ) : DuetSegmentationOutcome()
 
     /**
      * No mask for this frame, backend still healthy (e.g. no media image, or
@@ -95,6 +122,7 @@ object DuetSegmentationFailureReason {
     /** Reason when a backend's [AndroidDuetSegmentationBackend.open] throws. */
     fun initFailed(backendId: String): String = when (backendId) {
         DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_INIT_FAILED
+        DuetSegmentationBackend.MEDIAPIPE_GPU_GRAPH -> "${backendId}_init_failed"
         DuetSegmentationBackend.MEDIAPIPE_CPU  -> MEDIAPIPE_INIT_FAILED
         DuetSegmentationBackend.MLKIT          -> MLKIT_INIT_FAILED
         DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_INIT_FAILED
@@ -104,6 +132,7 @@ object DuetSegmentationFailureReason {
     /** Reason when [ImageProxy] -> Bitmap conversion fails on a MediaPipe or TFLite rung. */
     fun frameConvertFailed(backendId: String): String = when (backendId) {
         DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_FRAME_CONVERT_FAILED
+        DuetSegmentationBackend.MEDIAPIPE_GPU_GRAPH -> "${backendId}_frame_convert_failed"
         DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_FRAME_CONVERT_FAILED
         else                                   -> MEDIAPIPE_FRAME_CONVERT_FAILED
     }
@@ -111,6 +140,7 @@ object DuetSegmentationFailureReason {
     /** Reason when inference throws on a segmentation rung. */
     fun inferenceFailed(backendId: String): String = when (backendId) {
         DuetSegmentationBackend.MEDIAPIPE_GPU  -> MEDIAPIPE_GPU_INFERENCE_FAILED
+        DuetSegmentationBackend.MEDIAPIPE_GPU_GRAPH -> "${backendId}_inference_failed"
         DuetSegmentationBackend.RAW_TFLITE_GPU -> RAW_TFLITE_GPU_INFERENCE_FAILED
         else                                   -> MEDIAPIPE_INFERENCE_FAILED
     }

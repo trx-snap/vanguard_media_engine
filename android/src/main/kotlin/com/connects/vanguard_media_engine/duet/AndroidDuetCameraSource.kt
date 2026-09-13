@@ -142,8 +142,10 @@ class AndroidDuetCameraSource(private val context: Context) {
      *
      * [targetSurface] is compositor-owned: this class never releases it.
      * [analyzer] is optional. When non-null, an ImageAnalysis use-case is bound
-     *   alongside Preview using STRATEGY_KEEP_ONLY_LATEST and a capped resolution
-     *   of 256 px on the shortest side. Preview never waits for analysis.
+     *   alongside Preview using STRATEGY_KEEP_ONLY_LATEST and the same 16:9
+     *   resolution family as Preview (target ~256x144), so the segmentation
+     *   input covers the same field of view as what is actually shown on
+     *   screen. Preview never waits for analysis.
      * [onStarted] fires on the main thread when CameraX accepts the surface.
      * [onError] fires on the main thread on any failure (including missing
      *   CAMERA permission, in which case a SecurityException is passed).
@@ -301,10 +303,14 @@ class AndroidDuetCameraSource(private val context: Context) {
             }
 
             val useCases = if (analyzer != null) {
+                // Same 16:9 aspect-ratio family as Preview (RATIO_16_9_FALLBACK_AUTO_STRATEGY
+                // above), with a small 256x144 target size, so analysis sees the same field
+                // of view as the live preview instead of a square crop with a different FOV.
                 val analysisResolutionSelector = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
                     .setResolutionStrategy(
                         ResolutionStrategy(
-                            Size(256, 256),
+                            Size(256, 144),
                             ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
                         )
                     )
@@ -320,7 +326,7 @@ class AndroidDuetCameraSource(private val context: Context) {
                 }
                 analyzerExecutor = executor
                 analysisUseCase.setAnalyzer(executor, analyzer)
-                Log.d(TAG, "bindPreview() — ImageAnalysis use-case bound (256px cap, KEEP_ONLY_LATEST)")
+                Log.d(TAG, "bindPreview() — ImageAnalysis use-case bound (16:9 ~256x144, KEEP_ONLY_LATEST)")
                 arrayOf(previewUseCase, analysisUseCase)
             } else {
                 arrayOf(previewUseCase)

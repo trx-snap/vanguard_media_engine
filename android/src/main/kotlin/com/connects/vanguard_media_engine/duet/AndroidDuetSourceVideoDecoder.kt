@@ -7,6 +7,7 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
+import android.util.Log
 import android.view.Surface
 import java.io.File
 import java.io.IOException
@@ -43,10 +44,29 @@ interface AndroidDuetFrameProvider {
     val lastPresentationTimeMs: Long
     val videoWidth: Int
     val videoHeight: Int
+    /**
+     * Normalized (0/90/180/270) clockwise display rotation the source video
+     * was recorded with (MediaFormat.KEY_ROTATION), so a compositor that
+     * aspect-fills by buffer dimensions can correct for a portrait-recorded
+     * source that decodes into a sideways buffer instead of rendering it
+     * rotated. 0 when the track carries no rotation metadata.
+     */
+    val videoRotationDegrees: Int
     val isEndOfStream: Boolean
     fun stepFrame(targetPtsMs: Long): AndroidDuetFrameStepResult
     fun seekTo(ptsMs: Long): Boolean
     fun release()
+}
+
+/** Normalizes any integer degrees to a cardinal 0/90/180/270 value; anything else maps to 0. */
+private fun normalizeVideoRotationDegrees(degrees: Int): Int {
+    return when (((degrees % 360) + 360) % 360) {
+        0 -> 0
+        90 -> 90
+        180 -> 180
+        270 -> 270
+        else -> 0
+    }
 }
 
 /**
@@ -73,7 +93,30 @@ class AndroidDuetSourceVideoDecoder(
     private val customSurface: Surface? = null,
 ) : AndroidDuetFrameProvider {
 
+    companion object {
+        private const val TAG = "DuetSourceVideoDecoder"
+
+        /**
+         * Largest backward step (lastPresentationTimeMs - targetPtsMs) that
+         * [stepFrame] treats as clock/frame-interval jitter and holds the
+         * current frame for. [decodeToTarget] lands on the first decoded frame
+         * whose PTS is >= the target, so the presented frame normally sits a
+         * little AHEAD of the playback clock; flushing + SEEK_TO_PREVIOUS_SYNC
+         * on every such marginal backward target rewinds to an earlier
+         * keyframe and visibly re-plays a GOP (flicker/loop). Larger backward
+         * deltas are real scrubs and still seek.
+         */
+        private const val BACKWARD_SEEK_TOLERANCE_MS = 500L
+
+        /** Small-backward-hold log throttle: first N, then every Mth. */
+        private const val SMALL_BACKWARD_HOLD_LOG_FIRST = 3L
+        private const val SMALL_BACKWARD_HOLD_LOG_EVERY = 120L
+    }
+
     private val isReleased = AtomicBoolean(false)
+
+    /** Decoder-thread-confined count of small backward targets held by [stepFrame]. */
+    private var smallBackwardHoldCount = 0L
 
     private var extractor: MediaExtractor? = null
     private var codec: MediaCodec? = null
@@ -90,6 +133,8 @@ class AndroidDuetSourceVideoDecoder(
     override var videoWidth: Int = 0
         private set
     override var videoHeight: Int = 0
+        private set
+    override var videoRotationDegrees: Int = 0
         private set
     override var lastPresentationTimeMs: Long = 0L
         private set
@@ -156,6 +201,7 @@ class AndroidDuetSourceVideoDecoder(
         videoHeight = selectedFormat.getInteger(MediaFormat.KEY_HEIGHT, 0)
         if (videoWidth <= 0) videoWidth = 64
         if (videoHeight <= 0) videoHeight = 64
+        videoRotationDegrees = normalizeVideoRotationDegrees(selectedFormat.getInteger(MediaFormat.KEY_ROTATION, 0))
 
         val mime = selectedFormat.getString(MediaFormat.KEY_MIME)
             ?: throw IOException("Missing MIME type for video track.")
@@ -232,15 +278,27 @@ class AndroidDuetSourceVideoDecoder(
 
     /**
      * Steps frame decoding on demand until [targetPtsMs].
+     *
+     * Backward targets are gated by [BACKWARD_SEEK_TOLERANCE_MS]: a target at
+     * or marginally behind the last presented frame holds that frame (no
+     * flush, no extractor seek); only a larger backward delta performs a real
+     * seek. Forward decode behavior is unchanged.
      */
     override fun stepFrame(targetPtsMs: Long): AndroidDuetFrameStepResult {
         if (isReleased.get()) return stepResult(advanced = false)
-        if (targetPtsMs < lastPresentationTimeMs) {
+        if (lastPresentationTimeMs >= targetPtsMs) {
+            val backwardDeltaMs = lastPresentationTimeMs - targetPtsMs
+            if (backwardDeltaMs <= BACKWARD_SEEK_TOLERANCE_MS) {
+                if (backwardDeltaMs > 0L) logSmallBackwardHold(targetPtsMs, backwardDeltaMs)
+                return stepResult(advanced = false)
+            }
+            Log.d(
+                TAG,
+                "ANDROID_DUET_DECODER_BACKWARD_SEEK " +
+                    "targetMs=$targetPtsMs lastMs=$lastPresentationTimeMs deltaMs=$backwardDeltaMs",
+            )
             seekTo(targetPtsMs)
             return stepResult(advanced = renderedOutputInLastDecode)
-        }
-        if (lastPresentationTimeMs >= targetPtsMs) {
-            return stepResult(advanced = false)
         }
         val reached = decodeToTarget(targetPtsMs * 1000L)
         var advanced = renderedOutputInLastDecode
@@ -249,6 +307,19 @@ class AndroidDuetSourceVideoDecoder(
             advanced = advanced || renderedOutputInLastDecode
         }
         return stepResult(advanced = advanced)
+    }
+
+    /** Throttled marker for a small backward target held by [stepFrame]: first 3, then every 120th. */
+    private fun logSmallBackwardHold(targetPtsMs: Long, backwardDeltaMs: Long) {
+        smallBackwardHoldCount++
+        val n = smallBackwardHoldCount
+        if (n <= SMALL_BACKWARD_HOLD_LOG_FIRST || n % SMALL_BACKWARD_HOLD_LOG_EVERY == 0L) {
+            Log.d(
+                TAG,
+                "ANDROID_DUET_DECODER_SMALL_BACKWARD_HOLD " +
+                    "count=$n targetMs=$targetPtsMs lastMs=$lastPresentationTimeMs deltaMs=$backwardDeltaMs",
+            )
+        }
     }
 
     /**
@@ -340,6 +411,9 @@ class AndroidDuetSourceVideoDecoder(
                     val newFmt = dec.outputFormat
                     videoWidth  = newFmt.getInteger(MediaFormat.KEY_WIDTH, videoWidth)
                     videoHeight = newFmt.getInteger(MediaFormat.KEY_HEIGHT, videoHeight)
+                    videoRotationDegrees = normalizeVideoRotationDegrees(
+                        newFmt.getInteger(MediaFormat.KEY_ROTATION, videoRotationDegrees)
+                    )
                 }
                 outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     // bounded timeout, continue

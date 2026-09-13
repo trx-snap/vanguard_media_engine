@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.hardware.HardwareBuffer
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
@@ -72,6 +73,16 @@ class AndroidDuetGreenScreenAdapter(
     initialBackendId: String = selector.primaryBackendId(),
     /** Called with each owned mask frame. May fire off main thread. */
     private val onMask: (AndroidDuetSegmentationFrame) -> Unit,
+    /**
+     * Called with each owned GPU-resident mask (see
+     * [DuetSegmentationOutcome.GpuMask]). Receives the [HardwareBuffer] plus
+     * widthPx, heightPx, timestampUs. Ownership of the buffer transfers to
+     * this callback exactly once when it is invoked; the callback (or
+     * whatever it hands the buffer to) is responsible for eventually closing
+     * it. May fire off main thread. Never receives a CPU mask — those go
+     * through [onMask] and [AndroidDuetMaskTemporalSmoother] instead.
+     */
+    private val onGpuMask: (HardwareBuffer, Int, Int, Long) -> Unit,
     /**
      * Non-terminal degradation: [previousBackend] -> [currentBackend] with green
      * screen still live on [currentBackend]. Fires at most once per adapter.
@@ -340,6 +351,22 @@ class AndroidDuetGreenScreenAdapter(
                         try { onMask(temporalSmoother.smooth(outcome.frame)) } catch (t: Throwable) {
                             Log.w(TAG, "onMask threw: ${t.message}")
                         }
+                    }
+                }
+                is DuetSegmentationOutcome.GpuMask -> {
+                    // Fail closed: deliver exactly once while running/non-terminal,
+                    // otherwise (or if delivery throws) close here so the owned
+                    // HardwareBuffer is never leaked. GPU masks never touch
+                    // temporalSmoother — that path is CPU-mask only.
+                    if (isRunning.get() && !terminal.get()) {
+                        try {
+                            onGpuMask(outcome.hardwareBuffer, outcome.widthPx, outcome.heightPx, outcome.timestampUs)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "onGpuMask threw: ${t.message}")
+                            try { outcome.hardwareBuffer.close() } catch (_: Throwable) {}
+                        }
+                    } else {
+                        try { outcome.hardwareBuffer.close() } catch (_: Throwable) {}
                     }
                 }
                 is DuetSegmentationOutcome.Skipped -> {

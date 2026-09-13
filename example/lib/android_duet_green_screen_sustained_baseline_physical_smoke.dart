@@ -25,7 +25,14 @@
 //         debugRawTfliteGpuModelAssetPath keys sent)
 //       * preview texture attach success
 //       * startRecording activates render loop and camera
-//       * sustained production-ladder live preview window (mediapipe_cpu -> mlkit)
+//       * sustained production-ladder segmentation window (mediapipe_cpu -> mlkit) runs
+//         continuously against the live camera feed for the full observation duration,
+//         independent of the decoded source video's own playback position
+//       * the decoded source video plays (moving picture, not a frozen frame) for its
+//         trim window (0.0s -> kTrimEndSeconds, a known-safe ~9.0s window within the
+//         ~9.83s clip_A.mov fixture); AndroidDuetPreviewClock clamps it to a frozen
+//         last frame for the remainder of the observation window when
+//         kSustainedObservationSeconds exceeds kTrimEndSeconds (true at the 45s default)
 //       * zero matching Duet degrade/fallback events during window (green_screen_degraded /
 //         green_screen_fallback for this session, observed via VGDuetEvents.stream)
 //       * native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS /
@@ -33,6 +40,13 @@
 //         segmentation completion stats
 //       * stop/detach/dispose/temp cleanup complete
 //   - Non-claims:
+//       * no full-duration moving-video proof: clip_A.mov is only ~9.83s long, so a
+//         default 45s kSustainedObservationSeconds window cannot show ~35s of it as
+//         moving video no matter how the trim window is set; only the first
+//         kTrimEndSeconds (~9.0s) of the observation shows genuine source video motion,
+//         the rest is a frozen last frame. This does not affect the degrade/fallback
+//         event proof above, which is measured against the live camera feed, not the
+//         decoded source video.
 //       * no automated pixel/matte-quality proof
 //       * no export/audio proof
 //       * no all-device/low-end proof
@@ -68,8 +82,31 @@ const int kSustainedObservationSeconds = int.fromEnvironment(
   defaultValue: 45,
 );
 
+/// Optional debug-only MediaPipe CPU model asset override for R&D comparison.
+/// Empty keeps the production default model.
+const String kMediaPipeCpuModelAsset = String.fromEnvironment(
+  'MEDIAPIPE_CPU_MODEL_ASSET',
+  defaultValue: '',
+);
+
 /// How often an observe tick (and eventCount snapshot) is printed.
 const int kObserveTickIntervalSeconds = 5;
+
+/// ANDROID-DUET-VISUAL-REGISTRATION: trim end (seconds) for the staged source
+/// clip. clip_A.mov is only ~9.83s long (measured via ffprobe), far shorter
+/// than the default kSustainedObservationSeconds (45s). AndroidDuetPreviewClock
+/// clamps source playback to trimEndMs, so regardless of trim end the decoded
+/// source video cannot show moving picture for anywhere near the full default
+/// observation window — the previous fixed 2.5s trim end made this worse than
+/// necessary by freezing after only 2.5s. This value is a known-safe window
+/// within the fixture (leaving an ~0.8s margin below the measured duration)
+/// so the moving-video portion of the observation is maximized without
+/// requesting a decode past the physical end of the clip. This harness's
+/// actual purpose — detecting green_screen_degraded/green_screen_fallback
+/// events — is unaffected by the source video freezing, since segmentation
+/// runs continuously against the live camera feed for the entire window,
+/// independent of the (separate) decoded source video's playback position.
+const double kTrimEndSeconds = 9.0;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -198,10 +235,13 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
         },
       );
 
-      // Step 2: Initialize Duet session (trim: 0.0s - 2.5s).
+      // Step 2: Initialize Duet session (trim: 0.0s - kTrimEndSeconds). See
+      // kTrimEndSeconds' doc comment: this is a known-safe window within the
+      // ~9.83s clip_A.mov fixture, not a claim that the full sustained window
+      // shows moving video.
       sessionId = await runStep<String>(
         'INIT_SESSION',
-        'Initializing Duet session (trim: 0.0s - 2.5s)',
+        'Initializing Duet session (trim: 0.0s - ${kTrimEndSeconds}s)',
         () async {
           final result = await _withTimeout(
             _channel.invokeMethod<String>(
@@ -210,7 +250,7 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
                 'source': <String, dynamic>{'filePath': sourcePath},
                 'trimWindow': <String, dynamic>{
                   'startSeconds': 0.0,
-                  'endSeconds': 2.5,
+                  'endSeconds': kTrimEndSeconds,
                 },
               },
             ),
@@ -246,6 +286,13 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
       // debugRawTfliteGpuDelegateMode, and debugRawTfliteGpuModelAssetPath so
       // the session starts on the selector's normal primary
       // (mediapipe_cpu -> mlkit), exactly as a production session would.
+      final layoutConfig = <String, dynamic>{
+        'mode': 'greenScreen',
+        'isSideSwapped': false,
+        'isTopBottomSwapped': false,
+        if (kMediaPipeCpuModelAsset.isNotEmpty)
+          'debugMediaPipeCpuModelAssetPath': kMediaPipeCpuModelAsset,
+      };
       await runStep<void>(
         'ATTACH_PREVIEW_GREENSCREEN',
         'Attaching preview texture (1080x1920, greenScreen, production ladder)',
@@ -256,11 +303,7 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
               <String, dynamic>{
                 'sessionId': sessionId!,
                 'canvasSize': <String, dynamic>{'width': 1080, 'height': 1920},
-                'layoutConfig': <String, dynamic>{
-                  'mode': 'greenScreen',
-                  'isSideSwapped': false,
-                  'isTopBottomSwapped': false,
-                },
+                'layoutConfig': layoutConfig,
               },
             ),
             'attachDuetPreviewTexture',
@@ -470,8 +513,11 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
               'debugRawTfliteGpuModelAssetPath keys sent)',
           'preview texture attach success',
           'startRecording activates render loop and camera',
-          'sustained production-ladder live preview window (~${kSustainedObservationSeconds}s, '
-              'mediapipe_cpu -> mlkit)',
+          'sustained production-ladder segmentation window (~${kSustainedObservationSeconds}s, '
+              'mediapipe_cpu -> mlkit) runs continuously against the live camera feed for the '
+              'full observation duration, independent of the decoded source video playback position',
+          'decoded source video plays as moving picture (not a frozen frame) for its trim window '
+              '(0.0s -> ${kTrimEndSeconds}s, a known-safe window within the ~9.83s clip_A.mov fixture)',
           'zero matching Duet degrade/fallback events (green_screen_degraded / '
               'green_screen_fallback) for this session during the sustained observation window',
           'native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS / '
@@ -480,6 +526,12 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
           'stop/detach/dispose/temp cleanup complete',
         ],
         'nonClaims': <String>[
+          'no full-duration moving-video proof: clip_A.mov is only ~9.83s long, so the default '
+              '${kSustainedObservationSeconds}s observation window cannot show the full duration as '
+              'moving video; only the first ${kTrimEndSeconds}s show genuine source video motion, '
+              'the remainder is a frozen last frame (AndroidDuetPreviewClock trim-clamp) — this does '
+              'not affect the degrade/fallback event proof above, which is measured independently '
+              'against the live camera feed',
           'no automated pixel/matte-quality proof',
           'no export/audio proof',
           'no all-device/low-end proof',
@@ -487,6 +539,7 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
         ],
         'sessionId': sessionId,
         'textureId': textureId,
+        'trimEndSeconds': kTrimEndSeconds,
         'duetEvents': duetEvents,
         'stepResults': stepResults,
         'failures': failures,

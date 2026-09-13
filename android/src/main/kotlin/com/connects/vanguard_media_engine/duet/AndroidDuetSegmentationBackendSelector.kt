@@ -22,11 +22,9 @@ import android.util.Log
 //     not offered to any device yet. The GPU backend implementation itself
 //     (AndroidDuetMediaPipeSegmentationBackend.gpu) is kept latent/experimental
 //     for future investigation.
-//   - raw_tflite_gpu is in EXTENDED_LADDER before mediapipe_cpu so that a
+//   - raw_tflite_gpu is in the debug ladder before mediapipe_cpu so that a
 //     session explicitly started on it (via debugSegmentationBackend) degrades
-//     to CPU on failure. It is NEVER in the default production primary path:
-//     [supports] returns true only when context != null AND the Android asset is
-//     readable; [primaryBackendId] never returns it.
+//     to CPU on failure. It is NEVER in the default production primary path.
 //   - MediaPipe CPU is primary whenever the bundled model asset is readable
 //     from the merged app assets. True CPU delegate support can only be
 //     proven by actually opening the ImageSegmenter (createFromOptions with
@@ -58,6 +56,12 @@ class AndroidDuetSegmentationBackendSelector(
      * `null` → default ([TFLITE_GPU_MODEL_ASSET_PATH]). Ignored for all other backends.
      */
     private val rawGpuModelAssetPath: String? = null,
+    /**
+     * Debug-only model asset path for [DuetSegmentationBackend.MEDIAPIPE_CPU].
+     * Must be allowlisted by [MEDIAPIPE_MODEL_ALLOWLIST] before it reaches this
+     * selector. `null` keeps the production default [MODEL_ASSET_PATH].
+     */
+    private val mediaPipeCpuModelAssetPath: String? = null,
 ) {
 
     /** Context this selector was constructed with, exposed so the adapter can build its adaptive-quality policy. */
@@ -66,8 +70,25 @@ class AndroidDuetSegmentationBackendSelector(
     companion object {
         private const val TAG = "DuetSegSelector"
 
-        /** Asset-relative path of the bundled MediaPipe selfie segmenter model. */
-        const val MODEL_ASSET_PATH = "selfie_segmenter.tflite"
+        /**
+         * Asset-relative path of the bundled MediaPipe selfie segmenter model
+         * used by the production CPU rung.
+         *
+         * SM A566B physical evidence: the landscape variant sustained 651 masks
+         * over 44.077s with no skips/failures/degrade and nominal thermal state,
+         * outperforming the previous `selfie_segmenter.tflite` baseline.
+         */
+        const val MODEL_ASSET_PATH = "selfie_segmentation_landscape.tflite"
+
+        /**
+         * Allowlist of asset-relative model paths accepted by the debug-only
+         * MediaPipe CPU model override.
+         */
+        val MEDIAPIPE_MODEL_ALLOWLIST: Set<String> = setOf(
+            MODEL_ASSET_PATH,
+            "selfie_segmentation.tflite",
+            "selfie_segmentation_landscape.tflite",
+        )
 
         /**
          * Asset-relative path of the bundled raw TFLite multiclass selfie model.
@@ -87,10 +108,9 @@ class AndroidDuetSegmentationBackendSelector(
         )
 
         /**
-         * Extended ladder including [DuetSegmentationBackend.RAW_TFLITE_GPU]
-         * before MEDIAPIPE_CPU. Used only when a session explicitly opts in to
-         * raw_tflite_gpu via `debugSegmentationBackend`. Degradation follows:
-         * raw_tflite_gpu -> mediapipe_cpu -> mlkit -> none (safe PiP).
+         * Extended ladder including the debug opt-in [DuetSegmentationBackend.RAW_TFLITE_GPU]
+         * rung before MEDIAPIPE_CPU. Runtime [nextBackendId] special-cases RAW_TFLITE_GPU
+         * so it degrades directly to mediapipe_cpu.
          */
         val EXTENDED_LADDER: List<String> = listOf(
             DuetSegmentationBackend.RAW_TFLITE_GPU,
@@ -102,13 +122,14 @@ class AndroidDuetSegmentationBackendSelector(
          * Allowlist of asset-relative model paths accepted by the raw_tflite_gpu
          * debug backend. Validated by [AndroidDuetSessionCoordinator] before the
          * selector is constructed; invalid paths fall back to [TFLITE_GPU_MODEL_ASSET_PATH].
-         * [MODEL_ASSET_PATH] (selfie_segmenter.tflite) is included as an opt-in
-         * degrade/negative lane; if the raw interpreter cannot open it due to a custom
-         * op, the existing adapter open-failure fallback handles degradation.
+         * [MODEL_ASSET_PATH] is included as an opt-in degrade/negative lane; if
+         * the raw interpreter cannot open it due to a custom op, the existing
+         * adapter open-failure fallback handles degradation.
          */
         val RAW_TFLITE_GPU_MODEL_ALLOWLIST: Set<String> = setOf(
             TFLITE_GPU_MODEL_ASSET_PATH,
             MODEL_ASSET_PATH,
+            "selfie_segmenter.tflite",
             "selfie_segmentation.tflite",
             "selfie_segmentation_landscape.tflite",
         )
@@ -121,11 +142,12 @@ class AndroidDuetSegmentationBackendSelector(
      */
     val isMediaPipeModelBundled: Boolean by lazy {
         val ctx = context ?: return@lazy false
+        val assetPath = mediaPipeCpuModelAssetPath ?: MODEL_ASSET_PATH
         try {
-            ctx.assets.open(MODEL_ASSET_PATH).use { }
+            ctx.assets.open(assetPath).use { }
             true
         } catch (t: Throwable) {
-            Log.w(TAG, "MediaPipe model asset '$MODEL_ASSET_PATH' not readable (${t.message}); " +
+            Log.w(TAG, "MediaPipe model asset '$assetPath' not readable (${t.message}); " +
                 "starting ladder at ${DuetSegmentationBackend.MLKIT}")
             false
         }
@@ -164,10 +186,13 @@ class AndroidDuetSegmentationBackendSelector(
 
     /**
      * Next rung below [backendId], or null when [backendId] is the last
-     * segmentation rung (terminal -> safe PiP). Searches EXTENDED_LADDER so
-     * that raw_tflite_gpu degrades to mediapipe_cpu.
+     * segmentation rung (terminal -> safe PiP). The [DuetSegmentationBackend.RAW_TFLITE_GPU]
+     * debug rung degrades directly to mediapipe_cpu.
      */
     fun nextBackendId(backendId: String): String? {
+        if (backendId == DuetSegmentationBackend.RAW_TFLITE_GPU) {
+            return DuetSegmentationBackend.MEDIAPIPE_CPU
+        }
         val idx = EXTENDED_LADDER.indexOf(backendId)
         if (idx < 0) return null
         return EXTENDED_LADDER.getOrNull(idx + 1)
@@ -207,7 +232,10 @@ class AndroidDuetSegmentationBackendSelector(
         DuetSegmentationBackend.MEDIAPIPE_CPU -> {
             val ctx = context
                 ?: throw IllegalArgumentException("MediaPipe backend requires a Context")
-            AndroidDuetMediaPipeSegmentationBackend.cpu(ctx.applicationContext ?: ctx, MODEL_ASSET_PATH)
+            AndroidDuetMediaPipeSegmentationBackend.cpu(
+                ctx.applicationContext ?: ctx,
+                mediaPipeCpuModelAssetPath ?: MODEL_ASSET_PATH,
+            )
         }
         DuetSegmentationBackend.MLKIT -> AndroidDuetMlKitSegmentationBackend()
         DuetSegmentationBackend.RAW_TFLITE_GPU -> {

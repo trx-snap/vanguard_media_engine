@@ -21,6 +21,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 // -----------------------------------------------------------------------------
 // VG-DUET-GREEN-SCREEN: MediaPipe Tasks Vision ImageSegmenter backend.
@@ -34,7 +35,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 //   - RunningMode.VIDEO, [modelAssetPath] is the bundled selfie segmenter model.
 //   - Input: CameraX YUV_420_888 ImageProxy -> ARGB_8888 Bitmap (rotated
 //     upright by ImageInfo.rotationDegrees so the mask has the same
-//     orientation semantics as the ML Kit raw mask) -> MPImage.
+//     orientation semantics as the ML Kit raw mask, then mirrored
+//     horizontally to match the front-camera live preview's mirrored
+//     SurfaceTexture transform) -> MPImage.
 //   - Output: the model's person confidence mask (float32) converted into a
 //     UINT8_ALPHA frame (stride 1). The frame is tagged with
 //     [DuetSegmentationMaskFormat.UINT8_ALPHA] so the compositor never reads
@@ -87,6 +90,14 @@ class AndroidDuetMediaPipeSegmentationBackend private constructor(
         private const val CLOSE_TIMEOUT_MS = 1_500L
 
         /**
+         * Long edge (px) the bitmap sent to MediaPipe is capped to before inference.
+         * Ports the RND-proven downscale-before-rotate latency win (physical proof on
+         * SM-A566B: warmTotalAcquireToDrawMeanMs ~= 17.67ms at this cap, vs. ~33ms
+         * uncapped at the camera's native 640x480 analysis resolution).
+         */
+        private const val SEGMENT_INPUT_LONG_EDGE_PX = 192
+
+        /**
          * GPU-delegate rung (`mediapipe_gpu`). EXPERIMENTAL / NOT PRODUCTION-
          * PROVEN: a physical smoke test on SM-A566B (Android 16) showed this
          * configuration (Delegate.GPU + outputConfidenceMasks(true)) can
@@ -123,9 +134,6 @@ class AndroidDuetMediaPipeSegmentationBackend private constructor(
 
     /** Owned-thread-only monotonic guard for segmentForVideo timestamps. */
     private var lastTimestampMs = Long.MIN_VALUE
-
-    /** Owned-thread-only scratch for the float32 -> uint8 conversion. */
-    private var floatScratch = FloatArray(0)
 
     private var loggedMaskLayout = false
 
@@ -328,7 +336,6 @@ class AndroidDuetMediaPipeSegmentationBackend private constructor(
                 Log.w(TAG, "ImageSegmenter.close() threw ($backendId): ${t.message}")
             }
         }
-        floatScratch = FloatArray(0)
         Log.d(TAG, "close() — ImageSegmenter released ($backendId)")
     }
 
@@ -342,18 +349,52 @@ class AndroidDuetMediaPipeSegmentationBackend private constructor(
     /**
      * Converts the YUV_420_888 proxy to an ARGB_8888 bitmap rotated upright by
      * [ImageProxy.getImageInfo].rotationDegrees (clockwise, CameraX semantics),
-     * matching the orientation ML Kit applies via InputImage.fromMediaImage.
+     * matching the orientation ML Kit applies via InputImage.fromMediaImage,
+     * then mirrored horizontally.
+     *
+     * The mirror is required because this backend is only ever fed by the
+     * front camera (AndroidDuetCameraSource), and CameraX's ImageAnalysis
+     * delivers raw, un-mirrored sensor-orientation buffers — but the live
+     * preview the user actually sees is mirrored by the camera SurfaceTexture
+     * transform (cameraStMatrix in AndroidDuetPreviewCompositor). Without
+     * this mirror the resulting mask is registered against the wrong side of
+     * the face relative to the mirrored preview. Applied after rotation (not
+     * combined into the same axis) so the mirror is always a horizontal flip
+     * of the final upright image, regardless of sensor rotation.
+     *
+     * Downscales to [SEGMENT_INPUT_LONG_EDGE_PX] before rotating (not after) so the
+     * rotation transform runs on the small segmenter-sized bitmap instead of the
+     * full-resolution camera frame; the long-edge scale factor is the same either
+     * way since it is computed from maxOf(width, height), which 90/270 rotation
+     * only swaps. This is the RND-proven order from the green-screen latency smoke.
      */
     private fun toUprightBitmap(proxy: ImageProxy): Bitmap {
         val raw = proxy.toBitmap()
+        val downscaled = downscaleForSegmenter(raw)
         val rotation = proxy.imageInfo.rotationDegrees
-        if (rotation % 360 == 0) return raw
-        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-        val rotated = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
-        if (rotated !== raw) {
-            try { raw.recycle() } catch (_: Throwable) {}
+        val matrix = Matrix().apply {
+            if (rotation % 360 != 0) postRotate(rotation.toFloat())
+            postScale(-1f, 1f)
         }
-        return rotated
+        val transformed = Bitmap.createBitmap(downscaled, 0, 0, downscaled.width, downscaled.height, matrix, true)
+        if (transformed !== downscaled) {
+            try { downscaled.recycle() } catch (_: Throwable) {}
+        }
+        return transformed
+    }
+
+    /** Downscales [source] so its long edge is at most [SEGMENT_INPUT_LONG_EDGE_PX], recycling [source] if scaled. */
+    private fun downscaleForSegmenter(source: Bitmap): Bitmap {
+        val maxEdge = maxOf(source.width, source.height)
+        if (maxEdge <= SEGMENT_INPUT_LONG_EDGE_PX) return source
+        val scale = SEGMENT_INPUT_LONG_EDGE_PX.toFloat() / maxEdge.toFloat()
+        val targetWidth = (source.width * scale).roundToInt().coerceAtLeast(1)
+        val targetHeight = (source.height * scale).roundToInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+        if (scaled !== source) {
+            try { source.recycle() } catch (_: Throwable) {}
+        }
+        return scaled
     }
 
     /**
@@ -392,17 +433,21 @@ class AndroidDuetMediaPipeSegmentationBackend private constructor(
                     "for ${width}x$height",
             )
         }
-        if (floatScratch.size < pixelCount) floatScratch = FloatArray(pixelCount)
-        val scratch = floatScratch
-        floats.get(scratch, 0, pixelCount)
-
         // float32 [0,1] -> uint8 [0,255] with the same truncating quantisation the
-        // compositor applies to ML Kit floats, so both rungs key identically.
+        // compositor applies to ML Kit floats, so both rungs key identically. Reads
+        // straight out of the mask's FloatBuffer (valid until closeResultQuietly()
+        // runs in segmentOnOwnedThread's finally, after this function returns) to
+        // avoid an extra full-frame array copy, and branches directly instead of
+        // calling Float.coerceIn per pixel.
         val alpha = ByteBuffer.allocateDirect(pixelCount)
         for (i in 0 until pixelCount) {
-            val f = scratch[i]
-            val clamped = if (f.isNaN()) 0f else f.coerceIn(0f, 1f)
-            alpha.put(i, (clamped * 255f).toInt().toByte())
+            val f = floats.get(i)
+            val v = when {
+                f.isNaN() || f <= 0f -> 0
+                f >= 1f -> 255
+                else -> (f * 255f).toInt()
+            }
+            alpha.put(i, v.toByte())
         }
         alpha.rewind()
 

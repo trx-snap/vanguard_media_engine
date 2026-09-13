@@ -60,14 +60,25 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         private const val CAMERA_PLACEHOLDER_G = 0.14f
         private const val CAMERA_PLACEHOLDER_B = 0.17f
 
-        // Deterministic portrait preview buffer size for the camera SurfaceTexture.
-        // CameraX negotiates a real resolution for its Preview use-case, but the
-        // SurfaceTexture needs a non-zero default buffer size up front so it can
-        // export a valid EGLImage from the first onFrameAvailable call. Without this
-        // the first updateTexImage may silently produce a zero-size image.
-        // This is a preview-ingress default only; no recording/export claim.
-        private const val CAMERA_ST_DEFAULT_WIDTH  = 1080
-        private const val CAMERA_ST_DEFAULT_HEIGHT = 1920
+        // Deterministic landscape preview buffer size for the camera SurfaceTexture,
+        // matching the 16:9 SurfaceRequest resolution CameraX's Preview use-case
+        // actually negotiates on-device (observed 1920x1080). The SurfaceTexture
+        // needs a non-zero default buffer size up front so it can export a valid
+        // EGLImage from the first onFrameAvailable call; without this the first
+        // updateTexImage may silently produce a zero-size image. This is a
+        // preview-ingress default only; no recording/export claim.
+        private const val CAMERA_ST_DEFAULT_WIDTH  = 1920
+        private const val CAMERA_ST_DEFAULT_HEIGHT = 1080
+
+        // Aspect ratio (width/height) of the camera image once [cameraStMatrix]
+        // has rotated the landscape sensor buffer upright for a portrait front
+        // camera: the width/height dimensions swap, so the upright aspect is
+        // height-over-width of the raw buffer above (1080/1920 == 9:16). Used by
+        // [cameraAspectFillViewport] instead of [aspectFillViewport]'s
+        // decoder-video aspect, since the camera has no analogous
+        // sourceVideoWidthPx/HeightPx of its own.
+        private const val CAMERA_UPRIGHT_ASPECT =
+            CAMERA_ST_DEFAULT_HEIGHT.toDouble() / CAMERA_ST_DEFAULT_WIDTH.toDouble()
     }
 
     // -- EGL core (created lazily on first attach, destroyed only in release) --
@@ -188,6 +199,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private var gsUSTMatrixLoc = -1
     private var gsSCameraLoc = -1
     private var gsUMaskLoc = -1
+    private var gsUDebugViewLoc = -1
+    private var gsUMaskTexelSizeLoc = -1
+
+    /**
+     * Debug-only (RND diagnostic): raw mask visualization mode. Render-thread
+     * only, mutated exclusively via [setGreenScreenDebugView]. Null (the
+     * default) means normal production compositing; any value other than
+     * "mask_direct"/"mask_mapped"/"mask_direct_mirror_x"/"mask_direct_flip_y"/
+     * "camera_passthrough" is treated as null by the setter.
+     */
+    private var greenScreenDebugView: String? = null
 
     /** Whether [maskTextureId] has been uploaded with at least one real mask. */
     private var hasMaskTexture = false
@@ -197,6 +219,15 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     /** Backend id of the most recently uploaded mask (diagnostic only). Render-thread only. */
     private var lastUploadedMaskBackend: String? = null
+
+    /**
+     * Dimensions of the most recently uploaded mask texture, used to derive the
+     * `uMaskTexelSize` uniform for GPU-side matte erosion. 0 = unknown (draw
+     * falls back to a (1,1) texel size so neighbour taps clamp to the edge and
+     * refinement degrades to a plain sample rather than crashing). Render-thread only.
+     */
+    private var latestMaskWidth = 0
+    private var latestMaskHeight = 0
 
     private val quadPositions: FloatBuffer = floatBufferOf(
         -1f, -1f,
@@ -307,6 +338,8 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             hasMaskTexture = false
             hasLoggedFirstMaskUpload = false
             lastUploadedMaskBackend = null
+            latestMaskWidth = 0
+            latestMaskHeight = 0
         }
     }
 
@@ -317,6 +350,27 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      */
     override fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
         pendingMaskRef.set(frame)
+    }
+
+    /**
+     * Debug-only (RND diagnostic): allowlists [view] to exactly "mask_direct",
+     * "mask_mapped", "mask_direct_mirror_x", "mask_direct_flip_y" or
+     * "camera_passthrough"; any other value (including null) disables the
+     * visualization and restores normal production compositing.
+     * "mask_direct_mirror_x" and "mask_direct_flip_y" let physical RND
+     * identify front-camera mirror/flip mismatches by sampling the raw mask
+     * with the X or Y raw texture coordinate inverted, respectively.
+     * "camera_passthrough" shows the raw live camera feed (no mask, no
+     * smoothstep) inside the green-screen camera rect, so physical RND can
+     * confirm the OES camera path itself independent of segmentation. Must be
+     * called on the render thread.
+     */
+    override fun setGreenScreenDebugView(view: String?) {
+        greenScreenDebugView = when (view) {
+            "mask_direct", "mask_mapped", "mask_direct_mirror_x", "mask_direct_flip_y",
+            "camera_passthrough" -> view
+            else -> null
+        }
     }
 
 
@@ -451,6 +505,8 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         maskTextureId = 0
         hasMaskTexture = false
         hasLoggedFirstMaskUpload = false
+        latestMaskWidth = 0
+        latestMaskHeight = 0
 
         try { _decoderInputSurface?.release() } catch (_: Throwable) {}
         _decoderInputSurface = null
@@ -593,11 +649,12 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * independently of the decoder ingest. Must be called from [ensureCore] after
      * the GL context is current.
      *
-     * Sets a deterministic portrait preview default buffer size (1080×1920) on the
-     * SurfaceTexture before wrapping it in a Surface. The size must be non-zero
-     * before the first camera frame arrives so that updateTexImage produces a valid
-     * image and the OES sampler has a defined texel size. Preview-ingress default
-     * only — no recording/export claim.
+     * Sets a deterministic landscape preview default buffer size (1920×1080,
+     * matching CameraX's negotiated Preview SurfaceRequest) on the SurfaceTexture
+     * before wrapping it in a Surface. The size must be non-zero before the first
+     * camera frame arrives so that updateTexImage produces a valid image and the
+     * OES sampler has a defined texel size. Preview-ingress default only — no
+     * recording/export claim.
      */
     private fun setupCameraIngest() {
         val textures = IntArray(1)
@@ -678,11 +735,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             uniform mat4 uSTMatrix;
             varying vec2 vTextureCoord;
             varying vec2 vMaskCoord;
+            varying vec2 vRawTexCoord;
             void main() {
                 gl_Position = aPosition;
-                vTextureCoord = (uSTMatrix * aTextureCoord).xy;
-                // Mask is in the same [0,1] UV space without an ST matrix.
-                vMaskCoord = aTextureCoord.xy;
+                vec2 cameraCoord = (uSTMatrix * aTextureCoord).xy;
+                vTextureCoord = cameraCoord;
+                // Mask is sampled in the same ST-matrix-transformed camera UV
+                // space as the camera texture, so no additional remapping is needed.
+                vMaskCoord = clamp(cameraCoord, 0.0, 1.0);
+                // Raw (untransformed) quad texture coordinate — debug-only,
+                // used solely by the mask_direct diagnostic visualization.
+                vRawTexCoord = aTextureCoord.xy;
             }
         """.trimIndent()
         val fragmentSrc = """
@@ -690,11 +753,84 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             precision mediump float;
             varying vec2 vTextureCoord;
             varying vec2 vMaskCoord;
+            varying vec2 vRawTexCoord;
             uniform samplerExternalOES sCamera;
             uniform sampler2D uMask;
+            // (1/maskWidth, 1/maskHeight) in mask UV space; drives the
+            // one-mask-pixel erosion taps in normal (non-debug) mode only.
+            uniform vec2 uMaskTexelSize;
+            // Debug-only (RND diagnostic): 0 = normal, 1 = mask_direct,
+            // 2 = mask_mapped, 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y,
+            // 5 = camera_passthrough.
+            uniform int uDebugView;
             void main() {
+                if (uDebugView == 5) {
+                    // camera_passthrough: raw live camera feed, no mask, no
+                    // smoothstep — drawCameraGreenScreen already scissors and
+                    // viewports to the green-screen camera rect, so this only
+                    // ever paints inside that rect.
+                    vec4 cameraColorRaw = texture2D(sCamera, vTextureCoord);
+                    gl_FragColor = vec4(cameraColorRaw.rgb, 1.0);
+                    return;
+                }
+                if (uDebugView == 1) {
+                    float rawMaskAlpha = texture2D(uMask, vRawTexCoord).r;
+                    gl_FragColor = vec4(rawMaskAlpha, rawMaskAlpha, rawMaskAlpha, 1.0);
+                    return;
+                }
+                if (uDebugView == 2) {
+                    float rawMaskAlpha = texture2D(uMask, vMaskCoord).r;
+                    gl_FragColor = vec4(rawMaskAlpha, rawMaskAlpha, rawMaskAlpha, 1.0);
+                    return;
+                }
+                if (uDebugView == 3) {
+                    // mask_direct_mirror_x: raw mask sampled with X inverted, to
+                    // help RND spot a front-camera horizontal mirror mismatch.
+                    float rawMaskAlpha = texture2D(uMask, vec2(1.0 - vRawTexCoord.x, vRawTexCoord.y)).r;
+                    gl_FragColor = vec4(rawMaskAlpha, rawMaskAlpha, rawMaskAlpha, 1.0);
+                    return;
+                }
+                if (uDebugView == 4) {
+                    // mask_direct_flip_y: raw mask sampled with Y inverted, to
+                    // help RND spot a front-camera vertical flip mismatch.
+                    float rawMaskAlpha = texture2D(uMask, vec2(vRawTexCoord.x, 1.0 - vRawTexCoord.y)).r;
+                    gl_FragColor = vec4(rawMaskAlpha, rawMaskAlpha, rawMaskAlpha, 1.0);
+                    return;
+                }
                 vec4 cameraColor = texture2D(sCamera, vTextureCoord);
-                float maskAlpha = texture2D(uMask, vMaskCoord).r;
+                // Physical RND on SM-A566B showed the CPU MediaPipe mask
+                // arrives in raw analysis UV with vertical orientation
+                // inverted relative to the GLES rect: mask_direct_flip_y was
+                // the only debug candidate that placed the matte into the
+                // foreground rect (mask_mapped produced a side-stripe
+                // failure, mask_direct produced a top-heavy rectangle).
+                // Normal mode therefore samples the raw mask with Y flipped;
+                // vMaskCoord/mask_mapped remains diagnostic only.
+                //
+                // X is intentionally NOT flipped here. AndroidDuetMediaPipeSegmentationBackend
+                // now mirrors its CPU input horizontally before segmentation (matching the
+                // front-camera preview mirror applied by cameraStMatrix), so the mask buffer
+                // itself already carries the same X orientation this raw-quad sampling
+                // expects. Adding an X flip here on top of that would cancel the upstream
+                // mirror fix and reintroduce the wrong-side registration bug.
+                vec2 maskUv = vec2(vRawTexCoord.x, 1.0 - vRawTexCoord.y);
+                float centerAlpha = texture2D(uMask, maskUv).r;
+                // Conservative GPU-side matte refinement: take the minimum of
+                // the centre tap and its four direct neighbours (one mask
+                // pixel away, clamped inside [0,1]). This erodes the matte by
+                // one mask pixel so false-positive room background clinging
+                // to the head/shoulder silhouette shrinks, while the true
+                // person core (uniformly high confidence) is unaffected.
+                float leftAlpha  = texture2D(uMask, clamp(maskUv - vec2(uMaskTexelSize.x, 0.0), 0.0, 1.0)).r;
+                float rightAlpha = texture2D(uMask, clamp(maskUv + vec2(uMaskTexelSize.x, 0.0), 0.0, 1.0)).r;
+                float upAlpha    = texture2D(uMask, clamp(maskUv - vec2(0.0, uMaskTexelSize.y), 0.0, 1.0)).r;
+                float downAlpha  = texture2D(uMask, clamp(maskUv + vec2(0.0, uMaskTexelSize.y), 0.0, 1.0)).r;
+                float erodedAlpha = min(centerAlpha, min(min(leftAlpha, rightAlpha), min(upAlpha, downAlpha)));
+                // Shape the eroded MediaPipe selfie-segmentation confidence
+                // with a slightly stricter feather than the raw sample used
+                // previously (0.45..0.75), so low-confidence background is
+                // rejected while true edge pixels still feather smoothly.
+                float maskAlpha = smoothstep(0.52, 0.78, erodedAlpha);
                 gl_FragColor = vec4(cameraColor.rgb, cameraColor.a * maskAlpha);
             }
         """.trimIndent()
@@ -719,6 +855,8 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         gsUSTMatrixLoc = GLES20.glGetUniformLocation(prog, "uSTMatrix")
         gsSCameraLoc   = GLES20.glGetUniformLocation(prog, "sCamera")
         gsUMaskLoc     = GLES20.glGetUniformLocation(prog, "uMask")
+        gsUDebugViewLoc = GLES20.glGetUniformLocation(prog, "uDebugView")
+        gsUMaskTexelSizeLoc = GLES20.glGetUniformLocation(prog, "uMaskTexelSize")
     }
 
     /**
@@ -805,6 +943,10 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         hasMaskTexture = true
+        // Remember the uploaded dimensions so drawCameraGreenScreen can pass
+        // the matching texel size to the erosion taps.
+        latestMaskWidth = w
+        latestMaskHeight = h
         if (!hasLoggedFirstMaskUpload) {
             hasLoggedFirstMaskUpload = true
             Log.i(
@@ -826,23 +968,50 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * Draws the camera OES frame alpha-blended into [rect] using the current
      * mask texture. GL_BLEND is enabled around this draw only; source video
      * underneath shows through where mask alpha is low (background).
+     *
+     * Like [drawCameraRect], the viewport is aspect-filled (via
+     * [cameraAspectFillViewport]) and the scissor crops the overflow back to
+     * [rect]; camera passthrough and green-screen share the same aspect-fill
+     * geometry so the two draws stay visually consistent.
      */
     private fun drawCameraGreenScreen(rect: VGDuetPixelRect) {
         val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
         if (scissor.width <= 0 || scissor.height <= 0) return
+        val viewport = cameraAspectFillViewport(rect)
 
         ensureGreenScreenProgram()
         if (greenScreenProgram == 0) return  // compilation failed; skip silently
 
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
-        GLES20.glViewport(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
 
         // Enable blending so camera pixels with low mask alpha reveal the source below.
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
         GLES20.glUseProgram(greenScreenProgram)
+
+        // Debug-only (RND diagnostic): 0 = normal, 1 = mask_direct,
+        // 2 = mask_mapped, 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y,
+        // 5 = camera_passthrough.
+        val debugViewCode = when (greenScreenDebugView) {
+            "mask_direct" -> 1
+            "mask_mapped" -> 2
+            "mask_direct_mirror_x" -> 3
+            "mask_direct_flip_y" -> 4
+            "camera_passthrough" -> 5
+            else -> 0
+        }
+        GLES20.glUniform1i(gsUDebugViewLoc, debugViewCode)
+
+        // Mask texel size for the normal-mode erosion taps. Falls back to
+        // (1,1) when dimensions are not yet known (e.g. a draw racing ahead of
+        // the first upload): neighbour taps then clamp to the texture edge, so
+        // the shader degrades gracefully instead of reading garbage.
+        val maskTexelW = if (latestMaskWidth > 0) 1f / latestMaskWidth else 1f
+        val maskTexelH = if (latestMaskHeight > 0) 1f / latestMaskHeight else 1f
+        GLES20.glUniform2f(gsUMaskTexelSizeLoc, maskTexelW, maskTexelH)
 
         // Texture unit 0: camera OES
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -937,26 +1106,26 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     }
 
     /**
-     * Draws the latched camera OES frame aspect-filled into [rect], mirroring
-     * the structure of [drawSourceRect] but binding [cameraOesTextureId] and
-     * [cameraStMatrix]. Reuses the same OES shader program; camera and decoder
-     * are independent GL textures and transform matrices.
+     * Draws the latched camera OES frame into [rect], mirroring the structure
+     * of [drawSourceRect] but binding [cameraOesTextureId] and [cameraStMatrix].
+     * Reuses the same OES shader program; camera and decoder are independent
+     * GL textures and transform matrices.
      *
-     * Aspect-fill uses the 9:16 camera stream aspect (front camera negotiated
-     * resolution). The scissor constrains output to the camera rect bounds.
-     * Camera frames are not aspect-distorted.
+     * Like [drawSourceRect], the viewport is aspect-filled (via
+     * [cameraAspectFillViewport]) and the scissor crops the overflow back to
+     * [rect]; camera passthrough and [drawCameraGreenScreen] share this same
+     * geometry. [cameraStMatrix] separately supplies the texture-coordinate
+     * transform for reading the OES buffer (rotation/crop/mirror baked in by
+     * CameraX); it does not perform aspect-fill itself.
      */
     private fun drawCameraRect(rect: VGDuetPixelRect) {
         val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
         if (scissor.width <= 0 || scissor.height <= 0) return
+        val viewport = cameraAspectFillViewport(rect)
 
-        // For the camera we don't know the resolved resolution from here, so use
-        // the rect itself as the viewport (aspect-fill via scissor alone is
-        // sufficient for typical 9:16 portrait camera into portrait camera rect).
-        // The SurfaceTexture transform matrix (cameraStMatrix) handles any flip/crop.
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
-        GLES20.glViewport(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
 
         GLES20.glUseProgram(oesProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -1019,6 +1188,39 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         } else {
             drawnW = rectW
             drawnH = rectW / videoAspect
+        }
+        return toGlRect(
+            rect.left - (drawnW - rectW) / 2.0,
+            rect.top - (drawnH - rectH) / 2.0,
+            drawnW,
+            drawnH,
+        )
+    }
+
+    /**
+     * Viewport for an aspect-fill of the upright camera image into [rect]: same
+     * centre, inflated along one axis to [CAMERA_UPRIGHT_ASPECT]. Mirrors
+     * [aspectFillViewport]'s centred-inflate logic but uses the fixed camera
+     * buffer aspect instead of a per-frame decoder video size, since the camera
+     * SurfaceTexture's negotiated size is not tracked per-frame the way
+     * [sourceVideoWidthPx]/[sourceVideoHeightPx] are for the decoder.
+     */
+    private fun cameraAspectFillViewport(rect: VGDuetPixelRect): GlRect {
+        val rectW = rect.width
+        val rectH = rect.height
+        if (rectW <= 0.0 || rectH <= 0.0) {
+            return toGlRect(rect.left, rect.top, rectW, rectH)
+        }
+        val cameraAspect = CAMERA_UPRIGHT_ASPECT
+        val rectAspect = rectW / rectH
+        val drawnW: Double
+        val drawnH: Double
+        if (cameraAspect > rectAspect) {
+            drawnH = rectH
+            drawnW = rectH * cameraAspect
+        } else {
+            drawnW = rectW
+            drawnH = rectW / cameraAspect
         }
         return toGlRect(
             rect.left - (drawnW - rectW) / 2.0,

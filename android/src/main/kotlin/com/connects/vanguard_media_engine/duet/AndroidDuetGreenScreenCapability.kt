@@ -8,6 +8,7 @@ import android.os.PowerManager
 
 object DuetSegmentationBackend {
     const val MEDIAPIPE_GPU  = "mediapipe_gpu"
+    const val MEDIAPIPE_GPU_GRAPH = "mediapipe_gpu_graph"
     const val MEDIAPIPE_CPU  = "mediapipe_cpu"
     const val MLKIT          = "mlkit"
     const val NONE           = "none"
@@ -118,6 +119,26 @@ data class DuetSegmentationProbe(
                 thermalTier            = "nominal",
             )
 
+        /**
+         * Probe result for the low-level MediaPipe Framework GPU graph backend.
+         * This is distinct from [mediapipeGpu], which describes the disabled
+         * MediaPipe Tasks ImageSegmenter GPU path.
+         */
+        fun mediapipeGpuGraph(quality: DuetSegmentationQuality = DuetSegmentationQuality.QUALITY) =
+            DuetSegmentationProbe(
+                isAvailable            = true,
+                selectedBackend        = DuetSegmentationBackend.MEDIAPIPE_GPU_GRAPH,
+                quality                = quality,
+                maxResolution          = 256,
+                supportsRawMask        = true,
+                reason                 = "MediaPipe Framework GPU graph selected (debug/smoke opt-in; produces GPU-resident masks and degrades to mediapipe_cpu on failure).",
+                mediaPipeGpuSupported  = true,
+                mediaPipeCpuSupported  = true,
+                mlKitAvailable         = true,
+                analysisMaxResolution  = 256,
+                thermalTier            = "nominal",
+            )
+
         /** Probe result when no backend is available; session falls back to PiP. */
         fun unavailable(reason: String) =
             DuetSegmentationProbe(
@@ -151,6 +172,7 @@ data class DuetSegmentationProbe(
         ): DuetSegmentationProbe {
             val base = when (backendId) {
                 DuetSegmentationBackend.MEDIAPIPE_GPU  -> mediapipeGpu(quality)
+                DuetSegmentationBackend.MEDIAPIPE_GPU_GRAPH -> mediapipeGpuGraph(quality)
                 DuetSegmentationBackend.MEDIAPIPE_CPU  -> mediapipeCpu(quality)
                 DuetSegmentationBackend.MLKIT          -> mlkit(quality)
                 DuetSegmentationBackend.RAW_TFLITE_GPU -> rawTfliteGpu(quality)

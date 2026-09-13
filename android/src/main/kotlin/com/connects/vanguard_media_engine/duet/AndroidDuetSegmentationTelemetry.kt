@@ -54,6 +54,7 @@ internal class AndroidDuetSegmentationTelemetry {
     private val lock = Any()
     private var count = 0
     private var masks = 0
+    private var gpuMasks = 0
     private var skipped = 0
     private var failures = 0
     private var totalDurationMs = 0L
@@ -69,6 +70,7 @@ internal class AndroidDuetSegmentationTelemetry {
     private data class Snapshot(
         val count: Int,
         val masks: Int,
+        val gpuMasks: Int,
         val skipped: Int,
         val failures: Int,
         val avgMs: Long,
@@ -104,6 +106,7 @@ internal class AndroidDuetSegmentationTelemetry {
                 if (durationMs > QUALITY_BUDGET_MS) overBudget += 1
                 when (outcome) {
                     is DuetSegmentationOutcome.Mask -> masks += 1
+                    is DuetSegmentationOutcome.GpuMask -> gpuMasks += 1
                     is DuetSegmentationOutcome.Skipped -> skipped += 1
                     is DuetSegmentationOutcome.Failure -> failures += 1
                 }
@@ -137,7 +140,7 @@ internal class AndroidDuetSegmentationTelemetry {
             Log.i(
                 TAG,
                 "$SUMMARY_MARKER backends=$backends count=${snapshot.count} masks=${snapshot.masks} " +
-                    "skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
+                    "gpu_masks=${snapshot.gpuMasks} skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
                     "maxMs=${snapshot.maxMs} overBudget=${snapshot.overBudget} qualityBudgetMs=$QUALITY_BUDGET_MS " +
                     "elapsedMs=${snapshot.elapsedMs} quality=$quality thermal=$thermal finalBackend=$finalBackend " +
                     "degraded=$degraded terminal=$terminal",
@@ -163,7 +166,7 @@ internal class AndroidDuetSegmentationTelemetry {
         Log.i(
             TAG,
             "$STATS_MARKER backends=$backends count=${snapshot.count} masks=${snapshot.masks} " +
-                "skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
+                "gpu_masks=${snapshot.gpuMasks} skipped=${snapshot.skipped} failures=${snapshot.failures} avgMs=${snapshot.avgMs} " +
                 "maxMs=${snapshot.maxMs} overBudget=${snapshot.overBudget} qualityBudgetMs=$QUALITY_BUDGET_MS " +
                 "elapsedMs=${snapshot.elapsedMs} quality=$quality thermal=$thermal",
         )
@@ -184,6 +187,7 @@ internal class AndroidDuetSegmentationTelemetry {
         Snapshot(
             count = count,
             masks = masks,
+            gpuMasks = gpuMasks,
             skipped = skipped,
             failures = failures,
             avgMs = avg,
