@@ -220,12 +220,15 @@ void main() {
   // ── Slice 5B-A: exportDuetComposition ────────────────────────────────────
 
   group('exportDuetComposition (Slice 5B-A)', () {
-    VGDuetCompositionDescriptor makeDescriptor() {
+    VGDuetCompositionDescriptor makeDescriptor({
+      VGDuetGreenScreenBackground? greenScreenBackground,
+    }) {
       return VGDuetCompositionDescriptor(
         source: VGDuetSource.localFile('/tmp/source.mp4'),
         layoutConfig: VGDuetLayoutConfig(
           mode: VGDuetLayoutMode.greenScreen,
           foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
+          greenScreenBackground: greenScreenBackground,
         ),
         trimWindow: VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 5.0),
         initialSpeed: 1.0,
@@ -374,6 +377,106 @@ void main() {
         ),
       );
     });
+
+    test(
+      'payload includes greenScreenBackground map when solidColor background is present',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        final desc = makeDescriptor(
+          greenScreenBackground: const VGDuetGreenScreenBackground.solidColor(
+            0xFF336699,
+          ),
+        );
+        await platform.exportDuetComposition(
+          descriptor: desc,
+          outputPath: '/tmp/out.mp4',
+        );
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        final descMap = args['descriptor'] as Map;
+        final layoutMap = descMap['layoutConfig'] as Map;
+        expect(layoutMap.containsKey('greenScreenBackground'), isTrue);
+        final bgMap = layoutMap['greenScreenBackground'] as Map;
+        expect(bgMap['type'], 'solidColor');
+        expect(bgMap['argbColor'], 0xFF336699);
+      },
+    );
+
+    test(
+      'payload includes greenScreenBackground map when image background is present',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        final desc = makeDescriptor(
+          greenScreenBackground: const VGDuetGreenScreenBackground.imageFile(
+            '/path/to/bg.png',
+            scaleMode: VGDuetBackgroundScaleMode.aspectFit,
+          ),
+        );
+        await platform.exportDuetComposition(
+          descriptor: desc,
+          outputPath: '/tmp/out.mp4',
+        );
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        final descMap = args['descriptor'] as Map;
+        final layoutMap = descMap['layoutConfig'] as Map;
+        expect(layoutMap.containsKey('greenScreenBackground'), isTrue);
+        final bgMap = layoutMap['greenScreenBackground'] as Map;
+        expect(bgMap['type'], 'image');
+        expect(bgMap['filePath'], '/path/to/bg.png');
+        expect(bgMap['scaleMode'], 'aspectFit');
+      },
+    );
+
+    test(
+      'payload includes greenScreenBackground map when video background is present',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        final desc = makeDescriptor(
+          greenScreenBackground: const VGDuetGreenScreenBackground.video(),
+        );
+        await platform.exportDuetComposition(
+          descriptor: desc,
+          outputPath: '/tmp/out.mp4',
+        );
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        final descMap = args['descriptor'] as Map;
+        final layoutMap = descMap['layoutConfig'] as Map;
+        expect(layoutMap.containsKey('greenScreenBackground'), isTrue);
+        final bgMap = layoutMap['greenScreenBackground'] as Map;
+        expect(bgMap['type'], 'video');
+      },
+    );
+
+    test(
+      'payload omits greenScreenBackground map when background is absent',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        final desc = makeDescriptor(greenScreenBackground: null);
+        await platform.exportDuetComposition(
+          descriptor: desc,
+          outputPath: '/tmp/out.mp4',
+        );
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        final descMap = args['descriptor'] as Map;
+        final layoutMap = descMap['layoutConfig'] as Map;
+        expect(layoutMap.containsKey('greenScreenBackground'), isFalse);
+      },
+    );
 
     test('VGDuetExportResult toMap/fromMap round-trips', () {
       final r = VGDuetExportResult(

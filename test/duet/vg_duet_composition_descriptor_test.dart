@@ -11,6 +11,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
   VGDuetPiPAnchor? pipAnchor,
   VGDuetRect? pipNormalizedRect,
   VGDuetForegroundTransform? foregroundTransform,
+  VGDuetGreenScreenBackground? greenScreenBackground,
   double initialSpeed = 1.0,
   double sourceAudioGain = 0.8,
   double micAudioGain = 0.6,
@@ -27,6 +28,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
       pipAnchor: pipAnchor,
       pipNormalizedRect: pipNormalizedRect,
       foregroundTransform: foregroundTransform,
+      greenScreenBackground: greenScreenBackground,
     ),
     trimWindow: VGDuetTrimWindow(startSeconds: 1.0, endSeconds: 10.0),
     initialSpeed: initialSpeed,
@@ -653,6 +655,110 @@ void main() {
             equals(const VGDuetPoint(0.5, 0.5)),
           );
         }
+      },
+    );
+  });
+
+  // ── Green-screen greenScreenBackground contract ───────────────────────────
+
+  group('VGDuetLayoutConfig green-screen greenScreenBackground', () {
+    test(
+      'greenScreen descriptor with solidColor background round-trips preserving type and color',
+      () {
+        final d = _makeDescriptor(
+          mode: VGDuetLayoutMode.greenScreen,
+          greenScreenBackground: const VGDuetGreenScreenBackground.solidColor(
+            0xFF123456,
+          ),
+        );
+        final map = d.toMap();
+        final restored = VGDuetCompositionDescriptor.fromMap(map);
+
+        expect(restored, equals(d));
+        final bg = restored.layoutConfig.greenScreenBackground;
+        expect(bg, isNotNull);
+        expect(bg!.type, VGDuetGreenScreenBackgroundType.solidColor);
+        expect(bg.argbColor, 0xFF123456);
+        expect(bg.filePath, isNull);
+        expect(bg.scaleMode, isNull);
+        expect(
+          bg,
+          equals(const VGDuetGreenScreenBackground.solidColor(0xFF123456)),
+        );
+      },
+    );
+
+    test(
+      'greenScreen descriptor with image background round-trips preserving type, path, and scaleMode',
+      () {
+        final d = _makeDescriptor(
+          mode: VGDuetLayoutMode.greenScreen,
+          greenScreenBackground: const VGDuetGreenScreenBackground.imageFile(
+            '/path/to/bg.png',
+            scaleMode: VGDuetBackgroundScaleMode.aspectFit,
+          ),
+        );
+        final map = d.toMap();
+        final restored = VGDuetCompositionDescriptor.fromMap(map);
+
+        expect(restored, equals(d));
+        final bg = restored.layoutConfig.greenScreenBackground;
+        expect(bg, isNotNull);
+        expect(bg!.type, VGDuetGreenScreenBackgroundType.image);
+        expect(bg.filePath, '/path/to/bg.png');
+        expect(bg.scaleMode, VGDuetBackgroundScaleMode.aspectFit);
+        expect(bg.argbColor, isNull);
+        expect(
+          bg,
+          equals(
+            const VGDuetGreenScreenBackground.imageFile(
+              '/path/to/bg.png',
+              scaleMode: VGDuetBackgroundScaleMode.aspectFit,
+            ),
+          ),
+        );
+      },
+    );
+
+    test(
+      'greenScreen descriptor with video background round-trips preserving type',
+      () {
+        final d = _makeDescriptor(
+          mode: VGDuetLayoutMode.greenScreen,
+          greenScreenBackground: const VGDuetGreenScreenBackground.video(),
+        );
+        final map = d.toMap();
+        final restored = VGDuetCompositionDescriptor.fromMap(map);
+
+        expect(restored, equals(d));
+        final bg = restored.layoutConfig.greenScreenBackground;
+        expect(bg, isNotNull);
+        expect(bg!.type, VGDuetGreenScreenBackgroundType.video);
+        expect(bg.argbColor, isNull);
+        expect(bg.filePath, isNull);
+        expect(bg.scaleMode, isNull);
+        expect(bg, equals(const VGDuetGreenScreenBackground.video()));
+      },
+    );
+
+    test(
+      'greenScreen layout with no greenScreenBackground leaves it null after round-trip and does not serialize the key',
+      () {
+        final d = _makeDescriptor(mode: VGDuetLayoutMode.greenScreen);
+        expect(d.layoutConfig.greenScreenBackground, isNull);
+
+        final descriptorMap = d.toMap();
+        final layoutConfigMap =
+            descriptorMap['layoutConfig'] as Map<String, dynamic>;
+        expect(layoutConfigMap.containsKey('greenScreenBackground'), isFalse);
+
+        final restored = VGDuetCompositionDescriptor.fromMap(descriptorMap);
+        expect(restored.layoutConfig.greenScreenBackground, isNull);
+
+        final layoutMap = d.layoutConfig.toMap();
+        expect(layoutMap.containsKey('greenScreenBackground'), isFalse);
+        final restoredLayout = VGDuetLayoutConfig.fromMap(layoutMap);
+        expect(restoredLayout.greenScreenBackground, isNull);
       },
     );
   });

@@ -131,6 +131,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         val videoBitRate: Int,
         val layoutMode: String,
         val foregroundTransform: NativeForegroundTransform?,
+        val greenScreenBackground: AndroidDuetGreenScreenBackground,
     )
 
     private sealed class ParseResult {
@@ -214,22 +215,35 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                     "startSeconds ($trimStartSec).")
         }
 
-        // layout mode and optional foreground transform
-        val layoutMap   = descriptorMap["layoutConfig"] as? Map<*, *>
-        val layoutMode  = (layoutMap?.get("mode") as? String) ?: "pip"
-        val fgTransform = parseForegroundTransform(layoutMap)
+        // layout mode, optional foreground transform, and green-screen background
+        val layoutMap     = descriptorMap["layoutConfig"] as? Map<*, *>
+        val layoutMode    = (layoutMap?.get("mode") as? String) ?: "pip"
+        val fgTransform   = parseForegroundTransform(layoutMap)
+        val greenScreenBg = AndroidDuetGreenScreenBackground.parse(
+            layoutMap?.get("greenScreenBackground") as? Map<*, *>
+        )
+
+        if (layoutMode == "greenScreen" &&
+            greenScreenBg.type != AndroidDuetGreenScreenBackgroundType.VIDEO
+        ) {
+            return ParseResult.Failure(
+                "unsupported_export_feature",
+                "exportDuetComposition: static/image green-screen backgrounds are preview-only for now; offline export requires a future compositor."
+            )
+        }
 
         return ParseResult.Success(
             ExportParams(
-                sourceFilePath      = sourceFilePath,
-                trimStartSec        = trimStartSec,
-                trimEndSec          = trimEndSec,
-                outputPath          = outputPath,
-                targetWidth         = targetWidth,
-                targetHeight        = targetHeight,
-                videoBitRate        = videoBitRate,
-                layoutMode          = layoutMode,
-                foregroundTransform = fgTransform,
+                sourceFilePath         = sourceFilePath,
+                trimStartSec           = trimStartSec,
+                trimEndSec             = trimEndSec,
+                outputPath             = outputPath,
+                targetWidth            = targetWidth,
+                targetHeight           = targetHeight,
+                videoBitRate           = videoBitRate,
+                layoutMode             = layoutMode,
+                foregroundTransform    = fgTransform,
+                greenScreenBackground = greenScreenBg,
             )
         )
     }

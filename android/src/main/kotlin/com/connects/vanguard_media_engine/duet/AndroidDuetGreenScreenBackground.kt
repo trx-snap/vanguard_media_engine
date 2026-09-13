@@ -1,7 +1,7 @@
 package com.connects.vanguard_media_engine.duet
 
 // -----------------------------------------------------------------------------
-// Static green-screen background model (engine preview only).
+// Static green-screen background model (engine preview and export parsing).
 // -----------------------------------------------------------------------------
 //
 // Mirrors VGDuetGreenScreenBackground.toMap() on the Dart side
