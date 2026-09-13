@@ -664,6 +664,13 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
         private var compositeAlphaBitmap: Bitmap? = null
         private var compositeAlphaBuffer: ByteBuffer? = null
         private var confidenceFloatScratch: FloatArray? = null
+
+        // MediaPipe result-thread confined scratch. Reusing this array across masks (rather
+        // than allocating ByteArray(count) per frame) is only safe because exactly one frame
+        // is ever in flight (see the `inFlight` single-slot contract): extractAlphaMask never
+        // runs concurrently for two frames, and the returned AlphaMask is consumed by the
+        // render thread before the next mask is extracted.
+        private var alphaByteScratch: ByteArray? = null
         private val pictureBackgroundLoadFailed = AtomicBoolean(false)
         private val confidenceAlphaLut = IntArray(256) { index ->
             buildConfidenceDisplayAlpha(index.toFloat() / 255f)
@@ -1001,18 +1008,25 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
         }
 
         private fun prepareBitmapForSegmenter(source: Bitmap, rotationDegrees: Int): Bitmap {
-            val oriented = if (config.segmentInputOrientationPolicy == SEGMENT_INPUT_UPRIGHT_BITMAP) {
-                val normalizedRotation = ((rotationDegrees % 360) + 360) % 360
-                if (normalizedRotation == 0) {
-                    source
-                } else {
-                    val rotate = Matrix().apply { postRotate(normalizedRotation.toFloat()) }
-                    Bitmap.createBitmap(source, 0, 0, source.width, source.height, rotate, true)
-                }
-            } else {
-                source
+            // Downscale before rotating (not after) so the 90/180/270 rotation transform
+            // below runs on the small segmenter-sized bitmap instead of the full-resolution
+            // camera frame; the long-edge scale factor is the same either way since it is
+            // computed from maxOf(width, height), which 90/270 rotation only swaps.
+            val downscaled = downscaleForSegmenter(source, recycleSourceIfScaled = false)
+            if (config.segmentInputOrientationPolicy != SEGMENT_INPUT_UPRIGHT_BITMAP) {
+                return downscaled
             }
-            return downscaleForSegmenter(oriented, recycleSourceIfScaled = oriented !== source)
+            val normalizedRotation = ((rotationDegrees % 360) + 360) % 360
+            if (normalizedRotation == 0) {
+                return downscaled
+            }
+            // Exact 90/180/270 rotation needs no bilinear filtering.
+            val rotate = Matrix().apply { postRotate(normalizedRotation.toFloat()) }
+            val rotated = Bitmap.createBitmap(downscaled, 0, 0, downscaled.width, downscaled.height, rotate, false)
+            if (downscaled !== source && !downscaled.isRecycled) {
+                try { downscaled.recycle() } catch (_: Throwable) {}
+            }
+            return rotated
         }
 
         private fun downscaleForSegmenter(source: Bitmap, recycleSourceIfScaled: Boolean): Bitmap {
@@ -1150,6 +1164,15 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
             return scratch
         }
 
+        private fun alphaScratch(count: Int): ByteArray {
+            var scratch = alphaByteScratch
+            if (scratch == null || scratch.size < count) {
+                scratch = ByteArray(count)
+                alphaByteScratch = scratch
+            }
+            return scratch
+        }
+
         private fun extractAlphaMask(result: ImageSegmenterResult): AlphaMask? {
             if (config.outputCategory) {
                 val mask = result.categoryMask().orElse(null)
@@ -1175,7 +1198,8 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
                     return null
                 }
                 val alphaStartNs = SystemClock.elapsedRealtimeNanos()
-                val alpha = ByteArray(count)
+                val alpha = alphaScratch(count)
+                alpha.fill(0, 0, count)
                 val personValue = config.categoryPersonValue
                 var zeroCount = 0L
                 var fullCount = 0L
@@ -1246,7 +1270,7 @@ class AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
             val alphaStartNs = SystemClock.elapsedRealtimeNanos()
             val floatScratch = confidenceScratch(count)
             floats.get(floatScratch, 0, count)
-            val alpha = ByteArray(count)
+            val alpha = alphaScratch(count)
             var minV = Float.MAX_VALUE
             var maxV = -Float.MAX_VALUE
             var sum = 0.0
