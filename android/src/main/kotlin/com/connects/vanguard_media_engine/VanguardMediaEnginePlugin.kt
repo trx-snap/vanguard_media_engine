@@ -96,6 +96,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGpuGreenScreenV
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGreenScreenTasksLiveSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportPixelProofSmokeHarness
+import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -3193,6 +3194,38 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     }
                     mainHandler.post { if (!detached) result.success(smokeResult) }
                 }, "VGDuetGreenScreenExportPixelProof").apply { isDaemon = true }.start()
+            }
+
+            "runAndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmoke" -> {
+                val outputPath = args?.get("outputPath") as? String
+                if (outputPath.isNullOrBlank()) {
+                    result.error(
+                        "INVALID_ARG",
+                        "runAndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmoke: outputPath required",
+                        null,
+                    )
+                    return
+                }
+                val width = (args["width"] as? Number)?.toInt() ?: 360
+                val height = (args["height"] as? Number)?.toInt() ?: 640
+
+                Thread({
+                    val smokeResult = try {
+                        AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness.runSmoke(
+                            outputPath = outputPath,
+                            width = width,
+                            height = height,
+                        )
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "runAndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmoke failed", t)
+                        mapOf(
+                            "pass" to false,
+                            "reason" to "exception:${t.javaClass.simpleName}:${t.message}",
+                            "proofBoundary" to AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness.PROOF_BOUNDARY,
+                        )
+                    }
+                    mainHandler.post { if (!detached) result.success(smokeResult) }
+                }, "VGDuetGreenScreenExportExternalYcbcrPixelProof").apply { isDaemon = true }.start()
             }
 
             else -> result.notImplemented()
