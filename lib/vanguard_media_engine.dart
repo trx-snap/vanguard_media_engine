@@ -367,6 +367,8 @@ export 'vg_android_multicam_actions_fail_closed_smoke.dart';
 export 'vg_android_multicam_diagnostic_fail_closed_smoke.dart';
 // Duet Slice 1: pure-Dart Duet foundation contracts.
 export 'vg_duet.dart';
+// VG-GREENSCREEN-EXPORT-API: generic, caller-agnostic offline green-screen export contracts.
+export 'vg_green_screen.dart';
 
 const String _libName = 'vanguard_media_engine';
 

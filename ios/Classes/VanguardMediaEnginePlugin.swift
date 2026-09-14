@@ -201,6 +201,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             })
     }()
 
+    // ── Green-screen export dispatch handler ───────────────────────────────────
+    // Owns the `exportGreenScreenComposition` MethodChannel route. Plugin is a
+    // thin router only — no parsing, rendering, or AVFoundation/CoreImage logic
+    // lives here. No texture registry dependency, so a simple stored property
+    // (not lazy) is sufficient.
+    private let greenScreenExportMethodHandler = VGGreenScreenExportMethodHandler()
+
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setFilterChain` route. Plugin provides composition wiring only.
@@ -639,6 +646,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         if _duetMethodHandlerCreated {
             duetMethodHandler.disposeAll()
         }
+        greenScreenExportMethodHandler.disposeAll()
     }
 
     // Phase 7 Stage 7.5C: shared compositor init + runtime prepare helper.
@@ -1940,6 +1948,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             return
         }
 
+        // ── Green-screen export dispatch ───────────────────────────────────────
+        // Owned by VGGreenScreenExportMethodHandler. Plugin is a thin router only.
+        if VGGreenScreenExportMethodHandler.ownsMethod(call.method) {
+            greenScreenExportMethodHandler.handle(method: call.method, args: args, result: result)
+            return
+        }
 
         // The five cache MethodChannel routes are forwarded to
         // VGStreamingCacheManager.shared. No cache or lifecycle logic lives here.
