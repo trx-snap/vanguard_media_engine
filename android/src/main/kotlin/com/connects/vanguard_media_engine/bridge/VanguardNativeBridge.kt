@@ -1200,6 +1200,37 @@ class VanguardNativeBridge(
             height: Int,
         ): Boolean
 
+        // ANDROID-DUET-VULKAN-GPU-MASK: imports gpuMaskHardwareBuffer (an
+        // R8/RGBA mask already produced on GPU, e.g. by a future MediaPipe
+        // GPU graph) as the session's GPU-resident green-screen mask via the
+        // same Vulkan AHardwareBuffer import path used for the decoder/
+        // camera layers, storing it separately from the CPU-uploaded mask
+        // above so both remain independently valid. A subsequent
+        // renderAndroidDuetVulkanPreviewFrame call with greenScreenEnabled
+        // prefers this GPU mask over the CPU mask whenever it is present.
+        // Unlike the decoder/camera buffers, the GPU mask import is held
+        // across frames (not released per render call) until replaced by a
+        // later call to this function or the session is destroyed.
+        // format/timestampUs are caller-supplied metadata for logging/future
+        // use only; native trusts the AHardwareBuffer's own imported
+        // dimensions for rendering and validates width/height only as a
+        // fail-closed precondition. The Kotlin caller (see
+        // AndroidDuetVulkanPreviewCompositor.updateGreenScreenMaskHardwareBuffer)
+        // retains gpuMaskHardwareBuffer only while this returns true, so it
+        // stays open for as long as native's Vulkan import of it is live.
+        // Returns false (leaving any previously valid GPU mask in place) on
+        // a null buffer, non-positive width/height, an unsupported/failed
+        // import, or an unknown/destroyed session handle.
+        external fun updateAndroidDuetVulkanPreviewGpuMask(
+            handle: Long,
+            gpuMaskHardwareBuffer: HardwareBuffer,
+            width: Int,
+            height: Int,
+            format: Int,
+            timestampUs: Long,
+            acquireFenceFd: Int,
+        ): Boolean
+
         // Presents one Duet frame from decoderHardwareBuffer (background /
         // source) and cameraHardwareBuffer (foreground / camera) onto the
         // attached surface:
@@ -1213,6 +1244,35 @@ class VanguardNativeBridge(
         // Rects are canvas pixel rects (top-left origin, Y-down) already
         // rounded and clamped to the attached canvas by the caller; a
         // non-positive layout rect size returns false without rendering.
+        // sourceRotationDegrees/cameraRotationDegrees are normalized
+        // (0/90/180/270) clockwise display rotations for the decoder/camera
+        // layers respectively (ANDROID-DUET-VULKAN-TRANSFORM); cameraMirrorHorizontal
+        // additionally mirrors the camera layer horizontally (front camera).
+        // Applied before each layer's existing aspect-fill crop so a
+        // portrait-recorded-but-rotated source, or an unmirrored front-camera
+        // feed, is corrected instead of rendered sideways/mirrored.
+        // ANDROID-DUET-VULKAN-CAMERA-CONTENT-DIMENSIONS: sourceContentWidth/
+        // sourceContentHeight and cameraContentWidth/cameraContentHeight are
+        // the decoder/camera layer's logical content size, used by native as
+        // the aspect-fill crop dimensions in place of the imported
+        // AHardwareBuffer's own descriptor width/height whenever both are
+        // positive. sourceContentWidth/Height come from the decoder's own
+        // Image.width/height (trustworthy on that ImageReader). The camera
+        // path is on a PRIVATE-format ImageReader where Image.width/height
+        // are NOT trustworthy — the caller instead passes its own requested
+        // camera reader dimensions, since a consumer/allocator can round the
+        // camera's AHardwareBuffer up to a padded size (e.g. a 720x1280
+        // request landing in a 1088x1088 allocation), and cropping by that
+        // padded size instead of the true content size distorts/mirrors
+        // portrait geometry. Pass 0 for a pair (or both non-positive) to
+        // fall back to the AHB descriptor's own dimensions, matching the
+        // prior behavior; native/descriptor dimensions remain fallback/
+        // diagnostic only, never authoritative for camera geometry.
+        // debugMode is the RND matte-visualization mode forwarded to the
+        // green-screen fragment shader when greenScreenEnabled is true
+        // (0 = normal, 1 = mask_direct, 2 = mask_mapped,
+        // 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y); ignored on the
+        // opaque layout path.
         // Returns false (with the session left intact for retry) when no
         // surface is attached, either buffer fails to import, or the render
         // itself fails; never retains either HardwareBuffer beyond the call.
@@ -1229,7 +1289,123 @@ class VanguardNativeBridge(
             cameraY: Int,
             cameraWidth: Int,
             cameraHeight: Int,
+            sourceRotationDegrees: Int,
+            cameraRotationDegrees: Int,
+            cameraMirrorHorizontal: Boolean,
+            sourceContentWidth: Int = 0,
+            sourceContentHeight: Int = 0,
+            cameraContentWidth: Int = 0,
+            cameraContentHeight: Int = 0,
+            debugMode: Int = 0,
         ): Boolean
+
+        // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
+        // only): presents one camera-only green-screen frame over a STATIC
+        // background instead of the decoded source video, so person-matte
+        // quality can be evaluated without video-background decoder
+        // pressure. No decoder HardwareBuffer is taken: native imports only
+        // cameraHardwareBuffer, clears the whole canvas to the colour
+        // selected by backgroundMode (1 = solid_teal, an opaque teal; any
+        // other value returns false before importing anything), then draws
+        // the camera aspect-filled into the camera rect over it alpha-masked
+        // by the session's current mask -- the GPU mask from
+        // updateAndroidDuetVulkanPreviewGpuMask preferred when present and
+        // valid, the CPU mask from updateAndroidDuetVulkanPreviewMask
+        // otherwise, exactly as renderAndroidDuetVulkanPreviewFrame's
+        // green-screen path selects it. The camera rect, rotation, mirror,
+        // content dimensions and debugMode follow
+        // renderAndroidDuetVulkanPreviewFrame's camera contract verbatim.
+        // Returns false (session left intact for retry) when no surface is
+        // attached, the camera rect size is non-positive, the camera buffer
+        // fails to import, or the render itself fails; never retains
+        // cameraHardwareBuffer beyond the call; GPU-mask ownership is
+        // unchanged. renderAndroidDuetVulkanPreviewFrame is unchanged.
+        external fun renderAndroidDuetVulkanPreviewStaticBackgroundFrame(
+            handle: Long,
+            cameraHardwareBuffer: HardwareBuffer,
+            cameraX: Int,
+            cameraY: Int,
+            cameraWidth: Int,
+            cameraHeight: Int,
+            cameraRotationDegrees: Int,
+            cameraMirrorHorizontal: Boolean,
+            cameraContentWidth: Int,
+            cameraContentHeight: Int,
+            debugMode: Int,
+            backgroundMode: Int,
+        ): Boolean
+
+        // ── P5-ANDROID-DUET-GPU-TEXTURE-BRIDGE (lifecycle skeleton) ──
+        // Own EGL context (pbuffer, ES3 with ES2 fallback) sized to
+        // width/height, parented to no other session. This slice is
+        // lifecycle-only: resolve/copy always fail closed (0/false) and
+        // import no AHardwareBuffer. Returns 0 on any failure.
+        external fun createAndroidDuetGpuTextureBridge(width: Int, height: Int): Long
+
+        // Returns the bridge's own EGLContext, cast to jlong, or 0 if the
+        // handle is unknown/destroyed.
+        external fun getAndroidDuetGpuTextureBridgeParentGlContext(handle: Long): Long
+
+        // Imports cameraHardwareBuffer transiently and draws it into a FREE
+        // slot of the bridge's fixed pool of 3 session-owned RGBA output
+        // textures (RND texture-slot pool), glFinish()es, marks that slot in
+        // use and returns its GL texture name. The caller may recycle
+        // cameraHardwareBuffer as soon as this returns. Returns 0 on any
+        // failure, including when every pool slot is still owned by the
+        // consumer: an in-use slot is never overwritten. Each non-zero
+        // result must be handed back through
+        // releaseAndroidDuetGpuTextureBridgeResolvedTexture once the
+        // consumer (MediaPipe's TextureReleaseCallback) is done with it, or
+        // the pool drains and every later resolve returns 0.
+        external fun resolveAndroidDuetCameraHardwareBufferToRgbaTexture(
+            handle: Long,
+            cameraHardwareBuffer: HardwareBuffer,
+            width: Int,
+            height: Int,
+            timestampUs: Long,
+        ): Int
+
+        // Returns the pool slot whose texture name is textureName to the
+        // free state (ownership flag only: the texture is never deleted or
+        // redrawn here, so a stale consumer read that races this release
+        // still sees a valid texture). Any thread, no GL context needed.
+        // Returns true iff an in-use slot was released; unknown texture
+        // names and destroyed/unknown handles are ignored (false).
+        external fun releaseAndroidDuetGpuTextureBridgeResolvedTexture(
+            handle: Long,
+            textureName: Int,
+        ): Boolean
+
+        // Stub in this slice: always returns false without copying
+        // textureName into targetHardwareBuffer, other than validating the
+        // handle exists.
+        external fun copyAndroidDuetTextureToHardwareBuffer(
+            handle: Long,
+            textureName: Int,
+            width: Int,
+            height: Int,
+            targetHardwareBuffer: HardwareBuffer,
+        ): Boolean
+
+        // Same copy path as copyAndroidDuetTextureToHardwareBuffer, but when
+        // EGL_ANDROID_native_fence_sync is available it returns a sync-fd
+        // acquire fence for the copy instead of blocking on glFinish(). The
+        // caller owns any fd >= 0 and must pass it to a consumer that closes
+        // it or close it directly. Returns -1 when the copy succeeded but no
+        // fence was produced (fallback path already synchronized), and -2 on
+        // copy failure.
+        external fun copyAndroidDuetTextureToHardwareBufferAcquireFenceFd(
+            handle: Long,
+            textureName: Int,
+            width: Int,
+            height: Int,
+            targetHardwareBuffer: HardwareBuffer,
+        ): Int
+
+        // Any-thread, idempotent destroy: tears down the EGL context/surface/
+        // display and erases the session. Second call / unknown handle is a
+        // safe no-op.
+        external fun destroyAndroidDuetGpuTextureBridge(handle: Long)
 
     }
 
@@ -1823,6 +1999,92 @@ class VanguardNativeBridge(
     // Clearing an already-empty store is a legal no-op (still status=OK).
     external fun clearAndroidTimelineVulkanExportOverlayTextures(
         sessionId: String,
+    ): String
+
+    // ── ANDROID-DUET-VULKAN-GREENSCREEN-EXPORT-PIXEL-PROOF (diagnostic only) ──
+    // Create-or-update the session's backend-owned R8_UNORM green-screen mask
+    // texture -- the SAME backend-owned overlay texture store as
+    // uploadAndroidTimelineVulkanExportOverlayTexture above (an R8 handle
+    // from this call is equally valid input to
+    // releaseAndroidTimelineVulkanExportOverlayTexture /
+    // clearAndroidTimelineVulkanExportOverlayTextures). The mask contract is
+    // UINT8_ALPHA only.
+    // [existingTextureHandle] of 0 creates a brand-new texture and returns
+    // its fresh handle; a positive value updates that existing texture's
+    // pixels in place (the same handle is echoed back on success), letting a
+    // caller re-upload a new alpha value into the same mask texture across
+    // frames without reallocating. An unknown/already-released/size-
+    // mismatched handle fails closed with reason=mask_texture_unknown.
+    // [r8Buffer] must be a direct java.nio.ByteBuffer read from byte index 0
+    // for its own direct-buffer capacity (position/limit ignored).
+    // [rowStrideBytes] of 0 means tightly packed (width * 1 byte/row -- R8
+    // is one byte per pixel); a non-zero value less than width fails closed
+    // with reason=invalid_stride, and a buffer too small for
+    // [rowStrideBytes] * [height] bytes fails closed with
+    // reason=buffer_too_small -- both checked before the session is even
+    // looked up, so an invalid stride never touches a HardwareBuffer or the
+    // backend.
+    external fun uploadAndroidTimelineVulkanExportMaskTextureR8(
+        sessionId: String,
+        existingTextureHandle: Long,
+        r8Buffer: java.nio.ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStrideBytes: Int,
+    ): String
+
+    // Renders one Duet green-screen composite frame (opaque background
+    // "source" layer, then the camera layer alpha-masked by the session's R8
+    // mask texture from uploadAndroidTimelineVulkanExportMaskTextureR8
+    // above) through VulkanBackend::renderDuetGreenScreenFrame on the
+    // EXISTING export session -- never a second swapchain owner, never
+    // AndroidDuetExportSession or the production Duet preview session.
+    // [sourceRectX/Y/Width/Height] / [cameraRectX/Y/Width/Height] are each
+    // layer's aspect-fill destination rect in output-canvas pixels,
+    // validated non-empty and fully inside [width]x[height] before either
+    // HardwareBuffer is resolved. [sourceBufferWidth/Height] /
+    // [cameraBufferWidth/Height] are each layer's content dimensions used
+    // for the aspect-fill crop. [sourceRotationDegrees]/
+    // [cameraRotationDegrees] must each be exactly 0, 90, 180, or 270 --
+    // native fails closed with "vulkan_rotation_unsupported:source:<value>"
+    // / "vulkan_rotation_unsupported:camera:<value>" before either buffer is
+    // resolved on any other value. [sourceMirrorHorizontal]/
+    // [cameraMirrorHorizontal] mirror that layer horizontally in addition to
+    // the rotation.
+    // [cpuMaskTextureHandle] must be a currently active handle from
+    // uploadAndroidTimelineVulkanExportMaskTextureR8 above -- a non-positive
+    // value fails closed with reason=invalid_mask_handle before the session
+    // is even looked up, and an unknown/released handle fails closed with
+    // reason=mask_texture_unknown once the session is found, BEFORE either
+    // HardwareBuffer is resolved/imported. This diagnostic never uses a
+    // GPU-resident mask. [debugMode] is forwarded verbatim to the backend's
+    // RND matte-visualization mode (0 = normal compositing).
+    external fun renderAndroidTimelineVulkanExportDuetGreenScreenFrame(
+        sessionId: String,
+        backgroundHardwareBuffer: HardwareBuffer,
+        cameraHardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        sourceRectX: Int,
+        sourceRectY: Int,
+        sourceRectWidth: Int,
+        sourceRectHeight: Int,
+        cameraRectX: Int,
+        cameraRectY: Int,
+        cameraRectWidth: Int,
+        cameraRectHeight: Int,
+        sourceBufferWidth: Int,
+        sourceBufferHeight: Int,
+        cameraBufferWidth: Int,
+        cameraBufferHeight: Int,
+        cpuMaskTextureHandle: Long,
+        sourceRotationDegrees: Int,
+        sourceMirrorHorizontal: Boolean,
+        cameraRotationDegrees: Int,
+        cameraMirrorHorizontal: Boolean,
+        debugMode: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
     ): String
 
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
@@ -2989,6 +3251,26 @@ class VanguardNativeBridge(
         toFrameIndex: Int,
         toPtsUs: Long,
         progress: Double,
+    ): String
+
+    // ── ANDROID-DUET-TFLITE-GPU-NATIVE-CAPABILITY: diagnostic-only native ─────
+    // capability probe. Resolves the TensorFlow Lite C API and GPU delegate C
+    // API entirely via dlopen/dlsym against the packaged
+    // libtensorflowlite_jni.so / libtensorflowlite_gpu_jni.so (no build-time
+    // TFLite link), builds one interpreter for the caller-supplied model
+    // bytes (a direct native-order ByteBuffer, [modelBytes] long) with the
+    // GPU delegate added, fills the float32 input with 0.5, invokes it
+    // [repeatCount] times, and probes whether the delegate exposes an output
+    // delegate buffer handle before the tensor data is made CPU-readable —
+    // the zero/low-copy prerequisite for a future green-screen pipeline.
+    // Fails closed (a JSON pass=false with a specific failureReason) at the
+    // first unmet gate; never throws. Diagnostic only: no MediaPipe graph,
+    // no camera, no production preview/export wiring, no matte quality
+    // proof.
+    external fun runAndroidDuetTfliteGpuNativeCapabilitySmoke(
+        modelBuffer: java.nio.ByteBuffer,
+        modelBytes: Int,
+        repeatCount: Int,
     ): String
 
     fun initialize() {

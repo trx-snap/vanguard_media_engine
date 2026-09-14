@@ -37,6 +37,18 @@
 //                                                                  backend-owned overlay texture store)
 //   releaseAndroidTimelineVulkanExportOverlayTexture  -> jstring (sub-slice N5: release one overlay texture)
 //   clearAndroidTimelineVulkanExportOverlayTextures   -> jstring (sub-slice N5: release every overlay texture)
+//   uploadAndroidTimelineVulkanExportMaskTextureR8    -> jstring (ANDROID-DUET-VULKAN-GREENSCREEN-EXPORT-PIXEL-PROOF,
+//                                                                  diagnostic-only: create-or-update the session's
+//                                                                  R8_UNORM green-screen mask texture, same backend-
+//                                                                  owned overlay texture store as the RGBA routes
+//                                                                  above)
+//   renderAndroidTimelineVulkanExportDuetGreenScreenFrame -> jstring (ANDROID-DUET-VULKAN-GREENSCREEN-EXPORT-PIXEL-
+//                                                                  PROOF, diagnostic-only: two-HardwareBuffer Duet
+//                                                                  green-screen composite via
+//                                                                  VulkanBackend::renderDuetGreenScreenFrame on the
+//                                                                  existing export session; never used by
+//                                                                  AndroidDuetExportSession or the production Duet
+//                                                                  preview session)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -3311,6 +3323,540 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_clearAndro
     }
 
     std::snprintf(status, sizeof(status), "status=OK;sessionId=%s", sid.c_str());
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: uploadAndroidTimelineVulkanExportMaskTextureR8
+// ---------------------------------------------------------------------------
+// ANDROID-DUET-VULKAN-GREENSCREEN-EXPORT-PIXEL-PROOF (diagnostic only):
+// uploads (create) or re-uploads (update) the session's backend-owned
+// R8_UNORM green-screen mask texture, backing
+// renderAndroidTimelineVulkanExportDuetGreenScreenFrame's
+// cpuMaskTextureHandle below via VulkanBackend::createOverlayTextureR8 /
+// updateOverlayTextureR8 -- the SAME backend-owned overlay texture store
+// used by uploadAndroidTimelineVulkanExportOverlayTexture above (an R8
+// handle from this call is equally valid input to
+// releaseAndroidTimelineVulkanExportOverlayTexture /
+// clearAndroidTimelineVulkanExportOverlayTextures). The mask contract is
+// UINT8_ALPHA only.
+//
+// [existingTextureHandle] selects create-vs-update: 0
+// (kInvalidOverlayTextureHandle) creates a brand-new texture and returns its
+// fresh handle; a positive value updates that existing texture's pixels in
+// place (the same handle is echoed back on success), letting a caller
+// re-upload a new alpha value into the same mask texture across frames
+// without reallocating. An unknown, already-released, or size-mismatched
+// handle fails closed with reason=mask_texture_unknown; native never falls
+// back to creating a new texture in that case.
+//
+// [r8Buffer] must be a direct java.nio.ByteBuffer read from byte index 0 for
+// its own direct-buffer capacity (position/limit ignored), exactly like
+// uploadAndroidTimelineVulkanExportOverlayTexture. [rowStrideBytes] of 0
+// means tightly packed (width * 1 byte/row -- R8 is one byte per pixel); a
+// non-zero value less than width fails closed with reason=invalid_stride,
+// and a buffer too small for rowStrideBytes * height bytes fails closed with
+// reason=buffer_too_small -- both stride checks run before the session is
+// even looked up, so an invalid stride never touches a HardwareBuffer or the
+// backend.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_uploadAndroidTimelineVulkanExportMaskTextureR8(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ,
+    jlong    existingTextureHandleJ,
+    jobject  r8BufferJ,
+    jint     width,
+    jint     height,
+    jint     rowStrideBytes) {
+
+    char status[384];
+
+    if (!sessionIdJ) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=none;reason=invalid_args");
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    if (!r8BufferJ || width <= 0 || height <= 0 || rowStrideBytes < 0 || existingTextureHandleJ < 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=invalid_args", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    void* rawAddress = env->GetDirectBufferAddress(r8BufferJ);
+    const jlong capacity = env->GetDirectBufferCapacity(r8BufferJ);
+    if (rawAddress == nullptr || capacity <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=not_direct_buffer", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    // R8 is one byte per pixel, so the minimum tight stride is just [width].
+    const uint64_t minStride = static_cast<uint64_t>(width);
+    const uint64_t effectiveStride =
+        rowStrideBytes == 0 ? minStride : static_cast<uint64_t>(rowStrideBytes);
+    if (effectiveStride < minStride) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=invalid_stride", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+    if (effectiveStride * static_cast<uint64_t>(height) > static_cast<uint64_t>(capacity)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=buffer_too_small", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    VulkanExportSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=session_not_found", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=session_not_ready", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    const auto existingHandle =
+        static_cast<vanguard::render::VulkanOverlayTextureHandle>(existingTextureHandleJ);
+    const bool isUpdate = existingHandle != vanguard::render::kInvalidOverlayTextureHandle;
+
+    vanguard::render::VulkanOverlayTextureHandle handle = existingHandle;
+    vanguard::render::VulkanOverlayTextureInfo info{};
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+        if (isUpdate) {
+            ok = session->backend.updateOverlayTextureR8(
+                existingHandle,
+                static_cast<const uint8_t*>(rawAddress),
+                static_cast<size_t>(capacity),
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height),
+                static_cast<uint32_t>(rowStrideBytes));
+            if (ok) {
+                session->backend.getOverlayTextureInfo(existingHandle, &info);
+            }
+        } else {
+            ok = session->backend.createOverlayTextureR8(
+                static_cast<const uint8_t*>(rawAddress),
+                static_cast<size_t>(capacity),
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height),
+                static_cast<uint32_t>(rowStrideBytes),
+                &handle,
+                &info);
+        }
+    }
+
+    if (!ok) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=%s",
+            sid.c_str(), isUpdate ? "mask_texture_unknown" : "texture_create_failed");
+        return env->NewStringUTF(status);
+    }
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;sessionId=%s;textureHandle=%llu;imageViewHandle=%llu;samplerHandle=%llu;"
+        "width=%u;height=%u;updated=%d",
+        sid.c_str(),
+        static_cast<unsigned long long>(handle),
+        static_cast<unsigned long long>(info.imageViewHandle),
+        static_cast<unsigned long long>(info.samplerHandle),
+        info.width, info.height,
+        isUpdate ? 1 : 0);
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: renderAndroidTimelineVulkanExportDuetGreenScreenFrame
+// ---------------------------------------------------------------------------
+// ANDROID-DUET-VULKAN-GREENSCREEN-EXPORT-PIXEL-PROOF (diagnostic only):
+// exercises VulkanBackend::renderDuetGreenScreenFrame -- two aspect-filled
+// layers (opaque background "source", then camera alpha-masked by the
+// session's R8 mask texture from uploadAndroidTimelineVulkanExportMaskTextureR8
+// above) composited on the EXISTING production Vulkan export session (same
+// registry/lane-mutex/ReleaseGuard/activeRenderCount/destroy protocol as
+// every route above). Structurally a diagnostic sibling of
+// renderAndroidTimelineVulkanExportFrameCropped; never used by
+// AndroidDuetExportSession or the production Duet preview session, and never
+// creates a second swapchain owner (it reuses this session's own backend).
+//
+// [backgroundHardwareBuffer] plays the "source" layer, [cameraHardwareBuffer]
+// the "camera" layer, each aspect-filled into its own destination rect
+// ([sourceRectX/Y/Width/Height] / [cameraRectX/Y/Width/Height], both
+// validated non-empty and fully inside [width]x[height] before either
+// buffer is resolved) using its own content dimensions
+// ([sourceBufferWidth/Height] / [cameraBufferWidth/Height]).
+// [sourceRotationDegrees]/[cameraRotationDegrees] must each be exactly 0,
+// 90, 180, or 270 -- native fails closed with
+// "vulkan_rotation_unsupported:source:<value>" /
+// "vulkan_rotation_unsupported:camera:<value>" before either buffer is
+// resolved on any other value. [sourceMirrorHorizontal]/
+// [cameraMirrorHorizontal] mirror that layer horizontally in addition to the
+// rotation, matching VulkanBackend::renderDuetGreenScreenFrame's own
+// contract.
+//
+// [cpuMaskTextureHandle] must be a currently active R8 handle previously
+// returned by uploadAndroidTimelineVulkanExportMaskTextureR8 above -- a
+// non-positive value fails closed with reason=invalid_mask_handle before the
+// session is even looked up, and an unknown/already-released/mismatched
+// handle fails closed with reason=mask_texture_unknown once the session is
+// found, BEFORE either HardwareBuffer is resolved/imported
+// (getOverlayTextureInfo is checked first, inside the same backendLaneMutex
+// critical section that then resolves/imports/renders/releases both
+// buffers). This diagnostic never passes a GPU-resident mask: gpuMaskHandle
+// is always vanguard::render::kInvalidHardwareBufferHandle (0 width/height),
+// so renderDuetGreenScreenFrame always resolves to the CPU/R8 mask path.
+//
+// [debugMode] is forwarded verbatim to the backend's RND matte-visualization
+// mode (0 = normal compositing; see renderDuetGreenScreenFrame's own header
+// doc in vulkan_backend.h for 1..4).
+//
+// Both buffers are imported, and both are released (closing both release
+// fence fds) on every path after both imports succeed, exactly like
+// renderAndroidTimelineVulkanExportTransitionFrame's twin-buffer protocol
+// above. A backend that cannot service this route (host build / no
+// swapchain) reports RenderFrameResult::kUnavailable, surfaced here as
+// reason=green_screen_render_unavailable so a caller can tell an
+// unsupported/unavailable Vulkan backend apart from an actual render
+// failure -- native never crashes on an unsupported device.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportDuetGreenScreenFrame(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ,
+    jobject  backgroundHardwareBufferJ,
+    jobject  cameraHardwareBufferJ,
+    jint     width,
+    jint     height,
+    jint     sourceRectX,
+    jint     sourceRectY,
+    jint     sourceRectWidth,
+    jint     sourceRectHeight,
+    jint     cameraRectX,
+    jint     cameraRectY,
+    jint     cameraRectWidth,
+    jint     cameraRectHeight,
+    jint     sourceBufferWidth,
+    jint     sourceBufferHeight,
+    jint     cameraBufferWidth,
+    jint     cameraBufferHeight,
+    jlong    cpuMaskTextureHandleJ,
+    jint     sourceRotationDegrees,
+    jboolean sourceMirrorHorizontal,
+    jint     cameraRotationDegrees,
+    jboolean cameraMirrorHorizontal,
+    jint     debugMode,
+    jlong    timelinePtsUs,
+    jint     frameIndex) {
+
+    char status[768];
+
+    if (!sessionIdJ || !backgroundHardwareBufferJ || !cameraHardwareBufferJ ||
+        width <= 0 || height <= 0 ||
+        sourceBufferWidth <= 0 || sourceBufferHeight <= 0 ||
+        cameraBufferWidth <= 0 || cameraBufferHeight <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=invalid_args",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (sourceRotationDegrees != 0 && sourceRotationDegrees != 90 &&
+        sourceRotationDegrees != 180 && sourceRotationDegrees != 270) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_rotation_unsupported:source:%d",
+            static_cast<int>(frameIndex), static_cast<int>(sourceRotationDegrees));
+        return env->NewStringUTF(status);
+    }
+    if (cameraRotationDegrees != 0 && cameraRotationDegrees != 90 &&
+        cameraRotationDegrees != 180 && cameraRotationDegrees != 270) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_rotation_unsupported:camera:%d",
+            static_cast<int>(frameIndex), static_cast<int>(cameraRotationDegrees));
+        return env->NewStringUTF(status);
+    }
+
+    if (sourceRectWidth <= 0 || sourceRectHeight <= 0 || sourceRectX < 0 || sourceRectY < 0 ||
+        (static_cast<int64_t>(sourceRectX) + sourceRectWidth) > width ||
+        (static_cast<int64_t>(sourceRectY) + sourceRectHeight) > height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_dest_fit_rect_invalid:source:"
+            "rect=%d,%d-%dx%d:outW=%d:outH=%d",
+            static_cast<int>(frameIndex),
+            static_cast<int>(sourceRectX), static_cast<int>(sourceRectY),
+            static_cast<int>(sourceRectWidth), static_cast<int>(sourceRectHeight),
+            static_cast<int>(width), static_cast<int>(height));
+        return env->NewStringUTF(status);
+    }
+    if (cameraRectWidth <= 0 || cameraRectHeight <= 0 || cameraRectX < 0 || cameraRectY < 0 ||
+        (static_cast<int64_t>(cameraRectX) + cameraRectWidth) > width ||
+        (static_cast<int64_t>(cameraRectY) + cameraRectHeight) > height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_dest_fit_rect_invalid:camera:"
+            "rect=%d,%d-%dx%d:outW=%d:outH=%d",
+            static_cast<int>(frameIndex),
+            static_cast<int>(cameraRectX), static_cast<int>(cameraRectY),
+            static_cast<int>(cameraRectWidth), static_cast<int>(cameraRectHeight),
+            static_cast<int>(width), static_cast<int>(height));
+        return env->NewStringUTF(status);
+    }
+
+    if (cpuMaskTextureHandleJ <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=invalid_mask_handle",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    VulkanExportSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=session_not_found;sessionId=%s",
+            static_cast<int>(frameIndex), sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=session_not_ready",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (width != session->width || height != session->height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_output_geometry_mismatch:"
+            "sessionW=%d:sessionH=%d:outW=%d:outH=%d",
+            static_cast<int>(frameIndex), session->width, session->height,
+            static_cast<int>(width), static_cast<int>(height));
+        return env->NewStringUTF(status);
+    }
+
+    const auto cpuMaskHandle =
+        static_cast<vanguard::render::VulkanOverlayTextureHandle>(cpuMaskTextureHandleJ);
+
+    using vanguard::render::HardwareBufferImportResult;
+    vanguard::render::HardwareBufferHandle sourceHandle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferHandle cameraHandle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor sourceDescriptor{};
+    vanguard::render::HardwareBufferDescriptor cameraDescriptor{};
+    HardwareBufferImportResult sourceImportResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult cameraImportResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult sourceReleaseResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult cameraReleaseResult = HardwareBufferImportResult::kUnknownHandle;
+    bool maskKnown = false;
+    bool bothImported = false;
+    vanguard::render::RenderFrameResult renderResult = vanguard::render::RenderFrameResult::kInvalidBufferHandle;
+    bool renderOk = false;
+    AHardwareBuffer* sourceAhwb = nullptr;
+    AHardwareBuffer* cameraAhwb = nullptr;
+
+    {
+        // One uninterrupted critical section: the mask-handle lookup, both
+        // imports, the render, and both releases all happen while holding
+        // backendLaneMutex, exactly like the transition route's twin-buffer
+        // protocol above -- no other call can interleave its own backend use
+        // with this frame's, and the mask lookup below runs before either
+        // HardwareBuffer is even resolved (a mismatched/unknown mask handle
+        // fails closed here without ever calling
+        // ResolveAHardwareBufferFromJObject).
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+
+        vanguard::render::VulkanOverlayTextureInfo maskInfo{};
+        maskKnown = session->backend.getOverlayTextureInfo(cpuMaskHandle, &maskInfo);
+        if (maskKnown) {
+            sourceAhwb = ResolveAHardwareBufferFromJObject(env, backgroundHardwareBufferJ);
+            cameraAhwb = ResolveAHardwareBufferFromJObject(env, cameraHardwareBufferJ);
+            if (sourceAhwb && cameraAhwb) {
+                sourceImportResult = session->backend.importHardwareBuffer(
+                    sourceAhwb, -1, &sourceHandle, &sourceDescriptor);
+                if (sourceImportResult == HardwareBufferImportResult::kSuccess) {
+                    cameraImportResult = session->backend.importHardwareBuffer(
+                        cameraAhwb, -1, &cameraHandle, &cameraDescriptor);
+                    if (cameraImportResult != HardwareBufferImportResult::kSuccess) {
+                        // Exactly-once release of the already imported
+                        // "source" layer.
+                        int sourceReleaseFenceFd = -1;
+                        sourceReleaseResult = session->backend.releaseHardwareBuffer(
+                            sourceHandle, &sourceReleaseFenceFd);
+                        if (sourceReleaseFenceFd >= 0) ::close(sourceReleaseFenceFd);
+                    } else {
+                        // Both imported: from here every path releases both
+                        // handles below.
+                        bothImported = true;
+
+                        vanguard::render::RenderDestinationRect sourceRect{};
+                        sourceRect.x = static_cast<int32_t>(sourceRectX);
+                        sourceRect.y = static_cast<int32_t>(sourceRectY);
+                        sourceRect.width = static_cast<int32_t>(sourceRectWidth);
+                        sourceRect.height = static_cast<int32_t>(sourceRectHeight);
+                        vanguard::render::RenderDestinationRect cameraRect{};
+                        cameraRect.x = static_cast<int32_t>(cameraRectX);
+                        cameraRect.y = static_cast<int32_t>(cameraRectY);
+                        cameraRect.width = static_cast<int32_t>(cameraRectWidth);
+                        cameraRect.height = static_cast<int32_t>(cameraRectHeight);
+
+                        renderResult = session->backend.renderDuetGreenScreenFrame(
+                            sourceHandle, cameraHandle,
+                            sourceRect, cameraRect,
+                            static_cast<uint32_t>(sourceBufferWidth),
+                            static_cast<uint32_t>(sourceBufferHeight),
+                            static_cast<uint32_t>(cameraBufferWidth),
+                            static_cast<uint32_t>(cameraBufferHeight),
+                            cpuMaskHandle,
+                            vanguard::render::kInvalidHardwareBufferHandle,
+                            0u, 0u,
+                            static_cast<uint32_t>(sourceRotationDegrees),
+                            sourceMirrorHorizontal == JNI_TRUE,
+                            static_cast<uint32_t>(cameraRotationDegrees),
+                            cameraMirrorHorizontal == JNI_TRUE,
+                            static_cast<int32_t>(debugMode));
+                        renderOk =
+                            renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                            renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+
+                        int sourceReleaseFenceFd = -1;
+                        sourceReleaseResult = session->backend.releaseHardwareBuffer(
+                            sourceHandle, &sourceReleaseFenceFd);
+                        if (sourceReleaseFenceFd >= 0) ::close(sourceReleaseFenceFd);
+                        int cameraReleaseFenceFd = -1;
+                        cameraReleaseResult = session->backend.releaseHardwareBuffer(
+                            cameraHandle, &cameraReleaseFenceFd);
+                        if (cameraReleaseFenceFd >= 0) ::close(cameraReleaseFenceFd);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!maskKnown) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=mask_texture_unknown",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!sourceAhwb || !cameraAhwb) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=ahardwarebuffer_resolve_failed:layer=%s",
+            static_cast<int>(frameIndex), !sourceAhwb ? "source" : "camera");
+        return env->NewStringUTF(status);
+    }
+
+    if (sourceImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=import_failed:layer=source;importResult=%s",
+            static_cast<int>(frameIndex), HwBufResultName(sourceImportResult));
+        return env->NewStringUTF(status);
+    }
+
+    if (cameraImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=import_failed:layer=camera;importResult=%s;"
+            "sourceReleaseResult=%s",
+            static_cast<int>(frameIndex), HwBufResultName(cameraImportResult),
+            HwBufResultName(sourceReleaseResult));
+        return env->NewStringUTF(status);
+    }
+
+    if (!bothImported) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=render_failed:unreachable",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!renderOk) {
+        const char* reason =
+            renderResult == vanguard::render::RenderFrameResult::kUnavailable
+                ? "green_screen_render_unavailable"
+                : "render_failed";
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=%s;renderResult=%s;sourceReleaseResult=%s;"
+            "cameraReleaseResult=%s",
+            static_cast<int>(frameIndex), reason, RenderResultName(renderResult),
+            HwBufResultName(sourceReleaseResult), HwBufResultName(cameraReleaseResult));
+        return env->NewStringUTF(status);
+    }
+
+    if (sourceReleaseResult != HardwareBufferImportResult::kSuccess ||
+        cameraReleaseResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=release_failed;sourceReleaseResult=%s;"
+            "cameraReleaseResult=%s",
+            static_cast<int>(frameIndex),
+            HwBufResultName(sourceReleaseResult), HwBufResultName(cameraReleaseResult));
+        return env->NewStringUTF(status);
+    }
+
+    session->renderedFrames++;
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;renderResult=%s;"
+        "sourceReleaseResult=%s;cameraReleaseResult=%s;sourceDescW=%u;sourceDescH=%u;"
+        "cameraDescW=%u;cameraDescH=%u;cameraRotation=%d;cameraMirror=%d;debugMode=%d",
+        static_cast<int>(frameIndex),
+        static_cast<long long>(timelinePtsUs),
+        session->renderedFrames,
+        RenderResultName(renderResult),
+        HwBufResultName(sourceReleaseResult),
+        HwBufResultName(cameraReleaseResult),
+        sourceDescriptor.width, sourceDescriptor.height,
+        cameraDescriptor.width, cameraDescriptor.height,
+        static_cast<int>(cameraRotationDegrees),
+        cameraMirrorHorizontal == JNI_TRUE ? 1 : 0,
+        static_cast<int>(debugMode));
     return env->NewStringUTF(status);
 }
 
