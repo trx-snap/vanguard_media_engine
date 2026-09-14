@@ -97,6 +97,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDuetTfliteGpuNative
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGreenScreenTasksLiveSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
+import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenProductionExportSmokeHarness
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -3226,6 +3227,38 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     }
                     mainHandler.post { if (!detached) result.success(smokeResult) }
                 }, "VGDuetGreenScreenExportExternalYcbcrPixelProof").apply { isDaemon = true }.start()
+            }
+
+            "runAndroidGreenScreenProductionExportSmoke" -> {
+                val outputPath = args?.get("outputPath") as? String
+                if (outputPath.isNullOrBlank()) {
+                    result.error(
+                        "INVALID_ARG",
+                        "runAndroidGreenScreenProductionExportSmoke: outputPath required",
+                        null,
+                    )
+                    return
+                }
+                val width = (args["width"] as? Number)?.toInt() ?: 360
+                val height = (args["height"] as? Number)?.toInt() ?: 640
+
+                Thread({
+                    val smokeResult = try {
+                        AndroidGreenScreenProductionExportSmokeHarness.runSmoke(
+                            outputPath = outputPath,
+                            width = width,
+                            height = height,
+                        )
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "runAndroidGreenScreenProductionExportSmoke failed", t)
+                        mapOf(
+                            "pass" to false,
+                            "reason" to "exception:${t.javaClass.simpleName}:${t.message}",
+                            "proofBoundary" to AndroidGreenScreenProductionExportSmokeHarness.PROOF_BOUNDARY,
+                        )
+                    }
+                    mainHandler.post { if (!detached) result.success(smokeResult) }
+                }, "VGGreenScreenProductionExportSmoke").apply { isDaemon = true }.start()
             }
 
             else -> result.notImplemented()
