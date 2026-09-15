@@ -98,6 +98,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGreenScreenTask
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenProductionExportSmokeHarness
+import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenExportApiPixelProofSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -114,6 +115,7 @@ import com.connects.vanguard_media_engine.streaming.AndroidMedia3StreamSourceCoo
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import com.connects.vanguard_media_engine.duet.AndroidDuetMethodHandler
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenExportMethodHandler
 import com.connects.vanguard_media_engine.greenscreen.AndroidLiveGreenScreenMethodHandler
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -616,6 +618,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // Initialized lazily once mainHandler is available (onAttachedToEngine).
     private var duetMethodHandler: AndroidDuetMethodHandler? = null
 
+    // ── VG-GREENSCREEN-EXPORT-API: generic green-screen export route handler ──
+    // Owns "exportGreenScreenComposition" (parsing, busy admission, background
+    // execution, terminal mapping). Plugin is a thin router only.
+    private var greenScreenExportMethodHandler: AndroidGreenScreenExportMethodHandler? = null
     // VG-CAMERA-ADMISSION: engine-wide single live camera/keying owner guard,
     // shared by the Duet session coordinator and the generic live green-screen
     // coordinator so only one of them holds the camera at a time.
@@ -623,6 +629,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // VG-LIVE-GREENSCREEN: generic live green-screen handler. Owns the four
     // "*LiveGreenScreenSession" routes; plugin is a thin router only.
     private var liveGreenScreenMethodHandler: AndroidLiveGreenScreenMethodHandler? = null
+
+    // ── VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator ──
+    private var greenScreenExportApiPixelProofSmokeCoordinator: AndroidGreenScreenExportApiPixelProofSmokeCoordinator? = null
 
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
@@ -1000,6 +1009,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             onDuetEvent = { payload -> mainHandler.post { channel.invokeMethod("onDuetEvent", payload) } },
             cameraAdmission = cameraSessionAdmission,
         )
+        // VG-GREENSCREEN-EXPORT-API: generic green-screen export handler (main-thread replies).
+        greenScreenExportMethodHandler = AndroidGreenScreenExportMethodHandler(mainHandler)
         // VG-LIVE-GREENSCREEN: generic live green-screen handler (production GL
         // preview stack, engine-owned camera, shared camera admission).
         liveGreenScreenMethodHandler = AndroidLiveGreenScreenMethodHandler(
@@ -1011,6 +1022,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 mainHandler.post { channel.invokeMethod("onLiveGreenScreenEvent", payload) }
             },
         )
+        // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator
+        greenScreenExportApiPixelProofSmokeCoordinator = AndroidGreenScreenExportApiPixelProofSmokeCoordinator(mainHandler)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -1029,6 +1042,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             return
         }
 
+        // ── VG-GREENSCREEN-EXPORT-API: generic green-screen export dispatch ──
+        if (AndroidGreenScreenExportMethodHandler.ownsMethod(call.method)) {
+            val handler = greenScreenExportMethodHandler
+            if (handler != null) {
+                handler.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Green-screen export method handler unavailable", null)
+            }
+            return
+        }
+
         // ── VG-LIVE-GREENSCREEN: generic live green-screen session dispatch ──
         if (AndroidLiveGreenScreenMethodHandler.ownsMethod(call.method)) {
             val handler = liveGreenScreenMethodHandler
@@ -1036,6 +1060,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 handler.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Live green-screen method handler unavailable", null)
+            }
+            return
+        }
+
+        // ── VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert dispatch ──
+        if (AndroidGreenScreenExportApiPixelProofSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = greenScreenExportApiPixelProofSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android green screen export API pixel proof coordinator unavailable", null)
             }
             return
         }
@@ -3794,10 +3829,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // VG-DUET-SLICE-2: cancel any in-flight probe and release active session.
         duetMethodHandler?.disposeAll()
         duetMethodHandler = null
+        // VG-GREENSCREEN-EXPORT-API: cancel any in-flight green-screen export and stop its executor.
+        greenScreenExportMethodHandler?.disposeAll()
+        greenScreenExportMethodHandler = null
         // VG-LIVE-GREENSCREEN: stop any active live session (camera, segmentation,
         // compositor, texture) and release its camera admission.
         liveGreenScreenMethodHandler?.disposeAll()
         liveGreenScreenMethodHandler = null
+        // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: shutdown background executor.
+        greenScreenExportApiPixelProofSmokeCoordinator?.disposeAll()
+        greenScreenExportApiPixelProofSmokeCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

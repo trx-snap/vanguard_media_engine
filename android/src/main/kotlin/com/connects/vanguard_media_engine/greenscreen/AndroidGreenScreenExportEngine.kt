@@ -1,6 +1,12 @@
 package com.connects.vanguard_media_engine.greenscreen
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Paint
+import android.graphics.RectF
 import android.hardware.HardwareBuffer
 import android.media.Image
 import android.media.ImageReader
@@ -28,13 +34,22 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Generic, caller-agnostic Android green-screen export engine (Duet, live
  * meeting/calling, going live, and camera are all expected callers).
  *
- * Composites two offline video inputs (opaque background + foreground masked by
- * a caller-supplied per-frame mask) into AVC/MP4 on a fixed output clock:
+ * Composites an opaque background lane and a foreground video lane masked by
+ * a caller-supplied per-frame mask into AVC/MP4 on a fixed output clock:
  * output frame `i` has `outputPtsUs = i * 1_000_000 / fps`; each lane selects
  * the newest decoded frame with pts <= outputPtsUs; frames superseded before
  * being rendered count as dropped; after input EOS the last frame is held and
  * every reuse counts as held; a lane with no frame at or before an output pts
  * (including pts 0) fails the export closed.
+ *
+ * The background is a sealed [BackgroundSource]: a local video file is decoded
+ * directly; a solid color or a local image file is first written to a bounded
+ * temporary MP4 (same fps, frame count, and bitrate as the output; sized to the
+ * background's destination rect, or the full canvas when no rect is given, so
+ * the compositor's aspect-fill placement is an identity and image letterboxing
+ * survives) and then decoded through the same hardware lane. That temporary
+ * MP4 is deleted on every terminal path. The foreground is always a local
+ * video file in this slice.
  *
  * Each lane owns a MediaExtractor, hardware MediaCodec decoder, ImageReader
  * (PRIVATE, GPU_SAMPLED_IMAGE), HandlerThread, and up to two open Images
@@ -48,6 +63,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 object AndroidGreenScreenExportEngine {
     private const val TAG = "VanguardGreenScreenExport"
     const val ENGINE_BOUNDARY = "android_greenscreen_export_engine_offline_two_input_fixed_clock"
+    private const val GENERATED_BACKGROUND_SUFFIX = ".bg.tmp.mp4"
+    private const val GENERATED_BACKGROUND_MIN_DIMENSION = 2
+    private const val IMAGE_DECODE_MAX_DIMENSION_FACTOR = 2
 
     private const val IMAGE_READER_MAX_IMAGES = 4
     private const val DECODER_DEQUEUE_TIMEOUT_US = 10_000L
@@ -69,6 +87,7 @@ object AndroidGreenScreenExportEngine {
         "no_av_sync",
         "no_realtime_clock",
         "no_container_rotation_auto_apply",
+        "no_image_exif_orientation_auto_apply",
         "no_production_duet_wiring",
         "no_connectsapp_or_universal_editor_wiring",
         "fixed_offline_frame_clock_only",
@@ -78,6 +97,46 @@ object AndroidGreenScreenExportEngine {
     data class CanvasRect(val x: Int, val y: Int, val width: Int, val height: Int) {
         fun fitsInside(canvasWidth: Int, canvasHeight: Int): Boolean =
             width > 0 && height > 0 && x >= 0 && y >= 0 && x + width <= canvasWidth && y + height <= canvasHeight
+    }
+
+    /** How an image background is placed on its destination rect (black letterbox/pillarbox for fit). */
+    enum class ImageScaleMode(val wireName: String) {
+        ASPECT_FILL("aspectFill"),
+        ASPECT_FIT("aspectFit");
+
+        companion object {
+            fun fromWireName(name: String?): ImageScaleMode? = values().firstOrNull { it.wireName == name }
+        }
+    }
+
+    /**
+     * Background input. [VideoFile] is decoded directly. [SolidColor] and
+     * [ImageFile] are rendered into a bounded temporary MP4 that the engine
+     * owns, decodes through the hardware lane, and deletes on every terminal
+     * path. [SolidColor.argb] alpha is ignored (the background is opaque).
+     */
+    sealed class BackgroundSource {
+        abstract val typeName: String
+
+        class VideoFile(val path: String) : BackgroundSource() {
+            override val typeName: String get() = TYPE_VIDEO_FILE
+        }
+
+        class SolidColor(val argb: Int) : BackgroundSource() {
+            override val typeName: String get() = TYPE_SOLID_COLOR
+        }
+
+        class ImageFile(val path: String, val scaleMode: ImageScaleMode) : BackgroundSource() {
+            override val typeName: String get() = TYPE_IMAGE_FILE
+        }
+
+        val isGenerated: Boolean get() = this !is VideoFile
+
+        companion object {
+            const val TYPE_VIDEO_FILE = "videoFile"
+            const val TYPE_SOLID_COLOR = "solidColor"
+            const val TYPE_IMAGE_FILE = "imageFile"
+        }
     }
 
     /**
@@ -106,10 +165,13 @@ object AndroidGreenScreenExportEngine {
 
     /**
      * Null rects mean full canvas. Rotations are cardinal only (0/90/180/270)
-     * and applied explicitly; container rotation is NOT auto-applied.
+     * and applied explicitly; container rotation is NOT auto-applied. A
+     * generated (solid/image) background is sized to the pre-rotation
+     * background destination rect, so rotating a generated background is
+     * allowed but is then aspect-fill cropped by the compositor.
      */
     class Request(
-        val backgroundVideoPath: String,
+        val background: BackgroundSource,
         val foregroundVideoPath: String,
         val outputPath: String,
         val width: Int,
@@ -161,6 +223,7 @@ object AndroidGreenScreenExportEngine {
         val outputSize: Long,
         val outputExists: Boolean,
         val tmpExists: Boolean,
+        val fps: Int,
         val outputFrameCount: Int,
         val renderedFrames: Int,
         val writtenVideoSamples: Int,
@@ -168,8 +231,18 @@ object AndroidGreenScreenExportEngine {
         val foreground: LaneTelemetry,
         val maskWidth: Int,
         val maskHeight: Int,
+        val backgroundSourceType: String,
+        /** Frames written into the engine-owned temporary background MP4 (0 for a video background). */
+        val backgroundGeneratedFrames: Int,
+        /** True only if the engine-owned temporary background MP4 survived cleanup (always expected false). */
+        val backgroundGeneratedTmpExists: Boolean,
     ) {
         val renderedEqualsWritten: Boolean get() = renderedFrames == writtenVideoSamples
+
+        /** Nominal output duration from the fixed output clock. */
+        val durationMs: Long get() = if (fps > 0) outputFrameCount * 1000L / fps else 0L
+
+        val backgroundGenerated: Boolean get() = backgroundSourceType != BackgroundSource.TYPE_VIDEO_FILE
 
         val claims: List<String>
             get() = buildList {
@@ -184,8 +257,10 @@ object AndroidGreenScreenExportEngine {
                     add("cpu_r8_mask_frozen_dimensions")
                     add("rendered_equals_written_samples")
                     add("atomic_tmp_rename_output")
+                    if (backgroundGenerated) add("generated_static_background_hardware_lane")
                 }
                 if (!tmpExists) add("clean_tmp_cleanup")
+                if (backgroundGenerated && !backgroundGeneratedTmpExists) add("clean_generated_background_cleanup")
             }
 
         val nonClaims: List<String> get() = NON_CLAIMS
@@ -197,14 +272,20 @@ object AndroidGreenScreenExportEngine {
             put("engineBoundary", ENGINE_BOUNDARY)
             put("outputPath", outputPath)
             put("outputSize", outputSize)
+            put("fileSizeBytes", outputSize)
+            put("durationMs", durationMs)
             put("outputExists", outputExists)
             put("tmpExists", tmpExists)
+            put("fps", fps)
             put("outputFrameCount", outputFrameCount)
             put("renderedFrames", renderedFrames)
             put("writtenVideoSamples", writtenVideoSamples)
             put("renderedEqualsWritten", renderedEqualsWritten)
             putAll(background.toMap("background"))
             putAll(foreground.toMap("foreground"))
+            put("backgroundSourceType", backgroundSourceType)
+            put("backgroundGeneratedFrames", backgroundGeneratedFrames)
+            put("backgroundGeneratedTmpExists", backgroundGeneratedTmpExists)
             put("maskWidth", maskWidth)
             put("maskHeight", maskHeight)
             put("claims", claims)
@@ -214,7 +295,7 @@ object AndroidGreenScreenExportEngine {
 
     /** Runs the export synchronously on the calling thread. */
     fun export(request: Request): Result {
-        val validationError = validateRequest(request)
+        val validationError = validate(request)
         if (validationError != null) {
             return Result(
                 pass = false,
@@ -224,6 +305,7 @@ object AndroidGreenScreenExportEngine {
                 outputSize = 0L,
                 outputExists = File(request.outputPath).exists(),
                 tmpExists = File("${request.outputPath}.tmp").exists(),
+                fps = request.fps,
                 outputFrameCount = request.outputFrameCount,
                 renderedFrames = 0,
                 writtenVideoSamples = 0,
@@ -231,6 +313,9 @@ object AndroidGreenScreenExportEngine {
                 foreground = LaneTelemetry.EMPTY,
                 maskWidth = 0,
                 maskHeight = 0,
+                backgroundSourceType = request.background.typeName,
+                backgroundGeneratedFrames = 0,
+                backgroundGeneratedTmpExists = false,
             )
         }
         return ExportRun(request).run()
@@ -238,12 +323,27 @@ object AndroidGreenScreenExportEngine {
 
     fun outputPtsUs(frameIndex: Int, fps: Int): Long = frameIndex * 1_000_000L / fps
 
-    private fun validateRequest(r: Request): String? {
+    /**
+     * Static request validation (no media probing). Returns null when valid or
+     * a stable reason string; [export] applies the same check and callers may
+     * pre-check it to reject bad arguments before scheduling work.
+     */
+    fun validate(r: Request): String? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "api_below_29"
-        if (r.backgroundVideoPath.isBlank() || r.foregroundVideoPath.isBlank() || r.outputPath.isBlank()) {
+        if (r.foregroundVideoPath.isBlank() || r.outputPath.isBlank()) {
             return "invalid_args:blank_path"
         }
-        if (!File(r.backgroundVideoPath).isFile) return "background_input_missing"
+        when (val bg = r.background) {
+            is BackgroundSource.VideoFile -> {
+                if (bg.path.isBlank()) return "invalid_args:blank_path"
+                if (!File(bg.path).isFile) return "background_input_missing"
+            }
+            is BackgroundSource.SolidColor -> Unit
+            is BackgroundSource.ImageFile -> {
+                if (bg.path.isBlank()) return "invalid_args:blank_path"
+                if (!File(bg.path).isFile) return "background_image_missing"
+            }
+        }
         if (!File(r.foregroundVideoPath).isFile) return "foreground_input_missing"
         if (r.width <= 0 || r.height <= 0) return "invalid_args:canvas"
         if (r.fps <= 0) return "invalid_args:fps"
@@ -302,6 +402,10 @@ object AndroidGreenScreenExportEngine {
         private var background: DecodeLane? = null
         private var foreground: DecodeLane? = null
 
+        /** Engine-owned temporary MP4 for a solid/image background; deleted in [releaseResources]. */
+        private var generatedBackgroundFile: File? = null
+        private var backgroundGeneratedFrames = 0
+
         private var renderedFrames = 0
         private var writtenVideoSamples = 0
         private val released = AtomicBoolean(false)
@@ -358,6 +462,7 @@ object AndroidGreenScreenExportEngine {
                 outputSize = if (outputExists) outputFile.length() else 0L,
                 outputExists = outputExists,
                 tmpExists = tmpFile.exists(),
+                fps = req.fps,
                 outputFrameCount = req.outputFrameCount,
                 renderedFrames = renderedFrames,
                 writtenVideoSamples = writtenVideoSamples,
@@ -365,6 +470,9 @@ object AndroidGreenScreenExportEngine {
                 foreground = foreground?.telemetry() ?: LaneTelemetry.EMPTY,
                 maskWidth = maskWidth,
                 maskHeight = maskHeight,
+                backgroundSourceType = req.background.typeName,
+                backgroundGeneratedFrames = backgroundGeneratedFrames,
+                backgroundGeneratedTmpExists = generatedBackgroundFile?.exists() ?: false,
             )
         }
 
@@ -375,8 +483,25 @@ object AndroidGreenScreenExportEngine {
             val staleTmp = File(tmpPath)
             if (staleTmp.exists() && !staleTmp.delete()) return Outcome.Failed("stale_tmp_delete_failed")
 
+            // Static backgrounds become an engine-owned temporary MP4 before any lane opens.
+            val backgroundVideoPath: String = when (val source = req.background) {
+                is BackgroundSource.VideoFile -> source.path
+                is BackgroundSource.SolidColor, is BackgroundSource.ImageFile -> {
+                    val generated = File("${req.outputPath}$GENERATED_BACKGROUND_SUFFIX").also { generatedBackgroundFile = it }
+                    if (generated.exists() && !generated.delete()) return Outcome.Failed("stale_generated_background_delete_failed")
+                    val destination = req.backgroundRect ?: CanvasRect(0, 0, req.width, req.height)
+                    when (val gen = StaticBackgroundWriter(req, source, destination, generated).write()) {
+                        is StaticBackgroundOutcome.Written -> backgroundGeneratedFrames = gen.frames
+                        is StaticBackgroundOutcome.Cancelled -> return Outcome.Cancelled
+                        is StaticBackgroundOutcome.Failed -> return Outcome.Failed("background_generation_failed:${gen.reason}")
+                    }
+                    generated.absolutePath
+                }
+            }
+            if (cancelled()) return Outcome.Cancelled
+
             // Decoders first: bad inputs fail before any encoder/native allocation.
-            val bg = DecodeLane("background", req.backgroundVideoPath, req.cancelFlag).also { background = it }
+            val bg = DecodeLane("background", backgroundVideoPath, req.cancelFlag).also { background = it }
             bg.prepare()?.let { return Outcome.Failed("background_decoder_prepare_failed:$it") }
             val fg = DecodeLane("foreground", req.foregroundVideoPath, req.cancelFlag).also { foreground = it }
             fg.prepare()?.let { return Outcome.Failed("foreground_decoder_prepare_failed:$it") }
@@ -565,9 +690,18 @@ object AndroidGreenScreenExportEngine {
             }
         }
 
-        /** Idempotent. Order: mask handle → native session → encoder/surface → muxer → lanes. */
+        /** Idempotent. Order: mask handle → native session → encoder/surface → muxer → lanes → generated background. */
         private fun releaseResources() {
             if (!released.compareAndSet(false, true)) return
+            try {
+                releaseResourcesInOrder()
+            } finally {
+                // Last: the background lane's extractor is released above, so the temp MP4 can go.
+                generatedBackgroundFile?.let { deleteQuietly(it) }
+            }
+        }
+
+        private fun releaseResourcesInOrder() {
             val bridge = nativeBridge
             val sid = sessionId
             if (bridge != null && sid != null) {
@@ -594,6 +728,243 @@ object AndroidGreenScreenExportEngine {
             // Lanes are kept (closed) so their telemetry survives into the Result.
             try { background?.close() } catch (_: Throwable) {}
             try { foreground?.close() } catch (_: Throwable) {}
+        }
+    }
+
+    // ── Static background writer: solid color / image file → engine-owned temporary MP4 ──
+
+    private sealed class StaticBackgroundOutcome {
+        class Written(val frames: Int) : StaticBackgroundOutcome()
+        object Cancelled : StaticBackgroundOutcome()
+        class Failed(val reason: String) : StaticBackgroundOutcome()
+    }
+
+    /**
+     * Writes a [BackgroundSource.SolidColor] or [BackgroundSource.ImageFile]
+     * as AVC/MP4 with exactly `outputFrameCount` frames at the output fps and
+     * bitrate, sized to the background destination rect aligned down to the
+     * encoder's size alignment. Frames are drawn with
+     * `Surface.lockHardwareCanvas` (software canvas fallback); muxer pts are
+     * overwritten from the sample index so the clip's timing equals the output
+     * clock and the background lane pairs 1:1 with no drops or holds. An image
+     * is aspect-filled or aspect-fitted (black letterbox/pillarbox) into the
+     * clip; EXIF orientation is NOT applied. Fails closed on any sample-count
+     * mismatch. Releases the encoder, surface, and muxer in `finally`; the
+     * caller owns deleting [outputFile].
+     */
+    private class StaticBackgroundWriter(
+        private val req: Request,
+        private val source: BackgroundSource,
+        private val destination: CanvasRect,
+        private val outputFile: File,
+    ) {
+        private var encoder: MediaCodec? = null
+        private var surface: Surface? = null
+        private var muxer: MediaMuxer? = null
+        private var muxerStarted = false
+        private var muxerStoppedCleanly = false
+        private var videoTrackIndex = -1
+        private var written = 0
+        private val bufferInfo = MediaCodec.BufferInfo()
+
+        fun write(): StaticBackgroundOutcome {
+            var bitmap: Bitmap? = null
+            try {
+                if (req.cancelFlag.get()) return StaticBackgroundOutcome.Cancelled
+                val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { encoder = it }
+                val (width, height) = alignedDimensions(enc)
+
+                val painter: (Canvas) -> Unit
+                when (source) {
+                    is BackgroundSource.SolidColor -> {
+                        val opaque = source.argb or Color.BLACK
+                        painter = { canvas -> canvas.drawColor(opaque) }
+                    }
+                    is BackgroundSource.ImageFile -> {
+                        val decoded = decodeImage(source.path, width, height)
+                            ?: return StaticBackgroundOutcome.Failed("image_decode_failed")
+                        bitmap = decoded
+                        val dst = placementRect(decoded.width, decoded.height, width, height, source.scaleMode)
+                        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                        painter = { canvas ->
+                            canvas.drawColor(Color.BLACK)
+                            canvas.drawBitmap(decoded, null, dst, paint)
+                        }
+                    }
+                    is BackgroundSource.VideoFile -> return StaticBackgroundOutcome.Failed("video_background_is_not_generated")
+                }
+
+                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                    setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                    setInteger(MediaFormat.KEY_BIT_RATE, req.bitrate)
+                    setInteger(MediaFormat.KEY_FRAME_RATE, req.fps)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL_SECONDS)
+                }
+                enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                val inputSurface = enc.createInputSurface().also { surface = it }
+                muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                enc.start()
+
+                for (frameIndex in 0 until req.outputFrameCount) {
+                    if (req.cancelFlag.get()) return StaticBackgroundOutcome.Cancelled
+                    val canvas = try {
+                        inputSurface.lockHardwareCanvas()
+                    } catch (_: Throwable) {
+                        inputSurface.lockCanvas(null)
+                    }
+                    try {
+                        painter(canvas)
+                    } finally {
+                        inputSurface.unlockCanvasAndPost(canvas)
+                    }
+                    drain(enc, endOfStream = false, budgetMs = ENCODER_DRAIN_BUDGET_MS)
+                }
+                if (req.cancelFlag.get()) return StaticBackgroundOutcome.Cancelled
+                enc.signalEndOfInputStream()
+                drain(enc, endOfStream = true, budgetMs = ENCODER_EOS_DRAIN_BUDGET_MS)
+
+                if (written != req.outputFrameCount) {
+                    return StaticBackgroundOutcome.Failed(
+                        "sample_count_mismatch;written=$written;expected=${req.outputFrameCount}",
+                    )
+                }
+                val mux = muxer ?: return StaticBackgroundOutcome.Failed("muxer_missing")
+                if (!muxerStarted) return StaticBackgroundOutcome.Failed("muxer_never_started")
+                try {
+                    mux.stop()
+                    muxerStoppedCleanly = true
+                } catch (t: Throwable) {
+                    return StaticBackgroundOutcome.Failed("muxer_stop_failed:${t.javaClass.simpleName}:${t.message}")
+                }
+                if (!outputFile.isFile || outputFile.length() <= 0L) {
+                    return StaticBackgroundOutcome.Failed("output_missing_or_empty")
+                }
+                return StaticBackgroundOutcome.Written(written)
+            } catch (t: Throwable) {
+                Log.e(TAG, "static background generation failed (${source.typeName})", t)
+                return StaticBackgroundOutcome.Failed("exception:${t.javaClass.simpleName}:${t.message}")
+            } finally {
+                release()
+                try { bitmap?.recycle() } catch (_: Throwable) {}
+            }
+        }
+
+        /** Destination rect size aligned down to the encoder's width/height alignment (never below the alignment itself). */
+        private fun alignedDimensions(enc: MediaCodec): Pair<Int, Int> {
+            var widthAlignment = GENERATED_BACKGROUND_MIN_DIMENSION
+            var heightAlignment = GENERATED_BACKGROUND_MIN_DIMENSION
+            try {
+                val caps = enc.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
+                if (caps != null) {
+                    widthAlignment = maxOf(widthAlignment, caps.widthAlignment)
+                    heightAlignment = maxOf(heightAlignment, caps.heightAlignment)
+                } else {
+                    Log.w(TAG, "encoder video capabilities unavailable; using ${GENERATED_BACKGROUND_MIN_DIMENSION}")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "encoder alignment query failed; using ${GENERATED_BACKGROUND_MIN_DIMENSION}: $t")
+            }
+            return Pair(alignDown(destination.width, widthAlignment), alignDown(destination.height, heightAlignment))
+        }
+
+        private fun alignDown(value: Int, alignment: Int): Int = maxOf(alignment, (value / alignment) * alignment)
+
+        /** Decodes with a power-of-two subsample so the bitmap stays bounded relative to the target size. */
+        private fun decodeImage(path: String, targetWidth: Int, targetHeight: Int): Bitmap? {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val maxWidth = targetWidth * IMAGE_DECODE_MAX_DIMENSION_FACTOR
+            val maxHeight = targetHeight * IMAGE_DECODE_MAX_DIMENSION_FACTOR
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= maxWidth && bounds.outHeight / (sample * 2) >= maxHeight) {
+                sample *= 2
+            }
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            return try {
+                BitmapFactory.decodeFile(path, options)
+            } catch (t: Throwable) {
+                Log.w(TAG, "image background decode failed: $t")
+                null
+            }
+        }
+
+        private fun placementRect(
+            bitmapWidth: Int,
+            bitmapHeight: Int,
+            canvasWidth: Int,
+            canvasHeight: Int,
+            mode: ImageScaleMode,
+        ): RectF {
+            val scaleX = canvasWidth.toFloat() / bitmapWidth
+            val scaleY = canvasHeight.toFloat() / bitmapHeight
+            val scale = when (mode) {
+                ImageScaleMode.ASPECT_FILL -> maxOf(scaleX, scaleY)
+                ImageScaleMode.ASPECT_FIT -> minOf(scaleX, scaleY)
+            }
+            val drawWidth = bitmapWidth * scale
+            val drawHeight = bitmapHeight * scale
+            val left = (canvasWidth - drawWidth) / 2f
+            val top = (canvasHeight - drawHeight) / 2f
+            return RectF(left, top, left + drawWidth, top + drawHeight)
+        }
+
+        private fun drain(enc: MediaCodec, endOfStream: Boolean, budgetMs: Long) {
+            val deadline = System.currentTimeMillis() + budgetMs
+            var draining = true
+            while (draining && System.currentTimeMillis() <= deadline) {
+                val outIdx = enc.dequeueOutputBuffer(bufferInfo, ENCODER_DEQUEUE_TIMEOUT_US)
+                when {
+                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        if (!endOfStream) draining = false
+                    }
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        val mux = muxer
+                        if (videoTrackIndex < 0 && mux != null) {
+                            videoTrackIndex = mux.addTrack(enc.outputFormat)
+                            mux.start()
+                            muxerStarted = true
+                        }
+                    }
+                    outIdx >= 0 -> {
+                        val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                        val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                        val mux = muxer
+                        if (!isConfig && bufferInfo.size > 0 && muxerStarted && videoTrackIndex >= 0 && mux != null) {
+                            val encoded = enc.getOutputBuffer(outIdx)
+                            if (encoded != null) {
+                                encoded.position(bufferInfo.offset)
+                                encoded.limit(bufferInfo.offset + bufferInfo.size)
+                                bufferInfo.presentationTimeUs = outputPtsUs(written, req.fps)
+                                mux.writeSampleData(videoTrackIndex, encoded, bufferInfo)
+                                written++
+                            }
+                        }
+                        enc.releaseOutputBuffer(outIdx, false)
+                        if (isEos) draining = false
+                    }
+                }
+            }
+        }
+
+        /** Order: surface → encoder → muxer. Safe to call once from `finally`. */
+        private fun release() {
+            try { surface?.release() } catch (_: Throwable) {}
+            surface = null
+            try { encoder?.stop() } catch (_: Throwable) {}
+            try { encoder?.release() } catch (_: Throwable) {}
+            encoder = null
+            val mux = muxer
+            if (mux != null) {
+                if (muxerStarted && !muxerStoppedCleanly) {
+                    try { mux.stop() } catch (_: Throwable) {}
+                }
+                try { mux.release() } catch (_: Throwable) {}
+            }
+            muxer = null
         }
     }
 
