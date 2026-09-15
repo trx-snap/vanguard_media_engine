@@ -114,6 +114,8 @@ import com.connects.vanguard_media_engine.streaming.AndroidMedia3StreamSourceCoo
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import com.connects.vanguard_media_engine.duet.AndroidDuetMethodHandler
+import com.connects.vanguard_media_engine.greenscreen.AndroidLiveGreenScreenMethodHandler
+import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -614,6 +616,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // Initialized lazily once mainHandler is available (onAttachedToEngine).
     private var duetMethodHandler: AndroidDuetMethodHandler? = null
 
+    // VG-CAMERA-ADMISSION: engine-wide single live camera/keying owner guard,
+    // shared by the Duet session coordinator and the generic live green-screen
+    // coordinator so only one of them holds the camera at a time.
+    private val cameraSessionAdmission = AndroidCameraSessionAdmission()
+    // VG-LIVE-GREENSCREEN: generic live green-screen handler. Owns the four
+    // "*LiveGreenScreenSession" routes; plugin is a thin router only.
+    private var liveGreenScreenMethodHandler: AndroidLiveGreenScreenMethodHandler? = null
+
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
 
@@ -988,6 +998,18 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             binding.textureRegistry,
             binding.applicationContext,
             onDuetEvent = { payload -> mainHandler.post { channel.invokeMethod("onDuetEvent", payload) } },
+            cameraAdmission = cameraSessionAdmission,
+        )
+        // VG-LIVE-GREENSCREEN: generic live green-screen handler (production GL
+        // preview stack, engine-owned camera, shared camera admission).
+        liveGreenScreenMethodHandler = AndroidLiveGreenScreenMethodHandler(
+            mainHandler,
+            binding.textureRegistry,
+            binding.applicationContext,
+            cameraSessionAdmission,
+            onLiveGreenScreenEvent = { payload ->
+                mainHandler.post { channel.invokeMethod("onLiveGreenScreenEvent", payload) }
+            },
         )
     }
 
@@ -1003,6 +1025,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 handler.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Duet method handler unavailable", null)
+            }
+            return
+        }
+
+        // ── VG-LIVE-GREENSCREEN: generic live green-screen session dispatch ──
+        if (AndroidLiveGreenScreenMethodHandler.ownsMethod(call.method)) {
+            val handler = liveGreenScreenMethodHandler
+            if (handler != null) {
+                handler.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Live green-screen method handler unavailable", null)
             }
             return
         }
@@ -3761,6 +3794,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // VG-DUET-SLICE-2: cancel any in-flight probe and release active session.
         duetMethodHandler?.disposeAll()
         duetMethodHandler = null
+        // VG-LIVE-GREENSCREEN: stop any active live session (camera, segmentation,
+        // compositor, texture) and release its camera admission.
+        liveGreenScreenMethodHandler?.disposeAll()
+        liveGreenScreenMethodHandler = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

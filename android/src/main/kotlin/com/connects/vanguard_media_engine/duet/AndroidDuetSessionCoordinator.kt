@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
+import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.UUID
@@ -165,6 +166,14 @@ class AndroidDuetSessionCoordinator(
      * main thread before calling `channel.invokeMethod`.
      */
     private val onDuetEvent: ((Map<String, Any?>) -> Unit)? = null,
+    /**
+     * Engine-wide single live camera owner guard shared with the generic live
+     * green-screen session. Acquired in [initializeSession] after validation
+     * and sessionId creation (before pendingSessionId) and released on every
+     * failure/cancel path after acquisition and on stop/dispose/disposeAll.
+     * Null keeps the standalone behavior (no cross-feature admission).
+     */
+    private val cameraAdmission: AndroidCameraSessionAdmission? = null,
 ) {
 
     companion object {
@@ -361,6 +370,17 @@ class AndroidDuetSessionCoordinator(
         }
 
         val sessionId = UUID.randomUUID().toString()
+        // Engine-wide camera admission: a generic live green-screen session that
+        // holds the camera blocks Duet with the existing session_conflict code.
+        val admission = cameraAdmission
+        if (admission != null &&
+            !admission.tryAcquire(AndroidCameraSessionAdmission.OWNER_DUET, sessionId)
+        ) {
+            reply(null, errorMsg("session_conflict",
+                "The camera is held by another engine session (${admission.debugString()}). " +
+                    "Stop it before initializing a Duet session."))
+            return
+        }
         pendingSessionId = sessionId
 
         probeHandler.post {
@@ -372,6 +392,7 @@ class AndroidDuetSessionCoordinator(
                     if (pendingSessionId == sessionId) {
                         pendingSessionId = null
                     }
+                    releaseCameraAdmission(sessionId)
                     if (canceledProbeIds.contains(sessionId)) {
                         canceledProbeIds.remove(sessionId)
                         return@post
@@ -389,6 +410,7 @@ class AndroidDuetSessionCoordinator(
                     if (pendingSessionId == sessionId) {
                         pendingSessionId = null
                     }
+                    releaseCameraAdmission(sessionId)
                     if (canceledProbeIds.contains(sessionId)) {
                         canceledProbeIds.remove(sessionId)
                         return@post
@@ -417,11 +439,13 @@ class AndroidDuetSessionCoordinator(
                     if (canceledProbeIds.contains(sessionId)) {
                         canceledProbeIds.remove(sessionId)
                         decoderHandler.post { decoder.release() }
+                        releaseCameraAdmission(sessionId)
                         return@post
                     }
 
                     if (prepErr != null) {
                         decoderHandler.post { decoder.release() }
+                        releaseCameraAdmission(sessionId)
                         reply(null, errorMsg("source_invalid", prepErr))
                         return@post
                     }
@@ -1481,6 +1505,7 @@ class AndroidDuetSessionCoordinator(
         session.decoder = null
         activeSession = null
         decoderHandler.post { dec?.release() }
+        releaseCameraAdmission(session.sessionId)
         reply(session.buildStopResult(), null)
     }
 
@@ -1490,6 +1515,9 @@ class AndroidDuetSessionCoordinator(
         if (pendingSessionId == sessionId) {
             canceledProbeIds += sessionId
             pendingSessionId = null
+            // Free the camera lane now so a new session may start before the
+            // canceled probe lands (its own late release is then a no-op).
+            releaseCameraAdmission(sessionId)
         }
         val current = activeSession
         if (current != null && current.sessionId == sessionId) {
@@ -1500,6 +1528,7 @@ class AndroidDuetSessionCoordinator(
             current.decoder = null
             activeSession = null
             decoderHandler.post { dec?.release() }
+            releaseCameraAdmission(sessionId)
         }
         reply(null, null)
     }
@@ -1511,6 +1540,7 @@ class AndroidDuetSessionCoordinator(
         if (pending != null) {
             canceledProbeIds += pending
             pendingSessionId = null
+            releaseCameraAdmission(pending)
         }
         val current = activeSession
         if (current != null) {
@@ -1521,6 +1551,7 @@ class AndroidDuetSessionCoordinator(
             val dec = current.decoder
             current.decoder = null
             decoderHandler.post { dec?.release() }
+            releaseCameraAdmission(current.sessionId)
         }
         activeSession = null
         try {
@@ -1553,6 +1584,14 @@ class AndroidDuetSessionCoordinator(
         else
             "$route: operation not valid in state '$current'."
         return errorMsg("invalid_state", msg)
+    }
+
+    /**
+     * Frees the engine-wide camera lane held for [sessionId]. No-op when no
+     * admission guard is wired or the lane is not held by Duet/[sessionId].
+     */
+    private fun releaseCameraAdmission(sessionId: String) {
+        cameraAdmission?.release(AndroidCameraSessionAdmission.OWNER_DUET, sessionId)
     }
 
     /** Encodes error as "code|message" for the handler to decode and surface as FlutterError. */

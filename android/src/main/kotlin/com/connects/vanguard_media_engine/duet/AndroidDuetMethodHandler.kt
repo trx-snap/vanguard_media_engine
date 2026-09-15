@@ -2,6 +2,7 @@ package com.connects.vanguard_media_engine.duet
 
 import android.content.Context
 import android.os.Handler
+import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 
@@ -24,6 +25,8 @@ class AndroidDuetMethodHandler(
     textureRegistry: TextureRegistry? = null,
     context: Context? = null,
     onDuetEvent: ((Map<String, Any?>) -> Unit)? = null,
+    /** Engine-wide camera admission shared with the generic live green-screen session (null = standalone). */
+    cameraAdmission: AndroidCameraSessionAdmission? = null,
 ) {
 
     // ── Owned routes ──────────────────────────────────────────────────────────
@@ -58,6 +61,7 @@ class AndroidDuetMethodHandler(
         textureRegistry,
         context,
         onDuetEvent,
+        cameraAdmission,
     )
 
     // ── Export session (Slice 5B-A) ───────────────────────────────────────────

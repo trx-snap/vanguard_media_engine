@@ -369,6 +369,8 @@ export 'vg_android_multicam_diagnostic_fail_closed_smoke.dart';
 export 'vg_duet.dart';
 // VG-GREENSCREEN-EXPORT-API: generic, caller-agnostic offline green-screen export contracts.
 export 'vg_green_screen.dart';
+// VG-LIVE-GREENSCREEN: generic, caller-agnostic live green-screen contracts (Android v1; iOS deferred).
+export 'vg_live_green_screen.dart';
 
 const String _libName = 'vanguard_media_engine';
 

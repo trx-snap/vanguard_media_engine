@@ -135,6 +135,17 @@ final class VGDuetEventSubscription {
   VGDuetEventSubscription._(this._token);
 }
 
+/// Subscription token for generic live green-screen event callbacks
+/// (`onLiveGreenScreenEvent`).
+///
+/// Multi-listener and independent of [VGDuetEventSubscription]. Public
+/// consumers should go through the `vg_live_green_screen` barrel
+/// (`VGLiveGreenScreenEvents.stream`) rather than the dispatcher directly.
+final class VGLiveGreenScreenEventSubscription {
+  final Object _token;
+  VGLiveGreenScreenEventSubscription._(this._token);
+}
+
 // ── Internal storage types ────────────────────────────────────────────────────
 
 class _TimelineEntry {
@@ -179,6 +190,12 @@ class _DuetEventEntry {
   _DuetEventEntry({required this.token, required this.onEvent});
 }
 
+class _LiveGreenScreenEventEntry {
+  final Object token;
+  final void Function(Map<dynamic, dynamic> payload) onEvent;
+  _LiveGreenScreenEventEntry({required this.token, required this.onEvent});
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 /// The package-level singleton MethodChannel callback router.
@@ -204,6 +221,7 @@ class _DuetEventEntry {
 /// | Thermal state      | Single-slot      | token        |
 /// | iCloud download    | Per assetId      | assetId      |
 /// | Duet events         | Multi-listener   | token        |
+/// | Live green screen   | Multi-listener   | token        |
 ///
 /// Export progress is a stack rather than a single slot so that a
 /// short-lived registration (e.g. a nested [VanguardTimelineExporter]
@@ -277,6 +295,13 @@ final class VanguardChannelDispatcher {
   // time; consumers filter by sessionId themselves if needed).
   final Map<Object, _DuetEventEntry> _duetEventListeners = {};
 
+  // Live green-screen events: multi-listener — every registered entry receives
+  // every `onLiveGreenScreenEvent` payload. Unkeyed (one live session at a
+  // time; consumers filter by sessionId themselves if needed). Independent of
+  // the Duet listeners above.
+  final Map<Object, _LiveGreenScreenEventEntry> _liveGreenScreenEventListeners =
+      {};
+
   // ── Handler registration ───────────────────────────────────────────────────
 
   /// Ensures the global MethodChannel handler is registered.
@@ -348,6 +373,10 @@ final class VanguardChannelDispatcher {
         _dispatchDuetEvent(call.arguments);
         break;
 
+      case 'onLiveGreenScreenEvent':
+        _dispatchLiveGreenScreenEvent(call.arguments);
+        break;
+
       // Unknown callbacks are silently dropped — forward compatibility.
     }
   }
@@ -376,6 +405,23 @@ final class VanguardChannelDispatcher {
       return; // malformed — drop silently
     }
     for (final entry in _duetEventListeners.values.toList(growable: false)) {
+      entry.onEvent(args);
+    }
+  }
+
+  void _dispatchLiveGreenScreenEvent(dynamic arguments) {
+    // Payload: {event, sessionId, previousBackend, currentBackend, reason,
+    // userMessage}. Field-level and event-name validation is the
+    // responsibility of the `vg_live_green_screen` typed layer
+    // (VGLiveGreenScreenEvent.tryParse); here we only guard the outer shape
+    // and drop when nobody is listening.
+    final args = arguments as Map?;
+    if (args == null || _liveGreenScreenEventListeners.isEmpty) {
+      return; // malformed — drop silently
+    }
+    for (final entry in _liveGreenScreenEventListeners.values.toList(
+      growable: false,
+    )) {
       entry.onEvent(args);
     }
   }
@@ -676,6 +722,35 @@ final class VanguardChannelDispatcher {
     _duetEventListeners.remove(subscription._token);
   }
 
+  // ── Live green-screen event registration ───────────────────────────────────
+
+  /// Registers a generic live green-screen event listener
+  /// (`onLiveGreenScreenEvent`).
+  ///
+  /// Multi-listener: any number of listeners may be registered concurrently
+  /// and every one receives every event. Unregistering one subscription never
+  /// affects the others, and never affects Duet listeners.
+  VGLiveGreenScreenEventSubscription registerLiveGreenScreenEventListener(
+    void Function(Map<dynamic, dynamic> payload) onEvent,
+  ) {
+    ensureHandlerRegistered();
+    final token = Object();
+    _liveGreenScreenEventListeners[token] = _LiveGreenScreenEventEntry(
+      token: token,
+      onEvent: onEvent,
+    );
+    return VGLiveGreenScreenEventSubscription._(token);
+  }
+
+  /// Unregisters a live green-screen event listener.
+  ///
+  /// Stale tokens are safe no-ops.
+  void unregisterLiveGreenScreenEventListener(
+    VGLiveGreenScreenEventSubscription subscription,
+  ) {
+    _liveGreenScreenEventListeners.remove(subscription._token);
+  }
+
   // ── Testing seam ──────────────────────────────────────────────────────────
 
   /// Resets all dispatcher state. **Test-only — never call in production.**
@@ -695,6 +770,7 @@ final class VanguardChannelDispatcher {
     _thermalStateToken = null;
     _photoVideoDownloadListeners.clear();
     _duetEventListeners.clear();
+    _liveGreenScreenEventListeners.clear();
     _handlerRegistered = false;
     _channel = channel ?? const MethodChannel('vanguard_media_engine');
   }
