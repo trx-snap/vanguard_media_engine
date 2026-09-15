@@ -385,13 +385,23 @@ class VanguardMediaPreparer {
   /// Uses the native `inspectMedia` method channel case on both platforms.
   /// Does not call FFmpegKit.
   static Future<MediaInfo?> inspectMedia(String path) async {
-    final file = File(path);
-    if (!file.existsSync() || file.lengthSync() == 0) return null;
+    final lower = path.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://')) {
+      return null;
+    }
+
+    // content:// URIs are resolved by the native layer; only plain local paths
+    // are gated by a Dart-side file existence/size check.
+    final isContentUri = lower.startsWith('content://');
 
     // Fast-path MIME type from extension for kind detection (matches existing
     // lookupMimeType usage in file_compress.dart:221).
     // Native call follows for actual track-level info.
     try {
+      if (!isContentUri) {
+        final file = File(path);
+        if (!file.existsSync() || file.lengthSync() == 0) return null;
+      }
       final raw = await _channel.invokeMethod<Map>('inspectMedia', {
         'path': path,
       });
