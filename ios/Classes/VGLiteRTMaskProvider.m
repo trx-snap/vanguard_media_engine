@@ -8,8 +8,9 @@
 //   TfLiteInterpreterOptionsAddDelegate — used with Metal delegate
 //   TfLiteInterpreterCreate/Delete
 //   TfLiteInterpreterAllocateTensors
+//   TfLiteInterpreterGetInputTensorCount / GetOutputTensorCount
 //   TfLiteInterpreterGetInputTensor / GetOutputTensor
-//   TfLiteTensorType / TfLiteTensorNumDims / TfLiteTensorDim
+//   TfLiteTensorType / TfLiteTensorNumDims / TfLiteTensorDim / TfLiteTensorByteSize
 //   TfLiteTensorCopyFromBuffer
 //   TfLiteInterpreterInvoke
 //   TfLiteTensorData
@@ -27,7 +28,10 @@
 // Frame preprocessing:
 //   Accepts kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA, and
 //   kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange / FullRange (NV12/NV21).
-//   Output: float RGB [0,1] at 256×256 (strided nearest-neighbour).
+//   Output: float RGB [0,1] at the model input size (read from the input
+//   tensor), sampled nearest-neighbour through per-column / per-row lookup
+//   tables built once per source size (VGLiteRTInputGeometry decides whether
+//   the frame is stretched or aspect-fitted with a zero border).
 //   No Metal shaders — deterministic CPU path for this slice.
 
 #import "VGLiteRTMaskProvider.h"
@@ -48,23 +52,30 @@
 #import <Accelerate/Accelerate.h>
 #import <os/log.h>
 #import <os/lock.h>
+#include <math.h>
 #include <stdatomic.h>
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-static const int kInputH  = 256;
-static const int kInputW  = 256;
-static const int kInputC  = 3;   // RGB
-static const int kOutputC = 6;   // MediaPipe Selfie Multiclass classes
-
-static const size_t kInputFloats  = (size_t)(kInputH * kInputW * kInputC);
-// kOutputFloats = 256*256*6 — not needed; output is read via TfLiteTensorData pointer.
+/// Input tensor channel contract (RGB, [0,1]).
+static const int kInputC = 3;
+/// MediaPipe Selfie Multiclass class count: selects the policy matte path.
+static const int kMulticlassOutputC = 6;
+/// Spatial size the multiclass policies hard-code (VGFaceNeckBeautyMaskPolicy /
+/// VGLiveGreenScreenPersonMattePolicy): a 6-channel model must be 256×256.
+static const int kMulticlassSide = 256;
+/// Sanity cap on any model tensor side (bounds the init-time scratch allocation).
+static const int kMaxTensorSide = 2048;
 
 static os_log_t VGLiteRTLog(void) {
     static os_log_t log;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ log = os_log_create("com.vanguard", "VGLiteRTMaskProvider"); });
     return log;
+}
+
+static NSString *VGLiteRTInputGeometryName(VGLiteRTInputGeometry geometry) {
+    return geometry == VGLiteRTInputGeometryAspectFit ? @"aspectFit" : @"stretch";
 }
 
 // ─── VGSkinMask private category (same pattern as VGFaceNeckBeautyMaskPolicy) ─
@@ -88,10 +99,25 @@ static os_log_t VGLiteRTLog(void) {
 #endif
 
     // ── Policy (serialized by _mlQueue — not thread-safe on its own) ─────────
+    // Used only on the multiclass (6-channel) matte path.
     VGFaceNeckBeautyMaskPolicy *_policy;
 
     // ── Fallback provider ─────────────────────────────────────────────────────
     id<VGMaskProvider> _Nullable _fallback;
+
+    // ── Metal delegate precision option (fixed at init) ──────────────────────
+    BOOL      _metalAllowPrecisionLoss;   // TFLGpuDelegateOptions.allow_precision_loss
+    NSString *_inferenceBackend;          // see header: metal_fp32 | metal_fp16 | cpu_simulator | unavailable
+
+    // ── Input geometry + setup options (fixed at init) ───────────────────────
+    VGLiteRTInputGeometry _inputGeometry;
+    BOOL                  _warmUpInvokeAtSetup;
+
+    // ── Tensor contract (read from the allocated tensors at setup) ───────────
+    int       _inputW, _inputH, _inputC;      // 0 until validated
+    int       _outputW, _outputH, _outputC;   // 0 until validated
+    size_t    _inputFloats;                   // _inputH * _inputW * _inputC
+    NSString *_mattePath;                     // see header
 
     // ── State ─────────────────────────────────────────────────────────────────
     dispatch_queue_t _mlQueue;
@@ -100,8 +126,17 @@ static os_log_t VGLiteRTLog(void) {
     // Current seek generation — detects resets.
     uint64_t _currentGeneration;
 
-    // Float input scratch buffer — reused each frame (kInputH * kInputW * kInputC floats).
-    float *_inputScratch;  // kInputFloats
+    // Float input scratch buffer — allocated once at setup (_inputFloats floats),
+    // reused every frame.
+    float *_inputScratch;
+
+    // Nearest-neighbour sample maps (allocated at setup, _inputW / _inputH
+    // entries; rebuilt only when the source frame size changes — never per
+    // frame). Entry = source column/row, or -1 for the zero border of the
+    // aspect-fit geometry.
+    int32_t *_mapCols;
+    int32_t *_mapRows;
+    size_t   _mapSrcW, _mapSrcH;   // source size the maps were built for (0 = none)
 
     // ── Phase 9B-6A: diagnostic timing state (mlQueue only) ──────────────────
     // _diagFrameCount: total number of frames that entered _processPixelBuffer.
@@ -125,9 +160,22 @@ static os_log_t VGLiteRTLog(void) {
     NSUInteger       _diagPendingFired; // times a pending frame was immediately processed
 }
 
-@synthesize latestMask      = _latestMask;
-@synthesize usingFallback   = _usingFallback;
-@synthesize ready           = _ready;
+@synthesize latestMask              = _latestMask;
+@synthesize usingFallback           = _usingFallback;
+@synthesize ready                   = _ready;
+@synthesize onTimingSample          = _onTimingSample;
+@synthesize metalAllowPrecisionLoss = _metalAllowPrecisionLoss;
+@synthesize inferenceBackend        = _inferenceBackend;
+@synthesize inputGeometry           = _inputGeometry;
+@synthesize mattePath               = _mattePath;
+
+// Tensor contract accessors (written once at setup, before `ready` is published).
+- (NSInteger)inputWidth     { return _inputW; }
+- (NSInteger)inputHeight    { return _inputH; }
+- (NSInteger)inputChannels  { return _inputC; }
+- (NSInteger)outputWidth    { return _outputW; }
+- (NSInteger)outputHeight   { return _outputH; }
+- (NSInteger)outputChannels { return _outputC; }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
@@ -139,31 +187,62 @@ static os_log_t VGLiteRTLog(void) {
 - (nullable instancetype)initWithModelURL:(NSURL *)modelURL
                                  fallback:(nullable id<VGMaskProvider>)fallback
                                    policy:(nullable VGFaceNeckBeautyMaskPolicy *)policy {
+    // Pre-existing callers: full float32 precision, unchanged behaviour.
+    return [self initWithModelURL:modelURL
+                         fallback:fallback
+                           policy:policy
+          metalAllowPrecisionLoss:NO];
+}
+
+- (nullable instancetype)initWithModelURL:(NSURL *)modelURL
+                                 fallback:(nullable id<VGMaskProvider>)fallback
+                                   policy:(nullable VGFaceNeckBeautyMaskPolicy *)policy
+                  metalAllowPrecisionLoss:(BOOL)metalAllowPrecisionLoss {
+    // Pre-existing production path: stretch geometry, no warm-up invoke.
+    return [self initWithModelURL:modelURL
+                         fallback:fallback
+                           policy:policy
+          metalAllowPrecisionLoss:metalAllowPrecisionLoss
+                    inputGeometry:VGLiteRTInputGeometryStretch
+              warmUpInvokeAtSetup:NO];
+}
+
+- (nullable instancetype)initWithModelURL:(NSURL *)modelURL
+                                 fallback:(nullable id<VGMaskProvider>)fallback
+                                   policy:(nullable VGFaceNeckBeautyMaskPolicy *)policy
+                  metalAllowPrecisionLoss:(BOOL)metalAllowPrecisionLoss
+                            inputGeometry:(VGLiteRTInputGeometry)inputGeometry
+                      warmUpInvokeAtSetup:(BOOL)warmUpInvokeAtSetup {
     self = [super init];
     if (!self) return nil;
 
-    _fallback             = fallback;
-    _policy               = policy ?: [[VGFaceNeckBeautyMaskPolicy alloc] init];
-    _usingFallback        = NO;
-    _ready                = NO;
-    _invalidated          = NO;
+    _fallback                = fallback;
+    _policy                  = policy;   // default instance created at setup for a 6-channel model
+    _metalAllowPrecisionLoss = metalAllowPrecisionLoss;
+    _inputGeometry           = inputGeometry;
+    _warmUpInvokeAtSetup     = warmUpInvokeAtSetup;
+    _inferenceBackend        = @"unavailable";   // replaced once an interpreter is READY
+    _mattePath               = @"none";          // replaced once the contract is validated
+    _inputW = _inputH = _inputC = 0;
+    _outputW = _outputH = _outputC = 0;
+    _inputFloats             = 0;
+    _inputScratch            = NULL;
+    _mapCols                 = NULL;
+    _mapRows                 = NULL;
+    _mapSrcW = _mapSrcH      = 0;
+    _usingFallback           = NO;
+    _ready                   = NO;
+    _invalidated             = NO;
     _currentGeneration    = UINT64_MAX;
     _latestMask           = nil;
     _pendingPixelBuffer   = nil;
     _pendingPTS           = kCMTimeInvalid;
     _pendingGeneration    = 0;
     _pendingLock          = OS_UNFAIR_LOCK_INIT;
+    _onTimingSample       = nil;
     atomic_store(&_mlInFlight, 0);
 
     _mlQueue = dispatch_queue_create("com.vanguard.litert", DISPATCH_QUEUE_SERIAL);
-
-    // Allocate input scratch buffer.
-    _inputScratch = (float *)malloc(kInputFloats * sizeof(float));
-    if (!_inputScratch) {
-        os_log_error(VGLiteRTLog(), "Failed to allocate input scratch buffer");
-        _usingFallback = YES;
-        return self;
-    }
 
     if (!modelURL) {
         os_log_error(VGLiteRTLog(), "nil modelURL — entering fallback mode");
@@ -219,14 +298,20 @@ static const NSUInteger kVGDiagLogInterval = 30;
 
     // 3. Attempt Metal GPU delegate (device only — simulator has no Metal GPU).
 #if !TARGET_OS_SIMULATOR
-    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] metalDelegate=attempting");
+    os_log_info(VGLiteRTLog(),
+        "[VGLiteRTMaskProvider lifecycle] metalDelegate=attempting allowPrecisionLoss=%{public}s",
+        _metalAllowPrecisionLoss ? "true" : "false");
     TFLGpuDelegateOptions gpuOpts = TFLGpuDelegateOptionsDefault();
-    gpuOpts.allow_precision_loss = false;  // full float32 precision
+    // Default NO: full float32 precision (pre-existing behaviour).
+    // YES ("fast Metal"): the delegate may compute in float16.
+    gpuOpts.allow_precision_loss = _metalAllowPrecisionLoss ? true : false;
     gpuOpts.enable_quantization  = true;
     _metalDelegate = TFLGpuDelegateCreate(&gpuOpts);
     if (_metalDelegate) {
         TfLiteInterpreterOptionsAddDelegate(opts, _metalDelegate);
-        os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] metalDelegate=attached");
+        os_log_info(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] metalDelegate=attached precision=%{public}s",
+            _metalAllowPrecisionLoss ? "fp16_allowed" : "fp32");
     } else {
         os_log_error(VGLiteRTLog(),
             "[VGLiteRTMaskProvider lifecycle] metalDelegate=failed reason=TFLGpuDelegateCreate returned nil");
@@ -268,8 +353,9 @@ static const NSUInteger kVGDiagLogInterval = 30;
     }
     os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] tensors=allocated");
 
-    // 6. Validate tensor contract: input [1,256,256,3] float32, output [1,256,256,6] float32.
-    if (![self _validateTensorContract]) {
+    // 6. Read + validate the tensor contract from the allocated tensors
+    //    (input [1,H,W,3] float32; output [1,H',W',C] float32, C ∈ {1,2,6}).
+    if (![self _readAndValidateTensorContract]) {
         os_log_error(VGLiteRTLog(),
             "[VGLiteRTMaskProvider lifecycle] tensors=contractMismatch — entering fallback");
         [self _teardownInterpreter];
@@ -277,6 +363,40 @@ static const NSUInteger kVGDiagLogInterval = 30;
         return;
     }
 
+    // 7. Input scratch + sample maps sized from the input tensor (setup only —
+    //    never reallocated per frame).
+    if (![self _allocateInputScratchAndMaps]) {
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] scratch=allocFailed — entering fallback");
+        [self _teardownInterpreter];
+        _usingFallback = YES;
+        return;
+    }
+
+    // 8. Matte path from the output contract.
+    if (_outputC == kMulticlassOutputC) {
+        if (!_policy) _policy = [[VGFaceNeckBeautyMaskPolicy alloc] init];
+        _mattePath = @"multiclass_policy";
+    } else {
+        _mattePath = @"person_confidence_direct";
+    }
+
+    // 9. Optional warm-up invoke: fail closed at setup if the runtime/delegate
+    //    cannot execute this model (e.g. an unresolved custom op left on CPU).
+    if (_warmUpInvokeAtSetup && ![self _warmUpInvoke]) {
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] warmUpInvoke=failed — entering fallback");
+        [self _teardownInterpreter];
+        _mattePath = @"none";
+        _usingFallback = YES;
+        return;
+    }
+
+#if !TARGET_OS_SIMULATOR
+    _inferenceBackend = _metalAllowPrecisionLoss ? @"metal_fp16" : @"metal_fp32";
+#else
+    _inferenceBackend = @"cpu_simulator";
+#endif
     _ready         = YES;
     _usingFallback = NO;
     os_log_info(VGLiteRTLog(),
@@ -286,27 +406,56 @@ static const NSUInteger kVGDiagLogInterval = 30;
 #else
         "metalDelegate=skipped(sim)"
 #endif
-        " status=READY");
+        " backend=%{public}@ input=%dx%dx%d output=%dx%dx%d mattePath=%{public}@ "
+        "inputGeometry=%{public}@ warmUpInvoke=%{public}s status=READY",
+        _inferenceBackend, _inputW, _inputH, _inputC, _outputW, _outputH, _outputC,
+        _mattePath, VGLiteRTInputGeometryName(_inputGeometry),
+        _warmUpInvokeAtSetup ? "ok" : "skipped");
 }
 
-/// Returns YES if input [1,256,256,3] float32 and output [1,256,256,6] float32.
-- (BOOL)_validateTensorContract {
+/// Reads the input/output tensor dimensions after allocation into _input*/
+/// _output* and returns YES only for the supported contract:
+///   exactly one input,  float32, [1, H, W, 3], 1 ≤ H,W ≤ kMaxTensorSide
+///   exactly one output, float32, [1, H', W', C], 1 ≤ H',W' ≤ kMaxTensorSide,
+///                       C ∈ {1, 2, 6}; C == 6 additionally requires 256×256
+///                       (the multiclass policies hard-code that size).
+- (BOOL)_readAndValidateTensorContract {
     if (!_tflInterpreter) return NO;
 
+    if (TfLiteInterpreterGetInputTensorCount(_tflInterpreter) != 1 ||
+        TfLiteInterpreterGetOutputTensorCount(_tflInterpreter) != 1) {
+        os_log_error(VGLiteRTLog(), "Tensor count mismatch: inputs=%d outputs=%d (expected 1/1)",
+                     (int)TfLiteInterpreterGetInputTensorCount(_tflInterpreter),
+                     (int)TfLiteInterpreterGetOutputTensorCount(_tflInterpreter));
+        return NO;
+    }
+
     // Input tensor.
-    TfLiteTensor *inputTensor = TfLiteInterpreterGetInputTensor(_tflInterpreter, 0);
+    const TfLiteTensor *inputTensor = TfLiteInterpreterGetInputTensor(_tflInterpreter, 0);
     if (!inputTensor) { os_log_error(VGLiteRTLog(), "Input tensor is nil"); return NO; }
 
     if (TfLiteTensorType(inputTensor) != kTfLiteFloat32) {
         os_log_error(VGLiteRTLog(), "Input tensor type is not float32");
         return NO;
     }
-    if (TfLiteTensorNumDims(inputTensor) != 4 ||
-        TfLiteTensorDim(inputTensor, 0) != 1 ||
-        TfLiteTensorDim(inputTensor, 1) != kInputH ||
-        TfLiteTensorDim(inputTensor, 2) != kInputW ||
-        TfLiteTensorDim(inputTensor, 3) != kInputC) {
-        os_log_error(VGLiteRTLog(), "Input tensor shape mismatch");
+    if (TfLiteTensorNumDims(inputTensor) != 4) {
+        os_log_error(VGLiteRTLog(), "Input tensor rank %d (expected 4)", (int)TfLiteTensorNumDims(inputTensor));
+        return NO;
+    }
+    const int inN = TfLiteTensorDim(inputTensor, 0);
+    const int inH = TfLiteTensorDim(inputTensor, 1);
+    const int inW = TfLiteTensorDim(inputTensor, 2);
+    const int inC = TfLiteTensorDim(inputTensor, 3);
+    if (inN != 1 || inC != kInputC ||
+        inH < 1 || inH > kMaxTensorSide || inW < 1 || inW > kMaxTensorSide) {
+        os_log_error(VGLiteRTLog(), "Input tensor shape [%d,%d,%d,%d] unsupported (expected [1,H,W,3])",
+                     inN, inH, inW, inC);
+        return NO;
+    }
+    const size_t inputFloats = (size_t)inH * (size_t)inW * (size_t)inC;
+    if (TfLiteTensorByteSize(inputTensor) != inputFloats * sizeof(float)) {
+        os_log_error(VGLiteRTLog(), "Input tensor byte size %zu != %zu",
+                     TfLiteTensorByteSize(inputTensor), inputFloats * sizeof(float));
         return NO;
     }
 
@@ -318,15 +467,95 @@ static const NSUInteger kVGDiagLogInterval = 30;
         os_log_error(VGLiteRTLog(), "Output tensor type is not float32");
         return NO;
     }
-    if (TfLiteTensorNumDims(outputTensor) != 4 ||
-        TfLiteTensorDim(outputTensor, 0) != 1 ||
-        TfLiteTensorDim(outputTensor, 1) != kInputH ||
-        TfLiteTensorDim(outputTensor, 2) != kInputW ||
-        TfLiteTensorDim(outputTensor, 3) != kOutputC) {
-        os_log_error(VGLiteRTLog(), "Output tensor shape mismatch");
+    if (TfLiteTensorNumDims(outputTensor) != 4) {
+        os_log_error(VGLiteRTLog(), "Output tensor rank %d (expected 4)", (int)TfLiteTensorNumDims(outputTensor));
+        return NO;
+    }
+    const int outN = TfLiteTensorDim(outputTensor, 0);
+    const int outH = TfLiteTensorDim(outputTensor, 1);
+    const int outW = TfLiteTensorDim(outputTensor, 2);
+    const int outC = TfLiteTensorDim(outputTensor, 3);
+    const BOOL channelsOK = (outC == 1 || outC == 2 || outC == kMulticlassOutputC);
+    if (outN != 1 || !channelsOK ||
+        outH < 1 || outH > kMaxTensorSide || outW < 1 || outW > kMaxTensorSide) {
+        os_log_error(VGLiteRTLog(), "Output tensor shape [%d,%d,%d,%d] unsupported (expected [1,H,W,{1,2,6}])",
+                     outN, outH, outW, outC);
+        return NO;
+    }
+    if (outC == kMulticlassOutputC && (outH != kMulticlassSide || outW != kMulticlassSide)) {
+        os_log_error(VGLiteRTLog(), "6-channel output must be %dx%d for the multiclass policy (got %dx%d)",
+                     kMulticlassSide, kMulticlassSide, outW, outH);
+        return NO;
+    }
+    const size_t outputFloats = (size_t)outH * (size_t)outW * (size_t)outC;
+    if (TfLiteTensorByteSize(outputTensor) != outputFloats * sizeof(float)) {
+        os_log_error(VGLiteRTLog(), "Output tensor byte size %zu != %zu",
+                     TfLiteTensorByteSize(outputTensor), outputFloats * sizeof(float));
         return NO;
     }
 
+    _inputW = inW;  _inputH = inH;  _inputC = inC;
+    _outputW = outW; _outputH = outH; _outputC = outC;
+    _inputFloats = inputFloats;
+    os_log_info(VGLiteRTLog(),
+        "[VGLiteRTMaskProvider lifecycle] tensors=contractOK input=[1,%d,%d,%d] output=[1,%d,%d,%d]",
+        inH, inW, inC, outH, outW, outC);
+    return YES;
+}
+
+/// Allocates the float input scratch and the nearest-neighbour sample maps
+/// for the validated input size. Setup only.
+- (BOOL)_allocateInputScratchAndMaps {
+    free(_inputScratch); _inputScratch = NULL;
+    free(_mapCols);      _mapCols      = NULL;
+    free(_mapRows);      _mapRows      = NULL;
+    _mapSrcW = _mapSrcH = 0;
+
+    _inputScratch = (float *)malloc(_inputFloats * sizeof(float));
+    _mapCols      = (int32_t *)malloc((size_t)_inputW * sizeof(int32_t));
+    _mapRows      = (int32_t *)malloc((size_t)_inputH * sizeof(int32_t));
+    if (!_inputScratch || !_mapCols || !_mapRows) {
+        os_log_error(VGLiteRTLog(), "Failed to allocate input scratch / sample maps (%dx%dx%d)",
+                     _inputW, _inputH, _inputC);
+        return NO;
+    }
+    return YES;
+}
+
+/// One TfLiteInterpreterInvoke with a zero input. YES when the invoke ran and
+/// the output tensor is readable with the validated shape. Setup only.
+- (BOOL)_warmUpInvoke {
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    memset(_inputScratch, 0, _inputFloats * sizeof(float));
+
+    TfLiteTensor *inputTensor = TfLiteInterpreterGetInputTensor(_tflInterpreter, 0);
+    if (!inputTensor ||
+        TfLiteTensorCopyFromBuffer(inputTensor, _inputScratch, _inputFloats * sizeof(float)) != kTfLiteOk) {
+        os_log_error(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] warmUpInvoke=failed reason=inputCopy");
+        return NO;
+    }
+    if (TfLiteInterpreterInvoke(_tflInterpreter) != kTfLiteOk) {
+        os_log_error(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] warmUpInvoke=failed reason=invoke");
+        return NO;
+    }
+    const TfLiteTensor *outputTensor = TfLiteInterpreterGetOutputTensor(_tflInterpreter, 0);
+    if (!outputTensor || !TfLiteTensorData(outputTensor)) {
+        os_log_error(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] warmUpInvoke=failed reason=outputData");
+        return NO;
+    }
+    // A model with dynamic output shapes would change the contract on invoke:
+    // treat that as unsupported (the per-frame matte build trusts _output*).
+    if (TfLiteTensorNumDims(outputTensor) != 4 ||
+        TfLiteTensorDim(outputTensor, 0) != 1 ||
+        TfLiteTensorDim(outputTensor, 1) != _outputH ||
+        TfLiteTensorDim(outputTensor, 2) != _outputW ||
+        TfLiteTensorDim(outputTensor, 3) != _outputC) {
+        os_log_error(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] warmUpInvoke=failed reason=outputShapeChanged");
+        return NO;
+    }
+    os_log_info(VGLiteRTLog(),
+        "[VGLiteRTMaskProvider lifecycle] warmUpInvoke=ok durationMs=%.1f",
+        (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
     return YES;
 }
 
@@ -426,6 +655,9 @@ static const NSUInteger kVGDiagLogInterval = 30;
     // Mark invalidated atomically before dispatching teardown.
     _invalidated = YES;
     _ready       = NO;
+    // Drop the diagnostic hook: a frame already inside _processPixelBuffer
+    // holds its own copy and may deliver one final sample; nothing after that.
+    self.onTimingSample = nil;
 
     // Release any pending buffer immediately — it can no longer be processed.
     os_unfair_lock_lock(&_pendingLock);
@@ -472,15 +704,19 @@ static const NSUInteger kVGDiagLogInterval = 30;
             "throttleInterval=%lu firstLogFrames=3",
             (unsigned long)kVGDiagLogInterval);
     }
-    CFAbsoluteTime t0 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
+    // Diagnostic handler (atomic copy read, once per frame). When nil the
+    // timing path below is exactly the pre-existing throttled-log behaviour.
+    VGLiteRTMaskProviderTimingHandler timingHandler = self.onTimingSample;
+    const BOOL measure = shouldLog || (timingHandler != nil);
+    CFAbsoluteTime t0 = measure ? CFAbsoluteTimeGetCurrent() : 0;
 
-    // 1. Preprocess pixel buffer → float RGB [0,1] at 256×256.
+    // 1. Preprocess pixel buffer → float RGB [0,1] at the model input size.
     if (![self _preprocessPixelBuffer:pixelBuffer intoScratch:_inputScratch]) {
         os_log_error(VGLiteRTLog(), "Pixel buffer preprocessing failed — skipping frame");
         return;
     }
 
-    CFAbsoluteTime t1 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
+    CFAbsoluteTime t1 = measure ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 2. Copy into input tensor.
     TfLiteTensor *inputTensor = TfLiteInterpreterGetInputTensor(_tflInterpreter, 0);
@@ -488,11 +724,15 @@ static const NSUInteger kVGDiagLogInterval = 30;
 
     TfLiteStatus copyStatus = TfLiteTensorCopyFromBuffer(inputTensor,
                                                           _inputScratch,
-                                                          kInputFloats * sizeof(float));
+                                                          _inputFloats * sizeof(float));
     if (copyStatus != kTfLiteOk) {
         os_log_error(VGLiteRTLog(), "TfLiteTensorCopyFromBuffer failed");
         return;
     }
+
+    // t1c: end of input copy — inputCopyMs = t1c − t1 (includes the cheap
+    // GetInputTensor lookup so that inputCopyMs + invokeMs == t2 − t1 == inferMs).
+    CFAbsoluteTime t1c = measure ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 3. Run inference.
     if (TfLiteInterpreterInvoke(_tflInterpreter) != kTfLiteOk) {
@@ -500,7 +740,7 @@ static const NSUInteger kVGDiagLogInterval = 30;
         return;
     }
 
-    CFAbsoluteTime t2 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
+    CFAbsoluteTime t2 = measure ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 4. Read output tensor data pointer.
     const TfLiteTensor *outputTensor = TfLiteInterpreterGetOutputTensor(_tflInterpreter, 0);
@@ -512,47 +752,124 @@ static const NSUInteger kVGDiagLogInterval = 30;
         return;
     }
 
-    // 5. Pass output tensor to policy.
-    // Note: pixelBuffer sourceWidth/Height are the original frame dimensions.
-    size_t sourceW = (size_t)CVPixelBufferGetWidth(pixelBuffer);
-    size_t sourceH = (size_t)CVPixelBufferGetHeight(pixelBuffer);
+    // t2o: end of output tensor access — outputAccessMs = t2o − t2. Any
+    // delegate-side GPU → host readback that is not paid inside Invoke lands here.
+    CFAbsoluteTime t2o = measure ? CFAbsoluteTimeGetCurrent() : 0;
 
-    VGSkinMask *mask = [_policy processTensor:outputData
-                                  sourceWidth:sourceW
-                                 sourceHeight:sourceH
-                                          pts:pts
-                              generationReset:generationReset];
+    // 5. Matte build.
+    VGSkinMask *mask = nil;
+    if (_outputC == kMulticlassOutputC) {
+        // Multiclass policy path (6 channels, 256×256).
+        // Note: pixelBuffer sourceWidth/Height are the original frame dimensions.
+        size_t sourceW = (size_t)CVPixelBufferGetWidth(pixelBuffer);
+        size_t sourceH = (size_t)CVPixelBufferGetHeight(pixelBuffer);
+        mask = [_policy processTensor:outputData
+                          sourceWidth:sourceW
+                         sourceHeight:sourceH
+                                  pts:pts
+                      generationReset:generationReset];
+    } else {
+        // Direct person-confidence path (1 or 2 channels): no temporal state,
+        // so a generation reset has nothing to clear.
+        mask = [self _buildPersonConfidenceMatte:outputData pts:pts];
+    }
 
-    CFAbsoluteTime t3 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
+    CFAbsoluteTime t3 = measure ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 6. Publish.
     if (mask) {
         // ── Phase 9B-6A: cadence measurement ─────────────────────────────────
+        CFAbsoluteTime now = (t3 > 0) ? t3 : CFAbsoluteTimeGetCurrent();
+        double cadenceMs = (_diagLastSuccessTime > 0)
+            ? (now - _diagLastSuccessTime) * 1000.0
+            : -1.0;
+        double preMs = 0, inferMs = 0, postMs = 0, totalMs = 0;
+        double inputCopyMs = 0, invokeMs = 0, outputAccessMs = 0, policyMs = 0;
+        if (measure) {
+            preMs          = (t1  - t0)  * 1000.0;
+            inputCopyMs    = (t1c - t1)  * 1000.0;
+            invokeMs       = (t2  - t1c) * 1000.0;
+            outputAccessMs = (t2o - t2)  * 1000.0;
+            policyMs       = (t3  - t2o) * 1000.0;
+            // Backward-compatible combined spans (see header):
+            //   inferMs = inputCopyMs + invokeMs, postMs = outputAccessMs + policyMs.
+            inferMs = (t2 - t1) * 1000.0;
+            postMs  = (t3 - t2) * 1000.0;
+            totalMs = (t3 - t0) * 1000.0;
+        }
         if (shouldLog) {
-            CFAbsoluteTime now = (t3 > 0) ? t3 : CFAbsoluteTimeGetCurrent();
-            double cadenceMs = (_diagLastSuccessTime > 0)
-                ? (now - _diagLastSuccessTime) * 1000.0
-                : -1.0;
-            double preMs   = (t1 - t0) * 1000.0;
-            double inferMs = (t2 - t1) * 1000.0;
-            double postMs  = (t3 - t2) * 1000.0;
-            double totalMs = (t3 - t0) * 1000.0;
             os_log_info(VGLiteRTLog(),
-                "[VGLiteRTMaskProvider diagnostic] pre=%.1fms infer=%.1fms post=%.1fms "
-                "total=%.1fms cadence=%.1fms pts=%.3fs gen=%llu frame=%lu",
-                preMs, inferMs, postMs, totalMs, cadenceMs,
+                "[VGLiteRTMaskProvider diagnostic] pre=%.1fms infer=%.1fms "
+                "(copy=%.1fms invoke=%.1fms) post=%.1fms (out=%.1fms policy=%.1fms) "
+                "total=%.1fms cadence=%.1fms backend=%{public}@ mattePath=%{public}@ "
+                "pts=%.3fs gen=%llu frame=%lu",
+                preMs, inferMs, inputCopyMs, invokeMs, postMs, outputAccessMs, policyMs,
+                totalMs, cadenceMs, _inferenceBackend, _mattePath,
                 CMTimeGetSeconds(pts), (unsigned long long)generation,
                 (unsigned long)_diagFrameCount);
         }
-        _diagLastSuccessTime = (t3 > 0) ? t3 : CFAbsoluteTimeGetCurrent();
+        _diagLastSuccessTime = now;
         _latestMask = mask;
+
+        // Diagnostic sample — after the publish so a handler that reads
+        // latestMask observes the mask this sample describes.
+        if (timingHandler) {
+            VGLiteRTMaskProviderTimingSample sample;
+            sample.preMs          = preMs;
+            sample.inferMs        = inferMs;
+            sample.postMs         = postMs;
+            sample.totalMs        = totalMs;
+            sample.inputCopyMs    = inputCopyMs;
+            sample.invokeMs       = invokeMs;
+            sample.outputAccessMs = outputAccessMs;
+            sample.policyMs       = policyMs;
+            sample.cadenceMs      = cadenceMs;
+            sample.ptsSeconds     = CMTimeGetSeconds(pts);
+            sample.generation     = generation;
+            sample.frameIndex     = _diagFrameCount;
+            timingHandler(sample);
+        }
     }
 }
 
-// ─── Private: pixel buffer → float RGB [0,1] 256×256 ─────────────────────────
+// ─── Private: direct person-confidence matte (1/2-channel models) ────────────
 
-/// Returns YES on success. Writes kInputFloats floats into outBuf.
-/// outBuf must be pre-allocated with kInputFloats * sizeof(float) bytes.
+/// Builds a OneComponent8 VGSkinMask (255 = person) at the model output size
+/// from the person-confidence channel: channel 0 for a 1-channel output, the
+/// last channel for a 2-channel (background, person) output — the same choice
+/// as the Android MediaPipe rung. Float [0,1] → uint8 uses the same truncating
+/// quantisation as that rung (NaN / ≤ 0 → 0, ≥ 1 → 255) so both key alike.
+/// No temporal smoothing: the current frame's confidence is published as is.
+/// faceCount 1 marks the matte valid for the adapter. Nil on allocation failure.
+- (nullable VGSkinMask *)_buildPersonConfidenceMatte:(const float *)outputData pts:(CMTime)pts {
+    const size_t w      = (size_t)_outputW;
+    const size_t h      = (size_t)_outputH;
+    const size_t c      = (size_t)_outputC;
+    const size_t pixels = w * h;
+    const float *person = outputData + (c - 1);   // channel 0 (C=1) or last (C=2)
+
+    uint8_t *buf = (uint8_t *)malloc(pixels);
+    if (!buf) return nil;
+    for (size_t i = 0; i < pixels; i++) {
+        const float f = person[i * c];
+        buf[i] = (isnan(f) || f <= 0.0f) ? 0
+               : (f >= 1.0f)             ? 255
+               : (uint8_t)(f * 255.0f);
+    }
+    // dataWithBytesNoCopy → VGSkinMask's `[data copy]` on an immutable NSData
+    // is a retain, not a second copy (same trick as the matte policies).
+    NSData *maskData = [NSData dataWithBytesNoCopy:buf length:pixels freeWhenDone:YES];
+    return [[VGSkinMask alloc] _initWithData:maskData
+                                       width:w
+                                      height:h
+                                   sourcePTS:pts
+                                   faceCount:1];
+}
+
+// ─── Private: pixel buffer → float RGB [0,1] at the model input size ─────────
+
+/// Returns YES on success. Writes _inputFloats floats into outBuf.
+/// outBuf must be pre-allocated with _inputFloats * sizeof(float) bytes.
 - (BOOL)_preprocessPixelBuffer:(CVPixelBufferRef)pixelBuffer
                   intoScratch:(float *)outBuf {
 
@@ -578,7 +895,54 @@ static const NSUInteger kVGDiagLogInterval = 30;
     return ok;
 }
 
-/// BGRA → float RGB [0,1] with nearest-neighbour resize to 256×256.
+/// (Re)builds the per-column / per-row nearest-neighbour sample maps for a
+/// source size. No-op while the source size is unchanged (the common case:
+/// once per session). Runs on _mlQueue; no allocation.
+///
+///   stretch   — sx = (ox·srcW + srcW/2) / inputW (the pre-existing anamorphic
+///               integer mapping), never a border entry.
+///   aspectFit — s = min(inputW/srcW, inputH/srcH); the frame occupies a
+///               centred srcW·s × srcH·s region; tensor pixels outside it map
+///               to -1 (zero border). Pixel centres are used, so the region is
+///               centred at sub-pixel precision — the compositor's centred
+///               scale-to-fill of the model-aspect matte crops exactly that border.
+- (void)_ensureSampleMapsForSourceWidth:(size_t)srcW height:(size_t)srcH {
+    if (_mapSrcW == srcW && _mapSrcH == srcH) return;
+
+    const int inW = _inputW, inH = _inputH;
+    if (_inputGeometry == VGLiteRTInputGeometryAspectFit) {
+        const double s    = fmin((double)inW / (double)srcW, (double)inH / (double)srcH);
+        const double offX = ((double)inW - (double)srcW * s) * 0.5;
+        const double offY = ((double)inH - (double)srcH * s) * 0.5;
+        for (int ox = 0; ox < inW; ox++) {
+            const double u = ((double)ox + 0.5 - offX) / s;   // continuous source x
+            _mapCols[ox] = (u < 0.0 || u >= (double)srcW) ? -1 : (int32_t)u;   // trunc == floor for u ≥ 0
+        }
+        for (int oy = 0; oy < inH; oy++) {
+            const double v = ((double)oy + 0.5 - offY) / s;   // continuous source y
+            _mapRows[oy] = (v < 0.0 || v >= (double)srcH) ? -1 : (int32_t)v;
+        }
+        os_log_info(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider preprocess] inputGeometry=aspectFit source=%zux%zu input=%dx%d "
+            "scale=%.4f content=%.1fx%.1f offset=(%.1f,%.1f) border=zero sampling=nearest",
+            srcW, srcH, inW, inH, s, (double)srcW * s, (double)srcH * s, offX, offY);
+    } else {
+        for (int ox = 0; ox < inW; ox++) {
+            size_t sx = ((size_t)ox * srcW + srcW / 2) / (size_t)inW;
+            if (sx >= srcW) sx = srcW - 1;
+            _mapCols[ox] = (int32_t)sx;
+        }
+        for (int oy = 0; oy < inH; oy++) {
+            size_t sy = ((size_t)oy * srcH + srcH / 2) / (size_t)inH;
+            if (sy >= srcH) sy = srcH - 1;
+            _mapRows[oy] = (int32_t)sy;
+        }
+    }
+    _mapSrcW = srcW;
+    _mapSrcH = srcH;
+}
+
+/// BGRA → float RGB [0,1] through the sample maps (nearest-neighbour).
 - (BOOL)_convertBGRA:(CVPixelBufferRef)pb into:(float *)out {
     size_t srcW      = CVPixelBufferGetWidth(pb);
     size_t srcH      = CVPixelBufferGetHeight(pb);
@@ -586,24 +950,28 @@ static const NSUInteger kVGDiagLogInterval = 30;
     const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
     if (!src || srcW == 0 || srcH == 0) return NO;
 
-    for (int oy = 0; oy < kInputH; oy++) {
-        size_t sy = (size_t)((oy * srcH + srcH / 2) / (size_t)kInputH);
-        if (sy >= srcH) sy = srcH - 1;
-        const uint8_t *row = src + sy * bytesPerRow;
-        for (int ox = 0; ox < kInputW; ox++) {
-            size_t sx = (size_t)((ox * srcW + srcW / 2) / (size_t)kInputW);
-            if (sx >= srcW) sx = srcW - 1;
-            const uint8_t *px = row + sx * 4; // BGRA
-            int base = (oy * kInputW + ox) * kInputC;
-            out[base + 0] = px[2] / 255.0f;  // R
-            out[base + 1] = px[1] / 255.0f;  // G
-            out[base + 2] = px[0] / 255.0f;  // B
+    [self _ensureSampleMapsForSourceWidth:srcW height:srcH];
+    const int    inW       = _inputW, inH = _inputH;
+    const size_t rowFloats = (size_t)inW * kInputC;
+
+    for (int oy = 0; oy < inH; oy++) {
+        float        *dst = out + (size_t)oy * rowFloats;
+        const int32_t sy  = _mapRows[oy];
+        if (sy < 0) { memset(dst, 0, rowFloats * sizeof(float)); continue; }   // zero border row
+        const uint8_t *row = src + (size_t)sy * bytesPerRow;
+        for (int ox = 0; ox < inW; ox++, dst += kInputC) {
+            const int32_t sx = _mapCols[ox];
+            if (sx < 0) { dst[0] = 0.0f; dst[1] = 0.0f; dst[2] = 0.0f; continue; }   // zero border column
+            const uint8_t *px = row + (size_t)sx * 4; // BGRA
+            dst[0] = px[2] / 255.0f;  // R
+            dst[1] = px[1] / 255.0f;  // G
+            dst[2] = px[0] / 255.0f;  // B
         }
     }
     return YES;
 }
 
-/// RGBA → float RGB [0,1] with nearest-neighbour resize to 256×256.
+/// RGBA → float RGB [0,1] through the sample maps (nearest-neighbour).
 - (BOOL)_convertRGBA:(CVPixelBufferRef)pb into:(float *)out {
     size_t srcW        = CVPixelBufferGetWidth(pb);
     size_t srcH        = CVPixelBufferGetHeight(pb);
@@ -611,24 +979,28 @@ static const NSUInteger kVGDiagLogInterval = 30;
     const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
     if (!src || srcW == 0 || srcH == 0) return NO;
 
-    for (int oy = 0; oy < kInputH; oy++) {
-        size_t sy = (size_t)((oy * srcH + srcH / 2) / (size_t)kInputH);
-        if (sy >= srcH) sy = srcH - 1;
-        const uint8_t *row = src + sy * bytesPerRow;
-        for (int ox = 0; ox < kInputW; ox++) {
-            size_t sx = (size_t)((ox * srcW + srcW / 2) / (size_t)kInputW);
-            if (sx >= srcW) sx = srcW - 1;
-            const uint8_t *px = row + sx * 4; // RGBA
-            int base = (oy * kInputW + ox) * kInputC;
-            out[base + 0] = px[0] / 255.0f;  // R
-            out[base + 1] = px[1] / 255.0f;  // G
-            out[base + 2] = px[2] / 255.0f;  // B
+    [self _ensureSampleMapsForSourceWidth:srcW height:srcH];
+    const int    inW       = _inputW, inH = _inputH;
+    const size_t rowFloats = (size_t)inW * kInputC;
+
+    for (int oy = 0; oy < inH; oy++) {
+        float        *dst = out + (size_t)oy * rowFloats;
+        const int32_t sy  = _mapRows[oy];
+        if (sy < 0) { memset(dst, 0, rowFloats * sizeof(float)); continue; }
+        const uint8_t *row = src + (size_t)sy * bytesPerRow;
+        for (int ox = 0; ox < inW; ox++, dst += kInputC) {
+            const int32_t sx = _mapCols[ox];
+            if (sx < 0) { dst[0] = 0.0f; dst[1] = 0.0f; dst[2] = 0.0f; continue; }
+            const uint8_t *px = row + (size_t)sx * 4; // RGBA
+            dst[0] = px[0] / 255.0f;  // R
+            dst[1] = px[1] / 255.0f;  // G
+            dst[2] = px[2] / 255.0f;  // B
         }
     }
     return YES;
 }
 
-/// NV12/NV21 (YUV 420 biplanar) → float RGB [0,1] with resize to 256×256.
+/// NV12/NV21 (YUV 420 biplanar) → float RGB [0,1] through the sample maps.
 /// Uses BT.601 limited/full range YUV → RGB conversion.
 - (BOOL)_convertNV12:(CVPixelBufferRef)pb into:(float *)out fullRange:(BOOL)fullRange {
     size_t srcW = CVPixelBufferGetWidth(pb);
@@ -649,19 +1021,25 @@ static const NSUInteger kVGDiagLogInterval = 30;
     const float yOffset = fullRange ? 0.0f : 16.0f;
     const float uvScale = fullRange ? (1.0f / 255.0f) : (1.0f / 224.0f);
 
-    for (int oy = 0; oy < kInputH; oy++) {
-        size_t sy = (size_t)((oy * srcH + srcH / 2) / (size_t)kInputH);
-        if (sy >= srcH) sy = srcH - 1;
+    [self _ensureSampleMapsForSourceWidth:srcW height:srcH];
+    const int    inW       = _inputW, inH = _inputH;
+    const size_t rowFloats = (size_t)inW * kInputC;
+
+    for (int oy = 0; oy < inH; oy++) {
+        float        *dst = out + (size_t)oy * rowFloats;
+        const int32_t sy  = _mapRows[oy];
+        if (sy < 0) { memset(dst, 0, rowFloats * sizeof(float)); continue; }
 
         // UV plane is half-resolution vertically.
-        size_t uvy = sy / 2;
+        size_t uvy = (size_t)sy / 2;
 
-        const uint8_t *yRow  = yPlane  + sy  * yStride;
+        const uint8_t *yRow  = yPlane  + (size_t)sy * yStride;
         const uint8_t *uvRow = uvPlane + uvy * uvStride;
 
-        for (int ox = 0; ox < kInputW; ox++) {
-            size_t sx = (size_t)((ox * srcW + srcW / 2) / (size_t)kInputW);
-            if (sx >= srcW) sx = srcW - 1;
+        for (int ox = 0; ox < inW; ox++, dst += kInputC) {
+            const int32_t sxi = _mapCols[ox];
+            if (sxi < 0) { dst[0] = 0.0f; dst[1] = 0.0f; dst[2] = 0.0f; continue; }
+            const size_t sx = (size_t)sxi;
 
             float Y  = ((float)yRow[sx]     - yOffset) * yScale;
             // UV plane: interleaved Cb, Cr (NV12 layout).
@@ -679,10 +1057,9 @@ static const NSUInteger kVGDiagLogInterval = 30;
             G = G < 0.0f ? 0.0f : (G > 1.0f ? 1.0f : G);
             B = B < 0.0f ? 0.0f : (B > 1.0f ? 1.0f : B);
 
-            int base = (oy * kInputW + ox) * kInputC;
-            out[base + 0] = R;
-            out[base + 1] = G;
-            out[base + 2] = B;
+            dst[0] = R;
+            dst[1] = G;
+            dst[2] = B;
         }
     }
     return YES;
@@ -721,10 +1098,14 @@ static const NSUInteger kVGDiagLogInterval = 30;
 #endif
     TfLiteModel       *model   = _tflModel;
     void              *scratch = _inputScratch;
+    void              *mapCols = _mapCols;
+    void              *mapRows = _mapRows;
 
     _tflInterpreter = nil;
     _tflModel       = nil;
     _inputScratch   = NULL;
+    _mapCols        = NULL;
+    _mapRows        = NULL;
 
     // Phase 9B-6B.1: capture and release pending buffer on _mlQueue.
     // _pendingLock is not needed here — dealloc is single-threaded and no
@@ -750,6 +1131,12 @@ static const NSUInteger kVGDiagLogInterval = 30;
         }
         if (scratch) {
             free(scratch);
+        }
+        if (mapCols) {
+            free(mapCols);
+        }
+        if (mapRows) {
+            free(mapRows);
         }
     });
 }
