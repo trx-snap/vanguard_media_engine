@@ -37,8 +37,7 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
 
 @interface VanguardCameraMediaSource () <
     AVCaptureVideoDataOutputSampleBufferDelegate,
-    AVCaptureAudioDataOutputSampleBufferDelegate,
-    AVCapturePhotoCaptureDelegate>
+    AVCaptureAudioDataOutputSampleBufferDelegate, AVCapturePhotoCaptureDelegate>
 @end
 
 @implementation VanguardCameraMediaSource {
@@ -49,6 +48,14 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   dispatch_queue_t _captureQueue;
   AVCaptureDevicePosition _position;
   int _targetFPS;
+  // Ordered AVCaptureSession presets requested by the caller (e.g.
+  // iFrame960x540 then 1280x720 for live green-screen). The first supported
+  // entry wins. Nil or empty preserves the existing 1080p-first behavior.
+  // Copied at init; read only in _configureSession.
+  NSArray<NSString *> *_preferredSessionPresets;
+  // The preset actually applied in _configureSession. Backs the readonly
+  // selectedSessionPreset property. Written once at init; read-only after.
+  NSString *_selectedSessionPreset;
 
   // ── VanguardMediaSource callbacks ─────────────────────────────────────────
   void (^_videoCallback)(CVPixelBufferRef, CMTime);
@@ -147,49 +154,63 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   // All writes are on _captureQueue (serial) — no lock needed.
   // Reset in startRecordingToURL:. Read via roiPtsDiagnostics property
   // (called on main thread after stop completes — counters are frozen).
-  uint64_t  _roiDiagPtsCount;           // frames with valid PTS seen during recording
-  uint64_t  _roiDiagPtsInvalidCount;    // frames with CMTIME_IS_INVALID(pts) during recording
-  uint64_t  _roiDiagMonotonicViolations;// frames where pts <= previous pts
-  double    _roiDiagFirstPtsMs;         // first valid PTS in ms
-  double    _roiDiagLastPtsMs;          // last valid PTS in ms
-  double    _roiDiagMinDeltaMs;         // min inter-frame delta in ms (DBL_MAX sentinel until set)
-  double    _roiDiagMaxDeltaMs;         // max inter-frame delta in ms
-  double    _roiDiagPtsSumMs;           // running sum of deltas for average (computed at stop time)
-  CMTime    _roiDiagPrevPts;            // previous valid PTS for delta/monotonic checks
+  uint64_t _roiDiagPtsCount; // frames with valid PTS seen during recording
+  uint64_t _roiDiagPtsInvalidCount; // frames with CMTIME_IS_INVALID(pts) during
+                                    // recording
+  uint64_t _roiDiagMonotonicViolations; // frames where pts <= previous pts
+  double _roiDiagFirstPtsMs;            // first valid PTS in ms
+  double _roiDiagLastPtsMs;             // last valid PTS in ms
+  double _roiDiagMinDeltaMs; // min inter-frame delta in ms (DBL_MAX sentinel
+                             // until set)
+  double _roiDiagMaxDeltaMs; // max inter-frame delta in ms
+  double _roiDiagPtsSumMs;   // running sum of deltas for average (computed at
+                             // stop time)
+  CMTime _roiDiagPrevPts;    // previous valid PTS for delta/monotonic checks
 
   // ── ROI-2A: Capture-time face-detection diagnostic ────────────────────────
   // _roiWorkerQueue: dedicated serial queue at utility QoS for Vision requests.
-  //   Never blocked from _captureQueue. Created in init; alive for object lifetime.
+  //   Never blocked from _captureQueue. Created in init; alive for object
+  //   lifetime.
   // _roiDetectInFlight: atomic flag ensuring at most one Vision request and one
   //   retained CVPixelBuffer are alive at any moment.
   //   Set to true on _captureQueue; cleared on _roiWorkerQueue.
   //
   // Counter ownership:
-  //   Written on _captureQueue (serial):  _roiDetectFrameCounter, _roiDetectAttempts,
+  //   Written on _captureQueue (serial):  _roiDetectFrameCounter,
+  //   _roiDetectAttempts,
   //                                       _roiDetectSkippedBusy
-  //   Written on _roiWorkerQueue (serial): _roiDetectionsCompleted, _roiDetectErrors,
-  //                                        _roiFramesWithFace, _roiTotalFacesDetected
+  //   Written on _roiWorkerQueue (serial): _roiDetectionsCompleted,
+  //   _roiDetectErrors,
+  //                                        _roiFramesWithFace,
+  //                                        _roiTotalFacesDetected
   //   Atomic (set on capture, cleared on worker): _roiDetectInFlight
   //
   // No locks required: each counter is written by exactly one queue.
   // roiPtsDiagnostics drains _roiWorkerQueue before reading worker counters.
   dispatch_queue_t _roiWorkerQueue;
-  atomic_bool      _roiDetectInFlight;
+  atomic_bool _roiDetectInFlight;
 
-  uint64_t _roiDetectFrameCounter;    // eligible frames seen; cadence divisor (capture queue)
-  uint64_t _roiDetectAttempts;        // frames dispatched to worker (capture queue)
-  uint64_t _roiDetectSkippedBusy;     // frames skipped due to in-flight guard (capture queue)
-  uint64_t _roiDetectionsCompleted;   // Vision requests that finished without error (worker queue)
-  uint64_t _roiDetectErrors;          // Vision requests that returned an error (worker queue)
-  uint64_t _roiFramesWithFace;        // completed detections with >= 1 face (worker queue)
-  uint64_t _roiTotalFacesDetected;    // total face count across all completed detections (worker queue)
+  uint64_t _roiDetectFrameCounter; // eligible frames seen; cadence divisor
+                                   // (capture queue)
+  uint64_t _roiDetectAttempts;    // frames dispatched to worker (capture queue)
+  uint64_t _roiDetectSkippedBusy; // frames skipped due to in-flight guard
+                                  // (capture queue)
+  uint64_t _roiDetectionsCompleted; // Vision requests that finished without
+                                    // error (worker queue)
+  uint64_t
+      _roiDetectErrors; // Vision requests that returned an error (worker queue)
+  uint64_t
+      _roiFramesWithFace; // completed detections with >= 1 face (worker queue)
+  uint64_t _roiTotalFacesDetected; // total face count across all completed
+                                   // detections (worker queue)
 
   // ── ROI-2B: PTS-aligned face-box diagnostic samples ──────────────────────
   // _roiSamples: in-memory array of NSDictionary samples, one per sampled
   //   frame where a face was detected. Each entry contains:
   //     ptsMs     (double) — frame PTS in milliseconds
-  //     x/y/w/h   (double) — largest-face bounding box in portrait_capture_normalized
-  //     faceCount (uint64) — total faces detected in this sampled frame
+  //     x/y/w/h   (double) — largest-face bounding box in
+  //     portrait_capture_normalized faceCount (uint64) — total faces detected
+  //     in this sampled frame
   //
   // Thread ownership: written exclusively on _roiWorkerQueue (serial).
   //   Reset on _captureQueue at recording start — safe because:
@@ -208,20 +229,20 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   //   At ~11 samples/sec (cadence=3 at 30fps minus in-flight skips), 3000
   //   samples covers ~4.5 minutes. Samples beyond the cap are silently dropped.
   //   Missing ROI is acceptable; wrong ROI is not.
-  NSMutableArray<NSDictionary *> *_roiSamples;   // worker-queue-owned
-  NSUInteger                      _roiSampleCap;  // = 3000
+  NSMutableArray<NSDictionary *> *_roiSamples; // worker-queue-owned
+  NSUInteger _roiSampleCap;                    // = 3000
 
-  // ── ROI-3: Capture-space sidecar persistence ───────────────────────────────────
-  // _roiRecordingSessionId: UUID generated at startRecordingToURL: so each
+  // ── ROI-3: Capture-space sidecar persistence
+  // ─────────────────────────────────── _roiRecordingSessionId: UUID generated
+  // at startRecordingToURL: so each
   //   recording clip has a unique identity in its sidecar.
   // _roiSidecarPath: absolute path of the written .roi.json file, or nil.
   // _roiSidecarError: localizedDescription if write failed, or nil on success.
   // All three are written on _captureQueue and read on main thread after stop.
-  NSString *_roiRecordingSessionId;  // UUID per recording clip
-  NSString *_roiSidecarPath;         // non-nil after successful write
-  NSString *_roiSidecarError;        // non-nil on write failure
+  NSString *_roiRecordingSessionId; // UUID per recording clip
+  NSString *_roiSidecarPath;        // non-nil after successful write
+  NSString *_roiSidecarError;       // non-nil on write failure
 }
-
 
 @synthesize captureSession = _session;
 
@@ -233,13 +254,15 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
 // from _captureQueue (which would deadlock via stopRecordingWithCompletion:).
 static const char kCaptureQueueKey = 0;
 
-// ── ROI-2B: Vision bottom-left/Y-up → UMF top-left/Y-down coordinate conversion
+// ── ROI-2B: Vision bottom-left/Y-up → UMF top-left/Y-down coordinate
+// conversion
 //
 // Converts a VNFaceObservation.boundingBox (normalized, origin = lower-left,
 // Y increases upward) to the shared portrait_capture_normalized coordinate
 // space (normalized, origin = upper-left, Y increases downward).
 //
-// Math per UMF ROI contract §12.3 and reference in VGOfflineFaceBoxBenchmarkTest:
+// Math per UMF ROI contract §12.3 and reference in
+// VGOfflineFaceBoxBenchmarkTest:
 //   x_shared = x_vision          (X axis direction is identical)
 //   y_shared = 1.0 - y_vision - h_vision  (flip: lower-left Y → upper-left Y)
 //   w_shared = w_vision
@@ -247,12 +270,8 @@ static const char kCaptureQueueKey = 0;
 //
 // Called only on _roiWorkerQueue.
 static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
-    return CGRectMake(
-        vb.origin.x,
-        1.0 - vb.origin.y - vb.size.height,
-        vb.size.width,
-        vb.size.height
-    );
+  return CGRectMake(vb.origin.x, 1.0 - vb.origin.y - vb.size.height,
+                    vb.size.width, vb.size.height);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,12 +279,31 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
 - (instancetype)initWithPosition:(AVCaptureDevicePosition)position
                        frameRate:(int)fps {
+  return [self initWithPosition:position
+                       frameRate:fps
+        preferredSessionPresets:nil];
+}
+
+- (instancetype)initWithPosition:(AVCaptureDevicePosition)position
+                       frameRate:(int)fps
+         preferredSessionPreset:(NSString *)preferredSessionPreset {
+  NSArray<NSString *> *presets =
+      preferredSessionPreset ? @[ preferredSessionPreset ] : nil;
+  return [self initWithPosition:position
+                       frameRate:fps
+        preferredSessionPresets:presets];
+}
+
+- (instancetype)initWithPosition:(AVCaptureDevicePosition)position
+                       frameRate:(int)fps
+        preferredSessionPresets:(NSArray<NSString *> *)preferredSessionPresets {
   self = [super init];
   if (!self)
     return nil;
 
   _position = position;
   _targetFPS = fps;
+  _preferredSessionPresets = [preferredSessionPresets copy];
   _latestBufferLock = OS_UNFAIR_LOCK_INIT;
   _lastFrameTime = kCMTimeInvalid;
   _recordingFrameSkip = 1;
@@ -289,11 +327,10 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
   // ROI-2A: Dedicated serial worker queue for async Vision face-rectangle
   // detection. Runs at utility QoS to avoid interfering with capture/recording.
-  _roiWorkerQueue = dispatch_queue_create(
-      "com.vanguard.roiWorker", DISPATCH_QUEUE_SERIAL);
-  dispatch_set_target_queue(
-      _roiWorkerQueue,
-      dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+  _roiWorkerQueue =
+      dispatch_queue_create("com.vanguard.roiWorker", DISPATCH_QUEUE_SERIAL);
+  dispatch_set_target_queue(_roiWorkerQueue,
+                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
   atomic_init(&_roiDetectInFlight, false);
 
   // Persistent queue for JPEG encoding + file I/O (Phase 4).
@@ -372,6 +409,13 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
               }];
 
   _session = [[AVCaptureSession alloc] init];
+  // Prevent AVCaptureSession from hijacking AVAudioSession category/options.
+  // AppAudioHardwareArbiter (Dart) is the sole owner of AVAudioSession
+  // configuration. Leaving automaticallyConfiguresApplicationAudioSession = YES
+  // (the default) causes the capture session to silently override the category
+  // to PlayAndRecord with its own option set on startRunning, which drops
+  // Bluetooth A2DP routes and forces audio to the main speaker.
+  _session.automaticallyConfiguresApplicationAudioSession = NO;
   [self _configureSession];
 
   // POC2: raw forwarding gate defaults to YES (POC1 path active by default).
@@ -389,12 +433,30 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 - (void)_configureSession {
   [_session beginConfiguration];
 
-  // Preset: 1080p on A13+; 720p fallback on older devices
-  NSString *preset = AVCaptureSessionPreset1920x1080;
-  if (![_session canSetSessionPreset:preset]) {
-    preset = AVCaptureSessionPreset1280x720;
+  // Preset: the first supported caller-preferred preset, in list order (e.g.
+  // iFrame960x540 then 720p for live green-screen). When the list is nil,
+  // empty, or has no supported entry: the existing behavior — 1080p on A13+,
+  // 720p fallback on older devices.
+  NSString *preset = nil;
+  for (NSString *candidate in _preferredSessionPresets) {
+    if ([_session canSetSessionPreset:candidate]) {
+      preset = candidate;
+      break;
+    }
+  }
+  if (!preset) {
+    preset = AVCaptureSessionPreset1920x1080;
+    if (![_session canSetSessionPreset:preset]) {
+      preset = AVCaptureSessionPreset1280x720;
+    }
   }
   _session.sessionPreset = preset;
+  _selectedSessionPreset = [preset copy];
+  NSLog(@"[VanguardCamera] session preset requested=%@ selected=%@",
+        _preferredSessionPresets.count > 0
+            ? [_preferredSessionPresets componentsJoinedByString:@","]
+            : @"(default 1080p-first)",
+        preset);
 
   // ── Video input ───────────────────────────────────────────────────────────
   AVCaptureDevice *cam = [AVCaptureDevice
@@ -474,7 +536,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     // ── High-resolution still capture opt-in ─────────────────────────────
     // iOS 16+: use maxPhotoDimensions — select the largest CMVideoDimensions
     //          from the active format's supportedMaxPhotoDimensions array.
-    // iOS 14–15: use the deprecated (but functional) highResolutionCaptureEnabled
+    // iOS 14–15: use the deprecated (but functional)
+    // highResolutionCaptureEnabled
     //            flag to enable the same behaviour.
     if (@available(iOS 16.0, *)) {
       // _captureDevice is set to `cam` at line 300, before this block.
@@ -492,10 +555,12 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
       if (best.width > 0 && best.height > 0) {
         _photoOutput.maxPhotoDimensions = best;
       } else {
-        NSLog(@"[VanguardCamera] WARNING: no supportedMaxPhotoDimensions found — output may be 1080p");
+        NSLog(@"[VanguardCamera] WARNING: no supportedMaxPhotoDimensions found "
+              @"— output may be 1080p");
       }
     } else {
-      // iOS 14–15: deprecated API, still required to unlock full-sensor resolution.
+      // iOS 14–15: deprecated API, still required to unlock full-sensor
+      // resolution.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
       _photoOutput.highResolutionCaptureEnabled = YES;
@@ -503,7 +568,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     }
   } else {
     _photoOutput = nil;
-    NSLog(@"[VanguardCamera] WARNING: session cannot add AVCapturePhotoOutput — native photo will fall back to preview-frame capture");
+    NSLog(@"[VanguardCamera] WARNING: session cannot add AVCapturePhotoOutput "
+          @"— native photo will fall back to preview-frame capture");
   }
 
   [_session commitConfiguration];
@@ -722,8 +788,9 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   int32_t total = ++_totalFrameCount;
 
   // ── ROI-1C / ROI-2A: PTS diagnostic update + face-detection offer ────────
-  // Extracted to helpers shared with the graph-backed appendProcessedVideoFrame:
-  // path. See _updateROIPTSDiagnosticsForPTS: and _offerROIDetectionForPixelBuffer:pts:
+  // Extracted to helpers shared with the graph-backed
+  // appendProcessedVideoFrame: path. See _updateROIPTSDiagnosticsForPTS: and
+  // _offerROIDetectionForPixelBuffer:pts:
   [self _updateROIPTSDiagnosticsForPTS:pts];
 
   // Frame skip (Tier 2 active)
@@ -937,7 +1004,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
     // ── ROI-1C: Reset PTS diagnostic counters ────────────────────────────────
     // On _captureQueue (serial) — plain assignment is race-free.
-    // DBL_MAX is the sentinel for "no delta observed yet" in _roiDiagMinDeltaMs.
+    // DBL_MAX is the sentinel for "no delta observed yet" in
+    // _roiDiagMinDeltaMs.
     self->_roiDiagPtsCount = 0;
     self->_roiDiagPtsInvalidCount = 0;
     self->_roiDiagMonotonicViolations = 0;
@@ -952,29 +1020,30 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     // On _captureQueue (serial) — plain assignment is race-free.
     // Also reset the atomic in-flight flag so any prior state from the previous
     // clip is cleared before the new recording begins.
-    self->_roiDetectFrameCounter  = 0;
-    self->_roiDetectAttempts      = 0;
-    self->_roiDetectSkippedBusy   = 0;
+    self->_roiDetectFrameCounter = 0;
+    self->_roiDetectAttempts = 0;
+    self->_roiDetectSkippedBusy = 0;
     self->_roiDetectionsCompleted = 0;
-    self->_roiDetectErrors        = 0;
-    self->_roiFramesWithFace      = 0;
-    self->_roiTotalFacesDetected  = 0;
+    self->_roiDetectErrors = 0;
+    self->_roiFramesWithFace = 0;
+    self->_roiTotalFacesDetected = 0;
     atomic_store(&self->_roiDetectInFlight, false);
 
     // ── ROI-2B: Reset sample storage ─────────────────────────────────────────
     // On _captureQueue (serial). _roiDetectInFlight was cleared above so no
     // worker block is in-flight. Safe to allocate a fresh array here;
-    // the worker queue will not see _roiSamples until the next detection dispatch.
-    self->_roiSamples    = [[NSMutableArray alloc] init];
-    self->_roiSampleCap  = 3000;
+    // the worker queue will not see _roiSamples until the next detection
+    // dispatch.
+    self->_roiSamples = [[NSMutableArray alloc] init];
+    self->_roiSampleCap = 3000;
 
-    // ── ROI-3: Reset sidecar state for new recording clip ────────────────────────
-    // Generate a new UUID so each recording clip has its own sidecar identity.
-    // On _captureQueue (serial) — plain assignment is race-free.
+    // ── ROI-3: Reset sidecar state for new recording clip
+    // ──────────────────────── Generate a new UUID so each recording clip has
+    // its own sidecar identity. On _captureQueue (serial) — plain assignment is
+    // race-free.
     self->_roiRecordingSessionId = [[NSUUID UUID] UUIDString];
-    self->_roiSidecarPath        = nil;
-    self->_roiSidecarError       = nil;
-
+    self->_roiSidecarPath = nil;
+    self->_roiSidecarError = nil;
 
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil);
@@ -1046,8 +1115,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
         if (chained)
           chained(err ? nil : url, dropped, total, err);
 
-        // ── ROI-3: Write capture-space sidecar before notifying main thread ───
-        // We are on _captureQueue, after writer teardown, before Dart is
+        // ── ROI-3: Write capture-space sidecar before notifying main thread
+        // ─── We are on _captureQueue, after writer teardown, before Dart is
         // notified. The sidecar writer drains _roiWorkerQueue internally.
         // Failure here does NOT fail video recording.
         [self _writeROISidecarToURL:(err ? nil : url)];
@@ -1061,7 +1130,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   });
 }
 
-// ── ROI-1C: PTS diagnostic snapshot property ──────────────────────────────────
+// ── ROI-1C: PTS diagnostic snapshot property
+// ──────────────────────────────────
 //
 // Called on main thread after stopRecordingWithCompletion: fires.
 // At that point _recordingState == Idle and all _captureQueue recording work is
@@ -1079,38 +1149,41 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // class and is never used to call external code that might invoke
   // roiPtsDiagnostics. The getter is documented as a main-thread post-stop
   // call. This is safe.
-  dispatch_sync(_roiWorkerQueue, ^{});
+  dispatch_sync(_roiWorkerQueue, ^{
+                });
 
   double avgDeltaMs = (_roiDiagPtsCount > 1)
-      ? _roiDiagPtsSumMs / (double)(_roiDiagPtsCount - 1)
-      : 0.0;
-  double minDeltaMs = (_roiDiagMinDeltaMs == DBL_MAX) ? 0.0 : _roiDiagMinDeltaMs;
+                          ? _roiDiagPtsSumMs / (double)(_roiDiagPtsCount - 1)
+                          : 0.0;
+  double minDeltaMs =
+      (_roiDiagMinDeltaMs == DBL_MAX) ? 0.0 : _roiDiagMinDeltaMs;
   return @{
     // ROI-1C PTS timing keys (unchanged)
-    @"ptsAvailableCount":          @(_roiDiagPtsCount),
-    @"ptsInvalidCount":            @(_roiDiagPtsInvalidCount),
-    @"ptsMonotonicViolationCount": @(_roiDiagMonotonicViolations),
-    @"firstPtsMs":                 @(_roiDiagFirstPtsMs),
-    @"lastPtsMs":                  @(_roiDiagLastPtsMs),
-    @"minFrameDeltaMs":            @(minDeltaMs),
-    @"maxFrameDeltaMs":            @(_roiDiagMaxDeltaMs),
-    @"averageFrameDeltaMs":        @(avgDeltaMs),
+    @"ptsAvailableCount" : @(_roiDiagPtsCount),
+    @"ptsInvalidCount" : @(_roiDiagPtsInvalidCount),
+    @"ptsMonotonicViolationCount" : @(_roiDiagMonotonicViolations),
+    @"firstPtsMs" : @(_roiDiagFirstPtsMs),
+    @"lastPtsMs" : @(_roiDiagLastPtsMs),
+    @"minFrameDeltaMs" : @(minDeltaMs),
+    @"maxFrameDeltaMs" : @(_roiDiagMaxDeltaMs),
+    @"averageFrameDeltaMs" : @(avgDeltaMs),
     // ROI-2A face-detection diagnostic keys (unchanged)
-    @"roiDetectAttempts":      @(_roiDetectAttempts),
-    @"roiDetectSkippedBusy":   @(_roiDetectSkippedBusy),
-    @"roiDetectionsCompleted": @(_roiDetectionsCompleted),
-    @"roiDetectErrors":        @(_roiDetectErrors),
-    @"roiFramesWithFace":      @(_roiFramesWithFace),
-    @"roiTotalFacesDetected":  @(_roiTotalFacesDetected),
+    @"roiDetectAttempts" : @(_roiDetectAttempts),
+    @"roiDetectSkippedBusy" : @(_roiDetectSkippedBusy),
+    @"roiDetectionsCompleted" : @(_roiDetectionsCompleted),
+    @"roiDetectErrors" : @(_roiDetectErrors),
+    @"roiFramesWithFace" : @(_roiFramesWithFace),
+    @"roiTotalFacesDetected" : @(_roiTotalFacesDetected),
     // ROI-2B PTS-aligned face-box sample keys
     // _roiSamples is worker-queue-owned; the dispatch_sync drain above
     // ensures all pending appends have completed before we copy.
-    @"roiSampleCount": @(_roiSamples.count),
-    @"roiSamples":     [_roiSamples copy],
+    @"roiSampleCount" : @(_roiSamples.count),
+    @"roiSamples" : [_roiSamples copy],
   };
 }
 
-// ── ROI-3: Capture-space sidecar writer ────────────────────────────────────────────
+// ── ROI-3: Capture-space sidecar writer
+// ────────────────────────────────────────────
 //
 // Called on _captureQueue inside the stopRecordingWithCompletion: cleanup
 // block, after the asset writer has finished and before the main-thread
@@ -1140,7 +1213,7 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 - (void)_writeROISidecarToURL:(NSURL *)videoURL {
   // Guard: nil URL means stop produced an error path — skip sidecar.
   if (!videoURL) {
-    _roiSidecarPath  = nil;
+    _roiSidecarPath = nil;
     _roiSidecarError = @"output URL nil";
     return;
   }
@@ -1149,38 +1222,38 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // we copy _roiSamples. dispatch_sync from _captureQueue to _roiWorkerQueue
   // is safe: they are different serial queues and _roiWorkerQueue never
   // calls back into _captureQueue.
-  dispatch_sync(_roiWorkerQueue, ^{});
+  dispatch_sync(_roiWorkerQueue, ^{
+                });
 
   // Snapshot samples while on _captureQueue after the worker drain.
   NSArray<NSDictionary *> *samplesSnapshot = [_roiSamples copy];
 
-  // ── Build per-sample JSON array ───────────────────────────────────────────────────
+  // ── Build per-sample JSON array
+  // ───────────────────────────────────────────────────
   double firstPtsMs = _roiDiagFirstPtsMs;
-  double lastPtsMs  = _roiDiagLastPtsMs;
+  double lastPtsMs = _roiDiagLastPtsMs;
 
-  NSMutableArray *jsonSamples = [[NSMutableArray alloc]
-                                  initWithCapacity:samplesSnapshot.count];
+  NSMutableArray *jsonSamples =
+      [[NSMutableArray alloc] initWithCapacity:samplesSnapshot.count];
   for (NSDictionary *raw in samplesSnapshot) {
     double ptsMs = [raw[@"ptsMs"] doubleValue];
-    double bX    = [raw[@"x"]    doubleValue];
-    double bY    = [raw[@"y"]    doubleValue];
-    double bW    = [raw[@"w"]    doubleValue];
-    double bH    = [raw[@"h"]    doubleValue];
+    double bX = [raw[@"x"] doubleValue];
+    double bY = [raw[@"y"] doubleValue];
+    double bW = [raw[@"w"] doubleValue];
+    double bH = [raw[@"h"] doubleValue];
 
     // Validate coordinates: skip invalid samples rather than writing bad data.
     // Missing ROI is acceptable; wrong ROI is not.
-    BOOL coordsValid = (isfinite(bX) && isfinite(bY) &&
-                        isfinite(bW) && isfinite(bH) &&
-                        bX >= 0.0 && bY >= 0.0 &&
-                        bW >  0.0 && bH >  0.0 &&
-                        (bX + bW) <= 1.001 && (bY + bH) <= 1.001);
+    BOOL coordsValid = (isfinite(bX) && isfinite(bY) && isfinite(bW) &&
+                        isfinite(bH) && bX >= 0.0 && bY >= 0.0 && bW > 0.0 &&
+                        bH > 0.0 && (bX + bW) <= 1.001 && (bY + bH) <= 1.001);
     if (!coordsValid || !isfinite(ptsMs) || ptsMs < 0.0) {
       continue;
     }
 
-    int64_t timestampMs         = (int64_t)round(ptsMs);
-    int64_t framePtsMs          = timestampMs;
-    int64_t relMs               = (int64_t)MAX(0.0, round(ptsMs - firstPtsMs));
+    int64_t timestampMs = (int64_t)round(ptsMs);
+    int64_t framePtsMs = timestampMs;
+    int64_t relMs = (int64_t)MAX(0.0, round(ptsMs - firstPtsMs));
 
     // Box: clamp to exact [0,1] after tolerance allowed during validity check.
     double cx = MIN(MAX(bX, 0.0), 1.0);
@@ -1189,45 +1262,47 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     double ch = MIN(bH, 1.0 - cy);
 
     [jsonSamples addObject:@{
-      @"timestampMs":         @(timestampMs),
-      @"framePtsMs":          @(framePtsMs),
-      @"recordingRelativeMs": @(relMs),
-      @"box": @{
-        @"x": @(cx),
-        @"y": @(cy),
-        @"w": @(cw),
-        @"h": @(ch),
+      @"timestampMs" : @(timestampMs),
+      @"framePtsMs" : @(framePtsMs),
+      @"recordingRelativeMs" : @(relMs),
+      @"box" : @{
+        @"x" : @(cx),
+        @"y" : @(cy),
+        @"w" : @(cw),
+        @"h" : @(ch),
       },
-      @"quality":       @"detected",
-      @"confidence":    [NSNull null],
-      @"paddingPolicy": [NSNull null],
+      @"quality" : @"detected",
+      @"confidence" : [NSNull null],
+      @"paddingPolicy" : [NSNull null],
     }];
   }
 
-  // ── Build top-level sidecar dictionary ─────────────────────────────────────────────
+  // ── Build top-level sidecar dictionary
+  // ─────────────────────────────────────────────
   int64_t durationMs = (int64_t)MAX(0.0, round(lastPtsMs - firstPtsMs));
 
   NSDictionary *sidecar = @{
-    @"version":          @(1),
-    @"sourceType":       @"app_recorded",
-    @"platform":         @"ios",
-    @"coordinateSpace":  @"portrait_capture_normalized",
-    @"recordingSessionId": _roiRecordingSessionId ?: @"unknown",
-    @"videoIdentity": @{
-      @"durationMs": @(durationMs),
-      @"width":      @(1080),
-      @"height":     @(1920),
-      @"hash":       [NSNull null],
+    @"version" : @(1),
+    @"sourceType" : @"app_recorded",
+    @"platform" : @"ios",
+    @"coordinateSpace" : @"portrait_capture_normalized",
+    @"recordingSessionId" : _roiRecordingSessionId ?: @"unknown",
+    @"videoIdentity" : @{
+      @"durationMs" : @(durationMs),
+      @"width" : @(1080),
+      @"height" : @(1920),
+      @"hash" : [NSNull null],
     },
-    @"coverage": @{
-      @"coveragePercent":  @(1.0),
-      @"missingIntervals": @[],
+    @"coverage" : @{
+      @"coveragePercent" : @(1.0),
+      @"missingIntervals" : @[],
     },
-    @"samples":   jsonSamples,
-    @"finalized": @(YES),
+    @"samples" : jsonSamples,
+    @"finalized" : @(YES),
   };
 
-  // ── Serialize and write atomically ────────────────────────────────────────────────
+  // ── Serialize and write atomically
+  // ────────────────────────────────────────────────
   NSError *jsonErr = nil;
   NSJSONWritingOptions jsonOpts =
       NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys;
@@ -1235,25 +1310,25 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
                                                      options:jsonOpts
                                                        error:&jsonErr];
   if (!jsonData) {
-    _roiSidecarPath  = nil;
+    _roiSidecarPath = nil;
     _roiSidecarError = jsonErr.localizedDescription
-                       ?: @"ROI sidecar JSON serialization failed";
+                           ?: @"ROI sidecar JSON serialization failed";
     return;
   }
 
   NSURL *sidecarURL = [[videoURL URLByDeletingPathExtension]
-                        URLByAppendingPathExtension:@"roi.json"];
+      URLByAppendingPathExtension:@"roi.json"];
   NSError *writeErr = nil;
   BOOL written = [jsonData writeToURL:sidecarURL
                               options:NSDataWritingAtomic
                                 error:&writeErr];
   if (written) {
-    _roiSidecarPath  = sidecarURL.path;
+    _roiSidecarPath = sidecarURL.path;
     _roiSidecarError = nil;
   } else {
-    _roiSidecarPath  = nil;
-    _roiSidecarError = writeErr.localizedDescription
-                       ?: @"ROI sidecar write failed";
+    _roiSidecarPath = nil;
+    _roiSidecarError =
+        writeErr.localizedDescription ?: @"ROI sidecar write failed";
   }
 }
 
@@ -1279,8 +1354,10 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
         _roiDiagMonotonicViolations++;
       } else {
         _roiDiagPtsSumMs += deltaMs;
-        if (deltaMs < _roiDiagMinDeltaMs) _roiDiagMinDeltaMs = deltaMs;
-        if (deltaMs > _roiDiagMaxDeltaMs) _roiDiagMaxDeltaMs = deltaMs;
+        if (deltaMs < _roiDiagMinDeltaMs)
+          _roiDiagMinDeltaMs = deltaMs;
+        if (deltaMs > _roiDiagMaxDeltaMs)
+          _roiDiagMaxDeltaMs = deltaMs;
       }
     }
     _roiDiagPrevPts = pts;
@@ -1289,7 +1366,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   }
 }
 
-// ── ROI-2A: Async face-rectangle detection tap ────────────────────────────────
+// ── ROI-2A: Async face-rectangle detection tap
+// ────────────────────────────────
 //
 // Called on _captureQueue once per eligible recording frame (after frame-skip
 // gate, before isReadyForMoreMediaData gate). Early returns here are internal
@@ -1299,15 +1377,18 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 //   1. Cadence gate:  only every 3rd eligible frame proceeds.
 //   2. In-flight guard: atomic_exchange prevents overlapping detections and
 //      ensures at most one CVPixelBuffer is retained for ROI at any time.
-//   3. Retain: CVPixelBufferRetain before dispatch; released on EVERY exit path.
-//   4. Worker queue (utility serial): VNDetectFaceRectanglesRequest, count only.
+//   3. Retain: CVPixelBufferRetain before dispatch; released on EVERY exit
+//   path.
+//   4. Worker queue (utility serial): VNDetectFaceRectanglesRequest, count
+//   only.
 //   5. Clear in-flight flag on every exit path (success, error, self-nil).
 //
 // Performance: no per-frame NSLog/os_log, no allocation on capture queue,
 //   no locks, no dispatch_sync on capture queue, no landmarks, no masks.
 - (void)_offerROIDetectionForPixelBuffer:(CVPixelBufferRef)pixelBuffer
                                      pts:(CMTime)pts {
-  // ── Cadence gate: sample every 3rd eligible frame ───────────────────────────
+  // ── Cadence gate: sample every 3rd eligible frame
+  // ───────────────────────────
   _roiDetectFrameCounter++;
   if ((_roiDetectFrameCounter % 3) != 0) {
     return; // skip ROI only; recording continues in caller
@@ -1315,10 +1396,10 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
   _roiDetectAttempts++;
 
-  // ── In-flight guard: abort if a detection is already running ────────────────
-  // atomic_exchange returns the OLD value. If true, a prior detection is alive
-  // (its retained buffer is still held by the worker block). We must not retain
-  // a second buffer.
+  // ── In-flight guard: abort if a detection is already running
+  // ──────────────── atomic_exchange returns the OLD value. If true, a prior
+  // detection is alive (its retained buffer is still held by the worker block).
+  // We must not retain a second buffer.
   if (atomic_exchange(&_roiDetectInFlight, true)) {
     _roiDetectSkippedBusy++;
     return; // skip ROI only; _roiDetectAttempts was already incremented above
@@ -1328,18 +1409,19 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // Balanced by CVPixelBufferRelease on every exit path inside the block.
   CVPixelBufferRetain(pixelBuffer);
 
-  // ── Dispatch face-rectangle detection to the worker queue ───────────────────
+  // ── Dispatch face-rectangle detection to the worker queue
+  // ───────────────────
   // __weak capture of self: if VanguardCameraMediaSource is deallocated before
-  // the block executes, strongSelf will be nil; we release the buffer and return.
-  // The buffer is ALWAYS released and _roiDetectInFlight is ALWAYS cleared (when
-  // strongSelf is non-nil) on every exit path.
+  // the block executes, strongSelf will be nil; we release the buffer and
+  // return. The buffer is ALWAYS released and _roiDetectInFlight is ALWAYS
+  // cleared (when strongSelf is non-nil) on every exit path.
   __weak VanguardCameraMediaSource *weakSelf = self;
   dispatch_async(_roiWorkerQueue, ^{
     VanguardCameraMediaSource *strongSelf = weakSelf;
     if (!strongSelf) {
       CVPixelBufferRelease(pixelBuffer);
-      // _roiDetectInFlight lives in the object's memory which is being released;
-      // no action needed — the memory will be freed.
+      // _roiDetectInFlight lives in the object's memory which is being
+      // released; no action needed — the memory will be freed.
       return;
     }
 
@@ -1356,7 +1438,7 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
                       options:@{}];
 
     NSError *error = nil;
-    [handler performRequests:@[request] error:&error];
+    [handler performRequests:@[ request ] error:&error];
 
     // ── Release pixel buffer — Vision has finished reading ───────────────────
     CVPixelBufferRelease(pixelBuffer);
@@ -1380,42 +1462,41 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
       // "Largest" follows UMF ROI contract §14 primary-face selection policy.
       // We never sort — O(n) max-find is sufficient and allocation-free.
       VNFaceObservation *largest = results.firstObject;
-      CGFloat largestArea = (largest.boundingBox.size.width *
-                             largest.boundingBox.size.height);
+      CGFloat largestArea =
+          (largest.boundingBox.size.width * largest.boundingBox.size.height);
       for (NSUInteger i = 1; i < faceCount; i++) {
         VNFaceObservation *obs = results[i];
         CGFloat area = obs.boundingBox.size.width * obs.boundingBox.size.height;
         if (area > largestArea) {
-          largest    = obs;
+          largest = obs;
           largestArea = area;
         }
       }
 
-      // Convert Vision bottom-left/Y-up → portrait_capture_normalized top-left/Y-down.
+      // Convert Vision bottom-left/Y-up → portrait_capture_normalized
+      // top-left/Y-down.
       CGRect tlBox = _VGVisionBoxToTopLeftNormalized(largest.boundingBox);
-      double bX    = tlBox.origin.x;
-      double bY    = tlBox.origin.y;
-      double bW    = tlBox.size.width;
-      double bH    = tlBox.size.height;
+      double bX = tlBox.origin.x;
+      double bY = tlBox.origin.y;
+      double bW = tlBox.size.width;
+      double bH = tlBox.size.height;
 
       // Safety guard: reject non-finite or out-of-range coordinates.
       // Missing ROI is acceptable; wrong ROI is not.
-      BOOL coordsValid = (isfinite(bX) && isfinite(bY) &&
-                          isfinite(bW) && isfinite(bH) &&
-                          bX >= 0.0 && bY >= 0.0 &&
-                          bW > 0.0  && bH > 0.0  &&
-                          (bX + bW) <= 1.001 && (bY + bH) <= 1.001);
+      BOOL coordsValid = (isfinite(bX) && isfinite(bY) && isfinite(bW) &&
+                          isfinite(bH) && bX >= 0.0 && bY >= 0.0 && bW > 0.0 &&
+                          bH > 0.0 && (bX + bW) <= 1.001 && (bY + bH) <= 1.001);
 
       if (coordsValid &&
           strongSelf->_roiSamples.count < strongSelf->_roiSampleCap) {
         double ptsMs = CMTimeGetSeconds(pts) * 1000.0;
         [strongSelf->_roiSamples addObject:@{
-          @"ptsMs":     @(ptsMs),
-          @"x":         @(bX),
-          @"y":         @(bY),
-          @"w":         @(bW),
-          @"h":         @(bH),
-          @"faceCount": @(faceCount),
+          @"ptsMs" : @(ptsMs),
+          @"x" : @(bX),
+          @"y" : @(bY),
+          @"w" : @(bW),
+          @"h" : @(bH),
+          @"faceCount" : @(faceCount),
         }];
       }
     }
@@ -1423,7 +1504,6 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     atomic_store(&strongSelf->_roiDetectInFlight, false);
   });
 }
-
 
 /// Blocks the calling thread (must NOT be _captureQueue — deadlock) until
 /// AVAssetWriter.finishWritingWithCompletionHandler: fires.
@@ -1469,7 +1549,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Phase 6E.1C — Graph-backed recording append
 
-/// Appends a processed (effects-applied) graph frame to the active AVAssetWriter.
+/// Appends a processed (effects-applied) graph frame to the active
+/// AVAssetWriter.
 ///
 /// Threading: Called from VGRecordingSinkNode.presentEnvelope: on the graph
 /// execution queue (com.vanguard.cameraGraphExecution). Dispatches internally
@@ -1479,16 +1560,20 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 ///
 /// Behavior is a no-op in Phase 6E.1C because graphRecordingEnabled defaults
 /// to NO. No caller sets it to YES in this phase.
-- (void)appendProcessedVideoFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts {
+- (void)appendProcessedVideoFrame:(CVPixelBufferRef)pixelBuffer
+                              pts:(CMTime)pts {
   // Gate 1: graph recording must be explicitly enabled (defaults NO in 6E.1C).
-  if (!self.graphRecordingEnabled) return;
+  if (!self.graphRecordingEnabled)
+    return;
 
   // Gate 2: buffer must be valid.
-  if (!pixelBuffer) return;
+  if (!pixelBuffer)
+    return;
 
   // Gate 3: fast-path recording state check (non-authoritative; re-checked on
   // _captureQueue below to avoid a race on _recordingState).
-  if (_recordingState != VanguardRecordingStateWriting) return;
+  if (_recordingState != VanguardRecordingStateWriting)
+    return;
 
   // Retain buffer across the async boundary. Released unconditionally inside
   // the block below.
@@ -1514,7 +1599,7 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     // so stats reported via stopRecordingWithCompletion: remain accurate.
     if (!self->_videoWriterInput.isReadyForMoreMediaData) {
       int32_t dropped = ++self->_droppedFrameCount;
-      int32_t consec  = ++self->_consecutiveDropCount;
+      int32_t consec = ++self->_consecutiveDropCount;
       self->_windowDrops++;
       int32_t total = ++self->_totalFrameCount;
       (void)dropped;
@@ -1540,16 +1625,16 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     // Append the processed frame. AVAssetWriterInputPixelBufferAdaptor is
     // synchronous — buffer consumed before this returns.
     [self->_pixelBufferAdaptor appendPixelBuffer:pixelBuffer
-                              withPresentationTime:pts];
+                            withPresentationTime:pts];
 
     // Window bookkeeping — mirrors raw path exactly.
     self->_windowFrames++;
     NSTimeInterval elapsed = CACurrentMediaTime() - self->_windowStart;
     if (elapsed >= 2.0) {
       [self _evaluateBackpressureWithTotal:total];
-      self->_windowDrops  = 0;
+      self->_windowDrops = 0;
       self->_windowFrames = 0;
-      self->_windowStart  = CACurrentMediaTime();
+      self->_windowStart = CACurrentMediaTime();
     }
 
     // No Tier-2 frame-skip here. The graph execution queue already provides
@@ -1625,12 +1710,13 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
 // Phase 10-C: recording active signal.
 // Compound check required:
-//   _recordingState == Writing  — writer is in the active accepting-frames phase
-//   _sessionStarted             — startSessionAtSourceTime: has been called (first frame)
+//   _recordingState == Writing  — writer is in the active accepting-frames
+//   phase _sessionStarted             — startSessionAtSourceTime: has been
+//   called (first frame)
 //
 // During Finishing: _recordingState == Finishing → returns NO (correct).
-// During Writing before first frame: Writing && !_sessionStarted → NO (correct).
-// Only returns YES once the writer is genuinely producing output.
+// During Writing before first frame: Writing && !_sessionStarted → NO
+// (correct). Only returns YES once the writer is genuinely producing output.
 //
 // Both ivars are written only on _captureQueue (serial). Reading them from
 // the main thread for a point-in-time snapshot is safe on ARM64: NSInteger and
@@ -1676,15 +1762,15 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // ── Camera position string ────────────────────────────────────────────────
   NSString *positionStr;
   switch (dev.position) {
-    case AVCaptureDevicePositionFront:
-      positionStr = @"front";
-      break;
-    case AVCaptureDevicePositionBack:
-      positionStr = @"back";
-      break;
-    default:
-      positionStr = @"unknown";
-      break;
+  case AVCaptureDevicePositionFront:
+    positionStr = @"front";
+    break;
+  case AVCaptureDevicePositionBack:
+    positionStr = @"back";
+    break;
+  default:
+    positionStr = @"unknown";
+    break;
   }
   BOOL isFront = (dev.position == AVCaptureDevicePositionFront);
 
@@ -1765,7 +1851,7 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
   return @{
     @"minZoomFactor" : @(minZoom),
-    @"maxZoomFactor" : @(recommendedMax),      // recommended quality-safe max
+    @"maxZoomFactor" : @(recommendedMax),        // recommended quality-safe max
     @"technicalMaxZoomFactor" : @(technicalMax), // raw AVFoundation ceiling
     @"upscaleThresholdZoomFactor" : @(upscaleThreshold), // lossless boundary
     @"defaultZoomFactor" : @(defaultZoom),
@@ -1775,7 +1861,6 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     @"cameraPosition" : positionStr,
   };
 }
-
 
 /// Sets tap-to-focus and tap-to-expose at a normalised point (0.0–1.0,
 /// 0.0–1.0). x = horizontal from left, y = vertical from top (AVFoundation
@@ -1885,8 +1970,10 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // _applyConnectionOrientationContract above already enforces portrait when
   // locked, but calling the public method logs the event for diagnostics.
   if (_previewOrientationLocked) {
-    NSLog(@"[Vanguard][6C] moveCameraToPosition: re-applying portrait lock after camera switch");
-    // Lock already enforced by _applyConnectionOrientationContract; no further work.
+    NSLog(@"[Vanguard][6C] moveCameraToPosition: re-applying portrait lock "
+          @"after camera switch");
+    // Lock already enforced by _applyConnectionOrientationContract; no further
+    // work.
   }
 
   // Reconfiguration complete — photo capture allowed again.
@@ -2056,12 +2143,13 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 //   delegates to takePhotoToURL:completion: so no regression occurs.
 
 - (void)takeNativePhotoToURL:(NSURL *)url
-                  completion:
-                      (void (^)(NSURL *_Nullable, NSError *_Nullable))completion {
+                  completion:(void (^)(NSURL *_Nullable,
+                                       NSError *_Nullable))completion {
 
   // ── Fallback: no AVCapturePhotoOutput available ────────────────────────────
   if (!_photoOutput) {
-    NSLog(@"[VanguardCamera] _photoOutput nil — falling back to preview-frame capture");
+    NSLog(@"[VanguardCamera] _photoOutput nil — falling back to preview-frame "
+          @"capture");
     [self takePhotoToURL:url completion:completion];
     return;
   }
@@ -2072,7 +2160,9 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     NSError *err = [NSError
         errorWithDomain:@"VanguardCamera"
                    code:3
-               userInfo:@{NSLocalizedDescriptionKey : @"Camera switch in progress"}];
+               userInfo:@{
+                 NSLocalizedDescriptionKey : @"Camera switch in progress"
+               }];
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil, err);
     });
@@ -2082,10 +2172,13 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // ── Guard: concurrent native capture ──────────────────────────────────────
   // Single-slot: only one AVCapturePhotoOutput request may be in-flight.
   if (_nativeCaptureInFlight) {
-    NSError *err = [NSError
-        errorWithDomain:@"VanguardCamera"
-                   code:3
-               userInfo:@{NSLocalizedDescriptionKey : @"Native photo capture already in progress"}];
+    NSError *err =
+        [NSError errorWithDomain:@"VanguardCamera"
+                            code:3
+                        userInfo:@{
+                          NSLocalizedDescriptionKey :
+                              @"Native photo capture already in progress"
+                        }];
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil, err);
     });
@@ -2173,17 +2266,18 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     // existing extension is replaced with .heic.
     NSURL *heicURL = [[[url URLByDeletingPathExtension]
         URLByAppendingPathExtension:@"heic"] absoluteURL];
-    _nativePhotoURL = heicURL; // Update before capture fires (delegate reads this).
+    _nativePhotoURL =
+        heicURL; // Update before capture fires (delegate reads this).
   } else {
     // HEVC unavailable (older device or simulator): preserve Phase 10-E.1 JPEG.
-    settings = [AVCapturePhotoSettings photoSettingsWithFormat:@{
-      AVVideoCodecKey : AVVideoCodecTypeJPEG
-    }];
+    settings = [AVCapturePhotoSettings
+        photoSettingsWithFormat:@{AVVideoCodecKey : AVVideoCodecTypeJPEG}];
   }
 
   // ── High-resolution per-request opt-in (Phase 10-E.1, preserved) ──────────
   // iOS 16+: request the same maxPhotoDimensions set on the output object.
-  //          The dimensions must match or be smaller than _photoOutput.maxPhotoDimensions.
+  //          The dimensions must match or be smaller than
+  //          _photoOutput.maxPhotoDimensions.
   // iOS 14–15: set the deprecated highResolutionPhotoEnabled flag on settings.
   if (@available(iOS 16.0, *)) {
     CMVideoDimensions outputMax = _photoOutput.maxPhotoDimensions;
@@ -2207,15 +2301,18 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 - (void)captureOutput:(AVCapturePhotoOutput *)output
     didFinishProcessingPhoto:(AVCapturePhoto *)photo
                        error:(NSError *)error {
-  // ── Capture completion — dispatch all state mutations to main thread ────────
-  // AVFoundation calls this on an internal serial queue. We dispatch to main
-  // so _nativePhotoURL / _nativePhotoCompletion / _nativeCaptureInFlight are
-  // only ever read/written on the main thread, matching takeNativePhotoToURL:.
+  // ── Capture completion — dispatch all state mutations to main thread
+  // ──────── AVFoundation calls this on an internal serial queue. We dispatch
+  // to main so _nativePhotoURL / _nativePhotoCompletion /
+  // _nativeCaptureInFlight are only ever read/written on the main thread,
+  // matching takeNativePhotoToURL:.
   dispatch_async(dispatch_get_main_queue(), ^{
     NSURL *targetURL = self->_nativePhotoURL;
-    void (^completion)(NSURL *_Nullable, NSError *_Nullable) = self->_nativePhotoCompletion;
+    void (^completion)(NSURL *_Nullable, NSError *_Nullable) =
+        self->_nativePhotoCompletion;
 
-    // Clear pending state before calling completion (prevents re-entrant issues).
+    // Clear pending state before calling completion (prevents re-entrant
+    // issues).
     self->_nativePhotoURL = nil;
     self->_nativePhotoCompletion = nil;
     self->_nativeCaptureInFlight = NO;
@@ -2226,9 +2323,12 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
       NSError *mappedErr = [NSError
           errorWithDomain:@"VanguardCamera"
                      code:2
-                 userInfo:@{NSLocalizedDescriptionKey :
-                                error.localizedDescription ?: @"AVCapturePhotoOutput error"}];
-      if (completion) completion(nil, mappedErr);
+                 userInfo:@{
+                   NSLocalizedDescriptionKey : error.localizedDescription
+                       ?: @"AVCapturePhotoOutput error"
+                 }];
+      if (completion)
+        completion(nil, mappedErr);
       return;
     }
 
@@ -2236,11 +2336,15 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     NSData *jpegData = [photo fileDataRepresentation];
     if (!jpegData) {
       NSLog(@"[VanguardCamera] fileDataRepresentation returned nil");
-      NSError *encErr = [NSError
-          errorWithDomain:@"VanguardCamera"
-                     code:1
-                 userInfo:@{NSLocalizedDescriptionKey : @"fileDataRepresentation returned nil"}];
-      if (completion) completion(nil, encErr);
+      NSError *encErr =
+          [NSError errorWithDomain:@"VanguardCamera"
+                              code:1
+                          userInfo:@{
+                            NSLocalizedDescriptionKey :
+                                @"fileDataRepresentation returned nil"
+                          }];
+      if (completion)
+        completion(nil, encErr);
       return;
     }
 
@@ -2251,7 +2355,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
       NSLog(@"[VanguardCamera] write failed: %@", writeErr);
     }
 
-    if (completion) completion(writeErr ? nil : targetURL, writeErr);
+    if (completion)
+      completion(writeErr ? nil : targetURL, writeErr);
   });
 }
 
@@ -2362,7 +2467,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   // Mirror the video connection contract so the photo output always matches the
   // preview orientation. Orientation is also set at capture time (in
   // takeNativePhotoToURL:) for correctness; setting it here ensures the
-  // connection is ready and consistent with _applyConnectionOrientationContract.
+  // connection is ready and consistent with
+  // _applyConnectionOrientationContract.
   if (_photoOutput) {
     AVCaptureConnection *photoConn =
         [_photoOutput connectionWithMediaType:AVMediaTypeVideo];
@@ -2371,7 +2477,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
         if (_previewOrientationLocked) {
           photoConn.videoOrientation = AVCaptureVideoOrientationPortrait;
         } else {
-          // Derive orientation from the video connection we just computed above.
+          // Derive orientation from the video connection we just computed
+          // above.
           if (vidConn.isVideoOrientationSupported) {
             photoConn.videoOrientation = vidConn.videoOrientation;
           }

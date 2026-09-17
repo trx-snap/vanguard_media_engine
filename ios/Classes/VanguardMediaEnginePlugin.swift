@@ -208,6 +208,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // (not lazy) is sufficient.
     private let greenScreenExportMethodHandler = VGGreenScreenExportMethodHandler()
 
+    // ── Generic live green-screen dispatch handler ─────────────────────────────
+    // Owns the four live green-screen routes (start / updateBackground /
+    // updateTransform / stop). Plugin is a thin router only — session, camera,
+    // segmentation, and render-loop logic live in
+    // VGLiveGreenScreenSessionCoordinator. Lazy so `registrar` is available at
+    // first use; the created flag lets detachFromEngine skip instantiating the
+    // handler just to dispose it.
+    private var _liveGreenScreenMethodHandlerCreated = false
+    private lazy var liveGreenScreenMethodHandler: VGLiveGreenScreenMethodHandler = {
+        _liveGreenScreenMethodHandlerCreated = true
+        return VGLiveGreenScreenMethodHandler(
+            textureRegistry: self.registrar.textures(),
+            onLiveGreenScreenEvent: { [weak self] payload in
+                DispatchQueue.main.async {
+                    self?.channel?.invokeMethod("onLiveGreenScreenEvent", arguments: payload)
+                }
+            })
+    }()
+
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setFilterChain` route. Plugin provides composition wiring only.
@@ -647,6 +666,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             duetMethodHandler.disposeAll()
         }
         greenScreenExportMethodHandler.disposeAll()
+        // Generic live green-screen: release the active live session (render loop,
+        // segmentation, camera, texture). Guarded so the lazy handler is not
+        // force-initialised just to dispose it.
+        if _liveGreenScreenMethodHandlerCreated {
+            liveGreenScreenMethodHandler.disposeAll()
+        }
     }
 
     // Phase 7 Stage 7.5C: shared compositor init + runtime prepare helper.
@@ -1952,6 +1977,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // Owned by VGGreenScreenExportMethodHandler. Plugin is a thin router only.
         if VGGreenScreenExportMethodHandler.ownsMethod(call.method) {
             greenScreenExportMethodHandler.handle(method: call.method, args: args, result: result)
+            return
+        }
+
+        // ── Generic live green-screen dispatch ─────────────────────────────────
+        // Owned by VGLiveGreenScreenMethodHandler. Plugin is a thin router only.
+        if VGLiveGreenScreenMethodHandler.ownsMethod(call.method) {
+            liveGreenScreenMethodHandler.handle(method: call.method, args: args, result: result)
             return
         }
 

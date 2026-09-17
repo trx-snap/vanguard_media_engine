@@ -18,6 +18,45 @@
 //   flips Y and snaps edges to whole pixels, so geometry intent is preserved to
 //   within 1 px.
 //
+// Production green-screen mask refinement pipeline:
+// The aspect-filled L8 mask is refined at output (canvas) scale before CIBlendWithMask:
+//   morphology close -> feather -> trimap -> guided edge preserve -> CIBlendWithMask
+//
+// Refinement stages:
+//   1. applyGreenScreenMorphologyClose — morphological close (CIMorphologyMaximum dilate,
+//      then CIMorphologyMinimum erode, radius 1.0; r1b). Clamped to extent before dilate,
+//      cropped to a finite radius-padded rect before erode to ensure bounded input and
+//      prevent EXC_BAD_ACCESS, filling pinholes and stair-step bites before blur.
+//   2. featherGreenScreenMask — CIGaussianBlur at feather radius 2.25 px softens the mask.
+//   3. applyGreenScreenTrimap — remaps blurred mask luminance via smoothstep(0.18, 0.82, m)
+//      to establish definite foreground/background regions with a narrow transition band.
+//   4. applyGreenScreenGuidedEdgePreserve — restores the pre-trimap feathered mask wherever
+//      the camera frame has strong edges (CIEdges intensity 2.0, blur 1.0, smoothstep
+//      0.06/0.30), preserving fine detail (hair, fingers) while keeping flat regions clean.
+//   5. CIBlendWithMask — composites aspect-filled camera frame over canvas background using
+//      the refined mask.
+//
+// Fail-open behavior:
+// Each refinement stage is fail-open to its input: if a required CoreImage filter is
+// unavailable or inputs are degenerate, the stage is skipped and the previous stage's
+// output is used unchanged, so the worst case is the raw unmodified mask. CIBlendWithMask
+// is never skipped due to refinement failure; only if CIBlendWithMask itself is unavailable
+// does composition fall back to opaque camera overlay.
+//
+// Production stack & physical proof summary:
+// Accepted iOS production stack: Vision Fast default + compositor refinement
+// (morphology close r1b radius 1.0, feather 2.25, trimap 0.18/0.82, guided edge
+// constants 2.0/1.0/0.06/0.30).
+// Physical proof: iPhone_Fanif, IOS_LIVE_GREENSCREEN_PUBLIC_API_PHYSICAL_PASS,
+// avgTotalMs ≈ 15.61 ms, degradedEventCount 0.
+//
+// Deterministic pixel proof note:
+// The in-file deterministic pixel proof (runDeterministicPixelProof, reached via
+// VGDuetMethodHandler) was authored for linear blending. Because mask refinement is
+// nonlinear (specifically, trimap smoothstep remaps mask byte 64 [~0.251] to ~0.034,
+// which trips fractionalBlendMathOk), deterministic pixel proof must be rebaselined
+// separately if used with the production refinement pipeline active.
+//
 // Threading: composite() is expected to be called from a single serial queue
 // (the render loop's render queue).  The CIContext and pool are immutable
 // after init and are themselves thread-safe.
@@ -70,6 +109,44 @@ final class VGDuetPreviewCompositor {
     /// screen / degenerate layouts).  Keeps the source visible instead of
     /// occluding it with an opaque placeholder.
     private static let overlayAlpha: CGFloat = 0.28
+
+    /// Production mask refinement: morphological close (CIMorphologyMaximum dilate then
+    /// CIMorphologyMinimum erode, radius 1.0; r1b) applied before feathering to fill tiny
+    /// stair-step bites and pinholes in the raw matte.
+    /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints
+    /// maskMorphologyCloseEnabled / maskMorphologyCloseApplied /
+    /// maskMorphologyCloseRadius.
+    private static let greenScreenMaskMorphologyCloseEnabled: Bool = true
+    private static let greenScreenMaskMorphologyCloseRadius: CGFloat = 1.0
+
+    /// Production mask refinement: feather radius, in canvas pixels, applied as a
+    /// CIGaussianBlur `inputRadius` to soften the closed mask at output scale before
+    /// CIBlendWithMask (production constant: 2.25 px).
+    /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints this value as
+    /// maskFeatherRadius.
+    private static let greenScreenMaskFeatherRadius: CGFloat = 2.25
+
+    /// Production mask refinement: trimap / alpha-curve pass remapping mask luminance m
+    /// through smoothstep(greenScreenTrimapLow, greenScreenTrimapHigh, m) to produce
+    /// solid foreground/background bands with a narrow soft edge (production constants: 0.18 / 0.82).
+    /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints
+    /// maskTrimapEnabled / maskTrimapApplied / maskTrimapLow / maskTrimapHigh.
+    private static let greenScreenTrimapEnabled: Bool = true
+    private static let greenScreenTrimapLow:  CGFloat = 0.18
+    private static let greenScreenTrimapHigh: CGFloat = 0.82
+
+    /// Production mask refinement: guided-edge-preservation pass restoring the
+    /// pre-trimap feathered mask wherever the camera frame has strong edges
+    /// (production constants: intensity 2.0, blur radius 1.0, smoothstep 0.06/0.30),
+    /// preserving thin detail (hair, fingers) while keeping flat regions cleanly keyed.
+    /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints maskGuidedEdgeEnabled /
+    /// maskGuidedEdgeApplied / maskGuidedEdgeIntensity / maskGuidedEdgeBlurRadius /
+    /// maskGuidedEdgeLow / maskGuidedEdgeHigh.
+    private static let greenScreenGuidedEdgeEnabled: Bool = true
+    private static let greenScreenGuidedEdgeIntensity: CGFloat = 2.0
+    private static let greenScreenGuidedEdgeBlurRadius: CGFloat = 1.0
+    private static let greenScreenGuidedEdgeLow: CGFloat = 0.06
+    private static let greenScreenGuidedEdgeHigh: CGFloat = 0.30
 
     /// One-time diagnostic marker: set to true after the first successful
     /// CIBlendWithMask composite.  Guards against log spam on every frame.
@@ -144,13 +221,22 @@ final class VGDuetPreviewCompositor {
                 //   background = current composed source canvas (image)
                 //   mask       = aspect-filled segmentation mask into cameraRect
                 // The filter replaces pixels where mask ~= 255 (subject) with the foreground.
-                // Falls through to the opaque-overlay path if the filter is unavailable.
+                // The mapped mask is refined at output scale first (see
+                // refineGreenScreenMask: morphology close, then 2.25 px feather,
+                // then trimap smoothstep, then camera-guided edge preservation);
+                // a failed morphology close falls back to the raw mask, a failed
+                // feather falls back to the (possibly closed) unblurred mask, a
+                // failed trimap falls back to the blurred mask, and a failed
+                // guided-edge pass falls back to the trimapped mask — never to
+                // the camera overlay.
+                // Falls through to the opaque-overlay path if the blend filter is unavailable.
                 let camFilled  = aspectFill(CIImage(cvPixelBuffer: camFrame),   into: ciCamera)
                 let maskFilled = aspectFill(CIImage(cvPixelBuffer: maskBuffer), into: ciCamera)
+                let refined    = refineGreenScreenMask(maskFilled, in: ciCamera, guidedBy: camFilled)
                 let params: [String: Any] = [
                     "inputBackgroundImage": image,
                     "inputImage":           camFilled,
-                    "inputMaskImage":       maskFilled,
+                    "inputMaskImage":       refined.mask,
                 ]
                 if let blended = CIFilter(name: "CIBlendWithMask", parameters: params)?.outputImage {
                     image = blended.cropped(to: bounds)
@@ -158,7 +244,7 @@ final class VGDuetPreviewCompositor {
                     // Grep marker: IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST
                     if !_hasLoggedFirstMaskBlend {
                         _hasLoggedFirstMaskBlend = true
-                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame")
+                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame maskFeatherRadius=\(VGDuetPreviewCompositor.greenScreenMaskFeatherRadius) maskFeatherApplied=\(refined.featherApplied) maskTrimapEnabled=\(VGDuetPreviewCompositor.greenScreenTrimapEnabled) maskTrimapApplied=\(refined.trimapApplied) maskTrimapLow=\(VGDuetPreviewCompositor.greenScreenTrimapLow) maskTrimapHigh=\(VGDuetPreviewCompositor.greenScreenTrimapHigh) maskGuidedEdgeEnabled=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeEnabled) maskGuidedEdgeApplied=\(refined.guidedApplied) maskGuidedEdgeIntensity=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeIntensity) maskGuidedEdgeBlurRadius=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeBlurRadius) maskGuidedEdgeLow=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeLow) maskGuidedEdgeHigh=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeHigh) maskMorphologyCloseEnabled=\(VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseEnabled) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskMorphologyCloseRadius=\(VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseRadius)")
                     }
                 } else {
                     // Filter unavailable (should not happen on supported iOS): fall back to
@@ -211,6 +297,247 @@ final class VGDuetPreviewCompositor {
         let ty = rect.minY + (rect.height - scaledH) / 2 - extent.minY * scale
         let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
         return image.transformed(by: transform).cropped(to: rect)
+    }
+
+    /// Refines an already aspect-filled green-screen mask at output scale in four
+    /// fail-open stages:
+    ///   1. applyGreenScreenMorphologyClose — morphology close r1b fills pinholes / bites.
+    ///   2. featherGreenScreenMask — gaussian blur softens edges.
+    ///   3. applyGreenScreenTrimap — smoothstep curve separates foreground/background.
+    ///   4. applyGreenScreenGuidedEdgePreserve — restores fine edges from camera guide.
+    ///
+    /// - Parameter guide: aspect-filled camera frame used as an edge guide for stage 4;
+    ///   never composited into the returned mask directly.
+    /// - Returns: refined mask plus per-stage applied flags. Each stage fails open to
+    ///   its input if filter creation fails or inputs are degenerate.
+    private func refineGreenScreenMask(_ mask: CIImage, in rect: CGRect, guidedBy guide: CIImage)
+        -> (mask: CIImage, morphologyCloseApplied: Bool, featherApplied: Bool, trimapApplied: Bool, guidedApplied: Bool) {
+        let closed = applyGreenScreenMorphologyClose(mask, in: rect)
+        let feathered = featherGreenScreenMask(closed.mask, in: rect)
+        let trimapped = applyGreenScreenTrimap(feathered.mask, in: rect)
+        let guided = applyGreenScreenGuidedEdgePreserve(trimapped: trimapped.mask,
+                                                          feathered: feathered.mask,
+                                                          guide: guide,
+                                                          in: rect)
+        return (guided.mask, closed.applied, feathered.applied, trimapped.applied, guided.applied)
+    }
+
+    /// Morphological close: CIMorphologyMaximum (dilate) then CIMorphologyMinimum (erode),
+    /// each with inputRadius = greenScreenMaskMorphologyCloseRadius (1.0 px; r1b).
+    /// Clamped to extent before dilate, then cropped to a finite radius-padded rect before
+    /// erode to ensure bounded input and prevent EXC_BAD_ACCESS, then cropped back to `rect`.
+    /// Fails open to input mask if disabled, empty, or filters are unavailable.
+    ///
+    /// - Returns: the closed mask and `applied == true`, or the input mask
+    ///   unchanged and `applied == false`.
+    private func applyGreenScreenMorphologyClose(_ mask: CIImage, in rect: CGRect) -> (mask: CIImage, applied: Bool) {
+        guard VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseEnabled else { return (mask, false) }
+        let radius = VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseRadius
+        guard radius > 0, !rect.isEmpty, !mask.extent.isEmpty else { return (mask, false) }
+
+        let clamped = mask.clampedToExtent()
+
+        let maxParams: [String: Any] = [
+            "inputImage":  clamped,
+            "inputRadius": radius,
+        ]
+        guard let dilated = CIFilter(name: "CIMorphologyMaximum", parameters: maxParams)?.outputImage else {
+            return (mask, false)
+        }
+
+        // r1b: `dilated` still carries the infinite extent inherited from
+        // `clamped`. Feeding that straight into a second morphology filter
+        // crashed with EXC_BAD_ACCESS on-device, so crop to a finite rect —
+        // padded by the radius on each side so the erode below still has
+        // valid samples out to its own reach — before the erode pass.
+        // `boundedDilated` is used as-is (not re-clamped) since
+        // clampedToExtent() would reintroduce an infinite-extent image and
+        // recreate the exact crash condition this works around.
+        let pad = max(radius * 2, 2)
+        let workingRect = rect.insetBy(dx: -pad, dy: -pad)
+        let boundedDilated = dilated.cropped(to: workingRect)
+
+        let minParams: [String: Any] = [
+            "inputImage":  boundedDilated,
+            "inputRadius": radius,
+        ]
+        guard let eroded = CIFilter(name: "CIMorphologyMinimum", parameters: minParams)?.outputImage else {
+            return (mask, false)
+        }
+
+        return (eroded.cropped(to: rect), true)
+    }
+
+    /// Softens the mask with CIGaussianBlur at greenScreenMaskFeatherRadius (2.25 px).
+    /// Clamped to extent before blur and cropped back to `rect` to prevent edge darkening.
+    /// Fails open to input mask if radius <= 0, empty, or blur filter is unavailable.
+    ///
+    /// - Returns: the feathered mask and `applied == true`, or the input mask
+    ///   unchanged and `applied == false`.
+    private func featherGreenScreenMask(_ mask: CIImage, in rect: CGRect) -> (mask: CIImage, applied: Bool) {
+        let radius = VGDuetPreviewCompositor.greenScreenMaskFeatherRadius
+        guard radius > 0, !rect.isEmpty, !mask.extent.isEmpty else { return (mask, false) }
+        let params: [String: Any] = [
+            "inputImage":  mask.clampedToExtent(),
+            "inputRadius": radius,
+        ]
+        guard let blurred = CIFilter(name: "CIGaussianBlur", parameters: params)?.outputImage else {
+            return (mask, false)
+        }
+        return (blurred.cropped(to: rect), true)
+    }
+
+    /// Remaps mask luminance m through smoothstep(low, high, m) with constants [0.18, 0.82].
+    /// Values <= low become solid background, values >= high become solid foreground,
+    /// and the narrow band in between stays soft.
+    ///
+    /// Implemented as a CoreImage GPU pipeline fusing CIColorMatrix, CIColorClamp,
+    /// and CIColorPolynomial into a per-pixel program, cropped back to `rect`.
+    /// Fails open to input mask if disabled, degenerate, empty, or filters are unavailable.
+    ///
+    /// - Returns: the remapped mask and `applied == true`, or the input mask
+    ///   unchanged and `applied == false`.
+    private func applyGreenScreenTrimap(_ mask: CIImage, in rect: CGRect) -> (mask: CIImage, applied: Bool) {
+        guard VGDuetPreviewCompositor.greenScreenTrimapEnabled else { return (mask, false) }
+        let low  = VGDuetPreviewCompositor.greenScreenTrimapLow
+        let high = VGDuetPreviewCompositor.greenScreenTrimapHigh
+        guard high > low, !rect.isEmpty, !mask.extent.isEmpty else { return (mask, false) }
+
+        // 1. Linear ramp: t = (m - low) / (high - low), applied to R, G, B; alpha untouched.
+        let scale = 1 / (high - low)
+        let bias  = -low * scale
+        let rampParams: [String: Any] = [
+            "inputImage":      mask,
+            "inputRVector":    CIVector(x: scale, y: 0,     z: 0,     w: 0),
+            "inputGVector":    CIVector(x: 0,     y: scale, z: 0,     w: 0),
+            "inputBVector":    CIVector(x: 0,     y: 0,     z: scale, w: 0),
+            "inputAVector":    CIVector(x: 0,     y: 0,     z: 0,     w: 1),
+            "inputBiasVector": CIVector(x: bias,  y: bias,  z: bias,  w: 0),
+        ]
+        guard let ramped = CIFilter(name: "CIColorMatrix", parameters: rampParams)?.outputImage else {
+            return (mask, false)
+        }
+
+        // 2. Clamp t to [0, 1] so the polynomial below only ever sees the smoothstep domain.
+        let clampParams: [String: Any] = [
+            "inputImage":         ramped,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]
+        guard let clamped = CIFilter(name: "CIColorClamp", parameters: clampParams)?.outputImage else {
+            return (mask, false)
+        }
+
+        // 3. Smoothstep curve: s = 0 + 0·t + 3·t² − 2·t³ (per R, G, B); alpha = identity.
+        let smoothstep = CIVector(x: 0, y: 0, z: 3, w: -2)
+        let curveParams: [String: Any] = [
+            "inputImage":             clamped,
+            "inputRedCoefficients":   smoothstep,
+            "inputGreenCoefficients": smoothstep,
+            "inputBlueCoefficients":  smoothstep,
+            "inputAlphaCoefficients": CIVector(x: 0, y: 1, z: 0, w: 0),
+        ]
+        guard let curved = CIFilter(name: "CIColorPolynomial", parameters: curveParams)?.outputImage else {
+            return (mask, false)
+        }
+        return (curved.cropped(to: rect), true)
+    }
+
+    /// Restores the pre-trimap `feathered` mask over the `trimapped` mask wherever
+    /// the camera frame (`guide`) has a strong edge, preserving thin subject detail
+    /// (hair, fingers) while flat regions keep the trimapped mask.
+    ///
+    /// Guided edge constants: intensity 2.0, blur radius 1.0, smoothstep [0.06, 0.30].
+    /// Edge confidence is derived from `guide` alone via CIEdges -> CIGaussianBlur ->
+    /// smoothstep normalized confidence mask -> CIBlendWithMask.
+    /// Fails open to `trimapped` mask if disabled, degenerate, empty, or filters are unavailable.
+    ///
+    /// - Returns: the guided-edge-preserved mask and `applied == true`, or
+    ///   `trimapped` unchanged and `applied == false`.
+    private func applyGreenScreenGuidedEdgePreserve(trimapped: CIImage,
+                                                      feathered: CIImage,
+                                                      guide: CIImage,
+                                                      in rect: CGRect) -> (mask: CIImage, applied: Bool) {
+        guard VGDuetPreviewCompositor.greenScreenGuidedEdgeEnabled else { return (trimapped, false) }
+        let low  = VGDuetPreviewCompositor.greenScreenGuidedEdgeLow
+        let high = VGDuetPreviewCompositor.greenScreenGuidedEdgeHigh
+        guard high > low, !rect.isEmpty, !trimapped.extent.isEmpty,
+              !feathered.extent.isEmpty, !guide.extent.isEmpty else {
+            return (trimapped, false)
+        }
+
+        // 1. Crop the guide (camera frame) to the foreground rect.
+        let croppedGuide = guide.cropped(to: rect)
+
+        // 2. Edge detection on the camera frame itself.
+        let edgesParams: [String: Any] = [
+            "inputImage":     croppedGuide,
+            "inputIntensity": VGDuetPreviewCompositor.greenScreenGuidedEdgeIntensity,
+        ]
+        guard let edges = CIFilter(name: "CIEdges", parameters: edgesParams)?.outputImage else {
+            return (trimapped, false)
+        }
+
+        // 3. Small blur so isolated edge pixels become a soft confidence band
+        //    instead of a 1-pixel-wide mask.
+        let blurParams: [String: Any] = [
+            "inputImage":  edges.clampedToExtent(),
+            "inputRadius": VGDuetPreviewCompositor.greenScreenGuidedEdgeBlurRadius,
+        ]
+        guard let blurredEdges = CIFilter(name: "CIGaussianBlur", parameters: blurParams)?.outputImage else {
+            return (trimapped, false)
+        }
+
+        // 4a. Linear ramp: t = (m - low) / (high - low), applied to R, G, B; alpha untouched.
+        let scale = 1 / (high - low)
+        let bias  = -low * scale
+        let rampParams: [String: Any] = [
+            "inputImage":      blurredEdges,
+            "inputRVector":    CIVector(x: scale, y: 0,     z: 0,     w: 0),
+            "inputGVector":    CIVector(x: 0,     y: scale, z: 0,     w: 0),
+            "inputBVector":    CIVector(x: 0,     y: 0,     z: scale, w: 0),
+            "inputAVector":    CIVector(x: 0,     y: 0,     z: 0,     w: 1),
+            "inputBiasVector": CIVector(x: bias,  y: bias,  z: bias,  w: 0),
+        ]
+        guard let ramped = CIFilter(name: "CIColorMatrix", parameters: rampParams)?.outputImage else {
+            return (trimapped, false)
+        }
+
+        // 4b. Clamp t to [0, 1] so the polynomial below only ever sees the smoothstep domain.
+        let clampParams: [String: Any] = [
+            "inputImage":         ramped,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]
+        guard let clamped = CIFilter(name: "CIColorClamp", parameters: clampParams)?.outputImage else {
+            return (trimapped, false)
+        }
+
+        // 4c. Smoothstep curve: s = 0 + 0·t + 3·t² − 2·t³ (per R, G, B); alpha = identity.
+        let smoothstep = CIVector(x: 0, y: 0, z: 3, w: -2)
+        let curveParams: [String: Any] = [
+            "inputImage":             clamped,
+            "inputRedCoefficients":   smoothstep,
+            "inputGreenCoefficients": smoothstep,
+            "inputBlueCoefficients":  smoothstep,
+            "inputAlphaCoefficients": CIVector(x: 0, y: 1, z: 0, w: 0),
+        ]
+        guard let curved = CIFilter(name: "CIColorPolynomial", parameters: curveParams)?.outputImage else {
+            return (trimapped, false)
+        }
+        // 5. Crop back to `rect`.
+        let edgeConfidence = curved.cropped(to: rect)
+
+        // Composite: feathered where the camera has a strong edge, trimapped elsewhere.
+        let blendParams: [String: Any] = [
+            "inputImage":           feathered,
+            "inputBackgroundImage": trimapped,
+            "inputMaskImage":       edgeConfidence,
+        ]
+        guard let blended = CIFilter(name: "CIBlendWithMask", parameters: blendParams)?.outputImage else {
+            return (trimapped, false)
+        }
+        return (blended.cropped(to: rect), true)
     }
 
     /// Deterministic camera placeholder: slate fill, 2 px lighter edge, soft

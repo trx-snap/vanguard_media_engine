@@ -13,6 +13,14 @@
 //   snapshotRetained() retains the slot under lock and returns an Unmanaged value; the caller
 //   MUST balance with .release() or takeRetainedValue().
 //
+// PTS-pairing history:
+//   Besides the latest-frame slot, the source keeps a short ring of the most recent frames
+//   (historyCapacity = 8, ~0.27 s at 30 fps), each holding its OWN +1 retain plus the frame's
+//   presentation timestamp. snapshotRetained(near:maxDeltaSeconds:) lets the render loop
+//   pull the camera frame closest to a segmentation mask's source PTS instead of the newest
+//   frame, so the keyed foreground and the mask describe the same instant (no motion voids).
+//   History entries are released when evicted (oldest first, outside the lock) or in stop().
+//
 // Frame observer seam:
 //   setFrameObserver installs an optional observer invoked synchronously on the capture queue
 //   for every delivered frame, OUTSIDE the lock, BEFORE the callback-owned retain is released.
@@ -36,11 +44,25 @@ final class VGDuetCameraSource {
 
     // MARK: - Private state
 
-    /// Guards _latestBuffer, _running, and _frameObserver from concurrent callback vs. stop().
+    /// Guards _latestBuffer, _history, _running, and _frameObserver from concurrent
+    /// callback vs. stop() / snapshot reads.
     private var _lock = os_unfair_lock_s()
 
     /// The most recently arrived camera frame. Retained by us; released on swap or stop.
     private var _latestBuffer: CVPixelBuffer?
+
+    /// Maximum number of recent frames kept for PTS pairing (see file header).
+    private static let historyCapacity = 8
+
+    /// One PTS-pairing history entry. `buffer` carries its own +1 retain, independent
+    /// of the _latestBuffer slot retain, released on eviction or stop().
+    private struct HistoryEntry {
+        let buffer: CVPixelBuffer
+        let pts: CMTime
+    }
+
+    /// Recent frames, oldest first, at most `historyCapacity` entries. Guarded by _lock.
+    private var _history: [HistoryEntry] = []
 
     /// True after start() and before stop(). Guarded by _lock for the callback path;
     /// only mutated on the main thread by start/stop callers.
@@ -49,19 +71,47 @@ final class VGDuetCameraSource {
     /// The underlying camera source. Nilled out in stop().
     private var _source: VanguardCameraMediaSource?
 
+    /// Ordered AVCaptureSession presets (rawValues, e.g.
+    /// AVCaptureSession.Preset.iFrame960x540.rawValue) requested by the caller.
+    /// The first preset the session supports wins. Empty preserves the existing
+    /// default (1080p-first) camera behavior.
+    private let _sessionPresets: [String]
+
     /// Optional observer invoked on the capture queue for every delivered frame.
     /// Snapshotted under _lock but called outside it. Cleared in stop().
     private var _frameObserver: ((_ pixelBuffer: CVPixelBuffer, _ pts: CMTime) -> Void)?
 
     // MARK: - Init / deinit
 
-    init() {}
+    /// - Parameter sessionPreset: an AVCaptureSession.Preset rawValue (e.g.
+    ///   AVCaptureSession.Preset.hd1280x720.rawValue) to request a specific
+    ///   capture resolution. Nil (the default) preserves the existing
+    ///   1080p-first camera behavior. Equivalent to `init(sessionPresets:)`
+    ///   with a one-element list.
+    init(sessionPreset: String? = nil) {
+        _sessionPresets = sessionPreset.map { [$0] } ?? []
+    }
+
+    /// - Parameter sessionPresets: ordered AVCaptureSession.Preset rawValues to
+    ///   try in turn; the first one the session supports is applied (e.g.
+    ///   [iFrame960x540, hd1280x720]). When none is supported — or the list is
+    ///   empty — the source uses its existing 1080p-first default.
+    init(sessionPresets: [String]) {
+        _sessionPresets = sessionPresets
+    }
 
     deinit {
         stop()
     }
 
     // MARK: - Public API (main thread)
+
+    /// The AVCaptureSession preset actually applied by the underlying source
+    /// (the first supported requested preset, or the 1080p/720p default).
+    /// Nil before start() and after stop(). Diagnostic read; main thread.
+    var selectedSessionPreset: String? {
+        return _source?.selectedSessionPreset
+    }
 
     /// Install (or replace) a frame observer.  The observer is called synchronously on
     /// the AVFoundation capture queue for every delivered frame, outside _lock, before the
@@ -79,7 +129,14 @@ final class VGDuetCameraSource {
     func start() {
         guard !_running else { return }
 
-        let source = VanguardCameraMediaSource(position: .front, frameRate: 30)
+        let source: VanguardCameraMediaSource
+        if !_sessionPresets.isEmpty {
+            source = VanguardCameraMediaSource(position: .front,
+                                               frameRate: 30,
+                                               preferredSessionPresets: _sessionPresets)
+        } else {
+            source = VanguardCameraMediaSource(position: .front, frameRate: 30)
+        }
 
         // Portrait lock before start, matching the ordering in VanguardMediaEnginePlugin.swift.
         source.lockPreviewOrientationToPortrait()
@@ -106,7 +163,8 @@ final class VGDuetCameraSource {
     }
 
     /// Stop the camera. Idempotent — safe to call multiple times.
-    /// Clears the observer and callback first, then stops the source, then drains the latest-frame slot.
+    /// Clears the observer and callback first, then stops the source, then drains the
+    /// latest-frame slot and the PTS-pairing history.
     func stop() {
         guard _running else { return }
 
@@ -126,14 +184,19 @@ final class VGDuetCameraSource {
 
         _source = nil
 
-        // 3. Release the held buffer under lock.
+        // 3. Release the held buffer and the PTS-pairing history under lock.
         os_unfair_lock_lock(&_lock)
         let old = _latestBuffer
         _latestBuffer = nil
+        let history = _history
+        _history.removeAll()
         os_unfair_lock_unlock(&_lock)
 
         if let old = old {
             _releasePB(old)
+        }
+        for entry in history {
+            _releasePB(entry.buffer)
         }
     }
 
@@ -149,6 +212,41 @@ final class VGDuetCameraSource {
         // Manual retain was done above; passUnretained hands the +1 to the caller
         // without an extra ARC retain, matching the documented "retained" contract.
         return Unmanaged.passUnretained(buf)
+    }
+
+    /// Returns a *retained* snapshot of the history frame whose presentation timestamp is
+    /// numerically closest to `pts`, provided |framePTS − pts| <= `maxDeltaSeconds`; nil
+    /// when `pts` is not numeric, the history is empty, or no frame is within the window.
+    /// Same +1 ownership contract as `snapshotRetained()`. Thread-safe.
+    func snapshotRetained(near pts: CMTime, maxDeltaSeconds: Double) -> Unmanaged<CVPixelBuffer>? {
+        return snapshotRetainedWithPTS(near: pts, maxDeltaSeconds: maxDeltaSeconds)?.frame
+    }
+
+    /// Same selection and +1 ownership contract as `snapshotRetained(near:maxDeltaSeconds:)`,
+    /// additionally reporting the matched frame's own presentation timestamp so callers can
+    /// measure the achieved pairing delta (telemetry). Thread-safe.
+    func snapshotRetainedWithPTS(near pts: CMTime,
+                                 maxDeltaSeconds: Double) -> (frame: Unmanaged<CVPixelBuffer>, pts: CMTime)? {
+        guard pts.isNumeric else { return nil }
+        let target = CMTimeGetSeconds(pts)
+
+        os_unfair_lock_lock(&_lock)
+        var best: HistoryEntry? = nil
+        var bestDelta = Double.infinity
+        for entry in _history where entry.pts.isNumeric {
+            let delta = abs(CMTimeGetSeconds(entry.pts) - target)
+            if delta < bestDelta {
+                bestDelta = delta
+                best = entry
+            }
+        }
+        if bestDelta > maxDeltaSeconds { best = nil }
+        if let b = best { _retainPB(b.buffer) }
+        os_unfair_lock_unlock(&_lock)
+
+        guard let match = best else { return nil }
+        // Manual retain was done above; passUnretained hands the +1 to the caller.
+        return (frame: Unmanaged.passUnretained(match.buffer), pts: match.pts)
     }
 
     // MARK: - Private
@@ -179,12 +277,24 @@ final class VGDuetCameraSource {
         _retainPB(pixelBuffer)
         let old = _latestBuffer
         _latestBuffer = pixelBuffer
+        // Retain a third, independent copy for the PTS-pairing history and append it
+        // as the newest entry; evict (collect) the oldest entries beyond capacity.
+        _retainPB(pixelBuffer)
+        _history.append(HistoryEntry(buffer: pixelBuffer, pts: pts))
+        var evicted: [CVPixelBuffer] = []
+        let overflow = _history.count - VGDuetCameraSource.historyCapacity
+        if overflow > 0 {
+            evicted = _history[0..<overflow].map { $0.buffer }
+            _history.removeFirst(overflow)
+        }
         // Snapshot the observer under lock (safe: it's only a closure reference copy).
         let observer = _frameObserver
         os_unfair_lock_unlock(&_lock)
 
-        // Release the previous occupant (outside lock — no contention needed).
+        // Release the previous occupant and any evicted history retains
+        // (outside lock — no contention needed).
         if let old = old { _releasePB(old) }
+        for b in evicted { _releasePB(b) }
 
         // Invoke observer outside lock, before releasing the callback-owned retain.
         // Observer does NOT receive a retain; it submits synchronously.

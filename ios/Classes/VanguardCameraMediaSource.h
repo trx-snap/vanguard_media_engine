@@ -17,12 +17,48 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface VanguardCameraMediaSource : NSObject <VanguardMediaSource>
 
+/// Convenience initialiser. Does NOT start the session.
+/// Position: AVCaptureDevicePositionBack or Front.
+/// fps: target frame rate (30 or 60). Session preset: 1920×1080 first,
+/// falling back to 1280×720 when unsupported.
+/// Equivalent to calling initWithPosition:frameRate:preferredSessionPresets:
+/// with a nil list.
+- (instancetype)initWithPosition:(AVCaptureDevicePosition)position
+                       frameRate:(int)fps;
+
+/// Convenience initialiser. Does NOT start the session.
+/// Position: AVCaptureDevicePositionBack or Front.
+/// fps: target frame rate (30 or 60).
+/// preferredSessionPreset: an AVCaptureSession preset constant (e.g.
+/// AVCaptureSessionPreset1280x720) to request instead of the default
+/// 1080p-first behavior. When nil, or when the session does not support the
+/// requested preset, falls back to the existing behavior: 1920×1080 first,
+/// then 1280×720.
+/// Equivalent to calling initWithPosition:frameRate:preferredSessionPresets:
+/// with a one-element list (or nil when preferredSessionPreset is nil).
+- (instancetype)initWithPosition:(AVCaptureDevicePosition)position
+                       frameRate:(int)fps
+         preferredSessionPreset:(nullable NSString *)preferredSessionPreset;
+
 /// Designated initialiser. Does NOT start the session.
 /// Position: AVCaptureDevicePositionBack or Front.
-/// fps: target frame rate (30 or 60). Session preset always 1920×1080.
+/// fps: target frame rate (30 or 60).
+/// preferredSessionPresets: an ordered list of AVCaptureSession preset
+/// constants (e.g. @[AVCaptureSessionPresetiFrame960x540,
+/// AVCaptureSessionPreset1280x720]). The first entry the session supports is
+/// selected. When nil, empty, or when no entry is supported, falls back to
+/// the existing behavior: 1920×1080 first, then 1280×720.
 - (instancetype)initWithPosition:(AVCaptureDevicePosition)position
-                       frameRate:(int)fps NS_DESIGNATED_INITIALIZER;
+                       frameRate:(int)fps
+        preferredSessionPresets:
+            (nullable NSArray<NSString *> *)preferredSessionPresets
+    NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
+
+/// The AVCaptureSession preset actually applied during session configuration
+/// (the first supported preferred preset, or the 1080p/720p default). Set once
+/// at init; nil only if configuration has not run. Diagnostic read.
+@property(nonatomic, readonly, nullable) NSString *selectedSessionPreset;
 
 // ── VanguardMediaSource (preview path) ───────────────────────────────────────
 // start / stop / seekTo: / setVideoCallback: / setAudioCallback:
