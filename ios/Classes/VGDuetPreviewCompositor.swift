@@ -27,12 +27,12 @@
 //      then CIMorphologyMinimum erode, radius 1.0; r1b). Clamped to extent before dilate,
 //      cropped to a finite radius-padded rect before erode to ensure bounded input and
 //      prevent EXC_BAD_ACCESS, filling pinholes and stair-step bites before blur.
-//   2. featherGreenScreenMask — CIGaussianBlur at feather radius 2.25 px softens the mask.
-//   3. applyGreenScreenTrimap — remaps blurred mask luminance via smoothstep(0.18, 0.82, m)
-//      to establish definite foreground/background regions with a narrow transition band.
+//   2. featherGreenScreenMask — CIGaussianBlur at feather radius 3.0 px softens the mask.
+//   3. applyGreenScreenTrimap — remaps blurred mask luminance via smoothstep(0.14, 0.86, m)
+//      to establish definite foreground/background regions with a widened transition band.
 //   4. applyGreenScreenGuidedEdgePreserve — restores the pre-trimap feathered mask wherever
-//      the camera frame has strong edges (CIEdges intensity 2.0, blur 1.0, smoothstep
-//      0.06/0.30), preserving fine detail (hair, fingers) while keeping flat regions clean.
+//      the camera frame has strong edges (CIEdges intensity 2.0, blur 1.5, smoothstep
+//      0.08/0.34), preserving fine detail (hair, fingers) while keeping flat regions clean.
 //   5. CIBlendWithMask — composites aspect-filled camera frame over canvas background using
 //      the refined mask.
 //
@@ -44,11 +44,13 @@
 // does composition fall back to opaque camera overlay.
 //
 // Production stack & physical proof summary:
-// Accepted iOS production stack: Vision Fast default + compositor refinement
-// (morphology close r1b radius 1.0, feather 2.25, trimap 0.18/0.82, guided edge
-// constants 2.0/1.0/0.06/0.30).
-// Physical proof: iPhone_Fanif, IOS_LIVE_GREENSCREEN_PUBLIC_API_PHYSICAL_PASS,
-// avgTotalMs ≈ 15.61 ms, degradedEventCount 0.
+// iOS live green-screen edge smoothness A/B S1: Vision Fast default + compositor refinement
+// (morphology close r1b radius 1.0, feather 3.0, trimap 0.14/0.86, guided edge
+// constants 2.0/1.5/0.08/0.34).
+// Rationale: S1 widens output-scale anti-aliased alpha transition to reduce visible edge pixelation
+// while preserving the already-proved Vision Fast backend, 512 matte publish geometry,
+// camera aspect/orientation, and morphology r1b crash fix.
+// Physical proof baseline: clean-copy Vision Fast avgTotalMs ≈ 13.9 ms, degradedEventCount 0.
 //
 // Deterministic pixel proof note:
 // The in-file deterministic pixel proof (runDeterministicPixelProof, reached via
@@ -121,32 +123,32 @@ final class VGDuetPreviewCompositor {
 
     /// Production mask refinement: feather radius, in canvas pixels, applied as a
     /// CIGaussianBlur `inputRadius` to soften the closed mask at output scale before
-    /// CIBlendWithMask (production constant: 2.25 px).
+    /// CIBlendWithMask (production constant: 3.0 px, S1 edge smoothness A/B).
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints this value as
     /// maskFeatherRadius.
-    private static let greenScreenMaskFeatherRadius: CGFloat = 2.25
+    private static let greenScreenMaskFeatherRadius: CGFloat = 3.0
 
     /// Production mask refinement: trimap / alpha-curve pass remapping mask luminance m
     /// through smoothstep(greenScreenTrimapLow, greenScreenTrimapHigh, m) to produce
-    /// solid foreground/background bands with a narrow soft edge (production constants: 0.18 / 0.82).
+    /// solid foreground/background bands with a widened soft edge (production constants: 0.14 / 0.86, S1).
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints
     /// maskTrimapEnabled / maskTrimapApplied / maskTrimapLow / maskTrimapHigh.
     private static let greenScreenTrimapEnabled: Bool = true
-    private static let greenScreenTrimapLow:  CGFloat = 0.18
-    private static let greenScreenTrimapHigh: CGFloat = 0.82
+    private static let greenScreenTrimapLow:  CGFloat = 0.14
+    private static let greenScreenTrimapHigh: CGFloat = 0.86
 
     /// Production mask refinement: guided-edge-preservation pass restoring the
     /// pre-trimap feathered mask wherever the camera frame has strong edges
-    /// (production constants: intensity 2.0, blur radius 1.0, smoothstep 0.06/0.30),
+    /// (production constants: intensity 2.0, blur radius 1.5, smoothstep 0.08/0.34, S1),
     /// preserving thin detail (hair, fingers) while keeping flat regions cleanly keyed.
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints maskGuidedEdgeEnabled /
     /// maskGuidedEdgeApplied / maskGuidedEdgeIntensity / maskGuidedEdgeBlurRadius /
     /// maskGuidedEdgeLow / maskGuidedEdgeHigh.
     private static let greenScreenGuidedEdgeEnabled: Bool = true
     private static let greenScreenGuidedEdgeIntensity: CGFloat = 2.0
-    private static let greenScreenGuidedEdgeBlurRadius: CGFloat = 1.0
-    private static let greenScreenGuidedEdgeLow: CGFloat = 0.06
-    private static let greenScreenGuidedEdgeHigh: CGFloat = 0.30
+    private static let greenScreenGuidedEdgeBlurRadius: CGFloat = 1.5
+    private static let greenScreenGuidedEdgeLow: CGFloat = 0.08
+    private static let greenScreenGuidedEdgeHigh: CGFloat = 0.34
 
     /// One-time diagnostic marker: set to true after the first successful
     /// CIBlendWithMask composite.  Guards against log spam on every frame.
@@ -222,7 +224,7 @@ final class VGDuetPreviewCompositor {
                 //   mask       = aspect-filled segmentation mask into cameraRect
                 // The filter replaces pixels where mask ~= 255 (subject) with the foreground.
                 // The mapped mask is refined at output scale first (see
-                // refineGreenScreenMask: morphology close, then 2.25 px feather,
+                // refineGreenScreenMask: morphology close, then 3.0 px feather,
                 // then trimap smoothstep, then camera-guided edge preservation);
                 // a failed morphology close falls back to the raw mask, a failed
                 // feather falls back to the (possibly closed) unblurred mask, a
@@ -368,7 +370,7 @@ final class VGDuetPreviewCompositor {
         return (eroded.cropped(to: rect), true)
     }
 
-    /// Softens the mask with CIGaussianBlur at greenScreenMaskFeatherRadius (2.25 px).
+    /// Softens the mask with CIGaussianBlur at greenScreenMaskFeatherRadius (3.0 px).
     /// Clamped to extent before blur and cropped back to `rect` to prevent edge darkening.
     /// Fails open to input mask if radius <= 0, empty, or blur filter is unavailable.
     ///
@@ -387,7 +389,7 @@ final class VGDuetPreviewCompositor {
         return (blurred.cropped(to: rect), true)
     }
 
-    /// Remaps mask luminance m through smoothstep(low, high, m) with constants [0.18, 0.82].
+    /// Remaps mask luminance m through smoothstep(low, high, m) with constants [0.14, 0.86].
     /// Values <= low become solid background, values >= high become solid foreground,
     /// and the narrow band in between stays soft.
     ///
@@ -447,7 +449,7 @@ final class VGDuetPreviewCompositor {
     /// the camera frame (`guide`) has a strong edge, preserving thin subject detail
     /// (hair, fingers) while flat regions keep the trimapped mask.
     ///
-    /// Guided edge constants: intensity 2.0, blur radius 1.0, smoothstep [0.06, 0.30].
+    /// Guided edge constants: intensity 2.0, blur radius 1.5, smoothstep [0.08, 0.34].
     /// Edge confidence is derived from `guide` alone via CIEdges -> CIGaussianBlur ->
     /// smoothstep normalized confidence mask -> CIBlendWithMask.
     /// Fails open to `trimapped` mask if disabled, degenerate, empty, or filters are unavailable.
