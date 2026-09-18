@@ -638,6 +638,36 @@ final class VGThermalMonitor {
 
 enum VanguardMode { nleOffline, livestream }
 
+/// Capture profile selected once at [VanguardEngine.startCamera] time.
+///
+/// The profile fixes the native capture resolution for the lifetime of the
+/// camera session. It is a start-camera decision, not a mid-stream mutation:
+/// [VanguardEngine.setCameraFilterChain] only swaps graph nodes and never
+/// reconfigures the capture session, so adding a greenScreen filter to an
+/// already-running [defaultQuality] camera does NOT downshift capture. Callers
+/// that want the low-latency path must choose [greenScreenLowLatency] before
+/// starting the camera.
+///
+/// Platform-neutral by design: the method channel carries the enum name, and
+/// each platform maps it to its own capture configuration. iOS AVCapture preset
+/// constants are never exposed through this enum; the explicit
+/// `sessionPreset` argument on [VanguardEngine.startCamera] remains the
+/// diagnostic/override path for raw preset strings.
+enum VanguardCameraCaptureProfile {
+  /// Existing production default. Capture resolution is unchanged from the
+  /// historical behavior (iOS: 1080p-first, 720p fallback). No profile value is
+  /// sent over the method channel.
+  defaultQuality,
+
+  /// Low-latency capture intended for UFM camera graph green-screen keying.
+  /// iOS maps this to an ordered preset preference of 960x540 (iFrame) then
+  /// 1280x720; the first preset the session supports is selected, otherwise
+  /// the native source falls back to its default. Measured physical latency on
+  /// the greenScreen S1 path drops from roughly 23 ms at 1080x1920 to roughly
+  /// 14.6 ms at 540x960.
+  greenScreenLowLatency,
+}
+
 class VanguardEngine {
   // G-01: Hot-reload protection.
   // In debug mode, a static reference to the last-created instance is kept.
@@ -912,14 +942,48 @@ class VanguardEngine {
   ///
   /// [position]: 1 = back (default), 2 = front.
   /// [fps]: target frame rate (30 recommended for all devices).
+  /// [captureProfile]: production capture profile, fixed for the lifetime of
+  ///   this camera session. Defaults to
+  ///   [VanguardCameraCaptureProfile.defaultQuality], which sends no profile
+  ///   argument and leaves native behavior unchanged. Choose
+  ///   [VanguardCameraCaptureProfile.greenScreenLowLatency] here, at start
+  ///   time, when the session will run the camera graph greenScreen filter;
+  ///   applying that filter later via [setCameraFilterChain] never changes
+  ///   capture resolution.
+  /// [sessionPreset]: explicit diagnostic/override raw preset string (iOS
+  ///   AVCaptureSession preset constant). When non-empty it takes precedence:
+  ///   it is sent as-is and [captureProfile] is NOT sent, so an A/B run can
+  ///   pin an exact preset regardless of the profile argument.
+  ///
+  /// PlatformException codes:
+  /// - 'INVALID_CAMERA_CAPTURE_PROFILE' if native does not recognise the
+  ///   profile value (fails closed before any camera teardown/restart).
   ///
   /// The _videoCallback is wired to the renderer BEFORE the capture session
   /// starts, eliminating any callback-arrival-before-wire race.
-  static Future<int> startCamera({int position = 1, int fps = 30}) async {
-    final id = await _cameraChannel.invokeMethod<int>('startCamera', {
+  static Future<int> startCamera({
+    int position = 1,
+    int fps = 30,
+    String? sessionPreset,
+    VanguardCameraCaptureProfile captureProfile =
+        VanguardCameraCaptureProfile.defaultQuality,
+  }) async {
+    final Map<String, dynamic> args = <String, dynamic>{
       'position': position,
       'fps': fps,
-    });
+    };
+    final String? trimmed = sessionPreset?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) {
+      // Explicit preset override wins; do not also force a profile.
+      args['sessionPreset'] = trimmed;
+    } else if (captureProfile ==
+        VanguardCameraCaptureProfile.greenScreenLowLatency) {
+      // Platform-neutral profile token; native maps it to its own ordered
+      // capture preference. defaultQuality intentionally sends nothing so the
+      // historical native default path is byte-for-byte unchanged.
+      args['cameraCaptureProfile'] = 'greenScreenLowLatency';
+    }
+    final id = await _cameraChannel.invokeMethod<int>('startCamera', args);
     if (id == null || id < 0) {
       throw StateError('[Vanguard] startCamera: native returned no texture id');
     }
@@ -948,6 +1012,48 @@ class VanguardEngine {
     await _cameraChannel.invokeMethod<void>('setCameraFilterChain', {
       'filters': filters.map((f) => f.toJson()).toList(),
     });
+  }
+
+  /// Returns a read-only native telemetry snapshot of the greenScreen filter
+  /// node currently active in the UFM camera graph, or `null` when no
+  /// greenScreen filter is installed (never applied, or cleared by
+  /// [setCameraFilterChain] with an empty list).
+  ///
+  /// iOS only (VG_USE_CAMERA_GRAPH=1). Read-only: does not touch the camera,
+  /// the filter chain, or any node state. Intended for physical smoke proof
+  /// and diagnostics, so a harness does not depend on native log visibility.
+  ///
+  /// Keys (see `VGGreenScreenFilterNode.h` `diagnosticsSnapshot`):
+  /// - `nodeId`, `filterName`, `enabled`
+  /// - `matteSource` (`'visionPersonFast'` | `'unavailable'`)
+  /// - `proofLevel`, `edgeRefinement` (both `'S1'`)
+  /// - `backgroundARGB` (int, 0xAARRGGBB as applied)
+  /// - `frameCount`, `processedFrameCount`, `failOpenCount`,
+  ///   `lastFailOpenReason` (`'none'` until the first fail-open)
+  /// - `sourceWidth`, `sourceHeight`, `matteWidth`, `matteHeight`
+  /// - `morphologyCloseApplied`, `featherApplied`, `trimapApplied`,
+  ///   `guidedEdgeApplied`, `allS1StagesApplied` (last keyed frame),
+  ///   `allS1StagesAppliedFrameCount`
+  /// - `lastVisionMs`, `meanVisionMs`, `maxVisionMs`,
+  ///   `lastBlendRenderMs`, `meanBlendRenderMs`, `maxBlendRenderMs`,
+  ///   `lastTotalMs`, `meanTotalMs`, `maxTotalMs`
+  ///
+  /// `processedFrameCount` and the latency statistics cover successfully keyed
+  /// frames only; fail-open frames are counted in `failOpenCount`.
+  ///
+  /// PlatformException codes:
+  /// - 'GRAPH_MODE_DISABLED' if camera graph mode is disabled.
+  /// - 'NO_CAMERA_GRAPH' if the camera graph session is not running.
+  static Future<Map<String, dynamic>?> getCameraGreenScreenDiagnostics() async {
+    final raw = await _cameraChannel.invokeMethod<Map>(
+      'getCameraGreenScreenDiagnostics',
+    );
+    if (raw == null) return null;
+    // The codec delivers Map<Object?, Object?>; stringify keys so callers get
+    // a plain Map<String, dynamic> without a runtime cast failure.
+    return raw.map<String, dynamic>(
+      (key, value) => MapEntry<String, dynamic>(key.toString(), value),
+    );
   }
 
   /// Swaps to the given sensor without tearing down the session (~150 ms).

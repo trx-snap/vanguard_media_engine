@@ -4126,7 +4126,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Pre-validate type strings before touching the runtime.
             // Mirrors the Dart-side assertValid() allowlist; provides server-side
             // error reporting for release-mode callers where assert is elided.
-            let knownTypes: Set<String> = ["lut", "beauty", "segmentation"]
+            let knownTypes: Set<String> = ["lut", "beauty", "segmentation", "greenScreen"]
             for dict in filterDicts {
                 let type = dict["type"] as? String ?? ""
                 if !knownTypes.contains(type) {
@@ -4869,6 +4869,46 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "startCamera":
             let positionInt = args?["position"] as? Int ?? 1  // 1=back, 2=front
             let fps         = args?["fps"]      as? Int ?? 30
+            let sessionPreset = (args?["sessionPreset"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            // Production capture profile (platform-neutral token from Dart
+            // VanguardCameraCaptureProfile). Resolved ONCE here, before any
+            // teardown/restart, into an ordered AVCaptureSession preset
+            // preference that is fixed for the lifetime of the new camera
+            // session. setCameraFilterChain never reconfigures capture, so a
+            // greenScreen filter added to a running defaultQuality camera does
+            // not downshift; callers must pick the profile at startCamera time.
+            //
+            // Precedence: a non-empty sessionPreset (explicit diagnostic/override
+            // path) maps to a one-element list and wins over the profile. An
+            // unknown non-empty profile fails closed with
+            // INVALID_CAMERA_CAPTURE_PROFILE and leaves the current camera
+            // (and any in-flight recording) untouched.
+            let cameraCaptureProfile = (args?["cameraCaptureProfile"] as? String)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            var profilePresets: [String]? = nil
+            if let profile = cameraCaptureProfile {
+                switch profile {
+                case "greenScreenLowLatency":
+                    profilePresets = [
+                        AVCaptureSession.Preset.iFrame960x540.rawValue,
+                        AVCaptureSession.Preset.hd1280x720.rawValue,
+                    ]
+                default:
+                    result(FlutterError(
+                        code: "INVALID_CAMERA_CAPTURE_PROFILE",
+                        message: "Unknown cameraCaptureProfile '\(profile)'. "
+                            + "Supported: greenScreenLowLatency (or omit for default quality).",
+                        details: nil
+                    ))
+                    return
+                }
+            }
+            let preferredSessionPresets: [String]? = sessionPreset.map { [$0] } ?? profilePresets
+            NSLog("[VanguardMediaEnginePlugin] startCamera captureProfile=%@ sessionPresetOverride=%@ preferredSessionPresets=%@",
+                  cameraCaptureProfile ?? "defaultQuality",
+                  sessionPreset ?? "(none)",
+                  preferredSessionPresets?.joined(separator: ",") ?? "(native default 1080p-first)")
             // BLOCK-1 FIX: when already in camera mode a recording may be active.
             // switchToMode(.camera) → teardownCurrentMode() → cameraSource?.stop()
             // does NOT call finishWritingWithCompletionHandler: on the AVAssetWriter —
@@ -4880,7 +4920,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     guard let self = self else { result(nil); return }
                     self.currentMode = .camera
                     let position: AVCaptureDevice.Position = positionInt == 2 ? .front : .back
-                    let src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps))
+                    let src: VanguardCameraMediaSource
+                    if let presets = preferredSessionPresets {
+                        src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps), preferredSessionPresets: presets)
+                    } else {
+                        src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps))
+                    }
                     // Flutter Texture portrait lock: prevents UIDeviceOrientationDidChangeNotification
                     // from switching AVCaptureConnection.videoOrientation to landscape and delivering
                     // 1920x1080 buffers to the graph. Beauty V1 lacks a stride guard so any dimension
@@ -4939,7 +4984,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             streamingEncoder = nil
 
             let position: AVCaptureDevice.Position = positionInt == 2 ? .front : .back
-            let src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps))
+            let src: VanguardCameraMediaSource
+            if let presets = preferredSessionPresets {
+                src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps), preferredSessionPresets: presets)
+            } else {
+                src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps))
+            }
             // Flutter Texture portrait lock: prevents UIDeviceOrientationDidChangeNotification
             // from switching AVCaptureConnection.videoOrientation to landscape and delivering
             // 1920x1080 buffers to the graph. Beauty V1 lacks a stride guard so any dimension
@@ -5059,7 +5109,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            let knownTypes: Set<String> = ["lut", "beauty", "segmentation"]
+            let knownTypes: Set<String> = ["lut", "beauty", "segmentation", "greenScreen"]
             for dict in filterDicts {
                 let type = dict["type"] as? String ?? ""
                 if !knownTypes.contains(type) {
@@ -5083,6 +5133,44 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let code = nsError.domain
                 let message = nsError.localizedDescription
                 result(FlutterError(code: code, message: message, details: nil))
+            }
+            #else
+            result(FlutterError(
+                code: "GRAPH_MODE_DISABLED",
+                message: "Camera graph mode is disabled. Build with VG_USE_CAMERA_GRAPH=1.",
+                details: nil
+            ))
+            #endif
+
+        case "getCameraGreenScreenDiagnostics":
+            // UFM camera graph green screen: read-only native telemetry.
+            //
+            // Returns VGGreenScreenFilterNode's diagnostics snapshot for the
+            // greenScreen node currently committed in the live filter chain
+            // (see VGGreenScreenFilterNode.h -diagnosticsSnapshot for keys:
+            // proofLevel/edgeRefinement "S1", matteSource, backgroundARGB,
+            // frame/processed/fail-open counts, last S1 stage flags, and
+            // last/mean/max Vision, blend-render and total latency in ms).
+            // Returns nil when no greenScreen filter is active — including
+            // right after the chain is cleared.
+            //
+            // Safety:
+            //   • Read-only. Does NOT start/stop/switch the camera, rebuild
+            //     the graph, touch the scheduler, or mutate any node.
+            //   • Serialized on the session queue by the session itself.
+            #if VG_USE_CAMERA_GRAPH
+            guard let session = cameraGraphSession else {
+                result(FlutterError(
+                    code: "NO_CAMERA_GRAPH",
+                    message: "Camera graph session is not running.",
+                    details: nil
+                ))
+                return
+            }
+            if let snapshot = session.greenScreenDiagnosticsSnapshot() {
+                result(snapshot)
+            } else {
+                result(nil)
             }
             #else
             result(FlutterError(
