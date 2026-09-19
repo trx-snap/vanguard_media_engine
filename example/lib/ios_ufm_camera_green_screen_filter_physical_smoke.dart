@@ -16,6 +16,30 @@
 //   thresholds. Green-screen node telemetry still measures greenScreen node
 //   time only; neither surface provides Beauty V2 per-node cost.
 //
+// Optional alpha-output lane (opt-in, dart-define):
+//   Set UFM_GREENSCREEN_OUTPUT_MODE=alpha to apply
+//     [VGFilterSpecs.greenScreenAlpha()]
+//   instead of the solid-colour spec. The node then emits the camera foreground
+//   RGB with the S1-refined matte in the output alpha (32BGRA, straight alpha,
+//   no background composite). Asserted from native telemetry: outputMode ==
+//   'alpha', backgroundType == 'alpha', alphaEncoding == 'straight' (native
+//   reports it only when its byte self-test passed), alphaByteSelfTestPassed
+//   == true (the native one-time synthetic byte self-test run at node init:
+//   the alpha construction rendered on a 48x16 synthetic input through the
+//   production un-premultiplied alpha render path and read back — background
+//   A~0, foreground A~255, edge 0<A<255, foreground RGB preserved in the edge
+//   and foreground bands, i.e. straight rather than premultiplied),
+//   backgroundARGB == 0, processedFrameCount > 0, all four S1 stage flags
+//   true. Latency, steady-window and pixel metrics are reported, not gated.
+//   The self-test proves the alpha BYTES of the construction, not end-user
+//   visual quality of the keyed output. Explicit non-claim: the Flutter
+//   Texture composites the frame with its own alpha interpretation, so
+//   whatever the preview shows in alpha mode is neither a keying proof nor a
+//   Duet proof. Not combinable with UFM_ENABLE_BEAUTY_V2=true
+//   (fails closed at CONFIG). The default lane (solidColor) keeps the previous
+//   route, thresholds and pixel assertions unchanged and additionally asserts
+//   the new outputMode/backgroundType contract fields.
+//
 // Harness proof lanes:
 //   1. Start active UFM camera with VanguardEngine.startCamera(position: 2, fps: 30,
 //      captureProfile: <UFM_CAMERA_CAPTURE_PROFILE>, sessionPreset: <UFM_CAMERA_PRESET>).
@@ -94,6 +118,11 @@
 //   - recording/export/photo
 //   - Duet
 //   - Android
+//   - In alpha mode: Flutter texture visual transparency and byte-level alpha
+//     encoding of LIVE camera frames (the native self-test measures a synthetic
+//     input once at init; neither is a keying proof nor a Duet proof);
+//     end-user visual quality of the keyed alpha output (the self-test proves
+//     alpha bytes of the construction only); alpha-lane latency thresholds
 //   - per-node Beauty V2 timing (filter-chain timing is cumulative scheduler + active filters + synchronous sink present; green-screen node telemetry excludes Beauty V2 per-node cost)
 //   - When greenScreen only: native cumulative latency across a combined chain (filter-chain timing is reported, not gated)
 
@@ -127,6 +156,8 @@ const String kStepSteadySampledMarker =
     'IOS_UFM_GREENSCREEN_FILTER_STEP_STEADY_SAMPLED';
 const String kStepFrameCapturedMarker =
     'IOS_UFM_GREENSCREEN_FILTER_STEP_FRAME_CAPTURED';
+const String kStepAlphaModeReportedMarker =
+    'IOS_UFM_GREENSCREEN_FILTER_STEP_ALPHA_MODE_REPORTED';
 const String kMetricsJsonMarker = 'IOS_UFM_GREENSCREEN_METRICS_JSON';
 const String kStepFilterClearedMarker =
     'IOS_UFM_GREENSCREEN_FILTER_STEP_FILTER_CLEARED';
@@ -136,6 +167,11 @@ const String kStepCameraStoppedMarker =
     'IOS_UFM_GREENSCREEN_FILTER_STEP_CAMERA_STOPPED';
 const String kSmokePassMarker = 'IOS_UFM_GREENSCREEN_FILTER_PASS';
 const String kSmokeFailMarker = 'IOS_UFM_GREENSCREEN_FILTER_FAIL';
+
+/// One-line failure summary printed BEFORE [kSmokeFailMarker] so the error,
+/// lane and failing step survive even if the long JSON payload is truncated.
+const String kSmokeFailCompactMarker =
+    'IOS_UFM_GREENSCREEN_FILTER_FAIL_COMPACT';
 
 /// When true, exercises combined Beauty V2 + greenScreen filter proof mode.
 /// When false (default), exercises greenScreen-only proof mode.
@@ -156,6 +192,46 @@ const String kUfmCameraCaptureProfile = String.fromEnvironment(
   'UFM_CAMERA_CAPTURE_PROFILE',
   defaultValue: 'greenScreenLowLatency',
 );
+
+/// Green-screen output-mode lane. `'solidColor'` (default) keeps the existing
+/// solid-teal route, thresholds and pixel assertions exactly as before.
+/// `'alpha'` applies [VGFilterSpecs.greenScreenAlpha] instead and asserts the
+/// native alpha contract only (outputMode == 'alpha', alphaByteSelfTestPassed
+/// == true, processedFrameCount > 0, all four S1 stages); latency and pixel
+/// metrics are reported, not gated.
+/// Any other value fails closed at CONFIG. Not combinable with
+/// UFM_ENABLE_BEAUTY_V2=true (fails closed) so each lane's claims stay crisp.
+const String kUfmGreenScreenOutputMode = String.fromEnvironment(
+  'UFM_GREENSCREEN_OUTPUT_MODE',
+  defaultValue: 'solidColor',
+);
+
+/// True only for the opt-in alpha lane. Unknown strings resolve to false here
+/// and are rejected by [_validateGreenScreenOutputMode] before the camera
+/// starts, so a typo can never run the solid lane while claiming alpha.
+const bool kUfmAlphaOutputMode = kUfmGreenScreenOutputMode == 'alpha';
+
+/// Explicit alpha-lane non-claim, attached to the pixel metrics and payloads.
+const String kAlphaModeTextureNonClaim =
+    'Alpha output mode: Flutter texture pixels are reported, not asserted. '
+    'The preview composites the 32BGRA texture with its own alpha '
+    'interpretation, so visual transparency (or its absence) on the Flutter '
+    'texture is not a keying proof and not a Duet proof.';
+
+/// Fails closed on unknown UFM_GREENSCREEN_OUTPUT_MODE values (exact match,
+/// no trimming, so it agrees with [kUfmAlphaOutputMode]).
+void _validateGreenScreenOutputMode(String raw) {
+  switch (raw) {
+    case 'solidColor':
+    case 'alpha':
+      return;
+    default:
+      throw StateError(
+        '[CONFIG] Unknown UFM_GREENSCREEN_OUTPUT_MODE "$raw" '
+        '(expected solidColor or alpha)',
+      );
+  }
+}
 
 /// Maps the dart-define string to the public enum. Fails closed on unknown
 /// values so a typo never silently runs the wrong profile.
@@ -185,12 +261,20 @@ List<String> get kClaimsAllowed => <String>[
     'combined Beauty V2 + greenScreen filter chain is accepted and co-executes in active camera graph',
     'combined-chain throughput/co-execution proven via steady processed FPS (>= 20.0 fps across steady frames >= 50)',
     'native cumulative active filter-chain timing proven via getCameraFilterChainDiagnostics (filterChainTimingV1; beauty + greenScreen active, steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms)',
+  ] else if (kUfmAlphaOutputMode) ...<String>[
+    'greenScreen alpha-output route (VGFilterSpecs.greenScreenAlpha) is accepted and the S1-refined node is invoked by the active camera graph',
+    'native telemetry reports outputMode == alpha, backgroundType == alpha, alphaEncoding == straight (native reports it only when its byte self-test passed), backgroundARGB == 0, processedFrameCount > 0 and all four S1 stages applied',
+    'native one-time synthetic alpha byte self-test passed at node init (alphaByteSelfTestPassed == true: the alpha construction rendered on a 48x16 synthetic input through the production un-premultiplied alpha render path and read back shows background A~0, foreground A~255, edge 0<A<255 with foreground RGB preserved in the edge and foreground bands — straight, not premultiplied; background RGB at A~0 is reported, not evaluated)',
+    'alpha-lane latency and steady-window metrics are reported, not gated',
   ] else ...<String>[
     'greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph',
     'warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)',
   ],
   'native S1 stage telemetry proof is available and asserted (getCameraGreenScreenDiagnostics)',
-  'objective pixel metrics sampled from active video texture',
+  if (kUfmAlphaOutputMode)
+    'Flutter texture pixel metrics sampled and reported only (not asserted) in alpha mode'
+  else
+    'objective pixel metrics sampled from active video texture',
   'same texture remains mounted',
   'clear returns to passthrough (greenScreen and filter-chain native telemetry both return null after clear)',
   'startCamera captureProfile is a fixed start-time capture decision (greenScreenLowLatency asserts source long side < 1920 when no preset override)',
@@ -204,6 +288,13 @@ List<String> get kNonClaims => <String>[
   'recording/export/photo',
   'Duet',
   'Android',
+  if (kUfmAlphaOutputMode) ...<String>[
+    'Flutter texture visual transparency in alpha mode (the preview composites the 32BGRA texture with its own alpha interpretation; whatever it shows is not a keying proof and not a Duet proof)',
+    'byte-level alpha encoding of live camera frames (the native self-test measures a synthetic input once at init; live frame bytes are not read natively or from Dart)',
+    'end-user visual quality of the keyed alpha output (the native alpha byte self-test proves the alpha bytes of the construction only)',
+    'downstream alpha compositing (no compositor consumes the alpha output in this slice)',
+    'alpha-lane latency thresholds (reported only)',
+  ],
   if (kUfmEnableBeautyV2)
     'per-node Beauty V2 timing (filter-chain timing is cumulative scheduler + active filters + synchronous sink present cost)'
   else
@@ -244,6 +335,16 @@ const int kBeautyV2MinSteadyGraphFrames = 50;
 const int kPixelSampleStride = 4;
 
 int _asInt(Object? value) => value is num ? value.toInt() : -1;
+
+/// Compact copy of the native alpha byte self-test fields for the structured
+/// payloads (alpha lane only). Values are echoed verbatim from the snapshot.
+Map<String, dynamic> _alphaByteSelfTestSummary(Map<String, dynamic> d) =>
+    <String, dynamic>{
+      'passed': d['alphaByteSelfTestPassed'],
+      'reason': d['alphaByteSelfTestReason'],
+      'width': d['alphaByteSelfTestWidth'],
+      'height': d['alphaByteSelfTestHeight'],
+    };
 
 double _asDouble(Object? value) => value is num ? value.toDouble() : 0.0;
 
@@ -339,7 +440,10 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
     if (!mounted) return;
     setState(() {
       var summary =
-          'Native S1 telemetry: processed=${d['processedFrameCount']} '
+          'Native S1 telemetry (outputMode=${d['outputMode']} '
+          'alphaEncoding=${d['alphaEncoding']} '
+          'alphaByteSelfTest=${d['alphaByteSelfTestPassed']}): '
+          'processed=${d['processedFrameCount']} '
           'entered=${d['frameCount']} failOpen=${d['failOpenCount']} '
           'allS1=${d['allS1StagesApplied']} '
           '(allS1Frames=${d['allS1StagesAppliedFrameCount']}) '
@@ -550,11 +654,52 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       d['matteSource'] == 'visionPersonFast',
       "matteSource == 'visionPersonFast' (got ${d['matteSource']})",
     );
+    final String expectedOutputMode = kUfmAlphaOutputMode
+        ? 'alpha'
+        : 'solidColor';
     check(
-      _asInt(d['backgroundARGB']) == kExpectedBackgroundARGB,
-      'backgroundARGB == 0x${kExpectedBackgroundARGB.toRadixString(16).toUpperCase()} '
-      '(got ${d['backgroundARGB']})',
+      d['outputMode'] == expectedOutputMode,
+      "outputMode == '$expectedOutputMode' (got ${d['outputMode']})",
     );
+    check(
+      d['backgroundType'] == expectedOutputMode,
+      "backgroundType == '$expectedOutputMode' (got ${d['backgroundType']})",
+    );
+    if (kUfmAlphaOutputMode) {
+      // Native reports 'straight' only when its one-time byte self-test
+      // passed through the alpha render path ('unverified' otherwise).
+      check(
+        d['alphaEncoding'] == 'straight',
+        "alphaEncoding == 'straight' (got ${d['alphaEncoding']})",
+      );
+      check(
+        _asInt(d['backgroundARGB']) == 0,
+        'backgroundARGB == 0 in alpha mode (argb ignored; '
+        'got ${d['backgroundARGB']})',
+      );
+      // Measured natively, once at node init, on a synthetic input: the
+      // decisive straight-vs-premultiplied byte evidence for the construction.
+      // The reason carries the bytes read back so a failure is diagnosable
+      // from the log alone.
+      check(
+        d['alphaByteSelfTestPassed'] == true,
+        'alphaByteSelfTestPassed == true '
+        '(got ${d['alphaByteSelfTestPassed']}; '
+        'reason=${d['alphaByteSelfTestReason']})',
+      );
+      check(
+        _asInt(d['alphaByteSelfTestWidth']) > 0 &&
+            _asInt(d['alphaByteSelfTestHeight']) > 0,
+        'alphaByteSelfTestWidth/Height > 0 (got '
+        '${d['alphaByteSelfTestWidth']}x${d['alphaByteSelfTestHeight']})',
+      );
+    } else {
+      check(
+        _asInt(d['backgroundARGB']) == kExpectedBackgroundARGB,
+        'backgroundARGB == 0x${kExpectedBackgroundARGB.toRadixString(16).toUpperCase()} '
+        '(got ${d['backgroundARGB']})',
+      );
+    }
     check(
       _asInt(d['processedFrameCount']) > 0,
       'processedFrameCount > 0 (got ${d['processedFrameCount']})',
@@ -628,6 +773,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
     final bool presetOverrideActive = kUfmCameraPreset.trim().isNotEmpty;
     print(
       'CONFIG: UFM_ENABLE_BEAUTY_V2=$kUfmEnableBeautyV2 '
+      'UFM_GREENSCREEN_OUTPUT_MODE="$kUfmGreenScreenOutputMode" '
       'UFM_CAMERA_CAPTURE_PROFILE="$kUfmCameraCaptureProfile" '
       'UFM_CAMERA_PRESET='
       '"${presetOverrideActive ? kUfmCameraPreset : "(none)"}" '
@@ -651,6 +797,15 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
     };
 
     try {
+      // Lane 0: configuration fail-closed checks (before any camera work).
+      _validateGreenScreenOutputMode(kUfmGreenScreenOutputMode);
+      if (kUfmAlphaOutputMode && kUfmEnableBeautyV2) {
+        throw StateError(
+          '[CONFIG] UFM_GREENSCREEN_OUTPUT_MODE=alpha cannot be combined with '
+          'UFM_ENABLE_BEAUTY_V2=true in this harness (run the lanes separately)',
+        );
+      }
+
       // Lane 1: Start active UFM camera through the production captureProfile
       // path (default greenScreenLowLatency). UFM_CAMERA_PRESET, when set, is
       // passed as the explicit override and wins inside VanguardEngine.startCamera.
@@ -709,6 +864,22 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                 'UFM camera graph Beauty V2 + greenScreen filter chain active (Beauty V2 + S1-refined)';
           });
         }
+      } else if (kUfmAlphaOutputMode) {
+        _updateStatus(
+          'APPLY_FILTER',
+          'Applying UFM camera graph greenScreen filter (alpha output: '
+              'foreground RGB + S1 matte in alpha, no background)...',
+        );
+        await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
+          VGFilterSpecs.greenScreenAlpha(),
+        ]);
+        if (mounted) {
+          setState(() {
+            _isGreenScreenActive = true;
+            _cameraModeDescription =
+                'UFM camera graph greenScreen filter active (alpha output, S1-refined)';
+          });
+        }
       } else {
         _updateStatus(
           'APPLY_FILTER',
@@ -739,6 +910,8 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         'GREENSCREEN_OBSERVE',
         kUfmEnableBeautyV2
             ? 'Observing UFM camera graph Beauty V2 + greenScreen filter chain for 10 seconds...'
+            : kUfmAlphaOutputMode
+            ? 'Observing UFM camera graph greenScreen filter (alpha output, S1-refined) for 10 seconds — preview appearance is not asserted...'
             : 'Observing UFM camera graph greenScreen filter (S1-refined) for 10 seconds...',
       );
       final observeStart = DateTime.now();
@@ -898,7 +1071,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
             'in ${steadyWindowSeconds}s)',
           );
         }
-      } else {
+      } else if (!kUfmAlphaOutputMode) {
         if (steadyFrameCount < 50) {
           throw StateError(
             '[GREENSCREEN_MEASUREMENT] steadyFrameCount must be >= 50 '
@@ -971,7 +1144,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         }
       }
 
-      if (!kUfmEnableBeautyV2) {
+      if (!kUfmEnableBeautyV2 && !kUfmAlphaOutputMode) {
         if (warmupExcludedMeanTotalMs == null ||
             warmupExcludedMeanTotalMs <= 0.0 ||
             warmupExcludedMeanTotalMs >= 50.0) {
@@ -1021,7 +1194,9 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       final pixelCaptureAvailable =
           pixelMetrics['pixelCaptureAvailable'] == true;
 
-      if (!kUfmEnableBeautyV2 && pixelCaptureAvailable) {
+      if (!kUfmEnableBeautyV2 &&
+          !kUfmAlphaOutputMode &&
+          pixelCaptureAvailable) {
         if (backgroundCoveragePct < 15.0) {
           throw StateError(
             '[GREENSCREEN_MEASUREMENT] backgroundCoveragePct must be >= 15.0 '
@@ -1039,7 +1214,38 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
             'Pixel capture unavailable on this run; objective pixel coverage metrics skipped without claiming visual parity';
       }
 
+      if (kUfmAlphaOutputMode) {
+        // Alpha lane: everything below the contract assertions is evidence,
+        // not a gate. Emit it in one structured line so a log reader can see
+        // the alpha path sustained frames without mistaking it for a claim.
+        pixelMetrics['alphaModeNote'] = kAlphaModeTextureNonClaim;
+        final alphaModeReport = <String, dynamic>{
+          'outputMode': finalDiagnostics['outputMode'],
+          'backgroundType': finalDiagnostics['backgroundType'],
+          'alphaEncoding': finalDiagnostics['alphaEncoding'],
+          'alphaByteSelfTestPassed':
+              finalDiagnostics['alphaByteSelfTestPassed'],
+          'alphaByteSelfTestReason':
+              finalDiagnostics['alphaByteSelfTestReason'],
+          'alphaByteSelfTestWidth': finalDiagnostics['alphaByteSelfTestWidth'],
+          'alphaByteSelfTestHeight':
+              finalDiagnostics['alphaByteSelfTestHeight'],
+          'processedFrameCount': n2,
+          'failOpenCount': finalDiagnostics['failOpenCount'],
+          'lastFailOpenReason': finalDiagnostics['lastFailOpenReason'],
+          'steadyFrameCount': steadyFrameCount,
+          'steadyProcessedFps': steadyProcessedFps,
+          'warmupExcludedMeanTotalMs': warmupExcludedMeanTotalMs,
+          'warmupExcludedMeanVisionMs': warmupExcludedMeanVisionMs,
+          'warmupExcludedMeanBlendRenderMs': warmupExcludedMeanBlendRenderMs,
+          'reportedOnly': true,
+          'nonClaim': kAlphaModeTextureNonClaim,
+        };
+        print('$kStepAlphaModeReportedMarker ${jsonEncode(alphaModeReport)}');
+      }
+
       measurement = <String, dynamic>{
+        'greenScreenOutputMode': kUfmGreenScreenOutputMode,
         'warmupProcessedCount': n1,
         'finalProcessedCount': n2,
         'steadyFrameCount': steadyFrameCount,
@@ -1065,6 +1271,10 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
 
       final metricsPayload = <String, dynamic>{
         'beautyV2Enabled': kUfmEnableBeautyV2,
+        'greenScreenOutputMode': kUfmGreenScreenOutputMode,
+        if (kUfmAlphaOutputMode) 'alphaModeNonClaim': kAlphaModeTextureNonClaim,
+        if (kUfmAlphaOutputMode)
+          'alphaByteSelfTest': _alphaByteSelfTestSummary(finalDiagnostics),
         'captureProfile': captureProfile.name,
         'sessionPresetOverride': presetOverrideActive ? kUfmCameraPreset : null,
         'lowLatencyProfileEffective': lowLatencyProfileEffective,
@@ -1163,6 +1373,10 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       final passPayload = <String, dynamic>{
         'pass': true,
         'beautyV2Enabled': kUfmEnableBeautyV2,
+        'greenScreenOutputMode': kUfmGreenScreenOutputMode,
+        if (kUfmAlphaOutputMode) 'alphaModeNonClaim': kAlphaModeTextureNonClaim,
+        if (kUfmAlphaOutputMode)
+          'alphaByteSelfTest': _alphaByteSelfTestSummary(finalDiagnostics),
         'textureId': textureId,
         'captureProfile': captureProfile.name,
         'sessionPresetOverride': presetOverrideActive ? kUfmCameraPreset : null,
@@ -1196,7 +1410,18 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       await Future<void>.delayed(const Duration(milliseconds: 500));
       exit(0);
     } catch (e, st) {
-      errorMessage = e.toString();
+      final String failedStep = _currentStep;
+      final String errorText = e.toString();
+      errorMessage = errorText;
+      // Compact one-liner first: diagnosable even if the long JSON below is
+      // truncated by the log capture. Short fields lead so a cut line keeps
+      // the step and lane.
+      print(
+        '$kSmokeFailCompactMarker step=$failedStep '
+        'mode=$kUfmGreenScreenOutputMode beautyV2=$kUfmEnableBeautyV2 '
+        'textureId=$textureId '
+        'error=${errorText.replaceAll('\n', ' ')}',
+      );
       _updateStatus('ERROR', 'Failure: $errorMessage');
 
       if (cameraStarted) {
@@ -1213,6 +1438,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       final failPayload = <String, dynamic>{
         'pass': false,
         'beautyV2Enabled': kUfmEnableBeautyV2,
+        'greenScreenOutputMode': kUfmGreenScreenOutputMode,
         'textureId': textureId,
         'captureProfileRequested': kUfmCameraCaptureProfile,
         'sessionPresetOverride': presetOverrideActive ? kUfmCameraPreset : null,
@@ -1367,6 +1593,15 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                           fontSize: 11,
                         ),
                       ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'GreenScreen output mode: $kUfmGreenScreenOutputMode'
+                        '${kUfmAlphaOutputMode ? " (alpha lane: preview appearance is NOT a proof)" : " (solid teal 0xFF00796B)"}',
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 11,
+                        ),
+                      ),
                       const SizedBox(height: 8),
                       // Overlay explicitly distinguishing UFM camera graph greenScreen filter
                       // from standalone live green-screen API.
@@ -1391,6 +1626,8 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                               _isGreenScreenActive
                                   ? (kUfmEnableBeautyV2
                                         ? 'UFM CAMERA GRAPH BEAUTY V2 + GREENSCREEN FILTER ACTIVE'
+                                        : kUfmAlphaOutputMode
+                                        ? 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (ALPHA OUTPUT, S1-REFINED)'
                                         : 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (S1-REFINED)')
                                   : 'CAMERA MODE: $_cameraModeDescription',
                               style: TextStyle(
@@ -1412,6 +1649,12 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                                               'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics and asserted (processed frames, all four S1 stages, steadyProcessedFps >= 20.0).\n'
                                               'Filter-chain proof: cumulative active filter-chain timing read via getCameraFilterChainDiagnostics (filterChainTimingV1, measured natively around the scheduler call) and asserted (beauty + greenScreen active, steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms).\n'
                                               'Non-claims: neither surface provides Beauty V2 per-node cost; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
+                                        : kUfmAlphaOutputMode
+                                        ? 'Route: VGFilterSpecs.greenScreenAlpha()\n'
+                                              'Pipeline: Active UFM camera graph S1-refined filter node, alpha output (foreground RGB + matte in alpha, no background)\n'
+                                              'Proves: greenScreen alpha-output route is accepted and the S1-refined node is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
+                                              'Native proof: telemetry read via getCameraGreenScreenDiagnostics and asserted (outputMode alpha, backgroundType alpha, alphaEncoding straight (native reports it only when its byte self-test passed), alphaByteSelfTestPassed true = one-time synthetic byte self-test of the alpha construction at node init, processed frames > 0, all four S1 stages). Latency and pixel metrics are reported only.\n'
+                                              'Non-claims: whatever this preview shows is NOT a keying or Duet proof (the Flutter Texture composites the alpha its own way); no byte-level verification of live camera frames (the self-test covers a synthetic input only); no downstream compositor; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
                                         : 'Route: VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)\n'
                                               'Pipeline: Active UFM camera graph S1-refined filter node\n'
                                               'Proves: greenScreen filter route is accepted and S1-refined node '

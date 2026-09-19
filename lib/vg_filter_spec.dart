@@ -72,8 +72,11 @@ final class VGFilterSpec {
   /// - `'lut'`          → `'intensity'` (double, 0.0–1.0)
   /// - `'beauty'`       → `'intensity'` (double, 0.0–1.0), `'radius'` (double)
   /// - `'segmentation'` → (none in Phase 3; reserved for Phase 4)
-  /// - `'greenScreen'`  → `'backgroundType'` (`'solidColor'`), `'argb'` (int,
-  ///                      0xAARRGGBB) — see [VGFilterSpecs.greenScreenSolidColor]
+  /// - `'greenScreen'`  → `'backgroundType'` (`'solidColor'` | `'alpha'`);
+  ///                      `'argb'` (int, 0xAARRGGBB) is required for
+  ///                      `'solidColor'` only and ignored for `'alpha'` — see
+  ///                      [VGFilterSpecs.greenScreenSolidColor] and
+  ///                      [VGFilterSpecs.greenScreenAlpha]
   /// - `'colorMatrix'`  → `'matrix'` (`List<double>`, exactly 20 elements,
   ///                      4×5 row-major matching Flutter's [ColorFilter.matrix])
   ///
@@ -355,11 +358,13 @@ extension VGFilterSpecs on VGFilterSpec {
   ///   "parameters": { "backgroundType": "solidColor", "argb": 4278483307 } }
   /// ```
   ///
-  /// iOS-first, solid-background-only MVP. Image/video backgrounds are not
-  /// part of this contract (native returns UNSUPPORTED_FILTER_TYPE for any
-  /// other `backgroundType`). Matte quality is MVP-level: the native node
-  /// keys with a raw Vision person matte and no edge refinement, and fails
-  /// open to the unkeyed camera frame on any per-frame failure.
+  /// iOS-first MVP. Image/video backgrounds are not part of this contract
+  /// (native returns UNSUPPORTED_FILTER_TYPE for any `backgroundType` other
+  /// than `'solidColor'` or `'alpha'`; see [greenScreenAlpha] for the
+  /// alpha-output variant). Matte quality is MVP-level: the native node keys
+  /// with a Vision person matte plus the S1 edge-refinement pipeline (no
+  /// temporal smoothing) and fails open to the unkeyed camera frame on any
+  /// per-frame failure.
   static VGFilterSpec greenScreenSolidColor({int argb = 0xFF00796B}) {
     assert(
       argb >= 0 && argb <= 0xFFFFFFFF,
@@ -371,6 +376,37 @@ extension VGFilterSpecs on VGFilterSpec {
       parameters: {'backgroundType': 'solidColor', 'argb': argb},
     );
   }
+
+  /// Creates a live green-screen filter that keeps the camera foreground RGB
+  /// and writes the refined person matte to the output alpha channel instead
+  /// of compositing over a background.
+  ///
+  /// Same independent 1-in/1-out camera-graph transform as
+  /// [greenScreenSolidColor]; only the output stage differs. The keyed frame
+  /// (32BGRA, straight alpha: 255 = subject, 0 = background, feather in
+  /// between) is what a downstream multi-input compositor blends over its own
+  /// background. This helper wires no compositor and is not tied to Duet or
+  /// any other product mode — any camera-graph caller may use it.
+  ///
+  /// No parameters: `argb` is not part of the alpha contract. A raw spec that
+  /// carries one is still accepted natively and the value is ignored.
+  ///
+  /// Wire format:
+  /// ```json
+  /// { "type": "greenScreen", "enabled": true,
+  ///   "parameters": { "backgroundType": "alpha" } }
+  /// ```
+  ///
+  /// Non-claims: the Flutter preview [Texture] composites the frame with its
+  /// own alpha interpretation, so whatever it shows in alpha mode is neither a
+  /// keying proof nor a Duet proof — assert the native telemetry instead
+  /// (`getCameraGreenScreenDiagnostics`: `outputMode == 'alpha'`). Native
+  /// declares the alpha encoding as straight (RGB not premultiplied by alpha)
+  /// by construction; no byte-level verification exists yet.
+  static VGFilterSpec greenScreenAlpha() => const VGFilterSpec(
+    type: 'greenScreen',
+    parameters: {'backgroundType': 'alpha'},
+  );
 
   /// Creates a color-matrix filter for export and timeline pipelines.
   ///

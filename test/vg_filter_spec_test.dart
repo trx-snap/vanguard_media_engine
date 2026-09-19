@@ -44,54 +44,48 @@ void main() {
   );
 
   // ── Test 2 ────────────────────────────────────────────────────────────────
-  test(
-    'VGFilterSpecs.beauty(intensity: 0.5) preserves custom intensity '
-    'and default radius (plan:394)',
-    () {
-      final spec = VGFilterSpecs.beauty(intensity: 0.5);
+  test('VGFilterSpecs.beauty(intensity: 0.5) preserves custom intensity '
+      'and default radius (plan:394)', () {
+    final spec = VGFilterSpecs.beauty(intensity: 0.5);
 
-      expect(
-        spec.type,
-        equals('beauty'),
-        reason: 'beauty() must produce type string "beauty"',
-      );
-      expect(
-        spec.parameters['intensity'],
-        closeTo(0.5, 1e-9),
-        reason: 'Custom intensity must be forwarded to parameters',
-      );
-      expect(
-        spec.parameters.containsKey('radius'),
-        isTrue,
-        reason: 'beauty() must include radius key even when using default',
-      );
-      expect(
-        spec.parameters['radius'],
-        closeTo(2.0, 1e-9),
-        reason: 'Default radius must be 2.0',
-      );
-    },
-  );
+    expect(
+      spec.type,
+      equals('beauty'),
+      reason: 'beauty() must produce type string "beauty"',
+    );
+    expect(
+      spec.parameters['intensity'],
+      closeTo(0.5, 1e-9),
+      reason: 'Custom intensity must be forwarded to parameters',
+    );
+    expect(
+      spec.parameters.containsKey('radius'),
+      isTrue,
+      reason: 'beauty() must include radius key even when using default',
+    );
+    expect(
+      spec.parameters['radius'],
+      closeTo(2.0, 1e-9),
+      reason: 'Default radius must be 2.0',
+    );
+  });
 
   // ── Test 3 ────────────────────────────────────────────────────────────────
-  test(
-    'VGFilterSpecs.segmentation() produces type=="segmentation" '
-    'with empty parameters (plan:395)',
-    () {
-      final spec = VGFilterSpecs.segmentation();
+  test('VGFilterSpecs.segmentation() produces type=="segmentation" '
+      'with empty parameters (plan:395)', () {
+    final spec = VGFilterSpecs.segmentation();
 
-      expect(
-        spec.type,
-        equals('segmentation'),
-        reason: 'segmentation() must produce type string "segmentation"',
-      );
-      expect(
-        spec.parameters,
-        isEmpty,
-        reason: 'segmentation() must have empty parameters (no Phase 4 params)',
-      );
-    },
-  );
+    expect(
+      spec.type,
+      equals('segmentation'),
+      reason: 'segmentation() must produce type string "segmentation"',
+    );
+    expect(
+      spec.parameters,
+      isEmpty,
+      reason: 'segmentation() must have empty parameters (no Phase 4 params)',
+    );
+  });
 
   // ── Test 4 ────────────────────────────────────────────────────────────────
   test(
@@ -143,55 +137,84 @@ void main() {
     () {
       // Identity matrix: no-op color transform.
       final identity = <double>[
-        1, 0, 0, 0, 0,
-        0, 1, 0, 0, 0,
-        0, 0, 1, 0, 0,
-        0, 0, 0, 1, 0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
       ];
       final spec = VGFilterSpecs.colorMatrix(matrix: identity);
 
-      expect(spec.type, equals('colorMatrix'),
-          reason: 'colorMatrix() must produce type string "colorMatrix"');
-      expect(spec.enabled, isTrue,
-          reason: 'colorMatrix() default enabled must be true');
+      expect(
+        spec.type,
+        equals('colorMatrix'),
+        reason: 'colorMatrix() must produce type string "colorMatrix"',
+      );
+      expect(
+        spec.enabled,
+        isTrue,
+        reason: 'colorMatrix() default enabled must be true',
+      );
 
       final matrix = spec.parameters['matrix'] as List<double>;
-      expect(matrix.length, equals(20),
-          reason: 'matrix parameter must contain exactly 20 elements');
-      expect(matrix[0], closeTo(1.0, 1e-9),
-          reason: 'Row 0 col 0 of identity matrix must be 1.0');
-      expect(matrix[1], closeTo(0.0, 1e-9),
-          reason: 'Row 0 col 1 of identity matrix must be 0.0');
+      expect(
+        matrix.length,
+        equals(20),
+        reason: 'matrix parameter must contain exactly 20 elements',
+      );
+      expect(
+        matrix[0],
+        closeTo(1.0, 1e-9),
+        reason: 'Row 0 col 0 of identity matrix must be 1.0',
+      );
+      expect(
+        matrix[1],
+        closeTo(0.0, 1e-9),
+        reason: 'Row 0 col 1 of identity matrix must be 0.0',
+      );
     },
   );
 
   // ── Test 7 ────────────────────────────────────────────────────────────────
-  test(
-    'VGFilterSpecs.colorMatrix() toJson() serialises matrix correctly',
-    () {
-      final spec = VGFilterSpecs.colorMatrix(matrix: List<double>.filled(20, 0.5));
-      final json = spec.toJson();
+  test('VGFilterSpecs.colorMatrix() toJson() serialises matrix correctly', () {
+    final spec = VGFilterSpecs.colorMatrix(
+      matrix: List<double>.filled(20, 0.5),
+    );
+    final json = spec.toJson();
 
-      expect(json['type'], equals('colorMatrix'));
-      expect(json['enabled'], isTrue);
-      final matrix = (json['parameters'] as Map)['matrix'] as List;
-      expect(matrix.length, equals(20));
-      expect(matrix.first, closeTo(0.5, 1e-9));
-    },
-  );
+    expect(json['type'], equals('colorMatrix'));
+    expect(json['enabled'], isTrue);
+    final matrix = (json['parameters'] as Map)['matrix'] as List;
+    expect(matrix.length, equals(20));
+    expect(matrix.first, closeTo(0.5, 1e-9));
+  });
 
   // ── Test 8 ────────────────────────────────────────────────────────────────
-  test(
-    'VGFilterSpecs.colorMatrix() assertValid() does not throw',
-    () {
-      final spec = VGFilterSpecs.colorMatrix(matrix: List<double>.filled(20, 0.0));
-      expect(
-        () => spec.assertValid(),
-        returnsNormally,
-        reason: '"colorMatrix" is in _validTypes; assertValid() must not throw',
-      );
-    },
-  );
+  test('VGFilterSpecs.colorMatrix() assertValid() does not throw', () {
+    final spec = VGFilterSpecs.colorMatrix(
+      matrix: List<double>.filled(20, 0.0),
+    );
+    expect(
+      () => spec.assertValid(),
+      returnsNormally,
+      reason: '"colorMatrix" is in _validTypes; assertValid() must not throw',
+    );
+  });
 
   // ── Test 9 ────────────────────────────────────────────────────────────────
   test(
@@ -222,19 +245,34 @@ void main() {
         flipX: true,
       );
 
-      expect(spec.type, equals('transform'),
-          reason: 'transform() must produce type string "transform"');
-      expect(spec.enabled, isTrue,
-          reason: 'transform() default enabled must be true');
+      expect(
+        spec.type,
+        equals('transform'),
+        reason: 'transform() must produce type string "transform"',
+      );
+      expect(
+        spec.enabled,
+        isTrue,
+        reason: 'transform() default enabled must be true',
+      );
       expect(spec.parameters['canvasWidth'], equals(1080));
       expect(spec.parameters['canvasHeight'], equals(1920));
       expect((spec.parameters['scale'] as num).toDouble(), closeTo(1.5, 1e-9));
-      expect((spec.parameters['offsetX'] as num).toDouble(), closeTo(0.2, 1e-9));
-      expect((spec.parameters['offsetY'] as num).toDouble(), closeTo(-0.3, 1e-9));
+      expect(
+        (spec.parameters['offsetX'] as num).toDouble(),
+        closeTo(0.2, 1e-9),
+      );
+      expect(
+        (spec.parameters['offsetY'] as num).toDouble(),
+        closeTo(-0.3, 1e-9),
+      );
       expect(spec.parameters['rotationQuarterTurns'], equals(1));
       expect(spec.parameters['flipX'], isTrue);
-      expect(spec.parameters.containsKey('cropRect'), isFalse,
-          reason: 'cropRect absent when not provided');
+      expect(
+        spec.parameters.containsKey('cropRect'),
+        isFalse,
+        reason: 'cropRect absent when not provided',
+      );
     },
   );
 
@@ -269,26 +307,23 @@ void main() {
   );
 
   // ── Test 12 ───────────────────────────────────────────────────────────────
-  test(
-    'VGFilterSpecs.transform() assertValid() does not throw '
-    '("transform" is in _validTypes)',
-    () {
-      final spec = VGFilterSpecs.transform(
-        canvasWidth: 1080,
-        canvasHeight: 1920,
-        scale: 1.0,
-        offsetX: 0.0,
-        offsetY: 0.0,
-        rotationQuarterTurns: 0,
-        flipX: false,
-      );
-      expect(
-        () => spec.assertValid(),
-        returnsNormally,
-        reason: '"transform" is a known type; assertValid() must not throw',
-      );
-    },
-  );
+  test('VGFilterSpecs.transform() assertValid() does not throw '
+      '("transform" is in _validTypes)', () {
+    final spec = VGFilterSpecs.transform(
+      canvasWidth: 1080,
+      canvasHeight: 1920,
+      scale: 1.0,
+      offsetX: 0.0,
+      offsetY: 0.0,
+      rotationQuarterTurns: 0,
+      flipX: false,
+    );
+    expect(
+      () => spec.assertValid(),
+      returnsNormally,
+      reason: '"transform" is a known type; assertValid() must not throw',
+    );
+  });
 
   // ── Test 13 ───────────────────────────────────────────────────────────────
   test(
@@ -315,23 +350,35 @@ void main() {
   test(
     'VGFilterSpecs.transform() normalises rotationQuarterTurns to [0, 3]',
     () {
-      final spec4  = VGFilterSpecs.transform(
-        canvasWidth: 1080, canvasHeight: 1920,
-        scale: 1.0, offsetX: 0.0, offsetY: 0.0,
-        rotationQuarterTurns: 4,  // 4 mod 4 = 0
+      final spec4 = VGFilterSpecs.transform(
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        scale: 1.0,
+        offsetX: 0.0,
+        offsetY: 0.0,
+        rotationQuarterTurns: 4, // 4 mod 4 = 0
         flipX: false,
       );
-      expect(spec4.parameters['rotationQuarterTurns'], equals(0),
-          reason: 'quarterTurns=4 must normalise to 0');
+      expect(
+        spec4.parameters['rotationQuarterTurns'],
+        equals(0),
+        reason: 'quarterTurns=4 must normalise to 0',
+      );
 
       final spec5 = VGFilterSpecs.transform(
-        canvasWidth: 1080, canvasHeight: 1920,
-        scale: 1.0, offsetX: 0.0, offsetY: 0.0,
-        rotationQuarterTurns: 5,  // 5 mod 4 = 1
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        scale: 1.0,
+        offsetX: 0.0,
+        offsetY: 0.0,
+        rotationQuarterTurns: 5, // 5 mod 4 = 1
         flipX: false,
       );
-      expect(spec5.parameters['rotationQuarterTurns'], equals(1),
-          reason: 'quarterTurns=5 must normalise to 1');
+      expect(
+        spec5.parameters['rotationQuarterTurns'],
+        equals(1),
+        reason: 'quarterTurns=5 must normalise to 1',
+      );
     },
   );
 
@@ -341,7 +388,7 @@ void main() {
     () {
       expect(
         () => VGFilterSpecs.transform(
-          canvasWidth: 0,   // invalid
+          canvasWidth: 0, // invalid
           canvasHeight: 1920,
           scale: 1.0,
           offsetX: 0.0,
@@ -362,7 +409,7 @@ void main() {
       expect(
         () => VGFilterSpecs.transform(
           canvasWidth: 1080,
-          canvasHeight: -1,   // invalid
+          canvasHeight: -1, // invalid
           scale: 1.0,
           offsetX: 0.0,
           offsetY: 0.0,
@@ -376,24 +423,21 @@ void main() {
   );
 
   // ── Test 17 ───────────────────────────────────────────────────────────────
-  test(
-    'VGFilterSpecs.transform() throws AssertionError for scale <= 0',
-    () {
-      expect(
-        () => VGFilterSpecs.transform(
-          canvasWidth: 1080,
-          canvasHeight: 1920,
-          scale: 0.0,   // invalid
-          offsetX: 0.0,
-          offsetY: 0.0,
-          rotationQuarterTurns: 0,
-          flipX: false,
-        ),
-        throwsA(isA<AssertionError>()),
-        reason: 'scale=0.0 must throw AssertionError',
-      );
-    },
-  );
+  test('VGFilterSpecs.transform() throws AssertionError for scale <= 0', () {
+    expect(
+      () => VGFilterSpecs.transform(
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        scale: 0.0, // invalid
+        offsetX: 0.0,
+        offsetY: 0.0,
+        rotationQuarterTurns: 0,
+        flipX: false,
+      ),
+      throwsA(isA<AssertionError>()),
+      reason: 'scale=0.0 must throw AssertionError',
+    );
+  });
 
   // ── Test 18 ───────────────────────────────────────────────────────────────
   test(
@@ -408,7 +452,7 @@ void main() {
           offsetY: 0.0,
           rotationQuarterTurns: 0,
           flipX: false,
-          cropRect: [0.0, 0.0, 1.0],   // only 3 elements — invalid
+          cropRect: [0.0, 0.0, 1.0], // only 3 elements — invalid
         ),
         throwsA(isA<AssertionError>()),
         reason: 'cropRect with 3 elements must throw AssertionError',
@@ -429,13 +473,133 @@ void main() {
           offsetY: 0.0,
           rotationQuarterTurns: 0,
           flipX: false,
-          cropRect: [0.0, 0.0, 0.0, 1.0],   // w=0 — invalid
+          cropRect: [0.0, 0.0, 0.0, 1.0], // w=0 — invalid
         ),
         throwsA(isA<AssertionError>()),
         reason: 'cropRect with w=0 must throw AssertionError',
       );
     },
   );
+
+  // ── Phase 3 greenScreen alpha-output contract ──────────────────────────────
+
+  // ── Test 20 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreenAlpha() serialises type=="greenScreen" with '
+      'parameters exactly {backgroundType: alpha} and no argb', () {
+    final spec = VGFilterSpecs.greenScreenAlpha();
+
+    expect(
+      spec.type,
+      equals('greenScreen'),
+      reason: 'greenScreenAlpha() must produce type string "greenScreen"',
+    );
+    expect(
+      spec.enabled,
+      isTrue,
+      reason: 'greenScreenAlpha() default enabled must be true',
+    );
+    expect(
+      spec.parameters,
+      equals(<String, Object?>{'backgroundType': 'alpha'}),
+      reason: 'alpha parameters must be exactly {backgroundType: alpha}',
+    );
+    expect(
+      spec.parameters.containsKey('argb'),
+      isFalse,
+      reason: 'argb is not part of the alpha contract and must be absent',
+    );
+
+    final json = spec.toJson();
+    expect(
+      json,
+      equals(<String, Object?>{
+        'type': 'greenScreen',
+        'enabled': true,
+        'parameters': <String, Object?>{'backgroundType': 'alpha'},
+      }),
+      reason: 'toJson() must emit the documented alpha wire format',
+    );
+  });
+
+  // ── Test 21 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreenAlpha() assertValid() does not throw and the '
+      'spec differs from greenScreenSolidColor()', () {
+    expect(
+      () => VGFilterSpecs.greenScreenAlpha().assertValid(),
+      returnsNormally,
+      reason: '"greenScreen" is a known type; assertValid() must not throw',
+    );
+    expect(
+      VGFilterSpecs.greenScreenAlpha(),
+      isNot(equals(VGFilterSpecs.greenScreenSolidColor())),
+      reason: 'alpha and solidColor specs must not compare equal',
+    );
+    expect(
+      VGFilterSpecs.greenScreenAlpha(),
+      equals(VGFilterSpecs.greenScreenAlpha()),
+      reason: 'greenScreenAlpha() must be deterministic (value equality)',
+    );
+  });
+
+  // ── Test 22 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreenSolidColor() default wire format is preserved '
+      '(backgroundType solidColor, argb 0xFF00796B, nothing else)', () {
+    final spec = VGFilterSpecs.greenScreenSolidColor();
+
+    expect(spec.type, equals('greenScreen'));
+    expect(spec.enabled, isTrue);
+    expect(
+      spec.parameters,
+      equals(<String, Object?>{
+        'backgroundType': 'solidColor',
+        'argb': 0xFF00796B,
+      }),
+      reason: 'solidColor default parameters must be unchanged',
+    );
+
+    final json = spec.toJson();
+    expect(
+      json,
+      equals(<String, Object?>{
+        'type': 'greenScreen',
+        'enabled': true,
+        'parameters': <String, Object?>{
+          'backgroundType': 'solidColor',
+          'argb': 0xFF00796B,
+        },
+      }),
+      reason: 'toJson() must emit the documented solidColor wire format',
+    );
+  });
+
+  // ── Test 23 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreenSolidColor(argb: ...) forwards a custom argb '
+      'and passes assertValid()', () {
+    final spec = VGFilterSpecs.greenScreenSolidColor(argb: 0x80123456);
+
+    expect(spec.parameters['backgroundType'], equals('solidColor'));
+    expect(spec.parameters['argb'], equals(0x80123456));
+    expect(
+      () => spec.assertValid(),
+      returnsNormally,
+      reason: '"greenScreen" is a known type; assertValid() must not throw',
+    );
+  });
+
+  // ── Test 24 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreenSolidColor() throws AssertionError for argb '
+      'outside [0, 0xFFFFFFFF]', () {
+    expect(
+      () => VGFilterSpecs.greenScreenSolidColor(argb: -1),
+      throwsA(isA<AssertionError>()),
+      reason: 'argb=-1 must throw AssertionError',
+    );
+    expect(
+      () => VGFilterSpecs.greenScreenSolidColor(argb: 0x100000000),
+      throwsA(isA<AssertionError>()),
+      reason: 'argb=0x100000000 must throw AssertionError',
+    );
+  });
 }
 
 // ── AC coverage summary (P4-10 + Phase 10-C-3L.1C) ───────────────────────────
@@ -460,3 +624,8 @@ void main() {
 // P10C3L1D-09  transform() cropRect wrong length asserts (Test 18)
 // P10C3L1D-10  transform() cropRect invalid values asserts (Test 19)
 // P10C3L1D-11  'transform' accepted by assertValid (part of Test 12)
+// GS-ALPHA-01  greenScreenAlpha() type, exact parameters, no argb, toJson (Test 20)
+// GS-ALPHA-02  greenScreenAlpha() assertValid passes; differs from solidColor (Test 21)
+// GS-ALPHA-03  greenScreenSolidColor() default wire format preserved (Test 22)
+// GS-ALPHA-04  greenScreenSolidColor(argb:) forwards argb, assertValid passes (Test 23)
+// GS-ALPHA-05  greenScreenSolidColor() asserts on out-of-range argb (Test 24)
