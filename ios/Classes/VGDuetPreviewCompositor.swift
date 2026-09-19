@@ -36,6 +36,65 @@
 //   5. CIBlendWithMask — composites aspect-filled camera frame over canvas background using
 //      the refined mask.
 //
+// Diagnostic stage tap (offline replay lab only):
+// greenScreenMatteStages(aspectFilledMask:in:guidedBy:) is the single implementation of the
+// stage order above and returns every intermediate CIImage plus per-stage applied flags
+// (GreenScreenMatteStages). refineGreenScreenMask — the live composite path — is a thin view
+// over it, so production and diagnostics share one filter pipeline and cannot drift.
+// ciRect(fromTopLeft:), aspectFill(_:into:), and ciContext are internal (not private) so
+// VGLiveGreenScreenReplayDiagnostics can reproduce composite()'s exact geometry and render
+// the taps through the same context. The compositor itself never writes files.
+//
+// External live engine seam:
+// refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask:in:guidedBy:) exposes the
+// live refinement (refineGreenScreenMask: the S1 stages plus the opt-in tightAlphaR1
+// post-pass) to an engine that owns its own camera, matte, CIContext, and output —
+// the ARKit ARMatteGenerator engine (VGARKitLiveGreenScreenPreviewCoordinator) refines
+// its full-resolution matte through it before its own CIBlendWithMask. The wrapper
+// returns the refined CIImage recipe plus the per-stage applied flags and never changes
+// composite() or the default .s1 behavior; there is one implementation of the pipeline.
+//
+// S4 camera-guided alpha RND candidate (diagnostic only, NOT live):
+// greenScreenMatteStages(..., refinementMode: .s4GuidedAlphaR1) additionally runs
+// applyGreenScreenS4GuidedAlphaR1 on the S1 final mask. It builds a narrow unknown band
+// from the S1 matte (morphological gradient dilate − erode, softened, smoothstepped), a
+// camera luminance edge-confidence map (CIColorMatrix luma → CIEdges → blur → smoothstep),
+// and two in-band alpha candidates (an edge-aligned steepened S1 alpha and a locally
+// softened S1 alpha). Inside the band the candidate alpha is selected by edge confidence;
+// outside the band the S1 mask is returned untouched. Every step is a bounded stock
+// CoreImage filter (no CPU pixel loops, no global blur of the output, no S1 constant
+// changes) and any unavailable/degenerate step fails open to the S1 final mask.
+// composite() and refineGreenScreenMask never request S4; the default mode is .s1.
+//
+// S5 "guided filter R1" RND candidate (diagnostic only, NOT live):
+// greenScreenMatteStages(..., refinementMode: .s5GuidedFilterR1) additionally runs
+// applyGreenScreenS5GuidedFilterR1 on the S1 final mask. It approximates a true
+// local-linear guided filter (He et al.) using only stock CoreImage GPU filters — box-blur
+// means of the camera luminance guide I and the S1 mask p, their correlations and
+// variance/covariance, the closed-form linear coefficients a = cov/(var+eps) and
+// b = meanP − a·meanI, a second box blur of those coefficients, and q = meanA·I + meanB —
+// then clamps q to [0, 1] and applies it only inside a narrow matte-edge band (same
+// morphological-gradient band construction family as S4, S5-scoped constants); outside the
+// band the S1 mask is returned untouched. Every step is a bounded stock CoreImage filter
+// (no CPU pixel loops, no custom kernel needed) and any unavailable/degenerate step fails
+// open to the S1 final mask. composite() and refineGreenScreenMask never request S5; the
+// default mode is .s1.
+//
+// "tightAlphaR1" live matte refinement (opt-in; live-selectable, NOT lab-only):
+// Distinct from the diagnostic-only GreenScreenRefinementMode above (which gates only
+// the offline matte-lab / replay diagnostics), LiveMatteRefinementMode gates a second,
+// independent knob that the LIVE composite path itself may opt into. It is selectable
+// only through the diagnostic-only setLiveGreenScreenDiagnosticsOptions route
+// (iosLiveMatteRefinement) before session start; default live behavior is always
+// exactly .s1 (current production pipeline, byte-for-byte unchanged). When a session
+// opts into .tightAlphaR1, refineGreenScreenMask runs applyLiveTightAlphaR1 on the S1
+// final mask (postGuidedEdge) only — never on the raw Vision mask: a smoothstep remap
+// (approximately 0.28/0.90) tightens the alpha transition, then a small final
+// CIGaussianBlur (~0.35 px) re-softens the now-steeper edge. Every step is a bounded
+// stock CoreImage filter (no CPU pixel loops, no custom Metal/kernel) and any
+// unavailable/degenerate step fails open to the S1 mask unchanged. composite() and
+// refineGreenScreenMask default to .s1 with no init argument.
+//
 // Fail-open behavior:
 // Each refinement stage is fail-open to its input: if a required CoreImage filter is
 // unavailable or inputs are degenerate, the stage is skipped and the previous stage's
@@ -76,6 +135,13 @@ final class VGDuetPreviewCompositor {
     let canvasWidth: Int
     let canvasHeight: Int
 
+    /// Live-selectable matte refinement mode for this compositor instance (see
+    /// `LiveMatteRefinementMode`). Defaults to `.s1` (current production behavior,
+    /// unchanged when no argument is passed to `init`). Set once at session start from
+    /// the diagnostic-only `setLiveGreenScreenDiagnosticsOptions` route; never mutated
+    /// for the lifetime of the instance.
+    let liveMatteRefinementMode: LiveMatteRefinementMode
+
     var canvasSize: CGSize { CGSize(width: canvasWidth, height: canvasHeight) }
     private var canvasBounds: CGRect { CGRect(origin: .zero, size: canvasSize) }
 
@@ -84,7 +150,9 @@ final class VGDuetPreviewCompositor {
     /// Compositor-owned CIContext.  Backed by a single process-wide context
     /// (CIContext is thread-safe and expensive to create), so repeated
     /// attach/detach cycles do not pay the Metal pipeline warm-up cost again.
-    private let ciContext: CIContext
+    /// Internal (not private) so the offline replay lab can render matte stage
+    /// taps through the same context composite() uses.
+    let ciContext: CIContext
 
     /// Output pool.  BGRA + Metal compatible + IOSurface backed so Flutter's
     /// texture path can consume buffers directly.  nil when creation failed;
@@ -101,7 +169,9 @@ final class VGDuetPreviewCompositor {
 
     // MARK: - Palette (deterministic)
 
-    private static let canvasColor      = CIColor(red: 0.04, green: 0.04, blue: 0.05, alpha: 1.0)
+    /// Internal (not private) so the offline replay lab can rebuild composite()'s canvas
+    /// when composing a diagnostic-only (non-S1) final mask; composite() itself is unchanged.
+    static let canvasColor              = CIColor(red: 0.04, green: 0.04, blue: 0.05, alpha: 1.0)
     private static let placeholderFill  = CIColor(red: 0.16, green: 0.18, blue: 0.22, alpha: 1.0)
     private static let placeholderEdge  = CIColor(red: 0.34, green: 0.37, blue: 0.44, alpha: 1.0)
     private static let placeholderGlow  = CIColor(red: 0.30, green: 0.33, blue: 0.40, alpha: 1.0)
@@ -150,6 +220,61 @@ final class VGDuetPreviewCompositor {
     private static let greenScreenGuidedEdgeLow: CGFloat = 0.08
     private static let greenScreenGuidedEdgeHigh: CGFloat = 0.34
 
+    // MARK: - S4 guided-alpha RND constants (diagnostic only; never read by composite())
+
+    /// S4 band extraction: morphological gradient radius (dilate − erode of the S1 mask),
+    /// in canvas px. Defines how wide the refinable unknown band around the matte edge is.
+    private static let greenScreenS4BandRadius: CGFloat = 2.0
+    /// S4 band softening blur so the band boundary itself never introduces a seam.
+    private static let greenScreenS4BandBlurRadius: CGFloat = 1.0
+    /// S4 band weight smoothstep thresholds over the softened morphological gradient.
+    private static let greenScreenS4BandLow: CGFloat = 0.10
+    private static let greenScreenS4BandHigh: CGFloat = 0.50
+    /// S4 camera luminance edge confidence: CIEdges intensity, blur radius, smoothstep.
+    private static let greenScreenS4EdgeIntensity: CGFloat = 2.5
+    private static let greenScreenS4EdgeBlurRadius: CGFloat = 1.0
+    private static let greenScreenS4EdgeLow: CGFloat = 0.10
+    private static let greenScreenS4EdgeHigh: CGFloat = 0.40
+    /// S4 in-band candidates: soft-alpha blur radius used where the camera is flat, and the
+    /// edge-aligned steepening smoothstep used where the camera has a strong edge.
+    private static let greenScreenS4SoftAlphaRadius: CGFloat = 2.0
+    private static let greenScreenS4SnapLow: CGFloat = 0.20
+    private static let greenScreenS4SnapHigh: CGFloat = 0.80
+    /// Rec.709 luma weights used to derive the S4 camera guide luminance.
+    private static let greenScreenS4LumaWeights = CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0)
+
+    // MARK: - S5 guided-filter RND constants (diagnostic only; never read by composite())
+
+    /// S5 guided filter box-blur radius (canvas px): the local window used to estimate
+    /// means, correlations, and the linear coefficients a/b of the guided filter.
+    private static let greenScreenS5GuidedFilterRadius: CGFloat = 4.0
+    /// S5 guided filter regularization epsilon: keeps a = cov/(var+eps) bounded where the
+    /// camera guide is near-flat (var ≈ 0).
+    private static let greenScreenS5Epsilon: CGFloat = 0.0001
+    /// S5 band extraction: morphological gradient radius (dilate − erode of the S1 mask),
+    /// in canvas px. Same construction family as the S4 band, but an independent constant
+    /// so S4's band tuning is never touched.
+    private static let greenScreenS5BandRadius: CGFloat = 2.0
+    /// S5 band softening blur so the band boundary itself never introduces a seam.
+    private static let greenScreenS5BandBlurRadius: CGFloat = 1.0
+    /// S5 band weight smoothstep thresholds over the softened morphological gradient.
+    private static let greenScreenS5BandLow: CGFloat = 0.10
+    private static let greenScreenS5BandHigh: CGFloat = 0.50
+    /// Rec.709 luma weights used to derive the S5 camera guide luminance (S5-scoped so S4's
+    /// constant is never touched).
+    private static let greenScreenS5LumaWeights = CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0)
+
+    // MARK: - Live "tight alpha R1" RND constants (opt-in; live-selectable, never read
+    // unless liveMatteRefinementMode == .tightAlphaR1)
+
+    /// Live tight-alpha smoothstep remap thresholds applied to the S1 final mask
+    /// (offline A/B candidate "A tight alpha").
+    private static let liveTightAlphaR1Low: CGFloat = 0.28
+    private static let liveTightAlphaR1High: CGFloat = 0.90
+    /// Live tight-alpha final softening blur radius, in canvas px, applied after the
+    /// smoothstep remap to avoid reintroducing a hard edge.
+    private static let liveTightAlphaR1BlurRadius: CGFloat = 0.35
+
     /// One-time diagnostic marker: set to true after the first successful
     /// CIBlendWithMask composite.  Guards against log spam on every frame.
     private var _hasLoggedFirstMaskBlend = false
@@ -168,13 +293,15 @@ final class VGDuetPreviewCompositor {
 
     // MARK: - Init
 
-    init(canvasWidth: Double, canvasHeight: Double) {
+    init(canvasWidth: Double, canvasHeight: Double,
+         liveMatteRefinementMode: LiveMatteRefinementMode = .s1) {
         let width  = max(2, Int(canvasWidth.rounded()))
         let height = max(2, Int(canvasHeight.rounded()))
         self.canvasWidth  = width
         self.canvasHeight = height
         self.ciContext    = VGDuetPreviewCompositor.sharedContext
         self.pool         = VGDuetPreviewCompositor.makePool(width: width, height: height)
+        self.liveMatteRefinementMode = liveMatteRefinementMode
     }
 
     // MARK: - Composite
@@ -246,7 +373,7 @@ final class VGDuetPreviewCompositor {
                     // Grep marker: IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST
                     if !_hasLoggedFirstMaskBlend {
                         _hasLoggedFirstMaskBlend = true
-                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame maskFeatherRadius=\(VGDuetPreviewCompositor.greenScreenMaskFeatherRadius) maskFeatherApplied=\(refined.featherApplied) maskTrimapEnabled=\(VGDuetPreviewCompositor.greenScreenTrimapEnabled) maskTrimapApplied=\(refined.trimapApplied) maskTrimapLow=\(VGDuetPreviewCompositor.greenScreenTrimapLow) maskTrimapHigh=\(VGDuetPreviewCompositor.greenScreenTrimapHigh) maskGuidedEdgeEnabled=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeEnabled) maskGuidedEdgeApplied=\(refined.guidedApplied) maskGuidedEdgeIntensity=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeIntensity) maskGuidedEdgeBlurRadius=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeBlurRadius) maskGuidedEdgeLow=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeLow) maskGuidedEdgeHigh=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeHigh) maskMorphologyCloseEnabled=\(VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseEnabled) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskMorphologyCloseRadius=\(VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseRadius)")
+                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame maskFeatherRadius=\(VGDuetPreviewCompositor.greenScreenMaskFeatherRadius) maskFeatherApplied=\(refined.featherApplied) maskTrimapEnabled=\(VGDuetPreviewCompositor.greenScreenTrimapEnabled) maskTrimapApplied=\(refined.trimapApplied) maskTrimapLow=\(VGDuetPreviewCompositor.greenScreenTrimapLow) maskTrimapHigh=\(VGDuetPreviewCompositor.greenScreenTrimapHigh) maskGuidedEdgeEnabled=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeEnabled) maskGuidedEdgeApplied=\(refined.guidedApplied) maskGuidedEdgeIntensity=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeIntensity) maskGuidedEdgeBlurRadius=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeBlurRadius) maskGuidedEdgeLow=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeLow) maskGuidedEdgeHigh=\(VGDuetPreviewCompositor.greenScreenGuidedEdgeHigh) maskMorphologyCloseEnabled=\(VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseEnabled) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskMorphologyCloseRadius=\(VGDuetPreviewCompositor.greenScreenMaskMorphologyCloseRadius) liveMatteRefinementMode=\(liveMatteRefinementMode.rawValue) liveTightAlphaR1Applied=\(refined.tightAlphaR1Applied)")
                     }
                 } else {
                     // Filter unavailable (should not happen on supported iOS): fall back to
@@ -273,7 +400,8 @@ final class VGDuetPreviewCompositor {
 
     /// Converts a top-left-origin canvas rect to CoreImage bottom-left space,
     /// snapping edges to whole pixels and clipping to the canvas.
-    private func ciRect(fromTopLeft rect: CGRect) -> CGRect {
+    /// Internal so the offline replay lab maps cameraRect exactly as composite() does.
+    func ciRect(fromTopLeft rect: CGRect) -> CGRect {
         guard rect.width > 0, rect.height > 0 else { return .zero }
         let x0 = rect.minX.rounded()
         let x1 = rect.maxX.rounded()
@@ -289,7 +417,8 @@ final class VGDuetPreviewCompositor {
     }
 
     /// Scale-to-fill + center-crop `image` into `rect` (CI coordinates).
-    private func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {
+    /// Internal so the offline replay lab fills camera/mask exactly as composite() does.
+    func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {
         let extent = image.extent
         guard extent.width > 0, extent.height > 0 else { return CIImage.empty() }
         let scale  = max(rect.width / extent.width, rect.height / extent.height)
@@ -301,27 +430,240 @@ final class VGDuetPreviewCompositor {
         return image.transformed(by: transform).cropped(to: rect)
     }
 
-    /// Refines an already aspect-filled green-screen mask at output scale in four
-    /// fail-open stages:
+    // MARK: - Matte refinement stage tap
+
+    /// Diagnostic-only matte refinement modes selectable through
+    /// `greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:)`.
+    /// The live composite path (`composite()` / `refineGreenScreenMask`) always uses `.s1`;
+    /// no other mode is reachable from production code. Raw values are the exact strings
+    /// accepted at the method channel.
+    enum GreenScreenRefinementMode: String, CaseIterable {
+        /// Production pipeline (default): morphology close → feather → trimap → guided edge.
+        case s1 = "s1"
+        /// RND candidate: S1 final mask plus band-limited camera-guided alpha refinement.
+        case s4GuidedAlphaR1 = "s4GuidedAlphaR1"
+        /// RND candidate: S1 final mask plus band-limited local-linear guided-filter
+        /// refinement (approximate He et al. guided filter) using the camera frame as guide.
+        case s5GuidedFilterR1 = "s5GuidedFilterR1"
+    }
+
+    /// Live-selectable matte refinement mode, opt-in only through the diagnostic-only
+    /// `setLiveGreenScreenDiagnosticsOptions` route (`iosLiveMatteRefinement`) before
+    /// session start; never part of the public Dart API. Distinct from
+    /// `GreenScreenRefinementMode`, which gates only the offline matte-lab / replay
+    /// diagnostics — the two enums are independent so lab-only S4/S5 candidates can
+    /// never be reached live, and this live-only mode never reaches the lab. Raw values
+    /// are the exact strings accepted at the method channel.
+    enum LiveMatteRefinementMode: String, CaseIterable {
+        /// Production default (default with no init argument): unchanged S1 final mask.
+        case s1 = "s1"
+        /// Opt-in RND candidate ("A tight alpha" offline A/B): bounded CoreImage
+        /// post-pass over the S1 final mask (smoothstep remap + small final blur). See
+        /// `applyLiveTightAlphaR1`.
+        case tightAlphaR1 = "tightAlphaR1"
+    }
+
+    /// Every intermediate image of the production matte refinement pipeline plus the
+    /// per-stage applied flags, as produced by
+    /// `greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:)`.
+    /// Images are lazy CoreImage recipes cropped to the camera rect; the caller renders
+    /// them (the compositor never writes files). `postGuidedEdge` is exactly the mask
+    /// that `composite()` feeds to CIBlendWithMask. The S4 fields are populated only when
+    /// `.s4GuidedAlphaR1` was requested; otherwise they alias `postGuidedEdge`.
+    struct GreenScreenMatteStages {
+        /// The aspect-filled mask exactly as passed in (input to stage 1).
+        let aspectFilledInput: CIImage
+        /// Stage 1 output (morphology close), or `aspectFilledInput` when not applied.
+        let postMorphologyClose: CIImage
+        /// Stage 2 output (feather), or `postMorphologyClose` when not applied.
+        let postFeather: CIImage
+        /// Stage 3 output (trimap), or `postFeather` when not applied.
+        let postTrimap: CIImage
+        /// Stage 4 output (guided edge preserve), or `postTrimap` when not applied.
+        /// This is the final refined mask used by `composite()`.
+        let postGuidedEdge: CIImage
+        let morphologyCloseApplied: Bool
+        let featherApplied: Bool
+        let trimapApplied: Bool
+        let guidedEdgeApplied: Bool
+
+        /// Mode these stages were requested with. `composite()` always requests `.s1`.
+        let refinementMode: GreenScreenRefinementMode
+        /// S4 RND candidate output: the band-limited camera-guided refinement of
+        /// `postGuidedEdge` when `refinementMode == .s4GuidedAlphaR1` and every S4 filter
+        /// step succeeded; otherwise exactly `postGuidedEdge` (fail-open to S1).
+        let postS4GuidedAlpha: CIImage
+        /// S4 refinement band weight (0 = S1 kept, 1 = fully S4-refined), only when S4 was
+        /// applied; nil otherwise. Diagnostic tap so the lab can show where S4 acted.
+        let s4RefinementBand: CIImage?
+        /// True only when `.s4GuidedAlphaR1` was requested and fully applied.
+        let s4GuidedAlphaApplied: Bool
+        /// Non-nil only when `.s4GuidedAlphaR1` was requested but failed open to S1;
+        /// names the first unavailable/degenerate step.
+        let s4GuidedAlphaFailOpenReason: String?
+
+        /// S5 RND candidate output: the band-limited local-linear guided-filter refinement
+        /// of `postGuidedEdge` when `refinementMode == .s5GuidedFilterR1` and every S5
+        /// filter step succeeded; otherwise exactly `postGuidedEdge` (fail-open to S1).
+        let postS5GuidedFilter: CIImage
+        /// S5 refinement band weight (0 = S1 kept, 1 = fully S5-refined), only when S5 was
+        /// applied; nil otherwise. Diagnostic tap so the lab can show where S5 acted.
+        let s5RefinementBand: CIImage?
+        /// True only when `.s5GuidedFilterR1` was requested and fully applied.
+        let s5GuidedFilterApplied: Bool
+        /// Non-nil only when `.s5GuidedFilterR1` was requested but failed open to S1;
+        /// names the first unavailable/degenerate step.
+        let s5GuidedFilterFailOpenReason: String?
+
+        /// The final mask selected by `refinementMode`: `postGuidedEdge` for `.s1`,
+        /// `postS4GuidedAlpha` for `.s4GuidedAlphaR1`, `postS5GuidedFilter` for
+        /// `.s5GuidedFilterR1` (each identical to `postGuidedEdge` on fail-open). The live
+        /// composite path reads `postGuidedEdge` directly.
+        var finalMask: CIImage {
+            switch refinementMode {
+            case .s1:               return postGuidedEdge
+            case .s4GuidedAlphaR1:  return postS4GuidedAlpha
+            case .s5GuidedFilterR1: return postS5GuidedFilter
+            }
+        }
+    }
+
+    /// Runs the four production refinement stages on an already aspect-filled mask and
+    /// returns every intermediate image:
     ///   1. applyGreenScreenMorphologyClose — morphology close r1b fills pinholes / bites.
     ///   2. featherGreenScreenMask — gaussian blur softens edges.
     ///   3. applyGreenScreenTrimap — smoothstep curve separates foreground/background.
     ///   4. applyGreenScreenGuidedEdgePreserve — restores fine edges from camera guide.
     ///
-    /// - Parameter guide: aspect-filled camera frame used as an edge guide for stage 4;
-    ///   never composited into the returned mask directly.
-    /// - Returns: refined mask plus per-stage applied flags. Each stage fails open to
-    ///   its input if filter creation fails or inputs are degenerate.
-    private func refineGreenScreenMask(_ mask: CIImage, in rect: CGRect, guidedBy guide: CIImage)
-        -> (mask: CIImage, morphologyCloseApplied: Bool, featherApplied: Bool, trimapApplied: Bool, guidedApplied: Bool) {
-        let closed = applyGreenScreenMorphologyClose(mask, in: rect)
+    /// This is the single implementation of the stage order; `refineGreenScreenMask`
+    /// (live composite path) is a thin view over it, so diagnostics and production cannot
+    /// drift. Each stage fails open to its input if filter creation fails or inputs are
+    /// degenerate.
+    ///
+    /// - Parameters:
+    ///   - mask:  mask already aspect-filled into `rect` (see `aspectFill(_:into:)`).
+    ///   - rect:  CI-space camera rect (see `ciRect(fromTopLeft:)`).
+    ///   - guide: camera frame already aspect-filled into `rect`; used as an edge guide
+    ///            for stage 4 (and the S4 candidate) only, never composited into the
+    ///            returned masks.
+    ///   - refinementMode: `.s1` (default; the four stages above, exactly what
+    ///            `composite()` uses), `.s4GuidedAlphaR1`, or `.s5GuidedFilterR1`
+    ///            (diagnostic-only RND candidates run on top of the unchanged S1 stages;
+    ///            see `applyGreenScreenS4GuidedAlphaR1` / `applyGreenScreenS5GuidedFilterR1`).
+    func greenScreenMatteStages(aspectFilledMask mask: CIImage,
+                                in rect: CGRect,
+                                guidedBy guide: CIImage,
+                                refinementMode: GreenScreenRefinementMode = .s1) -> GreenScreenMatteStages {
+        let closed    = applyGreenScreenMorphologyClose(mask, in: rect)
         let feathered = featherGreenScreenMask(closed.mask, in: rect)
         let trimapped = applyGreenScreenTrimap(feathered.mask, in: rect)
-        let guided = applyGreenScreenGuidedEdgePreserve(trimapped: trimapped.mask,
-                                                          feathered: feathered.mask,
-                                                          guide: guide,
-                                                          in: rect)
-        return (guided.mask, closed.applied, feathered.applied, trimapped.applied, guided.applied)
+        let guided    = applyGreenScreenGuidedEdgePreserve(trimapped: trimapped.mask,
+                                                           feathered: feathered.mask,
+                                                           guide: guide,
+                                                           in: rect)
+        let s4: GreenScreenS4Result
+        let s5: GreenScreenS5Result
+        switch refinementMode {
+        case .s1:
+            s4 = GreenScreenS4Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+            s5 = GreenScreenS5Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+        case .s4GuidedAlphaR1:
+            s4 = applyGreenScreenS4GuidedAlphaR1(base: guided.mask, guide: guide, in: rect)
+            s5 = GreenScreenS5Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+        case .s5GuidedFilterR1:
+            s4 = GreenScreenS4Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+            s5 = applyGreenScreenS5GuidedFilterR1(base: guided.mask, guide: guide, in: rect)
+        }
+        return GreenScreenMatteStages(aspectFilledInput: mask,
+                                      postMorphologyClose: closed.mask,
+                                      postFeather: feathered.mask,
+                                      postTrimap: trimapped.mask,
+                                      postGuidedEdge: guided.mask,
+                                      morphologyCloseApplied: closed.applied,
+                                      featherApplied: feathered.applied,
+                                      trimapApplied: trimapped.applied,
+                                      guidedEdgeApplied: guided.applied,
+                                      refinementMode: refinementMode,
+                                      postS4GuidedAlpha: s4.mask,
+                                      s4RefinementBand: s4.band,
+                                      s4GuidedAlphaApplied: s4.applied,
+                                      s4GuidedAlphaFailOpenReason: s4.failOpenReason,
+                                      postS5GuidedFilter: s5.mask,
+                                      s5RefinementBand: s5.band,
+                                      s5GuidedFilterApplied: s5.applied,
+                                      s5GuidedFilterFailOpenReason: s5.failOpenReason)
+    }
+
+    /// Result of the live mask refinement as exposed to an external live engine (see
+    /// `refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask:in:guidedBy:)`).
+    /// `mask` is a lazy CoreImage recipe cropped to the rect it was refined in; the
+    /// caller blends and renders it through its own CIContext. The applied flags are the
+    /// exact per-stage flags `composite()` logs for its own first blend.
+    struct LiveGreenScreenMaskRefinement {
+        /// Refined mask (S1 final mask, plus tight-alpha R1 when opted in); fails open
+        /// stage by stage to the raw input, never nil.
+        let mask: CIImage
+        /// Mode this compositor instance runs live (`.s1` default or `.tightAlphaR1`).
+        let liveMatteRefinementMode: LiveMatteRefinementMode
+        let morphologyCloseApplied: Bool
+        let featherApplied: Bool
+        let trimapApplied: Bool
+        let guidedEdgeApplied: Bool
+        let tightAlphaR1Applied: Bool
+    }
+
+    /// Live mask refinement for an external live engine that owns its own camera, matte
+    /// source, CIContext, output pool, and publishing (the ARKit ARMatteGenerator engine,
+    /// VGARKitLiveGreenScreenPreviewCoordinator) and uses this compositor only to refine
+    /// its mask with the identical production pipeline the adapter path runs. It is a
+    /// thin wrapper over `refineGreenScreenMask` — the same call `composite()` makes —
+    /// so there is exactly one implementation of the live refinement and the two engines
+    /// cannot drift. `composite()` and its default behavior are untouched.
+    ///
+    /// - Parameters:
+    ///   - mask:  single-channel matte already oriented and aspect-filled into `rect`
+    ///            (mask ~= 1 → subject), the same geometry the caller blends with.
+    ///   - rect:  CI-space (bottom-left origin) foreground rect the mask and guide were
+    ///            filled into; every stage is evaluated only over this rect.
+    ///   - guide: camera frame already oriented and aspect-filled into `rect`, used only
+    ///            as the edge guide for the guided-edge-preserve stage.
+    func refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask mask: CIImage,
+                                                    in rect: CGRect,
+                                                    guidedBy guide: CIImage) -> LiveGreenScreenMaskRefinement {
+        let refined = refineGreenScreenMask(mask, in: rect, guidedBy: guide)
+        return LiveGreenScreenMaskRefinement(mask: refined.mask,
+                                             liveMatteRefinementMode: liveMatteRefinementMode,
+                                             morphologyCloseApplied: refined.morphologyCloseApplied,
+                                             featherApplied: refined.featherApplied,
+                                             trimapApplied: refined.trimapApplied,
+                                             guidedEdgeApplied: refined.guidedApplied,
+                                             tightAlphaR1Applied: refined.tightAlphaR1Applied)
+    }
+
+    /// Live composite path: refines an already aspect-filled green-screen mask at output
+    /// scale through `greenScreenMatteStages` (S1 default mode; never S4/S5 — those are
+    /// lab-only) and then, only when this instance opted into `.tightAlphaR1` via
+    /// `liveMatteRefinementMode`, runs `applyLiveTightAlphaR1` on the S1 final mask
+    /// (`postGuidedEdge`). The default `.s1` mode returns `postGuidedEdge` unchanged.
+    /// Shared verbatim with the ARKit engine through
+    /// `refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask:in:guidedBy:)`.
+    private func refineGreenScreenMask(_ mask: CIImage, in rect: CGRect, guidedBy guide: CIImage)
+        -> (mask: CIImage, morphologyCloseApplied: Bool, featherApplied: Bool, trimapApplied: Bool,
+            guidedApplied: Bool, tightAlphaR1Applied: Bool) {
+        let stages = greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide)
+        var finalMask = stages.postGuidedEdge
+        var tightAlphaR1Applied = false
+        if liveMatteRefinementMode == .tightAlphaR1 {
+            let tightAlpha = applyLiveTightAlphaR1(stages.postGuidedEdge, in: rect)
+            finalMask = tightAlpha.mask
+            tightAlphaR1Applied = tightAlpha.applied
+        }
+        return (finalMask,
+                stages.morphologyCloseApplied,
+                stages.featherApplied,
+                stages.trimapApplied,
+                stages.guidedEdgeApplied,
+                tightAlphaR1Applied)
     }
 
     /// Morphological close: CIMorphologyMaximum (dilate) then CIMorphologyMinimum (erode),
@@ -540,6 +882,527 @@ final class VGDuetPreviewCompositor {
             return (trimapped, false)
         }
         return (blended.cropped(to: rect), true)
+    }
+
+    // MARK: - S4 guided-alpha RND candidate (diagnostic only)
+
+    /// Result of the S4 candidate: `mask` is the refined mask (or `base` on fail-open),
+    /// `band` the 0..1 refinement band weight when applied.
+    struct GreenScreenS4Result {
+        let mask: CIImage
+        let band: CIImage?
+        let applied: Bool
+        let failOpenReason: String?
+    }
+
+    /// S4 "guided alpha R1": band-limited, camera-guided refinement of the S1 final mask.
+    ///
+    /// Pipeline (all stock CoreImage filters, evaluated only over the camera `rect`):
+    ///   1. Unknown band from the S1 matte: morphological gradient (CIMorphologyMaximum −
+    ///      CIMorphologyMinimum via CIDifferenceBlendMode, radius 2.0) → CIGaussianBlur 1.0
+    ///      → smoothstep(0.10, 0.50). ≈1 on the matte edge, 0 in solid regions.
+    ///   2. Camera edge confidence from `guide` luminance (Rec.709 CIColorMatrix) → CIEdges
+    ///      intensity 2.5 → CIGaussianBlur 1.0 → smoothstep(0.10, 0.40).
+    ///   3. In-band candidates from the S1 mask: `snapped` = smoothstep(0.20, 0.80, base)
+    ///      (edge-aligned, steeper transition) and `soft` = CIGaussianBlur(base, 2.0).
+    ///   4. `guidedInBand` = CIBlendWithMask(fg: snapped, bg: soft, mask: edgeConfidence):
+    ///      steeper where the camera has a real edge, softer where it is flat.
+    ///   5. `refined` = CIBlendWithMask(fg: guidedInBand, bg: base, mask: band): only band
+    ///      pixels change; everything else is the S1 mask bit-for-bit.
+    ///
+    /// Fail-open: any nil filter, degenerate rect/extent, or inconsistent constant returns
+    /// `base` unchanged with `applied == false` and a reason naming the step. Never called
+    /// by `composite()`; S1 constants and stage bodies are untouched.
+    private func applyGreenScreenS4GuidedAlphaR1(base: CIImage,
+                                                 guide: CIImage,
+                                                 in rect: CGRect) -> GreenScreenS4Result {
+        func failOpen(_ reason: String) -> GreenScreenS4Result {
+            return GreenScreenS4Result(mask: base, band: nil, applied: false, failOpenReason: reason)
+        }
+
+        let bandRadius = VGDuetPreviewCompositor.greenScreenS4BandRadius
+        let bandBlur   = VGDuetPreviewCompositor.greenScreenS4BandBlurRadius
+        let bandLow    = VGDuetPreviewCompositor.greenScreenS4BandLow
+        let bandHigh   = VGDuetPreviewCompositor.greenScreenS4BandHigh
+        let edgeBlur   = VGDuetPreviewCompositor.greenScreenS4EdgeBlurRadius
+        let edgeLow    = VGDuetPreviewCompositor.greenScreenS4EdgeLow
+        let edgeHigh   = VGDuetPreviewCompositor.greenScreenS4EdgeHigh
+        let softRadius = VGDuetPreviewCompositor.greenScreenS4SoftAlphaRadius
+        let snapLow    = VGDuetPreviewCompositor.greenScreenS4SnapLow
+        let snapHigh   = VGDuetPreviewCompositor.greenScreenS4SnapHigh
+
+        guard bandRadius > 0, bandBlur > 0, bandHigh > bandLow,
+              edgeBlur > 0, edgeHigh > edgeLow,
+              softRadius > 0, snapHigh > snapLow else {
+            return failOpen("degenerate_constants")
+        }
+        guard !rect.isEmpty, !rect.isInfinite, rect.width >= 2, rect.height >= 2 else {
+            return failOpen("degenerate_rect")
+        }
+        guard !base.extent.isEmpty, !base.extent.isInfinite,
+              !guide.extent.isEmpty, !guide.extent.isInfinite else {
+            return failOpen("empty_or_unbounded_input")
+        }
+
+        // 1. Unknown band: morphological gradient of the S1 mask, softened, smoothstepped.
+        //    Every morphology input is a finite, edge-replicated crop (never an infinite
+        //    extent chained into a second morphology filter; see r1b note in stage 1).
+        let pad         = max(bandRadius * 2, 2)
+        let workingRect = rect.insetBy(dx: -pad, dy: -pad)
+        let morphInput  = base.clampedToExtent().cropped(to: workingRect.insetBy(dx: -bandRadius, dy: -bandRadius))
+        guard let dilated = CIFilter(name: "CIMorphologyMaximum",
+                                     parameters: ["inputImage": morphInput, "inputRadius": bandRadius])?
+                .outputImage?.cropped(to: workingRect) else {
+            return failOpen("band_dilate_unavailable")
+        }
+        guard let eroded = CIFilter(name: "CIMorphologyMinimum",
+                                    parameters: ["inputImage": morphInput, "inputRadius": bandRadius])?
+                .outputImage?.cropped(to: workingRect) else {
+            return failOpen("band_erode_unavailable")
+        }
+        guard let gradient = CIFilter(name: "CIDifferenceBlendMode",
+                                      parameters: ["inputImage": dilated, "inputBackgroundImage": eroded])?
+                .outputImage?.cropped(to: workingRect) else {
+            return failOpen("band_gradient_unavailable")
+        }
+        guard let gradientSoft = CIFilter(name: "CIGaussianBlur",
+                                          parameters: ["inputImage": gradient.clampedToExtent(), "inputRadius": bandBlur])?
+                .outputImage?.cropped(to: rect) else {
+            return failOpen("band_blur_unavailable")
+        }
+        guard let band = greenScreenS4Smoothstep(gradientSoft, low: bandLow, high: bandHigh)?.cropped(to: rect) else {
+            return failOpen("band_smoothstep_unavailable")
+        }
+
+        // 2. Camera luminance edge confidence (guide is only ever read, never composited).
+        let lumaWeights = VGDuetPreviewCompositor.greenScreenS4LumaWeights
+        let lumaParams: [String: Any] = [
+            "inputImage":      guide.cropped(to: rect),
+            "inputRVector":    lumaWeights,
+            "inputGVector":    lumaWeights,
+            "inputBVector":    lumaWeights,
+            "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+            "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+        ]
+        guard let luma = CIFilter(name: "CIColorMatrix", parameters: lumaParams)?.outputImage else {
+            return failOpen("edge_luma_unavailable")
+        }
+        let edgesParams: [String: Any] = [
+            "inputImage":     luma,
+            "inputIntensity": VGDuetPreviewCompositor.greenScreenS4EdgeIntensity,
+        ]
+        guard let edges = CIFilter(name: "CIEdges", parameters: edgesParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("edge_detect_unavailable")
+        }
+        guard let edgesSoft = CIFilter(name: "CIGaussianBlur",
+                                       parameters: ["inputImage": edges.clampedToExtent(), "inputRadius": edgeBlur])?
+                .outputImage?.cropped(to: rect) else {
+            return failOpen("edge_blur_unavailable")
+        }
+        guard let edgeConfidence = greenScreenS4Smoothstep(edgesSoft, low: edgeLow, high: edgeHigh)?.cropped(to: rect) else {
+            return failOpen("edge_smoothstep_unavailable")
+        }
+
+        // 3. In-band candidates derived from the S1 mask only.
+        guard let softAlpha = CIFilter(name: "CIGaussianBlur",
+                                       parameters: ["inputImage": base.clampedToExtent(), "inputRadius": softRadius])?
+                .outputImage?.cropped(to: rect) else {
+            return failOpen("soft_alpha_unavailable")
+        }
+        guard let snappedAlpha = greenScreenS4Smoothstep(base, low: snapLow, high: snapHigh)?.cropped(to: rect) else {
+            return failOpen("snap_alpha_unavailable")
+        }
+
+        // 4. Guided selection inside the band: steeper at camera edges, softer where flat.
+        let guidedParams: [String: Any] = [
+            "inputImage":           snappedAlpha,
+            "inputBackgroundImage": softAlpha,
+            "inputMaskImage":       edgeConfidence,
+        ]
+        guard let guidedInBand = CIFilter(name: "CIBlendWithMask", parameters: guidedParams)?.outputImage else {
+            return failOpen("guided_blend_unavailable")
+        }
+
+        // 5. Band-limited application: outside the band the S1 mask is returned untouched.
+        let bandParams: [String: Any] = [
+            "inputImage":           guidedInBand,
+            "inputBackgroundImage": base,
+            "inputMaskImage":       band,
+        ]
+        guard let refined = CIFilter(name: "CIBlendWithMask", parameters: bandParams)?.outputImage else {
+            return failOpen("band_blend_unavailable")
+        }
+        return GreenScreenS4Result(mask: refined.cropped(to: rect), band: band, applied: true, failOpenReason: nil)
+    }
+
+    /// S4 helper: smoothstep(low, high, m) per R, G, B with alpha identity, as a fused
+    /// CIColorMatrix → CIColorClamp → CIColorPolynomial recipe (same construction as the
+    /// S1 trimap / guided-edge curves, kept separate so S1 stage bodies stay untouched).
+    /// Returns nil when `high <= low` or a filter is unavailable.
+    private func greenScreenS4Smoothstep(_ image: CIImage, low: CGFloat, high: CGFloat) -> CIImage? {
+        guard high > low else { return nil }
+        let scale = 1 / (high - low)
+        let bias  = -low * scale
+        let rampParams: [String: Any] = [
+            "inputImage":      image,
+            "inputRVector":    CIVector(x: scale, y: 0,     z: 0,     w: 0),
+            "inputGVector":    CIVector(x: 0,     y: scale, z: 0,     w: 0),
+            "inputBVector":    CIVector(x: 0,     y: 0,     z: scale, w: 0),
+            "inputAVector":    CIVector(x: 0,     y: 0,     z: 0,     w: 1),
+            "inputBiasVector": CIVector(x: bias,  y: bias,  z: bias,  w: 0),
+        ]
+        guard let ramped = CIFilter(name: "CIColorMatrix", parameters: rampParams)?.outputImage else {
+            return nil
+        }
+        let clampParams: [String: Any] = [
+            "inputImage":         ramped,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]
+        guard let clamped = CIFilter(name: "CIColorClamp", parameters: clampParams)?.outputImage else {
+            return nil
+        }
+        let smoothstep = CIVector(x: 0, y: 0, z: 3, w: -2)
+        let curveParams: [String: Any] = [
+            "inputImage":             clamped,
+            "inputRedCoefficients":   smoothstep,
+            "inputGreenCoefficients": smoothstep,
+            "inputBlueCoefficients":  smoothstep,
+            "inputAlphaCoefficients": CIVector(x: 0, y: 1, z: 0, w: 0),
+        ]
+        return CIFilter(name: "CIColorPolynomial", parameters: curveParams)?.outputImage
+    }
+
+    // MARK: - S5 guided-filter RND candidate (diagnostic only)
+
+    /// Result of the S5 candidate: `mask` is the refined mask (or `base` on fail-open),
+    /// `band` the 0..1 refinement band weight when applied.
+    struct GreenScreenS5Result {
+        let mask: CIImage
+        let band: CIImage?
+        let applied: Bool
+        let failOpenReason: String?
+    }
+
+    /// S5 "guided filter R1": band-limited, camera-guided-filter refinement of the S1 final
+    /// mask, approximating a true local-linear guided filter (He et al.) using only stock
+    /// CoreImage GPU filters (no CPU pixel loops, no custom kernel needed).
+    ///
+    /// Let I = camera luminance guide, p = the S1 final mask (`base`). Over a box window of
+    /// radius `greenScreenS5GuidedFilterRadius`:
+    ///   meanI, meanP           = box-blur(I), box-blur(p)
+    ///   corrI, corrIP          = box-blur(I·I), box-blur(I·p)
+    ///   varI                   = corrI − meanI·meanI
+    ///   covIP                  = corrIP − meanI·meanP
+    ///   a                      = covIP / (varI + eps)   (eps floors the divisor so a
+    ///                            reciprocal via CIGammaAdjust(power: -1) never sees <= 0)
+    ///   b                      = meanP − a·meanI
+    ///   meanA, meanB           = box-blur(a), box-blur(b)   (classic guided-filter step:
+    ///                            the linear coefficients themselves are smoothed)
+    ///   q                      = meanA·I + meanB, clamped to [0, 1]
+    /// `q` is then applied only inside a narrow matte-edge band derived from `base`
+    /// (morphological gradient dilate − erode, softened, smoothstepped — same construction
+    /// family as the S4 band, S5-scoped constants); outside the band `base` is returned
+    /// untouched.
+    ///
+    /// Fail-open: any nil filter, degenerate rect/extent, or inconsistent constant returns
+    /// `base` unchanged with `applied == false` and a reason naming the step. Never called
+    /// by `composite()`; S1 constants and stage bodies are untouched.
+    private func applyGreenScreenS5GuidedFilterR1(base: CIImage,
+                                                   guide: CIImage,
+                                                   in rect: CGRect) -> GreenScreenS5Result {
+        func failOpen(_ reason: String) -> GreenScreenS5Result {
+            return GreenScreenS5Result(mask: base, band: nil, applied: false, failOpenReason: reason)
+        }
+
+        let filterRadius = VGDuetPreviewCompositor.greenScreenS5GuidedFilterRadius
+        let epsilon      = VGDuetPreviewCompositor.greenScreenS5Epsilon
+        let bandRadius   = VGDuetPreviewCompositor.greenScreenS5BandRadius
+        let bandBlur     = VGDuetPreviewCompositor.greenScreenS5BandBlurRadius
+        let bandLow      = VGDuetPreviewCompositor.greenScreenS5BandLow
+        let bandHigh     = VGDuetPreviewCompositor.greenScreenS5BandHigh
+
+        guard filterRadius > 0, epsilon > 0, bandRadius > 0, bandBlur > 0, bandHigh > bandLow else {
+            return failOpen("degenerate_constants")
+        }
+        guard !rect.isEmpty, !rect.isInfinite, rect.width >= 2, rect.height >= 2 else {
+            return failOpen("degenerate_rect")
+        }
+        guard !base.extent.isEmpty, !base.extent.isInfinite,
+              !guide.extent.isEmpty, !guide.extent.isInfinite else {
+            return failOpen("empty_or_unbounded_input")
+        }
+
+        // 1. Camera luminance guide I (Rec.709), cropped to rect.
+        let lumaWeights = VGDuetPreviewCompositor.greenScreenS5LumaWeights
+        let lumaParams: [String: Any] = [
+            "inputImage":      guide.cropped(to: rect),
+            "inputRVector":    lumaWeights,
+            "inputGVector":    lumaWeights,
+            "inputBVector":    lumaWeights,
+            "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+            "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+        ]
+        guard let lumaI = CIFilter(name: "CIColorMatrix", parameters: lumaParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("luma_unavailable")
+        }
+
+        // p is the S1 final mask, already 0..1 grayscale, cropped to rect.
+        let p = base.cropped(to: rect)
+
+        // 2. Box-filter means and elementwise products (all bounded stock GPU filters).
+        func boxMean(_ image: CIImage) -> CIImage? {
+            let params: [String: Any] = [
+                "inputImage":  image.clampedToExtent(),
+                "inputRadius": filterRadius,
+            ]
+            return CIFilter(name: "CIBoxBlur", parameters: params)?.outputImage?.cropped(to: rect)
+        }
+        func multiply(_ a: CIImage, _ b: CIImage) -> CIImage? {
+            let params: [String: Any] = ["inputImage": a, "inputBackgroundImage": b]
+            return CIFilter(name: "CIMultiplyBlendMode", parameters: params)?.outputImage?.cropped(to: rect)
+        }
+        func subtract(_ a: CIImage, _ b: CIImage) -> CIImage? {
+            let params: [String: Any] = ["inputImage": a, "inputBackgroundImage": b]
+            return CIFilter(name: "CISubtractBlendMode", parameters: params)?.outputImage?.cropped(to: rect)
+        }
+
+        guard let meanI = boxMean(lumaI) else { return failOpen("mean_i_unavailable") }
+        guard let meanP = boxMean(p) else { return failOpen("mean_p_unavailable") }
+        guard let iSquared = multiply(lumaI, lumaI) else { return failOpen("i_squared_unavailable") }
+        guard let iTimesP = multiply(lumaI, p) else { return failOpen("i_times_p_unavailable") }
+        guard let corrI = boxMean(iSquared) else { return failOpen("corr_i_unavailable") }
+        guard let corrIP = boxMean(iTimesP) else { return failOpen("corr_ip_unavailable") }
+
+        // 3. Variance / covariance over the box window.
+        guard let meanISquared = multiply(meanI, meanI) else { return failOpen("mean_i_squared_unavailable") }
+        guard let meanIMeanP   = multiply(meanI, meanP) else { return failOpen("mean_i_mean_p_unavailable") }
+        guard let varI  = subtract(corrI, meanISquared) else { return failOpen("var_i_unavailable") }
+        guard let covIP = subtract(corrIP, meanIMeanP) else { return failOpen("cov_ip_unavailable") }
+
+        // 4. a = cov / (var + eps). (var + eps) is floored at eps so the reciprocal
+        //    (CIGammaAdjust, power -1, i.e. pow(x, -1)) never sees a value <= 0.
+        let epsBiasParams: [String: Any] = [
+            "inputImage":      varI,
+            "inputRVector":    CIVector(x: 1, y: 0, z: 0, w: 0),
+            "inputGVector":    CIVector(x: 0, y: 1, z: 0, w: 0),
+            "inputBVector":    CIVector(x: 0, y: 0, z: 1, w: 0),
+            "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+            "inputBiasVector": CIVector(x: epsilon, y: epsilon, z: epsilon, w: 0),
+        ]
+        guard let varPlusEps = CIFilter(name: "CIColorMatrix", parameters: epsBiasParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("var_plus_eps_unavailable")
+        }
+        let floorParams: [String: Any] = [
+            "inputImage":         varPlusEps,
+            "inputMinComponents": CIVector(x: epsilon, y: epsilon, z: epsilon, w: 0),
+            "inputMaxComponents": CIVector(x: 1e6, y: 1e6, z: 1e6, w: 1),
+        ]
+        guard let varFloored = CIFilter(name: "CIColorClamp", parameters: floorParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("var_floor_unavailable")
+        }
+        let reciprocalParams: [String: Any] = [
+            "inputImage": varFloored,
+            "inputPower": -1.0,
+        ]
+        guard let reciprocalVar = CIFilter(name: "CIGammaAdjust", parameters: reciprocalParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("reciprocal_unavailable")
+        }
+        guard let a = multiply(covIP, reciprocalVar) else { return failOpen("coeff_a_unavailable") }
+
+        // 5. b = meanP − a·meanI.
+        guard let aTimesMeanI = multiply(a, meanI) else { return failOpen("a_times_mean_i_unavailable") }
+        guard let b = subtract(meanP, aTimesMeanI) else { return failOpen("coeff_b_unavailable") }
+
+        // 6. Box-filter the per-pixel linear coefficients themselves (classic guided-filter step).
+        guard let meanA = boxMean(a) else { return failOpen("mean_a_unavailable") }
+        guard let meanB = boxMean(b) else { return failOpen("mean_b_unavailable") }
+
+        // 7. q = meanA·I + meanB, then clamp to [0, 1].
+        guard let meanAI = multiply(meanA, lumaI) else { return failOpen("mean_a_times_i_unavailable") }
+        let addParams: [String: Any] = ["inputImage": meanAI, "inputBackgroundImage": meanB]
+        guard let qRaw = CIFilter(name: "CIAdditionCompositing", parameters: addParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("q_add_unavailable")
+        }
+        let qClampParams: [String: Any] = [
+            "inputImage":         qRaw,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]
+        guard let q = CIFilter(name: "CIColorClamp", parameters: qClampParams)?.outputImage?.cropped(to: rect) else {
+            return failOpen("q_clamp_unavailable")
+        }
+
+        // 8. Matte edge band from the S1 mask (same construction family as the S4 band, with
+        //    S5-scoped constants): morphological gradient → soften → smoothstep. ~1 on the
+        //    matte edge, 0 in solid regions, so q only replaces the S1 mask near the edge.
+        let pad         = max(bandRadius * 2, 2)
+        let workingRect = rect.insetBy(dx: -pad, dy: -pad)
+        let morphInput  = p.clampedToExtent().cropped(to: workingRect.insetBy(dx: -bandRadius, dy: -bandRadius))
+        guard let dilated = CIFilter(name: "CIMorphologyMaximum",
+                                     parameters: ["inputImage": morphInput, "inputRadius": bandRadius])?
+                .outputImage?.cropped(to: workingRect) else {
+            return failOpen("band_dilate_unavailable")
+        }
+        guard let eroded = CIFilter(name: "CIMorphologyMinimum",
+                                    parameters: ["inputImage": morphInput, "inputRadius": bandRadius])?
+                .outputImage?.cropped(to: workingRect) else {
+            return failOpen("band_erode_unavailable")
+        }
+        guard let gradient = CIFilter(name: "CIDifferenceBlendMode",
+                                      parameters: ["inputImage": dilated, "inputBackgroundImage": eroded])?
+                .outputImage?.cropped(to: workingRect) else {
+            return failOpen("band_gradient_unavailable")
+        }
+        guard let gradientSoft = CIFilter(name: "CIGaussianBlur",
+                                          parameters: ["inputImage": gradient.clampedToExtent(), "inputRadius": bandBlur])?
+                .outputImage?.cropped(to: rect) else {
+            return failOpen("band_blur_unavailable")
+        }
+        guard let band = greenScreenS5Smoothstep(gradientSoft, low: bandLow, high: bandHigh)?.cropped(to: rect) else {
+            return failOpen("band_smoothstep_unavailable")
+        }
+
+        // 9. Band-limited application: outside the band the S1 mask is returned untouched.
+        let bandParams: [String: Any] = [
+            "inputImage":           q,
+            "inputBackgroundImage": base,
+            "inputMaskImage":       band,
+        ]
+        guard let refined = CIFilter(name: "CIBlendWithMask", parameters: bandParams)?.outputImage else {
+            return failOpen("band_blend_unavailable")
+        }
+        return GreenScreenS5Result(mask: refined.cropped(to: rect), band: band, applied: true, failOpenReason: nil)
+    }
+
+    /// S5 helper: smoothstep(low, high, m) per R, G, B with alpha identity, as a fused
+    /// CIColorMatrix → CIColorClamp → CIColorPolynomial recipe (same construction as
+    /// `greenScreenS4Smoothstep`, kept separate so S4's helper stays untouched).
+    /// Returns nil when `high <= low` or a filter is unavailable.
+    private func greenScreenS5Smoothstep(_ image: CIImage, low: CGFloat, high: CGFloat) -> CIImage? {
+        guard high > low else { return nil }
+        let scale = 1 / (high - low)
+        let bias  = -low * scale
+        let rampParams: [String: Any] = [
+            "inputImage":      image,
+            "inputRVector":    CIVector(x: scale, y: 0,     z: 0,     w: 0),
+            "inputGVector":    CIVector(x: 0,     y: scale, z: 0,     w: 0),
+            "inputBVector":    CIVector(x: 0,     y: 0,     z: scale, w: 0),
+            "inputAVector":    CIVector(x: 0,     y: 0,     z: 0,     w: 1),
+            "inputBiasVector": CIVector(x: bias,  y: bias,  z: bias,  w: 0),
+        ]
+        guard let ramped = CIFilter(name: "CIColorMatrix", parameters: rampParams)?.outputImage else {
+            return nil
+        }
+        let clampParams: [String: Any] = [
+            "inputImage":         ramped,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]
+        guard let clamped = CIFilter(name: "CIColorClamp", parameters: clampParams)?.outputImage else {
+            return nil
+        }
+        let smoothstep = CIVector(x: 0, y: 0, z: 3, w: -2)
+        let curveParams: [String: Any] = [
+            "inputImage":             clamped,
+            "inputRedCoefficients":   smoothstep,
+            "inputGreenCoefficients": smoothstep,
+            "inputBlueCoefficients":  smoothstep,
+            "inputAlphaCoefficients": CIVector(x: 0, y: 1, z: 0, w: 0),
+        ]
+        return CIFilter(name: "CIColorPolynomial", parameters: curveParams)?.outputImage
+    }
+
+    // MARK: - Live "tight alpha R1" RND refinement (opt-in; live-selectable)
+
+    /// Result of the live tight-alpha-R1 refinement: `mask` is the refined mask (or the
+    /// S1 mask unchanged on fail-open), `applied` true only when it fully succeeded.
+    struct LiveTightAlphaR1Result {
+        let mask: CIImage
+        let applied: Bool
+        let failOpenReason: String?
+    }
+
+    /// Opt-in live matte refinement candidate ("A tight alpha" from the offline A/B lab).
+    /// Runs only when `liveMatteRefinementMode == .tightAlphaR1` (selected through the
+    /// diagnostic-only `setLiveGreenScreenDiagnosticsOptions` route before session
+    /// start); the default `.s1` mode never calls this function.
+    ///
+    /// Pipeline (all stock CoreImage filters, evaluated only over `rect`):
+    ///   1. Smoothstep remap of the S1 final mask `mask` (`postGuidedEdge`, never the raw
+    ///      Vision mask) through smoothstep(liveTightAlphaR1Low, liveTightAlphaR1High) —
+    ///      the same fused CIColorMatrix -> CIColorClamp -> CIColorPolynomial recipe used
+    ///      by the S1 trimap stage — tightening the alpha transition band.
+    ///   2. A small final CIGaussianBlur (radius liveTightAlphaR1BlurRadius) re-softens
+    ///      the now-steeper edge so it does not look aliased, then crops back to `rect`.
+    ///
+    /// Fail-open: any nil filter or degenerate rect/constants/input returns `mask`
+    /// unchanged with `applied == false` and a reason naming the step. S1 constants and
+    /// stage bodies are untouched; this never runs unless explicitly opted into.
+    private func applyLiveTightAlphaR1(_ mask: CIImage, in rect: CGRect) -> LiveTightAlphaR1Result {
+        func failOpen(_ reason: String) -> LiveTightAlphaR1Result {
+            return LiveTightAlphaR1Result(mask: mask, applied: false, failOpenReason: reason)
+        }
+
+        let low        = VGDuetPreviewCompositor.liveTightAlphaR1Low
+        let high       = VGDuetPreviewCompositor.liveTightAlphaR1High
+        let blurRadius = VGDuetPreviewCompositor.liveTightAlphaR1BlurRadius
+        guard high > low, blurRadius > 0 else {
+            return failOpen("degenerate_constants")
+        }
+        guard !rect.isEmpty, !rect.isInfinite, rect.width >= 2, rect.height >= 2 else {
+            return failOpen("degenerate_rect")
+        }
+        guard !mask.extent.isEmpty, !mask.extent.isInfinite else {
+            return failOpen("empty_or_unbounded_input")
+        }
+
+        // 1. Smoothstep remap: t = (m - low) / (high - low), clamped to [0, 1], then
+        //    s = 3t^2 - 2t^3 per R, G, B; alpha untouched.
+        let scale = 1 / (high - low)
+        let bias  = -low * scale
+        let rampParams: [String: Any] = [
+            "inputImage":      mask,
+            "inputRVector":    CIVector(x: scale, y: 0,     z: 0,     w: 0),
+            "inputGVector":    CIVector(x: 0,     y: scale, z: 0,     w: 0),
+            "inputBVector":    CIVector(x: 0,     y: 0,     z: scale, w: 0),
+            "inputAVector":    CIVector(x: 0,     y: 0,     z: 0,     w: 1),
+            "inputBiasVector": CIVector(x: bias,  y: bias,  z: bias,  w: 0),
+        ]
+        guard let ramped = CIFilter(name: "CIColorMatrix", parameters: rampParams)?.outputImage else {
+            return failOpen("remap_matrix_unavailable")
+        }
+        let clampParams: [String: Any] = [
+            "inputImage":         ramped,
+            "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+        ]
+        guard let clamped = CIFilter(name: "CIColorClamp", parameters: clampParams)?.outputImage else {
+            return failOpen("remap_clamp_unavailable")
+        }
+        let smoothstep = CIVector(x: 0, y: 0, z: 3, w: -2)
+        let curveParams: [String: Any] = [
+            "inputImage":             clamped,
+            "inputRedCoefficients":   smoothstep,
+            "inputGreenCoefficients": smoothstep,
+            "inputBlueCoefficients":  smoothstep,
+            "inputAlphaCoefficients": CIVector(x: 0, y: 1, z: 0, w: 0),
+        ]
+        guard let curved = CIFilter(name: "CIColorPolynomial", parameters: curveParams)?.outputImage else {
+            return failOpen("remap_curve_unavailable")
+        }
+        let remapped = curved.cropped(to: rect)
+
+        // 2. Small final Gaussian blur, clamped to extent before blur and cropped back to
+        //    `rect` (same edge-darkening-avoidance pattern as featherGreenScreenMask).
+        let blurParams: [String: Any] = [
+            "inputImage":  remapped.clampedToExtent(),
+            "inputRadius": blurRadius,
+        ]
+        guard let blurred = CIFilter(name: "CIGaussianBlur", parameters: blurParams)?.outputImage else {
+            return failOpen("final_blur_unavailable")
+        }
+        return LiveTightAlphaR1Result(mask: blurred.cropped(to: rect), applied: true, failOpenReason: nil)
     }
 
     /// Deterministic camera placeholder: slate fill, 2 px lighter edge, soft

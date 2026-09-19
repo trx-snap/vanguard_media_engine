@@ -3,38 +3,77 @@
 // live meeting/calling, going live, camera, or any other surface starts one
 // session through the public Dart API; nothing here is scoped to Duet.
 //
-// Owns, per session: Flutter preview texture, static background buffer,
-// VGLiveGreenScreenMaskProviderAdapter (Vision Fast backend as iOS production
-// default; or LiteRT/Metal over selfie_multiclass_256x256.tflite with heuristic
-// fallback; or diagnostics options for Vision Balanced / Vision Accurate /
-// litertSelfie), VGDuetCameraSource (front camera ingress), VGDuetPreviewCompositor,
-// VGLiveGreenScreenRenderLoop. The Duet-named primitives are reused as generic
-// building blocks only.
+// Owns, per session: Flutter preview texture, static background buffer, the
+// current foreground rect, and exactly ONE of two segmentation engines:
+//   - ARKit engine (iOS production default when supported):
+//     VGARKitLiveGreenScreenPreviewCoordinator over the session's texture —
+//     ARFaceTrackingConfiguration + .personSegmentation, a full-resolution
+//     ARMatteGenerator matte per frame refined through the production
+//     VGDuetPreviewCompositor live mask pipeline (session
+//     liveMatteRefinementMode), CoreImage composite into the current
+//     foreground rect over the current background. It owns the camera through
+//     its ARSession; no VGDuetCameraSource exists while it runs.
+//   - Adapter path (fallback, and every explicitly requested adapter backend):
+//     VGLiveGreenScreenMaskProviderAdapter (Vision Fast; or LiteRT/Metal over
+//     selfie_multiclass_256x256.tflite with heuristic fallback; or diagnostics
+//     options for Vision Balanced / Vision Accurate / litertSelfie),
+//     VGDuetCameraSource (front camera ingress), VGDuetPreviewCompositor,
+//     VGLiveGreenScreenRenderLoop.
+// The Duet-named primitives are reused as generic building blocks only. An
+// ARSession and a VGDuetCameraSource are never running at the same time.
+//
+// Backend selection (`iosSegmentationBackend`, diagnostics options; "auto" by
+// default):
+//   "auto"   → ARKit when ARFaceTrackingConfiguration.isSupported and
+//              .personSegmentation is supported and the engine starts; else
+//              Vision Fast (adapter). If the ARKit engine fails at runtime the
+//              session falls back to Vision Fast on the same texture /
+//              background / foreground rect and emits a `green_screen_degraded`
+//              event (ios_arkit → ios_ml; keying continues).
+//   "arkit"  → explicit ARKit, no Vision fallback: unsupported, a failed start,
+//              or a runtime failure takes the degraded-unkeyed path with the
+//              exact reason (an A/B run never reports another provider).
+//   "visionFast" | "visionBalanced" | "visionAccurate" | "litert" | "litertSelfie"
+//            → the existing adapter path, unchanged.
 //
 // Lifecycle:
 //   startSession     → busy check → static background → texture register →
-//                      adapter start → camera start (frames observed into the
-//                      adapter) → render loop start → {sessionId, textureId,
-//                      width, height}.
-//   updateBackground → rebuild the static buffer and swap it on the loop; the
-//                      camera, segmenter, and texture are NOT restarted.
+//                      backend resolution → ARKit engine start | (adapter
+//                      start → camera start (frames observed into the adapter)
+//                      → render loop start) → {sessionId, textureId, width,
+//                      height}.
+//   updateBackground → rebuild the static buffer and swap it on the engine /
+//                      loop; the camera, segmenter, and texture are NOT
+//                      restarted.
 //   updateTransform  → recompute the foreground rect through
 //                      VGDuetLayoutGeometry.greenScreen(canvasWidth:canvasHeight:transform:)
-//                      and swap it on the loop.
+//                      and swap it on the engine / loop.
 //   stopSession      → idempotent for unknown/already-stopped ids.
-//   diagnostics      → diagnostic-only read of the adapter's matte latency /
-//                      publication telemetry plus the camera's selected
-//                      session preset for the active session id
-//                      (session_not_found otherwise). No state change.
+//   diagnostics      → diagnostic-only read of the active engine's matte
+//                      latency / publication telemetry plus the camera's
+//                      selected session preset for the active session id
+//                      (session_not_found otherwise). No state change. The
+//                      ARKit engine is reported with providerKind "arkit",
+//                      providerMode "arkit_face_matte_full", timingSemantics
+//                      "arkit_matte_generator_spans", segmentationEngine
+//                      "arkit"; the adapter path keeps its existing identity.
 //   setDiagnosticsOptions
 //                    → diagnostic-only (not public Dart API). Rejected with
 //                      live_busy while a session is active. Stores
-//                      {iosFastMetalPrecision, iosSegmentationBackend} for the
+//                      {iosFastMetalPrecision, iosSegmentationBackend,
+//                      iosLiveMatteRefinement} for the
 //                      NEXT startSession only: that start consumes them
 //                      (adapter fastMetalPrecision → LiteRT Metal
-//                      allow_precision_loss; adapter segmentationBackend →
-//                      visionFast (iOS production default) | litert |
-//                      visionBalanced | ...; diagnostics can override next start)
+//                      allow_precision_loss; iosSegmentationBackend → "auto"
+//                      (default, see above) | "arkit" | visionFast | litert |
+//                      visionBalanced | ...; iosLiveMatteRefinement →
+//                      VGDuetPreviewCompositor.LiveMatteRefinementMode, "s1"
+//                      (production default, unchanged) | "tightAlphaR1" (opt-in
+//                      RND candidate); applied on BOTH engines — the adapter
+//                      path's VGDuetPreviewCompositor and the ARKit engine's
+//                      refiner (StartRequest.liveMatteRefinementMode, the same
+//                      compositor pipeline) — and echoed in diagnostics with the
+//                      ARKit per-stage applied flags; diagnostics can override next start)
 //                      and the pending values reset to the defaults. Never alters a
 //                      running session.
 //   disposeAll       → plugin detach; releases the active session and drops
@@ -42,7 +81,11 @@
 //
 // Terminal order (stop / dispose):
 //   render loop stop → adapter invalidate → camera observer clear → camera stop
-//   → texture invalidate → texture unregister → active session cleared.
+//   → ARKit engine frame delivery stop (delegate nil, ARSession pause, bounded
+//   in-flight render drain) → texture invalidate → texture unregister → ARKit
+//   engine ARSession / Metal / CoreImage resources released → active session
+//   cleared. Only the components the session actually created exist; every
+//   step is idempotent.
 //
 // Segmentation failure (the adapter could create no mask provider at all):
 // keying is disabled, the adapter is invalidated, and the loop keeps presenting
@@ -62,6 +105,17 @@
 // mask (older than `maskMaxAgeSeconds` of camera time) is withheld by the
 // adapter, so the loop presents that frame unkeyed instead of mis-keyed.
 //
+// ARKit engine failure after start (render / ARSession / capture failure):
+// the engine reports it once on main (`onTerminalFailure`); the coordinator
+// stops the engine (frame delivery off, in-flight render drained, ARSession
+// released — the camera is free before any AVCapture path starts), caches its
+// final summary on the session (`arkitTerminalDiagnostics`, merged into later
+// diagnostics under `arkitEngine`), and then either starts the Vision Fast
+// adapter pipeline on the same texture ("auto": still keyed, degraded event
+// ios_arkit → ios_ml) or the camera-only unkeyed pipeline ("arkit": degraded
+// event ios_arkit → unkeyed through the segmentation-failure path). The
+// session is never stopped by the engine and the camera is never left locked.
+//
 // Mask/camera PTS pairing: the render loop fetches the mask (with the camera
 // PTS it was computed from) first, then the camera provider returns the
 // history frame nearest that PTS (VGDuetCameraSource.snapshotRetained(near:
@@ -72,6 +126,7 @@
 //
 // Threading: all public methods run on the main thread (Flutter plugin thread).
 
+import ARKit
 import AVFoundation
 import CoreGraphics
 import CoreMedia
@@ -101,22 +156,35 @@ struct VGLiveGreenScreenDiagnosticsOptions {
     /// Echoed but not applied when a Vision backend is selected.
     var iosFastMetalPrecision: Bool = false
 
-    /// Forwarded to VGLiveGreenScreenMaskProviderAdapter(…segmentationBackend:).
-    /// Vision Fast is iOS production default and diagnostics can override next
-    /// start ("litert" selectable alternate LiteRT/Metal path | "visionBalanced" |
-    /// "visionAccurate" | "litertSelfie").
-    /// Validated by the method handler against the
-    /// VGLiveGreenScreenSegmentationBackend* constants before reaching here.
-    var iosSegmentationBackend: String = VGLiveGreenScreenSegmentationBackendVisionFast
+    /// Segmentation backend for the next start. "auto" (default) resolves to
+    /// the ARKit engine when the device supports front-camera face tracking
+    /// with person segmentation, else to the Vision Fast adapter; "arkit"
+    /// forces the ARKit engine (no Vision fallback); every other value is
+    /// forwarded unchanged to VGLiveGreenScreenMaskProviderAdapter
+    /// (…segmentationBackend:) — "visionFast" | "litert" (selectable alternate
+    /// LiteRT/Metal path) | "visionBalanced" | "visionAccurate" | "litertSelfie".
+    /// Validated by the method handler against
+    /// VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto / …ARKit and
+    /// the VGLiveGreenScreenSegmentationBackend* constants before reaching here.
+    var iosSegmentationBackend: String = VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
+
+    /// Opt-in live matte refinement RND candidate for the NEXT session start only
+    /// (see VGDuetPreviewCompositor.LiveMatteRefinementMode). Default "s1" is exactly
+    /// current production live behavior, byte-for-byte unchanged; "tightAlphaR1" opts
+    /// into the bounded CoreImage post-pass A/B candidate ("A tight alpha"). Validated
+    /// by the method handler against VGDuetPreviewCompositor.LiveMatteRefinementMode
+    /// before reaching here.
+    var iosLiveMatteRefinement: String = VGDuetPreviewCompositor.LiveMatteRefinementMode.s1.rawValue
 
     static let `default` = VGLiveGreenScreenDiagnosticsOptions()
 
     /// Wire shape echoed back to the caller:
-    /// {iosFastMetalPrecision, iosSegmentationBackend}.
+    /// {iosFastMetalPrecision, iosSegmentationBackend, iosLiveMatteRefinement}.
     var payload: [String: Any] {
         return [
             "iosFastMetalPrecision":  iosFastMetalPrecision,
             "iosSegmentationBackend": iosSegmentationBackend,
+            "iosLiveMatteRefinement": iosLiveMatteRefinement,
         ]
     }
 }
@@ -136,11 +204,18 @@ final class VGLiveGreenScreenSessionCoordinator {
 
     /// `event` wire name parsed by VGLiveGreenScreenEvent on the Dart side.
     static let eventDegraded            = "green_screen_degraded"
+    /// `previousBackend` / `currentBackend` values: the adapter (Vision /
+    /// LiteRT) path, the ARKit engine, and no keying at all.
     static let backendIosMl             = "ios_ml"
+    static let backendIosARKit          = "ios_arkit"
     static let backendUnkeyed           = "unkeyed"
     /// Failure category of the degraded event (`failureCategory`), and the
     /// `reason` fallback when the adapter reported no exact failure reason.
     static let reasonSegmentationFailure = "segmentation_failure"
+    /// Failure category of the degraded event emitted when the ARKit engine
+    /// failed at runtime and the "auto" session moved to the Vision Fast
+    /// adapter (keying continues on a lower rung).
+    static let reasonARKitEngineFailure  = "arkit_engine_failure"
     /// `terminalState` diagnostics value while keying is active.
     static let terminalStateKeyed        = "keyed"
     /// `terminalState` diagnostics value after the segmentation failure path.
@@ -149,6 +224,20 @@ final class VGLiveGreenScreenSessionCoordinator {
     static let noFailureReason           = "none"
     private static let degradedUserMessage =
         "Green screen is unavailable on this device. Showing the live camera over the background."
+    private static let arkitFallbackUserMessage =
+        "Green screen switched to the standard segmenter."
+
+    // MARK: Segmentation backend selectors owned by this coordinator
+    // (accepted by setLiveGreenScreenDiagnosticsOptions next to the adapter's
+    // VGLiveGreenScreenSegmentationBackend* constants).
+
+    /// Default: the ARKit engine when supported, else the Vision Fast adapter.
+    static let segmentationBackendAuto  = "auto"
+    /// Explicit ARKit engine; no Vision fallback (degraded unkeyed instead).
+    static let segmentationBackendARKit = "arkit"
+    /// `segmentationEngine` diagnostics values.
+    static let segmentationEngineARKit   = "arkit"
+    static let segmentationEngineAdapter = "adapter"
 
     /// Maximum camera-time lag between the latest submitted frame and the mask
     /// handed to the compositor. Older masks are withheld (frame renders unkeyed).
@@ -169,13 +258,49 @@ final class VGLiveGreenScreenSessionCoordinator {
         let canvasHeight: Int
 
         /// Segmentation backend requested for this session (diagnostics
-        /// options at start; "visionFast" by default). Kept so diagnostics can
-        /// still echo it after the adapter has been released.
+        /// options at start; "auto" by default). Kept so diagnostics can
+        /// still echo it after the engine / adapter has been released.
         let requestedSegmentationBackend: String
 
+        /// Backend actually driving the session now: "arkit" while the ARKit
+        /// engine runs, or the adapter backend ("visionFast" after an "auto"
+        /// resolution or fallback; the explicit value otherwise).
+        var effectiveSegmentationBackend: String
+
+        /// Why `effectiveSegmentationBackend` was chosen (diagnostics only):
+        /// arkit_default | arkit_explicit | explicit |
+        /// vision_default_arkit_unsupported(reason) |
+        /// vision_fallback_after_arkit_start_failure(reason) |
+        /// vision_fallback_after_arkit_runtime_failure(reason) |
+        /// arkit_explicit_unavailable(reason) | arkit_explicit_runtime_failure(reason).
+        var segmentationBackendSelection: String
+
+        /// Live matte refinement mode requested for this session (diagnostics options
+        /// at start; "s1" by default). Kept so diagnostics can always echo it,
+        /// independent of the compositor / adapter lifecycle.
+        let requestedLiveMatteRefinement: String
+
+        /// Diagnostics options consumed at start, kept so an ARKit → adapter
+        /// fallback builds the adapter / compositor exactly as a direct adapter
+        /// start would have.
+        let fastMetalPrecision: Bool
+        let liveMatteRefinementMode: VGDuetPreviewCompositor.LiveMatteRefinementMode
+
+        /// Current full-canvas static background and foreground rect (top-left
+        /// origin). Updated by updateBackground / updateTransform and reused
+        /// verbatim when a fallback pipeline starts mid-session.
+        var background: CVPixelBuffer
+        var foregroundRect: CGRect
+
+        // Adapter path components (nil while the ARKit engine drives the session).
         var cameraSource: VGDuetCameraSource?
         var adapter: VGLiveGreenScreenMaskProviderAdapter?
         var renderLoop: VGLiveGreenScreenRenderLoop?
+        // ARKit path component (nil on the adapter path).
+        var arkitEngine: VGARKitLiveGreenScreenPreviewCoordinator?
+        /// Final ARKit engine summary cached when the engine failed at runtime
+        /// and the session moved to the adapter path (diagnostics only).
+        var arkitTerminalDiagnostics: [String: Any]?
         /// False after the terminal segmentation failure path ran.
         var isKeyed = true
         /// Exact adapter failure reason captured by the terminal segmentation
@@ -195,13 +320,25 @@ final class VGLiveGreenScreenSessionCoordinator {
              texture: VGDuetPreviewTexture,
              canvasWidth: Int,
              canvasHeight: Int,
-             requestedSegmentationBackend: String) {
+             requestedSegmentationBackend: String,
+             requestedLiveMatteRefinement: String,
+             fastMetalPrecision: Bool,
+             liveMatteRefinementMode: VGDuetPreviewCompositor.LiveMatteRefinementMode,
+             background: CVPixelBuffer,
+             foregroundRect: CGRect) {
             self.sessionId    = sessionId
             self.textureId    = textureId
             self.texture      = texture
             self.canvasWidth  = canvasWidth
             self.canvasHeight = canvasHeight
             self.requestedSegmentationBackend = requestedSegmentationBackend
+            self.effectiveSegmentationBackend = requestedSegmentationBackend
+            self.segmentationBackendSelection = "pending"
+            self.requestedLiveMatteRefinement = requestedLiveMatteRefinement
+            self.fastMetalPrecision = fastMetalPrecision
+            self.liveMatteRefinementMode = liveMatteRefinementMode
+            self.background = background
+            self.foregroundRect = foregroundRect
         }
     }
 
@@ -272,6 +409,15 @@ final class VGLiveGreenScreenSessionCoordinator {
         let diagnosticsOptions = pendingDiagnosticsOptions
         pendingDiagnosticsOptions = .default
 
+        // Fail open to .s1 if the stored string is somehow not a known raw value
+        // (the method handler already validates it exactly; this is defense in depth).
+        let liveMatteRefinementMode = VGDuetPreviewCompositor.LiveMatteRefinementMode(
+            rawValue: diagnosticsOptions.iosLiveMatteRefinement) ?? .s1
+
+        let rects = VGDuetLayoutGeometry.greenScreen(canvasWidth: CGFloat(width),
+                                                     canvasHeight: CGFloat(height),
+                                                     transform: request.foregroundTransform)
+
         let texture   = VGDuetPreviewTexture()
         let textureId = registry.register(texture)
         let sessionId = "ios_live_gs_" + UUID().uuidString.lowercased()
@@ -280,93 +426,86 @@ final class VGLiveGreenScreenSessionCoordinator {
                                   texture: texture,
                                   canvasWidth: width,
                                   canvasHeight: height,
-                                  requestedSegmentationBackend: diagnosticsOptions.iosSegmentationBackend)
-
-        let compositor = VGDuetPreviewCompositor(canvasWidth: Double(width), canvasHeight: Double(height))
-
-        // Mask adapter BEFORE camera start so frames are routed to the provider
-        // from the first delivered frame. The unavailable handler is wired
-        // before start(); provider setup runs asynchronously and warm-up is not
-        // a failure (frames are dropped until the provider is selected).
-        let adapter = VGLiveGreenScreenMaskProviderAdapter(
-            fastMetalPrecision:  diagnosticsOptions.iosFastMetalPrecision,
-            segmentationBackend: diagnosticsOptions.iosSegmentationBackend)
-        session.adapter = adapter
-        adapter.onProviderUnavailable = { [weak self, weak session] adapterDiagnostics in
-            guard let self = self, let session = session else { return }
-            self.handleAdapterFailure(session: session, adapterDiagnostics: adapterDiagnostics)
-        }
-        adapter.start()
-
-        // Camera ingress: observer wired before start() so no frame is missed.
-        // Live green-screen requests 960x540 iFrame capture first (vs. the
-        // 1080p-first default used by every other camera/Duet caller) — this
-        // RND latency path preserves 16:9 aspect while further reducing
-        // capture/input cost than 720p; segmentation and compositing do not
-        // need full 1080p. Where iFrame960x540 is unsupported the source falls
-        // back to 720p before its generic 1080p-first default.
-        let camera = VGDuetCameraSource(sessionPresets: [
-            AVCaptureSession.Preset.iFrame960x540.rawValue,
-            AVCaptureSession.Preset.hd1280x720.rawValue,
-        ])
-        session.cameraSource = camera
-        // Observer runs synchronously on the capture queue; the adapter's submit
-        // is non-blocking (the provider retains and dispatches internally).
-        camera.setFrameObserver { [weak adapter] pixelBuffer, pts in
-            adapter?.submitFrame(pixelBuffer, presentationTime: pts)
-        }
-        camera.start()
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_CAMERA_STARTED sessionId=\(sessionId) cameraSelectedSessionPreset=\(camera.selectedSessionPreset ?? "unknown")")
-
-        let rects = VGDuetLayoutGeometry.greenScreen(canvasWidth: CGFloat(width),
-                                                     canvasHeight: CGFloat(height),
-                                                     transform: request.foregroundTransform)
-
-        // Presents go texture → textureFrameAvailable on main. Providers hold
-        // the session weakly so the loop never keeps a released session alive.
-        let loop = VGLiveGreenScreenRenderLoop(
-            compositor:     compositor,
-            background:     background,
-            foregroundRect: rects.camera,
-            cameraFrameProvider: { [weak session] preferredPTS in
-                guard let session = session, let camera = session.cameraSource else { return nil }
-                // Pair to the mask's source PTS when it is numeric; otherwise,
-                // or when no history frame is inside the window, use the latest.
-                if let pts = preferredPTS, pts.isNumeric,
-                   let match = camera.snapshotRetainedWithPTS(
-                       near: pts,
-                       maxDeltaSeconds: VGLiveGreenScreenSessionCoordinator.maskPairingMaxDeltaSeconds) {
-                    if !session.loggedFirstAlignedPair {
-                        session.loggedFirstAlignedPair = true
-                        let absDeltaMs = abs(CMTimeGetSeconds(match.pts) - CMTimeGetSeconds(pts)) * 1000.0
-                        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_PTS_ALIGNED_PAIR_FIRST sessionId=\(session.sessionId) absDeltaMs=\(String(format: "%.2f", absDeltaMs)) maskSourcePtsSeconds=\(String(format: "%.4f", CMTimeGetSeconds(pts))) cameraPtsSeconds=\(String(format: "%.4f", CMTimeGetSeconds(match.pts))) maxPairingDeltaMs=\(Int((VGLiveGreenScreenSessionCoordinator.maskPairingMaxDeltaSeconds * 1000.0).rounded()))")
-                    }
-                    return match.frame
-                }
-                return camera.snapshotRetained()
-            },
-            maskProvider: { [weak session] in
-                // The adapter returns an owned (+1) CVPixelBuffer that ARC manages
-                // in `mask`; passRetained adds the +1 the loop releases after
-                // compositing, and `mask` drops its own reference on scope exit.
-                // sourcePTS is written only alongside a returned mask.
-                var sourcePTS = CMTime.invalid
-                guard let mask = session?.adapter?.latestMaskRetained(
-                    maxAgeSeconds: VGLiveGreenScreenSessionCoordinator.maskMaxAgeSeconds,
-                    sourcePTSOut: &sourcePTS)
-                else { return nil }
-                return VGLiveGreenScreenRenderLoop.MaskSnapshot(buffer: Unmanaged.passRetained(mask),
-                                                                sourcePTS: sourcePTS)
-            },
-            presentHandler: { pixelBuffer in
-                texture.update(pixelBuffer: pixelBuffer)
-                registry.textureFrameAvailable(textureId)
-            })
-        session.renderLoop = loop
+                                  requestedSegmentationBackend: diagnosticsOptions.iosSegmentationBackend,
+                                  requestedLiveMatteRefinement: diagnosticsOptions.iosLiveMatteRefinement,
+                                  fastMetalPrecision: diagnosticsOptions.iosFastMetalPrecision,
+                                  liveMatteRefinementMode: liveMatteRefinementMode,
+                                  background: background,
+                                  foregroundRect: rects.camera)
+        // The session is active from here: every engine failure callback
+        // (always asynchronous on main) resolves against `activeSession`.
         activeSession = session
-        loop.start()
 
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_SESSION_STARTED sessionId=\(sessionId) textureId=\(textureId) canvas=\(width)x\(height) foregroundRect=\(VGLiveGreenScreenSessionCoordinator.describe(rects.camera)) maskSource=\(diagnosticsOptions.iosSegmentationBackend)_adapter(pending) segmentationBackend=\(diagnosticsOptions.iosSegmentationBackend) fastMetalPrecision=\(diagnosticsOptions.iosFastMetalPrecision)")
+        // Backend resolution. Exactly one engine is created: the ARKit engine
+        // owns the camera through its ARSession and no VGDuetCameraSource
+        // exists while it runs; the adapter path owns the camera through
+        // VGDuetCameraSource and no ARSession exists.
+        let requestedBackend = diagnosticsOptions.iosSegmentationBackend
+        let wantsARKit =
+            requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
+            || requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit
+        var arkitFailureReason: String?
+        if wantsARKit {
+            let faceTrackingSupported = ARFaceTrackingConfiguration.isSupported
+            let facePersonSegmentationSupported = ARFaceTrackingConfiguration.supportsFrameSemantics(.personSegmentation)
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_CAPABILITY sessionId=\(sessionId) requestedSegmentationBackend=\(requestedBackend) faceTrackingSupported=\(faceTrackingSupported) facePersonSegmentationSupported=\(facePersonSegmentationSupported)")
+            if !faceTrackingSupported {
+                arkitFailureReason = "face_tracking_unsupported"
+            } else if !facePersonSegmentationSupported {
+                arkitFailureReason = "face_person_segmentation_unsupported"
+            } else {
+                arkitFailureReason = startARKitEngine(session: session, registry: registry)
+            }
+        }
+
+        if wantsARKit, arkitFailureReason == nil {
+            session.effectiveSegmentationBackend = VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit
+            session.segmentationBackendSelection =
+                requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
+                ? "arkit_default" : "arkit_explicit"
+        } else if requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit {
+            // Explicit ARKit could not start: no Vision fallback by design (an
+            // A/B run never reports numbers from another provider). The
+            // camera-only pipeline presents the unkeyed camera over the
+            // background and the segmentation-failure path records the exact
+            // reason (degraded event ios_arkit → unkeyed).
+            let reason = arkitFailureReason ?? "unknown"
+            session.effectiveSegmentationBackend = VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit
+            session.segmentationBackendSelection = "arkit_explicit_unavailable(\(reason))"
+            startCameraPipeline(session: session, registry: registry, adapter: nil)
+            handleAdapterFailure(
+                session: session,
+                adapterDiagnostics: VGLiveGreenScreenSessionCoordinator.arkitUnavailableDiagnostics(
+                    failureReason: "arkit_unavailable: \(reason)", engineSummary: nil),
+                previousBackend: VGLiveGreenScreenSessionCoordinator.backendIosARKit)
+        } else {
+            // Adapter path: the explicitly requested adapter backend, or Vision
+            // Fast when "auto" could not use ARKit (unsupported device, or the
+            // engine failed to start — the fallback happens before start replies).
+            let backend: String
+            if requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto {
+                backend = VGLiveGreenScreenSegmentationBackendVisionFast
+                let reason = arkitFailureReason ?? "unknown"
+                let unsupported = reason == "face_tracking_unsupported" || reason == "face_person_segmentation_unsupported"
+                session.segmentationBackendSelection = unsupported
+                    ? "vision_default_arkit_unsupported(\(reason))"
+                    : "vision_fallback_after_arkit_start_failure(\(reason))"
+                NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_UNAVAILABLE_VISION_DEFAULT sessionId=\(sessionId) reason=\(reason) segmentationBackend=\(backend)")
+            } else {
+                backend = requestedBackend
+                session.segmentationBackendSelection = "explicit"
+            }
+            session.effectiveSegmentationBackend = backend
+            let adapter = VGLiveGreenScreenMaskProviderAdapter(
+                fastMetalPrecision:  diagnosticsOptions.iosFastMetalPrecision,
+                segmentationBackend: backend)
+            startCameraPipeline(session: session, registry: registry, adapter: adapter)
+        }
+
+        let engineName = session.arkitEngine != nil
+            ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit
+            : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_SESSION_STARTED sessionId=\(sessionId) textureId=\(textureId) canvas=\(width)x\(height) foregroundRect=\(VGLiveGreenScreenSessionCoordinator.describe(rects.camera)) segmentationEngine=\(engineName) maskSource=\(session.effectiveSegmentationBackend)_\(engineName)(pending) requestedSegmentationBackend=\(requestedBackend) segmentationBackend=\(session.effectiveSegmentationBackend) segmentationBackendSelection=\(session.segmentationBackendSelection) fastMetalPrecision=\(diagnosticsOptions.iosFastMetalPrecision) liveMatteRefinement=\(diagnosticsOptions.iosLiveMatteRefinement)")
 
         let descriptor: [String: Any] = [
             "sessionId": sessionId,
@@ -396,9 +535,16 @@ final class VGLiveGreenScreenSessionCoordinator {
                 from: error, route: "updateLiveGreenScreenBackground"))
             return
         }
-        // Atomic swap on the loop; camera / segmenter / texture untouched.
-        session.renderLoop?.updateBackground(buffer)
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_BACKGROUND_UPDATED sessionId=\(sessionId) type=\(VGLiveGreenScreenSessionCoordinator.describe(spec))")
+        // Atomic swap on the live engine; camera / segmenter / texture untouched.
+        // The session keeps the current buffer so a mid-session fallback
+        // pipeline starts on exactly this background.
+        session.background = buffer
+        if let engine = session.arkitEngine {
+            engine.updateBackground(buffer)
+        } else {
+            session.renderLoop?.updateBackground(buffer)
+        }
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_BACKGROUND_UPDATED sessionId=\(sessionId) type=\(VGLiveGreenScreenSessionCoordinator.describe(spec)) segmentationEngine=\(session.arkitEngine != nil ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter)")
         reply(nil, nil)
     }
 
@@ -414,8 +560,13 @@ final class VGLiveGreenScreenSessionCoordinator {
         let rects = VGDuetLayoutGeometry.greenScreen(canvasWidth: CGFloat(session.canvasWidth),
                                                      canvasHeight: CGFloat(session.canvasHeight),
                                                      transform: transform)
-        session.renderLoop?.updateForegroundRect(rects.camera)
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_TRANSFORM_UPDATED sessionId=\(sessionId) foregroundRect=\(VGLiveGreenScreenSessionCoordinator.describe(rects.camera))")
+        session.foregroundRect = rects.camera
+        if let engine = session.arkitEngine {
+            engine.updateForegroundRect(rects.camera)
+        } else {
+            session.renderLoop?.updateForegroundRect(rects.camera)
+        }
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_TRANSFORM_UPDATED sessionId=\(sessionId) foregroundRect=\(VGLiveGreenScreenSessionCoordinator.describe(rects.camera)) segmentationEngine=\(session.arkitEngine != nil ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter)")
         reply(nil, nil)
     }
 
@@ -455,39 +606,65 @@ final class VGLiveGreenScreenSessionCoordinator {
         guard let session = resolveActiveSession(sessionId: sessionId,
                                                  route: "getLiveGreenScreenDiagnostics",
                                                  reply: reply) else { return }
-        let cameraSelectedSessionPreset =
+        let engineName = session.arkitEngine != nil
+            ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit
+            : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter
+        var cameraSelectedSessionPreset =
             session.cameraSource?.selectedSessionPreset ?? "unknown"
         var payload: [String: Any] = [
-            "sessionId":                   session.sessionId,
-            "textureId":                   session.textureId,
-            "isKeyed":                     session.isKeyed,
-            "degraded":                    !session.isKeyed,
-            "terminalState":               session.isKeyed
+            "sessionId":                    session.sessionId,
+            "textureId":                    session.textureId,
+            "isKeyed":                      session.isKeyed,
+            "degraded":                     !session.isKeyed,
+            "terminalState":                session.isKeyed
                 ? VGLiveGreenScreenSessionCoordinator.terminalStateKeyed
                 : VGLiveGreenScreenSessionCoordinator.terminalStateDegraded,
-            "terminalReason":              session.terminalReason
+            "terminalReason":               session.terminalReason
                 ?? VGLiveGreenScreenSessionCoordinator.noFailureReason,
-            "failureReason":               session.terminalReason
+            "failureReason":                session.terminalReason
                 ?? VGLiveGreenScreenSessionCoordinator.noFailureReason,
-            "segmentationBackend":         session.requestedSegmentationBackend,
-            "adapterReleased":             session.adapter == nil,
-            "maskMaxAgeSeconds":           VGLiveGreenScreenSessionCoordinator.maskMaxAgeSeconds,
-            "cameraSelectedSessionPreset": cameraSelectedSessionPreset,
+            "requestedSegmentationBackend": session.requestedSegmentationBackend,
+            "segmentationBackend":          session.effectiveSegmentationBackend,
+            "segmentationBackendSelection": session.segmentationBackendSelection,
+            "segmentationEngine":           engineName,
+            "liveMatteRefinement":          session.requestedLiveMatteRefinement,
+            "adapterReleased":              session.adapter == nil && session.arkitEngine == nil,
+            "maskMaxAgeSeconds":            VGLiveGreenScreenSessionCoordinator.maskMaxAgeSeconds,
         ]
-        if let adapter = session.adapter {
+        if let engine = session.arkitEngine {
+            // Live ARKit engine: its snapshot is authoritative and is mapped
+            // onto the adapter-compatible keys (providerKind "arkit",
+            // providerMode "arkit_face_matte_full", timingSemantics
+            // "arkit_matte_generator_spans", sampleCount / maskPublishCount =
+            // published composited frames) so no reader can mistake it for
+            // Vision. The ARSession video format stands in for the capture
+            // session preset.
+            let snapshot = engine.diagnosticsSnapshot()
+            for (key, value) in VGLiveGreenScreenSessionCoordinator.arkitDiagnosticsPayload(session: session,
+                                                                                            snapshot: snapshot) {
+                payload[key] = value
+            }
+            cameraSelectedSessionPreset = "arkit_face_\(snapshot["videoFormatWidth"] ?? 0)x\(snapshot["videoFormatHeight"] ?? 0)@\(snapshot["videoFormatFramesPerSecond"] ?? 0)"
+        } else if let adapter = session.adapter {
             // Live adapter: its snapshot is authoritative (failureReason is
             // "none" there unless a failure is in flight).
             for (key, value) in adapter.diagnosticsSnapshot() {
                 payload[key] = value
             }
+            if let arkitTerminal = session.arkitTerminalDiagnostics {
+                // The session started on ARKit and fell back: keep the engine's
+                // final summary observable next to the live adapter numbers.
+                payload["arkitEngine"] = arkitTerminal
+            }
         } else if let terminal = session.terminalDiagnostics {
-            // Adapter released by the segmentation failure path: report the
-            // snapshot cached at failure time, never a blank placeholder.
+            // Engine / adapter released by the segmentation failure path:
+            // report the snapshot cached at failure time, never a blank
+            // placeholder.
             for (key, value) in terminal {
                 payload[key] = value
             }
         } else {
-            // Defensive: an active session without an adapter and without a
+            // Defensive: an active session without an engine and without a
             // cached terminal snapshot is not a state this coordinator
             // produces; say so explicitly rather than looking healthy.
             payload["providerKind"]           = "released"
@@ -498,7 +675,8 @@ final class VGLiveGreenScreenSessionCoordinator {
             payload["terminalReason"]         = "adapter_released_without_terminal_diagnostics"
             payload["failureReason"]          = "adapter_released_without_terminal_diagnostics"
         }
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_DIAGNOSTICS sessionId=\(session.sessionId) isKeyed=\(session.isKeyed) terminalState=\(payload["terminalState"] ?? "?") failureReason=\(payload["failureReason"] ?? "?") adapterReleased=\(payload["adapterReleased"] ?? false) cameraSelectedSessionPreset=\(cameraSelectedSessionPreset) providerKind=\(payload["providerKind"] ?? "?") providerMode=\(payload["providerMode"] ?? "?") segmentationBackend=\(payload["segmentationBackend"] ?? "?") timingSemantics=\(payload["timingSemantics"] ?? "?") fastMetalPrecision=\(payload["fastMetalPrecision"] ?? false) metalAllowPrecisionLoss=\(payload["metalAllowPrecisionLoss"] ?? false) sampleCount=\(payload["sampleCount"] ?? 0) avgTotalMs=\(payload["avgTotalMs"] ?? -1) maxTotalMs=\(payload["maxTotalMs"] ?? -1) avgInferenceMs=\(payload["avgInferenceMs"] ?? -1) avgInputCopyMs=\(payload["avgInputCopyMs"] ?? -1) avgInvokeMs=\(payload["avgInvokeMs"] ?? -1) avgOutputAccessMs=\(payload["avgOutputAccessMs"] ?? -1) avgCadenceMs=\(payload["avgCadenceMs"] ?? -1) maskPublishCount=\(payload["maskPublishCount"] ?? 0) lastMaskCoveragePercent=\(payload["lastMaskCoveragePercent"] ?? -1) firstMaskLatencyMs=\(payload["firstMaskLatencyMs"] ?? -1)")
+        payload["cameraSelectedSessionPreset"] = cameraSelectedSessionPreset
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_DIAGNOSTICS sessionId=\(session.sessionId) isKeyed=\(session.isKeyed) terminalState=\(payload["terminalState"] ?? "?") failureReason=\(payload["failureReason"] ?? "?") adapterReleased=\(payload["adapterReleased"] ?? false) segmentationEngine=\(engineName) cameraSelectedSessionPreset=\(cameraSelectedSessionPreset) providerKind=\(payload["providerKind"] ?? "?") providerMode=\(payload["providerMode"] ?? "?") requestedSegmentationBackend=\(session.requestedSegmentationBackend) segmentationBackend=\(payload["segmentationBackend"] ?? "?") segmentationBackendSelection=\(session.segmentationBackendSelection) liveMatteRefinement=\(payload["liveMatteRefinement"] ?? "?") timingSemantics=\(payload["timingSemantics"] ?? "?") fastMetalPrecision=\(payload["fastMetalPrecision"] ?? false) metalAllowPrecisionLoss=\(payload["metalAllowPrecisionLoss"] ?? false) sampleCount=\(payload["sampleCount"] ?? 0) avgTotalMs=\(payload["avgTotalMs"] ?? -1) maxTotalMs=\(payload["maxTotalMs"] ?? -1) avgInferenceMs=\(payload["avgInferenceMs"] ?? -1) avgInputCopyMs=\(payload["avgInputCopyMs"] ?? -1) avgInvokeMs=\(payload["avgInvokeMs"] ?? -1) avgOutputAccessMs=\(payload["avgOutputAccessMs"] ?? -1) avgCadenceMs=\(payload["avgCadenceMs"] ?? -1) maskPublishCount=\(payload["maskPublishCount"] ?? 0) lastMaskCoveragePercent=\(payload["lastMaskCoveragePercent"] ?? -1) firstMaskLatencyMs=\(payload["firstMaskLatencyMs"] ?? -1) avgMatteGenerationMs=\(payload["avgMatteGenerationMs"] ?? "n/a") avgCompositeMs=\(payload["avgCompositeMs"] ?? "n/a") effectiveFps=\(payload["effectiveFps"] ?? "n/a") maskRefinementPath=\(payload["maskRefinementPath"] ?? "n/a") maskRefinementApplied=\(payload["maskRefinementApplied"] ?? "n/a") maskMorphologyCloseApplied=\(payload["maskMorphologyCloseApplied"] ?? "n/a") maskFeatherApplied=\(payload["maskFeatherApplied"] ?? "n/a") maskTrimapApplied=\(payload["maskTrimapApplied"] ?? "n/a") maskGuidedEdgeApplied=\(payload["maskGuidedEdgeApplied"] ?? "n/a") liveTightAlphaR1Applied=\(payload["liveTightAlphaR1Applied"] ?? "n/a")")
         reply(payload, nil)
     }
 
@@ -520,7 +698,7 @@ final class VGLiveGreenScreenSessionCoordinator {
             return
         }
         pendingDiagnosticsOptions = options
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_DIAGNOSTICS_OPTIONS_SET iosFastMetalPrecision=\(options.iosFastMetalPrecision) iosSegmentationBackend=\(options.iosSegmentationBackend) appliesTo=next_start")
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_DIAGNOSTICS_OPTIONS_SET iosFastMetalPrecision=\(options.iosFastMetalPrecision) iosSegmentationBackend=\(options.iosSegmentationBackend) iosLiveMatteRefinement=\(options.iosLiveMatteRefinement) appliesTo=next_start")
         reply(options.payload, nil)
     }
 
@@ -538,7 +716,11 @@ final class VGLiveGreenScreenSessionCoordinator {
     // MARK: - Private: release
 
     /// Terminal order: render loop stop → adapter invalidate → camera observer
-    /// clear → camera stop → texture invalidate → texture unregister → active nil.
+    /// clear → camera stop → ARKit engine frame delivery stop (delegate nil,
+    /// ARSession pause, bounded in-flight render drain) → texture invalidate →
+    /// texture unregister → ARKit engine ARSession / Metal / CoreImage
+    /// resources released → active nil. Only the components the session
+    /// created exist (adapter path xor ARKit engine); every step is idempotent.
     private func release(_ session: LiveSession) {
         assert(Thread.isMainThread)
 
@@ -552,19 +734,331 @@ final class VGLiveGreenScreenSessionCoordinator {
         session.cameraSource?.stop()
         session.cameraSource = nil
 
+        let engine = session.arkitEngine
+        engine?.onTerminalFailure = nil
+        engine?.stopFrameDelivery()
+
         session.texture.invalidate()
         textureRegistry?.unregisterTexture(session.textureId)
+
+        if let engine = engine {
+            _ = engine.stop()
+            session.arkitEngine = nil
+        }
 
         if activeSession === session {
             activeSession = nil
         }
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_SESSION_RELEASED sessionId=\(session.sessionId) textureId=\(session.textureId)")
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_SESSION_RELEASED sessionId=\(session.sessionId) textureId=\(session.textureId) segmentationEngine=\(engine != nil ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter)")
+    }
+
+    // MARK: - Private: engines
+
+    /// Starts the ARKit engine on the session's texture with the session's
+    /// current background, foreground rect, and live matte refinement mode
+    /// (the engine refines its matte through the same VGDuetPreviewCompositor
+    /// pipeline `startCameraPipeline` builds). Returns nil on success (the
+    /// engine is stored on the session) or the engine's exact start failure
+    /// reason; a failed start registers and retains nothing.
+    private func startARKitEngine(session: LiveSession,
+                                  registry: FlutterTextureRegistry) -> String? {
+        assert(Thread.isMainThread)
+        let engineRequest = VGARKitLiveGreenScreenPreviewCoordinator.StartRequest(
+            canvasWidth: session.canvasWidth,
+            canvasHeight: session.canvasHeight,
+            targetFps: VGARKitLiveGreenScreenPreviewCoordinator.productionTargetFps,
+            displayOrientationMode: VGARKitLiveGreenScreenPreviewCoordinator.defaultOrientationMode,
+            displayOrientation: VGARKitLiveGreenScreenPreviewCoordinator.defaultDisplayOrientation,
+            background: session.background,
+            foregroundRect: session.foregroundRect,
+            liveMatteRefinementMode: session.liveMatteRefinementMode)
+        let engine = VGARKitLiveGreenScreenPreviewCoordinator(request: engineRequest,
+                                                              textureRegistry: registry,
+                                                              texture: session.texture,
+                                                              textureId: session.textureId,
+                                                              sessionId: session.sessionId)
+        engine.onTerminalFailure = { [weak self, weak session, weak engine] reason in
+            guard let self = self, let session = session, let engine = engine else { return }
+            self.handleARKitEngineFailure(session: session, engine: engine, reason: reason)
+        }
+        switch engine.start() {
+        case .started(let descriptor):
+            session.arkitEngine = engine
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_ENGINE_STARTED sessionId=\(session.sessionId) textureId=\(session.textureId) providerKind=\(VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsProviderKind) providerMode=\(VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsProviderMode) orientationMode=\(descriptor["orientationMode"] ?? "?") targetFps=\(descriptor["targetFps"] ?? 0) videoFormat=\(descriptor["videoFormatWidth"] ?? 0)x\(descriptor["videoFormatHeight"] ?? 0)@\(descriptor["videoFormatFramesPerSecond"] ?? 0) foregroundRect=\(VGLiveGreenScreenSessionCoordinator.describe(session.foregroundRect)) liveMatteRefinement=\(descriptor["liveMatteRefinement"] ?? "?") maskRefinementPath=\(descriptor["maskRefinementPath"] ?? "?")")
+            return nil
+        case .failed(let failure):
+            let reason = failure["failureReason"] as? String ?? "unknown"
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_ENGINE_START_FAILED sessionId=\(session.sessionId) reason=\(reason)")
+            return reason
+        }
+    }
+
+    /// Starts the adapter-path pipeline on the session's texture: optional
+    /// mask adapter (nil → camera-only, unkeyed presentation), VGDuetCameraSource
+    /// front camera ingress, VGDuetPreviewCompositor, VGLiveGreenScreenRenderLoop,
+    /// all on the session's current background and foreground rect. Never
+    /// called while an ARKit engine is alive on the session.
+    private func startCameraPipeline(session: LiveSession,
+                                     registry: FlutterTextureRegistry,
+                                     adapter: VGLiveGreenScreenMaskProviderAdapter?) {
+        assert(Thread.isMainThread)
+        assert(session.arkitEngine == nil)
+
+        let compositor = VGDuetPreviewCompositor(canvasWidth: Double(session.canvasWidth),
+                                                 canvasHeight: Double(session.canvasHeight),
+                                                 liveMatteRefinementMode: session.liveMatteRefinementMode)
+
+        // Mask adapter BEFORE camera start so frames are routed to the provider
+        // from the first delivered frame. The unavailable handler is wired
+        // before start(); provider setup runs asynchronously and warm-up is not
+        // a failure (frames are dropped until the provider is selected).
+        if let adapter = adapter {
+            session.adapter = adapter
+            adapter.onProviderUnavailable = { [weak self, weak session] adapterDiagnostics in
+                guard let self = self, let session = session else { return }
+                self.handleAdapterFailure(session: session, adapterDiagnostics: adapterDiagnostics)
+            }
+            adapter.start()
+        }
+
+        // Camera ingress: observer wired before start() so no frame is missed.
+        // Live green-screen requests 960x540 iFrame capture first (vs. the
+        // 1080p-first default used by every other camera/Duet caller) — this
+        // RND latency path preserves 16:9 aspect while further reducing
+        // capture/input cost than 720p; segmentation and compositing do not
+        // need full 1080p. Where iFrame960x540 is unsupported the source falls
+        // back to 720p before its generic 1080p-first default.
+        let camera = VGDuetCameraSource(sessionPresets: [
+            AVCaptureSession.Preset.iFrame960x540.rawValue,
+            AVCaptureSession.Preset.hd1280x720.rawValue,
+        ])
+        session.cameraSource = camera
+        if let adapter = adapter {
+            // Observer runs synchronously on the capture queue; the adapter's submit
+            // is non-blocking (the provider retains and dispatches internally).
+            camera.setFrameObserver { [weak adapter] pixelBuffer, pts in
+                adapter?.submitFrame(pixelBuffer, presentationTime: pts)
+            }
+        }
+        camera.start()
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_CAMERA_STARTED sessionId=\(session.sessionId) cameraSelectedSessionPreset=\(camera.selectedSessionPreset ?? "unknown") keyed=\(adapter != nil)")
+
+        // Presents go texture → textureFrameAvailable on main. Providers hold
+        // the session weakly so the loop never keeps a released session alive.
+        let texture   = session.texture
+        let textureId = session.textureId
+        let loop = VGLiveGreenScreenRenderLoop(
+            compositor:     compositor,
+            background:     session.background,
+            foregroundRect: session.foregroundRect,
+            cameraFrameProvider: { [weak session] preferredPTS in
+                guard let session = session, let camera = session.cameraSource else { return nil }
+                // Pair to the mask's source PTS when it is numeric; otherwise,
+                // or when no history frame is inside the window, use the latest.
+                if let pts = preferredPTS, pts.isNumeric,
+                   let match = camera.snapshotRetainedWithPTS(
+                       near: pts,
+                       maxDeltaSeconds: VGLiveGreenScreenSessionCoordinator.maskPairingMaxDeltaSeconds) {
+                    if !session.loggedFirstAlignedPair {
+                        session.loggedFirstAlignedPair = true
+                        let absDeltaMs = abs(CMTimeGetSeconds(match.pts) - CMTimeGetSeconds(pts)) * 1000.0
+                        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_PTS_ALIGNED_PAIR_FIRST sessionId=\(session.sessionId) absDeltaMs=\(String(format: "%.2f", absDeltaMs)) maskSourcePtsSeconds=\(String(format: "%.4f", CMTimeGetSeconds(pts))) cameraPtsSeconds=\(String(format: "%.4f", CMTimeGetSeconds(match.pts))) maxPairingDeltaMs=\(Int((VGLiveGreenScreenSessionCoordinator.maskPairingMaxDeltaSeconds * 1000.0).rounded()))")
+                    }
+                    return match.frame
+                }
+                return camera.snapshotRetained()
+            },
+            maskProvider: { [weak session] in
+                // The adapter returns an owned (+1) CVPixelBuffer that ARC manages
+                // in `mask`; passRetained adds the +1 the loop releases after
+                // compositing, and `mask` drops its own reference on scope exit.
+                // sourcePTS is written only alongside a returned mask.
+                var sourcePTS = CMTime.invalid
+                guard let mask = session?.adapter?.latestMaskRetained(
+                    maxAgeSeconds: VGLiveGreenScreenSessionCoordinator.maskMaxAgeSeconds,
+                    sourcePTSOut: &sourcePTS)
+                else { return nil }
+                return VGLiveGreenScreenRenderLoop.MaskSnapshot(buffer: Unmanaged.passRetained(mask),
+                                                                sourcePTS: sourcePTS)
+            },
+            presentHandler: { pixelBuffer in
+                texture.update(pixelBuffer: pixelBuffer)
+                registry.textureFrameAvailable(textureId)
+            })
+        session.renderLoop = loop
+        loop.start()
+    }
+
+    /// Called on main (once) when the active ARKit engine failed after start.
+    /// Stops the engine completely first (frame delivery off, in-flight render
+    /// drained, ARSession and Metal resources released) so the camera is free
+    /// before any AVCapture path starts, caches its final summary, then either
+    /// continues keyed on the Vision Fast adapter pipeline ("auto") or takes
+    /// the degraded-unkeyed segmentation-failure path ("arkit" explicit). The
+    /// session, its texture, background, and foreground rect are unchanged.
+    private func handleARKitEngineFailure(session: LiveSession,
+                                          engine: VGARKitLiveGreenScreenPreviewCoordinator,
+                                          reason: String) {
+        assert(Thread.isMainThread)
+        guard session === activeSession, session.arkitEngine === engine else { return }
+
+        engine.onTerminalFailure = nil
+        let summary = engine.stop()
+        session.arkitEngine = nil
+        session.arkitTerminalDiagnostics = summary
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_ENGINE_FAILED sessionId=\(session.sessionId) reason=\(reason) requestedSegmentationBackend=\(session.requestedSegmentationBackend) publishedFrames=\(summary["publishedFrames"] ?? 0) renderFailureCount=\(summary["renderFailureCount"] ?? 0)")
+
+        guard let registry = textureRegistry else {
+            // Not reachable after a successful start (the registry was needed
+            // to start); logged so a frozen texture is never silent.
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_FALLBACK_UNAVAILABLE sessionId=\(session.sessionId) reason=texture_registry_missing")
+            return
+        }
+
+        if session.requestedSegmentationBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit {
+            // Explicit ARKit: no Vision fallback by design. Camera-only pipeline
+            // + segmentation-failure path (degraded event ios_arkit → unkeyed).
+            session.segmentationBackendSelection = "arkit_explicit_runtime_failure(\(reason))"
+            startCameraPipeline(session: session, registry: registry, adapter: nil)
+            handleAdapterFailure(
+                session: session,
+                adapterDiagnostics: VGLiveGreenScreenSessionCoordinator.arkitUnavailableDiagnostics(
+                    failureReason: "arkit_runtime_failure: \(reason)", engineSummary: summary),
+                previousBackend: VGLiveGreenScreenSessionCoordinator.backendIosARKit)
+            return
+        }
+
+        // "auto": keep keying on the Vision Fast adapter pipeline — same
+        // texture, same current background and foreground rect, same
+        // diagnostics options a direct adapter start would have used.
+        let backend = VGLiveGreenScreenSegmentationBackendVisionFast
+        session.effectiveSegmentationBackend = backend
+        session.segmentationBackendSelection = "vision_fallback_after_arkit_runtime_failure(\(reason))"
+        let adapter = VGLiveGreenScreenMaskProviderAdapter(
+            fastMetalPrecision:  session.fastMetalPrecision,
+            segmentationBackend: backend)
+        startCameraPipeline(session: session, registry: registry, adapter: adapter)
+        let failureReason = "arkit_runtime_failure: \(reason)"
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_FALLBACK_TO_VISION sessionId=\(session.sessionId) reason=\(reason) segmentationBackend=\(backend) — keying continues on the adapter path")
+
+        // Degraded event: keying continues on a lower rung (ios_arkit → ios_ml),
+        // mirroring the Dart `degraded` semantics ("moved to a lower rung; the
+        // camera is still keyed").
+        onLiveGreenScreenEvent?([
+            "event":               VGLiveGreenScreenSessionCoordinator.eventDegraded,
+            "type":                "degraded",
+            "sessionId":           session.sessionId,
+            "previousBackend":     VGLiveGreenScreenSessionCoordinator.backendIosARKit,
+            "currentBackend":      VGLiveGreenScreenSessionCoordinator.backendIosMl,
+            "reason":              failureReason,
+            "failureCategory":     VGLiveGreenScreenSessionCoordinator.reasonARKitEngineFailure,
+            "failureReason":       failureReason,
+            "segmentationBackend": backend,
+            "providerKind":        "pending",
+            "providerMode":        "pending",
+            "userMessage":         VGLiveGreenScreenSessionCoordinator.arkitFallbackUserMessage,
+        ])
+    }
+
+    /// Synthetic "no provider" diagnostics for an explicit ARKit request that
+    /// could not start or failed at runtime, shaped like the adapter's
+    /// `onProviderUnavailable` snapshot so `handleAdapterFailure` caches and
+    /// reports it exactly as it would a Vision / LiteRT setup failure. The
+    /// engine's final summary (when it ran) travels under `arkitEngine`.
+    private static func arkitUnavailableDiagnostics(failureReason: String,
+                                                    engineSummary: [String: Any]?) -> [String: Any] {
+        let published = engineSummary?["publishedFrames"] as? Int ?? 0
+        var diagnostics: [String: Any] = [
+            "providerKind":            "unavailable",
+            "providerMode":            "arkit_unavailable",
+            "segmentationBackend":     segmentationBackendARKit,
+            "timingSemantics":         "none",
+            "failureReason":           failureReason,
+            "modelName":               VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsModelName,
+            "mattePath":               VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsMattePath,
+            "sampleCount":             published,
+            "maskPublishCount":        published,
+            "lastMaskCoveragePercent": -1,
+        ]
+        if let engineSummary = engineSummary {
+            diagnostics["arkitEngine"] = engineSummary
+        }
+        return diagnostics
+    }
+
+    /// Maps a live ARKit engine snapshot onto the diagnostics keys the adapter
+    /// path reports (see VGLiveGreenScreenMaskProviderAdapter.diagnosticsSnapshot)
+    /// and keeps every engine-specific key verbatim (avgMatteGenerationMs,
+    /// p95MatteGenerationMs, avgCompositeMs, p95CompositeMs, effectiveFps,
+    /// publishedFrames, droppedBusyFrames, skippedNoMaskFrames, throttledFrames,
+    /// droppedPoolExhaustedFrames, videoFormat*, engineState, foregroundRect,
+    /// liveMatteRefinement, maskRefinementPath, maskRefinementApplied,
+    /// maskMorphologyCloseApplied, maskFeatherApplied, maskTrimapApplied,
+    /// maskGuidedEdgeApplied, liveTightAlphaR1Applied, …).
+    /// Timing semantics "arkit_matte_generator_spans": invoke = ARMatteGenerator
+    /// generateMatte + GPU wait, inputCopy = 0, outputAccess = matte texture →
+    /// CVPixelBuffer copy, policy = CoreImage blend + render, total = matte +
+    /// composite per published frame.
+    private static func arkitDiagnosticsPayload(session: LiveSession,
+                                                snapshot: [String: Any]) -> [String: Any] {
+        var payload: [String: Any] = [:]
+        for (key, value) in snapshot where key != "pass" && key != "proofBoundary" {
+            payload[key] = value
+        }
+        func number(_ key: String) -> Double? {
+            return (snapshot[key] as? NSNumber)?.doubleValue
+        }
+        func sum(_ a: Double?, _ b: Double?) -> Double {
+            guard let a = a, let b = b else { return -1 }
+            return a + b
+        }
+        let published    = snapshot["publishedFrames"] as? Int ?? 0
+        let avgMatte     = number("avgMatteGenerationMs")
+        let maxMatte     = number("maxMatteGenerationMs")
+        let avgCopy      = number("avgMatteCopyMs")
+        let maxCopy      = number("maxMatteCopyMs")
+        let avgComposite = number("avgCompositeMs")
+        let maxComposite = number("maxCompositeMs")
+
+        payload["providerKind"]                     = VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsProviderKind
+        payload["providerMode"]                     = VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsProviderMode
+        payload["timingSemantics"]                  = VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsTimingSemantics
+        payload["segmentationBackend"]              = segmentationBackendARKit
+        payload["failureReason"]                    = (snapshot["failureReason"] as? String) ?? noFailureReason
+        payload["modelName"]                        = VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsModelName
+        payload["mattePath"]                        = VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsMattePath
+        payload["inputGeometry"]                    = "aspectFill"
+        payload["fastMetalPrecision"]               = session.fastMetalPrecision
+        payload["metalAllowPrecisionLossRequested"] = session.fastMetalPrecision
+        payload["metalAllowPrecisionLoss"]          = false
+        payload["active"]                           = (snapshot["engineState"] as? String) == "running"
+        payload["sampleCount"]                      = published
+        payload["maskPublishCount"]                 = published
+        payload["lastMaskCoveragePercent"]          = -1
+        payload["lastMaskWidth"]                    = snapshot["matteWidth"] ?? 0
+        payload["lastMaskHeight"]                   = snapshot["matteHeight"] ?? 0
+        payload["avgTotalMs"]                       = sum(avgMatte, avgComposite)
+        payload["maxTotalMs"]                       = sum(maxMatte, maxComposite)
+        payload["avgInferenceMs"]                   = avgMatte ?? -1
+        payload["maxInferenceMs"]                   = maxMatte ?? -1
+        payload["avgInputCopyMs"]                   = 0
+        payload["avgInvokeMs"]                      = avgMatte ?? -1
+        payload["maxInvokeMs"]                      = maxMatte ?? -1
+        payload["avgOutputAccessMs"]                = avgCopy ?? -1
+        payload["maxOutputAccessMs"]                = maxCopy ?? -1
+        payload["avgPolicyMs"]                      = (avgComposite != nil && avgCopy != nil) ? avgComposite! - avgCopy! : -1
+        payload["avgCadenceMs"]                     = number("avgPublishIntervalMs") ?? -1
+        payload["firstMaskLatencyMs"]               = number("firstMaskLatencyMs") ?? -1
+        payload["firstPublishLatencyMs"]            = number("firstPublishLatencyMs") ?? -1
+        return payload
     }
 
     // MARK: - Private: segmentation failure
 
     /// Called on main when VGLiveGreenScreenMaskProviderAdapter could create no
-    /// mask provider at all (neither LiteRT nor the heuristic fallback). Keying
+    /// mask provider at all (neither LiteRT nor the heuristic fallback), or —
+    /// with a synthetic snapshot (`arkitUnavailableDiagnostics`) — when an
+    /// explicitly requested ARKit engine was unavailable or failed. Keying
     /// is disabled and rendering continues unkeyed over the same background;
     /// the session is NOT stopped.
     ///
@@ -573,9 +1067,12 @@ final class VGLiveGreenScreenSessionCoordinator {
     /// `failureReason`, …). It is cached on the session — together with the
     /// session fields that must outlive the adapter — BEFORE the adapter is
     /// invalidated and dropped, so `diagnostics(sessionId:)` and the degraded
-    /// event can both report why keying failed.
+    /// event can both report why keying failed. `previousBackend` names the
+    /// backend that was keying before (ios_ml for the adapter, ios_arkit for
+    /// the ARKit engine) in the degraded event.
     private func handleAdapterFailure(session: LiveSession,
-                                      adapterDiagnostics: [String: Any]) {
+                                      adapterDiagnostics: [String: Any],
+                                      previousBackend: String = VGLiveGreenScreenSessionCoordinator.backendIosMl) {
         assert(Thread.isMainThread)
         guard session === activeSession, session.isKeyed else { return }
         session.isKeyed = false
@@ -642,7 +1139,7 @@ final class VGLiveGreenScreenSessionCoordinator {
             "event":               VGLiveGreenScreenSessionCoordinator.eventDegraded,
             "type":                "degraded",
             "sessionId":           session.sessionId,
-            "previousBackend":     VGLiveGreenScreenSessionCoordinator.backendIosMl,
+            "previousBackend":     previousBackend,
             "currentBackend":      VGLiveGreenScreenSessionCoordinator.backendUnkeyed,
             "reason":              exactReason ?? VGLiveGreenScreenSessionCoordinator.reasonSegmentationFailure,
             "failureCategory":     VGLiveGreenScreenSessionCoordinator.reasonSegmentationFailure,

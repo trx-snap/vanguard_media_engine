@@ -55,13 +55,23 @@
 //     a mismatch is logged as IOS_LIVE_GREENSCREEN_PUBLIC_API_FAST_METAL_NOT_APPLIED
 //     (a note, never a failure).
 //     Segmentation backend: the default run proves the native production
-//     default (Vision Fast) without forcing an override: when
+//     default without forcing an override: when
 //     `LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND` is absent or empty, no
 //     `iosSegmentationBackend` key is passed in `setLiveGreenScreenDiagnosticsOptions`,
-//     letting the unconfigured native default run and be proven.
+//     letting the unconfigured native default ("auto") run and be proven. On
+//     iOS "auto" resolves to the ARKit ARMatteGenerator engine when the device
+//     supports front-camera face tracking with person segmentation (native
+//     diagnostics: segmentationEngine "arkit", providerKind "arkit",
+//     providerMode "arkit_face_matte_full", timingSemantics
+//     "arkit_matte_generator_spans", segmentationBackend "arkit",
+//     requestedSegmentationBackend "auto", segmentationBackendSelection
+//     "arkit_default") and to Vision Fast otherwise (providerMode vision_fast,
+//     segmentationBackendSelection vision_default_arkit_unsupported(...)).
 //     To run an explicit A/B override, pass:
-//         --dart-define=LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND=<litert|visionFast|visionBalanced|visionAccurate|litertSelfie>
-//     (litert = alternate LiteRT/Metal path; litertSelfie = the
+//         --dart-define=LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND=<auto|arkit|litert|visionFast|visionBalanced|visionAccurate|litertSelfie>
+//     (arkit = explicit ARKit engine with no Vision fallback — an unsupported
+//     device takes the degraded-unkeyed path with the exact reason;
+//     litert = alternate LiteRT/Metal path; litertSelfie = the
 //     same LiteRT/Metal runtime on the small Android-production selfie model
 //     selfie_segmentation_landscape.tflite with aspect-fit input and a direct
 //     single-channel person matte, no fallback). When non-empty, the value is sent
@@ -73,14 +83,31 @@
 //     plus `providerKind`, `providerMode`, and `timingSemantics` from the
 //     diagnostics route are reported next to it as
 //     `nativeSegmentationBackend` / `providerKind` / `providerMode` /
-//     `timingSemantics`, with `segmentationBackendApplied` true when the
-//     running provider matches the request (or matches the Vision Fast
-//     default when no override was requested: providerMode vision_fast).
+//     `timingSemantics` (plus the native `requestedSegmentationBackend`,
+//     `segmentationBackendSelection`, `segmentationEngine`, and the ARKit
+//     engine spans `avgMatteGenerationMs` / `avgCompositeMs` / `effectiveFps`
+//     when present), with `segmentationBackendApplied` true when the
+//     running provider matches the request (an explicit "auto" request is
+//     applied when the native side resolved it to the ARKit engine or to
+//     Vision Fast; null when no override was requested).
 //     A mismatch is logged as
 //     IOS_LIVE_GREENSCREEN_PUBLIC_API_SEGMENTATION_BACKEND_NOT_APPLIED (a
 //     note, never a failure). For a Vision backend the split spans mean:
 //     invoke = Vision request perform, inputCopy = 0, outputAccess =
 //     observation lookup, policy = mask copy (see `timingSemantics`).
+//     Live matte refinement (RND): the default run leaves the live matte
+//     refinement at its native production default (`s1`, the unchanged live
+//     pipeline): when `LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT` is absent or
+//     empty, no `iosLiveMatteRefinement` key is passed in
+//     `setLiveGreenScreenDiagnosticsOptions`. To opt into the "A tight alpha"
+//     offline A/B candidate, pass:
+//         --dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=tightAlphaR1
+//     (an unknown value is rejected natively with INVALID_ARG, which fails that
+//     step). The request is recorded as `requestedLiveMatteRefinement` ('s1'
+//     when no override is requested); the native echo `liveMatteRefinement`
+//     from the diagnostics route is reported next to it as
+//     `nativeLiveMatteRefinement`. This option never changes the overlay/PIP
+//     phase, which stays independently opt-in and defaults to false.
 //   - Keying readiness (WAIT_KEYING_READY step): right after START, before
 //     the first observation window, the harness polls the diagnostic-only
 //     native route `getLiveGreenScreenDiagnostics` every
@@ -192,6 +219,12 @@
 //         the native echoed backend / providerKind / providerMode /
 //         timingSemantics reported side by side for a LiteRT vs Apple Vision
 //         A/B on the same harness
+//       * live matte refinement native default proof (when no override is
+//         passed) proving the unconfigured native default stays "s1"; or
+//         explicit opt-in request (dart-define: tightAlphaR1) delivered
+//         through the same setLiveGreenScreenDiagnosticsOptions route before
+//         START, with the native echoed `liveMatteRefinement` reported side
+//         by side with the request
 //   - Non-claims:
 //       * no automated pixel or matte quality proof; the image background
 //         step is proved by accepted route/lifecycle/acceptance plus a
@@ -212,6 +245,10 @@
 //         (segmentationBackendApplied), never used to fail; Vision split
 //         spans are request/observation/copy spans, not TFLite tensor spans
 //         (see timingSemantics)
+//       * no live matte refinement assertion or quality claim: the requested
+//         vs native `liveMatteRefinement` value is reported only, never used
+//         to fail the smoke; this option carries no visual quality proof for
+//         "tightAlphaR1" beyond route acceptance
 //       * no video background proof (solid/image background only; video
 //         backgrounds remain explicitly not proved/deferred)
 //       * no export proof
@@ -263,6 +300,8 @@ const String kSegmentationBackendRequestedMarkerPrefix =
     'IOS_LIVE_GREENSCREEN_PUBLIC_API_SEGMENTATION_BACKEND_REQUESTED=';
 const String kSegmentationBackendNotAppliedMarker =
     'IOS_LIVE_GREENSCREEN_PUBLIC_API_SEGMENTATION_BACKEND_NOT_APPLIED';
+const String kLiveMatteRefinementRequestedMarkerPrefix =
+    'IOS_LIVE_GREENSCREEN_PUBLIC_API_LIVE_MATTE_REFINEMENT_REQUESTED=';
 const String kOverlayPhaseMarkerPrefix =
     'IOS_LIVE_GREENSCREEN_PUBLIC_API_OVERLAY_PHASE_INCLUDED=';
 const String kKeyingReadyMarkerPrefix =
@@ -315,11 +354,13 @@ const bool kFastMetalRequested = bool.fromEnvironment(
 
 /// Which native segmentation backend the next start should use.
 /// When absent or empty (the default), no `iosSegmentationBackend` option is
-/// sent, allowing the native production default (Vision Fast) to run and be
+/// sent, allowing the native production default ("auto": the ARKit
+/// ARMatteGenerator engine when supported, else Vision Fast) to run and be
 /// proven. Override with
 /// `--dart-define=LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND=<backend>`
-/// (`litert` selectable alternate LiteRT/Metal path; `visionFast` /
-/// `visionBalanced` / `visionAccurate` select the Apple Vision
+/// (`auto` the same resolution as the default; `arkit` explicit ARKit engine
+/// with no Vision fallback; `litert` selectable alternate LiteRT/Metal path;
+/// `visionFast` / `visionBalanced` / `visionAccurate` select the Apple Vision
 /// person-segmentation provider; `litertSelfie` runs the small Android selfie
 /// model on LiteRT/Metal). The native route rejects any other value with
 /// INVALID_ARG.
@@ -330,7 +371,8 @@ const String kSegmentationBackendRequested = String.fromEnvironment(
 
 /// Whether an explicit segmentation backend override was requested via
 /// `LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND`. When false, the harness proves
-/// the unconfigured native production default (Vision Fast).
+/// the unconfigured native production default ("auto": ARKit when supported,
+/// else Vision Fast).
 const bool kSegmentationBackendOverrideRequested =
     kSegmentationBackendRequested != '';
 
@@ -340,6 +382,33 @@ const String kSegmentationBackendReported =
     kSegmentationBackendOverrideRequested
         ? kSegmentationBackendRequested
         : 'nativeDefault';
+
+/// Which opt-in live matte refinement RND candidate the next start should use
+/// (see VGDuetPreviewCompositor.LiveMatteRefinementMode). When absent or empty
+/// (the default), no `iosLiveMatteRefinement` option is sent, letting the
+/// native production default ("s1", the unchanged live pipeline) run and be
+/// proven. Override with
+/// `--dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=tightAlphaR1`
+/// to opt into the "A tight alpha" offline A/B candidate. The native route
+/// rejects any other value with INVALID_ARG.
+const String kLiveMatteRefinementRequested = String.fromEnvironment(
+  'LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT',
+  defaultValue: '',
+);
+
+/// Whether an explicit live matte refinement override was requested via
+/// `LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT`. When false, the harness
+/// proves the unconfigured native production default ("s1").
+const bool kLiveMatteRefinementOverrideRequested =
+    kLiveMatteRefinementRequested != '';
+
+/// Live matte refinement name formatted for display, markers, and payload:
+/// 's1' when [kLiveMatteRefinementRequested] is empty, or the explicit
+/// requested value.
+const String kLiveMatteRefinementReported =
+    kLiveMatteRefinementOverrideRequested
+        ? kLiveMatteRefinementRequested
+        : 's1';
 
 /// Opt-in: run the explicit overlay-style transform phase (scale 0.45
 /// picture-in-picture over a green background) after the image background
@@ -428,6 +497,8 @@ bool? extractFastMetalApplied(Map<String, dynamic>? diagnostics) {
 /// prefix, see [expectedProviderModePrefixForBackend]).
 String? expectedProviderModeForBackend(String backend) {
   switch (backend) {
+    case 'arkit':
+      return 'arkit_face_matte_full';
     case 'visionFast':
       return 'vision_fast';
     case 'visionBalanced':
@@ -453,11 +524,14 @@ String? expectedProviderModePrefixForBackend(String backend) {
 
 /// Whether the native side ran the requested segmentation backend: the echoed
 /// `segmentationBackend` must match the request and the running provider must
-/// be the one that backend selects (`providerMode` vision_fast /
-/// vision_balanced / vision_accurate for a Vision request; `providerKind`
-/// litert for litert; `providerKind` litert AND `providerMode` prefixed
-/// litert_selfie for litertSelfie — a plain `litert_*` mode would mean the
-/// production model ran instead).
+/// be the one that backend selects (`providerMode` arkit_face_matte_full for
+/// an explicit arkit request; vision_fast / vision_balanced / vision_accurate
+/// for a Vision request; `providerKind` litert for litert; `providerKind`
+/// litert AND `providerMode` prefixed litert_selfie for litertSelfie — a plain
+/// `litert_*` mode would mean the production model ran instead). An explicit
+/// "auto" request is applied when the native side resolved it to the ARKit
+/// engine (segmentationBackend arkit, providerKind arkit) or to Vision Fast
+/// (segmentationBackend visionFast, providerMode vision_fast).
 /// Null when the native build does not report `segmentationBackend`.
 bool? extractSegmentationBackendApplied(
   Map<String, dynamic>? diagnostics,
@@ -465,6 +539,13 @@ bool? extractSegmentationBackendApplied(
 ) {
   final native = diagnostics?['segmentationBackend'];
   if (native is! String) return null;
+  if (requested == 'auto') {
+    if (native == 'arkit') return diagnostics?['providerKind'] == 'arkit';
+    if (native == 'visionFast') {
+      return diagnostics?['providerMode'] == 'vision_fast';
+    }
+    return false;
+  }
   if (native != requested) return false;
   final expectedMode = expectedProviderModeForBackend(requested);
   if (expectedMode != null) {
@@ -657,6 +738,7 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
     print(kSmokeStartMarker);
     print('$kFastMetalRequestedMarkerPrefix$kFastMetalRequested');
     print('$kSegmentationBackendRequestedMarkerPrefix$kSegmentationBackendReported');
+    print('$kLiveMatteRefinementRequestedMarkerPrefix$kLiveMatteRefinementReported');
     print('$kOverlayPhaseMarkerPrefix$kIncludeOverlayPhase');
 
     const platform = MethodChannelVGLiveGreenScreenPlatform();
@@ -762,13 +844,16 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
       // INVALID_ARG and fails this step (loud, never a silent default).
       await runStep<void>(
         'SET_DIAGNOSTICS_OPTIONS',
-        'Setting live green-screen diagnostics options (iosFastMetalPrecision=$kFastMetalRequested${kSegmentationBackendOverrideRequested ? ', iosSegmentationBackend=$kSegmentationBackendRequested' : ''})',
+        'Setting live green-screen diagnostics options (iosFastMetalPrecision=$kFastMetalRequested${kSegmentationBackendOverrideRequested ? ', iosSegmentationBackend=$kSegmentationBackendRequested' : ''}${kLiveMatteRefinementOverrideRequested ? ', iosLiveMatteRefinement=$kLiveMatteRefinementRequested' : ''})',
         () async {
           final options = <String, Object?>{
             'iosFastMetalPrecision': kFastMetalRequested,
           };
           if (kSegmentationBackendOverrideRequested) {
             options['iosSegmentationBackend'] = kSegmentationBackendRequested;
+          }
+          if (kLiveMatteRefinementOverrideRequested) {
+            options['iosLiveMatteRefinement'] = kLiveMatteRefinementRequested;
           }
           final raw = await kDiagnosticsChannel.invokeMapMethod<String, dynamic>(
             kDiagnosticsOptionsMethod,
@@ -1041,7 +1126,23 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
                   kSegmentationBackendOverrideRequested,
               'nativeSegmentationBackend': raw['segmentationBackend'],
               'segmentationBackendApplied': backendApplied,
+              // Native backend resolution identity (absent on older native
+              // builds): which backend was requested natively ("auto" when
+              // no override was sent), why the effective backend was chosen,
+              // and which engine drives the session ("arkit" | "adapter").
+              'nativeRequestedSegmentationBackend':
+                  raw['requestedSegmentationBackend'],
+              'segmentationBackendSelection':
+                  raw['segmentationBackendSelection'],
+              'segmentationEngine': raw['segmentationEngine'],
+              'requestedLiveMatteRefinement': kLiveMatteRefinementReported,
+              'nativeLiveMatteRefinement': raw['liveMatteRefinement'],
               'timingSemantics': raw['timingSemantics'],
+              // ARKit engine spans (present only when segmentationEngine is
+              // "arkit"; reported, never asserted).
+              'avgMatteGenerationMs': raw['avgMatteGenerationMs'],
+              'avgCompositeMs': raw['avgCompositeMs'],
+              'effectiveFps': raw['effectiveFps'],
               // Model / matte-path echo (litert vs litertSelfie proof; absent
               // on older native builds).
               'modelName': raw['modelName'],
@@ -1206,6 +1307,19 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
                 kSegmentationBackendRequested,
               )
             : null,
+        // Native backend resolution identity (absent on older native builds).
+        'nativeRequestedSegmentationBackend':
+            diagnostics?['requestedSegmentationBackend'],
+        'segmentationBackendSelection':
+            diagnostics?['segmentationBackendSelection'],
+        'segmentationEngine': diagnostics?['segmentationEngine'],
+        'avgMatteGenerationMs': diagnostics?['avgMatteGenerationMs'],
+        'avgCompositeMs': diagnostics?['avgCompositeMs'],
+        'effectiveFps': diagnostics?['effectiveFps'],
+        'requestedLiveMatteRefinement': kLiveMatteRefinementReported,
+        'liveMatteRefinementOverrideRequested':
+            kLiveMatteRefinementOverrideRequested,
+        'nativeLiveMatteRefinement': diagnostics?['liveMatteRefinement'],
         'timingSemantics': diagnostics?['timingSemantics'],
         'modelName': diagnostics?['modelName'],
         'mattePath': diagnostics?['mattePath'],
@@ -1235,7 +1349,8 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
           'staged image fixture temp file/directory guaranteed cleanup',
           'LiteRT matte latency/cadence telemetry captured on device through the diagnostic-only getLiveGreenScreenDiagnostics route and reported verbatim in the diagnostics map',
           'fast-Metal request (LIVE_GREENSCREEN_IOS_FAST_METAL dart-define) delivered through the diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, and the native requested/applied precision option, provider mode, and split inference spans (input copy / invoke / output access) reported side by side when present',
-          'segmentation backend request (LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND dart-define: litert | visionFast | visionBalanced | visionAccurate | litertSelfie) delivered through the same diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, and the native echoed backend, providerKind, providerMode, timingSemantics, modelName, mattePath, inputGeometry, and split spans reported side by side so the LiteRT/Metal multiclass path, the small selfie model on the same runtime, and Apple Vision person segmentation can be A/B compared on the same harness',
+          'segmentation backend request (LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND dart-define: auto | arkit | litert | visionFast | visionBalanced | visionAccurate | litertSelfie) delivered through the same diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, and the native echoed backend, requestedSegmentationBackend, segmentationBackendSelection, segmentationEngine, providerKind, providerMode, timingSemantics, modelName, mattePath, inputGeometry, split spans, and ARKit engine spans (avgMatteGenerationMs / avgCompositeMs / effectiveFps) reported side by side so the ARKit ARMatteGenerator engine (native default when supported), the LiteRT/Metal multiclass path, the small selfie model on the same runtime, and Apple Vision person segmentation can be A/B compared on the same harness',
+          'live matte refinement native default proof (when no override is passed) proving the unconfigured native default stays "s1"; or explicit opt-in request (LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT dart-define: tightAlphaR1) delivered through the same diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, with the native echoed liveMatteRefinement reported side by side with the request',
         ],
         'nonClaims': <String>[
           'no automated pixel or matte quality proof; the image background step is proved by accepted route/lifecycle/acceptance plus a bounded observation window, not by visual classification; the keying proof gates prove a real person matte was produced and consumed, not that it was accurate',
@@ -1243,6 +1358,7 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
           'no latency threshold assertion: timing values (avg/max/min spans, cadence, first-mask latency) are reported, never used to fail the smoke; only the presence gates (sampleCount > 0, maskPublishCount > 0) and the bounded readiness wait are asserted',
           'no fast-Metal assertion: a requested-but-not-applied precision option or absent split fields are reported (fastMetalApplied / latencySplitFieldsPresent), never used to fail the smoke',
           'no segmentation backend assertion: a requested-but-not-applied backend is reported (segmentationBackendApplied false/null), never used to fail the smoke; Vision split spans are request/observation/copy spans, not TFLite tensor spans (see timingSemantics)',
+          'no live matte refinement assertion or quality claim: the requested vs native liveMatteRefinement value is reported only, never used to fail the smoke; tightAlphaR1 carries no visual quality proof beyond route acceptance',
           'no video background proof (solid/image background only; video backgrounds remain explicitly not proved/deferred)',
           'no export proof',
           'no recording proof',
