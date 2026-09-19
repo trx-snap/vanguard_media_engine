@@ -9,10 +9,12 @@
 //     VGARKitLiveGreenScreenPreviewCoordinator over the session's texture —
 //     ARFaceTrackingConfiguration + .personSegmentation, a full-resolution
 //     ARMatteGenerator matte per frame refined through the production
-//     VGDuetPreviewCompositor live mask pipeline (session
-//     liveMatteRefinementMode), CoreImage composite into the current
-//     foreground rect over the current background. It owns the camera through
-//     its ARSession; no VGDuetCameraSource exists while it runs.
+//     VGMatteRefinementPipeline live mask pipeline (session
+//     liveMatteRefinementMode; the same caller-agnostic pipeline the adapter
+//     path's VGDuetPreviewCompositor runs internally), CoreImage composite
+//     into the current foreground rect over the current background. It owns
+//     the camera through its ARSession; no VGDuetCameraSource exists while
+//     it runs.
 //   - Adapter path (fallback, and every explicitly requested adapter backend):
 //     VGLiveGreenScreenMaskProviderAdapter (Vision Fast; or LiteRT/Metal over
 //     selfie_multiclass_256x256.tflite with heuristic fallback; or diagnostics
@@ -67,12 +69,14 @@
 //                      allow_precision_loss; iosSegmentationBackend → "auto"
 //                      (default, see above) | "arkit" | visionFast | litert |
 //                      visionBalanced | ...; iosLiveMatteRefinement →
-//                      VGDuetPreviewCompositor.LiveMatteRefinementMode, "s1"
+//                      VGMatteRefinementPipeline.LiveMatteRefinementMode, "s1"
 //                      (production default, unchanged) | "tightAlphaR1" (opt-in
 //                      RND candidate); applied on BOTH engines — the adapter
-//                      path's VGDuetPreviewCompositor and the ARKit engine's
-//                      refiner (StartRequest.liveMatteRefinementMode, the same
-//                      compositor pipeline) — and echoed in diagnostics with the
+//                      path's VGDuetPreviewCompositor (which owns a
+//                      VGMatteRefinementPipeline internally) and the ARKit
+//                      engine's own VGMatteRefinementPipeline refiner
+//                      (StartRequest.liveMatteRefinementMode, the same
+//                      refinement pipeline) — and echoed in diagnostics with the
 //                      ARKit per-stage applied flags; diagnostics can override next start)
 //                      and the pending values reset to the defaults. Never alters a
 //                      running session.
@@ -169,12 +173,12 @@ struct VGLiveGreenScreenDiagnosticsOptions {
     var iosSegmentationBackend: String = VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
 
     /// Opt-in live matte refinement RND candidate for the NEXT session start only
-    /// (see VGDuetPreviewCompositor.LiveMatteRefinementMode). Default "s1" is exactly
+    /// (see VGMatteRefinementPipeline.LiveMatteRefinementMode). Default "s1" is exactly
     /// current production live behavior, byte-for-byte unchanged; "tightAlphaR1" opts
     /// into the bounded CoreImage post-pass A/B candidate ("A tight alpha"). Validated
-    /// by the method handler against VGDuetPreviewCompositor.LiveMatteRefinementMode
-    /// before reaching here.
-    var iosLiveMatteRefinement: String = VGDuetPreviewCompositor.LiveMatteRefinementMode.s1.rawValue
+    /// by the method handler against VGMatteRefinementPipeline.LiveMatteRefinementMode
+    /// (exposed as VGDuetPreviewCompositor.LiveMatteRefinementMode) before reaching here.
+    var iosLiveMatteRefinement: String = VGMatteRefinementPipeline.LiveMatteRefinementMode.s1.rawValue
 
     static let `default` = VGLiveGreenScreenDiagnosticsOptions()
 
@@ -284,7 +288,7 @@ final class VGLiveGreenScreenSessionCoordinator {
         /// fallback builds the adapter / compositor exactly as a direct adapter
         /// start would have.
         let fastMetalPrecision: Bool
-        let liveMatteRefinementMode: VGDuetPreviewCompositor.LiveMatteRefinementMode
+        let liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode
 
         /// Current full-canvas static background and foreground rect (top-left
         /// origin). Updated by updateBackground / updateTransform and reused
@@ -323,7 +327,7 @@ final class VGLiveGreenScreenSessionCoordinator {
              requestedSegmentationBackend: String,
              requestedLiveMatteRefinement: String,
              fastMetalPrecision: Bool,
-             liveMatteRefinementMode: VGDuetPreviewCompositor.LiveMatteRefinementMode,
+             liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode,
              background: CVPixelBuffer,
              foregroundRect: CGRect) {
             self.sessionId    = sessionId
@@ -411,7 +415,7 @@ final class VGLiveGreenScreenSessionCoordinator {
 
         // Fail open to .s1 if the stored string is somehow not a known raw value
         // (the method handler already validates it exactly; this is defense in depth).
-        let liveMatteRefinementMode = VGDuetPreviewCompositor.LiveMatteRefinementMode(
+        let liveMatteRefinementMode = VGMatteRefinementPipeline.LiveMatteRefinementMode(
             rawValue: diagnosticsOptions.iosLiveMatteRefinement) ?? .s1
 
         let rects = VGDuetLayoutGeometry.greenScreen(canvasWidth: CGFloat(width),
@@ -756,10 +760,11 @@ final class VGLiveGreenScreenSessionCoordinator {
 
     /// Starts the ARKit engine on the session's texture with the session's
     /// current background, foreground rect, and live matte refinement mode
-    /// (the engine refines its matte through the same VGDuetPreviewCompositor
-    /// pipeline `startCameraPipeline` builds). Returns nil on success (the
-    /// engine is stored on the session) or the engine's exact start failure
-    /// reason; a failed start registers and retains nothing.
+    /// (the engine refines its matte through its own VGMatteRefinementPipeline
+    /// instance — the same refinement pipeline the VGDuetPreviewCompositor
+    /// `startCameraPipeline` builds runs internally). Returns nil on success
+    /// (the engine is stored on the session) or the engine's exact start
+    /// failure reason; a failed start registers and retains nothing.
     private func startARKitEngine(session: LiveSession,
                                   registry: FlutterTextureRegistry) -> String? {
         assert(Thread.isMainThread)

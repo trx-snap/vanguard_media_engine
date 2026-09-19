@@ -38,21 +38,24 @@
 //
 // Mask refinement: the oriented / aspect-filled full-resolution matte is NOT
 // blended raw. Before CIBlendWithMask it runs through the production live mask
-// refinement owned by VGDuetPreviewCompositor
-// (refineLiveGreenScreenMaskForExternalEngine: morphology close → feather →
-// trimap → camera-guided edge preserve, plus the opt-in tightAlphaR1 post-pass
+// refinement owned by the caller-agnostic VGMatteRefinementPipeline
+// (refineLiveGreenScreenMask: morphology close → feather → trimap →
+// camera-guided edge preserve, plus the opt-in tightAlphaR1 post-pass
 // when StartRequest.liveMatteRefinementMode is .tightAlphaR1; default .s1), so
-// the ARKit path and the Vision adapter path share one refinement pipeline and
-// one set of constants. The compositor instance held in RenderResources is
-// used for mask refinement only: this engine still owns the camera (ARSession),
-// ARMatteGenerator, CIContext, output pool, publishing, and lifecycle, and the
-// refinement never changes the camera / matte geometry or orientation (it is
-// applied to the already oriented and aspect-filled mask over the same target
-// rect, with the oriented camera image as the edge guide). Every stage fails
-// open to its input, so the worst case is the raw matte. The first refined
-// blend logs IOS_ARKIT_LIVE_MASK_REFINEMENT_FIRST with the mode and per-stage
-// applied flags, and diagnosticsSnapshot / the stop summary carry
-// liveMatteRefinement plus the same flags from the most recent blend.
+// the ARKit path and the Vision adapter path (which runs the same pipeline
+// through its own VGDuetPreviewCompositor) share one refinement pipeline and
+// one set of constants. The VGMatteRefinementPipeline instance held in
+// RenderResources is used for mask refinement only: this engine still owns
+// the camera (ARSession), ARMatteGenerator, CIContext, output pool,
+// publishing, and lifecycle — it never instantiates a VGDuetPreviewCompositor
+// — and the refinement never changes the camera / matte geometry or
+// orientation (it is applied to the already oriented and aspect-filled mask
+// over the same target rect, with the oriented camera image as the edge
+// guide). Every stage fails open to its input, so the worst case is the raw
+// matte. The first refined blend logs IOS_ARKIT_LIVE_MASK_REFINEMENT_FIRST
+// with the mode and per-stage applied flags, and diagnosticsSnapshot / the
+// stop summary carry liveMatteRefinement plus the same flags from the most
+// recent blend.
 //
 // Threading: ARSession delegate callbacks arrive on a private serial delegate
 // queue; matte generation + compositing run on a private serial render queue
@@ -139,7 +142,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
     static let diagnosticsModelName       = "ARMatteGenerator"
     static let diagnosticsMattePath       = "arkit_matte_full_resolution"
     /// `maskRefinementPath` diagnostics value: the matte is refined through
-    /// VGDuetPreviewCompositor's live pipeline before the blend (never raw).
+    /// VGMatteRefinementPipeline's live pipeline before the blend (never raw).
+    /// Value unchanged ("compositor_live_refinement") for wire compatibility.
     static let diagnosticsMaskRefinementPath = "compositor_live_refinement"
     /// Marker logged once on the first blend that used the refined mask.
     static let maskRefinementFirstMarker = "IOS_ARKIT_LIVE_MASK_REFINEMENT_FIRST"
@@ -200,11 +204,11 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         /// pixels (VGDuetLayoutGeometry.greenScreen). nil → full canvas.
         /// Swappable live through `updateForegroundRect`.
         let foregroundRect: CGRect?
-        /// Live mask refinement mode run by the VGDuetPreviewCompositor refiner
+        /// Live mask refinement mode run by the VGMatteRefinementPipeline refiner
         /// before every blend (see header). `.s1` (default) is the production
         /// pipeline; `.tightAlphaR1` adds the opt-in post-pass exactly as on
         /// the adapter path.
-        let liveMatteRefinementMode: VGDuetPreviewCompositor.LiveMatteRefinementMode
+        let liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode
 
         init(canvasWidth: Int,
              canvasHeight: Int,
@@ -216,7 +220,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
              captureBundleAfterPublishedFrames: Int = 1,
              background: CVPixelBuffer? = nil,
              foregroundRect: CGRect? = nil,
-             liveMatteRefinementMode: VGDuetPreviewCompositor.LiveMatteRefinementMode = .s1) {
+             liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode = .s1) {
             self.canvasWidth = canvasWidth
             self.canvasHeight = canvasHeight
             self.targetFps = targetFps
@@ -263,11 +267,12 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         /// Solid-teal full-canvas fallback background (used when no session
         /// background buffer is set: the probe path).
         let backgroundImage: CIImage
-        /// Production live mask refiner (VGDuetPreviewCompositor, canvas-sized,
+        /// Production live mask refiner (VGMatteRefinementPipeline,
         /// StartRequest.liveMatteRefinementMode). Used ONLY for
-        /// refineLiveGreenScreenMaskForExternalEngine; it never composites,
-        /// renders, or publishes here.
-        let maskRefiner: VGDuetPreviewCompositor
+        /// refineLiveGreenScreenMask; it never composites, renders, or
+        /// publishes here, and this engine never instantiates a
+        /// VGDuetPreviewCompositor.
+        let maskRefiner: VGMatteRefinementPipeline
         /// Matte pool, created lazily for the first observed matte size.
         var mattePool: CVPixelBufferPool?
         var mattePoolWidth = 0
@@ -281,7 +286,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
 
         init(device: MTLDevice, commandQueue: MTLCommandQueue, matteGenerator: ARMatteGenerator,
              ciContext: CIContext, outputPool: CVPixelBufferPool, canvasRect: CGRect, backgroundImage: CIImage,
-             maskRefiner: VGDuetPreviewCompositor) {
+             maskRefiner: VGMatteRefinementPipeline) {
             self.device = device
             self.commandQueue = commandQueue
             self.matteGenerator = matteGenerator
@@ -513,12 +518,11 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
             .cacheIntermediates: false,
         ])
         let matteGenerator = ARMatteGenerator(device: device, matteResolution: .full)
-        // Production mask refiner: the same VGDuetPreviewCompositor pipeline the
-        // adapter path runs, at canvas size and this session's live mode. Mask
-        // refinement only (see RenderResources.maskRefiner).
-        let maskRefiner = VGDuetPreviewCompositor(canvasWidth: Double(canvasWidth),
-                                                  canvasHeight: Double(canvasHeight),
-                                                  liveMatteRefinementMode: request.liveMatteRefinementMode)
+        // Production mask refiner: the same VGMatteRefinementPipeline the adapter
+        // path's VGDuetPreviewCompositor runs internally, at this session's live
+        // mode. Mask refinement only (see RenderResources.maskRefiner); this
+        // engine never instantiates a VGDuetPreviewCompositor.
+        let maskRefiner = VGMatteRefinementPipeline(liveMatteRefinementMode: request.liveMatteRefinementMode)
         resources = RenderResources(
             device: device,
             commandQueue: commandQueue,
@@ -919,7 +923,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
 
         // 4. Identical orientation + aspect-fill transform for camera and matte
         //    into the foreground rect; the aspect-filled matte is then refined
-        //    through the production VGDuetPreviewCompositor live pipeline (same
+        //    through the production VGMatteRefinementPipeline live pipeline (same
         //    rect, camera as edge guide — geometry and orientation untouched)
         //    and the camera is blended over the background through the REFINED
         //    mask, never the raw matte. Outside the rect the cropped camera /
@@ -930,7 +934,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         let composited: CIImage
         let cameraImage: CIImage
         let maskImage: CIImage
-        var refinement: VGDuetPreviewCompositor.LiveGreenScreenMaskRefinement?
+        var refinement: VGMatteRefinementPipeline.LiveGreenScreenMaskRefinement?
         if targetRect.isEmpty {
             cameraImage = CIImage.empty()
             maskImage   = CIImage.empty()
@@ -947,7 +951,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
                                            orientation: request.displayOrientation)
                 .transformed(by: fill)
                 .cropped(to: targetRect)
-            let refined = res.maskRefiner.refineLiveGreenScreenMaskForExternalEngine(
+            let refined = res.maskRefiner.refineLiveGreenScreenMask(
                 aspectFilledMask: maskImage, in: targetRect, guidedBy: cameraImage)
             refinement = refined
             let params: [String: Any] = [
