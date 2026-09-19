@@ -15,7 +15,9 @@
 // leftMirrored, aspect-filled) camera + matte baseline bundle from a live
 // front-camera frame and render its deterministic replay PNG and matte
 // stage PNGs across requested refinement modes (s1, s4GuidedAlphaR1,
-// s5GuidedFilterR1) for same-capture offline A/B quality-science inspection.
+// s5GuidedFilterR1, tightAlphaR1) for same-capture offline A/B quality-science
+// inspection, and computes objective per-mode mask-edge metrics from each
+// mode's 06_post_guided_edge.png so visual tuning can be evidence-based.
 //
 // Flow:
 //   1. unique run root under Directory.systemTemp (or
@@ -31,7 +33,13 @@
 //   6. runLiveGreenScreenMatteStageLab (once per requested refinement mode)
 //      → stage PNGs in <runRoot>/stages_<mode>
 //   7. verify every reported output file exists non-empty
-//   8. print JSON and exit 0 on pass / 1 on fail
+//   8. decode each verified mode's 06_post_guided_edge.png via dart:ui and
+//      compute objective mask-edge metrics, then validate them semantically
+//      (fail-closed: every verified mode must yield metrics that prove a
+//      subject boundary, i.e. foregroundCount > 0, backgroundCount > 0 and
+//      boundaryPairCount > 0, for PASS; an all-background or all-foreground
+//      mask decodes cleanly but fails its mode)
+//   9. print JSON and exit 0 on pass / 1 on fail
 //
 // Dart-defines: IOS_ARKIT_CAPTURE_REPLAY_HOLD_SECONDS (default 5),
 // IOS_ARKIT_CAPTURE_REPLAY_TARGET_FPS (default 30),
@@ -43,12 +51,15 @@
 // IOS_ARKIT_CAPTURE_REPLAY_DISPLAY_ORIENTATION (default 'leftMirrored',
 // either 'leftMirrored' or 'right'),
 // IOS_ARKIT_CAPTURE_REPLAY_REFINEMENT_MODES (default 's1', comma-separated subset
-// of s1, s4GuidedAlphaR1, s5GuidedFilterR1),
+// of s1, s4GuidedAlphaR1, s5GuidedFilterR1, tightAlphaR1),
 // IOS_ARKIT_CAPTURE_REPLAY_EMIT_PNG_BASE64 (default false).
 //
 // Markers: IOS_ARKIT_CAPTURE_REPLAY_CONFIG, IOS_ARKIT_CAPTURE_REPLAY_START,
 // IOS_ARKIT_CAPTURE_REPLAY_CAPTURED, IOS_ARKIT_CAPTURE_REPLAY_REPLAY_DONE,
 // IOS_ARKIT_CAPTURE_REPLAY_STAGE_LAB_DONE,
+// IOS_ARKIT_CAPTURE_REPLAY_EDGE_METRICS mode=<mode> ... (one per mode),
+// IOS_ARKIT_CAPTURE_REPLAY_EDGE_METRICS_INVALID mode=<mode> reason=... (only
+// for a mode whose metrics cannot prove a subject boundary),
 // IOS_ARKIT_CAPTURE_REPLAY_ARTIFACT_BEGIN,
 // IOS_ARKIT_CAPTURE_REPLAY_ARTIFACT_CHUNK,
 // IOS_ARKIT_CAPTURE_REPLAY_ARTIFACT_END,
@@ -58,10 +69,12 @@
 // IOS_ARKIT_CAPTURE_REPLAY_PASS / IOS_ARKIT_CAPTURE_REPLAY_FAIL.
 //
 // Non-claims: no production promotion, no tuning constants, no TikTok parity
-// claim, no visual metric comparison; no export MP4, no image/video
-// background, no audio, no Vision/LiteRT comparison; base64 PNG stdout emission
-// is a physical diagnostic transport workaround when devicectl artifact copying
-// fails, not a quality claim.
+// claim; edge metrics are objective descriptors of the written 8-bit mask
+// PNGs, not a perceptual quality score, and no threshold or ranking between
+// modes is asserted; no export MP4, no image/video background, no audio, no
+// Vision/LiteRT comparison; base64 PNG stdout emission is a physical diagnostic
+// transport workaround when devicectl artifact copying fails, not a quality
+// claim.
 
 // ignore_for_file: avoid_print
 
@@ -69,6 +82,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -153,12 +167,18 @@ const String kRefinementModeS4GuidedAlphaR1 = 's4GuidedAlphaR1';
 /// Diagnostic-only RND candidate refinement mode (matte stage lab only).
 const String kRefinementModeS5GuidedFilterR1 = 's5GuidedFilterR1';
 
+/// Offline lab evaluation of the live opt-in tight-alpha R1 post-pass (matte
+/// stage lab only; selecting it here never changes the live default). Writes
+/// exactly the seven standard stage files.
+const String kRefinementModeTightAlphaR1 = 'tightAlphaR1';
+
 /// Exact refinement mode strings accepted natively
 /// (VGDuetPreviewCompositor.GreenScreenRefinementMode raw values).
 const List<String> kAcceptedRefinementModes = <String>[
   kRefinementModeS1,
   kRefinementModeS4GuidedAlphaR1,
   kRefinementModeS5GuidedFilterR1,
+  kRefinementModeTightAlphaR1,
 ];
 
 /// Extra stage PNG native writes only for [kRefinementModeS4GuidedAlphaR1];
@@ -179,8 +199,8 @@ const String _rawRefinementModes = String.fromEnvironment(
 );
 
 /// Validates the refinement modes dart-define: comma-separated subset/order of
-/// exactly: s1, s4GuidedAlphaR1, s5GuidedFilterR1. Rejects empty, unknown, or
-/// duplicate modes before start.
+/// exactly: s1, s4GuidedAlphaR1, s5GuidedFilterR1, tightAlphaR1. Rejects empty,
+/// unknown, or duplicate modes before start.
 List<String> parseRefinementModes(String raw) {
   final trimmed = raw.trim();
   if (trimmed.isEmpty) {
@@ -266,8 +286,231 @@ Map<String, String> expectedStageFilesForMode(String mode) {
         ..._standardStageFiles,
         kS5BandStageKey: kS5BandStageFile,
       };
+    case kRefinementModeTightAlphaR1:
+      return _standardStageFiles;
     default:
       throw ArgumentError('Unknown refinement mode: $mode');
+  }
+}
+
+/// Stage key whose PNG (06_post_guided_edge.png, the mode-selected final mask)
+/// feeds the per-mode edge metrics.
+const String kEdgeMetricsStageKey = 'postGuidedEdge';
+
+/// 8-bit mask value thresholds: >= [kEdgeMetricsForegroundMin] counts as solid
+/// foreground, <= [kEdgeMetricsBackgroundMax] as solid background, anything in
+/// between as transition (soft edge).
+const int kEdgeMetricsForegroundMin = 245;
+const int kEdgeMetricsBackgroundMax = 10;
+
+/// Definitions carried in the JSON so a metric line is legible without this
+/// source. Mask PNGs are grayscale-in-RGB renders; the red channel is read.
+const Map<String, String> _edgeMetricsDefinitions = <String, String>{
+  'source':
+      "each mode's 06_post_guided_edge.png (the mode-selected final mask) decoded "
+          'at native size via dart:ui; mask value = red channel of the RGBA render',
+  'foregroundCount': 'pixels with value >= $kEdgeMetricsForegroundMin',
+  'backgroundCount': 'pixels with value <= $kEdgeMetricsBackgroundMax',
+  'transitionCount':
+      'pixels with $kEdgeMetricsBackgroundMax < value < $kEdgeMetricsForegroundMin',
+  'transitionRatio': 'transitionCount / (width * height)',
+  'boundaryPair':
+      'a horizontally or vertically adjacent pixel pair with a non-zero absolute value difference',
+  'boundaryPairCount': 'number of boundary pairs',
+  'avgBoundaryStep':
+      'mean absolute value difference over boundary pairs (0 when there are none)',
+  'p95BoundaryStep':
+      '95th percentile (nearest rank, exact from a 256-bin histogram) of the absolute value difference over boundary pairs (0 when there are none)',
+  'maxBoundaryStep':
+      'maximum absolute value difference over boundary pairs (0 when there are none)',
+  'semanticValidity':
+      'metrics are valid only if they can prove a subject boundary: foregroundCount > 0, '
+          'backgroundCount > 0 and boundaryPairCount > 0. A mask that decodes cleanly but is '
+          'all background (foregroundCount=0), all foreground (backgroundCount=0) or has no '
+          'boundary pairs (boundaryPairCount=0) describes no matte edge, so its mode is recorded '
+          'in perModeEdgeMetricsErrors and fails the run exactly as a decode error does',
+};
+
+/// Decodes the mask PNG at [path] with dart:ui at native size and computes the
+/// objective edge metrics defined in [_edgeMetricsDefinitions]. Throws on any
+/// read, decode, dimension, or byte-length problem (fail-closed).
+Future<Map<String, dynamic>> computeMaskEdgeMetrics(String path) async {
+  final file = File(path);
+  if (!await file.exists()) {
+    throw FileSystemException('Mask PNG does not exist', path);
+  }
+  final bytes = await file.readAsBytes();
+  if (bytes.isEmpty) {
+    throw StateError('Mask PNG is empty: $path');
+  }
+  final codec = await ui.instantiateImageCodec(bytes);
+  ui.Image? image;
+  try {
+    final frame = await codec.getNextFrame();
+    image = frame.image;
+    final width = image.width;
+    final height = image.height;
+    if (width <= 0 || height <= 0) {
+      throw StateError(
+        'Decoded mask PNG has invalid dimensions ${width}x$height: $path',
+      );
+    }
+    final byteData =
+        await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (byteData == null) {
+      throw StateError('toByteData(rawRgba) returned null for $path');
+    }
+    final expectedLength = width * height * 4;
+    if (byteData.lengthInBytes != expectedLength) {
+      throw StateError(
+        'Decoded RGBA byte length ${byteData.lengthInBytes} != expected '
+        '$expectedLength for ${width}x$height: $path',
+      );
+    }
+    final rgba = byteData.buffer.asUint8List(
+      byteData.offsetInBytes,
+      byteData.lengthInBytes,
+    );
+    return maskEdgeMetricsFromRgba(rgba: rgba, width: width, height: height);
+  } finally {
+    image?.dispose();
+    codec.dispose();
+  }
+}
+
+/// Pure metric computation over an RGBA byte buffer (red channel = mask value).
+/// See [_edgeMetricsDefinitions] for every field.
+Map<String, dynamic> maskEdgeMetricsFromRgba({
+  required Uint8List rgba,
+  required int width,
+  required int height,
+}) {
+  if (width <= 0 || height <= 0) {
+    throw ArgumentError('width/height must be positive (got ${width}x$height)');
+  }
+  final total = width * height;
+  if (rgba.length != total * 4) {
+    throw ArgumentError(
+      'rgba length ${rgba.length} != ${total * 4} for ${width}x$height',
+    );
+  }
+  final values = Uint8List(total);
+  for (var i = 0; i < total; i++) {
+    values[i] = rgba[i * 4];
+  }
+
+  var foregroundCount = 0;
+  var backgroundCount = 0;
+  for (var i = 0; i < total; i++) {
+    final v = values[i];
+    if (v >= kEdgeMetricsForegroundMin) {
+      foregroundCount++;
+    } else if (v <= kEdgeMetricsBackgroundMax) {
+      backgroundCount++;
+    }
+  }
+  final transitionCount = total - foregroundCount - backgroundCount;
+
+  final histogram = List<int>.filled(256, 0);
+  var boundaryPairCount = 0;
+  var stepSum = 0;
+  var maxBoundaryStep = 0;
+  void account(int d) {
+    if (d == 0) return;
+    histogram[d]++;
+    boundaryPairCount++;
+    stepSum += d;
+    if (d > maxBoundaryStep) maxBoundaryStep = d;
+  }
+
+  // Horizontal neighbours.
+  for (var y = 0; y < height; y++) {
+    final row = y * width;
+    for (var x = 0; x + 1 < width; x++) {
+      account((values[row + x] - values[row + x + 1]).abs());
+    }
+  }
+  // Vertical neighbours.
+  for (var y = 0; y + 1 < height; y++) {
+    final row = y * width;
+    final next = row + width;
+    for (var x = 0; x < width; x++) {
+      account((values[row + x] - values[next + x]).abs());
+    }
+  }
+
+  final avgBoundaryStep =
+      boundaryPairCount == 0 ? 0.0 : stepSum / boundaryPairCount;
+  var p95BoundaryStep = 0;
+  if (boundaryPairCount > 0) {
+    // Nearest-rank percentile: smallest step whose cumulative count reaches
+    // ceil(0.95 * n).
+    final rank = (boundaryPairCount * 95 + 99) ~/ 100;
+    var cumulative = 0;
+    for (var d = 1; d < 256; d++) {
+      cumulative += histogram[d];
+      if (cumulative >= rank) {
+        p95BoundaryStep = d;
+        break;
+      }
+    }
+  }
+
+  return <String, dynamic>{
+    'width': width,
+    'height': height,
+    'totalPixels': total,
+    'foregroundCount': foregroundCount,
+    'backgroundCount': backgroundCount,
+    'transitionCount': transitionCount,
+    'transitionRatio': transitionCount / total,
+    'boundaryPairCount': boundaryPairCount,
+    'avgBoundaryStep': avgBoundaryStep,
+    'p95BoundaryStep': p95BoundaryStep,
+    'maxBoundaryStep': maxBoundaryStep,
+  };
+}
+
+/// Thrown when edge metrics decoded and computed cleanly but cannot prove a
+/// subject boundary (see `semanticValidity` in [_edgeMetricsDefinitions]).
+class MaskEdgeMetricsSemanticException implements Exception {
+  MaskEdgeMetricsSemanticException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'MaskEdgeMetricsSemanticException: $message';
+}
+
+/// Returns null when [metrics] can prove a subject boundary, otherwise a
+/// human-readable reason. Invalid when `foregroundCount <= 0`,
+/// `backgroundCount <= 0` or `boundaryPairCount <= 0` (or when any of those
+/// fields is missing / non-integer): an all-background, all-foreground or
+/// boundary-free mask says nothing about matte edge quality, so a run that
+/// only produced such masks must not PASS.
+String? maskEdgeMetricsSemanticProblem(Map<String, dynamic> metrics) {
+  final problems = <String>[];
+  for (final entry in const <String, String>{
+    'foregroundCount': 'no solid foreground pixels (mask is all background?)',
+    'backgroundCount': 'no solid background pixels (mask is all foreground?)',
+    'boundaryPairCount': 'no boundary pairs (mask is uniform)',
+  }.entries) {
+    final value = _asInt(metrics[entry.key]);
+    if (value == null) {
+      problems.add('${entry.key} missing or non-integer');
+    } else if (value <= 0) {
+      problems.add('${entry.key}=$value: ${entry.value}');
+    }
+  }
+  if (problems.isEmpty) return null;
+  return 'metrics cannot prove a subject boundary: ${problems.join('; ')}';
+}
+
+/// Fail-closed wrapper over [maskEdgeMetricsSemanticProblem].
+void validateMaskEdgeMetricsSemantics(Map<String, dynamic> metrics) {
+  final problem = maskEdgeMetricsSemanticProblem(metrics);
+  if (problem != null) {
+    throw MaskEdgeMetricsSemanticException(problem);
   }
 }
 
@@ -275,13 +518,14 @@ const List<String> _claims = <String>[
   'One replay input bundle (metadata.json, background.bgra, camera.bgra, mask.r8) was captured natively from a successfully composited live ARKit frame at or after the warmup threshold using the identical oriented/aspect-filled camera and matte the live composite blended, at full canvas size with full-canvas sourceRect/cameraRect.',
   'The bundle replays deterministically through replayLiveGreenScreenInputBundle to one PNG and through runLiveGreenScreenMatteStageLab (per requested refinement mode) to one PNG per matte stage, and every reported output file exists non-empty.',
   'Live-preview telemetry (frame cadence, matte/composite timing, drop/skip/throttle counts) for the hold is carried through from the native stop summary.',
+  "For every verified refinement mode, objective mask-edge metrics (foreground/background/transition counts, transition ratio, boundary-pair count, avg/p95/max boundary step) are computed by this harness from that mode's 06_post_guided_edge.png as written and validated semantically (foregroundCount > 0, backgroundCount > 0, boundaryPairCount > 0); a mode without computed metrics, or whose metrics cannot prove a subject boundary (e.g. an all-background mask), fails the run.",
 ];
 
 const List<String> _nonClaims = <String>[
   'No production promotion: diagnostic-only routes over a discardable RND coordinator; no public Dart API is exercised.',
   'No tuning: no visual tuning constants are changed or proposed.',
   'No TikTok parity claim.',
-  'No visual metric comparison yet: this only freezes a correct ARKit baseline bundle and renders replay artifacts for inspection.',
+  'Edge metrics are objective descriptors of the written 8-bit mask PNGs (dart:ui decode, red channel), not a perceptual quality score; no threshold, target, or ranking between modes is asserted and no mode is promoted.',
   'The captured frame is taken at or after the warmup threshold (default 45 published frames), not a chosen or representative pose.',
   'No export MP4, no image or video background (solid teal only), no audio, no Vision/LiteRT comparison.',
   'Base64 PNG stdout emission is a physical diagnostic transport workaround when devicectl artifact copying fails, not a quality claim.',
@@ -453,6 +697,9 @@ class _IosArkitPersonSegmentationMatteCaptureReplayPhysicalSmokeAppState
     final perModeStageLabResults = <String, Map<String, dynamic>>{};
     final perModeStageLabErrors = <String, String>{};
     final perModeStageLabVerified = <String, bool>{};
+    final perModeEdgeMetrics = <String, Map<String, dynamic>>{};
+    final perModeEdgeMetricsErrors = <String, String>{};
+    final perModeEdgeMetricsSemanticValid = <String, bool>{};
 
     final stageOutputDir =
         perModeStageOutputDir[primaryMode] ?? defaultStageOutputDir;
@@ -753,6 +1000,63 @@ class _IosArkitPersonSegmentationMatteCaptureReplayPhysicalSmokeAppState
           (mode) => perModeStageLabVerified[mode] == true,
         );
 
+    // ---- per-mode mask-edge metrics (fail-closed) -------------------------
+    // Computed only for modes whose stage lab verified; every verified mode
+    // must yield metrics for PASS, and those metrics must prove a subject
+    // boundary (foregroundCount > 0, backgroundCount > 0, boundaryPairCount
+    // > 0). Raw metrics are still recorded for an invalid mode so the JSON
+    // shows what was measured, but the mode is failed like a decode error.
+    for (final mode in requestedRefinementModes) {
+      if (perModeStageLabVerified[mode] != true) continue;
+      _setStatus('Computing edge metrics ($mode)…');
+      try {
+        final maskPath = perModeStagePaths[mode]?[kEdgeMetricsStageKey];
+        if (maskPath == null || maskPath.isEmpty) {
+          throw StateError(
+            'No reported "$kEdgeMetricsStageKey" path for mode "$mode"',
+          );
+        }
+        final metrics = await computeMaskEdgeMetrics(maskPath);
+        perModeEdgeMetrics[mode] = metrics;
+        print('IOS_ARKIT_CAPTURE_REPLAY_EDGE_METRICS mode=$mode '
+            'file=$maskPath '
+            'width=${metrics['width']} height=${metrics['height']} '
+            'foregroundCount=${metrics['foregroundCount']} '
+            'backgroundCount=${metrics['backgroundCount']} '
+            'transitionCount=${metrics['transitionCount']} '
+            'transitionRatio=${(metrics['transitionRatio'] as double).toStringAsFixed(6)} '
+            'boundaryPairCount=${metrics['boundaryPairCount']} '
+            'avgBoundaryStep=${(metrics['avgBoundaryStep'] as double).toStringAsFixed(3)} '
+            'p95BoundaryStep=${metrics['p95BoundaryStep']} '
+            'maxBoundaryStep=${metrics['maxBoundaryStep']}');
+        final semanticProblem = maskEdgeMetricsSemanticProblem(metrics);
+        perModeEdgeMetricsSemanticValid[mode] = semanticProblem == null;
+        if (semanticProblem != null) {
+          print('IOS_ARKIT_CAPTURE_REPLAY_EDGE_METRICS_INVALID mode=$mode '
+              'file=$maskPath reason=$semanticProblem');
+          throw MaskEdgeMetricsSemanticException(semanticProblem);
+        }
+      } catch (e, st) {
+        final error = e is MaskEdgeMetricsSemanticException
+            ? e.message
+            : _describeError(e, st);
+        perModeEdgeMetricsErrors[mode] = error;
+        final reasonKey = e is MaskEdgeMetricsSemanticException
+            ? 'edge_metrics_invalid_$mode'
+            : 'edge_metrics_failed_$mode';
+        failureReasons.add('$reasonKey: $error');
+        print('IOS_ARKIT_CAPTURE_REPLAY_ERROR: [$mode] edge metrics: $error');
+      }
+    }
+
+    final edgeMetricsVerified = stageLabVerified &&
+        perModeEdgeMetricsErrors.isEmpty &&
+        requestedRefinementModes.every(
+          (mode) =>
+              perModeEdgeMetrics.containsKey(mode) &&
+              perModeEdgeMetricsSemanticValid[mode] == true,
+        );
+
     // ---- base64 artifact emission (opt-in RND transport workaround) ------
     if (_emitPngBase64) {
       if (replayVerified && stageLabVerified) {
@@ -803,6 +1107,7 @@ class _IosArkitPersonSegmentationMatteCaptureReplayPhysicalSmokeAppState
         bundleVerified &&
         replayVerified &&
         stageLabVerified &&
+        edgeMetricsVerified &&
         (!_emitPngBase64 || artifactExportVerified);
 
     final legacyStagePaths =
@@ -843,6 +1148,11 @@ class _IosArkitPersonSegmentationMatteCaptureReplayPhysicalSmokeAppState
       'perModeStageLabResults': perModeStageLabResults,
       'perModeStageLabErrors': perModeStageLabErrors,
       'perModeStageLabVerified': perModeStageLabVerified,
+      'perModeEdgeMetrics': perModeEdgeMetrics,
+      'perModeEdgeMetricsErrors': perModeEdgeMetricsErrors,
+      'perModeEdgeMetricsSemanticValid': perModeEdgeMetricsSemanticValid,
+      'edgeMetricsDefinitions': _edgeMetricsDefinitions,
+      'edgeMetricsStageKey': kEdgeMetricsStageKey,
       'stageOutputDir': stageOutputDir,
       'stagePaths': legacyStagePaths,
       'bundleFiles': _bundleFiles,
@@ -852,6 +1162,7 @@ class _IosArkitPersonSegmentationMatteCaptureReplayPhysicalSmokeAppState
       'bundleVerified': bundleVerified,
       'replayVerified': replayVerified,
       'stageLabVerified': stageLabVerified,
+      'edgeMetricsVerified': edgeMetricsVerified,
       'emitPngBase64': _emitPngBase64,
       'artifactExportVerified': artifactExportVerified,
       'exportedArtifactNames': exportedArtifactNames,

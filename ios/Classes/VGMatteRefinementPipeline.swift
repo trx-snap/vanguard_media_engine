@@ -71,6 +71,14 @@
 // CoreImage filter (no CPU pixel loops, no custom Metal/kernel) and any unavailable/
 // degenerate step fails open to the S1 mask unchanged.
 //
+// Offline lab parity for tightAlphaR1 (diagnostic only; never selects the live mode):
+// GreenScreenRefinementMode.tightAlphaR1 lets the offline matte-stage lab run the very
+// same applyLiveTightAlphaR1 post-pass on the S1 final mask (postGuidedEdge) so the lab
+// can emit objective mask-edge metrics for it next to S1/S4/S5. It reuses the live
+// implementation and constants verbatim, so lab evidence describes exactly what the live
+// opt-in would render; it does not change LiveMatteRefinementMode, its default, or any
+// live caller. The live path never requests it; the default mode is .s1.
+//
 // Fail-open behavior:
 // Each refinement stage is fail-open to its input: if a required CoreImage filter is
 // unavailable or inputs are degenerate, the stage is skipped and the previous stage's
@@ -112,6 +120,11 @@ final class VGMatteRefinementPipeline {
         /// RND candidate: S1 final mask plus band-limited local-linear guided-filter
         /// refinement (approximate He et al. guided filter) using the camera frame as guide.
         case s5GuidedFilterR1 = "s5GuidedFilterR1"
+        /// Offline lab evaluation of the live opt-in "tight alpha R1" post-pass: S1 final
+        /// mask plus the exact `applyLiveTightAlphaR1` recipe (smoothstep remap + small
+        /// final blur). Diagnostic only here; selecting it never changes
+        /// `LiveMatteRefinementMode` or any live default.
+        case tightAlphaR1 = "tightAlphaR1"
     }
 
     /// Live-selectable matte refinement mode, opt-in only through a diagnostic-only route
@@ -181,15 +194,28 @@ final class VGMatteRefinementPipeline {
         /// names the first unavailable/degenerate step.
         let s5GuidedFilterFailOpenReason: String?
 
+        /// Offline tight-alpha R1 output: `applyLiveTightAlphaR1` (the exact live opt-in
+        /// post-pass) run on `postGuidedEdge` when `refinementMode == .tightAlphaR1` and
+        /// every step succeeded; otherwise exactly `postGuidedEdge` (not requested, or
+        /// fail-open to S1).
+        let postTightAlphaR1: CIImage
+        /// True only when `.tightAlphaR1` was requested and fully applied.
+        let tightAlphaR1Applied: Bool
+        /// Non-nil only when `.tightAlphaR1` was requested but failed open to S1; names
+        /// the first unavailable/degenerate step.
+        let tightAlphaR1FailOpenReason: String?
+
         /// The final mask selected by `refinementMode`: `postGuidedEdge` for `.s1`,
         /// `postS4GuidedAlpha` for `.s4GuidedAlphaR1`, `postS5GuidedFilter` for
-        /// `.s5GuidedFilterR1` (each identical to `postGuidedEdge` on fail-open). A
-        /// caller's live composite path reads `postGuidedEdge` directly.
+        /// `.s5GuidedFilterR1`, `postTightAlphaR1` for `.tightAlphaR1` (each identical to
+        /// `postGuidedEdge` on fail-open). A caller's live composite path reads
+        /// `postGuidedEdge` directly.
         var finalMask: CIImage {
             switch refinementMode {
             case .s1:               return postGuidedEdge
             case .s4GuidedAlphaR1:  return postS4GuidedAlpha
             case .s5GuidedFilterR1: return postS5GuidedFilter
+            case .tightAlphaR1:     return postTightAlphaR1
             }
         }
     }
@@ -329,7 +355,9 @@ final class VGMatteRefinementPipeline {
     ///   - refinementMode: `.s1` (default; the four stages above, exactly what a caller's
     ///            live path uses), `.s4GuidedAlphaR1`, or `.s5GuidedFilterR1`
     ///            (diagnostic-only RND candidates run on top of the unchanged S1 stages;
-    ///            see `applyGreenScreenS4GuidedAlphaR1` / `applyGreenScreenS5GuidedFilterR1`).
+    ///            see `applyGreenScreenS4GuidedAlphaR1` / `applyGreenScreenS5GuidedFilterR1`),
+    ///            or `.tightAlphaR1` (offline lab evaluation of the live opt-in
+    ///            `applyLiveTightAlphaR1` post-pass on the unchanged S1 final mask).
     func greenScreenMatteStages(aspectFilledMask mask: CIImage,
                                 in rect: CGRect,
                                 guidedBy guide: CIImage,
@@ -341,18 +369,31 @@ final class VGMatteRefinementPipeline {
                                                            feathered: feathered.mask,
                                                            guide: guide,
                                                            in: rect)
+        let s4NotRequested = GreenScreenS4Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+        let s5NotRequested = GreenScreenS5Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+        let tightAlphaNotRequested = LiveTightAlphaR1Result(mask: guided.mask, applied: false, failOpenReason: nil)
         let s4: GreenScreenS4Result
         let s5: GreenScreenS5Result
+        let tightAlpha: LiveTightAlphaR1Result
         switch refinementMode {
         case .s1:
-            s4 = GreenScreenS4Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
-            s5 = GreenScreenS5Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+            s4 = s4NotRequested
+            s5 = s5NotRequested
+            tightAlpha = tightAlphaNotRequested
         case .s4GuidedAlphaR1:
             s4 = applyGreenScreenS4GuidedAlphaR1(base: guided.mask, guide: guide, in: rect)
-            s5 = GreenScreenS5Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+            s5 = s5NotRequested
+            tightAlpha = tightAlphaNotRequested
         case .s5GuidedFilterR1:
-            s4 = GreenScreenS4Result(mask: guided.mask, band: nil, applied: false, failOpenReason: nil)
+            s4 = s4NotRequested
             s5 = applyGreenScreenS5GuidedFilterR1(base: guided.mask, guide: guide, in: rect)
+            tightAlpha = tightAlphaNotRequested
+        case .tightAlphaR1:
+            // Offline lab parity: the exact live opt-in post-pass over the S1 final mask,
+            // never the raw segmentation mask. The live path never requests this mode.
+            s4 = s4NotRequested
+            s5 = s5NotRequested
+            tightAlpha = applyLiveTightAlphaR1(guided.mask, in: rect)
         }
         return GreenScreenMatteStages(aspectFilledInput: mask,
                                       postMorphologyClose: closed.mask,
@@ -371,7 +412,10 @@ final class VGMatteRefinementPipeline {
                                       postS5GuidedFilter: s5.mask,
                                       s5RefinementBand: s5.band,
                                       s5GuidedFilterApplied: s5.applied,
-                                      s5GuidedFilterFailOpenReason: s5.failOpenReason)
+                                      s5GuidedFilterFailOpenReason: s5.failOpenReason,
+                                      postTightAlphaR1: tightAlpha.mask,
+                                      tightAlphaR1Applied: tightAlpha.applied,
+                                      tightAlphaR1FailOpenReason: tightAlpha.failOpenReason)
     }
 
     /// Live mask refinement: refines an already aspect-filled green-screen mask at output
@@ -1070,9 +1114,11 @@ final class VGMatteRefinementPipeline {
     }
 
     /// Opt-in live matte refinement candidate ("A tight alpha" from the offline A/B lab).
-    /// Runs only when `liveMatteRefinementMode == .tightAlphaR1` (selected through a
+    /// Runs live only when `liveMatteRefinementMode == .tightAlphaR1` (selected through a
     /// diagnostic-only route before session start); the default `.s1` mode never calls
-    /// this function.
+    /// this function. The offline stage tap also calls it, unchanged, when
+    /// `GreenScreenRefinementMode.tightAlphaR1` is requested so lab metrics describe the
+    /// same recipe and constants the live opt-in renders.
     ///
     /// Pipeline (all stock CoreImage filters, evaluated only over `rect`):
     ///   1. Smoothstep remap of the S1 final mask `mask` (`postGuidedEdge`, never the raw

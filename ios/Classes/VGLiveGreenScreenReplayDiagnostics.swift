@@ -16,6 +16,10 @@
 //     mask/composite (07 is built here with composite()'s CIBlendWithMask recipe because
 //     composite() itself only ever runs S1), and an eighth PNG shows where the candidate
 //     acted (08_s4_guided_alpha_band.png for S4, 08_s5_guided_filter_band.png for S5).
+//     .tightAlphaR1 is the offline lab evaluation of the live opt-in tight-alpha post-pass
+//     (the same applyLiveTightAlphaR1 recipe over the S1 final mask): the seven standard
+//     PNG names only, 06/07 reflect the tight-alpha-selected final mask/composite, no band
+//     file. Selecting it here never changes the live default (LiveMatteRefinementMode .s1).
 // All writes refuse to overwrite existing files. No camera or ML segmentation runs here.
 
 import CoreGraphics
@@ -670,12 +674,15 @@ final class VGLiveGreenScreenReplayDiagnostics {
     /// `.s4GuidedAlphaR1`, so neither existing contract is affected by adding S5.
     static let matteStageS5BandFile: (key: String, file: String) = ("s5RefinementBand", "08_s5_guided_filter_band.png")
 
-    /// Stage files for a mode: the seven S1 files, plus the mode's own extra RND band file.
+    /// Stage files for a mode: the seven S1 files, plus the mode's own extra RND band file
+    /// (S4/S5 only). `.tightAlphaR1` is a global remap with no band tap, so it writes
+    /// exactly the seven standard files.
     static func matteStageFiles(for mode: VGDuetPreviewCompositor.GreenScreenRefinementMode) -> [(key: String, file: String)] {
         switch mode {
         case .s1:               return matteStageFiles
         case .s4GuidedAlphaR1:  return matteStageFiles + [matteStageS4BandFile]
         case .s5GuidedFilterR1: return matteStageFiles + [matteStageS5BandFile]
+        case .tightAlphaR1:     return matteStageFiles
         }
     }
 
@@ -698,8 +705,10 @@ final class VGLiveGreenScreenReplayDiagnostics {
     /// For `.s4GuidedAlphaR1` / `.s5GuidedFilterR1` (RND, diagnostic only) 06 is the
     /// mode-selected final mask (S1 on fail-open), 07 is composed here from that mask with
     /// composite()'s exact CIBlendWithMask recipe rendered into a BGRA canvas buffer, and
-    /// 08 is that mode's refinement band. The live compositor default is never changed by
-    /// this routine.
+    /// 08 is that mode's refinement band. For `.tightAlphaR1` (offline lab evaluation of
+    /// the live opt-in post-pass) 06 is the tight-alpha-selected final mask (S1 on
+    /// fail-open), 07 is composed here from that mask the same way, and there is no 08.
+    /// The live compositor default is never changed by this routine.
     static func runMatteStageLab(inputDir: String,
                                  outputDir: String,
                                  label: String,
@@ -747,9 +756,9 @@ final class VGLiveGreenScreenReplayDiagnostics {
 
         // Final composite for the selected mode.
         //   .s1: composite()'s own pool output (live path, unchanged).
-        //   .s4GuidedAlphaR1 / .s5GuidedFilterR1: composite() only ever runs S1, so the
-        //   candidate composite is built here from stages.finalMask with composite()'s
-        //   exact CIBlendWithMask recipe.
+        //   .s4GuidedAlphaR1 / .s5GuidedFilterR1 / .tightAlphaR1: composite() only ever
+        //   runs S1, so the candidate composite is built here from stages.finalMask with
+        //   composite()'s exact CIBlendWithMask recipe.
         let composited: CVPixelBuffer
         switch refinementMode {
         case .s1:
@@ -766,7 +775,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 )
             }
             composited = pooled
-        case .s4GuidedAlphaR1, .s5GuidedFilterR1:
+        case .s4GuidedAlphaR1, .s5GuidedFilterR1, .tightAlphaR1:
             composited = try composeWithSelectedMask(compositor: compositor,
                                                      bundle: bundle,
                                                      cameraFilled: camFilled,
@@ -801,6 +810,11 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 ? "S5 guided-filter R1 final mask: S1 stage-4 mask refined only inside the guided-filter band (RND, not live)"
                 : "S5 requested but failed open (\(stages.s5GuidedFilterFailOpenReason ?? "unknown")); identical to the S1 stage-4 mask"
             finalCompositeDescription = "full canvas composite built by the lab from the S5-selected final mask with composite()'s CIBlendWithMask recipe (not composite() pool output)"
+        case .tightAlphaR1:
+            finalMaskDescription = stages.tightAlphaR1Applied
+                ? "tight-alpha R1 final mask: the live opt-in applyLiveTightAlphaR1 post-pass (smoothstep remap + small final blur) run offline on the S1 stage-4 mask (lab evaluation, not the live default)"
+                : "tightAlphaR1 requested but failed open (\(stages.tightAlphaR1FailOpenReason ?? "unknown")); identical to the S1 stage-4 mask"
+            finalCompositeDescription = "full canvas composite built by the lab from the tight-alpha-R1-selected final mask with composite()'s CIBlendWithMask recipe (not composite() pool output)"
         }
         var stageImages: [(key: String, image: CIImage, rect: CGRect, context: CIContext, description: String)] = [
             ("rawMask", rawMaskImage, rawMaskImage.extent, compositor.ciContext,
@@ -883,26 +897,37 @@ final class VGLiveGreenScreenReplayDiagnostics {
             "guidedEdgeApplied":      stages.guidedEdgeApplied,
             "s4GuidedAlphaApplied":   stages.s4GuidedAlphaApplied,
             "s5GuidedFilterApplied":  stages.s5GuidedFilterApplied,
+            "tightAlphaR1Applied":    stages.tightAlphaR1Applied,
         ]
         let s4Status: String
         let s5Status: String
+        let tightAlphaR1Status: String
         switch refinementMode {
         case .s1:
             s4Status = "not_requested"
             s5Status = "not_requested"
+            tightAlphaR1Status = "not_requested"
         case .s4GuidedAlphaR1:
             s4Status = stages.s4GuidedAlphaApplied
                 ? "applied"
                 : "fail_open:\(stages.s4GuidedAlphaFailOpenReason ?? "unknown")"
             s5Status = "not_requested"
+            tightAlphaR1Status = "not_requested"
         case .s5GuidedFilterR1:
             s4Status = "not_requested"
             s5Status = stages.s5GuidedFilterApplied
                 ? "applied"
                 : "fail_open:\(stages.s5GuidedFilterFailOpenReason ?? "unknown")"
+            tightAlphaR1Status = "not_requested"
+        case .tightAlphaR1:
+            s4Status = "not_requested"
+            s5Status = "not_requested"
+            tightAlphaR1Status = stages.tightAlphaR1Applied
+                ? "applied"
+                : "fail_open:\(stages.tightAlphaR1FailOpenReason ?? "unknown")"
         }
 
-        NSLog("[VGLiveGreenScreenReplayDiagnostics] IOS_LIVE_GREENSCREEN_MATTE_STAGE_LAB_COMPLETED inputDir=\(inputDir) outputDir=\(trimmedOutputDir) label=\(label) refinementMode=\(refinementMode.rawValue) s4Status=\(s4Status) s5Status=\(s5Status) canvas=\(bundle.canvasWidth)x\(bundle.canvasHeight) cameraRectCI=\(Int(ciCamera.minX)),\(Int(ciCamera.minY)) \(Int(ciCamera.width))x\(Int(ciCamera.height)) rawMask=\(CVPixelBufferGetWidth(bundle.mask))x\(CVPixelBufferGetHeight(bundle.mask)) flags=\(appliedFlags)")
+        NSLog("[VGLiveGreenScreenReplayDiagnostics] IOS_LIVE_GREENSCREEN_MATTE_STAGE_LAB_COMPLETED inputDir=\(inputDir) outputDir=\(trimmedOutputDir) label=\(label) refinementMode=\(refinementMode.rawValue) s4Status=\(s4Status) s5Status=\(s5Status) tightAlphaR1Status=\(tightAlphaR1Status) canvas=\(bundle.canvasWidth)x\(bundle.canvasHeight) cameraRectCI=\(Int(ciCamera.minX)),\(Int(ciCamera.minY)) \(Int(ciCamera.width))x\(Int(ciCamera.height)) rawMask=\(CVPixelBufferGetWidth(bundle.mask))x\(CVPixelBufferGetHeight(bundle.mask)) flags=\(appliedFlags)")
 
         let claims: [String]
         let nonClaims: [String]
@@ -957,6 +982,24 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 "07 is not composite() pool output; bit-exactness with the live texture path or with the S1 lab composite is not asserted",
                 "S5 is a box-filter approximation of a true local-linear guided filter (He et al.), not an exact solve, and is not compared against S4 for quality",
             ]
+        case .tightAlphaR1:
+            claims = [
+                "offline deterministic replay of the exact captured camera, mask, and background CVPixelBuffers",
+                "camera and mask aspect-filled into the same snapped CI camera rect composite() uses",
+                "stage PNGs 02-05 are the compositor's unchanged S1 greenScreenMatteStages outputs (S1 constants unchanged)",
+                "06_post_guided_edge.png is the tight-alpha R1 selected final mask: the same applyLiveTightAlphaR1 post-pass (smoothstep remap + small final blur over the S1 stage-4 mask, live constants unchanged) that the live opt-in LiveMatteRefinementMode.tightAlphaR1 runs; identical to S1 on fail-open, see tightAlphaR1Status",
+                "07_final_composite.png is composed by the lab from that mask with composite()'s CIBlendWithMask recipe (canvas colour, aspect-filled source, aspect-filled camera foreground) rendered through the compositor CIContext",
+                "exactly the seven standard stage PNG names are written for this mode; there is no 08 band file",
+                "all seven PNGs written without overwriting; a failed write removes this call's partial files",
+            ]
+            nonClaims = [
+                "offline lab evaluation only: tightAlphaR1 is not the live production default (LiveMatteRefinementMode stays .s1 unless a session opts in through its diagnostic-only route) and composite() never runs it; no live behaviour changed by this routine",
+                "diagnostic only: no production visual-quality tuning, no S1 or tight-alpha constant changes",
+                "does not execute live camera capture or live ML segmentation",
+                "no automated pixel quality assertion in this routine; any objective mask-edge metrics are computed by the calling harness from the written stage PNGs",
+                "07 is not composite() pool output; bit-exactness with the live texture path (S1 or the live tightAlphaR1 opt-in) or with the S1 lab composite is not asserted",
+                "tight alpha is a global remap of the whole S1 mask, not a band-limited refinement, so no band tap exists and no comparison against S4/S5 quality is asserted",
+            ]
         }
 
         return [
@@ -968,6 +1011,8 @@ final class VGLiveGreenScreenReplayDiagnostics {
             "s4FailOpenReason": stages.s4GuidedAlphaFailOpenReason ?? "",
             "s5Status": s5Status,
             "s5FailOpenReason": stages.s5GuidedFilterFailOpenReason ?? "",
+            "tightAlphaR1Status": tightAlphaR1Status,
+            "tightAlphaR1FailOpenReason": stages.tightAlphaR1FailOpenReason ?? "",
             "files": stageFiles.map { $0.file },
             "paths": paths,
             "stages": stageEntries,
