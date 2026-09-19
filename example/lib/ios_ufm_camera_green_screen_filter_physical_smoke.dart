@@ -6,6 +6,15 @@
 // and actually keys frames (proved through native telemetry, not log
 // visibility), and does NOT use standalone live green-screen, ARKit, or Duet paths.
 //
+// Optional Beauty V2 + greenScreen combined physical proof mode:
+//   Set UFM_ENABLE_BEAUTY_V2=true to apply the combined chain:
+//     [VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5),
+//      VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)]
+//   Proves sequential co-execution in active camera graph and combined-chain
+//   throughput (steadyProcessedFps >= 20.0 across steady frames >= 50).
+//   Green-screen node telemetry measures greenScreen node time only, not
+//   Beauty V2 per-node or cumulative latency.
+//
 // Harness proof lanes:
 //   1. Start active UFM camera with VanguardEngine.startCamera(position: 2, fps: 30,
 //      captureProfile: <UFM_CAMERA_CAPTURE_PROFILE>, sessionPreset: <UFM_CAMERA_PRESET>).
@@ -17,9 +26,19 @@
 //      profile is not sent (Dart-side precedence in VanguardEngine.startCamera).
 //   2. Display the returned Texture(textureId: ...) full-screen with status overlay.
 //   3. Observe baseline camera for 3 seconds.
-//   4. Apply VanguardEngine.setCameraFilterChain([VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)]).
+//   4. Apply filter chain:
+//      - If UFM_ENABLE_BEAUTY_V2=true:
+//        VanguardEngine.setCameraFilterChain([
+//          VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5),
+//          VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B),
+//        ])
+//      - If UFM_ENABLE_BEAUTY_V2=false:
+//        VanguardEngine.setCameraFilterChain([
+//          VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B),
+//        ])
 //   5. Observe keyed solid-color green screen for 10 seconds. Overlay clearly indicates
-//      this is the UFM camera graph greenScreen filter (S1-refined), not standalone live green-screen API.
+//      the active filter mode (greenScreen only or Beauty V2 + greenScreen),
+//      not standalone live green-screen API.
 //      After a bounded settle period, read the native telemetry snapshot with
 //      VanguardEngine.getCameraGreenScreenDiagnostics() and assert:
 //        non-null, proofLevel == 'S1', matteSource == 'visionPersonFast',
@@ -27,17 +46,21 @@
 //        morphologyCloseApplied / featherApplied / trimapApplied /
 //        guidedEdgeApplied / allS1StagesApplied all true,
 //        allS1StagesAppliedFrameCount > 0.
+//      Steady window & throughput:
+//        Computes steadyWindowSeconds from actual time between warmup and final
+//        diagnostics, and steadyProcessedFps = steadyFrameCount / steadyWindowSeconds.
+//        For Beauty V2 mode: asserts steadyProcessedFps >= 20.0, steadyFrameCount >= 50,
+//        source long side < 1920, and existing greenScreen S1 flags.
 //      Warmup-excluded latency reporting:
 //        Reconstructs steady-state latency across steady frames (steadyFrameCount >= 50)
 //        excluding the warmup settle period:
-//          warmupExcludedMeanTotalMs (> 0 and < 50ms),
-//          warmupExcludedMeanVisionMs (> 0 and < 40ms),
-//          warmupExcludedMeanBlendRenderMs (> 0 and < 30ms).
+//          warmupExcludedMeanTotalMs, warmupExcludedMeanVisionMs, warmupExcludedMeanBlendRenderMs.
+//        For non-Beauty mode: asserts total < 50ms, vision < 40ms, blend < 30ms.
 //        Samples lastTotalMs 5 times across the active steady window.
 //      Objective pixel metrics:
 //        Samples pixels from the isolated video Texture RepaintBoundary against expected
 //        solid teal (0, 121, 107).
-//        Asserts backgroundCoveragePct >= 15.0% and edgeTransitionRatioPct > 0.05%.
+//        In non-Beauty mode, asserts backgroundCoveragePct >= 15.0% and edgeTransitionRatioPct > 0.05%.
 //        If pixel capture is unavailable, records fallback without failing.
 //   6. Clear filters with VanguardEngine.setCameraFilterChain([]). Assert
 //      getCameraGreenScreenDiagnostics() now returns null (no stale node
@@ -46,12 +69,15 @@
 //
 // Claims allowed:
 //   - active UFM camera starts
-//   - greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph
+//   - When Beauty V2 enabled: combined Beauty V2 + greenScreen filter chain accepted and co-executes
+//   - When Beauty V2 enabled: combined-chain throughput/co-execution proven via steady processed FPS (>= 20.0 fps across steady frames >= 50)
+//   - When greenScreen only: greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph
+//   - When greenScreen only: warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)
 //   - native S1 stage telemetry proof is available and asserted (getCameraGreenScreenDiagnostics)
-//   - warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)
-//   - objective pixel metrics sampled from active video texture (background coverage >= 15%, edge transition ratio > 0.05)
+//   - objective pixel metrics sampled from active video texture
 //   - same texture remains mounted
 //   - clear returns to passthrough (native telemetry returns null after clear)
+//   - startCamera captureProfile is a fixed start-time capture decision (greenScreenLowLatency asserts source long side < 1920 when no preset override)
 //   - cleanup stops camera
 //
 // Non-claims:
@@ -61,6 +87,7 @@
 //   - recording/export/photo
 //   - Duet
 //   - Android
+//   - native cumulative latency across combined chain (green-screen node telemetry excludes Beauty V2 per-node cost)
 
 // ignore_for_file: avoid_print
 
@@ -100,6 +127,13 @@ const String kStepCameraStoppedMarker =
 const String kSmokePassMarker = 'IOS_UFM_GREENSCREEN_FILTER_PASS';
 const String kSmokeFailMarker = 'IOS_UFM_GREENSCREEN_FILTER_FAIL';
 
+/// When true, exercises combined Beauty V2 + greenScreen filter proof mode.
+/// When false (default), exercises greenScreen-only proof mode.
+const bool kUfmEnableBeautyV2 = bool.fromEnvironment(
+  'UFM_ENABLE_BEAUTY_V2',
+  defaultValue: false,
+);
+
 const String kUfmCameraPreset = String.fromEnvironment(
   'UFM_CAMERA_PRESET',
   defaultValue: '',
@@ -135,25 +169,32 @@ VanguardCameraCaptureProfile _resolveCaptureProfile(String raw) {
 /// (540x960 when iFrame960x540 is supported, 720x1280 on the 720p fallback).
 const int kDefaultQualityLongSidePx = 1920;
 
-const List<String> kClaimsAllowed = <String>[
+List<String> get kClaimsAllowed => <String>[
   'active UFM camera starts',
-  'greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph',
+  if (kUfmEnableBeautyV2) ...<String>[
+    'combined Beauty V2 + greenScreen filter chain is accepted and co-executes in active camera graph',
+    'combined-chain throughput/co-execution proven via steady processed FPS (>= 20.0 fps across steady frames >= 50)',
+  ] else ...<String>[
+    'greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph',
+    'warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)',
+  ],
   'native S1 stage telemetry proof is available and asserted (getCameraGreenScreenDiagnostics)',
-  'warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)',
-  'objective pixel metrics sampled from active video texture (background coverage >= 15%, edge transition ratio > 0.05)',
+  'objective pixel metrics sampled from active video texture',
   'same texture remains mounted',
   'clear returns to passthrough (native telemetry returns null after clear)',
   'startCamera captureProfile is a fixed start-time capture decision (greenScreenLowLatency asserts source long side < 1920 when no preset override)',
   'cleanup stops camera',
 ];
 
-const List<String> kNonClaims = <String>[
+List<String> get kNonClaims => const <String>[
   'TikTok visual quality',
   'temporal smoothing',
   'image/video backgrounds',
   'recording/export/photo',
   'Duet',
   'Android',
+  'native cumulative latency across combined chain',
+  'green-screen node telemetry excludes Beauty V2 per-node cost',
 ];
 
 /// Background applied through VGFilterSpecs.greenScreenSolidColor and asserted
@@ -280,8 +321,15 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
           'blend mean=${_fmtMs(d['meanBlendRenderMs'])}';
 
       if (measurement != null) {
+        final fpsStr = measurement['steadyProcessedFps'] != null
+            ? 'fps=${measurement['steadyProcessedFps']} '
+            : '';
+        final windowStr = measurement['steadyWindowSeconds'] != null
+            ? ' in ${measurement['steadyWindowSeconds']}s'
+            : '';
         summary +=
-            '\nWarmup-excluded (steady=${measurement['steadyFrameCount']} frames): '
+            '\nWarmup-excluded (steady=${measurement['steadyFrameCount']} frames$windowStr): '
+            '$fpsStr'
             'total=${_fmtMs(measurement['warmupExcludedMeanTotalMs'])}ms '
             'vision=${_fmtMs(measurement['warmupExcludedMeanVisionMs'])}ms '
             'blend=${_fmtMs(measurement['warmupExcludedMeanBlendRenderMs'])}ms '
@@ -484,7 +532,8 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
     print(kSmokeStartMarker);
     final bool presetOverrideActive = kUfmCameraPreset.trim().isNotEmpty;
     print(
-      'CONFIG: UFM_CAMERA_CAPTURE_PROFILE="$kUfmCameraCaptureProfile" '
+      'CONFIG: UFM_ENABLE_BEAUTY_V2=$kUfmEnableBeautyV2 '
+      'UFM_CAMERA_CAPTURE_PROFILE="$kUfmCameraCaptureProfile" '
       'UFM_CAMERA_PRESET='
       '"${presetOverrideActive ? kUfmCameraPreset : "(none)"}" '
       'effectivePath=${presetOverrideActive ? "sessionPresetOverride" : "captureProfile"}',
@@ -493,6 +542,8 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
     int? textureId;
     bool cameraStarted = false;
     String? errorMessage;
+    double? steadyWindowSeconds;
+    double? steadyProcessedFps;
     Map<String, dynamic>? measurement;
     Map<String, dynamic> pixelMetrics = <String, dynamic>{
       'width': 0,
@@ -544,20 +595,39 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       await Future<void>.delayed(const Duration(seconds: 3));
       print(kStepBaselineObservedMarker);
 
-      // Lane 4: Apply VanguardEngine.setCameraFilterChain([VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)])
-      _updateStatus(
-        'APPLY_FILTER',
-        'Applying UFM camera graph greenScreen filter (solid teal 0xFF00796B, S1-refined)...',
-      );
-      await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
-        VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B),
-      ]);
-      if (mounted) {
-        setState(() {
-          _isGreenScreenActive = true;
-          _cameraModeDescription =
-              'UFM camera graph greenScreen filter active (S1-refined)';
-        });
+      // Lane 4: Apply filter chain
+      if (kUfmEnableBeautyV2) {
+        _updateStatus(
+          'APPLY_FILTER',
+          'Applying UFM camera graph Beauty V2 + greenScreen filter chain '
+          '(Beauty V2 intensity=0.5, solid teal 0xFF00796B, S1-refined)...',
+        );
+        await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
+          VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5),
+          VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B),
+        ]);
+        if (mounted) {
+          setState(() {
+            _isGreenScreenActive = true;
+            _cameraModeDescription =
+                'UFM camera graph Beauty V2 + greenScreen filter chain active (Beauty V2 + S1-refined)';
+          });
+        }
+      } else {
+        _updateStatus(
+          'APPLY_FILTER',
+          'Applying UFM camera graph greenScreen filter (solid teal 0xFF00796B, S1-refined)...',
+        );
+        await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
+          VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B),
+        ]);
+        if (mounted) {
+          setState(() {
+            _isGreenScreenActive = true;
+            _cameraModeDescription =
+                'UFM camera graph greenScreen filter active (S1-refined)';
+          });
+        }
       }
       print(kStepFilterAppliedMarker);
 
@@ -571,7 +641,9 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       // asserts that the active node keyed frames with every S1 stage applied.
       _updateStatus(
         'GREENSCREEN_OBSERVE',
-        'Observing UFM camera graph greenScreen filter (S1-refined) for 10 seconds...',
+        kUfmEnableBeautyV2
+            ? 'Observing UFM camera graph Beauty V2 + greenScreen filter chain for 10 seconds...'
+            : 'Observing UFM camera graph greenScreen filter (S1-refined) for 10 seconds...',
       );
       final observeStart = DateTime.now();
       await Future<void>.delayed(kDiagnosticsSettleDelay);
@@ -584,6 +656,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         await _awaitProcessedGreenScreenDiagnostics(),
         'GREENSCREEN_DIAGNOSTICS_WARMUP',
       );
+      final warmupTimestamp = DateTime.now();
       _showDiagnostics(warmupSnapshot);
       print('$kStepDiagnosticsAssertedMarker ${jsonEncode(warmupSnapshot)}');
 
@@ -594,7 +667,14 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       final int sourceW = _asInt(warmupSnapshot['sourceWidth']);
       final int sourceH = _asInt(warmupSnapshot['sourceHeight']);
       final int sourceLongSide = math.max(sourceW, sourceH);
-      if (lowLatencyProfileEffective) {
+      if (kUfmEnableBeautyV2) {
+        if (sourceLongSide <= 0 || sourceLongSide >= kDefaultQualityLongSidePx) {
+          throw StateError(
+            '[BEAUTY_V2_CAPTURE] Beauty V2 mode requires source long side > 0 and < $kDefaultQualityLongSidePx '
+            '(native telemetry reports source ${sourceW}x$sourceH)',
+          );
+        }
+      } else if (lowLatencyProfileEffective) {
         if (sourceLongSide <= 0 || sourceLongSide >= kDefaultQualityLongSidePx) {
           throw StateError(
             '[CAPTURE_PROFILE] greenScreenLowLatency was requested at startCamera '
@@ -652,8 +732,11 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         'GREENSCREEN_OBSERVE_END',
         'Reading final native greenScreen S1 telemetry snapshot...',
       );
+      final finalDiagnosticsRaw =
+          await VanguardEngine.getCameraGreenScreenDiagnostics();
+      final finalTimestamp = DateTime.now();
       final finalDiagnostics = _assertGreenScreenDiagnostics(
-        await VanguardEngine.getCameraGreenScreenDiagnostics(),
+        finalDiagnosticsRaw,
         'GREENSCREEN_OBSERVE_END',
       );
 
@@ -661,11 +744,49 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       final n2 = _asInt(finalDiagnostics['processedFrameCount']);
       final steadyFrameCount = n2 - n1;
 
-      if (steadyFrameCount < 50) {
-        throw StateError(
-          '[GREENSCREEN_MEASUREMENT] steadyFrameCount must be >= 50 '
-          '(got $steadyFrameCount; warmupProcessed=$n1, finalProcessed=$n2)',
-        );
+      final elapsedMicroseconds =
+          finalTimestamp.difference(warmupTimestamp).inMicroseconds;
+      steadyWindowSeconds = elapsedMicroseconds > 0
+          ? double.parse((elapsedMicroseconds / 1000000.0).toStringAsFixed(3))
+          : 0.0;
+      steadyProcessedFps = steadyWindowSeconds > 0.0
+          ? double.parse(
+              (steadyFrameCount / steadyWindowSeconds).toStringAsFixed(2),
+            )
+          : 0.0;
+
+      final int finalSourceW = _asInt(finalDiagnostics['sourceWidth']);
+      final int finalSourceH = _asInt(finalDiagnostics['sourceHeight']);
+      final int finalSourceLongSide = math.max(finalSourceW, finalSourceH);
+
+      if (kUfmEnableBeautyV2) {
+        if (finalSourceLongSide <= 0 ||
+            finalSourceLongSide >= kDefaultQualityLongSidePx) {
+          throw StateError(
+            '[BEAUTY_V2_CAPTURE] Beauty V2 mode requires source long side > 0 and < $kDefaultQualityLongSidePx '
+            '(final native telemetry reports source ${finalSourceW}x$finalSourceH)',
+          );
+        }
+        if (steadyFrameCount < 50) {
+          throw StateError(
+            '[BEAUTY_V2_MEASUREMENT] steadyFrameCount must be >= 50 '
+            '(got $steadyFrameCount; warmupProcessed=$n1, finalProcessed=$n2)',
+          );
+        }
+        if (steadyProcessedFps < 20.0) {
+          throw StateError(
+            '[BEAUTY_V2_MEASUREMENT] steadyProcessedFps must be >= 20.0 '
+            '(got $steadyProcessedFps fps across $steadyFrameCount steady frames '
+            'in ${steadyWindowSeconds}s)',
+          );
+        }
+      } else {
+        if (steadyFrameCount < 50) {
+          throw StateError(
+            '[GREENSCREEN_MEASUREMENT] steadyFrameCount must be >= 50 '
+            '(got $steadyFrameCount; warmupProcessed=$n1, finalProcessed=$n2)',
+          );
+        }
       }
 
       final warmupExcludedMeanTotalMs = _computeWarmupExcludedMean(
@@ -684,29 +805,31 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         metricKey: 'meanBlendRenderMs',
       );
 
-      if (warmupExcludedMeanTotalMs == null ||
-          warmupExcludedMeanTotalMs <= 0.0 ||
-          warmupExcludedMeanTotalMs >= 50.0) {
-        throw StateError(
-          '[GREENSCREEN_MEASUREMENT] warmupExcludedMeanTotalMs must be > 0 and < 50 '
-          '(got $warmupExcludedMeanTotalMs)',
-        );
-      }
-      if (warmupExcludedMeanVisionMs == null ||
-          warmupExcludedMeanVisionMs <= 0.0 ||
-          warmupExcludedMeanVisionMs >= 40.0) {
-        throw StateError(
-          '[GREENSCREEN_MEASUREMENT] warmupExcludedMeanVisionMs must be > 0 and < 40 '
-          '(got $warmupExcludedMeanVisionMs)',
-        );
-      }
-      if (warmupExcludedMeanBlendRenderMs == null ||
-          warmupExcludedMeanBlendRenderMs <= 0.0 ||
-          warmupExcludedMeanBlendRenderMs >= 30.0) {
-        throw StateError(
-          '[GREENSCREEN_MEASUREMENT] warmupExcludedMeanBlendRenderMs must be > 0 and < 30 '
-          '(got $warmupExcludedMeanBlendRenderMs)',
-        );
+      if (!kUfmEnableBeautyV2) {
+        if (warmupExcludedMeanTotalMs == null ||
+            warmupExcludedMeanTotalMs <= 0.0 ||
+            warmupExcludedMeanTotalMs >= 50.0) {
+          throw StateError(
+            '[GREENSCREEN_MEASUREMENT] warmupExcludedMeanTotalMs must be > 0 and < 50 '
+            '(got $warmupExcludedMeanTotalMs)',
+          );
+        }
+        if (warmupExcludedMeanVisionMs == null ||
+            warmupExcludedMeanVisionMs <= 0.0 ||
+            warmupExcludedMeanVisionMs >= 40.0) {
+          throw StateError(
+            '[GREENSCREEN_MEASUREMENT] warmupExcludedMeanVisionMs must be > 0 and < 40 '
+            '(got $warmupExcludedMeanVisionMs)',
+          );
+        }
+        if (warmupExcludedMeanBlendRenderMs == null ||
+            warmupExcludedMeanBlendRenderMs <= 0.0 ||
+            warmupExcludedMeanBlendRenderMs >= 30.0) {
+          throw StateError(
+            '[GREENSCREEN_MEASUREMENT] warmupExcludedMeanBlendRenderMs must be > 0 and < 30 '
+            '(got $warmupExcludedMeanBlendRenderMs)',
+          );
+        }
       }
 
       final sampledMinLastTotalMs = sampledLastTotalMs.isNotEmpty
@@ -732,7 +855,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       final pixelCaptureAvailable =
           pixelMetrics['pixelCaptureAvailable'] == true;
 
-      if (pixelCaptureAvailable) {
+      if (!kUfmEnableBeautyV2 && pixelCaptureAvailable) {
         if (backgroundCoveragePct < 15.0) {
           throw StateError(
             '[GREENSCREEN_MEASUREMENT] backgroundCoveragePct must be >= 15.0 '
@@ -745,7 +868,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
             '(got $edgeTransitionRatioPct%)',
           );
         }
-      } else {
+      } else if (!pixelCaptureAvailable) {
         pixelMetrics['fallbackNote'] =
             'Pixel capture unavailable on this run; objective pixel coverage metrics skipped without claiming visual parity';
       }
@@ -754,6 +877,8 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         'warmupProcessedCount': n1,
         'finalProcessedCount': n2,
         'steadyFrameCount': steadyFrameCount,
+        'steadyWindowSeconds': steadyWindowSeconds,
+        'steadyProcessedFps': steadyProcessedFps,
         'warmupExcludedMeanTotalMs': warmupExcludedMeanTotalMs,
         'warmupExcludedMeanVisionMs': warmupExcludedMeanVisionMs,
         'warmupExcludedMeanBlendRenderMs': warmupExcludedMeanBlendRenderMs,
@@ -769,12 +894,15 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       };
 
       final metricsPayload = <String, dynamic>{
+        'beautyV2Enabled': kUfmEnableBeautyV2,
         'captureProfile': captureProfile.name,
         'sessionPresetOverride': presetOverrideActive ? kUfmCameraPreset : null,
         'lowLatencyProfileEffective': lowLatencyProfileEffective,
         'sourceWidth': sourceW,
         'sourceHeight': sourceH,
         'steadyFrameCount': steadyFrameCount,
+        'steadyWindowSeconds': steadyWindowSeconds,
+        'steadyProcessedFps': steadyProcessedFps,
         'warmupExcludedMeanTotalMs': warmupExcludedMeanTotalMs,
         'warmupExcludedMeanVisionMs': warmupExcludedMeanVisionMs,
         'warmupExcludedMeanBlendRenderMs': warmupExcludedMeanBlendRenderMs,
@@ -847,12 +975,16 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
 
       final passPayload = <String, dynamic>{
         'pass': true,
+        'beautyV2Enabled': kUfmEnableBeautyV2,
         'textureId': textureId,
         'captureProfile': captureProfile.name,
         'sessionPresetOverride': presetOverrideActive ? kUfmCameraPreset : null,
         'lowLatencyProfileEffective': lowLatencyProfileEffective,
         'sourceWidth': sourceW,
         'sourceHeight': sourceH,
+        'steadyFrameCount': steadyFrameCount,
+        'steadyWindowSeconds': steadyWindowSeconds,
+        'steadyProcessedFps': steadyProcessedFps,
         'claimsAllowed': kClaimsAllowed,
         'nonClaims': kNonClaims,
         'diagnostics': finalDiagnostics,
@@ -888,9 +1020,12 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
 
       final failPayload = <String, dynamic>{
         'pass': false,
+        'beautyV2Enabled': kUfmEnableBeautyV2,
         'textureId': textureId,
         'captureProfileRequested': kUfmCameraCaptureProfile,
         'sessionPresetOverride': presetOverrideActive ? kUfmCameraPreset : null,
+        'steadyWindowSeconds': steadyWindowSeconds,
+        'steadyProcessedFps': steadyProcessedFps,
         'claimsAllowed': kClaimsAllowed,
         'nonClaims': kNonClaims,
         'error': errorMessage,
@@ -1032,6 +1167,14 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                           fontSize: 11,
                         ),
                       ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Beauty V2 mode: ${kUfmEnableBeautyV2 ? "ENABLED (V2, intensity 0.5)" : "DISABLED (greenScreen only)"}',
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 11,
+                        ),
+                      ),
                       const SizedBox(height: 8),
                       // Overlay explicitly distinguishing UFM camera graph greenScreen filter
                       // from standalone live green-screen API.
@@ -1054,7 +1197,9 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                           children: [
                             Text(
                               _isGreenScreenActive
-                                  ? 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (S1-REFINED)'
+                                  ? (kUfmEnableBeautyV2
+                                        ? 'UFM CAMERA GRAPH BEAUTY V2 + GREENSCREEN FILTER ACTIVE'
+                                        : 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (S1-REFINED)')
                                   : 'CAMERA MODE: $_cameraModeDescription',
                               style: TextStyle(
                                 color: _isGreenScreenActive
@@ -1067,15 +1212,22 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                             const SizedBox(height: 4),
                             Text(
                               _isGreenScreenActive
-                                  ? 'Route: VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)\n'
-                                        'Pipeline: Active UFM camera graph S1-refined filter node\n'
-                                        'Proves: greenScreen filter route is accepted and S1-refined node '
-                                        'is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
-                                        'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics '
-                                        'and asserted (processed frames, all four S1 stages, measured latency, '
-                                        'warmup-excluded steady latency, and objective pixel metrics).\n'
-                                        'Non-claims: Does NOT prove TikTok visual quality, temporal smoothing, '
-                                        'image/video backgrounds, recording/export/photo, Duet, or Android.'
+                                  ? (kUfmEnableBeautyV2
+                                        ? 'Route: [VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5), VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)]\n'
+                                              'Pipeline: Active UFM camera graph Beauty V2 + S1-refined filter chain\n'
+                                              'Proves: combined Beauty V2 + greenScreen filter chain is accepted and co-executes in active camera graph.\n'
+                                              'Throughput proof: steadyProcessedFps >= 20.0 asserted across steady frames >= 50.\n'
+                                              'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics and asserted (processed frames, all four S1 stages, steadyProcessedFps >= 20.0).\n'
+                                              'Non-claims: green-screen node telemetry excludes Beauty V2 per-node cost; does NOT prove native cumulative latency across combined chain, TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
+                                        : 'Route: VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)\n'
+                                              'Pipeline: Active UFM camera graph S1-refined filter node\n'
+                                              'Proves: greenScreen filter route is accepted and S1-refined node '
+                                              'is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
+                                              'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics '
+                                              'and asserted (processed frames, all four S1 stages, measured latency, '
+                                              'warmup-excluded steady latency, and objective pixel metrics).\n'
+                                              'Non-claims: Does NOT prove TikTok visual quality, temporal smoothing, '
+                                              'image/video backgrounds, recording/export/photo, Duet, or Android.')
                                   : 'Active route: VanguardEngine.startCamera / setCameraFilterChain',
                               style: TextStyle(
                                 color: _isGreenScreenActive
