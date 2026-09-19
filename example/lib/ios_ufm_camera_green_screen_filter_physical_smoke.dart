@@ -1535,159 +1535,165 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                       width: 1.5,
                     ),
                   ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        'iOS UFM Camera GreenScreen Filter Smoke',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 15,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'iOS UFM Camera GreenScreen Filter Smoke',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'Step: $_currentStep',
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 13,
+                        const SizedBox(height: 6),
+                        Text(
+                          'Step: $_currentStep',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        'Status: $_status',
-                        style: TextStyle(
-                          color: _isFailed
-                              ? Colors.redAccent
-                              : (_isPassed ? Colors.greenAccent : Colors.white),
-                          fontWeight: FontWeight.w600,
-                          fontSize: 13,
-                        ),
-                      ),
-                      if (_textureId != null) ...[
                         const SizedBox(height: 2),
                         Text(
-                          'Texture ID: $_textureId (retained across filter changes)',
+                          'Status: $_status',
+                          style: TextStyle(
+                            color: _isFailed
+                                ? Colors.redAccent
+                                : (_isPassed
+                                      ? Colors.greenAccent
+                                      : Colors.white),
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13,
+                          ),
+                        ),
+                        if (_textureId != null) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            'Texture ID: $_textureId (retained across filter changes)',
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 2),
+                        Text(
+                          'Capture profile: $kUfmCameraCaptureProfile'
+                          '${kUfmCameraPreset.trim().isNotEmpty ? " (overridden by UFM_CAMERA_PRESET=$kUfmCameraPreset)" : " (fixed at startCamera)"}',
                           style: const TextStyle(
                             color: Colors.white60,
                             fontSize: 11,
                           ),
                         ),
-                      ],
-                      const SizedBox(height: 2),
-                      Text(
-                        'Capture profile: $kUfmCameraCaptureProfile'
-                        '${kUfmCameraPreset.trim().isNotEmpty ? " (overridden by UFM_CAMERA_PRESET=$kUfmCameraPreset)" : " (fixed at startCamera)"}',
-                        style: const TextStyle(
-                          color: Colors.white60,
-                          fontSize: 11,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        'Beauty V2 mode: ${kUfmEnableBeautyV2 ? "ENABLED (V2, intensity 0.5)" : "DISABLED (greenScreen only)"}',
-                        style: const TextStyle(
-                          color: Colors.white60,
-                          fontSize: 11,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        'GreenScreen output mode: $kUfmGreenScreenOutputMode'
-                        '${kUfmAlphaOutputMode ? " (alpha lane: preview appearance is NOT a proof)" : " (solid teal 0xFF00796B)"}',
-                        style: const TextStyle(
-                          color: Colors.white60,
-                          fontSize: 11,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      // Overlay explicitly distinguishing UFM camera graph greenScreen filter
-                      // from standalone live green-screen API.
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: _isGreenScreenActive
-                              ? const Color(0xFF004D40).withValues(alpha: 0.85)
-                              : Colors.white.withValues(alpha: 0.08),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
-                            color: _isGreenScreenActive
-                                ? const Color(0xFF80CBC4)
-                                : Colors.white24,
+                        const SizedBox(height: 2),
+                        Text(
+                          'Beauty V2 mode: ${kUfmEnableBeautyV2 ? "ENABLED (V2, intensity 0.5)" : "DISABLED (greenScreen only)"}',
+                          style: const TextStyle(
+                            color: Colors.white60,
+                            fontSize: 11,
                           ),
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              _isGreenScreenActive
-                                  ? (kUfmEnableBeautyV2
-                                        ? 'UFM CAMERA GRAPH BEAUTY V2 + GREENSCREEN FILTER ACTIVE'
-                                        : kUfmAlphaOutputMode
-                                        ? 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (ALPHA OUTPUT, S1-REFINED)'
-                                        : 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (S1-REFINED)')
-                                  : 'CAMERA MODE: $_cameraModeDescription',
-                              style: TextStyle(
-                                color: _isGreenScreenActive
-                                    ? const Color(0xFF80CBC4)
-                                    : Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 12,
-                              ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'GreenScreen output mode: $kUfmGreenScreenOutputMode'
+                          '${kUfmAlphaOutputMode ? " (alpha lane: preview appearance is NOT a proof)" : " (solid teal 0xFF00796B)"}',
+                          style: const TextStyle(
+                            color: Colors.white60,
+                            fontSize: 11,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        // Overlay explicitly distinguishing UFM camera graph greenScreen filter
+                        // from standalone live green-screen API.
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: _isGreenScreenActive
+                                ? const Color(
+                                    0xFF004D40,
+                                  ).withValues(alpha: 0.85)
+                                : Colors.white.withValues(alpha: 0.08),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: _isGreenScreenActive
+                                  ? const Color(0xFF80CBC4)
+                                  : Colors.white24,
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              _isGreenScreenActive
-                                  ? (kUfmEnableBeautyV2
-                                        ? 'Route: [VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5), VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)]\n'
-                                              'Pipeline: Active UFM camera graph Beauty V2 + S1-refined filter chain\n'
-                                              'Proves: combined Beauty V2 + greenScreen filter chain is accepted and co-executes in active camera graph.\n'
-                                              'Throughput proof: steadyProcessedFps >= 20.0 asserted across steady frames >= 50.\n'
-                                              'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics and asserted (processed frames, all four S1 stages, steadyProcessedFps >= 20.0).\n'
-                                              'Filter-chain proof: cumulative active filter-chain timing read via getCameraFilterChainDiagnostics (filterChainTimingV1, measured natively around the scheduler call) and asserted (beauty + greenScreen active, steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms).\n'
-                                              'Non-claims: neither surface provides Beauty V2 per-node cost; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
-                                        : kUfmAlphaOutputMode
-                                        ? 'Route: VGFilterSpecs.greenScreenAlpha()\n'
-                                              'Pipeline: Active UFM camera graph S1-refined filter node, alpha output (foreground RGB + matte in alpha, no background)\n'
-                                              'Proves: greenScreen alpha-output route is accepted and the S1-refined node is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
-                                              'Native proof: telemetry read via getCameraGreenScreenDiagnostics and asserted (outputMode alpha, backgroundType alpha, alphaEncoding straight (native reports it only when its byte self-test passed), alphaByteSelfTestPassed true = one-time synthetic byte self-test of the alpha construction at node init, processed frames > 0, all four S1 stages). Latency and pixel metrics are reported only.\n'
-                                              'Non-claims: whatever this preview shows is NOT a keying or Duet proof (the Flutter Texture composites the alpha its own way); no byte-level verification of live camera frames (the self-test covers a synthetic input only); no downstream compositor; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
-                                        : 'Route: VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)\n'
-                                              'Pipeline: Active UFM camera graph S1-refined filter node\n'
-                                              'Proves: greenScreen filter route is accepted and S1-refined node '
-                                              'is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
-                                              'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics '
-                                              'and asserted (processed frames, all four S1 stages, measured latency, '
-                                              'warmup-excluded steady latency, and objective pixel metrics).\n'
-                                              'Non-claims: Does NOT prove TikTok visual quality, temporal smoothing, '
-                                              'image/video backgrounds, recording/export/photo, Duet, or Android.')
-                                  : 'Active route: VanguardEngine.startCamera / setCameraFilterChain',
-                              style: TextStyle(
-                                color: _isGreenScreenActive
-                                    ? Colors.white
-                                    : Colors.white60,
-                                fontSize: 11,
-                                height: 1.3,
-                              ),
-                            ),
-                            if (_diagnosticsSummary.isNotEmpty) ...[
-                              const SizedBox(height: 6),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
                               Text(
-                                _diagnosticsSummary,
-                                style: const TextStyle(
-                                  color: Color(0xFFB2DFDB),
-                                  fontSize: 10,
+                                _isGreenScreenActive
+                                    ? (kUfmEnableBeautyV2
+                                          ? 'UFM CAMERA GRAPH BEAUTY V2 + GREENSCREEN FILTER ACTIVE'
+                                          : kUfmAlphaOutputMode
+                                          ? 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (ALPHA OUTPUT, S1-REFINED)'
+                                          : 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (S1-REFINED)')
+                                    : 'CAMERA MODE: $_cameraModeDescription',
+                                style: TextStyle(
+                                  color: _isGreenScreenActive
+                                      ? const Color(0xFF80CBC4)
+                                      : Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 12,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                _isGreenScreenActive
+                                    ? (kUfmEnableBeautyV2
+                                          ? 'Route: [VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5), VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)]\n'
+                                                'Pipeline: Active UFM camera graph Beauty V2 + S1-refined filter chain\n'
+                                                'Proves: combined Beauty V2 + greenScreen filter chain is accepted and co-executes in active camera graph.\n'
+                                                'Throughput proof: steadyProcessedFps >= 20.0 asserted across steady frames >= 50.\n'
+                                                'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics and asserted (processed frames, all four S1 stages, steadyProcessedFps >= 20.0).\n'
+                                                'Filter-chain proof: cumulative active filter-chain timing read via getCameraFilterChainDiagnostics (filterChainTimingV1, measured natively around the scheduler call) and asserted (beauty + greenScreen active, steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms).\n'
+                                                'Non-claims: neither surface provides Beauty V2 per-node cost; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
+                                          : kUfmAlphaOutputMode
+                                          ? 'Route: VGFilterSpecs.greenScreenAlpha()\n'
+                                                'Pipeline: Active UFM camera graph S1-refined filter node, alpha output (foreground RGB + matte in alpha, no background)\n'
+                                                'Proves: greenScreen alpha-output route is accepted and the S1-refined node is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
+                                                'Native proof: telemetry read via getCameraGreenScreenDiagnostics and asserted (outputMode alpha, backgroundType alpha, alphaEncoding straight (native reports it only when its byte self-test passed), alphaByteSelfTestPassed true = one-time synthetic byte self-test of the alpha construction at node init, processed frames > 0, all four S1 stages). Latency and pixel metrics are reported only.\n'
+                                                'Non-claims: whatever this preview shows is NOT a keying or Duet proof (the Flutter Texture composites the alpha its own way); no byte-level verification of live camera frames (the self-test covers a synthetic input only); no downstream compositor; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
+                                          : 'Route: VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)\n'
+                                                'Pipeline: Active UFM camera graph S1-refined filter node\n'
+                                                'Proves: greenScreen filter route is accepted and S1-refined node '
+                                                'is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
+                                                'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics '
+                                                'and asserted (processed frames, all four S1 stages, measured latency, '
+                                                'warmup-excluded steady latency, and objective pixel metrics).\n'
+                                                'Non-claims: Does NOT prove TikTok visual quality, temporal smoothing, '
+                                                'image/video backgrounds, recording/export/photo, Duet, or Android.')
+                                    : 'Active route: VanguardEngine.startCamera / setCameraFilterChain',
+                                style: TextStyle(
+                                  color: _isGreenScreenActive
+                                      ? Colors.white
+                                      : Colors.white60,
+                                  fontSize: 11,
                                   height: 1.3,
                                 ),
                               ),
+                              if (_diagnosticsSummary.isNotEmpty) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                  _diagnosticsSummary,
+                                  style: const TextStyle(
+                                    color: Color(0xFFB2DFDB),
+                                    fontSize: 10,
+                                    height: 1.3,
+                                  ),
+                                ),
+                              ],
                             ],
-                          ],
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
