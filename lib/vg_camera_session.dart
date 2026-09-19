@@ -752,11 +752,22 @@ class VGMultiCamRenderTextureSession {
     required this.textureId,
     required this.outputWidth,
     required this.outputHeight,
+    this.backTextureId,
+    this.frontBufferWidth,
+    this.frontBufferHeight,
+    this.backBufferWidth,
+    this.backBufferHeight,
+    this.frontDeviceId,
+    this.backDeviceId,
   });
 
-  /// The Flutter texture ID. Pass to `Texture(textureId: textureId)` to display
-  /// the live dual-camera PiP composite.
+  /// The Flutter texture ID (primary display; on Android this is the front camera,
+  /// on iOS this is the composited output).
   final int textureId;
+
+  /// Secondary Flutter texture ID (back camera on Android when dual streaming).
+  /// Null on iOS where compositor renders to single [textureId].
+  final int? backTextureId;
 
   /// Width of the output composite buffer in pixels.
   /// 0 until the first frame has been composited.
@@ -765,6 +776,16 @@ class VGMultiCamRenderTextureSession {
   /// Height of the output composite buffer in pixels.
   /// 0 until the first frame has been composited.
   final int outputHeight;
+
+  /// Native sensor preview buffer dimensions.
+  final int? frontBufferWidth;
+  final int? frontBufferHeight;
+  final int? backBufferWidth;
+  final int? backBufferHeight;
+
+  /// Device IDs used in this session.
+  final String? frontDeviceId;
+  final String? backDeviceId;
 
   /// Parses a [VGMultiCamRenderTextureSession] from the native channel response.
   ///
@@ -778,16 +799,31 @@ class VGMultiCamRenderTextureSession {
     final int? tid = rawId is int ? rawId : null;
     if (tid == null) return null;
 
+    final rawBackId = map['backTextureId'];
+    final int? backTid = rawBackId is int ? rawBackId : null;
+
     // outputWidth / outputHeight — optional; default 0
     final rawW = map['outputWidth'];
     final rawH = map['outputHeight'];
     final int w = rawW is int ? rawW : (rawW is double ? rawW.toInt() : 0);
     final int h = rawH is int ? rawH : (rawH is double ? rawH.toInt() : 0);
 
+    final rawFbw = map['frontBufferWidth'];
+    final rawFbh = map['frontBufferHeight'];
+    final rawBbw = map['backBufferWidth'];
+    final rawBbh = map['backBufferHeight'];
+
     return VGMultiCamRenderTextureSession(
       textureId: tid,
+      backTextureId: backTid,
       outputWidth: w,
       outputHeight: h,
+      frontBufferWidth: rawFbw is int ? rawFbw : null,
+      frontBufferHeight: rawFbh is int ? rawFbh : null,
+      backBufferWidth: rawBbw is int ? rawBbw : null,
+      backBufferHeight: rawBbh is int ? rawBbh : null,
+      frontDeviceId: map['frontDeviceId'] as String?,
+      backDeviceId: map['backDeviceId'] as String?,
     );
   }
 
@@ -797,17 +833,19 @@ class VGMultiCamRenderTextureSession {
       other is VGMultiCamRenderTextureSession &&
           runtimeType == other.runtimeType &&
           textureId == other.textureId &&
+          backTextureId == other.backTextureId &&
           outputWidth == other.outputWidth &&
           outputHeight == other.outputHeight;
 
   @override
-  int get hashCode => Object.hash(textureId, outputWidth, outputHeight);
+  int get hashCode => Object.hash(textureId, backTextureId, outputWidth, outputHeight);
 
   @override
   String toString() =>
       'VGMultiCamRenderTextureSession('
       'textureId: $textureId, '
-      'output: ${outputWidth}x${outputHeight})';
+      'backTextureId: $backTextureId, '
+      'output: ${outputWidth}x$outputHeight)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1673,6 +1711,8 @@ final class VGCameraSession {
   static Future<VGMultiCamRenderTextureSession?> startMultiCamPreview({
     required String frontDeviceId,
     required String backDeviceId,
+    int? width,
+    int? height,
     VGLivePreviewConfig? config,
   }) async {
     try {
@@ -1680,9 +1720,41 @@ final class VGCameraSession {
           .invokeMethod<Map<Object?, Object?>>('startMultiCamPreview', {
             'frontDeviceId': frontDeviceId,
             'backDeviceId': backDeviceId,
+            if (width != null) 'width': width,
+            if (height != null) 'height': height,
             if (config != null) 'config': config.toMap(),
           });
       return VGMultiCamRenderTextureSession.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Discovers available cameras, facings, and candidate dual-camera pairs.
+  static Future<Map<String, dynamic>?> discoverDualCameraPairs() async {
+    try {
+      final raw = await _channel
+          .invokeMethod<Map<Object?, Object?>>('discoverDualCameraPairs');
+      if (raw == null) return null;
+      return raw.map((k, v) => MapEntry(k.toString(), v));
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Rapidly probes whether a specific candidate camera pair can stream concurrently.
+  static Future<Map<String, dynamic>?> probeDualCameraPair({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel
+          .invokeMethod<Map<Object?, Object?>>('probeDualCameraPair', {
+            'frontDeviceId': frontDeviceId,
+            'backDeviceId': backDeviceId,
+          });
+      if (raw == null) return null;
+      return raw.map((k, v) => MapEntry(k.toString(), v));
     } on PlatformException {
       return null;
     }

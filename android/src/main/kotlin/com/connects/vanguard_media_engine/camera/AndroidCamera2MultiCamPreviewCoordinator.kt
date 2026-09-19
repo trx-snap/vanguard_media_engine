@@ -1,8 +1,20 @@
 package com.connects.vanguard_media_engine.camera
 
+import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.view.TextureRegistry
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * P3-CAM-CONCURRENT-STARTMULTICAM-FAIL-CLOSED-ANDROID-HANDLER /
@@ -46,14 +58,26 @@ import io.flutter.plugin.common.MethodChannel
  */
 class AndroidCamera2MultiCamPreviewCoordinator(
     private val context: Context,
+    private val textureRegistry: TextureRegistry,
     private val hasActiveSingleCamera: () -> Boolean,
 ) {
+
+    // ── Dual-camera session state ──────────────────────────────────────────
+    // Non-null only while a concurrent preview is running.
+    // Coordinator owns the lifecycle of both texture entries.
+    private var dualCameraSource: IVanguardDualCameraSource? = null
+    private var frontTexture: TextureRegistry.SurfaceTextureEntry? = null
+    private var backTexture: TextureRegistry.SurfaceTextureEntry? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val cameraManager by lazy { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
     companion object {
         private const val TAG = "AndroidCamera2MultiCamPreviewCoordinator"
 
         private val OWNED_METHODS = setOf(
             "startMultiCamPreview",
             "stopMultiCamPreview",
+            "discoverDualCameraPairs",
+            "probeDualCameraPair",
             "runMultiCamRenderDiagnostic",
             "startMultiCamRenderDiagnostic",
             "stopMultiCamRenderDiagnostic",
@@ -72,8 +96,10 @@ class AndroidCamera2MultiCamPreviewCoordinator(
 
     fun handle(method: String, args: Map<String, Any?>?, result: MethodChannel.Result): Boolean {
         when (method) {
-            "startMultiCamPreview" -> startMultiCamPreviewLikeGuard(args, result)
-            "stopMultiCamPreview" -> stopIdempotent(result)
+            "startMultiCamPreview" -> startMultiCamPreviewReal(args, result)
+            "stopMultiCamPreview" -> stopMultiCamPreviewReal(result)
+            "discoverDualCameraPairs" -> discoverDualCameraPairs(result)
+            "probeDualCameraPair" -> probeDualCameraPair(args, result)
             "runMultiCamRenderDiagnostic" -> startMultiCamPreviewLikeGuard(args, result)
             "startMultiCamRenderDiagnostic" -> startMultiCamPreviewLikeGuard(args, result)
             "stopMultiCamRenderDiagnostic" -> stopIdempotent(result)
@@ -165,13 +191,323 @@ class AndroidCamera2MultiCamPreviewCoordinator(
         )
     }
 
-    // -- stopMultiCamPreview / stopMultiCamRenderDiagnostic --------------------
+    // -- startMultiCamPreview (real implementation) ----------------------------
+
+    private fun startMultiCamPreviewReal(args: Map<String, Any?>?, result: MethodChannel.Result) {
+        // Validate args — same guard shape as startMultiCamPreviewLikeGuard.
+        val frontDeviceId = (args?.get("frontDeviceId") as? String)?.trim()
+        val backDeviceId  = (args?.get("backDeviceId")  as? String)?.trim()
+        val targetWidth   = (args?.get("width") as? Number)?.toInt() ?: 1080
+        val targetHeight  = (args?.get("height") as? Number)?.toInt() ?: 1920
+
+        if (frontDeviceId.isNullOrEmpty() || backDeviceId.isNullOrEmpty()) {
+            result.error(
+                "INVALID_ARG",
+                "This route requires non-blank frontDeviceId and backDeviceId",
+                null,
+            )
+            return
+        }
+
+        // Guard: reject if single-camera session is active.
+        if (hasActiveSingleCamera()) {
+            result.error(
+                "CAMERA_ACTIVE",
+                "A single-camera session is active; stop it before starting a multi-cam preview",
+                null,
+            )
+            return
+        }
+
+        // Guard: reject if dual-camera preview is already running.
+        if (dualCameraSource != null) {
+            result.error(
+                "ALREADY_RUNNING",
+                "A MultiCam preview is already running — call stopMultiCamPreview first",
+                null,
+            )
+            return
+        }
+
+        // Allocate two Flutter texture entries — one per camera stream.
+        val front = textureRegistry.createSurfaceTexture()
+        val back  = textureRegistry.createSurfaceTexture()
+        Log.i(TAG, "startMultiCamPreview: allocated front textureId=${front.id()} back textureId=${back.id()}")
+
+        // Check whether HAL advertises concurrent camera IDs for CameraX
+        val probeResult = try {
+            AndroidCamera2CapabilityProbe(context).probe()
+        } catch (t: Throwable) {
+            null
+        }
+        val supportsConcurrent = probeResult?.get("supportsConcurrentCamera") as? Boolean ?: false
+        @Suppress("UNCHECKED_CAST")
+        val concurrentCameraIdSets =
+            probeResult?.get("concurrentCameraIdSets") as? List<List<String>> ?: emptyList()
+        val hasMatchingConcurrentSet = concurrentCameraIdSets.any {
+            it.contains(frontDeviceId) && it.contains(backDeviceId)
+        }
+
+        if (supportsConcurrent && hasMatchingConcurrentSet) {
+            // Attempt CameraX ConcurrentCamera path first
+            val source = VanguardDualCameraSource(
+                context           = context,
+                frontTextureEntry = front,
+                backTextureEntry  = back,
+            )
+            source.start(
+                onStarted = { resultMap ->
+                    dualCameraSource = source
+                    frontTexture     = front
+                    backTexture      = back
+                    Log.i(TAG, "startMultiCamPreview: CameraX live — frontTextureId=${front.id()} backTextureId=${back.id()}")
+                    result.success(resultMap)
+                },
+                onError = { e ->
+                    Log.w(TAG, "startMultiCamPreview: CameraX start failed (${e.message}) — falling back to generic Camera2")
+                    startGenericDualCamera2(frontDeviceId, backDeviceId, targetWidth, targetHeight, front, back, result)
+                },
+            )
+        } else {
+            // Direct generic raw Camera2 path (bypasses missing HAL concurrentCameraIds table)
+            startGenericDualCamera2(frontDeviceId, backDeviceId, targetWidth, targetHeight, front, back, result)
+        }
+    }
+
+    private fun startGenericDualCamera2(
+        frontDeviceId: String,
+        backDeviceId: String,
+        targetWidth: Int,
+        targetHeight: Int,
+        front: TextureRegistry.SurfaceTextureEntry,
+        back: TextureRegistry.SurfaceTextureEntry,
+        result: MethodChannel.Result,
+    ) {
+        val source = VanguardGenericDualCamera2Source(
+            context           = context,
+            frontTextureEntry = front,
+            backTextureEntry  = back,
+            frontCameraId     = frontDeviceId,
+            backCameraId      = backDeviceId,
+            targetWidth       = targetWidth,
+            targetHeight      = targetHeight,
+        )
+
+        source.start(
+            onStarted = { resultMap ->
+                dualCameraSource = source
+                frontTexture     = front
+                backTexture      = back
+                Log.i(TAG, "startMultiCamPreview: Generic Camera2 live — frontTextureId=${front.id()} backTextureId=${back.id()}")
+                result.success(resultMap)
+            },
+            onError = { e ->
+                Log.e(TAG, "startMultiCamPreview: Generic Camera2 failed: ${e.javaClass.simpleName}: ${e.message}")
+                try { front.release() } catch (t: Throwable) { /* ignore */ }
+                try { back.release()  } catch (t: Throwable) { /* ignore */ }
+                dualCameraSource = null
+                frontTexture     = null
+                backTexture      = null
+                result.error("CAMERA_ERROR", e.message, null)
+            },
+        )
+    }
+
+    // -- discoverDualCameraPairs (hardware enumeration) ------------------------
+
+    private fun discoverDualCameraPairs(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val allCameraIds = cameraManager.cameraIdList.toList()
+                val frontCameras = mutableListOf<Map<String, Any>>()
+                val backCameras  = mutableListOf<Map<String, Any>>()
+
+                for (id in allCameraIds) {
+                    val chars = try {
+                        cameraManager.getCameraCharacteristics(id)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "discover: getCameraCharacteristics($id) error: ${t.message}")
+                        continue
+                    }
+
+                    val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                    val orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+                    val hwLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1
+
+                    val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java)?.map {
+                        mapOf("width" to it.width, "height" to it.height)
+                    } ?: emptyList()
+
+                    val infoMap = mapOf(
+                        "cameraId" to id,
+                        "facing" to if (facing == CameraCharacteristics.LENS_FACING_FRONT) "FRONT" else "BACK",
+                        "orientation" to orientation,
+                        "hardwareLevel" to hwLevel,
+                        "previewSizes" to previewSizes.take(5),
+                    )
+
+                    if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                        frontCameras.add(infoMap)
+                    } else if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                        backCameras.add(infoMap)
+                    }
+                }
+
+                val candidatePairs = mutableListOf<Map<String, String>>()
+                for (f in frontCameras) {
+                    val fId = f["cameraId"] as String
+                    for (b in backCameras) {
+                        val bId = b["cameraId"] as String
+                        candidatePairs.add(mapOf("frontId" to fId, "backId" to bId))
+                    }
+                }
+
+                val payload = mapOf(
+                    "allCameraIds" to allCameraIds,
+                    "frontCameras" to frontCameras,
+                    "backCameras" to backCameras,
+                    "candidatePairs" to candidatePairs,
+                    "recommendedFrontId" to (frontCameras.firstOrNull()?.get("cameraId") ?: "1"),
+                    "recommendedBackId" to (backCameras.firstOrNull()?.get("cameraId") ?: "0"),
+                )
+
+                mainHandler.post { result.success(payload) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "discoverDualCameraPairs failed", t)
+                mainHandler.post { result.error("DISCOVERY_FAILED", t.message, null) }
+            }
+        }.start()
+    }
+
+    // -- probeDualCameraPair (non-destructive rapid hardware test) -------------
+
+    @SuppressLint("MissingPermission")
+    private fun probeDualCameraPair(args: Map<String, Any?>?, result: MethodChannel.Result) {
+        val frontId = (args?.get("frontDeviceId") as? String)?.trim() ?: "1"
+        val backId  = (args?.get("backDeviceId")  as? String)?.trim() ?: "0"
+
+        val probeThread = HandlerThread("DualCamProbeThread").apply { start() }
+        val probeHandler = Handler(probeThread.looper)
+
+        Thread {
+            val frontLatch = CountDownLatch(1)
+            val backLatch  = CountDownLatch(1)
+            val failed = AtomicBoolean(false)
+            var failureMessage: String? = null
+            var frontDev: CameraDevice? = null
+            var backDev: CameraDevice? = null
+
+            try {
+                cameraManager.openCamera(frontId, object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        frontDev = camera
+                        frontLatch.countDown()
+                    }
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                        failed.set(true)
+                        failureMessage = "Front camera $frontId disconnected"
+                        frontLatch.countDown()
+                    }
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        camera.close()
+                        failed.set(true)
+                        failureMessage = "Front camera $frontId error code=$error"
+                        frontLatch.countDown()
+                    }
+                }, probeHandler)
+
+                cameraManager.openCamera(backId, object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        backDev = camera
+                        backLatch.countDown()
+                    }
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                        failed.set(true)
+                        failureMessage = "Back camera $backId disconnected"
+                        backLatch.countDown()
+                    }
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        camera.close()
+                        failed.set(true)
+                        failureMessage = "Back camera $backId error code=$error"
+                        backLatch.countDown()
+                    }
+                }, probeHandler)
+
+                val frontOk = frontLatch.await(3, TimeUnit.SECONDS)
+                val backOk  = backLatch.await(3, TimeUnit.SECONDS)
+                val supported = frontOk && backOk && !failed.get() && frontDev != null && backDev != null
+
+                Log.i(TAG, "probeDualCameraPair F:$frontId + B:$backId -> supported=$supported (err=$failureMessage)")
+
+                try { frontDev?.close() } catch (t: Throwable) {}
+                try { backDev?.close()  } catch (t: Throwable) {}
+                probeThread.quitSafely()
+
+                mainHandler.post {
+                    result.success(
+                        mapOf(
+                            "frontDeviceId" to frontId,
+                            "backDeviceId" to backId,
+                            "supported" to supported,
+                            "error" to failureMessage,
+                        )
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "probeDualCameraPair exception F:$frontId + B:$backId", t)
+                try { frontDev?.close() } catch (e: Throwable) {}
+                try { backDev?.close()  } catch (e: Throwable) {}
+                probeThread.quitSafely()
+                mainHandler.post {
+                    result.success(
+                        mapOf(
+                            "frontDeviceId" to frontId,
+                            "backDeviceId" to backId,
+                            "supported" to false,
+                            "error" to t.message,
+                        )
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // -- stopMultiCamPreview (real implementation) ------------------------------
+
+    private fun stopMultiCamPreviewReal(result: MethodChannel.Result) {
+        val source = dualCameraSource
+        if (source == null) {
+            // Idempotent: no active session — succeed silently.
+            Log.d(TAG, "stopMultiCamPreview: no active session — idempotent no-op")
+            result.success(null)
+            return
+        }
+
+        Log.i(TAG, "stopMultiCamPreview: stopping dual camera session")
+        source.stop()
+
+        // Release the Flutter texture entries now that CameraX is unbound.
+        try { frontTexture?.release() } catch (t: Throwable) { Log.w(TAG, "frontTexture.release failed: ${t.message}") }
+        try { backTexture?.release()  } catch (t: Throwable) { Log.w(TAG, "backTexture.release failed: ${t.message}")  }
+
+        dualCameraSource = null
+        frontTexture     = null
+        backTexture      = null
+
+        Log.i(TAG, "stopMultiCamPreview: complete")
+        result.success(null)
+    }
+
+    // -- stopMultiCamRenderDiagnostic (fail-closed, no-op success) ---------------
 
     private fun stopIdempotent(result: MethodChannel.Result) {
-        // Idempotent no-op: this slice has no active Android multicam
-        // preview/diagnostic session to tear down, and this route must never
-        // touch the single-camera cameraSource/cameraTexture state owned by
-        // the plugin.
+        // Idempotent no-op for diagnostic routes that have no Android
+        // session to tear down. Must never touch dualCameraSource or the
+        // single-camera cameraSource/cameraTexture state owned by the plugin.
         result.success(null)
     }
 

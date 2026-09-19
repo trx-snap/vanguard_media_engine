@@ -24,6 +24,8 @@ export 'vg_camera_session.dart';
 export 'vg_camera_preview.dart';
 // MC-22: Production MultiCam preview widget (composited dual-camera texture).
 export 'vg_multicam_preview.dart';
+// Dual-camera concurrent preview widget supporting H Split, V Split, and 120Hz Floating PiP.
+export 'vg_dual_camera_preview.dart';
 // Phase 6: continuous device-aware zoom capability model.
 export 'vg_camera_zoom_capabilities.dart';
 // Phase 3-Unit A: Android Camera2 hardware/thermal capability probe report.
