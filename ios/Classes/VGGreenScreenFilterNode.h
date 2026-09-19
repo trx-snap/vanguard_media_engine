@@ -34,7 +34,7 @@
 //     production S1 refinement pipeline of VGDuetPreviewCompositor (same stage
 //     order, same constants, ported as private CoreImage recipes; no Duet
 //     import): morphology close (CIMorphologyMaximum→Minimum, r 1.0) → feather
-//     (CIGaussianBlur r 3.0) → trimap smoothstep(0.14, 0.86) → guided edge
+//     (CIGaussianBlur r 4.0) → trimap smoothstep(0.10, 0.90) → guided edge
 //     preserve (CIEdges 2.0 → blur 1.5 → smoothstep(0.08, 0.34) on the camera
 //     frame, restoring the feathered mask over the trimapped one where the
 //     frame has strong edges) → CIBlendWithMask. Every stage fails open to its

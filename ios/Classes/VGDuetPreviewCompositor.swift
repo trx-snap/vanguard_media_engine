@@ -50,7 +50,7 @@
 //
 // Production stack & physical proof summary:
 // iOS live green-screen edge smoothness A/B S1: Vision Fast default + compositor refinement
-// (morphology close r1b radius 1.0, feather 3.0, trimap 0.14/0.86, guided edge
+// (morphology close r1b radius 1.0, feather 4.0, trimap 0.10/0.90, guided edge
 // constants 2.0/1.5/0.08/0.34).
 // Rationale: S1 widens output-scale anti-aliased alpha transition to reduce visible edge pixelation
 // while preserving the already-proved Vision Fast backend, 512 matte publish geometry,
@@ -212,7 +212,7 @@ final class VGDuetPreviewCompositor {
                 // The filter replaces pixels where mask ~= 255 (subject) with the foreground.
                 // The mapped mask is refined at output scale first (see
                 // VGMatteRefinementPipeline.refineLiveGreenScreenMask: morphology close,
-                // then 3.0 px feather, then trimap smoothstep, then camera-guided edge
+                // then 4.0 px feather, then trimap smoothstep, then camera-guided edge
                 // preservation);
                 // a failed morphology close falls back to the raw mask, a failed
                 // feather falls back to the (possibly closed) unblurred mask, a

@@ -20,8 +20,8 @@
 //      then CIMorphologyMinimum erode, radius 1.0; r1b). Clamped to extent before dilate,
 //      cropped to a finite radius-padded rect before erode to ensure bounded input and
 //      prevent EXC_BAD_ACCESS, filling pinholes and stair-step bites before blur.
-//   2. featherGreenScreenMask — CIGaussianBlur at feather radius 3.0 px softens the mask.
-//   3. applyGreenScreenTrimap — remaps blurred mask luminance via smoothstep(0.14, 0.86, m)
+//   2. featherGreenScreenMask — CIGaussianBlur at feather radius 4.0 px softens the mask.
+//   3. applyGreenScreenTrimap — remaps blurred mask luminance via smoothstep(0.10, 0.90, m)
 //      to establish definite foreground/background regions with a widened transition band.
 //   4. applyGreenScreenGuidedEdgePreserve — restores the pre-trimap feathered mask wherever
 //      the camera frame has strong edges (CIEdges intensity 2.0, blur 1.5, smoothstep
@@ -251,19 +251,22 @@ final class VGMatteRefinementPipeline {
 
     /// Production mask refinement: feather radius, in canvas pixels, applied as a
     /// CIGaussianBlur `inputRadius` to soften the closed mask at output scale before
-    /// CIBlendWithMask (production constant: 3.0 px, S1 edge smoothness A/B).
+    /// CIBlendWithMask (production constant: 4.0 px, S1; promoted from 3.0 px after the
+    /// on-device matte-stage edge-metrics lab measured lower average / p95 / max boundary
+    /// steps on the same captured frame, together with the 0.10 / 0.90 trimap band below).
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints this value as
     /// maskFeatherRadius.
-    static let greenScreenMaskFeatherRadius: CGFloat = 3.0
+    static let greenScreenMaskFeatherRadius: CGFloat = 4.0
 
     /// Production mask refinement: trimap / alpha-curve pass remapping mask luminance m
     /// through smoothstep(greenScreenTrimapLow, greenScreenTrimapHigh, m) to produce
-    /// solid foreground/background bands with a widened soft edge (production constants: 0.14 / 0.86, S1).
+    /// solid foreground/background bands with a widened soft edge (production constants:
+    /// 0.10 / 0.90, S1; promoted from 0.14 / 0.86 together with the 4.0 px feather above).
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints
     /// maskTrimapEnabled / maskTrimapApplied / maskTrimapLow / maskTrimapHigh.
     static let greenScreenTrimapEnabled: Bool = true
-    static let greenScreenTrimapLow:  CGFloat = 0.14
-    static let greenScreenTrimapHigh: CGFloat = 0.86
+    static let greenScreenTrimapLow:  CGFloat = 0.10
+    static let greenScreenTrimapHigh: CGFloat = 0.90
 
     /// Production mask refinement: guided-edge-preservation pass restoring the
     /// pre-trimap feathered mask wherever the camera frame has strong edges
@@ -502,7 +505,7 @@ final class VGMatteRefinementPipeline {
         return (eroded.cropped(to: rect), true)
     }
 
-    /// Softens the mask with CIGaussianBlur at greenScreenMaskFeatherRadius (3.0 px).
+    /// Softens the mask with CIGaussianBlur at greenScreenMaskFeatherRadius (4.0 px).
     /// Clamped to extent before blur and cropped back to `rect` to prevent edge darkening.
     /// Fails open to input mask if radius <= 0, empty, or blur filter is unavailable.
     ///
@@ -521,7 +524,7 @@ final class VGMatteRefinementPipeline {
         return (blurred.cropped(to: rect), true)
     }
 
-    /// Remaps mask luminance m through smoothstep(low, high, m) with constants [0.14, 0.86].
+    /// Remaps mask luminance m through smoothstep(low, high, m) with constants [0.10, 0.90].
     /// Values <= low become solid background, values >= high become solid foreground,
     /// and the narrow band in between stays soft.
     ///

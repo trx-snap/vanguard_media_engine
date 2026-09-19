@@ -258,8 +258,8 @@ _VGStillCreatePool(size_t width, size_t height) {
 //      matte is scaled (non-uniform) to the frame extent.
 //   5. S1 matte refinement over the scaled matte — the proven production order
 //      and constants of VGDuetPreviewCompositor, ported verbatim:
-//        morphology close (r 1.0) → feather (r 3.0) → trimap smoothstep
-//        (0.14/0.86) → guided edge preserve (CIEdges 2.0, blur 1.5,
+//        morphology close (r 1.0) → feather (r 4.0) → trimap smoothstep
+//        (0.10/0.90) → guided edge preserve (CIEdges 2.0, blur 1.5,
 //        smoothstep 0.08/0.34, guided by the camera frame itself).
 //      Each stage fails open to its input mask and reports an applied flag.
 //      S4/S5/tightAlphaR1 lab candidates are deliberately NOT ported.
@@ -314,9 +314,9 @@ static CIContext *_VGGSFNSharedCIContext(id<MTLDevice> device) {
 // or retains anything beyond the call. S4/S5/tightAlphaR1 are NOT ported.
 
 static const CGFloat kVGGSFNMorphologyCloseRadius = 1.0;   // dilate then erode
-static const CGFloat kVGGSFNFeatherRadius         = 3.0;   // CIGaussianBlur px
-static const CGFloat kVGGSFNTrimapLow             = 0.14;  // smoothstep(low, high)
-static const CGFloat kVGGSFNTrimapHigh            = 0.86;
+static const CGFloat kVGGSFNFeatherRadius         = 4.0;   // CIGaussianBlur px
+static const CGFloat kVGGSFNTrimapLow             = 0.10;  // smoothstep(low, high)
+static const CGFloat kVGGSFNTrimapHigh            = 0.90;
 static const CGFloat kVGGSFNGuidedEdgeIntensity   = 2.0;   // CIEdges
 static const CGFloat kVGGSFNGuidedEdgeBlurRadius  = 1.5;   // CIGaussianBlur px
 static const CGFloat kVGGSFNGuidedEdgeLow         = 0.08;  // smoothstep(low, high)
@@ -395,7 +395,7 @@ static CIImage *_VGGSFNMorphologyClose(CIImage *mask, CGRect rect, BOOL *applied
     return [eroded imageByCroppingToRect:rect];
 }
 
-// Stage 2 — feather: CIGaussianBlur radius 3.0, clamped to extent before the
+// Stage 2 — feather: CIGaussianBlur radius 4.0, clamped to extent before the
 // blur (no edge darkening) and cropped back to `rect`.
 static CIImage *_VGGSFNFeather(CIImage *mask, CGRect rect, BOOL *applied) {
     *applied = NO;
@@ -413,7 +413,7 @@ static CIImage *_VGGSFNFeather(CIImage *mask, CGRect rect, BOOL *applied) {
     return [blurred imageByCroppingToRect:rect];
 }
 
-// Stage 3 — trimap: smoothstep(0.14, 0.86, m). Values ≤ low become solid
+// Stage 3 — trimap: smoothstep(0.10, 0.90, m). Values ≤ low become solid
 // background, ≥ high solid foreground, the band between stays soft.
 static CIImage *_VGGSFNTrimap(CIImage *mask, CGRect rect, BOOL *applied) {
     *applied = NO;
