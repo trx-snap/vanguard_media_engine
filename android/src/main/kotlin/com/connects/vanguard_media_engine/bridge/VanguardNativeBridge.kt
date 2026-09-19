@@ -1407,6 +1407,42 @@ class VanguardNativeBridge(
         // safe no-op.
         external fun destroyAndroidDuetGpuTextureBridge(handle: Long)
 
+        // ── SLICE-1: Dual-Camera Compositor Core ──────────────────────────
+        // nativeCreateDualCamSession: Creates VkInstance/VkDevice/VkQueue +
+        // VulkanSurfaceSwapchain attached to the ANativeWindow from outputSurface
+        // (Vulkan path), or EGLDisplay/EGLContext/EGLSurface (GLES fallback).
+        // Returns an opaque session handle (pointer cast to Long), or 0 on failure.
+        external fun nativeCreateDualCamSession(
+            outputSurface: Surface,
+            width: Int,
+            height: Int,
+            useVulkan: Boolean,
+        ): Long
+
+        // nativeDualCamCompositeFrame: Per-frame render. Vulkan path imports
+        // frontHardwareBuffer / backHardwareBuffer as AHardwareBuffer, renders
+        // via swapchain. GLES path clears + swaps (both HardwareBuffers null).
+        // Returns true on success.
+        external fun nativeDualCamCompositeFrame(
+            sessionHandle: Long,
+            frontHardwareBuffer: HardwareBuffer?,
+            backHardwareBuffer: HardwareBuffer?,
+            layoutParamsJson: String,
+        ): Boolean
+
+        // nativeComputeMultiCamLayout: Thin JSON wrapper over ComputeMultiCamLayout().
+        // Returns a JSON string with primaryViewport, secondaryViewport, and
+        // secondaryOpacity fields in normalized coordinates.
+        external fun nativeComputeMultiCamLayout(
+            layoutParamsJson: String,
+            canvasWidth: Int,
+            canvasHeight: Int,
+        ): String
+
+        // nativeDestroyDualCamSession: Idempotent teardown. Waits for device idle,
+        // destroys all Vulkan/GLES resources, and frees the session handle.
+        external fun nativeDestroyDualCamSession(sessionHandle: Long)
+
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
