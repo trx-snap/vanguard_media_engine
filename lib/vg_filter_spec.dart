@@ -72,6 +72,8 @@ final class VGFilterSpec {
   /// - `'lut'`          → `'intensity'` (double, 0.0–1.0)
   /// - `'beauty'`       → `'intensity'` (double, 0.0–1.0), `'radius'` (double)
   /// - `'segmentation'` → (none in Phase 3; reserved for Phase 4)
+  /// - `'greenScreen'`  → `'backgroundType'` (`'solidColor'`), `'argb'` (int,
+  ///                      0xAARRGGBB) — see [VGFilterSpecs.greenScreenSolidColor]
   /// - `'colorMatrix'`  → `'matrix'` (`List<double>`, exactly 20 elements,
   ///                      4×5 row-major matching Flutter's [ColorFilter.matrix])
   ///
@@ -133,6 +135,7 @@ const Set<String> _validTypes = {
   'lut',
   'beauty',
   'segmentation',
+  'greenScreen',
   'colorMatrix',
   'transform',
 };
@@ -326,8 +329,48 @@ extension VGFilterSpecs on VGFilterSpec {
   ///
   /// No parameters in Phase 4. Reads the current [VanguardMaskStore] snapshot
   /// on the native side.
+  ///
+  /// This is NOT the live green-screen filter. Green screen is a separate type
+  /// with its own contract — see [greenScreenSolidColor]. On the iOS camera
+  /// graph this type is still deferred (UNSUPPORTED_FILTER_TYPE).
   static VGFilterSpec segmentation() =>
       const VGFilterSpec(type: 'segmentation');
+
+  /// Creates a live green-screen filter that replaces the background behind
+  /// the person with an opaque solid colour.
+  ///
+  /// Runs as a regular filter node inside the active camera graph, so the
+  /// keyed frame reaches the preview, the recording sink and the photo sink
+  /// alike. It is not a standalone camera/session and is not tied to Duet or
+  /// any other product mode — any camera-graph caller may use it.
+  ///
+  /// [argb] is the background colour as `0xAARRGGBB`. The alpha byte is
+  /// ignored (the background is always opaque). Defaults to `0xFF00796B`
+  /// (teal). Must be in `[0, 0xFFFFFFFF]`; asserted in debug builds and
+  /// rejected natively (INVALID_GREEN_SCREEN_FILTER_SPEC) otherwise.
+  ///
+  /// Wire format:
+  /// ```json
+  /// { "type": "greenScreen", "enabled": true,
+  ///   "parameters": { "backgroundType": "solidColor", "argb": 4278483307 } }
+  /// ```
+  ///
+  /// iOS-first, solid-background-only MVP. Image/video backgrounds are not
+  /// part of this contract (native returns UNSUPPORTED_FILTER_TYPE for any
+  /// other `backgroundType`). Matte quality is MVP-level: the native node
+  /// keys with a raw Vision person matte and no edge refinement, and fails
+  /// open to the unkeyed camera frame on any per-frame failure.
+  static VGFilterSpec greenScreenSolidColor({int argb = 0xFF00796B}) {
+    assert(
+      argb >= 0 && argb <= 0xFFFFFFFF,
+      'VGFilterSpecs.greenScreenSolidColor: argb must be in [0, 0xFFFFFFFF]. '
+      'Got $argb.',
+    );
+    return VGFilterSpec(
+      type: 'greenScreen',
+      parameters: {'backgroundType': 'solidColor', 'argb': argb},
+    );
+  }
 
   /// Creates a color-matrix filter for export and timeline pipelines.
   ///
