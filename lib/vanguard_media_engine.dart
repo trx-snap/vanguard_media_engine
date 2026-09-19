@@ -1056,6 +1056,49 @@ class VanguardEngine {
     );
   }
 
+  /// Returns a read-only native snapshot of the cumulative graph/filter-chain
+  /// execution timing for the filter chain currently active in the UFM camera
+  /// graph, or `null` when no filter chain is installed (never applied, or
+  /// cleared by [setCameraFilterChain] with an empty list).
+  ///
+  /// iOS only (VG_USE_CAMERA_GRAPH=1). Read-only: does not touch the camera,
+  /// the filter chain, or any node state. Intended for physical smoke proof
+  /// of combined-chain (for example Beauty V2 + greenScreen) cost.
+  ///
+  /// Timing boundary: measured natively on the graph execution queue
+  /// immediately around the synchronous scheduler call for every accepted
+  /// (non-dropped) frame, so each sample covers scheduler traversal + every
+  /// active filter node + the synchronous sink present. It is cumulative
+  /// filter-chain timing, not per-node (Beauty V2-only) timing.
+  ///
+  /// Keys (see `VGCameraGraphSession.h` `filterChainDiagnosticsSnapshot`):
+  /// - `proofLevel` (`'filterChainTimingV1'`)
+  /// - `activeFilterCount` (int), `activeFilterTypes` (List of type strings,
+  ///   e.g. `['beauty', 'greenScreen']`, in applied order)
+  /// - `graphFrameCount` (int, accepted frames timed for the current chain)
+  /// - `droppedBusyCount` (int, frames dropped by the native in-flight
+  ///   backpressure guard since the current chain was committed)
+  /// - `lastGraphTotalMs`, `meanGraphTotalMs`, `maxGraphTotalMs` (double, ms;
+  ///   means are 0.0 when `graphFrameCount` is 0)
+  /// - `timingBoundary` (String), `nonClaims` (List of String)
+  ///
+  /// Statistics reset on every successful [setCameraFilterChain] commit.
+  ///
+  /// PlatformException codes:
+  /// - 'GRAPH_MODE_DISABLED' if camera graph mode is disabled.
+  /// - 'NO_CAMERA_GRAPH' if the camera graph session is not running.
+  static Future<Map<String, dynamic>?> getCameraFilterChainDiagnostics() async {
+    final raw = await _cameraChannel.invokeMethod<Map>(
+      'getCameraFilterChainDiagnostics',
+    );
+    if (raw == null) return null;
+    // The codec delivers Map<Object?, Object?>; stringify keys so callers get
+    // a plain Map<String, dynamic> without a runtime cast failure.
+    return raw.map<String, dynamic>(
+      (key, value) => MapEntry<String, dynamic>(key.toString(), value),
+    );
+  }
+
   /// Swaps to the given sensor without tearing down the session (~150 ms).
   /// The texture id returned by [startCamera] remains valid — no widget rebuild.
   ///

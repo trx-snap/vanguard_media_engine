@@ -30,6 +30,13 @@
 // Thread safety of _graphInFlight:
 //   _graphInFlight is _Atomic(BOOL). The in-flight check uses atomic_compare_
 //   exchange_strong so concurrent calls from the serial capture queue are safe.
+//
+// UFM filter-chain timing (read-only diagnostics):
+//   The async block brackets [scheduler didReceiveRawFrame:] with a monotonic
+//   clock while a non-empty chain is committed, folding results into _fc*
+//   aggregates owned by _graphExecutionQueue (read by
+//   -filterChainDiagnosticsSnapshot). Cumulative graph/filter-chain cost, not
+//   per-node cost.
 
 #import "VGCameraGraphSession.h"
 #import "VGUseCameraGraph.h"
@@ -44,9 +51,12 @@
 #import "VanguardBeautyFilterNode.h"
 #import "BeautyV2FilterGroup.h"
 #import "VGSegmentationNode.h"  // Phase 9B-5: segmentation auto-insertion before BeautyV2
+#import "VGGreenScreenFilterNode.h"  // UMF camera graph green screen (spec type "greenScreen")
 // [Beauty-Still]: VGOfflineFilterBundle and VGStillImageFilterFactory declarations
 // are provided through VGCameraGraphSession.h (already imported above).
 // Their @implementation blocks are inlined later in this file.
+// VGGreenScreenFilterNode's @implementation is inlined here as well (its .m is
+// comment-only) for the same Pods-project reason.
 
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGFrameDelegate.h>
@@ -55,8 +65,12 @@
 #import <UMF/VGFrameSink.h>
 #import <UMF/VGFrameEnvelope.h>
 #import <stdatomic.h>
+#import <time.h>                  // filter-chain timing: clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+#import <os/lock.h>               // VGGreenScreenFilterNode: telemetry lock (os_unfair_lock)
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreImage/CoreImage.h>   // VGGreenScreenFilterNode: CIBlendWithMask composite
+#import <Vision/Vision.h>         // VGGreenScreenFilterNode: person matte (iOS 15+)
 
 // [Beauty-Still]: VGOfflineFilterBundle implementation inlined here so the class is compiled
 // as part of VGCameraGraphSession.m without requiring a new Pods project source-file entry.
@@ -227,6 +241,711 @@ _VGStillCreatePool(size_t width, size_t height) {
 
 @end
 
+// ─── VGGreenScreenFilterNode (UMF camera graph green screen, iOS-first MVP) ──
+//
+// Implementation inlined here so the class compiles without a Pods project
+// regeneration (VGGreenScreenFilterNode.m is comment-only). Contract, scope
+// and explicit non-claims are documented in VGGreenScreenFilterNode.h.
+//
+// Processing contract (processBuffer:atTime:device:):
+//   1. enabled=NO or invalidated → CVPixelBufferRetain(input); return input.
+//   2. Matte source unavailable (iOS < 15), NULL pool, or zero-dimension input
+//      → passthrough (fail open), logged.
+//   3. Synchronous Vision person segmentation (FAST) on the input exactly as
+//      received (no orientation passed: the camera source already oriented and
+//      mirrored the frame). Error / no observation / wrong format → passthrough.
+//   4. CIImage wrap of the input (foreground) and the OneComponent8 matte; the
+//      matte is scaled (non-uniform) to the frame extent.
+//   5. S1 matte refinement over the scaled matte — the proven production order
+//      and constants of VGDuetPreviewCompositor, ported verbatim:
+//        morphology close (r 1.0) → feather (r 3.0) → trimap smoothstep
+//        (0.14/0.86) → guided edge preserve (CIEdges 2.0, blur 1.5,
+//        smoothstep 0.08/0.34, guided by the camera frame itself).
+//      Each stage fails open to its input mask and reports an applied flag.
+//      S4/S5/tightAlphaR1 lab candidates are deliberately NOT ported.
+//   6. CIBlendWithMask: inputImage = foreground, inputBackgroundImage = solid
+//      colour, inputMaskImage = refined matte (255 = subject → foreground).
+//   7. Pool buffer allocation; its dimensions must equal the frame's, else
+//      passthrough (logged once).
+//   8. Render with a NULL colour space into the pool buffer; return it (+1).
+//
+// Logging markers (grep in device logs):
+//   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_NODE_CREATED
+//   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_PROOF_UNAVAILABLE   (iOS < 15 only, once)
+//   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_FRAME               (frames 1-3, then every 60th)
+//   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_FAIL_OPEN           (events 1-3, then every 60th)
+//
+// Native telemetry (no log dependency): -diagnosticsSnapshot (contract in the
+// header). Per-frame counters are plain scalars written under _telemetryLock
+// at the end of a successful keyed render (step 7 below) and on fail-open;
+// nothing is allocated for telemetry on the frame path.
+
+NSString * const VGGreenScreenFilterNodeBackgroundTypeSolidColor = @"solidColor";
+
+static const uint64_t kVGGreenScreenFilterLogInterval = 60;
+
+// Shared CIContext with NO working colour space (raw bytes in, raw bytes out):
+// the same options as the proven live green-screen renderers in this package
+// (VGDuetPreviewCompositor, VGARKitLiveGreenScreenPreviewCoordinator). The
+// device passed on first use backs the context for the process lifetime.
+static CIContext *_VGGSFNSharedCIContext(id<MTLDevice> device) {
+    static CIContext *ctx;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *opts = @{
+            kCIContextWorkingColorSpace:  [NSNull null],
+            kCIContextCacheIntermediates: @NO,
+        };
+        ctx = device ? [CIContext contextWithMTLDevice:device options:opts]
+                     : [CIContext contextWithOptions:opts];
+    });
+    return ctx;
+}
+
+// ─── S1 matte refinement (ported from VGDuetPreviewCompositor, production) ───
+//
+// Stage order and constants are the proven live green-screen S1 pipeline:
+//   morphology close → feather → trimap → guided edge preserve → CIBlendWithMask
+// Every stage is a pure CIImage recipe (lazy; the GPU work lands in the single
+// render at the end of processBuffer:). Each stage returns its refined mask and
+// sets *applied = YES, or returns its INPUT mask unchanged with *applied = NO
+// (fail open) when a filter is unavailable, produces nil, or the inputs are
+// degenerate. Nothing here allocates buffers, touches the pool or the device,
+// or retains anything beyond the call. S4/S5/tightAlphaR1 are NOT ported.
+
+static const CGFloat kVGGSFNMorphologyCloseRadius = 1.0;   // dilate then erode
+static const CGFloat kVGGSFNFeatherRadius         = 3.0;   // CIGaussianBlur px
+static const CGFloat kVGGSFNTrimapLow             = 0.14;  // smoothstep(low, high)
+static const CGFloat kVGGSFNTrimapHigh            = 0.86;
+static const CGFloat kVGGSFNGuidedEdgeIntensity   = 2.0;   // CIEdges
+static const CGFloat kVGGSFNGuidedEdgeBlurRadius  = 1.5;   // CIGaussianBlur px
+static const CGFloat kVGGSFNGuidedEdgeLow         = 0.08;  // smoothstep(low, high)
+static const CGFloat kVGGSFNGuidedEdgeHigh        = 0.34;
+
+// smoothstep(low, high, m) on R, G, B (alpha identity), cropped to `rect`:
+//   CIColorMatrix (linear ramp t = (m - low) / (high - low))
+//   → CIColorClamp (t ∈ [0, 1]) → CIColorPolynomial (3t² − 2t³).
+// Returns nil on any filter failure so callers fail open to their input.
+static CIImage * _Nullable _VGGSFNSmoothstep(CIImage *image, CGFloat low, CGFloat high, CGRect rect) {
+    if (!image || high <= low) return nil;
+    const CGFloat scale = 1.0 / (high - low);
+    const CGFloat bias  = -low * scale;
+
+    CIFilter *ramp = [CIFilter filterWithName:@"CIColorMatrix"];
+    if (!ramp) return nil;
+    [ramp setValue:image forKey:kCIInputImageKey];
+    [ramp setValue:[CIVector vectorWithX:scale Y:0     Z:0     W:0] forKey:@"inputRVector"];
+    [ramp setValue:[CIVector vectorWithX:0     Y:scale Z:0     W:0] forKey:@"inputGVector"];
+    [ramp setValue:[CIVector vectorWithX:0     Y:0     Z:scale W:0] forKey:@"inputBVector"];
+    [ramp setValue:[CIVector vectorWithX:0     Y:0     Z:0     W:1] forKey:@"inputAVector"];
+    [ramp setValue:[CIVector vectorWithX:bias  Y:bias  Z:bias  W:0] forKey:@"inputBiasVector"];
+    CIImage *ramped = ramp.outputImage;
+    if (!ramped) return nil;
+
+    CIFilter *clamp = [CIFilter filterWithName:@"CIColorClamp"];
+    if (!clamp) return nil;
+    [clamp setValue:ramped forKey:kCIInputImageKey];
+    [clamp setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:0] forKey:@"inputMinComponents"];
+    [clamp setValue:[CIVector vectorWithX:1 Y:1 Z:1 W:1] forKey:@"inputMaxComponents"];
+    CIImage *clamped = clamp.outputImage;
+    if (!clamped) return nil;
+
+    CIFilter *curve = [CIFilter filterWithName:@"CIColorPolynomial"];
+    if (!curve) return nil;
+    CIVector *smoothstep = [CIVector vectorWithX:0 Y:0 Z:3 W:-2];   // 0 + 0t + 3t² − 2t³
+    [curve setValue:clamped    forKey:kCIInputImageKey];
+    [curve setValue:smoothstep forKey:@"inputRedCoefficients"];
+    [curve setValue:smoothstep forKey:@"inputGreenCoefficients"];
+    [curve setValue:smoothstep forKey:@"inputBlueCoefficients"];
+    [curve setValue:[CIVector vectorWithX:0 Y:1 Z:0 W:0] forKey:@"inputAlphaCoefficients"];
+    CIImage *curved = curve.outputImage;
+    if (!curved) return nil;
+    return [curved imageByCroppingToRect:rect];
+}
+
+// Stage 1 — morphological close: CIMorphologyMaximum (dilate) then
+// CIMorphologyMinimum (erode), radius 1.0. Clamped to extent before dilate; the
+// dilated image still carries the infinite extent, and feeding that into the
+// second morphology filter crashed on-device (EXC_BAD_ACCESS), so it is cropped
+// to a finite radius-padded rect before erode (NOT re-clamped), then cropped
+// back to `rect`. Fills pinholes and stair-step bites before the feather.
+static CIImage *_VGGSFNMorphologyClose(CIImage *mask, CGRect rect, BOOL *applied) {
+    *applied = NO;
+    const CGFloat radius = kVGGSFNMorphologyCloseRadius;
+    if (radius <= 0 || CGRectIsEmpty(rect) || CGRectIsEmpty(mask.extent)) return mask;
+
+    CIFilter *dilate = [CIFilter filterWithName:@"CIMorphologyMaximum"];
+    if (!dilate) return mask;
+    [dilate setValue:[mask imageByClampingToExtent] forKey:kCIInputImageKey];
+    [dilate setValue:@(radius) forKey:kCIInputRadiusKey];
+    CIImage *dilated = dilate.outputImage;
+    if (!dilated) return mask;
+
+    const CGFloat pad = MAX(radius * 2, 2);
+    CIImage *boundedDilated = [dilated imageByCroppingToRect:CGRectInset(rect, -pad, -pad)];
+
+    CIFilter *erode = [CIFilter filterWithName:@"CIMorphologyMinimum"];
+    if (!erode) return mask;
+    [erode setValue:boundedDilated forKey:kCIInputImageKey];
+    [erode setValue:@(radius) forKey:kCIInputRadiusKey];
+    CIImage *eroded = erode.outputImage;
+    if (!eroded) return mask;
+
+    *applied = YES;
+    return [eroded imageByCroppingToRect:rect];
+}
+
+// Stage 2 — feather: CIGaussianBlur radius 3.0, clamped to extent before the
+// blur (no edge darkening) and cropped back to `rect`.
+static CIImage *_VGGSFNFeather(CIImage *mask, CGRect rect, BOOL *applied) {
+    *applied = NO;
+    const CGFloat radius = kVGGSFNFeatherRadius;
+    if (radius <= 0 || CGRectIsEmpty(rect) || CGRectIsEmpty(mask.extent)) return mask;
+
+    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
+    if (!blur) return mask;
+    [blur setValue:[mask imageByClampingToExtent] forKey:kCIInputImageKey];
+    [blur setValue:@(radius) forKey:kCIInputRadiusKey];
+    CIImage *blurred = blur.outputImage;
+    if (!blurred) return mask;
+
+    *applied = YES;
+    return [blurred imageByCroppingToRect:rect];
+}
+
+// Stage 3 — trimap: smoothstep(0.14, 0.86, m). Values ≤ low become solid
+// background, ≥ high solid foreground, the band between stays soft.
+static CIImage *_VGGSFNTrimap(CIImage *mask, CGRect rect, BOOL *applied) {
+    *applied = NO;
+    if (CGRectIsEmpty(rect) || CGRectIsEmpty(mask.extent)) return mask;
+    CIImage *curved = _VGGSFNSmoothstep(mask, kVGGSFNTrimapLow, kVGGSFNTrimapHigh, rect);
+    if (!curved) return mask;
+    *applied = YES;
+    return curved;
+}
+
+// Stage 4 — guided edge preserve: restores the pre-trimap `feathered` mask over
+// the `trimapped` mask wherever the camera frame (`guide`) has a strong edge,
+// keeping thin detail (hair, fingers) while flat regions stay cleanly keyed.
+// Edge confidence = CIEdges(guide ∩ rect, 2.0) → CIGaussianBlur 1.5 →
+// smoothstep(0.08, 0.34); composite = CIBlendWithMask(feathered over trimapped
+// using that confidence). Fails open to `trimapped`.
+static CIImage *_VGGSFNGuidedEdgePreserve(CIImage *trimapped, CIImage *feathered,
+                                          CIImage *guide, CGRect rect, BOOL *applied) {
+    *applied = NO;
+    if (CGRectIsEmpty(rect) || CGRectIsEmpty(trimapped.extent) ||
+        CGRectIsEmpty(feathered.extent) || CGRectIsEmpty(guide.extent)) {
+        return trimapped;
+    }
+
+    CIFilter *edges = [CIFilter filterWithName:@"CIEdges"];
+    if (!edges) return trimapped;
+    [edges setValue:[guide imageByCroppingToRect:rect] forKey:kCIInputImageKey];
+    [edges setValue:@(kVGGSFNGuidedEdgeIntensity) forKey:kCIInputIntensityKey];
+    CIImage *edgeImage = edges.outputImage;
+    if (!edgeImage) return trimapped;
+
+    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
+    if (!blur) return trimapped;
+    [blur setValue:[edgeImage imageByClampingToExtent] forKey:kCIInputImageKey];
+    [blur setValue:@(kVGGSFNGuidedEdgeBlurRadius) forKey:kCIInputRadiusKey];
+    CIImage *blurredEdges = blur.outputImage;
+    if (!blurredEdges) return trimapped;
+
+    CIImage *edgeConfidence = _VGGSFNSmoothstep(blurredEdges, kVGGSFNGuidedEdgeLow,
+                                                kVGGSFNGuidedEdgeHigh, rect);
+    if (!edgeConfidence) return trimapped;
+
+    CIFilter *blend = [CIFilter filterWithName:@"CIBlendWithMask"];
+    if (!blend) return trimapped;
+    [blend setValue:feathered      forKey:kCIInputImageKey];
+    [blend setValue:trimapped      forKey:kCIInputBackgroundImageKey];
+    [blend setValue:edgeConfidence forKey:kCIInputMaskImageKey];
+    CIImage *blended = blend.outputImage;
+    if (!blended) return trimapped;
+
+    *applied = YES;
+    return [blended imageByCroppingToRect:rect];
+}
+
+@interface VGGreenScreenFilterNode ()
+- (nullable VNPixelBufferObservation *)_personMatteObservationForBuffer:(CVPixelBufferRef)input
+                                                                  error:(NSError * _Nullable * _Nullable)outError
+    API_AVAILABLE(ios(15.0));
+- (CVPixelBufferRef)_failOpenWithInput:(CVPixelBufferRef)input reason:(NSString *)reason;
+@end
+
+@implementation VGGreenScreenFilterNode {
+    CVPixelBufferPoolRef _pool;               // +1 owned; released in dealloc
+    id<MTLDevice>        _device;
+    CIImage             *_backgroundImage;    // infinite-extent solid colour; cropped per frame
+    _Atomic(BOOL)        _invalidated;
+    _Atomic(uint64_t)    _frameCounter;       // frames that entered processing (diagnostics)
+    _Atomic(uint64_t)    _failOpenCounter;    // fail-open events (diagnostics, throttled log)
+    _Atomic(BOOL)        _loggedUnavailable;
+    _Atomic(BOOL)        _loggedPoolMismatch;
+
+    // ── Telemetry (read by -diagnosticsSnapshot from any thread, written on
+    //    the graph execution queue). Every field below is guarded by
+    //    _telemetryLock; hold time is a handful of scalar stores/loads. The
+    //    counts here cover successfully keyed/rendered frames only — frames
+    //    entering processing and fail-opens use the atomics above.
+    os_unfair_lock       _telemetryLock;
+    uint64_t             _tmProcessedFrameCount;          // keyed + rendered frames
+    uint64_t             _tmAllS1StagesAppliedFrameCount; // keyed frames with all 4 S1 stages
+    size_t               _tmLastSourceWidth;
+    size_t               _tmLastSourceHeight;
+    size_t               _tmLastMatteWidth;
+    size_t               _tmLastMatteHeight;
+    BOOL                 _tmLastMorphologyCloseApplied;
+    BOOL                 _tmLastFeatherApplied;
+    BOOL                 _tmLastTrimapApplied;
+    BOOL                 _tmLastGuidedEdgeApplied;
+    double               _tmLastVisionMs;
+    double               _tmSumVisionMs;
+    double               _tmMaxVisionMs;
+    double               _tmLastBlendRenderMs;
+    double               _tmSumBlendRenderMs;
+    double               _tmMaxBlendRenderMs;
+    double               _tmLastTotalMs;
+    double               _tmSumTotalMs;
+    double               _tmMaxTotalMs;
+    NSString            *_tmLastFailOpenReason;           // @"none" until the first fail-open
+}
+
+@synthesize filterName     = _filterName;
+@synthesize enabled        = _enabled;
+@synthesize nodeId         = _nodeId;
+@synthesize nodeType       = _nodeType;
+@synthesize backgroundARGB = _backgroundARGB;
+@synthesize matteSource    = _matteSource;
+
+// ─── VGMediaNode / VGMetalFilterNode cost model ───────────────────────────────
+
+- (BOOL)isExpensive { return YES; }
+- (float)estimatedGPUCostMs { return 12.0f; }
+- (VGNodeRole)nodeRole { return VGNodeRoleFilter; }
+
+// ─── Lifecycle ────────────────────────────────────────────────────────────────
+
+- (void)prepareWithCompletion:(void (^)(NSError * _Nullable))completion {
+    if (completion) completion(nil);
+}
+
+- (void)invalidate {
+    // Terminal, idempotent, lock-free, allocation-free. Nothing asynchronous is
+    // ever in flight (Vision runs synchronously inside processBuffer:), so there
+    // is nothing to cancel; every subsequent frame passes through.
+    atomic_store(&_invalidated, YES);
+}
+
+- (instancetype)initWithPool:(nullable CVPixelBufferPoolRef)pool
+                      device:(id<MTLDevice>)device
+              backgroundARGB:(uint32_t)backgroundARGB {
+    NSParameterAssert(device != nil);
+    self = [super init];
+    if (!self) return nil;
+
+    _pool           = pool ? (CVPixelBufferPoolRef)CFRetain(pool) : NULL;
+    _device         = device;
+    _backgroundARGB = backgroundARGB;
+    _enabled        = YES;
+    atomic_init(&_invalidated, NO);
+    atomic_init(&_frameCounter, 0);
+    atomic_init(&_failOpenCounter, 0);
+    atomic_init(&_loggedUnavailable, NO);
+    atomic_init(&_loggedPoolMismatch, NO);
+
+    // Telemetry: the numeric fields start at zero from alloc; only the lock
+    // and the initial fail-open reason need explicit values.
+    _telemetryLock        = OS_UNFAIR_LOCK_INIT;
+    _tmLastFailOpenReason = @"none";
+
+    _nodeId     = [[NSUUID UUID] UUIDString];
+    _nodeType   = @"VGGreenScreenFilterNode";
+    _filterName = @"GreenScreen";
+
+    // Solid background: raw sRGB components, alpha forced opaque. With the
+    // unmanaged CIContext these component values reach the output bytes as-is.
+    CGFloat r = ((backgroundARGB >> 16) & 0xFF) / 255.0;
+    CGFloat g = ((backgroundARGB >>  8) & 0xFF) / 255.0;
+    CGFloat b = ( backgroundARGB        & 0xFF) / 255.0;
+    _backgroundImage = [CIImage imageWithColor:[CIColor colorWithRed:r green:g blue:b alpha:1.0]];
+
+    if (@available(iOS 15.0, *)) {
+        _matteSource = VGGreenScreenFilterNodeMatteSourceVisionPersonFast;
+    } else {
+        _matteSource = VGGreenScreenFilterNodeMatteSourceUnavailable;
+    }
+
+    NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_NODE_CREATED "
+           "proofLevel=S1 matteSource=%@ backgroundType=solidColor "
+           "backgroundARGB=0x%08X alphaByteIgnored=1 pool=%p edgeRefinement=S1 "
+           "morphologyCloseRadius=%.1f featherRadius=%.1f trimapLow=%.2f trimapHigh=%.2f "
+           "guidedEdgeIntensity=%.1f guidedEdgeBlurRadius=%.1f guidedEdgeLow=%.2f "
+           "guidedEdgeHigh=%.2f temporalSmoothing=none matteQualityClaim=none",
+          (_matteSource == VGGreenScreenFilterNodeMatteSourceVisionPersonFast)
+              ? @"visionPersonFast" : @"unavailable",
+          backgroundARGB, _pool,
+          (double)kVGGSFNMorphologyCloseRadius, (double)kVGGSFNFeatherRadius,
+          (double)kVGGSFNTrimapLow, (double)kVGGSFNTrimapHigh,
+          (double)kVGGSFNGuidedEdgeIntensity, (double)kVGGSFNGuidedEdgeBlurRadius,
+          (double)kVGGSFNGuidedEdgeLow, (double)kVGGSFNGuidedEdgeHigh);
+    return self;
+}
+
+- (void)dealloc {
+    if (_pool) {
+        CVPixelBufferPoolRelease(_pool);
+        _pool = NULL;
+    }
+}
+
+// ─── Fail-open helper ─────────────────────────────────────────────────────────
+//
+// Every failure path returns the input (+1) so the preview shows the unkeyed
+// camera rather than a dropped or corrupt frame. Logged for the first 3 events
+// and then every 60th so a physical run can count fail-opens without log spam.
+- (CVPixelBufferRef)_failOpenWithInput:(CVPixelBufferRef)input reason:(NSString *)reason {
+    uint64_t n = atomic_fetch_add(&_failOpenCounter, 1) + 1;
+
+    // Telemetry: remember the reason for -diagnosticsSnapshot. The immutable
+    // copy is taken outside the lock (a no-op retain for the immutable strings
+    // callers pass), and the previous string is released outside the lock so
+    // the hold is a single pointer swap.
+    NSString *reasonCopy = [reason copy] ?: @"unknown";
+    {
+        NSString *previousReason;
+        os_unfair_lock_lock(&_telemetryLock);
+        previousReason = _tmLastFailOpenReason;
+        _tmLastFailOpenReason = reasonCopy;
+        os_unfair_lock_unlock(&_telemetryLock);
+        (void)previousReason;   // released here, after the unlock
+    }
+
+    if (n <= 3 || (n % kVGGreenScreenFilterLogInterval) == 0) {
+        NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_FAIL_OPEN "
+               "reason=%@ failOpenCount=%llu frame=%llu — returning input unchanged",
+              reason, (unsigned long long)n,
+              (unsigned long long)atomic_load(&_frameCounter));
+    }
+    CVPixelBufferRetain(input);
+    return input;
+}
+
+// ─── Matte: synchronous Vision person segmentation (FAST) ─────────────────────
+//
+// Stateless per frame: a fresh request and a fresh handler, both locals of this
+// call, so nothing Vision-side survives between frames and nothing outlives the
+// call (the handler's reference to the input ends when this method returns).
+// No orientation is passed — the camera source already oriented/mirrored the
+// frame, so the matte keeps the buffer's own orientation and lines up 1:1.
+// Returns the observation (ARC-owned; keeps its pixelBuffer alive) or nil.
+- (nullable VNPixelBufferObservation *)_personMatteObservationForBuffer:(CVPixelBufferRef)input
+                                                                  error:(NSError * _Nullable * _Nullable)outError {
+    VNGeneratePersonSegmentationRequest *request =
+        [[VNGeneratePersonSegmentationRequest alloc] init];
+    request.qualityLevel = VNGeneratePersonSegmentationRequestQualityLevelFast;
+    request.outputPixelFormat = kCVPixelFormatType_OneComponent8;   // 255 = person
+    request.preferBackgroundProcessing = NO;
+
+    VNImageRequestHandler *handler =
+        [[VNImageRequestHandler alloc] initWithCVPixelBuffer:input options:@{}];
+    NSError *error = nil;
+    if (![handler performRequests:@[request] error:&error]) {
+        if (outError) *outError = error;
+        return nil;
+    }
+    VNPixelBufferObservation *observation = request.results.firstObject;
+    if (![observation isKindOfClass:[VNPixelBufferObservation class]] || !observation.pixelBuffer) {
+        return nil;
+    }
+    return observation;
+}
+
+// ─── VanguardFilterNode: processBuffer:atTime:device: ────────────────────────
+
+- (CVPixelBufferRef)processBuffer:(CVPixelBufferRef)input
+                           atTime:(CMTime)time
+                           device:(id<MTLDevice>)dev {
+    // Passthrough: disabled or invalidated (no buffer ops beyond the +1).
+    if (!_enabled || atomic_load(&_invalidated)) {
+        CVPixelBufferRetain(input);
+        return input;
+    }
+
+    const uint64_t frameIndex = atomic_fetch_add(&_frameCounter, 1) + 1;
+    const BOOL shouldLog = (frameIndex <= 3) || (frameIndex % kVGGreenScreenFilterLogInterval) == 0;
+
+    if (_matteSource != VGGreenScreenFilterNodeMatteSourceVisionPersonFast) {
+        BOOL expected = NO;
+        if (atomic_compare_exchange_strong(&_loggedUnavailable, &expected, YES)) {
+            NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_PROOF_UNAVAILABLE "
+                   "reason=vision_person_segmentation_requires_ios15 — passthrough for the node's "
+                   "lifetime; no keying is performed and nothing is proven on this system");
+        }
+        CVPixelBufferRetain(input);
+        return input;
+    }
+    if (!_pool) {
+        return [self _failOpenWithInput:input reason:@"pool_null"];
+    }
+
+    const size_t srcW = CVPixelBufferGetWidth(input);
+    const size_t srcH = CVPixelBufferGetHeight(input);
+    if (srcW == 0 || srcH == 0) {
+        return [self _failOpenWithInput:input reason:@"zero_dimension_input"];
+    }
+
+    const CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+
+    // ── 1. Person matte (synchronous Vision FAST) ─────────────────────────
+    VNPixelBufferObservation *observation = nil;   // kept alive until render completes
+    CVPixelBufferRef matteBuffer = NULL;
+    size_t matteW = 0, matteH = 0;
+    if (@available(iOS 15.0, *)) {
+        NSError *visionError = nil;
+        observation = [self _personMatteObservationForBuffer:input error:&visionError];
+        if (!observation) {
+            return [self _failOpenWithInput:input
+                                     reason:[NSString stringWithFormat:@"vision_no_matte(%@)",
+                                             visionError.localizedDescription ?: @"no_observation"]];
+        }
+        matteBuffer = observation.pixelBuffer;
+        matteW = CVPixelBufferGetWidth(matteBuffer);
+        matteH = CVPixelBufferGetHeight(matteBuffer);
+        if (CVPixelBufferGetPixelFormatType(matteBuffer) != kCVPixelFormatType_OneComponent8 ||
+            matteW == 0 || matteH == 0) {
+            return [self _failOpenWithInput:input reason:@"vision_matte_format_unsupported"];
+        }
+    } else {
+        // Unreachable: _matteSource is Unavailable below iOS 15 (guarded above).
+        return [self _failOpenWithInput:input reason:@"vision_unavailable"];
+    }
+    const CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+
+    // ── 2. CIImages: foreground (input) + matte scaled to the frame extent ─
+    CIImage *foreground = [CIImage imageWithCVPixelBuffer:input];
+    CIImage *matte      = [CIImage imageWithCVPixelBuffer:matteBuffer];
+    if (!foreground || !matte) {
+        return [self _failOpenWithInput:input reason:@"ciimage_wrap_failed"];
+    }
+    const CGRect srcBounds = CGRectMake(0, 0, (CGFloat)srcW, (CGFloat)srcH);
+    if (matteW != srcW || matteH != srcH) {
+        matte = [matte imageByApplyingTransform:
+                 CGAffineTransformMakeScale((CGFloat)srcW / (CGFloat)matteW,
+                                            (CGFloat)srcH / (CGFloat)matteH)];
+    }
+    CIImage *background = [_backgroundImage imageByCroppingToRect:srcBounds];
+
+    // ── 3. S1 matte refinement (each stage fails open to its input mask) ──
+    //   close → feather → trimap → guided edge (guide = camera foreground).
+    //   The guided stage needs BOTH the feathered and the trimapped masks.
+    BOOL morphologyCloseApplied = NO, featherApplied = NO;
+    BOOL trimapApplied = NO, guidedEdgeApplied = NO;
+    CIImage *closed    = _VGGSFNMorphologyClose(matte, srcBounds, &morphologyCloseApplied);
+    CIImage *feathered = _VGGSFNFeather(closed, srcBounds, &featherApplied);
+    CIImage *trimapped = _VGGSFNTrimap(feathered, srcBounds, &trimapApplied);
+    CIImage *refined   = _VGGSFNGuidedEdgePreserve(trimapped, feathered, foreground,
+                                                   srcBounds, &guidedEdgeApplied);
+
+    // ── 4. CIBlendWithMask ────────────────────────────────────────────────
+    //   inputImage           = foreground (camera)
+    //   inputBackgroundImage = solid colour
+    //   inputMaskImage       = refined matte (255/white = subject → foreground)
+    CIFilter *blend = [CIFilter filterWithName:@"CIBlendWithMask"];
+    if (!blend) {
+        return [self _failOpenWithInput:input reason:@"blend_filter_unavailable"];
+    }
+    [blend setValue:foreground forKey:kCIInputImageKey];
+    [blend setValue:background forKey:kCIInputBackgroundImageKey];
+    [blend setValue:refined    forKey:kCIInputMaskImageKey];
+    CIImage *keyed = blend.outputImage;
+    if (!keyed) {
+        return [self _failOpenWithInput:input reason:@"blend_nil_output"];
+    }
+    keyed = [keyed imageByCroppingToRect:srcBounds];
+
+    // ── 5. Output buffer from the session pool ────────────────────────────
+    CVPixelBufferRef output = NULL;
+    CVReturn rv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &output);
+    if (rv != kCVReturnSuccess || !output) {
+        return [self _failOpenWithInput:input
+                                 reason:[NSString stringWithFormat:@"pool_alloc_failed(%d)", (int)rv]];
+    }
+    if (CVPixelBufferGetWidth(output) != srcW || CVPixelBufferGetHeight(output) != srcH) {
+        BOOL expected = NO;
+        if (atomic_compare_exchange_strong(&_loggedPoolMismatch, &expected, YES)) {
+            NSLog(@"[VGGreenScreenFilterNode] pool buffer %zux%zu does not match frame %zux%zu "
+                   "— fail open (logged once)",
+                  CVPixelBufferGetWidth(output), CVPixelBufferGetHeight(output), srcW, srcH);
+        }
+        CVPixelBufferRelease(output);
+        return [self _failOpenWithInput:input reason:@"pool_dimension_mismatch"];
+    }
+
+    // ── 6. Render (NULL colour space: raw bytes, no colour matching) ──────
+    [_VGGSFNSharedCIContext(_device) render:keyed
+                            toCVPixelBuffer:output
+                                     bounds:srcBounds
+                                 colorSpace:NULL];
+    const CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
+    const double visionMs      = (t1 - t0) * 1000.0;
+    const double blendRenderMs = (t2 - t1) * 1000.0;
+    const double totalMs       = (t2 - t0) * 1000.0;
+    const BOOL allS1StagesApplied =
+        morphologyCloseApplied && featherApplied && trimapApplied && guidedEdgeApplied;
+
+    // ── 7. Telemetry (keyed frames only; scalar stores under a tiny lock) ─
+    //   Reached only after a successful render, so fail-open frames never
+    //   count as processed and never enter the latency averages.
+    os_unfair_lock_lock(&_telemetryLock);
+    _tmProcessedFrameCount += 1;
+    if (allS1StagesApplied) _tmAllS1StagesAppliedFrameCount += 1;
+    _tmLastSourceWidth  = srcW;
+    _tmLastSourceHeight = srcH;
+    _tmLastMatteWidth   = matteW;
+    _tmLastMatteHeight  = matteH;
+    _tmLastMorphologyCloseApplied = morphologyCloseApplied;
+    _tmLastFeatherApplied         = featherApplied;
+    _tmLastTrimapApplied          = trimapApplied;
+    _tmLastGuidedEdgeApplied      = guidedEdgeApplied;
+    _tmLastVisionMs = visionMs;
+    _tmSumVisionMs += visionMs;
+    if (visionMs > _tmMaxVisionMs) _tmMaxVisionMs = visionMs;
+    _tmLastBlendRenderMs = blendRenderMs;
+    _tmSumBlendRenderMs += blendRenderMs;
+    if (blendRenderMs > _tmMaxBlendRenderMs) _tmMaxBlendRenderMs = blendRenderMs;
+    _tmLastTotalMs = totalMs;
+    _tmSumTotalMs += totalMs;
+    if (totalMs > _tmMaxTotalMs) _tmMaxTotalMs = totalMs;
+    os_unfair_lock_unlock(&_telemetryLock);
+
+    if (shouldLog) {
+        NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_FRAME frame=%llu "
+               "src=%zux%zu matte=%zux%zu matteSource=visionPersonFast edgeRefinement=S1 "
+               "morphologyCloseApplied=%d featherApplied=%d trimapApplied=%d "
+               "guidedEdgeApplied=%d visionMs=%.1f blendRenderMs=%.1f totalMs=%.1f "
+               "pts=%.3f failOpenCount=%llu",
+              (unsigned long long)frameIndex, srcW, srcH, matteW, matteH,
+              (int)morphologyCloseApplied, (int)featherApplied, (int)trimapApplied,
+              (int)guidedEdgeApplied,
+              visionMs, blendRenderMs, totalMs,
+              CMTimeGetSeconds(time),
+              (unsigned long long)atomic_load(&_failOpenCounter));
+    }
+    (void)observation;   // lifetime: must outlive the render above
+    return output;
+}
+
+// ─── VGMetalFilterNode: processEnvelope:device: ──────────────────────────────
+//
+// Contract (DEC-44): VGFrameEnvelope is a struct — taken and returned BY VALUE.
+// Do NOT release envelope.payload.videoBuffer — the runtime owns it.
+
+- (VGFrameEnvelope)processEnvelope:(VGFrameEnvelope)envelope
+                             device:(id<MTLDevice>)device {
+    if (!_enabled || atomic_load(&_invalidated)) {
+        return envelope; // passthrough — no buffer ops
+    }
+
+    CVPixelBufferRef input = (CVPixelBufferRef)envelope.payload.videoBuffer;
+    if (!input) return envelope;
+
+    CVPixelBufferRef output = [self processBuffer:input
+                                           atTime:envelope.pts
+                                           device:device];
+
+    if (output == input) {
+        CVPixelBufferRelease(output); // release the extra +1 from the passthrough path
+        return envelope;
+    }
+
+    if (!output) {
+        VGFrameEnvelope failed = envelope;
+        failed.payload.videoBuffer = NULL;
+        return failed;
+    }
+
+    VGFrameEnvelope out = envelope;
+    out.payload.videoBuffer = output;
+    return out;
+}
+
+// ─── Diagnostics: read-only telemetry snapshot ────────────────────────────────
+//
+// Copies every guarded field out under _telemetryLock (scalar loads plus one
+// retain of the reason string — no allocation while locked), then builds the
+// dictionary outside the lock. Configuration fields are immutable after init
+// and the frame / fail-open counters are atomics, so they need no lock.
+// Callable from any thread; changes nothing.
+
+- (NSDictionary<NSString *, id> *)diagnosticsSnapshot {
+    os_unfair_lock_lock(&_telemetryLock);
+    const uint64_t processed      = _tmProcessedFrameCount;
+    const uint64_t allS1Frames    = _tmAllS1StagesAppliedFrameCount;
+    const size_t   sourceWidth    = _tmLastSourceWidth;
+    const size_t   sourceHeight   = _tmLastSourceHeight;
+    const size_t   matteWidth     = _tmLastMatteWidth;
+    const size_t   matteHeight    = _tmLastMatteHeight;
+    const BOOL     closeApplied   = _tmLastMorphologyCloseApplied;
+    const BOOL     featherApplied = _tmLastFeatherApplied;
+    const BOOL     trimapApplied  = _tmLastTrimapApplied;
+    const BOOL     guidedApplied  = _tmLastGuidedEdgeApplied;
+    const double   lastVision     = _tmLastVisionMs;
+    const double   sumVision      = _tmSumVisionMs;
+    const double   maxVision      = _tmMaxVisionMs;
+    const double   lastBlend      = _tmLastBlendRenderMs;
+    const double   sumBlend       = _tmSumBlendRenderMs;
+    const double   maxBlend       = _tmMaxBlendRenderMs;
+    const double   lastTotal      = _tmLastTotalMs;
+    const double   sumTotal       = _tmSumTotalMs;
+    const double   maxTotal       = _tmMaxTotalMs;
+    NSString *lastFailOpenReason  = _tmLastFailOpenReason;
+    os_unfair_lock_unlock(&_telemetryLock);
+
+    const BOOL allS1Last = closeApplied && featherApplied && trimapApplied && guidedApplied;
+    const double meanVision = processed > 0 ? sumVision / (double)processed : 0.0;
+    const double meanBlend  = processed > 0 ? sumBlend  / (double)processed : 0.0;
+    const double meanTotal  = processed > 0 ? sumTotal  / (double)processed : 0.0;
+
+    return @{
+        @"nodeId":                       _nodeId,
+        @"filterName":                   _filterName,
+        @"enabled":                      _enabled ? @YES : @NO,
+        @"matteSource":                  (_matteSource == VGGreenScreenFilterNodeMatteSourceVisionPersonFast)
+                                             ? @"visionPersonFast" : @"unavailable",
+        @"proofLevel":                   @"S1",
+        @"edgeRefinement":               @"S1",
+        @"backgroundARGB":               @(_backgroundARGB),
+        @"frameCount":                   @(atomic_load(&_frameCounter)),
+        @"processedFrameCount":          @(processed),
+        @"failOpenCount":                @(atomic_load(&_failOpenCounter)),
+        @"lastFailOpenReason":           lastFailOpenReason ?: @"none",
+        @"sourceWidth":                  @(sourceWidth),
+        @"sourceHeight":                 @(sourceHeight),
+        @"matteWidth":                   @(matteWidth),
+        @"matteHeight":                  @(matteHeight),
+        @"morphologyCloseApplied":       closeApplied   ? @YES : @NO,
+        @"featherApplied":               featherApplied ? @YES : @NO,
+        @"trimapApplied":                trimapApplied  ? @YES : @NO,
+        @"guidedEdgeApplied":            guidedApplied  ? @YES : @NO,
+        @"allS1StagesApplied":           allS1Last      ? @YES : @NO,
+        @"allS1StagesAppliedFrameCount": @(allS1Frames),
+        @"lastVisionMs":                 @(lastVision),
+        @"meanVisionMs":                 @(meanVision),
+        @"maxVisionMs":                  @(maxVision),
+        @"lastBlendRenderMs":            @(lastBlend),
+        @"meanBlendRenderMs":            @(meanBlend),
+        @"maxBlendRenderMs":             @(maxBlend),
+        @"lastTotalMs":                  @(lastTotal),
+        @"meanTotalMs":                  @(meanTotal),
+        @"maxTotalMs":                   @(maxTotal),
+    };
+}
+
+@end
+
 // 3G-C: VGCameraGraphSession adopts VGFrameDelegate so it can act as the
 // renderer.frameDelegate instead of _scheduler. This gives the session full
 // control over the async handoff boundary.
@@ -268,6 +987,21 @@ _VGStillCreatePool(size_t width, size_t height) {
     // Cleared on invalidate and when filter chain is cleared.
     // All reads and writes are serialized on _sessionQueue.
     NSArray<NSDictionary *> *_activeFilterSpecs;
+
+    // ── UFM filter-chain timing (read-only diagnostics) ──────────────────────
+    // _fc* fields are owned by _graphExecutionQueue: written by the async frame
+    // block and the reset block from _applyFilterChainInternal:, read via
+    // dispatch_sync in -filterChainDiagnosticsSnapshot. _fcTimingActive is YES
+    // only while a non-empty chain is committed.
+    BOOL     _fcTimingActive;
+    uint64_t _fcGraphFrameCount;
+    double   _fcLastGraphTotalMs;
+    double   _fcSumGraphTotalMs;
+    double   _fcMaxGraphTotalMs;
+    uint64_t _fcDroppedBusyBase;   // _graphDroppedBusyCounter sampled at the last reset
+    // Delta-since-commit count of frames dropped by the _graphInFlight guard
+    // (incremented on the capture queue in didReceiveRawFrame:).
+    _Atomic(uint64_t) _graphDroppedBusyCounter;
 }
 
 // [Beauty-Still]: hasActiveFilters and activeFilterSpecs are backed by _activeFilterSpecs ivar.
@@ -316,6 +1050,7 @@ _VGStillCreatePool(size_t width, size_t height) {
     _renderer = renderer;
     atomic_init(&_invalidated, NO);
     atomic_init(&_graphInFlight, NO);
+    atomic_init(&_graphDroppedBusyCounter, 0);
     _sessionQueue = dispatch_queue_create("com.vanguard.cameraGraphSession",
                                           DISPATCH_QUEUE_SERIAL);
     // 3G-C: serial execution queue for graph traversal.
@@ -416,6 +1151,26 @@ _VGStillCreatePool(size_t width, size_t height) {
 // setCameraFilterChainFromSpecs: can detect rebuild success without breaking
 // the public API.
 //
+// ─── UFM filter-chain timing: reset on commit ────────────────────────────────
+// Enqueued async on _graphExecutionQueue after a successful scheduler swap.
+// The queue is serial, so frame blocks enqueued before the swap drain first,
+// keeping the aggregates scoped to the committed chain. Async because the
+// caller holds _sessionQueue, which must never block on the graph queue (see
+// -invalidate).
+- (void)_enqueueFilterChainTimingResetActive:(BOOL)active {
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(_graphExecutionQueue, ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf->_fcTimingActive     = active;
+        strongSelf->_fcGraphFrameCount  = 0;
+        strongSelf->_fcLastGraphTotalMs = 0.0;
+        strongSelf->_fcSumGraphTotalMs  = 0.0;
+        strongSelf->_fcMaxGraphTotalMs  = 0.0;
+        strongSelf->_fcDroppedBusyBase  = atomic_load(&strongSelf->_graphDroppedBusyCounter);
+    });
+}
+
 // MUST be called while already on _sessionQueue (via dispatch_sync).
 // Returns YES on successful scheduler swap, NO on any failure.
 - (BOOL)_applyFilterChainInternal:(nullable NSArray *)filterChain {
@@ -491,6 +1246,10 @@ _VGStillCreatePool(size_t width, size_t height) {
     // [Fix-4]: Assign _currentFilterChain only after the swap succeeds so POC2
     // graph rebuilds always reflect a live committed graph state.
     self->_currentFilterChain = [filterChain copy];
+
+    // Reset filter-chain timing aggregates for the newly committed chain;
+    // active only when non-empty (a clear disables timing).
+    [self _enqueueFilterChainTimingResetActive:(filterChain.count > 0)];
 
     NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal hot-swap complete (filterCount=%lu execOrder=%lu)",
           (unsigned long)(filterChain.count ?: 0),
@@ -619,14 +1378,84 @@ _VGStillCreatePool(size_t width, size_t height) {
 //
 // Three-pass atomic validation:
 //   Pass 1 — resource contract: pool and Metal device must exist.
-//   Pass 2 — known-type check: every spec type must be in {beauty, lut, segmentation}.
-//   Pass 3 — constructable check: type must be camera-constructable in this phase.
+//   Pass 2 — known-type check: every spec type must be in
+//            {beauty, lut, segmentation, greenScreen}.
+//   Pass 3 — constructable check: type must be camera-constructable in this
+//            phase, and greenScreen parameters must satisfy their contract.
 // Only after all three passes succeed are nodes constructed and the graph mutated.
 //
-// Known-but-unsupported types (lut, segmentation, beautyVersion:2) return
-// UNSUPPORTED_FILTER_TYPE without mutating the graph.
+// Known-but-unsupported types (lut, segmentation) return UNSUPPORTED_FILTER_TYPE
+// without mutating the graph. "segmentation" (the old mask-store composite) is
+// a separate, still-deferred type from "greenScreen" and is NOT repurposed.
+// greenScreen with a malformed parameter set returns
+// INVALID_GREEN_SCREEN_FILTER_SPEC; a well-formed but unsupported
+// backgroundType returns UNSUPPORTED_FILTER_TYPE. Neither mutates the graph.
 // Unknown types return UNKNOWN_FILTER.
 // Missing pool/device returns UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT.
+
+// ─── greenScreen spec validation ─────────────────────────────────────────────
+//
+// Parameter contract (Dart: VGFilterSpecs.greenScreenSolidColor):
+//   parameters.backgroundType  NSString — must be "solidColor" (only value in this slice)
+//   parameters.argb            NSNumber — integral, 0 … 0xFFFFFFFF (0xAARRGGBB; alpha ignored)
+//
+// Error mapping (no graph mutation in any case):
+//   INVALID_GREEN_SCREEN_FILTER_SPEC (code 4)  parameters missing / not a dictionary,
+//                                              backgroundType missing / not a string,
+//                                              argb missing / not a number / out of
+//                                              range / non-integral
+//   UNSUPPORTED_FILTER_TYPE          (code 3)  backgroundType is a string other than
+//                                              "solidColor" (image/video backgrounds
+//                                              are known but deferred)
+static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
+                                                 uint32_t * _Nullable outARGB,
+                                                 NSError * _Nullable * _Nullable outError) {
+    NSError *(^invalid)(NSString *) = ^NSError *(NSString *message) {
+        return [NSError errorWithDomain:@"INVALID_GREEN_SCREEN_FILTER_SPEC"
+                                   code:4
+                               userInfo:@{NSLocalizedDescriptionKey: message}];
+    };
+    if (![params isKindOfClass:[NSDictionary class]]) {
+        if (outError) *outError = invalid(@"greenScreen spec requires a 'parameters' dictionary "
+                                           "with backgroundType and argb.");
+        return NO;
+    }
+    NSDictionary *dict = (NSDictionary *)params;
+    id backgroundType = dict[@"backgroundType"];
+    if (![backgroundType isKindOfClass:[NSString class]]) {
+        if (outError) *outError = invalid(@"greenScreen spec requires parameters.backgroundType (string).");
+        return NO;
+    }
+    if (![backgroundType isEqualToString:VGGreenScreenFilterNodeBackgroundTypeSolidColor]) {
+        if (outError) {
+            *outError = [NSError
+                errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
+                           code:3
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"greenScreen backgroundType '%@' is not supported "
+                                                "for the camera graph; only 'solidColor' is "
+                                                "supported in this slice.", backgroundType]
+            }];
+        }
+        return NO;
+    }
+    id argb = dict[@"argb"];
+    if (![argb isKindOfClass:[NSNumber class]]) {
+        if (outError) *outError = invalid(@"greenScreen spec requires parameters.argb "
+                                           "(integer 0xAARRGGBB).");
+        return NO;
+    }
+    const double argbValue = [(NSNumber *)argb doubleValue];
+    // The negated range test also rejects NaN.
+    if (!(argbValue >= 0.0 && argbValue <= 4294967295.0) || argbValue != floor(argbValue)) {
+        if (outError) *outError = invalid([NSString stringWithFormat:
+            @"greenScreen parameters.argb must be an integer in 0...0xFFFFFFFF (got %@).", argb]);
+        return NO;
+    }
+    if (outARGB) *outARGB = (uint32_t)[(NSNumber *)argb unsignedLongLongValue];
+    return YES;
+}
 
 - (BOOL)setCameraFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
                                 error:(NSError * _Nullable * _Nullable)outError
@@ -669,7 +1498,8 @@ _VGStillCreatePool(size_t width, size_t height) {
     static NSSet<NSString *> *knownTypes;
     static dispatch_once_t knownTypesToken;
     dispatch_once(&knownTypesToken, ^{
-        knownTypes = [NSSet setWithObjects:@"beauty", @"lut", @"segmentation", nil];
+        knownTypes = [NSSet setWithObjects:@"beauty", @"lut", @"segmentation",
+                                           @"greenScreen", nil];
     });
 
     for (NSDictionary *spec in specs) {
@@ -693,9 +1523,10 @@ _VGStillCreatePool(size_t width, size_t height) {
 
     // ── Pass 3: constructable check ───────────────────────────────────────────
     //
-    // Phase 6A-3D-2: only beauty V1 is constructable.
+    // Constructable: beauty (V1, V2, V2 face-aware) and greenScreen (solid
+    // background only; parameters validated here so a bad spec is rejected
+    // before any node exists).
     // lut and segmentation are known but deferred.
-    // beauty with beautyVersion:2 is known but deferred.
     for (NSDictionary *spec in specs) {
         NSString *type = spec[@"type"];
         NSDictionary *params = spec[@"parameters"];
@@ -726,6 +1557,16 @@ _VGStillCreatePool(size_t width, size_t height) {
             }
             NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: segmentation deferred");
             return NO;
+        }
+
+        if ([type isEqualToString:@"greenScreen"]) {
+            NSError *specError = nil;
+            if (!_VGValidateGreenScreenSpecParameters(params, NULL, &specError)) {
+                if (outError) *outError = specError;
+                NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: greenScreen "
+                       "rejected (%@): %@", specError.domain, specError.localizedDescription);
+                return NO;
+            }
         }
 
         if ([type isEqualToString:@"beauty"]) {
@@ -802,6 +1643,30 @@ _VGStillCreatePool(size_t width, size_t height) {
                 beauty.enabled = enabled;
                 [nodes addObject:(id<VGMetalFilterNode>)beauty];
             }
+        } else if ([type isEqualToString:@"greenScreen"]) {
+            // ── Green screen (solid background MVP) ───────────────────────────
+            // Parameters passed pass-3 validation; re-parse only to extract argb.
+            // The node borrows _sessionPool (retains it +1) and the shared Metal
+            // device, exactly like the beauty nodes. It owns no camera state.
+            uint32_t backgroundARGB = 0;
+            NSError *specError = nil;
+            if (!_VGValidateGreenScreenSpecParameters(params, &backgroundARGB, &specError)) {
+                // Unreachable after pass 3 (same input). Kept so construction can
+                // never proceed on an unvalidated value; still before any mutation.
+                if (outError) *outError = specError;
+                NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: greenScreen "
+                       "failed re-validation at construction — aborting without mutation");
+                return NO;
+            }
+            VGGreenScreenFilterNode *greenScreen =
+                [[VGGreenScreenFilterNode alloc] initWithPool:_sessionPool
+                                                       device:metalDevice
+                                               backgroundARGB:backgroundARGB];
+            greenScreen.enabled = enabled;
+            [nodes addObject:(id<VGMetalFilterNode>)greenScreen];
+            NSLog(@"[VGCameraGraphSession] VGGreenScreenFilterNode constructed "
+                   "(backgroundType=solidColor argb=0x%08X enabled=%d matteSource=%ld)",
+                  backgroundARGB, (int)enabled, (long)greenScreen.matteSource);
         }
         // Additional constructable types will be added in future phases.
     }
@@ -1149,6 +2014,101 @@ _VGStillCreatePool(size_t width, size_t height) {
     return success;
 }
 
+// ─── UFM green screen: read-only native diagnostics ──────────────────────────
+//
+// Lookup source is _currentFilterChain only — the concrete node instances
+// committed by the last successful _applyFilterChainInternal:. An empty
+// setCameraFilterChainFromSpecs: commits a nil chain, so after a clear there
+// is nothing to find and the result is nil; no node reference is cached here.
+// Serialized on _sessionQueue so it cannot race a rebuild, clear or teardown.
+// MUST NOT be called from _sessionQueue (dispatch_sync would deadlock).
+
+- (nullable NSDictionary<NSString *, id> *)greenScreenDiagnosticsSnapshot {
+    __block NSDictionary<NSString *, id> *snapshot = nil;
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            return;
+        }
+        for (id node in self->_currentFilterChain) {
+            if ([node isKindOfClass:[VGGreenScreenFilterNode class]]) {
+                snapshot = [(VGGreenScreenFilterNode *)node diagnosticsSnapshot];
+                return;
+            }
+        }
+    });
+    return snapshot;
+}
+
+// ─── UFM camera graph: read-only cumulative filter-chain timing ──────────────
+// Two sequential, never-nested reads: _sessionQueue for the committed spec
+// types, then _graphExecutionQueue for the _fc* aggregates (nesting would
+// risk the _sessionQueue-must-never-block-on-graph-queue deadlock documented
+// on -invalidate). A clear landing between the two reads is harmless — the
+// graph read then sees _fcTimingActive == NO and returns nil.
+// MUST NOT be called from _sessionQueue or _graphExecutionQueue (deadlock).
+
+- (nullable NSDictionary<NSString *, id> *)filterChainDiagnosticsSnapshot {
+    __block NSArray<NSString *> *activeTypes = nil;
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            return;
+        }
+        NSArray<NSDictionary *> *specs = self->_activeFilterSpecs;
+        if (specs.count == 0) {
+            return;
+        }
+        NSMutableArray<NSString *> *types = [NSMutableArray arrayWithCapacity:specs.count];
+        for (NSDictionary *spec in specs) {
+            id type = spec[@"type"];
+            [types addObject:[type isKindOfClass:[NSString class]] ? (NSString *)type : @"(unknown)"];
+        }
+        activeTypes = [types copy];
+    });
+    if (activeTypes.count == 0) {
+        return nil;
+    }
+
+    __block BOOL     active     = NO;
+    __block uint64_t frameCount = 0;
+    __block uint64_t dropped    = 0;
+    __block double   lastMs     = 0.0;
+    __block double   sumMs      = 0.0;
+    __block double   maxMs      = 0.0;
+    dispatch_sync(_graphExecutionQueue, ^{
+        active     = self->_fcTimingActive;
+        frameCount = self->_fcGraphFrameCount;
+        lastMs     = self->_fcLastGraphTotalMs;
+        sumMs      = self->_fcSumGraphTotalMs;
+        maxMs      = self->_fcMaxGraphTotalMs;
+        const uint64_t droppedNow = atomic_load(&self->_graphDroppedBusyCounter);
+        dropped = (droppedNow >= self->_fcDroppedBusyBase)
+                      ? (droppedNow - self->_fcDroppedBusyBase) : 0;
+    });
+    if (!active) {
+        return nil;
+    }
+
+    const double meanMs = frameCount > 0 ? sumMs / (double)frameCount : 0.0;
+    return @{
+        @"proofLevel":        @"filterChainTimingV1",
+        @"activeFilterCount": @(activeTypes.count),
+        @"activeFilterTypes": activeTypes,
+        @"graphFrameCount":   @(frameCount),
+        @"droppedBusyCount":  @(dropped),
+        @"lastGraphTotalMs":  @(lastMs),
+        @"meanGraphTotalMs":  @(meanMs),
+        @"maxGraphTotalMs":   @(maxMs),
+        @"timingBoundary":    @"VGCameraGraphSession graphExecutionQueue around scheduler.didReceiveRawFrame "
+                               "(scheduler traversal + active filter nodes + synchronous sink presentEnvelope; "
+                               "accepted frames only)",
+        @"nonClaims":         @[
+            @"does not provide per-node Beauty V2 cost",
+            @"does not include frames dropped by the in-flight backpressure guard",
+            @"does not include capture, rotation, or post-return display latency",
+        ],
+    };
+}
+
 - (void)invalidate {
     dispatch_sync(_sessionQueue, ^{
         if (atomic_exchange(&self->_invalidated, YES)) {
@@ -1335,6 +2295,8 @@ _VGStillCreatePool(size_t width, size_t height) {
     BOOL expected = NO;
     if (!atomic_compare_exchange_strong(&_graphInFlight, &expected, YES)) {
         // Frame dropped — graph execution is busy.
+        // Counts toward filterChainDiagnosticsSnapshot's droppedBusyCount delta.
+        atomic_fetch_add(&_graphDroppedBusyCounter, 1);
         return;
     }
 
@@ -1362,7 +2324,23 @@ _VGStillCreatePool(size_t width, size_t height) {
         // ── Execute graph if session is still live ─────────────────────────
         // scheduler may be nil if invalidate was called between enqueue and here.
         if (strongSelf && !atomic_load(&strongSelf->_invalidated) && scheduler) {
+            // Brackets the synchronous scheduler call: covers scheduler +
+            // every active filter + the synchronous sink present for this
+            // frame. Tracked only while a chain is committed. Plain stores are
+            // safe — _fc* state is owned by this serial queue.
+            const BOOL timeFrame = strongSelf->_fcTimingActive;
+            const uint64_t t0 = timeFrame ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
             [scheduler didReceiveRawFrame:asyncEnvelope];
+            if (timeFrame) {
+                const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                const double graphTotalMs = (double)(t1 - t0) / 1.0e6;
+                strongSelf->_fcGraphFrameCount  += 1;
+                strongSelf->_fcLastGraphTotalMs  = graphTotalMs;
+                strongSelf->_fcSumGraphTotalMs  += graphTotalMs;
+                if (graphTotalMs > strongSelf->_fcMaxGraphTotalMs) {
+                    strongSelf->_fcMaxGraphTotalMs = graphTotalMs;
+                }
+            }
         }
 
         // ── Release our +1 retain ─────────────────────────────────────────

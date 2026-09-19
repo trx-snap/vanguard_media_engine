@@ -5180,6 +5180,32 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             ))
             #endif
 
+        case "getCameraFilterChainDiagnostics":
+            // Read-only cumulative filter-chain timing; see
+            // VGCameraGraphSession.h -filterChainDiagnosticsSnapshot for the
+            // key contract and threading. Returns nil when no chain is active.
+            #if VG_USE_CAMERA_GRAPH
+            guard let session = cameraGraphSession else {
+                result(FlutterError(
+                    code: "NO_CAMERA_GRAPH",
+                    message: "Camera graph session is not running.",
+                    details: nil
+                ))
+                return
+            }
+            if let snapshot = session.filterChainDiagnosticsSnapshot() {
+                result(snapshot)
+            } else {
+                result(nil)
+            }
+            #else
+            result(FlutterError(
+                code: "GRAPH_MODE_DISABLED",
+                message: "Camera graph mode is disabled. Build with VG_USE_CAMERA_GRAPH=1.",
+                details: nil
+            ))
+            #endif
+
         case "applyGraphTransaction":
             // Phase 6C.2A/6C.2B: Apply a validated VGGraphTransactionPayload to
             // the active camera graph.

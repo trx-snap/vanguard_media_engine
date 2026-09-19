@@ -87,15 +87,34 @@ NS_ASSUME_NONNULL_BEGIN
 /// If any spec fails validation the method returns NO and does NOT mutate the graph.
 ///
 /// Supported:
-///   - "beauty" (V1 only — no beautyVersion key, or beautyVersion:1).
+///   - "beauty" (V1: no beautyVersion key or beautyVersion:1; V2: beautyVersion:2,
+///     optionally faceAwareEnabled — see the implementation for the V2 path).
+///   - "greenScreen" — live solid-background green screen as a camera graph
+///     filter (VGGreenScreenFilterNode). iOS-first MVP: solid background only.
+///     Required parameters:
+///       "backgroundType" (NSString) — must be "solidColor"
+///       "argb"           (NSNumber) — integer 0xAARRGGBB, 0 … 0xFFFFFFFF
+///                                     (alpha byte ignored; background is opaque)
+///     Optional: "enabled" (NSNumber/BOOL, default YES).
+///     Malformed parameters (missing dictionary, missing/non-string
+///     backgroundType, missing/non-number/out-of-range argb) return
+///     INVALID_GREEN_SCREEN_FILTER_SPEC. A well-formed backgroundType other
+///     than "solidColor" returns UNSUPPORTED_FILTER_TYPE. Neither mutates the graph.
+///     The node is a plain transform node: it owns no camera, ARSession or
+///     texture registration, applies no rotation/mirroring, and fails open to
+///     the input frame on any per-frame failure. Matte quality is MVP-level
+///     (Vision FAST person matte with S1 edge refinement; no temporal
+///     smoothing) — see VGGreenScreenFilterNode.h. Read-only telemetry for
+///     the active node is available via -greenScreenDiagnosticsSnapshot.
 ///
 /// Known but unsupported (returns UNSUPPORTED_FILTER_TYPE):
-///   - "beauty" with beautyVersion:2
 ///   - "lut"
-///   - "segmentation"
+///   - "segmentation" — the old mask-store composite type. It remains deferred
+///     and is deliberately NOT repurposed for green screen; "greenScreen" is a
+///     separate type.
 ///
 /// Unknown (returns UNKNOWN_FILTER):
-///   - Any type string not in {beauty, lut, segmentation}.
+///   - Any type string not in {beauty, lut, segmentation, greenScreen}.
 ///
 /// Resource unavailable (returns UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT):
 ///   - _sessionPool is NULL or metalDevice is nil at call time.
@@ -103,12 +122,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// Empty specs array clears the filter chain (passthrough). Returns YES.
 ///
 /// Validation is atomic: the graph is mutated only when every spec passes.
+/// Recording sink, photo sink and platform-view fan-out behaviour across the
+/// resulting graph swap is unchanged (see setCameraFilterChain:).
 ///
 /// @param specs    Array of filter spec dictionaries. Each must contain "type" (NSString).
 ///                 Optional keys: "parameters" (NSDictionary), "enabled" (NSNumber/BOOL).
 /// @param outError On failure, set to an NSError whose domain is the error code string:
 ///                   "UNKNOWN_FILTER"
 ///                   "UNSUPPORTED_FILTER_TYPE"
+///                   "INVALID_GREEN_SCREEN_FILTER_SPEC"
 ///                   "UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT"
 /// @return YES on success (filter chain applied or cleared), NO on any validation failure.
 - (BOOL)setCameraFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
@@ -194,6 +216,61 @@ NS_ASSUME_NONNULL_BEGIN
 ///         any validation or session failure.
 - (BOOL)applyHotParameterUpdates:(NSDictionary<NSString *, NSDictionary<NSString *, id> *> *)updates
                             error:(NSError * _Nullable * _Nullable)outError;
+
+// ─── UFM green screen: read-only native diagnostics ──────────────────────────
+
+/// Returns the telemetry snapshot of the VGGreenScreenFilterNode currently
+/// installed in the live (committed) filter chain — see
+/// VGGreenScreenFilterNode.h -diagnosticsSnapshot for the key set — or nil
+/// when the session is invalidated or no greenScreen filter is active (never
+/// installed, or cleared by an empty setCameraFilterChainFromSpecs:).
+///
+/// Read-only: does not touch the camera source, the graph, the scheduler, the
+/// pool, or any node state. It only scans the committed filter chain for the
+/// active greenScreen node and asks that node for its telemetry. No node
+/// reference is retained here, so after a filter clear the lookup source is
+/// empty and the result is nil (no stale telemetry survives a clear).
+///
+/// Threading:
+///   - Safe to call from the main/plugin thread.
+///   - Serialized via dispatch_sync on _sessionQueue, so it is mutually
+///     exclusive with graph rebuild, filter clear, and teardown.
+///   - MUST NOT be called from _sessionQueue — doing so will deadlock.
+- (nullable NSDictionary<NSString *, id> *)greenScreenDiagnosticsSnapshot;
+
+// ─── UFM camera graph: read-only cumulative filter-chain timing ──────────────
+
+/// Returns a read-only snapshot of the cumulative graph/filter-chain execution
+/// timing for the currently committed, non-empty filter chain, or nil when
+/// the session is invalidated or no non-empty chain is committed.
+///
+/// Timing boundary: measured on the graph execution queue immediately around
+/// the synchronous [scheduler didReceiveRawFrame:] call for every accepted
+/// (non-dropped) frame — scheduler traversal + every active filter node +
+/// the synchronous sink presentEnvelope: cost. Graph/filter-chain timing,
+/// NOT per-node (e.g. Beauty V2-only) timing.
+///
+/// Keys:
+///   proofLevel          NSString  "filterChainTimingV1"
+///   activeFilterCount   NSNumber  committed spec count
+///   activeFilterTypes   NSArray<NSString *> committed spec "type" strings, in order
+///   graphFrameCount     NSNumber  accepted frames timed for the current chain
+///   droppedBusyCount    NSNumber  frames dropped by the in-flight backpressure
+///                                 guard since the current chain was committed
+///   lastGraphTotalMs    NSNumber  (double, ms)
+///   meanGraphTotalMs    NSNumber  (double, ms; 0.0 when graphFrameCount is 0)
+///   maxGraphTotalMs     NSNumber  (double, ms)
+///   timingBoundary      NSString  describes the measurement boundary
+///   nonClaims           NSArray<NSString *>
+///
+/// Statistics reset on every successful filter-chain commit (non-empty or
+/// clear).
+///
+/// Threading: safe to call from the main/plugin thread. Reads the committed
+/// spec types via dispatch_sync on _sessionQueue, then the timing aggregates
+/// via dispatch_sync on _graphExecutionQueue — sequential, never nested.
+/// MUST NOT be called from _sessionQueue or _graphExecutionQueue (deadlock).
+- (nullable NSDictionary<NSString *, id> *)filterChainDiagnosticsSnapshot;
 
 // ─── POC2: Platform View graph delivery ──────────────────────────────────────
 
