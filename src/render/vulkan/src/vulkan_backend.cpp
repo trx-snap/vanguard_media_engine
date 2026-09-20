@@ -242,9 +242,44 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
 }
 
 RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(
-    HardwareBufferHandle /*backgroundHandle*/,
-    HardwareBufferHandle /*foregroundHandle*/,
-    VulkanOverlayTextureHandle /*maskHandle*/) {
+    HardwareBufferHandle /*sourceHandle*/,
+    HardwareBufferHandle /*cameraHandle*/,
+    const RenderDestinationRect& /*sourceRect*/,
+    const RenderDestinationRect& /*cameraRect*/,
+    uint32_t /*sourceBufferWidth*/,
+    uint32_t /*sourceBufferHeight*/,
+    uint32_t /*cameraBufferWidth*/,
+    uint32_t /*cameraBufferHeight*/,
+    VulkanOverlayTextureHandle /*cpuMaskHandle*/,
+    HardwareBufferHandle /*gpuMaskHandle*/,
+    uint32_t /*gpuMaskWidth*/,
+    uint32_t /*gpuMaskHeight*/,
+    uint32_t /*sourceRotationDegrees*/,
+    bool /*sourceMirrorHorizontal*/,
+    uint32_t /*cameraRotationDegrees*/,
+    bool /*cameraMirrorHorizontal*/,
+    int32_t /*debugMode*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
+// ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND:
+// renderDuetGreenScreenStaticBackgroundFrame stub - host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderDuetGreenScreenStaticBackgroundFrame(
+    HardwareBufferHandle /*cameraHandle*/,
+    const RenderDestinationRect& /*cameraRect*/,
+    uint32_t /*cameraBufferWidth*/,
+    uint32_t /*cameraBufferHeight*/,
+    VulkanOverlayTextureHandle /*cpuMaskHandle*/,
+    HardwareBufferHandle /*gpuMaskHandle*/,
+    uint32_t /*gpuMaskWidth*/,
+    uint32_t /*gpuMaskHeight*/,
+    uint32_t /*cameraRotationDegrees*/,
+    bool /*cameraMirrorHorizontal*/,
+    int32_t /*debugMode*/,
+    DuetGreenScreenStaticBackgroundMode /*backgroundMode*/) {
     return RenderFrameResult::kUnavailable;
 }
 
@@ -260,7 +295,12 @@ RenderFrameResult VulkanBackend::renderDuetLayoutFrame(
     uint32_t /*sourceBufferWidth*/,
     uint32_t /*sourceBufferHeight*/,
     uint32_t /*cameraBufferWidth*/,
-    uint32_t /*cameraBufferHeight*/) {
+    uint32_t /*cameraBufferHeight*/,
+    uint32_t /*sourceRotationDegrees*/,
+    bool /*sourceMirrorHorizontal*/,
+    uint32_t /*cameraRotationDegrees*/,
+    bool /*cameraMirrorHorizontal*/,
+    float /*cameraCornerRadiusPx*/) {
     return RenderFrameResult::kUnavailable;
 }
 
@@ -1307,9 +1347,29 @@ void VulkanBackend::clearOverlayTextures() {
     impl_->overlayTextureStore->clear();
 }
 
-RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle backgroundHandle,
-                                                            HardwareBufferHandle foregroundHandle,
-                                                            VulkanOverlayTextureHandle maskHandle) {
+// ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: validates the same backend /
+// surface / import preconditions as renderDuetLayoutFrame below, selects the
+// mask (GPU import preferred, CPU overlay texture otherwise), then delegates
+// to VulkanFrameRenderer::renderDuetGreenScreenFrame with the core
+// passthrough shaders for the source layer and the same per-layer rect /
+// buffer-dimension contract as the layout path.
+RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle sourceHandle,
+                                                            HardwareBufferHandle cameraHandle,
+                                                            const RenderDestinationRect& sourceRect,
+                                                            const RenderDestinationRect& cameraRect,
+                                                            uint32_t sourceBufferWidth,
+                                                            uint32_t sourceBufferHeight,
+                                                            uint32_t cameraBufferWidth,
+                                                            uint32_t cameraBufferHeight,
+                                                            VulkanOverlayTextureHandle cpuMaskHandle,
+                                                            HardwareBufferHandle gpuMaskHandle,
+                                                            uint32_t gpuMaskWidth,
+                                                            uint32_t gpuMaskHeight,
+                                                            uint32_t sourceRotationDegrees,
+                                                            bool sourceMirrorHorizontal,
+                                                            uint32_t cameraRotationDegrees,
+                                                            bool cameraMirrorHorizontal,
+                                                            int32_t debugMode) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -1317,32 +1377,168 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle
     if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
         return RenderFrameResult::kNoSurface;
     }
-    if (!s.ahbImports || backgroundHandle == foregroundHandle ||
-        !hasHardwareBuffer(backgroundHandle) || s.ahbImports->getImage(backgroundHandle) == nullptr ||
-        !hasHardwareBuffer(foregroundHandle) || s.ahbImports->getImage(foregroundHandle) == nullptr) {
+    if (!s.ahbImports || sourceHandle == cameraHandle ||
+        !hasHardwareBuffer(sourceHandle) || s.ahbImports->getImage(sourceHandle) == nullptr ||
+        !hasHardwareBuffer(cameraHandle) || s.ahbImports->getImage(cameraHandle) == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
-    VulkanOverlayTextureInfo overlayInfo{};
-    if (!getOverlayTextureInfo(maskHandle, &overlayInfo)) {
-        return RenderFrameResult::kVulkanFailure;
-    }
-    if (!s.frameRenderer) {
+    if (!s.frameRenderer || !s.coreShaders) {
         return RenderFrameResult::kUnavailable;
     }
 
+    // ANDROID-DUET-VULKAN-GPU-MASK: prefer the GPU-resident mask when the
+    // caller supplied a currently active import distinct from the source /
+    // camera buffers being rendered this frame; otherwise fall back to the
+    // CPU-uploaded overlay-texture mask (unchanged behavior when
+    // gpuMaskHandle is kInvalidHardwareBufferHandle). The mask is sampled
+    // through the green-screen helper's own mutable sampler, so an
+    // external-format (YCbCr, immutable-sampler-only) GPU mask import is
+    // not usable and also falls back to the CPU mask.
+    const VulkanHardwareBufferImage* gpuMaskImage =
+        (gpuMaskHandle != kInvalidHardwareBufferHandle && gpuMaskWidth > 0 && gpuMaskHeight > 0 &&
+         gpuMaskHandle != sourceHandle && gpuMaskHandle != cameraHandle &&
+         hasHardwareBuffer(gpuMaskHandle))
+            ? s.ahbImports->getImage(gpuMaskHandle)
+            : nullptr;
+
     VulkanFrameRenderer::VulkanGreenScreenMaskInfo maskInfo{};
-    maskInfo.imageViewHandle = overlayInfo.imageViewHandle;
-    maskInfo.samplerHandle = overlayInfo.samplerHandle;
-    maskInfo.width = overlayInfo.width;
-    maskInfo.height = overlayInfo.height;
+    if (gpuMaskImage != nullptr && gpuMaskImage->imageView != VK_NULL_HANDLE &&
+        !gpuMaskImage->isExternalFormat()) {
+        maskInfo.imageViewHandle = vkHandleToU64(gpuMaskImage->imageView);
+        maskInfo.width = gpuMaskWidth;
+        maskInfo.height = gpuMaskHeight;
+        maskInfo.gpuMaskHandle = gpuMaskHandle;
+    } else {
+        VulkanOverlayTextureInfo overlayInfo{};
+        if (!getOverlayTextureInfo(cpuMaskHandle, &overlayInfo)) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        maskInfo.imageViewHandle = overlayInfo.imageViewHandle;
+        maskInfo.width = overlayInfo.width;
+        maskInfo.height = overlayInfo.height;
+        maskInfo.gpuMaskHandle = kInvalidHardwareBufferHandle;
+    }
+    maskInfo.debugMode = debugMode;
+
+    VulkanFrameRenderer::DuetLayoutLayer source;
+    source.handle = sourceHandle;
+    source.rect = sourceRect;
+    source.bufferWidth = sourceBufferWidth;
+    source.bufferHeight = sourceBufferHeight;
+    source.rotationDegrees = sourceRotationDegrees;
+    source.mirrorHorizontal = sourceMirrorHorizontal;
+
+    VulkanFrameRenderer::DuetLayoutLayer camera;
+    camera.handle = cameraHandle;
+    camera.rect = cameraRect;
+    camera.bufferWidth = cameraBufferWidth;
+    camera.bufferHeight = cameraBufferHeight;
+    camera.rotationDegrees = cameraRotationDegrees;
+    camera.mirrorHorizontal = cameraMirrorHorizontal;
 
     return s.frameRenderer->renderDuetGreenScreenFrame(
         static_cast<void*>(s.queue),
         *s.surfaceSwapchain,
         *s.ahbImports,
-        backgroundHandle,
-        foregroundHandle,
+        *s.coreShaders,
+        source,
+        camera,
         maskInfo);
+}
+
+// ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic only):
+// validates the same backend / surface preconditions as
+// renderDuetGreenScreenFrame above for the single camera import, selects the
+// mask with the SAME GPU-preferred / CPU-fallback rule, resolves the
+// backgroundMode to its clear colour, then delegates to
+// VulkanFrameRenderer::renderDuetGreenScreenStaticBackgroundFrame (no source
+// layer, so the core passthrough shaders are not needed here).
+RenderFrameResult VulkanBackend::renderDuetGreenScreenStaticBackgroundFrame(
+    HardwareBufferHandle cameraHandle,
+    const RenderDestinationRect& cameraRect,
+    uint32_t cameraBufferWidth,
+    uint32_t cameraBufferHeight,
+    VulkanOverlayTextureHandle cpuMaskHandle,
+    HardwareBufferHandle gpuMaskHandle,
+    uint32_t gpuMaskWidth,
+    uint32_t gpuMaskHeight,
+    uint32_t cameraRotationDegrees,
+    bool cameraMirrorHorizontal,
+    int32_t debugMode,
+    DuetGreenScreenStaticBackgroundMode backgroundMode) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports ||
+        !hasHardwareBuffer(cameraHandle) || s.ahbImports->getImage(cameraHandle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer) {
+        return RenderFrameResult::kUnavailable;
+    }
+
+    // Fail closed on an unrecognized mode before the swapchain is touched;
+    // only the listed modes have a defined clear colour.
+    VulkanFrameRenderer::DuetStaticBackground background;
+    switch (backgroundMode) {
+        case DuetGreenScreenStaticBackgroundMode::kSolidTeal:
+            background.clearRgba[0] = 0.0f;
+            background.clearRgba[1] = 0.5f;
+            background.clearRgba[2] = 0.5f;
+            background.clearRgba[3] = 1.0f;
+            background.modeLabel = "solid_teal";
+            break;
+        default:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Same mask selection as renderDuetGreenScreenFrame: prefer the GPU
+    // import when active, distinct from the camera buffer and
+    // non-external-format; otherwise the CPU-uploaded overlay-texture mask.
+    const VulkanHardwareBufferImage* gpuMaskImage =
+        (gpuMaskHandle != kInvalidHardwareBufferHandle && gpuMaskWidth > 0 && gpuMaskHeight > 0 &&
+         gpuMaskHandle != cameraHandle && hasHardwareBuffer(gpuMaskHandle))
+            ? s.ahbImports->getImage(gpuMaskHandle)
+            : nullptr;
+
+    VulkanFrameRenderer::VulkanGreenScreenMaskInfo maskInfo{};
+    if (gpuMaskImage != nullptr && gpuMaskImage->imageView != VK_NULL_HANDLE &&
+        !gpuMaskImage->isExternalFormat()) {
+        maskInfo.imageViewHandle = vkHandleToU64(gpuMaskImage->imageView);
+        maskInfo.width = gpuMaskWidth;
+        maskInfo.height = gpuMaskHeight;
+        maskInfo.gpuMaskHandle = gpuMaskHandle;
+    } else {
+        VulkanOverlayTextureInfo overlayInfo{};
+        if (!getOverlayTextureInfo(cpuMaskHandle, &overlayInfo)) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        maskInfo.imageViewHandle = overlayInfo.imageViewHandle;
+        maskInfo.width = overlayInfo.width;
+        maskInfo.height = overlayInfo.height;
+        maskInfo.gpuMaskHandle = kInvalidHardwareBufferHandle;
+    }
+    maskInfo.debugMode = debugMode;
+
+    VulkanFrameRenderer::DuetLayoutLayer camera;
+    camera.handle = cameraHandle;
+    camera.rect = cameraRect;
+    camera.bufferWidth = cameraBufferWidth;
+    camera.bufferHeight = cameraBufferHeight;
+    camera.rotationDegrees = cameraRotationDegrees;
+    camera.mirrorHorizontal = cameraMirrorHorizontal;
+
+    return s.frameRenderer->renderDuetGreenScreenStaticBackgroundFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        camera,
+        maskInfo,
+        background);
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,7 +1556,12 @@ RenderFrameResult VulkanBackend::renderDuetLayoutFrame(HardwareBufferHandle sour
                                                        uint32_t sourceBufferWidth,
                                                        uint32_t sourceBufferHeight,
                                                        uint32_t cameraBufferWidth,
-                                                       uint32_t cameraBufferHeight) {
+                                                       uint32_t cameraBufferHeight,
+                                                       uint32_t sourceRotationDegrees,
+                                                       bool sourceMirrorHorizontal,
+                                                       uint32_t cameraRotationDegrees,
+                                                       bool cameraMirrorHorizontal,
+                                                       float cameraCornerRadiusPx) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -1382,12 +1583,17 @@ RenderFrameResult VulkanBackend::renderDuetLayoutFrame(HardwareBufferHandle sour
     source.rect = sourceRect;
     source.bufferWidth = sourceBufferWidth;
     source.bufferHeight = sourceBufferHeight;
+    source.rotationDegrees = sourceRotationDegrees;
+    source.mirrorHorizontal = sourceMirrorHorizontal;
 
     VulkanFrameRenderer::DuetLayoutLayer camera;
     camera.handle = cameraHandle;
     camera.rect = cameraRect;
     camera.bufferWidth = cameraBufferWidth;
     camera.bufferHeight = cameraBufferHeight;
+    camera.rotationDegrees = cameraRotationDegrees;
+    camera.mirrorHorizontal = cameraMirrorHorizontal;
+    camera.cornerRadiusPx = cameraCornerRadiusPx;
 
     return s.frameRenderer->renderDuetLayoutFrame(
         static_cast<void*>(s.queue),

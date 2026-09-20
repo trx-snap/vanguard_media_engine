@@ -36,9 +36,11 @@
 #include <dlfcn.h>
 #include <cstdlib>
 
-// Engine helpers — all in the private Vulkan source dir (render/vulkan/src).
-#include "vulkan_surface_swapchain.h"
-#include "vulkan_hardware_buffer_imports.h"
+// Engine helpers.
+#include "vanguard/render/vulkan_backend.h"
+#include <unistd.h>
+#include <cmath>
+#include <algorithm>
 
 // Layout math — public compositors include dir.
 #include "vanguard/compositors/multi_cam_compositor_node.h"
@@ -82,6 +84,7 @@ struct ParsedLayoutParams {
     double pipWidthFraction   = 0.3;
     double pipCenterX         = 0.5; // normalized [0,1]; used only when anchor == kFreeFloating
     double pipCenterY         = 0.5; // normalized [0,1]; used only when anchor == kFreeFloating
+    double pipCornerRadius    = 24.0;
 };
 
 // Minimal JSON value extraction — looks for "key":"value" or "key":number.
@@ -130,40 +133,9 @@ static ParsedLayoutParams ParseLayoutJson(const std::string& json) {
     out.pipWidthFraction = ExtractJsonDouble(json, "pipWidthFraction", 0.3);
     out.pipCenterX       = ExtractJsonDouble(json, "pipCenterX", 0.5);
     out.pipCenterY       = ExtractJsonDouble(json, "pipCenterY", 0.5);
+    out.pipCornerRadius  = ExtractJsonDouble(json, "pipCornerRadius", 24.0);
     out.ok = true;
     return out;
-}
-
-// ---------------------------------------------------------------------------
-// Vulkan device selection helpers (minimal — graphics queue + AHB extension).
-// ---------------------------------------------------------------------------
-static const char* kAhbExtension = "VK_ANDROID_external_memory_android_hardware_buffer";
-
-static bool DeviceSupportsExtension(VkPhysicalDevice dev, const char* name) {
-    uint32_t count = 0;
-    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
-    if (count == 0) return false;
-    std::vector<VkExtensionProperties> exts(count);
-    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, exts.data());
-    for (const auto& e : exts) {
-        if (std::strcmp(e.extensionName, name) == 0) return true;
-    }
-    return false;
-}
-
-static bool DeviceSupportsYcbcr(VkInstance instance, VkPhysicalDevice dev) {
-    auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
-        vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
-    if (!fn) fn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
-        vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2KHR"));
-    if (!fn) return false;
-    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
-    ycbcr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
-    VkPhysicalDeviceFeatures2 f2{};
-    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    f2.pNext = &ycbcr;
-    fn(dev, &f2);
-    return ycbcr.samplerYcbcrConversion == VK_TRUE;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,74 +143,23 @@ static bool DeviceSupportsYcbcr(VkInstance instance, VkPhysicalDevice dev) {
 // ---------------------------------------------------------------------------
 
 struct VulkanDualCamSession {
-    VkInstance       instance       = VK_NULL_HANDLE;
-    VkPhysicalDevice physDev        = VK_NULL_HANDLE;
-    uint32_t         queueFamily    = UINT32_MAX;
-    VkDevice         device         = VK_NULL_HANDLE;
-    VkQueue          queue          = VK_NULL_HANDLE;
-    VkCommandPool    commandPool    = VK_NULL_HANDLE;
-
-    // Output swapchain attached to the ANativeWindow from outputSurface.
-    vanguard::render::VulkanSurfaceSwapchain swapchain;
-
-    // AHB import table for per-frame imports.
-    vanguard::render::VulkanHardwareBufferImports imports;
-
-    // Swapchain synchronization primitives (one per swapchain image).
-    std::vector<VkSemaphore> imageAvailableSemaphores;
-    std::vector<VkSemaphore> renderFinishedSemaphores;
-    std::vector<VkFence>     inFlightFences;
-
-    // Command buffers (one per swapchain image).
-    std::vector<VkCommandBuffer> commandBuffers;
-
-    // Rotating frame slot counter — per-session, not global.
-    std::atomic<uint32_t> frameSlot{0};
-
-    // Borrowed native window (ANativeWindow from the output Surface).
+    std::unique_ptr<vanguard::render::VulkanBackend> backend;
     ANativeWindow* nativeWindow = nullptr;
+    uint32_t width  = 0;
+    uint32_t height = 0;
 
-    bool isValid() const { return device != VK_NULL_HANDLE; }
+    bool isValid() const { return backend != nullptr && backend->hasSurface(); }
 
     void Teardown() {
-        if (device == VK_NULL_HANDLE) return;
-        vkDeviceWaitIdle(device);
-
-        // Destroy sync objects.
-        for (auto& s : imageAvailableSemaphores) vkDestroySemaphore(device, s, nullptr);
-        for (auto& s : renderFinishedSemaphores) vkDestroySemaphore(device, s, nullptr);
-        for (auto& f : inFlightFences)           vkDestroyFence(device, f, nullptr);
-        imageAvailableSemaphores.clear();
-        renderFinishedSemaphores.clear();
-        inFlightFences.clear();
-
-        // Free command buffers.
-        if (!commandBuffers.empty() && commandPool != VK_NULL_HANDLE) {
-            vkFreeCommandBuffers(device, commandPool,
-                static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
-            commandBuffers.clear();
+        if (backend) {
+            backend->detachSurface();
+            backend->shutdown();
+            backend.reset();
         }
-
-        // Imports shutdown (drains retired queue before device destroy).
-        imports.shutdown();
-
-        // Swapchain detach (vkDeviceWaitIdle already called).
-        swapchain.detach();
-
-        if (commandPool != VK_NULL_HANDLE) {
-            vkDestroyCommandPool(device, commandPool, nullptr);
-            commandPool = VK_NULL_HANDLE;
+        if (nativeWindow) {
+            ANativeWindow_release(nativeWindow);
+            nativeWindow = nullptr;
         }
-        vkDestroyDevice(device, nullptr);
-        device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
-        if (instance != VK_NULL_HANDLE) {
-            vkDestroyInstance(instance, nullptr);
-            instance = VK_NULL_HANDLE;
-        }
-        physDev = VK_NULL_HANDLE; queueFamily = UINT32_MAX;
-
-        // Release borrowed native window.
-        if (nativeWindow) { ANativeWindow_release(nativeWindow); nativeWindow = nullptr; }
     }
 };
 
@@ -281,172 +202,22 @@ struct DualCamSession {
 static bool CreateVulkanSession(VulkanDualCamSession& s, ANativeWindow* window,
                                 uint32_t width, uint32_t height,
                                 std::string& outErr) {
-    // 1. Instance.
-    VkApplicationInfo appInfo{};
-    appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName   = "VanguardDualCamCompositor";
-    appInfo.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-    appInfo.pEngineName        = "VanguardRenderEngine";
-    appInfo.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
-    appInfo.apiVersion         = VK_API_VERSION_1_1;
-
-    const char* instanceExts[] = {
-        "VK_KHR_surface",
-        "VK_KHR_android_surface",
-    };
-    VkInstanceCreateInfo instanceCI{};
-    instanceCI.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    instanceCI.pApplicationInfo        = &appInfo;
-    instanceCI.enabledExtensionCount   = 2;
-    instanceCI.ppEnabledExtensionNames = instanceExts;
-
-    VkResult vr = vkCreateInstance(&instanceCI, nullptr, &s.instance);
-    if (vr != VK_SUCCESS) {
-        s.instance = VK_NULL_HANDLE;
-        outErr = "vkCreateInstance failed:" + std::to_string(static_cast<int>(vr));
+    s.backend = std::make_unique<vanguard::render::VulkanBackend>();
+    if (!s.backend->initialize()) {
+        outErr = "VulkanBackend::initialize failed";
+        s.Teardown();
         return false;
     }
-
-    // 2. Physical device (AHB-capable, graphics queue).
-    uint32_t devCount = 0;
-    vkEnumeratePhysicalDevices(s.instance, &devCount, nullptr);
-    if (devCount == 0) {
-        outErr = "no_physical_devices";
-        s.Teardown(); return false;
-    }
-    std::vector<VkPhysicalDevice> devs(devCount);
-    vkEnumeratePhysicalDevices(s.instance, &devCount, devs.data());
-
-    for (VkPhysicalDevice dev : devs) {
-        VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(dev, &props);
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
-        if (VK_VERSION_MAJOR(props.apiVersion) < 1 ||
-            (VK_VERSION_MAJOR(props.apiVersion) == 1 && VK_VERSION_MINOR(props.apiVersion) < 1)) continue;
-        if (!DeviceSupportsExtension(dev, kAhbExtension)) continue;
-        if (!DeviceSupportsYcbcr(s.instance, dev)) continue;
-
-        uint32_t famCount = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(dev, &famCount, nullptr);
-        std::vector<VkQueueFamilyProperties> fams(famCount);
-        vkGetPhysicalDeviceQueueFamilyProperties(dev, &famCount, fams.data());
-        uint32_t gfxFamily = UINT32_MAX;
-        for (uint32_t i = 0; i < famCount; ++i) {
-            if (fams[i].queueCount > 0 && (fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
-                gfxFamily = i; break;
-            }
-        }
-        if (gfxFamily == UINT32_MAX) continue;
-
-        s.physDev     = dev;
-        s.queueFamily = gfxFamily;
-        VGLOG_I("Selected GPU: %s", props.deviceName);
-        break;
-    }
-
-    if (s.physDev == VK_NULL_HANDLE) {
-        outErr = "no_suitable_ahb_capable_gpu";
-        s.Teardown(); return false;
-    }
-
-    // 3. Logical device + queue.
-    const float priority = 1.0f;
-    VkDeviceQueueCreateInfo queueCI{};
-    queueCI.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queueCI.queueFamilyIndex = s.queueFamily;
-    queueCI.queueCount       = 1;
-    queueCI.pQueuePriorities = &priority;
-
-    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeat{};
-    ycbcrFeat.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
-    ycbcrFeat.samplerYcbcrConversion = VK_TRUE;
-
-    // Swapchain device extension also needed.
-    const char* devExts[] = { kAhbExtension, "VK_KHR_swapchain" };
-    VkDeviceCreateInfo devCI{};
-    devCI.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    devCI.pNext                   = &ycbcrFeat;
-    devCI.queueCreateInfoCount    = 1;
-    devCI.pQueueCreateInfos       = &queueCI;
-    devCI.enabledExtensionCount   = 2;
-    devCI.ppEnabledExtensionNames = devExts;
-
-    vr = vkCreateDevice(s.physDev, &devCI, nullptr, &s.device);
-    if (vr != VK_SUCCESS) {
-        s.device = VK_NULL_HANDLE;
-        outErr = "vkCreateDevice failed:" + std::to_string(static_cast<int>(vr));
-        s.Teardown(); return false;
-    }
-    vkGetDeviceQueue(s.device, s.queueFamily, 0, &s.queue);
-
-    // 4. Command pool (resettable buffers for per-frame recording).
-    VkCommandPoolCreateInfo poolCI{};
-    poolCI.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolCI.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolCI.queueFamilyIndex = s.queueFamily;
-    vr = vkCreateCommandPool(s.device, &poolCI, nullptr, &s.commandPool);
-    if (vr != VK_SUCCESS) {
-        s.commandPool = VK_NULL_HANDLE;
-        outErr = "vkCreateCommandPool failed:" + std::to_string(static_cast<int>(vr));
-        s.Teardown(); return false;
-    }
-
-    // 5. AHB import table.
-    if (!s.imports.initialize(s.device, s.physDev)) {
-        outErr = "VulkanHardwareBufferImports::initialize failed";
-        s.Teardown(); return false;
-    }
-
-    // 6. Swapchain attached to ANativeWindow.
     s.nativeWindow = window;
     ANativeWindow_acquire(window);
-    if (!s.swapchain.attach(
-            static_cast<void*>(s.instance),
-            static_cast<void*>(s.physDev),
-            static_cast<void*>(s.device),
-            s.queueFamily,
-            static_cast<void*>(window),
-            width, height)) {
-        outErr = "VulkanSurfaceSwapchain::attach failed";
-        s.Teardown(); return false;
+    if (!s.backend->attachSurface(window, width, height)) {
+        outErr = "VulkanBackend::attachSurface failed";
+        s.Teardown();
+        return false;
     }
-
-    // 7. Per-swapchain-image synchronization objects + command buffers.
-    const uint32_t imgCount = s.swapchain.getImageCount();
-    if (imgCount == 0) {
-        outErr = "swapchain image count is 0";
-        s.Teardown(); return false;
-    }
-    s.imageAvailableSemaphores.resize(imgCount, VK_NULL_HANDLE);
-    s.renderFinishedSemaphores.resize(imgCount, VK_NULL_HANDLE);
-    s.inFlightFences.resize(imgCount, VK_NULL_HANDLE);
-    s.commandBuffers.resize(imgCount, VK_NULL_HANDLE);
-
-    VkSemaphoreCreateInfo semCI{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    VkFenceCreateInfo fenceCI{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    fenceCI.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled so first frame doesn't block
-
-    for (uint32_t i = 0; i < imgCount; ++i) {
-        if (vkCreateSemaphore(s.device, &semCI, nullptr, &s.imageAvailableSemaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(s.device, &semCI, nullptr, &s.renderFinishedSemaphores[i]) != VK_SUCCESS ||
-            vkCreateFence(s.device, &fenceCI, nullptr, &s.inFlightFences[i]) != VK_SUCCESS) {
-            outErr = "sync_object_creation_failed";
-            s.Teardown(); return false;
-        }
-    }
-
-    VkCommandBufferAllocateInfo cbAlloc{};
-    cbAlloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbAlloc.commandPool        = s.commandPool;
-    cbAlloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbAlloc.commandBufferCount = imgCount;
-    vr = vkAllocateCommandBuffers(s.device, &cbAlloc, s.commandBuffers.data());
-    if (vr != VK_SUCCESS) {
-        outErr = "vkAllocateCommandBuffers failed:" + std::to_string(static_cast<int>(vr));
-        s.Teardown(); return false;
-    }
-
-    VGLOG_I("Vulkan session created swapchainImages=%u width=%u height=%u", imgCount, width, height);
+    s.width = width;
+    s.height = height;
+    VGLOG_I("Vulkan session created via VulkanBackend width=%u height=%u", width, height);
     return true;
 }
 
@@ -531,161 +302,96 @@ static std::string BuildLayoutJson(const ParsedLayoutParams& p) {
 
 // ---------------------------------------------------------------------------
 // Vulkan per-frame composite render
-//   - Imports front/back AHBs.
-//   - Acquires swapchain image.
-//   - Records a clear render pass (solid color proof for Slice 1).
-//   - Submits + presents.
-//   - Releases AHB imports.
 // ---------------------------------------------------------------------------
 static bool VulkanCompositeFrame(VulkanDualCamSession& s,
                                  AHardwareBuffer* frontAhb,
                                  AHardwareBuffer* backAhb,
-                                 const ParsedLayoutParams& /*layout*/) {
+                                 const ParsedLayoutParams& layout) {
     using namespace vanguard::render;
+    using namespace vanguard::compositors;
 
-    // Import front AHB.
-    HardwareBufferHandle frontHandle = kInvalidHardwareBufferHandle;
-    HardwareBufferDescriptor frontDesc{};
-    if (frontAhb) {
-        auto res = s.imports.importBuffer(static_cast<void*>(frontAhb), -1, &frontHandle, &frontDesc);
-        if (res != HardwareBufferImportResult::kSuccess) {
-            VGLOG_W("Front AHB import failed result=%d", static_cast<int>(res));
-            frontHandle = kInvalidHardwareBufferHandle;
-        }
+    if (!s.backend || !frontAhb || !backAhb) {
+        return false;
     }
 
-    // Import back AHB.
     HardwareBufferHandle backHandle = kInvalidHardwareBufferHandle;
     HardwareBufferDescriptor backDesc{};
-    if (backAhb) {
-        auto res = s.imports.importBuffer(static_cast<void*>(backAhb), -1, &backHandle, &backDesc);
-        if (res != HardwareBufferImportResult::kSuccess) {
-            VGLOG_W("Back AHB import failed result=%d", static_cast<int>(res));
-            backHandle = kInvalidHardwareBufferHandle;
-        }
-    }
-
-    // Acquire next swapchain image.
-    uint32_t imageIndex = 0;
-    uint64_t acquireSemHandle = 0;
-    const uint32_t imgCount = s.swapchain.getImageCount();
-    // Per-session rotating frame slot (not global static — D4a fix).
-    const uint32_t slot = s.frameSlot.fetch_add(1) % imgCount;
-
-    // Encode acquire semaphore handle.
-    VkSemaphore acquireSem = s.imageAvailableSemaphores[slot];
-    std::memcpy(&acquireSemHandle, &acquireSem, sizeof(uint64_t));
-
-    VkFence fence = s.inFlightFences[slot];
-    // Wait for GPU to finish the previous frame that used this slot.
-    vkWaitForFences(s.device, 1, &fence, VK_TRUE, UINT64_MAX);
-    // Drain retired AHB imports from that frame now GPU work has completed (D4c fix).
-    s.imports.drainRetiredForFrame(slot);
-    // Reset fence once (and only once) after the wait (D4d fix — no duplicate reset later).
-    vkResetFences(s.device, 1, &fence);
-
-    // Pass fenceHandle=0: WSI GPU-GPU sync goes through acquireSem, not the
-    // in-flight fence. The fence belongs exclusively to vkQueueSubmit (D4b fix).
-    auto acquireResult = s.swapchain.acquireNextImage(acquireSemHandle, 0,
-                                                       &imageIndex, UINT64_MAX);
-    if (acquireResult == SwapchainResult::kOutOfDate ||
-        acquireResult == SwapchainResult::kSurfaceLost) {
-        VGLOG_W("acquireNextImage: swapchain out-of-date or surface lost — skipping frame");
-        // Release any imports before returning.
-        if (frontHandle != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(frontHandle, nullptr);
-        if (backHandle  != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(backHandle,  nullptr);
-        return false;
-    }
-    if (acquireResult != SwapchainResult::kSuccess && acquireResult != SwapchainResult::kSuboptimal) {
-        VGLOG_W("acquireNextImage unexpected result=%d", static_cast<int>(acquireResult));
-        if (frontHandle != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(frontHandle, nullptr);
-        if (backHandle  != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(backHandle,  nullptr);
+    auto backRes = s.backend->importHardwareBuffer(static_cast<void*>(backAhb), -1, &backHandle, &backDesc);
+    if (backRes != HardwareBufferImportResult::kSuccess) {
+        VGLOG_W("Back AHB import failed result=%d", static_cast<int>(backRes));
         return false;
     }
 
-    // Record command buffer: clear pass into the swapchain framebuffer.
-    VkCommandBuffer cb = s.commandBuffers[imageIndex];
-    vkResetCommandBuffer(cb, 0);
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cb, &beginInfo);
-
-    // Render pass — clear the framebuffer to opaque black (Slice 1 proof pass).
-    VkClearValue clearColor{};
-    clearColor.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-
-    uint64_t rpHandle = s.swapchain.getRenderPassHandle();
-    uint64_t fbHandle = s.swapchain.getFramebufferHandle(imageIndex);
-
-    if (rpHandle != 0 && fbHandle != 0) {
-        VkRenderPass  rp{}; std::memcpy(&rp, &rpHandle, sizeof(VkRenderPass));
-        VkFramebuffer fb{}; std::memcpy(&fb, &fbHandle, sizeof(VkFramebuffer));
-
-        const uint32_t w = s.swapchain.getExtentWidth();
-        const uint32_t h = s.swapchain.getExtentHeight();
-
-        VkRenderPassBeginInfo rpBegin{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-        rpBegin.renderPass        = rp;
-        rpBegin.framebuffer       = fb;
-        rpBegin.renderArea.offset = {0, 0};
-        rpBegin.renderArea.extent = {w, h};
-        rpBegin.clearValueCount   = 1;
-        rpBegin.pClearValues      = &clearColor;
-
-        vkCmdBeginRenderPass(cb, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-        // TODO Slice 3: bind pipeline, descriptor sets, draw imported AHB textures here.
-        vkCmdEndRenderPass(cb);
-    }
-
-    vkEndCommandBuffer(cb);
-
-    // Submit.
-    VkSemaphore renderFinishedSem = s.renderFinishedSemaphores[slot];
-    uint64_t renderFinishedHandle = 0;
-    std::memcpy(&renderFinishedHandle, &renderFinishedSem, sizeof(uint64_t));
-
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.waitSemaphoreCount   = 1;
-    submit.pWaitSemaphores      = &acquireSem;
-    submit.pWaitDstStageMask    = &waitStage;
-    submit.commandBufferCount   = 1;
-    submit.pCommandBuffers      = &cb;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores    = &renderFinishedSem;
-
-    // Fence was already reset after vkWaitForFences above; do NOT reset again here.
-    if (vkQueueSubmit(s.queue, 1, &submit, fence) != VK_SUCCESS) {
-        VGLOG_W("vkQueueSubmit failed");
-        if (frontHandle != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(frontHandle, nullptr);
-        if (backHandle  != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(backHandle,  nullptr);
+    HardwareBufferHandle frontHandle = kInvalidHardwareBufferHandle;
+    HardwareBufferDescriptor frontDesc{};
+    auto frontRes = s.backend->importHardwareBuffer(static_cast<void*>(frontAhb), -1, &frontHandle, &frontDesc);
+    if (frontRes != HardwareBufferImportResult::kSuccess) {
+        VGLOG_W("Front AHB import failed result=%d", static_cast<int>(frontRes));
+        int releaseFd = -1;
+        s.backend->releaseHardwareBuffer(backHandle, &releaseFd);
+        if (releaseFd >= 0) ::close(releaseFd);
         return false;
     }
 
-    // Mark AHB imports as submitted (so retirement queue uses correct slot).
-    if (frontHandle != kInvalidHardwareBufferHandle) s.imports.markBufferSubmitted(frontHandle, slot);
-    if (backHandle  != kInvalidHardwareBufferHandle) s.imports.markBufferSubmitted(backHandle,  slot);
+    const double canvasW = static_cast<double>(s.width);
+    const double canvasH = static_cast<double>(s.height);
+    const double canvasAr = (canvasH > 0) ? (canvasW / canvasH) : (9.0 / 16.0);
 
-    // Present.
-    SwapchainResult presentResult = s.swapchain.presentImage(
-        static_cast<void*>(s.queue), renderFinishedHandle, imageIndex);
+    MultiCamLayout mcl{};
+    mcl.mode = layout.mode;
+    mcl.canvasWidth = canvasW;
+    mcl.canvasHeight = canvasH;
+    mcl.pip.anchor = layout.anchor;
+    mcl.pip.centerX = std::max(0.0, std::min(1.0, layout.pipCenterX));
+    mcl.pip.centerY = std::max(0.0, std::min(1.0, layout.pipCenterY));
+    mcl.pip.normalizedWidth = std::max(0.05, std::min(0.95, layout.pipWidthFraction));
+    mcl.pip.aspectRatio = canvasAr;
+    mcl.pip.marginFraction = 0.02;
+    mcl.pip.cornerRadiusFractionOfCanvasWidth = (canvasW > 0) ? (layout.pipCornerRadius / canvasW) : 0.02;
+    mcl.pip.opacity = 1.0;
+    mcl.split.direction = layout.direction;
+    mcl.split.splitRatio = std::max(0.2, std::min(0.8, layout.splitRatio));
 
-    // After GPU completes this slot's fence (next time we wait), drain retired imports.
-    // Note: drainRetiredForFrame deferred to next frame's fence wait (approximation acceptable
-    // for Slice 1; Slice 3 will use a proper per-slot retired drain after fence wait).
+    const MultiCamLayoutResult res = ComputeMultiCamLayout(mcl);
 
-    // Release AHB imports back to retired queue.
-    if (frontHandle != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(frontHandle, nullptr);
-    if (backHandle  != kInvalidHardwareBufferHandle) s.imports.releaseBuffer(backHandle,  nullptr);
+    RenderDestinationRect backRect{
+        static_cast<int32_t>(std::round(res.primaryViewport.x * canvasW)),
+        static_cast<int32_t>(std::round(res.primaryViewport.y * canvasH)),
+        static_cast<int32_t>(std::round(res.primaryViewport.width * canvasW)),
+        static_cast<int32_t>(std::round(res.primaryViewport.height * canvasH)),
+    };
 
-    if (presentResult == SwapchainResult::kOutOfDate ||
-        presentResult == SwapchainResult::kSurfaceLost) {
-        VGLOG_W("presentImage: swapchain out-of-date after present");
-        return false; // Slice 3 will add resize handling.
-    }
+    RenderDestinationRect frontRect{
+        static_cast<int32_t>(std::round(res.secondaryViewport.x * canvasW)),
+        static_cast<int32_t>(std::round(res.secondaryViewport.y * canvasH)),
+        static_cast<int32_t>(std::round(res.secondaryViewport.width * canvasW)),
+        static_cast<int32_t>(std::round(res.secondaryViewport.height * canvasH)),
+    };
 
-    return true;
+    const float cameraCornerRadiusPx = static_cast<float>(
+        std::max(0.0, res.secondaryCornerRadiusFractionOfCanvasWidth * canvasW));
+
+    auto renderRes = s.backend->renderDuetLayoutFrame(
+        backHandle,
+        frontHandle,
+        backRect,
+        frontRect,
+        backDesc.width, backDesc.height,
+        frontDesc.width, frontDesc.height,
+        /*sourceRotationDegrees=*/90, /*sourceMirrorHorizontal=*/false,
+        /*cameraRotationDegrees=*/270, /*cameraMirrorHorizontal=*/true,
+        cameraCornerRadiusPx
+    );
+
+    int backReleaseFd = -1;
+    s.backend->releaseHardwareBuffer(backHandle, &backReleaseFd);
+    if (backReleaseFd >= 0) ::close(backReleaseFd);
+
+    int frontReleaseFd = -1;
+    s.backend->releaseHardwareBuffer(frontHandle, &frontReleaseFd);
+    if (frontReleaseFd >= 0) ::close(frontReleaseFd);
+
+    return renderRes == RenderFrameResult::kSuccess || renderRes == RenderFrameResult::kSuboptimal;
 }
 
 // ---------------------------------------------------------------------------

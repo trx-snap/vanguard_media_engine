@@ -141,6 +141,10 @@ bool ResolveVulkanDuetLayoutLayerPlacement(const VulkanDuetLayoutLayerGeometry& 
     out->viewport = viewport;
     out->scissor = scissor;
     out->pushConstants = makeVideoTransformFullPushConstants(transform);
+    if (layer.cornerRadiusPx > 0.0f && r.width > 0 && r.height > 0) {
+        out->pushConstants.uv.uvTransform0[2] = 2.0f * layer.cornerRadiusPx / static_cast<float>(r.width);
+        out->pushConstants.uv.uvTransform1[2] = static_cast<float>(r.height) / static_cast<float>(r.width);
+    }
     return true;
 }
 

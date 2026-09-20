@@ -36,6 +36,7 @@ layout(push_constant) uniform Transform {
 } xf;
 
 layout(location = 0) out vec2 outUv;
+layout(location = 1) out vec2 outViewportNdc;
 
 // Fullscreen triangle positions in clip space (NDC).
 // gl_VertexIndex: 0=(-1,-1), 1=(3,-1), 2=(-1,3)
@@ -63,6 +64,7 @@ void main() {
     vec4 uvExt = vec4(uv.x, uv.y, 0.0, 1.0);
     outUv = vec2(dot(xf.uvTransform0, uvExt),
                  dot(xf.uvTransform1, uvExt));
+    outViewportNdc = pos;
 
     gl_Position = vec4(pos, 0.0, 1.0);
 }

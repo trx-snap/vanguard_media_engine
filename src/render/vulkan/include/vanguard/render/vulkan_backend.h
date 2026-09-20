@@ -37,6 +37,18 @@ struct VulkanOverlayTextureInfo {
     uint32_t height = 0;
 };
 
+// ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic only):
+// static, non-video background selector for
+// VulkanBackend::renderDuetGreenScreenStaticBackgroundFrame below. The
+// integer values are the wire values crossing the Kotlin/JNI boundary
+// (VanguardNativeBridge.renderAndroidDuetVulkanPreviewStaticBackgroundFrame
+// backgroundMode); anything not listed here fails closed.
+enum class DuetGreenScreenStaticBackgroundMode : int32_t {
+    // Whole canvas cleared to an opaque teal (0.0, 0.5, 0.5, 1.0) in place
+    // of the decoded source layer; camera drawn masked over it.
+    kSolidTeal = 1,
+};
+
 class VulkanBackend : public RenderBackend {
 public:
     VulkanBackend();
@@ -143,9 +155,92 @@ public:
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
 
-    RenderFrameResult renderDuetGreenScreenFrame(HardwareBufferHandle backgroundHandle,
-                                                 HardwareBufferHandle foregroundHandle,
-                                                 VulkanOverlayTextureHandle maskHandle);
+    // ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: Duet green-screen frame. The
+    // source/decoder import [sourceHandle] is drawn first, opaque and
+    // aspect-filled into [sourceRect] exactly as renderDuetLayoutFrame below
+    // draws it; the camera import [cameraHandle] is then aspect-filled into
+    // [cameraRect] over it, alpha-masked by the session's green-screen mask
+    // (mask sampled at the camera's own cropped UV) and straight-alpha
+    // blended. Rects / buffer dimensions follow renderDuetLayoutFrame's
+    // contract and placement math, and every layer is sampled through its
+    // import's own external-format descriptor resources, so colour /
+    // orientation / crop match the layout path.
+    //
+    // ANDROID-DUET-VULKAN-GPU-MASK: prefers the GPU-resident mask identified
+    // by gpuMaskHandle (already imported via importHardwareBuffer, e.g. by
+    // AndroidDuetVulkanPreviewSession::UpdateGpuMask) over the CPU-uploaded
+    // overlay-texture mask identified by cpuMaskHandle (see UpdateMask() /
+    // createOverlayTextureR8 below), whenever gpuMaskHandle is a currently
+    // active, non-external-format import distinct from sourceHandle /
+    // cameraHandle and gpuMaskWidth/gpuMaskHeight are both > 0. The GPU mask
+    // import's first-use layout transition, pending acquire-semaphore wait
+    // and submitted marking are handled per frame; it is never released by
+    // this call. Pass kInvalidHardwareBufferHandle (with 0 width/height) for
+    // gpuMaskHandle to always use the CPU mask.
+    //
+    // Same swapchain acquire / submit / present lifecycle and post-submit
+    // import bookkeeping as renderDuetLayoutFrame. Not part of the shared
+    // RenderBackend interface (no `override`); host builds return
+    // kUnavailable. Invalid geometry fails closed with kVulkanFailure before
+    // the swapchain is touched.
+    // ANDROID-DUET-VULKAN-TRANSFORM: sourceRotationDegrees/cameraRotationDegrees
+    // are each layer's cardinal clockwise display rotation (0/90/180/270;
+    // non-cardinal values normalize to 0), applied before the aspect-fill
+    // crop exactly like a solo frame's VideoFrameTransform.
+    // sourceMirrorHorizontal/cameraMirrorHorizontal mirror that layer
+    // horizontally in addition to the rotation.
+    // debugMode is the RND matte-visualization mode forwarded verbatim to
+    // VulkanFrameRenderer::VulkanGreenScreenMaskInfo::debugMode (0 = normal,
+    // 1 = mask_direct, 2 = mask_mapped, 3 = mask_direct_mirror_x,
+    // 4 = mask_direct_flip_y).
+    RenderFrameResult renderDuetGreenScreenFrame(HardwareBufferHandle sourceHandle,
+                                                 HardwareBufferHandle cameraHandle,
+                                                 const RenderDestinationRect& sourceRect,
+                                                 const RenderDestinationRect& cameraRect,
+                                                 uint32_t sourceBufferWidth,
+                                                 uint32_t sourceBufferHeight,
+                                                 uint32_t cameraBufferWidth,
+                                                 uint32_t cameraBufferHeight,
+                                                 VulkanOverlayTextureHandle cpuMaskHandle,
+                                                 HardwareBufferHandle gpuMaskHandle,
+                                                 uint32_t gpuMaskWidth,
+                                                 uint32_t gpuMaskHeight,
+                                                 uint32_t sourceRotationDegrees,
+                                                 bool sourceMirrorHorizontal,
+                                                 uint32_t cameraRotationDegrees,
+                                                 bool cameraMirrorHorizontal,
+                                                 int32_t debugMode = 0);
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
+    // only): camera-only Duet green-screen frame over a static background.
+    // Identical to renderDuetGreenScreenFrame above -- same camera rect /
+    // buffer-dimension / rotation / mirror placement contract, same CPU-vs-GPU
+    // mask selection (gpuMaskHandle preferred when active, non-external-format
+    // and distinct from cameraHandle, cpuMaskHandle otherwise), same debugMode
+    // forwarding, same swapchain acquire / submit / present lifecycle and
+    // post-submit import bookkeeping for the camera import and the held GPU
+    // mask -- except that there is NO source / decoder layer: the swapchain
+    // render pass is begun with the clear colour selected by backgroundMode
+    // and nothing is drawn for the source before the masked camera draw. Lets
+    // RND evaluate person matte quality without video-background decoder
+    // pressure. Not part of the shared RenderBackend interface (no
+    // `override`); host builds return kUnavailable. An unrecognized
+    // backgroundMode or invalid geometry fails closed with kVulkanFailure
+    // before the swapchain is touched. Production renderDuetGreenScreenFrame /
+    // renderDuetLayoutFrame behaviour is unchanged.
+    RenderFrameResult renderDuetGreenScreenStaticBackgroundFrame(
+        HardwareBufferHandle cameraHandle,
+        const RenderDestinationRect& cameraRect,
+        uint32_t cameraBufferWidth,
+        uint32_t cameraBufferHeight,
+        VulkanOverlayTextureHandle cpuMaskHandle,
+        HardwareBufferHandle gpuMaskHandle,
+        uint32_t gpuMaskWidth,
+        uint32_t gpuMaskHeight,
+        uint32_t cameraRotationDegrees,
+        bool cameraMirrorHorizontal,
+        int32_t debugMode,
+        DuetGreenScreenStaticBackgroundMode backgroundMode);
 
     // ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame (PiP /
     // split, and the green-screen terminal fallback to safe PiP). The
@@ -161,6 +256,8 @@ public:
     // RenderBackend interface (no `override`); host builds return
     // kUnavailable. Invalid geometry fails closed with kVulkanFailure before
     // the swapchain is touched.
+    // ANDROID-DUET-VULKAN-TRANSFORM: see renderDuetGreenScreenFrame above for
+    // the rotation/mirror contract; identical here.
     RenderFrameResult renderDuetLayoutFrame(HardwareBufferHandle sourceHandle,
                                             HardwareBufferHandle cameraHandle,
                                             const RenderDestinationRect& sourceRect,
@@ -168,7 +265,12 @@ public:
                                             uint32_t sourceBufferWidth,
                                             uint32_t sourceBufferHeight,
                                             uint32_t cameraBufferWidth,
-                                            uint32_t cameraBufferHeight);
+                                            uint32_t cameraBufferHeight,
+                                            uint32_t sourceRotationDegrees,
+                                            bool sourceMirrorHorizontal,
+                                            uint32_t cameraRotationDegrees,
+                                            bool cameraMirrorHorizontal,
+                                            float cameraCornerRadiusPx = 0.0f);
 
     // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
     // sub-slice N4: backend-owned Vulkan overlay texture store for static

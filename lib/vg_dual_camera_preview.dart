@@ -30,8 +30,10 @@ class VGDualCameraPreview extends StatefulWidget {
     this.gridOption = VGDualCameraGridOption.pip,
     this.isFrontPrimary = false,
     this.onSwapCameras,
-    this.pipWidth = 130.0,
-    this.pipHeight = 220.0,
+    this.showBadges = false,
+    this.pipWidth = 0.0,
+    this.pipHeight = 0.0,
+    this.splitRatio = 0.5,
   });
 
   /// The active dual-camera session.
@@ -46,11 +48,17 @@ class VGDualCameraPreview extends StatefulWidget {
   /// Optional callback invoked when the user taps to swap camera assignments.
   final VoidCallback? onSwapCameras;
 
-  /// Width of the floating PiP window.
+  /// Whether to show FRONT/BACK label badges on streams.
+  final bool showBadges;
+
+  /// Width of the floating PiP window. When 0.0, automatically calculated at 9:16.
   final double pipWidth;
 
-  /// Height of the floating PiP window.
+  /// Height of the floating PiP window. When 0.0, automatically calculated at 9:16.
   final double pipHeight;
+
+  /// Height split ratio for Horizontal Split (top stream height fraction, 0.2–0.8).
+  final double splitRatio;
 
   @override
   State<VGDualCameraPreview> createState() => _VGDualCameraPreviewState();
@@ -115,16 +123,20 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
     );
   }
 
-  /// Builds Horizontal Split (Top / Bottom 50/50) with aspect ratio preserved.
+  /// Builds Horizontal Split (Top / Bottom) with dynamic split ratio.
   Widget _buildHorizontalSplit(
     int topTid,
     int bottomTid,
     String topLabel,
     String bottomLabel,
   ) {
+    final topFlex = (widget.splitRatio.clamp(0.2, 0.8) * 1000).round();
+    final bottomFlex = 1000 - topFlex;
+
     return Column(
       children: [
         Expanded(
+          flex: topFlex,
           child: Stack(
             fit: StackFit.expand,
             children: [
@@ -135,6 +147,7 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
         ),
         Container(height: 2, color: Colors.white24),
         Expanded(
+          flex: bottomFlex,
           child: Stack(
             fit: StackFit.expand,
             children: [
@@ -188,8 +201,9 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
     double screenWidth,
     double screenHeight,
   ) {
-    final pipW = widget.pipWidth;
-    final pipH = widget.pipHeight;
+    final pipW = (widget.pipWidth > 0 ? widget.pipWidth : screenWidth * 0.35)
+        .clamp(screenWidth * 0.15, screenWidth * 0.65);
+    final pipH = widget.pipHeight > 0 ? widget.pipHeight : pipW * (16.0 / 9.0);
 
     // Default position: top right corner with padding
     if (_pipPositionNotifier.value == null) {
@@ -238,10 +252,10 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
             height: pipH,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: const Color(0xFF00D4AA), width: 2.5),
+              border: Border.all(color: Colors.white, width: 2.0),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.55),
+                  color: Colors.black.withValues(alpha: 0.5),
                   blurRadius: 16,
                   offset: const Offset(0, 6),
                 ),
@@ -297,6 +311,7 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
   }
 
   Widget _buildStreamBadge(String label, Alignment alignment, {bool isMini = false}) {
+    if (!widget.showBadges) return const SizedBox.shrink();
     return Align(
       alignment: alignment,
       child: Container(
@@ -306,7 +321,7 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
           color: Colors.black.withValues(alpha: 0.65),
           borderRadius: BorderRadius.circular(6),
           border: Border.all(
-            color: label == 'FRONT' ? const Color(0xFF6C63FF) : const Color(0xFF00D4AA),
+            color: Colors.white24,
             width: 1,
           ),
         ),

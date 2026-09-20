@@ -213,32 +213,126 @@ public:
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
 
-    struct VulkanGreenScreenMaskInfo {
-        uint64_t imageViewHandle = 0;
-        uint64_t samplerHandle = 0;
-        uint32_t width = 0;
-        uint32_t height = 0;
-    };
-
-    RenderFrameResult renderDuetGreenScreenFrame(
-        void* queueHandle,
-        VulkanSurfaceSwapchain& swapchain,
-        VulkanHardwareBufferImports& ahbImports,
-        HardwareBufferHandle backgroundHandle,
-        HardwareBufferHandle foregroundHandle,
-        const VulkanGreenScreenMaskInfo& maskInfo);
-
-    // ANDROID-DUET-VULKAN-LAYOUT: one opaque Duet layout layer. [rect] is the
-    // canvas pixel rect (top-left origin, Y-down, width/height > 0) the
-    // layer aspect-fills; [bufferWidth]/[bufferHeight] are the imported
-    // buffer's content dimensions used for the aspect-fill crop (0 on either
-    // axis stretches the layer to the rect instead).
+    // ANDROID-DUET-VULKAN-LAYOUT: one Duet layer. [rect] is the canvas pixel
+    // rect (top-left origin, Y-down, width/height > 0) the layer
+    // aspect-fills; [bufferWidth]/[bufferHeight] are the imported buffer's
+    // content dimensions used for the aspect-fill crop (0 on either axis
+    // stretches the layer to the rect instead). Shared by the opaque layout
+    // frame and the green-screen frame below.
     struct DuetLayoutLayer {
         HardwareBufferHandle handle = kInvalidHardwareBufferHandle;
         RenderDestinationRect rect;
         uint32_t bufferWidth = 0;
         uint32_t bufferHeight = 0;
+        // ANDROID-DUET-VULKAN-TRANSFORM: cardinal clockwise display rotation
+        // of this layer's buffer content (0/90/180/270; non-cardinal values
+        // normalize to 0) and whether it is additionally mirrored
+        // horizontally (front camera). Threaded straight into
+        // VulkanDuetLayoutLayerGeometry / ResolveVulkanDuetLayoutLayerPlacement,
+        // applied before the aspect-fill crop, exactly like a solo frame's
+        // VideoFrameTransform.
+        uint32_t rotationDegrees = 0;
+        bool mirrorHorizontal = false;
+        float cornerRadiusPx = 0.0f;
     };
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: the green-screen matte.
+    // [imageViewHandle] is the mask's VkImageView widened to uint64_t; it is
+    // sampled with VulkanGreenScreenFrameRenderer's own LINEAR sampler, so it
+    // must be a non-external-format R8 / RGBA8 image whose .r channel is the
+    // matte (0 -> source shows through, 1 -> camera). [width]/[height] must
+    // be > 0.
+    //
+    // When [gpuMaskHandle] is a currently active import (the GPU-resident
+    // mask the session holds across frames), renderDuetGreenScreenFrame also
+    // owns that import's per-frame bookkeeping: it records the
+    // UNDEFINED -> SHADER_READ_ONLY_OPTIMAL transition on first use, waits on
+    // its pending acquire semaphore, and marks it submitted / transitioned
+    // after a successful submit -- but never releases it and never stores a
+    // release sync-fd on it. Leave it kInvalidHardwareBufferHandle for the
+    // CPU-uploaded overlay-texture mask, which needs none of that.
+    struct VulkanGreenScreenMaskInfo {
+        uint64_t imageViewHandle = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        HardwareBufferHandle gpuMaskHandle = kInvalidHardwareBufferHandle;
+
+        // RND debug visualization mode forwarded verbatim to
+        // VulkanGreenScreenCameraDraw::debugMode (0 = normal, 1 = mask_direct,
+        // 2 = mask_mapped, 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y).
+        int32_t debugMode = 0;
+    };
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: Duet green-screen frame.
+    // [source] (decoder) is drawn first, opaque and aspect-filled into its
+    // rect through its import's own descriptor resources and the core
+    // passthrough shaders (the same cached per-layer pipeline
+    // renderDuetLayoutFrame uses), then [camera] is drawn aspect-filled into
+    // ITS rect through VulkanGreenScreenFrameRenderer::recordCameraDraw: the
+    // camera import's own external-format descriptor set, alpha-masked by
+    // [maskInfo] and straight-alpha blended over the source layer. Both
+    // placements come from ResolveVulkanDuetLayoutLayerPlacement, so rect /
+    // aspect-fill crop / colour semantics are identical to the layout path;
+    // the mask is sampled at the camera's cropped UV (no extra rotation or
+    // mirror -- see the shader for the CPU-mask orientation caveat).
+    //
+    // Same acquire / frame fence / imageAvailable + presentReady semaphore /
+    // pending AHB acquire semaphore wait / release-fence export (one export,
+    // dup'd to the second import) / present protocol and post-submit
+    // bookkeeping as renderDuetLayoutFrame, plus the GPU-mask bookkeeping
+    // described on VulkanGreenScreenMaskInfo. Invalid geometry fails closed
+    // with kVulkanFailure before the swapchain is touched; any later failure
+    // fails closed with no partial present.
+    RenderFrameResult renderDuetGreenScreenFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        const DuetLayoutLayer& source,
+        const DuetLayoutLayer& camera,
+        const VulkanGreenScreenMaskInfo& maskInfo);
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
+    // only): the static, non-video background of a camera-only green-screen
+    // frame. [clearRgba] is the swapchain render pass clear colour the whole
+    // canvas is filled with in place of the decoded source layer;
+    // [modeLabel] is the caller's backgroundMode token (e.g. "solid_teal"),
+    // used verbatim in the one-shot first-frame structured log only. Never
+    // null; not retained beyond the call.
+    struct DuetStaticBackground {
+        float clearRgba[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        const char* modeLabel = "";
+    };
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
+    // only): camera-only Duet green-screen frame over a static background.
+    // Identical to renderDuetGreenScreenFrame above EXCEPT that there is no
+    // source / decoder layer at all: the swapchain render pass is begun with
+    // [background].clearRgba as its clear colour (via the same
+    // VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen body
+    // with zero layer draws), nothing is drawn for the source, and [camera]
+    // is then drawn aspect-filled into ITS rect through
+    // VulkanGreenScreenFrameRenderer::recordCameraDraw with the SAME
+    // ResolveVulkanDuetLayoutLayerPlacement placement, [maskInfo] mask and
+    // debugMode handling as the production path. Lets RND evaluate person
+    // matte quality without video-background decoder pressure.
+    //
+    // Same acquire / frame fence / imageAvailable + presentReady semaphore /
+    // pending AHB acquire semaphore wait / present protocol, the same
+    // GPU-mask bookkeeping described on VulkanGreenScreenMaskInfo, and the
+    // same post-submit bookkeeping for the single camera import (marked
+    // submitted, one release sync-fd export stored on it). Invalid geometry
+    // fails closed with kVulkanFailure before the swapchain is touched; any
+    // later failure fails closed with no partial present. Production
+    // renderDuetGreenScreenFrame / renderDuetLayoutFrame behaviour is
+    // unchanged.
+    RenderFrameResult renderDuetGreenScreenStaticBackgroundFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        const DuetLayoutLayer& camera,
+        const VulkanGreenScreenMaskInfo& maskInfo,
+        const DuetStaticBackground& background);
 
     // ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame (PiP /
     // split, and the green-screen terminal fallback to safe PiP): [source]

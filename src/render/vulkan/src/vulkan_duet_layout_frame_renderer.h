@@ -41,6 +41,15 @@ struct VulkanDuetLayoutLayerGeometry {
     RenderDestinationRect rect;
     uint32_t bufferWidth = 0;
     uint32_t bufferHeight = 0;
+    // ANDROID-DUET-VULKAN-TRANSFORM: cardinal clockwise display rotation of
+    // this layer's buffer content (0/90/180/270; non-cardinal values
+    // normalize to 0 -- see normalizeRotation in render_transform.h) and
+    // whether it is additionally mirrored horizontally (front camera).
+    // Applied before the aspect-fill crop below, exactly like a solo frame's
+    // VideoFrameTransform.
+    uint32_t rotationDegrees = 0;
+    bool mirrorHorizontal = false;
+    float cornerRadiusPx = 0.0f;
 };
 
 // Resolved on-canvas draw of one layer.

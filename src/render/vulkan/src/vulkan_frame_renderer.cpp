@@ -356,6 +356,64 @@ struct VulkanFrameRenderer::Impl {
         duetLayoutRenderPassHandle = 0;
     }
 
+    // ANDROID-DUET-VULKAN-LAYOUT / ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL:
+    // (re)builds the two per-layer opaque Duet pipelines when the cached
+    // (source layout, camera layout, render pass) key differs. Shared by the
+    // layout and green-screen paths -- the latter draws only the source
+    // layer through it, but keeping one key for both means a green-screen
+    // <-> layout toggle never churns the pair. The previous pair may still be
+    // in flight on the other frame slot, so the device is idled before
+    // destroying it. Returns false (with the pair invalidated) on failure.
+    bool ensureDuetLayoutPipelines(VkPipelineLayout sourceLayout,
+                                   VkPipelineLayout cameraLayout,
+                                   uint64_t renderPassHandle,
+                                   VkRenderPass renderPass,
+                                   VulkanCoreShaderModules& coreShaders) {
+        const bool pipelinesValid =
+            duetLayoutSourcePipeline && duetLayoutSourcePipeline->isValid() &&
+            duetLayoutCameraPipeline && duetLayoutCameraPipeline->isValid();
+        const bool mismatch =
+            !pipelinesValid ||
+            duetLayoutSourceLayout != sourceLayout ||
+            duetLayoutCameraLayout != cameraLayout ||
+            duetLayoutRenderPassHandle != renderPassHandle;
+        if (!mismatch) {
+            return true;
+        }
+        if (vkDeviceWaitIdle(device) != VK_SUCCESS) {
+            return false;
+        }
+        invalidateDuetLayoutPipelines();
+        duetLayoutSourcePipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!duetLayoutSourcePipeline->create(device, sourceLayout, renderPass,
+                                              coreShaders.vertex.get(),
+                                              coreShaders.fragment.get())) {
+            invalidateDuetLayoutPipelines();
+            return false;
+        }
+        duetLayoutCameraPipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!duetLayoutCameraPipeline->create(device, cameraLayout, renderPass,
+                                              coreShaders.vertex.get(),
+                                              coreShaders.fragment.get())) {
+            invalidateDuetLayoutPipelines();
+            return false;
+        }
+        duetLayoutSourceLayout = sourceLayout;
+        duetLayoutCameraLayout = cameraLayout;
+        duetLayoutRenderPassHandle = renderPassHandle;
+        return true;
+    }
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: one-shot structured log of the
+    // first successfully submitted green-screen frame's geometry / mask
+    // source, for physical-smoke log analysis.
+    bool greenScreenFirstFrameLogged = false;
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND: one-shot structured
+    // log of the first successfully submitted camera-only static-background
+    // green-screen frame (RND diagnostic), independent of the flag above.
+    bool greenScreenStaticBackgroundFirstFrameLogged = false;
+
     // Torn down only on shutdown()/failClosed() (never from the routine
     // invalidatePipeline() hot path) so beauty's cached geometry/pipelines
     // survive ordinary per-frame pipeline-layout churn.
@@ -2931,12 +2989,38 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
 }
 
+// ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: Duet green-screen frame. Mirrors
+// renderDuetLayoutFrame below's entire acquire / frame-fence / imageAvailable
+// + presentReady semaphore / pending AHB acquire semaphore wait /
+// release-fence export (one export, dup'd to the second import) / present
+// protocol and its post-submit bookkeeping for both layer imports, and
+// records the frame as:
+//   1. (outside the render pass) the GPU mask import's first-use layout
+//      transition, when a GPU mask is in use and still UNDEFINED;
+//   2. VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen with
+//      the optional source / camera layout transitions, one clear render
+//      pass, and the SOURCE layer draw only (opaque, aspect-filled into its
+//      rect through its import's own descriptor resources + core passthrough
+//      shaders, i.e. the same cached pipeline the layout path uses), leaving
+//      the render pass OPEN;
+//   3. VulkanGreenScreenFrameRenderer::recordCameraDraw appended into that
+//      same render pass: the camera import's own external-format descriptor
+//      set (set 0) alpha-masked by the mask (set 1), viewport / scissor / UV
+//      crop from the SAME ResolveVulkanDuetLayoutLayerPlacement resolution
+//      the layout path uses for the camera layer, straight-alpha blended
+//      over the source layer;
+//   4. vkCmdEndRenderPass / vkEndCommandBuffer here.
+// The GPU mask import (held across frames by the session) additionally has
+// its pending acquire semaphore waited and is marked submitted / transitioned
+// after a successful submit; it is never released and never has a release
+// sync-fd stored on it.
 RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     void* queueHandle,
     VulkanSurfaceSwapchain& swapchain,
     VulkanHardwareBufferImports& ahbImports,
-    HardwareBufferHandle backgroundHandle,
-    HardwareBufferHandle foregroundHandle,
+    VulkanCoreShaderModules& coreShaders,
+    const DuetLayoutLayer& source,
+    const DuetLayoutLayer& camera,
     const VulkanGreenScreenMaskInfo& maskInfo) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
@@ -2949,25 +3033,40 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     if (!swapchain.hasSurface()) {
         return RenderFrameResult::kNoSurface;
     }
-    if (backgroundHandle == foregroundHandle) {
+    if (source.handle == camera.handle) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
-    const VulkanHardwareBufferImage* backgroundImage = ahbImports.getImage(backgroundHandle);
-    const VulkanHardwareBufferImage* foregroundImage = ahbImports.getImage(foregroundHandle);
-    if (!ahbImports.hasBuffer(backgroundHandle) || backgroundImage == nullptr ||
-        !ahbImports.hasBuffer(foregroundHandle) || foregroundImage == nullptr) {
+    const VulkanHardwareBufferImage* sourceImage = ahbImports.getImage(source.handle);
+    const VulkanHardwareBufferImage* cameraImage = ahbImports.getImage(camera.handle);
+    if (!ahbImports.hasBuffer(source.handle) || sourceImage == nullptr ||
+        !ahbImports.hasBuffer(camera.handle) || cameraImage == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
-    if (backgroundImage->image == VK_NULL_HANDLE ||
-        backgroundImage->imageView == VK_NULL_HANDLE ||
-        backgroundImage->sampler == VK_NULL_HANDLE ||
-        foregroundImage->image == VK_NULL_HANDLE ||
-        foregroundImage->imageView == VK_NULL_HANDLE ||
-        foregroundImage->sampler == VK_NULL_HANDLE ||
-        maskInfo.imageViewHandle == 0 || maskInfo.samplerHandle == 0 ||
-        maskInfo.width == 0 || maskInfo.height == 0 ||
+    if (sourceImage->image == VK_NULL_HANDLE || cameraImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        maskInfo.imageViewHandle == 0 || maskInfo.width == 0 || maskInfo.height == 0 ||
         !s.frameSync || !s.frameSync->isInitialized()) {
         return RenderFrameResult::kVulkanFailure;
+    }
+
+    // GPU mask import (held across frames by the session): must be an active
+    // import distinct from both layers, non-external-format (it is sampled
+    // through the green-screen helper's own mutable sampler, not an
+    // immutable YCbCr one), and the view being sampled must be its own.
+    const bool hasGpuMask = maskInfo.gpuMaskHandle != kInvalidHardwareBufferHandle;
+    const VulkanHardwareBufferImage* gpuMaskImage = nullptr;
+    if (hasGpuMask) {
+        if (maskInfo.gpuMaskHandle == source.handle || maskInfo.gpuMaskHandle == camera.handle ||
+            !ahbImports.hasBuffer(maskInfo.gpuMaskHandle)) {
+            return RenderFrameResult::kInvalidBufferHandle;
+        }
+        gpuMaskImage = ahbImports.getImage(maskInfo.gpuMaskHandle);
+        if (gpuMaskImage == nullptr || gpuMaskImage->image == VK_NULL_HANDLE ||
+            gpuMaskImage->imageView == VK_NULL_HANDLE || gpuMaskImage->isExternalFormat() ||
+            vkHandleToU64(gpuMaskImage->imageView) != maskInfo.imageViewHandle) {
+            return RenderFrameResult::kVulkanFailure;
+        }
     }
 
     const uint32_t frameCount = s.frameSync->getFrameCount();
@@ -2984,14 +3083,71 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
     const uint32_t extentWidth = swapchain.getExtentWidth();
     const uint32_t extentHeight = swapchain.getExtentHeight();
-    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0) {
+    const VkPipelineLayout sourceLayout = sourceImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet sourceSet = sourceImage->descriptorResources.descriptorSet;
+    const VkPipelineLayout cameraLayout = cameraImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSetLayout cameraSetLayout = cameraImage->descriptorResources.descriptorSetLayout;
+    const VkDescriptorSet cameraSet = cameraImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        sourceLayout == VK_NULL_HANDLE || sourceSet == VK_NULL_HANDLE ||
+        cameraLayout == VK_NULL_HANDLE || cameraSetLayout == VK_NULL_HANDLE ||
+        cameraSet == VK_NULL_HANDLE) {
         return RenderFrameResult::kVulkanFailure;
     }
     const VkRenderPass renderPass = u64ToVkHandle<VkRenderPass>(renderPassHandle);
 
+    // Geometry is pure math; resolve (and fail closed) before any Vulkan
+    // state is touched so an invalid rect never reaches the swapchain. Both
+    // layers go through the SAME placement helper as the layout path, which
+    // is the single source of truth for rect / aspect-fill crop.
+    VulkanDuetLayoutLayerGeometry sourceGeometry;
+    sourceGeometry.rect = source.rect;
+    sourceGeometry.bufferWidth = source.bufferWidth;
+    sourceGeometry.bufferHeight = source.bufferHeight;
+    sourceGeometry.rotationDegrees = source.rotationDegrees;
+    sourceGeometry.mirrorHorizontal = source.mirrorHorizontal;
+    VulkanDuetLayoutLayerGeometry cameraGeometry;
+    cameraGeometry.rect = camera.rect;
+    cameraGeometry.bufferWidth = camera.bufferWidth;
+    cameraGeometry.bufferHeight = camera.bufferHeight;
+    cameraGeometry.rotationDegrees = camera.rotationDegrees;
+    cameraGeometry.mirrorHorizontal = camera.mirrorHorizontal;
+    VulkanDuetLayoutLayerPlacement sourcePlacement;
+    VulkanDuetLayoutLayerPlacement cameraPlacement;
+    if (!ResolveVulkanDuetLayoutLayerPlacement(sourceGeometry, extentWidth, extentHeight,
+                                               &sourcePlacement) ||
+        !ResolveVulkanDuetLayoutLayerPlacement(cameraGeometry, extentWidth, extentHeight,
+                                               &cameraPlacement)) {
+        VGLOG_VFR("renderDuetGreenScreenFrame: invalid layer rect (source %d,%d %dx%d camera "
+                  "%d,%d %dx%d extent %ux%u); failing closed",
+                  source.rect.x, source.rect.y, source.rect.width, source.rect.height,
+                  camera.rect.x, camera.rect.y, camera.rect.width, camera.rect.height,
+                  extentWidth, extentHeight);
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Source layer: the layout path's cached opaque per-layer pipeline pair
+    // (one key for both paths, see Impl::ensureDuetLayoutPipelines).
+    if (!s.ensureDuetLayoutPipelines(sourceLayout, cameraLayout, renderPassHandle, renderPass,
+                                     coreShaders)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Camera layer: the green-screen helper's pipeline is keyed by the camera
+    // import's descriptor set layout (immutable external-format sampler) and
+    // the render pass. Like the pair above, a stale pipeline may still be in
+    // flight on the other frame slot, so idle before invalidating.
     if (!s.greenScreenRenderer) {
         s.greenScreenRenderer = std::make_unique<VulkanGreenScreenFrameRenderer>();
     }
+    const uint64_t cameraSetLayoutHandle = vkHandleToU64(cameraSetLayout);
+    if (s.greenScreenRenderer->needsPipelineRebuild(cameraSetLayoutHandle, renderPassHandle)) {
+        if (vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.greenScreenRenderer->invalidate(s.device);
+    }
+
     if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
         return RenderFrameResult::kVulkanFailure;
     }
@@ -3033,51 +3189,83 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
-    const VulkanHardwareBufferImage* sourceImages[] = {backgroundImage, foregroundImage};
-    const HardwareBufferHandle sourceHandles[] = {backgroundHandle, foregroundHandle};
-    for (uint32_t i = 0; i < 2; ++i) {
-        if (ahbImports.getImageLayout(sourceHandles[i]) ==
+    // 1. GPU mask first-use layout transition (outside the render pass, same
+    //    stage / access masks as the layer imports' transitions).
+    if (gpuMaskImage != nullptr &&
+        ahbImports.getImageLayout(maskInfo.gpuMaskHandle) ==
             static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED)) {
-            sourceImages[i]->recordLayoutTransition(
-                frame->commandBuffer,
-                VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                0,
-                VK_ACCESS_SHADER_READ_BIT);
-        }
+        gpuMaskImage->recordLayoutTransition(
+            frame->commandBuffer,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            VK_ACCESS_SHADER_READ_BIT);
     }
 
-    VkClearValue clearValue{};
-    clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-    VkRenderPassBeginInfo renderPassBeginInfo{};
-    renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    renderPassBeginInfo.renderPass = renderPass;
-    renderPassBeginInfo.framebuffer = framebuffer;
-    renderPassBeginInfo.renderArea.offset = {0, 0};
-    renderPassBeginInfo.renderArea.extent = {extentWidth, extentHeight};
-    renderPassBeginInfo.clearValueCount = 1;
-    renderPassBeginInfo.pClearValues = &clearValue;
-    vkCmdBeginRenderPass(frame->commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+    // 2. Source / camera transitions, clear render pass, source layer draw;
+    //    render pass left open.
+    VulkanTransitionPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    passParams.fromImage = sourceImage;
+    passParams.fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionFromImage =
+        ahbImports.getImageLayout(source.handle) ==
+        static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED);
+    passParams.toImage = cameraImage;
+    passParams.toOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionToImage =
+        ahbImports.getImageLayout(camera.handle) ==
+        static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED);
 
-    VulkanGreenScreenFrameInputs inputs{};
-    inputs.backgroundImageView = vkHandleToU64(backgroundImage->imageView);
-    inputs.backgroundSampler = vkHandleToU64(backgroundImage->sampler);
-    inputs.foregroundImageView = vkHandleToU64(foregroundImage->imageView);
-    inputs.foregroundSampler = vkHandleToU64(foregroundImage->sampler);
-    inputs.maskImageView = maskInfo.imageViewHandle;
-    inputs.maskSampler = maskInfo.samplerHandle;
-    inputs.maskWidth = maskInfo.width;
-    inputs.maskHeight = maskInfo.height;
+    VulkanTransitionLayerResources sourceRes;
+    sourceRes.pipeline = s.duetLayoutSourcePipeline->get();
+    sourceRes.pipelineLayout = sourceLayout;
+    sourceRes.descriptorSet = sourceSet;
+    if (!AppendVulkanDuetLayoutLayer(&passParams, sourceRes, sourcePlacement)) {
+        abandonRecordingCommandBuffer(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    // Validates every handle / extent / scissor before recording anything
+    // (nothing is recorded on a validation failure, so no render pass is
+    // open on that path).
+    if (!VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen(passParams)) {
+        abandonRecordingCommandBuffer(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // 3. Camera layer, alpha-masked, into the same open render pass.
+    VulkanGreenScreenCameraDraw cameraDraw{};
+    cameraDraw.cameraDescriptorSetLayout = cameraSetLayoutHandle;
+    cameraDraw.cameraDescriptorSet = vkHandleToU64(cameraSet);
+    cameraDraw.maskImageView = maskInfo.imageViewHandle;
+    cameraDraw.maskWidth = maskInfo.width;
+    cameraDraw.maskHeight = maskInfo.height;
+    cameraDraw.debugMode = maskInfo.debugMode;
+    cameraDraw.viewportX = cameraPlacement.viewport.x;
+    cameraDraw.viewportY = cameraPlacement.viewport.y;
+    cameraDraw.viewportWidth = cameraPlacement.viewport.width();
+    cameraDraw.viewportHeight = cameraPlacement.viewport.height();
+    cameraDraw.scissorX = cameraPlacement.scissor.x;
+    cameraDraw.scissorY = cameraPlacement.scissor.y;
+    cameraDraw.scissorWidth = cameraPlacement.scissor.width();
+    cameraDraw.scissorHeight = cameraPlacement.scissor.height();
+    cameraDraw.pushConstants = cameraPlacement.pushConstants;
     std::string failureReason;
-    if (!s.greenScreenRenderer->recordGreenScreenDraw(
+    if (!s.greenScreenRenderer->recordCameraDraw(
             s.device, frame->commandBuffer, renderPassHandle,
-            extentWidth, extentHeight, inputs, &failureReason)) {
-        VGLOG_VFR("renderDuetGreenScreenFrame draw failed: %s", failureReason.c_str());
+            extentWidth, extentHeight, cameraDraw, &failureReason)) {
+        VGLOG_VFR("renderDuetGreenScreenFrame camera draw failed: %s", failureReason.c_str());
         abandonOpenRenderPass(frame->commandBuffer);
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
+
+    // 4. Close the pass and the command buffer.
     vkCmdEndRenderPass(frame->commandBuffer);
     if (vkEndCommandBuffer(frame->commandBuffer) != VK_SUCCESS) {
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
@@ -3086,24 +3274,33 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
-    VkSemaphore waitSemaphores[3] = {
-        frame->imageAvailableSemaphore, VK_NULL_HANDLE, VK_NULL_HANDLE,
+    // imageAvailable + up to three distinct pending AHB acquire semaphores
+    // (source, camera, GPU mask).
+    VkSemaphore waitSemaphores[4] = {
+        frame->imageAvailableSemaphore, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
     };
-    VkPipelineStageFlags waitStages[3] = {
+    VkPipelineStageFlags waitStages[4] = {
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
     };
     uint32_t waitSemaphoreCount = 1;
-    const uint64_t backgroundPendingAcquire =
-        ahbImports.getPendingAcquireSemaphoreHandle(backgroundHandle);
-    const uint64_t foregroundPendingAcquire =
-        ahbImports.getPendingAcquireSemaphoreHandle(foregroundHandle);
-    if (backgroundPendingAcquire != 0) {
-        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(backgroundPendingAcquire);
+    const uint64_t sourcePendingAcquire =
+        ahbImports.getPendingAcquireSemaphoreHandle(source.handle);
+    const uint64_t cameraPendingAcquire =
+        ahbImports.getPendingAcquireSemaphoreHandle(camera.handle);
+    const uint64_t maskPendingAcquire =
+        hasGpuMask ? ahbImports.getPendingAcquireSemaphoreHandle(maskInfo.gpuMaskHandle) : 0;
+    if (sourcePendingAcquire != 0) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(sourcePendingAcquire);
     }
-    if (foregroundPendingAcquire != 0 && foregroundPendingAcquire != backgroundPendingAcquire) {
-        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(foregroundPendingAcquire);
+    if (cameraPendingAcquire != 0 && cameraPendingAcquire != sourcePendingAcquire) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(cameraPendingAcquire);
+    }
+    if (maskPendingAcquire != 0 && maskPendingAcquire != sourcePendingAcquire &&
+        maskPendingAcquire != cameraPendingAcquire) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(maskPendingAcquire);
     }
 
     const bool canExportRelease =
@@ -3131,61 +3328,466 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
                 ? RenderFrameResult::kDeviceLost : RenderFrameResult::kVulkanFailure);
     }
 
-    // Both imports now belong to this submission, even if later bookkeeping fails.
-    const bool backgroundAcquireMarked = backgroundPendingAcquire == 0 ||
-        ahbImports.markAcquireSemaphoreSubmitted(backgroundHandle);
-    const bool foregroundAcquireMarked = foregroundPendingAcquire == 0 ||
-        ahbImports.markAcquireSemaphoreSubmitted(foregroundHandle);
-    const bool backgroundSubmitted = ahbImports.markBufferSubmitted(backgroundHandle, s.currentFrameIndex);
-    const bool foregroundSubmitted = ahbImports.markBufferSubmitted(foregroundHandle, s.currentFrameIndex);
-    const bool backgroundLayoutSet = ahbImports.setImageLayout(
-        backgroundHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-    const bool foregroundLayoutSet = ahbImports.setImageLayout(
-        foregroundHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-    if (!backgroundAcquireMarked || !foregroundAcquireMarked ||
-        !backgroundSubmitted || !foregroundSubmitted ||
-        !backgroundLayoutSet || !foregroundLayoutSet) {
+    // All three imports now belong to this submission, even if later
+    // bookkeeping fails. The GPU mask is marked submitted so a later release
+    // (UpdateGpuMask replacing it, or session teardown) retires it behind
+    // this frame's fence instead of destroying an image the GPU may still be
+    // sampling.
+    const bool sourceAcquireMarked = sourcePendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(source.handle);
+    const bool cameraAcquireMarked = cameraPendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(camera.handle);
+    const bool maskAcquireMarked = maskPendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(maskInfo.gpuMaskHandle);
+    const bool sourceSubmitted = ahbImports.markBufferSubmitted(source.handle, s.currentFrameIndex);
+    const bool cameraSubmitted = ahbImports.markBufferSubmitted(camera.handle, s.currentFrameIndex);
+    const bool maskSubmitted = !hasGpuMask ||
+        ahbImports.markBufferSubmitted(maskInfo.gpuMaskHandle, s.currentFrameIndex);
+    const bool sourceLayoutSet = ahbImports.setImageLayout(
+        source.handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    const bool cameraLayoutSet = ahbImports.setImageLayout(
+        camera.handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    const bool maskLayoutSet = !hasGpuMask || ahbImports.setImageLayout(
+        maskInfo.gpuMaskHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    if (!sourceAcquireMarked || !cameraAcquireMarked || !maskAcquireMarked ||
+        !sourceSubmitted || !cameraSubmitted || !maskSubmitted ||
+        !sourceLayoutSet || !cameraLayoutSet || !maskLayoutSet) {
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
-    int backgroundReleaseFd = -1;
-    int foregroundReleaseFd = -1;
+    int sourceReleaseFd = -1;
+    int cameraReleaseFd = -1;
     if (canExportRelease) {
         VkSemaphoreGetFdInfoKHR semGetFdInfo{};
         semGetFdInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
         semGetFdInfo.semaphore = frame->releaseFenceSemaphore;
         semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
         const VkResult exportResult =
-            s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &backgroundReleaseFd);
+            s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &sourceReleaseFd);
         if (exportResult != VK_SUCCESS) {
-            VGLOG_VFR("duet vkGetSemaphoreFdKHR failed: %d", static_cast<int>(exportResult));
-            if (backgroundReleaseFd >= 0) ::close(backgroundReleaseFd);
-            ahbImports.setLatestReleaseFenceFd(backgroundHandle, -1);
-            ahbImports.setLatestReleaseFenceFd(foregroundHandle, -1);
+            VGLOG_VFR("duet green-screen vkGetSemaphoreFdKHR failed: %d",
+                      static_cast<int>(exportResult));
+            if (sourceReleaseFd >= 0) ::close(sourceReleaseFd);
+            ahbImports.setLatestReleaseFenceFd(source.handle, -1);
+            ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
             return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
         }
         // Export consumes the semaphore payload: share that single sync-fd with both inputs.
-        if (backgroundReleaseFd >= 0) {
-            foregroundReleaseFd = ::dup(backgroundReleaseFd);
-            if (foregroundReleaseFd < 0) {
-                VGLOG_VFR("duet release sync-fd dup failed; failing closed");
-                ::close(backgroundReleaseFd);
-                ahbImports.setLatestReleaseFenceFd(backgroundHandle, -1);
-                ahbImports.setLatestReleaseFenceFd(foregroundHandle, -1);
+        if (sourceReleaseFd >= 0) {
+            cameraReleaseFd = ::dup(sourceReleaseFd);
+            if (cameraReleaseFd < 0) {
+                VGLOG_VFR("duet green-screen release sync-fd dup failed; failing closed");
+                ::close(sourceReleaseFd);
+                ahbImports.setLatestReleaseFenceFd(source.handle, -1);
+                ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
                 return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
             }
         }
     }
     // Each setter consumes its fd even on failure; attempt both without short-circuiting.
     // With no export support (or an empty sync-fd), -1 clears both stale stored fds.
-    const bool backgroundReleaseStored =
-        ahbImports.setLatestReleaseFenceFd(backgroundHandle, backgroundReleaseFd);
-    const bool foregroundReleaseStored =
-        ahbImports.setLatestReleaseFenceFd(foregroundHandle, foregroundReleaseFd);
-    if (!backgroundReleaseStored || !foregroundReleaseStored) {
-        ahbImports.setLatestReleaseFenceFd(backgroundHandle, -1);
-        ahbImports.setLatestReleaseFenceFd(foregroundHandle, -1);
+    const bool sourceReleaseStored =
+        ahbImports.setLatestReleaseFenceFd(source.handle, sourceReleaseFd);
+    const bool cameraReleaseStored =
+        ahbImports.setLatestReleaseFenceFd(camera.handle, cameraReleaseFd);
+    if (!sourceReleaseStored || !cameraReleaseStored) {
+        ahbImports.setLatestReleaseFenceFd(source.handle, -1);
+        ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.greenScreenFirstFrameLogged) {
+        s.greenScreenFirstFrameLogged = true;
+        // maskUv reports the actual GLSL matte-sampling policy selected by
+        // maskInfo.debugMode (see glsl/greenscreen_blend.frag): normal mode
+        // (0) samples the RAW camera-rect UV with Y flipped, eroded by one
+        // mask texel and shaped with smoothstep (raw_flip_y_eroded); modes
+        // 1..4 are the RND direct/mapped/mirror/flip diagnostics and report
+        // their own shader-side name verbatim.
+        const char* maskUvLabel = "raw_flip_y_eroded";
+        switch (maskInfo.debugMode) {
+            case 1: maskUvLabel = "mask_direct"; break;
+            case 2: maskUvLabel = "mask_mapped"; break;
+            case 3: maskUvLabel = "mask_direct_mirror_x"; break;
+            case 4: maskUvLabel = "mask_direct_flip_y"; break;
+            default: break;
+        }
+        VGLOG_VFR("ANDROID_DUET_VULKAN_GREENSCREEN_VISUAL_FIRST canvas=%ux%u "
+                  "source=%d,%d %dx%d buf=%ux%u camera=%d,%d %dx%d buf=%ux%u "
+                  "mask=%ux%u maskSource=%s debugMode=%d maskUv=%s "
+                  "sourceRot=%u sourceMirror=%d cameraRot=%u cameraMirror=%d",
+                  extentWidth, extentHeight,
+                  source.rect.x, source.rect.y, source.rect.width, source.rect.height,
+                  source.bufferWidth, source.bufferHeight,
+                  camera.rect.x, camera.rect.y, camera.rect.width, camera.rect.height,
+                  camera.bufferWidth, camera.bufferHeight,
+                  maskInfo.width, maskInfo.height,
+                  hasGpuMask ? "gpu_import" : "cpu_upload",
+                  maskInfo.debugMode, maskUvLabel,
+                  source.rotationDegrees, source.mirrorHorizontal ? 1 : 0,
+                  camera.rotationDegrees, camera.mirrorHorizontal ? 1 : 0);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle, presentReadySemaphoreHandle, imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+}
+
+// ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic only):
+// camera-only Duet green-screen frame over a static clear-colour background.
+// Mirrors renderDuetGreenScreenFrame above's acquire / frame-fence /
+// imageAvailable + presentReady semaphore / pending AHB acquire semaphore
+// wait / release-fence export / present protocol and its GPU-mask
+// bookkeeping, but with NO source / decoder layer:
+//   1. (outside the render pass) the GPU mask import's first-use layout
+//      transition, when a GPU mask is in use and still UNDEFINED;
+//   2. VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen with
+//      the optional camera layout transition, one render pass cleared to
+//      background.clearRgba and ZERO layer draws (the recorder explicitly
+//      supports a clear-only pass), leaving the render pass OPEN;
+//   3. VulkanGreenScreenFrameRenderer::recordCameraDraw appended into that
+//      same render pass, with the camera placement / mask / debugMode
+//      resolved exactly as the production path resolves them;
+//   4. vkCmdEndRenderPass / vkEndCommandBuffer here.
+// Post-submit bookkeeping covers the single camera import (marked submitted,
+// layout set, one release sync-fd stored -- no dup, there is no second
+// import) plus the held GPU mask import exactly as in the production path.
+RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenStaticBackgroundFrame(
+    void* queueHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    const DuetLayoutLayer& camera,
+    const VulkanGreenScreenMaskInfo& maskInfo,
+    const DuetStaticBackground& background) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
+        s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    const VulkanHardwareBufferImage* cameraImage = ahbImports.getImage(camera.handle);
+    if (!ahbImports.hasBuffer(camera.handle) || cameraImage == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (cameraImage->image == VK_NULL_HANDLE ||
+        maskInfo.imageViewHandle == 0 || maskInfo.width == 0 || maskInfo.height == 0 ||
+        background.modeLabel == nullptr ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // GPU mask import: same validation as the production path (active,
+    // distinct from the camera layer, non-external-format, own view).
+    const bool hasGpuMask = maskInfo.gpuMaskHandle != kInvalidHardwareBufferHandle;
+    const VulkanHardwareBufferImage* gpuMaskImage = nullptr;
+    if (hasGpuMask) {
+        if (maskInfo.gpuMaskHandle == camera.handle ||
+            !ahbImports.hasBuffer(maskInfo.gpuMaskHandle)) {
+            return RenderFrameResult::kInvalidBufferHandle;
+        }
+        gpuMaskImage = ahbImports.getImage(maskInfo.gpuMaskHandle);
+        if (gpuMaskImage == nullptr || gpuMaskImage->image == VK_NULL_HANDLE ||
+            gpuMaskImage->imageView == VK_NULL_HANDLE || gpuMaskImage->isExternalFormat() ||
+            vkHandleToU64(gpuMaskImage->imageView) != maskInfo.imageViewHandle) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame = s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    const VkDescriptorSetLayout cameraSetLayout = cameraImage->descriptorResources.descriptorSetLayout;
+    const VkDescriptorSet cameraSet = cameraImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        cameraSetLayout == VK_NULL_HANDLE || cameraSet == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass = u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    // Camera placement through the SAME helper as the production green-screen
+    // and layout paths (single source of truth for rect / aspect-fill crop /
+    // rotation / mirror); resolved before any Vulkan state is touched.
+    VulkanDuetLayoutLayerGeometry cameraGeometry;
+    cameraGeometry.rect = camera.rect;
+    cameraGeometry.bufferWidth = camera.bufferWidth;
+    cameraGeometry.bufferHeight = camera.bufferHeight;
+    cameraGeometry.rotationDegrees = camera.rotationDegrees;
+    cameraGeometry.mirrorHorizontal = camera.mirrorHorizontal;
+    VulkanDuetLayoutLayerPlacement cameraPlacement;
+    if (!ResolveVulkanDuetLayoutLayerPlacement(cameraGeometry, extentWidth, extentHeight,
+                                               &cameraPlacement)) {
+        VGLOG_VFR("renderDuetGreenScreenStaticBackgroundFrame: invalid camera rect "
+                  "(%d,%d %dx%d extent %ux%u); failing closed",
+                  camera.rect.x, camera.rect.y, camera.rect.width, camera.rect.height,
+                  extentWidth, extentHeight);
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Camera layer: same green-screen helper pipeline cache / rebuild
+    // protocol as the production path (keyed by the camera import's
+    // descriptor set layout and the render pass; idle before invalidating).
+    if (!s.greenScreenRenderer) {
+        s.greenScreenRenderer = std::make_unique<VulkanGreenScreenFrameRenderer>();
+    }
+    const uint64_t cameraSetLayoutHandle = vkHandleToU64(cameraSetLayout);
+    if (s.greenScreenRenderer->needsPipelineRebuild(cameraSetLayoutHandle, renderPassHandle)) {
+        if (vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.greenScreenRenderer->invalidate(s.device);
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore), 0, &imageIndex, UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle = swapchain.getFramebufferHandle(imageIndex);
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (framebufferHandle == 0 || presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer = u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(frame->commandBuffer, &beginInfo) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // 1. GPU mask first-use layout transition (outside the render pass).
+    if (gpuMaskImage != nullptr &&
+        ahbImports.getImageLayout(maskInfo.gpuMaskHandle) ==
+            static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED)) {
+        gpuMaskImage->recordLayoutTransition(
+            frame->commandBuffer,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            VK_ACCESS_SHADER_READ_BIT);
+    }
+
+    // 2. Optional camera transition, then a clear-only render pass filled
+    //    with the static background colour (zero layer draws -- no source
+    //    layer exists on this path); render pass left open.
+    VulkanTransitionPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    passParams.clearColor.float32[0] = background.clearRgba[0];
+    passParams.clearColor.float32[1] = background.clearRgba[1];
+    passParams.clearColor.float32[2] = background.clearRgba[2];
+    passParams.clearColor.float32[3] = background.clearRgba[3];
+    passParams.fromImage = cameraImage;
+    passParams.fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionFromImage =
+        ahbImports.getImageLayout(camera.handle) ==
+        static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED);
+    passParams.drawCount = 0;
+    // Validates every handle / extent before recording anything (nothing is
+    // recorded on a validation failure, so no render pass is open there).
+    if (!VulkanGraphicsCommandRecorder::recordTransitionPassBodyKeepOpen(passParams)) {
+        abandonRecordingCommandBuffer(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // 3. Camera layer, alpha-masked, into the same open render pass -- the
+    //    exact camera draw the production path records.
+    VulkanGreenScreenCameraDraw cameraDraw{};
+    cameraDraw.cameraDescriptorSetLayout = cameraSetLayoutHandle;
+    cameraDraw.cameraDescriptorSet = vkHandleToU64(cameraSet);
+    cameraDraw.maskImageView = maskInfo.imageViewHandle;
+    cameraDraw.maskWidth = maskInfo.width;
+    cameraDraw.maskHeight = maskInfo.height;
+    cameraDraw.debugMode = maskInfo.debugMode;
+    cameraDraw.viewportX = cameraPlacement.viewport.x;
+    cameraDraw.viewportY = cameraPlacement.viewport.y;
+    cameraDraw.viewportWidth = cameraPlacement.viewport.width();
+    cameraDraw.viewportHeight = cameraPlacement.viewport.height();
+    cameraDraw.scissorX = cameraPlacement.scissor.x;
+    cameraDraw.scissorY = cameraPlacement.scissor.y;
+    cameraDraw.scissorWidth = cameraPlacement.scissor.width();
+    cameraDraw.scissorHeight = cameraPlacement.scissor.height();
+    cameraDraw.pushConstants = cameraPlacement.pushConstants;
+    std::string failureReason;
+    if (!s.greenScreenRenderer->recordCameraDraw(
+            s.device, frame->commandBuffer, renderPassHandle,
+            extentWidth, extentHeight, cameraDraw, &failureReason)) {
+        VGLOG_VFR("renderDuetGreenScreenStaticBackgroundFrame camera draw failed: %s",
+                  failureReason.c_str());
+        abandonOpenRenderPass(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // 4. Close the pass and the command buffer.
+    vkCmdEndRenderPass(frame->commandBuffer);
+    if (vkEndCommandBuffer(frame->commandBuffer) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // imageAvailable + up to two distinct pending AHB acquire semaphores
+    // (camera, GPU mask).
+    VkSemaphore waitSemaphores[3] = {
+        frame->imageAvailableSemaphore, VK_NULL_HANDLE, VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[3] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t cameraPendingAcquire =
+        ahbImports.getPendingAcquireSemaphoreHandle(camera.handle);
+    const uint64_t maskPendingAcquire =
+        hasGpuMask ? ahbImports.getPendingAcquireSemaphoreHandle(maskInfo.gpuMaskHandle) : 0;
+    if (cameraPendingAcquire != 0) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(cameraPendingAcquire);
+    }
+    if (maskPendingAcquire != 0 && maskPendingAcquire != cameraPendingAcquire) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(maskPendingAcquire);
+    }
+
+    const bool canExportRelease =
+        frame->releaseFenceSemaphore != VK_NULL_HANDLE && s.pfnGetSemaphoreFd != nullptr;
+    VkSemaphore signalSemaphores[2] = {presentReadySemaphore, VK_NULL_HANDLE};
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+    const VkResult submitResult = vkQueueSubmit(
+        static_cast<VkQueue>(queueHandle), 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports,
+            submitResult == VK_ERROR_DEVICE_LOST
+                ? RenderFrameResult::kDeviceLost : RenderFrameResult::kVulkanFailure);
+    }
+
+    // Both imports now belong to this submission, even if later bookkeeping
+    // fails; the GPU mask is marked submitted so a later release retires it
+    // behind this frame's fence (never released here).
+    const bool cameraAcquireMarked = cameraPendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(camera.handle);
+    const bool maskAcquireMarked = maskPendingAcquire == 0 ||
+        ahbImports.markAcquireSemaphoreSubmitted(maskInfo.gpuMaskHandle);
+    const bool cameraSubmitted = ahbImports.markBufferSubmitted(camera.handle, s.currentFrameIndex);
+    const bool maskSubmitted = !hasGpuMask ||
+        ahbImports.markBufferSubmitted(maskInfo.gpuMaskHandle, s.currentFrameIndex);
+    const bool cameraLayoutSet = ahbImports.setImageLayout(
+        camera.handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    const bool maskLayoutSet = !hasGpuMask || ahbImports.setImageLayout(
+        maskInfo.gpuMaskHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    if (!cameraAcquireMarked || !maskAcquireMarked || !cameraSubmitted || !maskSubmitted ||
+        !cameraLayoutSet || !maskLayoutSet) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    int cameraReleaseFd = -1;
+    if (canExportRelease) {
+        VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+        semGetFdInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+        semGetFdInfo.semaphore = frame->releaseFenceSemaphore;
+        semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        const VkResult exportResult =
+            s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &cameraReleaseFd);
+        if (exportResult != VK_SUCCESS) {
+            VGLOG_VFR("duet static-background vkGetSemaphoreFdKHR failed: %d",
+                      static_cast<int>(exportResult));
+            if (cameraReleaseFd >= 0) ::close(cameraReleaseFd);
+            ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+    }
+    // The setter consumes the fd even on failure; with no export support (or
+    // an empty sync-fd), -1 clears any stale stored fd.
+    if (!ahbImports.setLatestReleaseFenceFd(camera.handle, cameraReleaseFd)) {
+        ahbImports.setLatestReleaseFenceFd(camera.handle, -1);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.greenScreenStaticBackgroundFirstFrameLogged) {
+        s.greenScreenStaticBackgroundFirstFrameLogged = true;
+        VGLOG_VFR("ANDROID_DUET_VULKAN_GREENSCREEN_STATIC_FIRST canvas=%ux%u "
+                  "camera=%d,%d %dx%d buf=%ux%u mask=%ux%u maskSource=%s "
+                  "backgroundMode=%s debugMode=%d cameraRot=%u cameraMirror=%d",
+                  extentWidth, extentHeight,
+                  camera.rect.x, camera.rect.y, camera.rect.width, camera.rect.height,
+                  camera.bufferWidth, camera.bufferHeight,
+                  maskInfo.width, maskInfo.height,
+                  hasGpuMask ? "gpu_import" : "cpu_upload",
+                  background.modeLabel, maskInfo.debugMode,
+                  camera.rotationDegrees, camera.mirrorHorizontal ? 1 : 0);
     }
 
     const SwapchainResult presentResult = swapchain.presentImage(
@@ -3285,10 +3887,16 @@ RenderFrameResult VulkanFrameRenderer::renderDuetLayoutFrame(
     sourceGeometry.rect = source.rect;
     sourceGeometry.bufferWidth = source.bufferWidth;
     sourceGeometry.bufferHeight = source.bufferHeight;
+    sourceGeometry.rotationDegrees = source.rotationDegrees;
+    sourceGeometry.mirrorHorizontal = source.mirrorHorizontal;
+    sourceGeometry.cornerRadiusPx = source.cornerRadiusPx;
     VulkanDuetLayoutLayerGeometry cameraGeometry;
     cameraGeometry.rect = camera.rect;
     cameraGeometry.bufferWidth = camera.bufferWidth;
     cameraGeometry.bufferHeight = camera.bufferHeight;
+    cameraGeometry.rotationDegrees = camera.rotationDegrees;
+    cameraGeometry.mirrorHorizontal = camera.mirrorHorizontal;
+    cameraGeometry.cornerRadiusPx = camera.cornerRadiusPx;
     VulkanDuetLayoutLayerPlacement sourcePlacement;
     VulkanDuetLayoutLayerPlacement cameraPlacement;
     if (!ResolveVulkanDuetLayoutLayerPlacement(sourceGeometry, extentWidth, extentHeight,
@@ -3306,40 +3914,13 @@ RenderFrameResult VulkanFrameRenderer::renderDuetLayoutFrame(
     // Pipelines are per import pipeline layout (the external-format YCbCr
     // sampler is an immutable sampler baked into the import's descriptor set
     // layout) and per render pass; both are cached and rebuilt only when
-    // either changes. The previous pair may still be in flight on the other
-    // frame slot, so idle the device before destroying it. Only this path's
-    // own pair is invalidated: the green-screen helper's cached pipeline is
-    // left intact so a green-screen <-> layout toggle never churns it.
-    const bool duetPipelinesValid =
-        s.duetLayoutSourcePipeline && s.duetLayoutSourcePipeline->isValid() &&
-        s.duetLayoutCameraPipeline && s.duetLayoutCameraPipeline->isValid();
-    const bool duetPipelinesMismatch =
-        !duetPipelinesValid ||
-        s.duetLayoutSourceLayout != sourceLayout ||
-        s.duetLayoutCameraLayout != cameraLayout ||
-        s.duetLayoutRenderPassHandle != renderPassHandle;
-    if (duetPipelinesMismatch) {
-        if (vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
-            return RenderFrameResult::kVulkanFailure;
-        }
-        s.invalidateDuetLayoutPipelines();
-        s.duetLayoutSourcePipeline = std::make_unique<VulkanGraphicsPipeline>();
-        if (!s.duetLayoutSourcePipeline->create(s.device, sourceLayout, renderPass,
-                                                coreShaders.vertex.get(),
-                                                coreShaders.fragment.get())) {
-            s.invalidateDuetLayoutPipelines();
-            return RenderFrameResult::kVulkanFailure;
-        }
-        s.duetLayoutCameraPipeline = std::make_unique<VulkanGraphicsPipeline>();
-        if (!s.duetLayoutCameraPipeline->create(s.device, cameraLayout, renderPass,
-                                                coreShaders.vertex.get(),
-                                                coreShaders.fragment.get())) {
-            s.invalidateDuetLayoutPipelines();
-            return RenderFrameResult::kVulkanFailure;
-        }
-        s.duetLayoutSourceLayout = sourceLayout;
-        s.duetLayoutCameraLayout = cameraLayout;
-        s.duetLayoutRenderPassHandle = renderPassHandle;
+    // either changes (see Impl::ensureDuetLayoutPipelines, shared with the
+    // green-screen path). Only this pair is touched: the green-screen
+    // helper's cached pipeline is left intact so a green-screen <-> layout
+    // toggle never churns it.
+    if (!s.ensureDuetLayoutPipelines(sourceLayout, cameraLayout, renderPassHandle, renderPass,
+                                     coreShaders)) {
+        return RenderFrameResult::kVulkanFailure;
     }
 
     if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
@@ -3766,12 +4347,16 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     return RenderFrameResult::kUnavailable;
 }
 
+// ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: host-build stub for the Duet
+// green-screen frame; same argument validation as the Android path's
+// pre-Vulkan checks, then unavailable.
 RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     void* /*queueHandle*/,
     VulkanSurfaceSwapchain& swapchain,
     VulkanHardwareBufferImports& ahbImports,
-    HardwareBufferHandle backgroundHandle,
-    HardwareBufferHandle foregroundHandle,
+    VulkanCoreShaderModules& /*coreShaders*/,
+    const DuetLayoutLayer& source,
+    const DuetLayoutLayer& camera,
     const VulkanGreenScreenMaskInfo& maskInfo) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
@@ -3779,13 +4364,38 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     if (!swapchain.hasSurface()) {
         return RenderFrameResult::kNoSurface;
     }
-    if (backgroundHandle == foregroundHandle ||
-        !ahbImports.hasBuffer(backgroundHandle) || ahbImports.getImage(backgroundHandle) == nullptr ||
-        !ahbImports.hasBuffer(foregroundHandle) || ahbImports.getImage(foregroundHandle) == nullptr) {
+    if (source.handle == camera.handle ||
+        !ahbImports.hasBuffer(source.handle) || ahbImports.getImage(source.handle) == nullptr ||
+        !ahbImports.hasBuffer(camera.handle) || ahbImports.getImage(camera.handle) == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
-    if (maskInfo.imageViewHandle == 0 || maskInfo.samplerHandle == 0 ||
-        maskInfo.width == 0 || maskInfo.height == 0) {
+    if (maskInfo.imageViewHandle == 0 || maskInfo.width == 0 || maskInfo.height == 0) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    return RenderFrameResult::kUnavailable;
+}
+
+// ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND: host-build stub for the
+// camera-only static-background green-screen frame; same argument validation
+// as the Android path's pre-Vulkan checks, then unavailable.
+RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenStaticBackgroundFrame(
+    void* /*queueHandle*/,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    const DuetLayoutLayer& camera,
+    const VulkanGreenScreenMaskInfo& maskInfo,
+    const DuetStaticBackground& background) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!ahbImports.hasBuffer(camera.handle) || ahbImports.getImage(camera.handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (maskInfo.imageViewHandle == 0 || maskInfo.width == 0 || maskInfo.height == 0 ||
+        background.modeLabel == nullptr) {
         return RenderFrameResult::kVulkanFailure;
     }
     return RenderFrameResult::kUnavailable;

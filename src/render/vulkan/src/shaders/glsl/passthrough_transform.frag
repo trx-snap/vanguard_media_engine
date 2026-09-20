@@ -37,9 +37,22 @@ layout(push_constant) uniform Transform {
 layout(binding = 0) uniform sampler2D uTexture;
 
 layout(location = 0) in vec2 inUv;
+layout(location = 1) in vec2 inViewportNdc;
 layout(location = 0) out vec4 outColor;
 
 void main() {
+    float r = xf.uvTransform0.z;
+    if (r > 0.0) {
+        float aspect = xf.uvTransform1.z;
+        vec2 p = abs(vec2(inViewportNdc.x, inViewportNdc.y * aspect));
+        vec2 b = vec2(1.0, aspect);
+        vec2 q = p - b + vec2(r);
+        float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+        if (dist > 0.0) {
+            discard;
+        }
+    }
+
     vec4 rgba = texture(uTexture, inUv);
     outColor = clamp(
         vec4(

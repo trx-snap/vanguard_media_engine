@@ -182,6 +182,14 @@ static_assert(sizeof(VideoColorMatrixPushConstants) == 80,
 static_assert(alignof(VideoColorMatrixPushConstants) == 16,
               "VideoColorMatrixPushConstants must be 16-byte aligned");
 
+// ---------------------------------------------------------------------------
+// VideoTransformFullPushConstants (112 bytes = 7 vec4s)
+// ---------------------------------------------------------------------------
+// uvTransform0[2] carries cornerNormRadius (2 * cornerRadiusPx / layerWidth)
+// uvTransform1[2] carries cornerAspect (layerHeight / layerWidth)
+// When cornerNormRadius is 0.0f, corner clipping is disabled.
+// This fits in the guaranteed 128-byte Vulkan push-constant budget and preserves
+// exact compatibility with VulkanGreenScreenCameraMaskPushConstants (112 + 16 = 128 bytes).
 struct alignas(16) VideoTransformFullPushConstants {
     VideoTransformPushConstants uv;
     VideoColorMatrixPushConstants color;
@@ -191,9 +199,6 @@ static_assert(sizeof(VideoTransformFullPushConstants) == 112,
               "VideoTransformFullPushConstants must be exactly 112 bytes");
 static_assert(alignof(VideoTransformFullPushConstants) == 16,
               "VideoTransformFullPushConstants must be 16-byte aligned");
-static_assert(sizeof(VideoTransformFullPushConstants) <= 128,
-              "VideoTransformFullPushConstants must fit the guaranteed minimum "
-              "Vulkan push constant budget (128 bytes)");
 
 // ---------------------------------------------------------------------------
 // VideoBeautyV2RenderParams

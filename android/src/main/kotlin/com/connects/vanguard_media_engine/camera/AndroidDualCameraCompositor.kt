@@ -58,6 +58,8 @@ class AndroidDualCameraCompositor(
     private val backendCapability: BackendCapabilityReport,
     private val canvasWidth: Int = 1080,
     private val canvasHeight: Int = 1920,
+    private val cameraInputWidth: Int = maxOf(canvasWidth, canvasHeight),
+    private val cameraInputHeight: Int = minOf(canvasWidth, canvasHeight),
 ) {
 
     // ── Public layout params ────────────────────────────────────────────────
@@ -70,6 +72,7 @@ class AndroidDualCameraCompositor(
         val pipWidthFraction: Double = 0.3,
         val pipCenterX: Double = 0.5,             // normalized [0,1]; only used when anchor == "freeFloating"
         val pipCenterY: Double = 0.5,             // normalized [0,1]; only used when anchor == "freeFloating"
+        val pipCornerRadius: Double = 24.0,
     )
 
     companion object {
@@ -90,6 +93,7 @@ class AndroidDualCameraCompositor(
             val pipWidthFraction = (pipMap?.get("widthFraction") as? Number)?.toDouble() ?: 0.3
             val pipCenterX = (pipMap?.get("centerX") as? Number)?.toDouble() ?: 0.5
             val pipCenterY = (pipMap?.get("centerY") as? Number)?.toDouble() ?: 0.5
+            val pipCornerRadius = (pipMap?.get("cornerRadius") as? Number)?.toDouble() ?: 24.0
 
             // Split sub-map — Dart key is "direction", NOT "splitDirection"
             val splitMap = config["splitLayout"] as? Map<*, *>
@@ -104,6 +108,7 @@ class AndroidDualCameraCompositor(
                 pipWidthFraction = pipWidthFraction,
                 pipCenterX = pipCenterX,
                 pipCenterY = pipCenterY,
+                pipCornerRadius = pipCornerRadius,
             )
         }
     }
@@ -356,19 +361,22 @@ class AndroidDualCameraCompositor(
 
     private fun allocateVulkanInputSurfaces() {
         // ImageFormat.PRIVATE with USAGE_GPU_SAMPLED_IMAGE → AHardwareBuffer for zero-copy Vulkan import.
+        // Camera sensors stream in native landscape orientation (e.g. 1920x1080). Passing cameraInputWidth
+        // x cameraInputHeight prevents Camera HAL from squeezing the 16:9 stream into portrait, and lets
+        // Vulkan's 90/270 degree rotation and aspect-fill correctly resolve to 9:16 portrait.
         val front = ImageReader.newInstance(
-            canvasWidth, canvasHeight, ImageFormat.PRIVATE, /* maxImages= */ 3,
+            cameraInputWidth, cameraInputHeight, ImageFormat.PRIVATE, /* maxImages= */ 3,
             HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
         )
         val back = ImageReader.newInstance(
-            canvasWidth, canvasHeight, ImageFormat.PRIVATE, /* maxImages= */ 3,
+            cameraInputWidth, cameraInputHeight, ImageFormat.PRIVATE, /* maxImages= */ 3,
             HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
         )
         frontImageReader = front
         backImageReader = back
         _frontInputSurface = front.surface
         _backInputSurface = back.surface
-        Log.d(TAG, "Vulkan ImageReaders allocated ${canvasWidth}x${canvasHeight}")
+        Log.d(TAG, "Vulkan ImageReaders allocated ${cameraInputWidth}x${cameraInputHeight}")
     }
 
     private fun allocateGlesInputSurfaces() {
@@ -383,10 +391,10 @@ class AndroidDualCameraCompositor(
                 backGlesTexId = texIds[1]
 
                 val front = SurfaceTexture(frontGlesTexId).apply {
-                    setDefaultBufferSize(canvasWidth, canvasHeight)
+                    setDefaultBufferSize(cameraInputWidth, cameraInputHeight)
                 }
                 val back = SurfaceTexture(backGlesTexId).apply {
-                    setDefaultBufferSize(canvasWidth, canvasHeight)
+                    setDefaultBufferSize(cameraInputWidth, cameraInputHeight)
                 }
                 frontSurfaceTexture = front
                 backSurfaceTexture = back
@@ -547,7 +555,7 @@ class AndroidDualCameraCompositor(
         // Matches the strict resolver in the existing JNI code (ParseLayoutJson).
         // pipCenterX/pipCenterY are passed unconditionally; the C++ side uses
         // them only when anchor == "freeFloating".
-        return """{"layoutMode":"${params.layoutMode}","pipAnchor":"${params.anchor}","splitDirection":"${params.splitDirection}","splitRatio":${params.splitRatio},"pipWidthFraction":${params.pipWidthFraction},"pipCenterX":${params.pipCenterX},"pipCenterY":${params.pipCenterY}}"""
+        return """{"layoutMode":"${params.layoutMode}","pipAnchor":"${params.anchor}","splitDirection":"${params.splitDirection}","splitRatio":${params.splitRatio},"pipWidthFraction":${params.pipWidthFraction},"pipCenterX":${params.pipCenterX},"pipCenterY":${params.pipCenterY},"pipCornerRadius":${params.pipCornerRadius}}"""
     }
 
     // ── finalize guard ──────────────────────────────────────────────────────
