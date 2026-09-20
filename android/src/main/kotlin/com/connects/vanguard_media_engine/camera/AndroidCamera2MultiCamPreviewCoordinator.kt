@@ -10,6 +10,7 @@ import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.StatFs
 import android.util.Log
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.BackendCapabilityReport
@@ -47,9 +48,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    implementations that operate on the live [dualCamCompositor] (layout
  *    updates and PixelCopy-based composited-frame snapshots respectively);
  *    both still reject with NOT_RUNNING when no MultiCam preview is active.
- *    startMultiCamRecording/stopMultiCamRecording remain fail-closed guard
- *    routes that reject with NOT_RUNNING (after arg validation) because
- *    there is no Android MultiCam recording lifecycle owner in this slice.
+ *    startMultiCamRecording/stopMultiCamRecording are real implementations
+ *    backed by [AndroidMultiCamVideoRecorder], which encodes the compositor's
+ *    rendered frames (delivered via [AndroidDualCameraCompositor.onFrameRendered])
+ *    into a composited H.264/AAC MP4; both still reject with NOT_RUNNING when
+ *    no MultiCam preview is active.
  *  - measureMultiCamHardwareCost/runMultiCamStreamingDiagnostic/
  *    runMultiCamSyncDiagnostic/runMultiCamSourceLifecycleDiagnostic
  *    (P3-CAM-CONCURRENT-DIAGNOSTIC-FAIL-CLOSED-ANDROID-HANDLER) are explicit
@@ -80,6 +83,7 @@ class AndroidCamera2MultiCamPreviewCoordinator(
     private var backTexture: TextureRegistry.SurfaceTextureEntry? = null
     private var dualCamCompositor: AndroidDualCameraCompositor? = null
     private var surfaceProducer: TextureRegistry.SurfaceProducer? = null
+    private var activeRecorder: AndroidMultiCamVideoRecorder? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cameraManager by lazy { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
     companion object {
@@ -572,6 +576,26 @@ class AndroidCamera2MultiCamPreviewCoordinator(
 
         Log.i(TAG, "stopMultiCamPreview: stopping dual camera session")
 
+        // 0. Finalize any active recording before tearing down the compositor,
+        //    so a valid MP4 remains at the requested path when possible. Bounded
+        //    and never throws; on finalize failure the recorder aborts and
+        //    cleans up its own .tmp file.
+        val recorder = activeRecorder
+        if (recorder != null) {
+            dualCamCompositor?.onFrameRendered = null
+            activeRecorder = null
+            val stats = try {
+                recorder.stop()
+            } catch (t: Throwable) {
+                Log.e(TAG, "stopMultiCamPreview: recorder.stop() threw during preview teardown: ${t.javaClass.simpleName}: ${t.message}", t)
+                null
+            }
+            if (stats == null) {
+                Log.w(TAG, "stopMultiCamPreview: recording finalize failed during preview teardown — aborting it")
+                try { recorder.abort() } catch (t: Throwable) { /* ignore */ }
+            }
+        }
+
         // 1. Stop camera source first (it streams into compositor surfaces)
         source.stop()
 
@@ -724,30 +748,151 @@ class AndroidCamera2MultiCamPreviewCoordinator(
 
     private fun startMultiCamRecording(args: Map<String, Any?>?, result: MethodChannel.Result) {
         val path = (args?.get("path") as? String)?.trim()
-        if (path.isNullOrEmpty()) {
+        if (path.isNullOrEmpty() || !path.endsWith(".mp4")) {
             result.error(
                 "INVALID_ARG",
-                "startMultiCamRecording requires a non-blank path",
+                "startMultiCamRecording requires a non-blank path ending in .mp4",
                 null,
             )
             return
         }
 
-        result.error(
-            "NOT_RUNNING",
-            "Android MultiCam preview is not running",
-            null,
+        val compositor = dualCamCompositor
+        if (compositor == null || dualCameraSource == null) {
+            result.error(
+                "NOT_RUNNING",
+                "Android MultiCam preview is not running",
+                null,
+            )
+            return
+        }
+
+        if (!compositor.hasRenderedFrame) {
+            result.error(
+                "NOT_RENDERING",
+                "No frames rendered yet — start preview first",
+                null,
+            )
+            return
+        }
+
+        if (activeRecorder != null) {
+            result.error(
+                "ALREADY_RECORDING",
+                "A recording is already active",
+                null,
+            )
+            return
+        }
+
+        val parent = File(path).absoluteFile.parentFile
+        if (parent == null) {
+            result.error("INVALID_ARG", "startMultiCamRecording path has no parent directory: $path", null)
+            return
+        }
+        try {
+            if (!parent.exists() && !parent.mkdirs()) {
+                result.error("INVALID_ARG", "Unable to create output directory: ${parent.absolutePath}", null)
+                return
+            }
+        } catch (t: Throwable) {
+            result.error("INVALID_ARG", "Unable to create output directory: ${t.message}", null)
+            return
+        }
+
+        val availableBytes = try {
+            StatFs(parent.absolutePath).availableBytes
+        } catch (t: Throwable) {
+            Log.w(TAG, "startMultiCamRecording: StatFs failed: ${t.javaClass.simpleName}: ${t.message}")
+            Long.MAX_VALUE
+        }
+        if (availableBytes < 200L * 1024 * 1024) {
+            result.error(
+                "DISK_SPACE",
+                "Insufficient disk space (< 200 MB)",
+                null,
+            )
+            return
+        }
+
+        val recorder = AndroidMultiCamVideoRecorder(
+            context = context,
+            outputPath = path,
+            width = compositor.outputWidth,
+            height = compositor.outputHeight,
         )
+
+        val started = try {
+            recorder.start()
+        } catch (t: Throwable) {
+            Log.e(TAG, "startMultiCamRecording: recorder.start() threw: ${t.javaClass.simpleName}: ${t.message}", t)
+            false
+        }
+
+        if (!started) {
+            try { recorder.abort() } catch (t: Throwable) { /* ignore */ }
+            result.error(
+                "WRITER_INIT_FAIL",
+                "Failed to initialize the video recorder",
+                null,
+            )
+            return
+        }
+
+        activeRecorder = recorder
+        compositor.onFrameRendered = { bitmap -> recorder.submitFrame(bitmap) }
+
+        Log.i(TAG, "startMultiCamRecording: recording started -> $path")
+        result.success(true)
     }
 
     // -- stopMultiCamRecording ------------------------------------------------
 
     private fun stopMultiCamRecording(result: MethodChannel.Result) {
-        result.error(
-            "NOT_RUNNING",
-            "Android MultiCam preview is not running",
-            null,
-        )
+        val compositor = dualCamCompositor
+        if (compositor == null) {
+            result.error(
+                "NOT_RUNNING",
+                "Android MultiCam preview is not running",
+                null,
+            )
+            return
+        }
+
+        val recorder = activeRecorder
+        if (recorder == null) {
+            result.error(
+                "NOT_RECORDING",
+                "No recording is currently active",
+                null,
+            )
+            return
+        }
+
+        compositor.onFrameRendered = null
+        activeRecorder = null
+
+        Thread {
+            val stats = try {
+                recorder.stop()
+            } catch (t: Throwable) {
+                Log.e(TAG, "stopMultiCamRecording: recorder.stop() threw: ${t.javaClass.simpleName}: ${t.message}", t)
+                null
+            }
+
+            mainHandler.post {
+                if (stats == null) {
+                    result.error(
+                        "WRITER_FINISH_FAIL",
+                        "Failed to finalize the recording",
+                        null,
+                    )
+                } else {
+                    Log.i(TAG, "stopMultiCamRecording: finalized ${stats["filePath"]}")
+                    result.success(stats)
+                }
+            }
+        }.start()
     }
 
     // -- measureMultiCamHardwareCost / runMultiCamStreamingDiagnostic /

@@ -153,6 +153,36 @@ class AndroidDualCameraCompositor(
     private var lastCompositedBitmap: Bitmap? = null
     private val pixelCopyInFlight = AtomicBoolean(false)
 
+    /**
+     * Optional sink for composited frames, invoked on the compositor's render
+     * thread exactly once per successful PixelCopy readback (i.e. at most
+     * once per rendered frame, never for a skipped/failed readback). The
+     * [Bitmap] passed to the sink is **borrowed** and valid only for the
+     * duration of the call — implementations must copy any pixels they need
+     * and return promptly; they must never retain, recycle, or mutate it,
+     * and must never block (the render loop's next PixelCopy request is
+     * gated on this call returning). Any exception thrown by the sink is
+     * caught and logged so it can never disrupt rendering.
+     */
+    @Volatile var onFrameRendered: ((Bitmap) -> Unit)? = null
+
+    /** Output canvas width in pixels, as configured at construction. */
+    val outputWidth: Int get() = canvasWidth
+
+    /** Output canvas height in pixels, as configured at construction. */
+    val outputHeight: Int get() = canvasHeight
+
+    /** True once at least one composited frame has been successfully read back. */
+    val hasRenderedFrame: Boolean
+        get() {
+            bitmapLock.lock()
+            try {
+                return lastCompositedBitmap != null
+            } finally {
+                bitmapLock.unlock()
+            }
+        }
+
     // ── Public API ──────────────────────────────────────────────────────────
 
     /**
@@ -303,6 +333,11 @@ class AndroidDualCameraCompositor(
         _frontInputSurface = null
         _backInputSurface?.release()
         _backInputSurface = null
+
+        // Clear the frame sink before releasing snapshot resources so no
+        // caller can be invoked with (or retain) a bitmap that is about to
+        // be recycled.
+        onFrameRendered = null
 
         // Release frame snapshot resources.
         bitmapLock.lock()
@@ -477,16 +512,27 @@ class AndroidDualCameraCompositor(
 
         try {
             PixelCopy.request(outputSurface, target, { copyResult ->
-                pixelCopyInFlight.set(false)
-                if (copyResult == PixelCopy.SUCCESS) {
-                    bitmapLock.lock()
-                    try {
-                        lastCompositedBitmap = target
-                    } finally {
-                        bitmapLock.unlock()
+                try {
+                    if (copyResult == PixelCopy.SUCCESS) {
+                        bitmapLock.lock()
+                        try {
+                            lastCompositedBitmap = target
+                        } finally {
+                            bitmapLock.unlock()
+                        }
+                        try {
+                            onFrameRendered?.invoke(target)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "captureFrameSnapshot: onFrameRendered threw: ${t.javaClass.simpleName}: ${t.message}")
+                        }
+                    } else {
+                        Log.w(TAG, "captureFrameSnapshot: PixelCopy failed with result=$copyResult")
                     }
-                } else {
-                    Log.w(TAG, "captureFrameSnapshot: PixelCopy failed with result=$copyResult")
+                } finally {
+                    // Reset only after the sink has finished reading `target` — this is
+                    // what makes the hand-off race-free: no new PixelCopy request can be
+                    // issued into `target` while a sink call is still in progress.
+                    pixelCopyInFlight.set(false)
                 }
             }, handler)
         } catch (t: Throwable) {
