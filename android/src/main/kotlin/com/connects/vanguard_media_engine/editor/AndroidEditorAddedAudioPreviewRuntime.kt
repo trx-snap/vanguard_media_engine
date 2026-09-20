@@ -1,9 +1,6 @@
 package com.connects.vanguard_media_engine.editor
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.HandlerThread
@@ -90,10 +87,8 @@ class AndroidEditorAddedAudioPreviewRuntime(
 
     private val released = AtomicBoolean(false)
 
-    // ── audioHandler-confined state (all MediaPlayer/AudioManager calls happen there) ────────
+    // ── audioHandler-confined state (all MediaPlayer calls happen there) ────────
     private var player: MediaPlayer? = null
-    private var audioManager: AudioManager? = null
-    private var focusRequest: AudioFocusRequest? = null
     private var hasFocus = false
 
     /** True once a usable, playable [MediaPlayer] exists for this track. */
@@ -589,56 +584,12 @@ class AndroidEditorAddedAudioPreviewRuntime(
     }
 
     private fun requestFocusLocked() {
-        if (hasFocus) {
-            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=already_has_focus trackId=${config.trackId} role=${config.role}")
-            return
-        }
-        val ctx = context
-        if (ctx == null) {
-            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_context trackId=${config.trackId} role=${config.role}")
-            return
-        }
-        try {
-            val am = audioManager ?: (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)?.also {
-                audioManager = it
-            }
-            if (am == null) {
-                Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_audio_manager trackId=${config.trackId} role=${config.role}")
-                return
-            }
-            val contentType = if (config.role == "voiceover") {
-                AudioAttributes.CONTENT_TYPE_SPEECH
-            } else {
-                AudioAttributes.CONTENT_TYPE_MUSIC
-            }
-            val attrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(contentType)
-                .build()
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(attrs)
-                .build()
-            focusRequest = request
-            hasFocus = am.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            Log.i(TAG, "$LOG_PREFIX focus_result ${if (hasFocus) "granted" else "not_granted"} trackId=${config.trackId} role=${config.role}")
-        } catch (t: Throwable) {
-            Log.w(TAG, "$LOG_PREFIX focus_result error trackId=${config.trackId} role=${config.role}", t)
-            hasFocus = false
-        }
+        // Audio focus is managed exclusively by Dart AppAudioHardwareArbiter (see android_bluetooth_routing_architecture.md).
+        // Native preview runtimes must never request AudioFocus directly, as doing so evicts the app's Dart AudioSession.
+        hasFocus = true
     }
 
     private fun abandonFocusLocked() {
-        if (!hasFocus) return
         hasFocus = false
-        val am = audioManager
-        val request = focusRequest
-        focusRequest = null
-        if (am != null && request != null) {
-            try {
-                am.abandonAudioFocusRequest(request)
-            } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX abandonFocusLocked_error trackId=${config.trackId} role=${config.role}", t)
-            }
-        }
     }
 }
