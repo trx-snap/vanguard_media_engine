@@ -28,12 +28,14 @@ interface AndroidGreenScreenPreviewBackend {
     fun setLayout(sourceRect: AndroidGreenScreenPixelRect, cameraRect: AndroidGreenScreenPixelRect)
 
     /**
-     * Informs the backend of the live camera feed's normalized (0/90/180/270)
-     * display rotation and whether it is horizontally mirrored. The GLES
-     * backend already presents a display-correct camera feed via the
-     * SurfaceTexture transform matrix (matching production behavior on the
-     * Duet render loop GreenScreen previously ran on, where this was also a
-     * no-op), so the default here no-ops.
+     * Optional seam for a backend to be informed of the live camera feed's
+     * normalized (0/90/180/270) display rotation and whether it is
+     * horizontally mirrored. No-op by default, matching
+     * duet/AndroidDuetPreviewBackend.kt: the camera SurfaceTexture's own
+     * transform matrix (latched via getTransformMatrix) already delivers a
+     * display-correct camera feed, so [AndroidGreenScreenPreviewCompositor]
+     * does not override this either — it stays the no-op default, exactly
+     * like the proven Duet GLES compositor.
      */
     fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean) {}
 

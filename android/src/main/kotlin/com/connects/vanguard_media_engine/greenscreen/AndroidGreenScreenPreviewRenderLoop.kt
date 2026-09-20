@@ -187,12 +187,11 @@ class AndroidGreenScreenPreviewRenderLoop(
     /**
      * Forwards the live camera feed's normalized display rotation and mirror
      * state to the compositor. Posts to the render thread, mirroring
-     * [setGreenScreenEnabled]'s posting style. The single-camera GLES
-     * compositor already presents a display-correct camera feed via the
-     * SurfaceTexture transform matrix, so this is a no-op forward — kept only
-     * for interface parity with the camera source's callback shape (matches
-     * production behavior: the Duet GLES backend GreenScreen previously ran
-     * on had the identical no-op).
+     * [setGreenScreenEnabled]'s posting style. This is backend-parity
+     * plumbing only: the current GLES compositor's [AndroidGreenScreenPreviewBackend.setCameraFrameTransform]
+     * implementation no-ops, matching the proven Duet GLES route where the
+     * camera SurfaceTexture's own transform matrix already delivers a
+     * display-correct camera feed.
      */
     fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean) {
         if (isStopped.get()) return

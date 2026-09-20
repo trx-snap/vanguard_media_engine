@@ -22,18 +22,21 @@ import kotlin.math.roundToInt
 // Independent single-camera GLES compositor for the GreenScreen preview.
 // -----------------------------------------------------------------------------
 //
-// Byte-for-byte port of the subset of duet/AndroidDuetPreviewCompositor.kt
-// that GreenScreen actually exercises in production. GreenScreen always ran
+// Ported the subset of duet/AndroidDuetPreviewCompositor.kt that GreenScreen
+// actually exercises in production. GreenScreen always ran
 // AndroidDuetPreviewRenderLoop with `decoderProvider = { null }`, so the
 // decoder/source-video OES ingest, its aspect-fill draw, and the RND-only
 // mask-debug-view / GPU-resident-mask seams were provably dead code for this
 // capability (the decoder was never bound, so `hasTexImage` was always
-// false and the video draw call never ran; `setCameraFrameTransform` was
-// already a no-op on the GLES backend GreenScreen used; the debug-view and
-// GPU-mask methods were never called by either GreenScreen consumer). None
-// of that is ported here — everything else (camera ingest, green-screen
-// mask compositing math, static background compositing, EGL lifecycle) is
-// preserved exactly.
+// false and the video draw call never ran; the debug-view and GPU-mask
+// methods were never called by either GreenScreen consumer). None of that is
+// ported here. `setCameraFrameTransform` is a no-op here, exactly like
+// duet/AndroidDuetPreviewCompositor.kt: the camera SurfaceTexture's own
+// transform matrix (cameraStMatrix, from getTransformMatrix) already
+// delivers a display-correct camera feed, so no additional rotation/mirror
+// of the camera texture sample is applied. Everything else (camera ingest,
+// green-screen mask compositing math, static background compositing, EGL
+// lifecycle) is preserved exactly.
 //
 // Owns the EGL display/context and the camera-facing SurfaceTexture ingest:
 //   - A camera OES texture + SurfaceTexture + [cameraInputSurface] the

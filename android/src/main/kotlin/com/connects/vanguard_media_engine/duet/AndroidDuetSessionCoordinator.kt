@@ -6,12 +6,10 @@ import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
-import androidx.camera.core.ImageAnalysis
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VG-DUET-SLICE-3: Android native session lifecycle, clock & decoder integration
@@ -79,16 +77,11 @@ class VGDuetAndroidSession(
     // Slice 4B-C: render loop pumping decoder frames into the producer's Surface.
     // Created alongside previewProducer, stopped and cleared with it.
     var previewRenderLoop: AndroidDuetPreviewRenderLoop? = null
-    // Live camera source for duet preview — started on attach, stopped with renderLoop.
-    var cameraSource: AndroidDuetCameraSource? = null
-    // Green-screen segmentation adapter — started when layout mode is greenScreen,
-    // stopped on fallback or layout mode switch.
-    var greenScreenAdapter: AndroidDuetGreenScreenAdapter? = null
-    // Session-level one-way ladder latch. Set to the rung reached after a
-    // `green_screen_degraded` (e.g. "mlkit") so any later adapter built for this
-    // session (layout switch back to greenScreen) starts there instead of
-    // re-trying MediaPipe — degradation never oscillates within a session.
-    var greenScreenLatchedBackendId: String? = null
+    // Foreground (live camera + green-screen keying) source — started on
+    // attach, stopped with renderLoop. Phase 6B seam: owns camera/adapter
+    // lifecycle, backend ladder latch, and first-mask readiness internally;
+    // see AndroidDuetForegroundProvider.
+    var foregroundProvider: AndroidDuetForegroundProvider? = null
     // Original dimensions and layout rects stored on first attach;
     // returned verbatim on repeated (idempotent) attach calls.
     var previewWidthPx:    Int? = null
@@ -97,10 +90,6 @@ class VGDuetAndroidSession(
     // Typed twin of previewLayoutRects, fed to the render loop on (re)attach.
     // Recomputed by updateLayout while a preview is attached.
     var previewTypedLayoutRects: VGDuetLayoutRects? = null
-    // Green-screen start barrier (main thread only). Set once the CURRENT adapter
-    // has delivered its first real mask; reset whenever that adapter is stopped so
-    // a rebuilt adapter must deliver a fresh mask before a start may proceed.
-    var firstGreenScreenMaskReady: Boolean = false
     // startDuetRecording reply parked behind the barrier. Non-null only while
     // state == INITIALIZED and a start is pending; cleared by completion/cancel.
     var pendingStartReply: ((Any?, String?) -> Unit)? = null
@@ -186,19 +175,6 @@ class AndroidDuetSessionCoordinator(
          * never hang if segmentation stalls.
          */
         private const val GREEN_SCREEN_FIRST_MASK_START_TIMEOUT_MS = 4000L
-
-        /**
-         * Allowlist for `layoutConfigMap["debugRawTfliteGpuDelegateMode"]`. Kept in sync
-         * with the backend's internal allowlist. Invalid values are silently fallen back
-         * to `compat_best_or_default`; they must not fail session start.
-         */
-        internal val RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST = setOf(
-            "compat_best_or_default",
-            "forced_default",
-            "sustained_speed",
-            "force_opencl",
-            "force_opengl",
-        )
 
         fun isValidSpeed(speed: Double): Boolean =
             VALID_SPEEDS.any { Math.abs(it - speed) < SPEED_EPSILON }
@@ -526,39 +502,29 @@ class AndroidDuetSessionCoordinator(
             }
             // Enable/disable green-screen compositing based on the new mode.
             if (newMode == "greenScreen") {
-                // Switching into greenScreen: build adapter if not already running,
-                // then hot-rebind the analysis use-case via setAnalysisAnalyzer.
-                if (session.greenScreenAdapter == null) {
-                    val adapter = buildGreenScreenAdapter(session)
-                    if (adapter != null) {
-                        // Hot-rebind: camera is already running, add ImageAnalysis.
-                        // If the rebind fails, fall back to safe PiP immediately.
-                        val bound = session.cameraSource?.setAnalysisAnalyzer(adapter) ?: false
-                        if (!bound) {
-                            Log.w("DuetCoordinator",
-                                "setAnalysisAnalyzer failed during greenScreen switch — PiP fallback")
-                            handleGreenScreenFallback(session, reportedSegmentationBackend(session),
-                                DuetSegmentationBackend.NONE, "bind_failed")
-                            reply(null, null)
-                            return
-                        }
-                    } else {
-                        // Adapter creation failed — fall back immediately.
-                        Log.w("DuetCoordinator",
-                            "buildGreenScreenAdapter returned null — PiP fallback")
-                        handleGreenScreenFallback(session, reportedSegmentationBackend(session),
-                            DuetSegmentationBackend.NONE, "adapter_creation_failed")
-                        reply(null, null)
-                        return
-                    }
+                // Switching into greenScreen: the provider builds/rebinds its
+                // adapter as needed. If it cannot enable keying, fall back to
+                // safe PiP immediately. When no provider exists yet (camera not
+                // started), that mirrors a bind failure (no camera to bind to),
+                // since the render loop guaranteed by this branch means adapter
+                // construction itself would not have failed.
+                val provider = session.foregroundProvider
+                val enabled = provider?.setGreenScreenEnabled(true, layoutConfigMap) ?: false
+                if (!enabled) {
+                    val reason = provider?.lastEnableFailureReason() ?: "bind_failed"
+                    Log.w("DuetCoordinator",
+                        "foregroundProvider.setGreenScreenEnabled(true) failed ($reason) — PiP fallback")
+                    handleGreenScreenFallback(session,
+                        provider?.reportedBackendId() ?: DuetSegmentationBackend.NONE,
+                        reason)
+                    reply(null, null)
+                    return
                 }
-                session.previewRenderLoop?.setGreenScreenEnabled(true)
             } else {
-                // Switching away from greenScreen: remove analysis use-case,
-                // stop adapter, disable compositor. Camera Preview continues.
-                session.cameraSource?.setAnalysisAnalyzer(null)
-                stopGreenScreenAdapter(session)
-                session.previewRenderLoop?.setGreenScreenEnabled(false)
+                // Switching away from greenScreen: provider removes the analysis
+                // use-case, stops its adapter, disables compositor. Camera Preview
+                // continues.
+                session.foregroundProvider?.setGreenScreenEnabled(false, layoutConfigMap)
                 // Leaving greenScreen while a start is parked behind the first-mask
                 // barrier: no mask will ever arrive, so begin immediately.
                 completePendingStart(session, "layout_left_green_screen")
@@ -631,7 +597,7 @@ class AndroidDuetSessionCoordinator(
                 Log.w("DuetCoordinator",
                     "ANDROID_DUET_GREENSCREEN_START_FIRST_MASK_TIMEOUT session=${session.sessionId} " +
                         "timeoutMs=$GREEN_SCREEN_FIRST_MASK_START_TIMEOUT_MS " +
-                        "backend=${session.greenScreenAdapter?.currentBackendId ?: "none"}")
+                        "backend=${session.foregroundProvider?.reportedBackendId() ?: "none"}")
                 completePendingStart(session, "first_mask_timeout")
             }
         }
@@ -639,8 +605,8 @@ class AndroidDuetSessionCoordinator(
         Log.i("DuetCoordinator",
             "ANDROID_DUET_GREENSCREEN_START_WAITING_FOR_FIRST_MASK session=${session.sessionId} " +
                 "timeoutMs=$GREEN_SCREEN_FIRST_MASK_START_TIMEOUT_MS " +
-                "adapterPresent=${session.greenScreenAdapter != null} " +
-                "backend=${session.greenScreenAdapter?.currentBackendId ?: "none"}")
+                "adapterPresent=${session.foregroundProvider != null} " +
+                "backend=${session.foregroundProvider?.reportedBackendId() ?: "none"}")
         mainHandler.postDelayed(timeout, GREEN_SCREEN_FIRST_MASK_START_TIMEOUT_MS)
     }
 
@@ -676,7 +642,7 @@ class AndroidDuetSessionCoordinator(
     private fun immediateStartReason(session: VGDuetAndroidSession): String? {
         val mode = session.layoutConfigMap["mode"] as? String ?: "pip"
         if (mode != "greenScreen") return "non_green_screen"
-        if (session.firstGreenScreenMaskReady) return "first_mask_ready"
+        if (session.foregroundProvider?.firstMaskReady == true) return "first_mask_ready"
         if (session.previewRenderLoop == null) return "no_preview_attached"
         return null
     }
@@ -720,22 +686,22 @@ class AndroidDuetSessionCoordinator(
     }
 
     /**
-     * Main-thread landing for the first mask of [adapter]. Marks readiness and
-     * releases a parked start only when [adapter] is still the session's live
-     * adapter — a mask from a stale (stopped/replaced) adapter proves nothing
-     * about what the compositor is drawing now.
+     * Main-thread landing for [AndroidDuetForegroundProvider]'s first-mask
+     * event. Releases a parked start only when [provider] is still the
+     * session's live foreground provider — an event from a stale (torn down)
+     * provider proves nothing about what the compositor is drawing now.
+     * Adapter-level staleness (rebuilt/replaced adapter within the same
+     * provider) is already filtered by the provider itself.
      */
     private fun handleGreenScreenFirstMask(
         session: VGDuetAndroidSession,
-        adapter: AndroidDuetGreenScreenAdapter?,
+        provider: AndroidDuetForegroundProvider,
     ) {
         if (activeSession !== session) return
-        if (adapter == null || session.greenScreenAdapter !== adapter) return
-        if (session.firstGreenScreenMaskReady) return
-        session.firstGreenScreenMaskReady = true
+        if (session.foregroundProvider !== provider) return
         Log.i("DuetCoordinator",
             "ANDROID_DUET_GREENSCREEN_FIRST_MASK_READY session=${session.sessionId} " +
-                "backend=${adapter.currentBackendId} startPending=${session.pendingStartReply != null}")
+                "backend=${provider.reportedBackendId()} startPending=${session.pendingStartReply != null}")
         completePendingStart(session, "first_mask_ready")
     }
 
@@ -920,10 +886,11 @@ class AndroidDuetSessionCoordinator(
      *
      * Camera management: [attachOutputSurface] inside the render loop re-fires the
      * [cameraInputSurfaceReady] callback on the main thread. [startCameraSourceIfNeeded]
-     * is idempotent — it no-ops when cameraSource is already running — so this is
-     * safe for normal re-attaches after output loss. It also enables retry: if a
-     * prior transient CameraX failure nulled cameraSource, the re-fired callback
-     * gives the coordinator a chance to start the camera again.
+     * is idempotent — the foreground provider no-ops when its camera source is
+     * already running — so this is safe for normal re-attaches after output loss.
+     * It also enables retry: if a prior transient CameraX failure nulled the
+     * provider's camera source, the re-fired callback gives the coordinator a
+     * chance to start the camera again.
      */
     private fun handlePreviewSurfaceAvailable(sessionId: String) {
         val session = activeSession ?: return
@@ -953,10 +920,11 @@ class AndroidDuetSessionCoordinator(
     }
 
     /**
-     * Centralized, idempotent camera-start helper called from the render loop's
-     * [cameraInputSurfaceReady] callback (main thread).
+     * Centralized, idempotent foreground-provider start helper called from the
+     * render loop's [cameraInputSurfaceReady] callback (main thread).
      *
-     * Idempotent guards (all checked before starting CameraX):
+     * Session-level idempotent guards (all checked before delegating to the
+     * provider):
      *   - [activeSession] is not this exact session object → no-op (session was
      *     detached/stopped/disposed/disposeAll between when the callback was posted
      *     on the render thread and when it ran on the main thread).
@@ -968,11 +936,9 @@ class AndroidDuetSessionCoordinator(
      *     output surface is gone and starting camera would be pointless).
      *   - [surface.isValid] is false → no-op (compositor's cameraInputSurface was
      *     already released during teardown before the posted callback ran).
-     *   - [context] is null → no-op (no Context available, cannot create CameraSource).
-     *   - [session.cameraSource] is non-null → no-op (camera already started; camera
-     *     source survives output loss — the compositor Surface lives across re-attaches).
      *
-     * On start error: stops/nulls the source so a later re-attach or re-callback can retry.
+     * [AndroidDuetForegroundProvider.start] itself guards context-availability
+     * and camera-already-started idempotency.
      */
     private fun startCameraSourceIfNeeded(
         session: VGDuetAndroidSession,
@@ -983,272 +949,79 @@ class AndroidDuetSessionCoordinator(
         // down between when cameraInputSurfaceReady was posted and when it ran.
         if (activeSession !== session) return
         if (session.sessionId != sessionId) return
-        if (session.previewRenderLoop == null) return
+        val renderLoop = session.previewRenderLoop ?: return
         if (session.previewProducer == null) return
         if (!surface.isValid) return
-        val ctx = context ?: return
-        // Already started: camera source and its surface survive output loss, so
-        // a repeat callback when cameraSource is non-null correctly does nothing.
-        if (session.cameraSource != null) return
 
         val mode = session.layoutConfigMap["mode"] as? String ?: "pip"
+        val provider = session.foregroundProvider
+            ?: AndroidDuetLegacyForegroundProvider(context, mainHandler).also { session.foregroundProvider = it }
 
-        val camSource = AndroidDuetCameraSource(ctx)
-        session.cameraSource = camSource
-
-        // When the initial/effective layout mode is greenScreen, create and start
-        // the adapter NOW — before the camera bind — so ImageAnalysis is part of
-        // the first use-case set. This is the only path that puts the analyzer
-        // into the CameraX bind.
-        val analyzerForBind: ImageAnalysis.Analyzer? = if (mode == "greenScreen") {
-            buildGreenScreenAdapter(session)
-        } else null
-
-        camSource.start(
-            targetSurface = surface,
-            analyzer      = analyzerForBind,
-            onStarted = {
-                Log.d("DuetCoordinator", "Camera source started for session $sessionId")
-                if (mode == "greenScreen" && session.greenScreenAdapter != null) {
-                    session.previewRenderLoop?.setGreenScreenEnabled(true)
+        provider.start(
+            surface         = surface,
+            renderLoop      = renderLoop,
+            layoutConfigMap = session.layoutConfigMap,
+            callbacks       = object : AndroidDuetForegroundProviderCallbacks {
+                override fun onStarted() {
+                    Log.d("DuetCoordinator", "Camera source started for session $sessionId")
                 }
-            },
-            onError = { e ->
-                Log.w("DuetCoordinator", "Camera source failed for $sessionId: ${e.message}")
-                // Stop any partial CameraX state and null the source so a later
-                // re-attach callback can retry cleanly.
-                camSource.stop()
-                if (session.cameraSource === camSource) {
-                    session.cameraSource = null
-                    // Fix C: always stop the adapter properly before clearing the ref,
-                    // to avoid leaking the ML Kit Segmenter.
-                    stopGreenScreenAdapter(session)
+
+                override fun onError(e: Exception) {
+                    Log.w("DuetCoordinator", "Camera source failed for $sessionId: ${e.message}")
                     // If this was a greenScreen bind attempt, apply safe PiP fallback
                     // so the session is in a clean state (no greenScreen enabled, no
                     // dangling adapter). Avoids infinite retry via re-attach surface.
-                    if (mode == "greenScreen" && activeSession === session) {
+                    if (mode == "greenScreen" && activeSession === session && session.foregroundProvider === provider) {
                         Log.w("DuetCoordinator",
                             "greenScreen initial camera bind failed — applying PiP fallback layout")
-                        handleGreenScreenFallback(session, reportedSegmentationBackend(session),
-                            DuetSegmentationBackend.NONE, "initial_camera_bind_failed")
+                        handleGreenScreenFallback(session, provider.reportedBackendId(),
+                            "initial_camera_bind_failed")
                     }
+                }
+
+                override fun onFirstMaskReady() {
+                    handleGreenScreenFirstMask(session, provider)
+                }
+
+                override fun onDegraded(previousBackend: String, currentBackend: String, reason: String, userMessage: String) {
+                    handleGreenScreenDegraded(session, provider, previousBackend, currentBackend, reason, userMessage)
+                }
+
+                override fun onFallback(previousBackend: String, reason: String, userMessage: String) {
+                    // Provider-origin callback: only act while this provider is
+                    // still the session's live foreground provider (not torn
+                    // down/replaced between the async fallback and this landing).
+                    if (session.foregroundProvider !== provider) return
+                    handleGreenScreenFallback(session, previousBackend, reason)
                 }
             },
         )
     }
 
-    /**
-     * Creates, stores, and starts a new [AndroidDuetGreenScreenAdapter] for [session].
-     * Returns the adapter (which also implements [ImageAnalysis.Analyzer]) so it can
-     * be passed directly to [AndroidDuetCameraSource.start]. No-ops and returns null
-     * if an adapter is already running or if construction/start throws.
-     *
-     * Backend ladder: the adapter starts on the session-latched rung when a prior
-     * degradation happened in this session, otherwise on the selector's primary
-     * (`mediapipe_cpu` when the model asset is bundled, else `mlkit`). Backends
-     * open lazily on the analysis thread, so start() here never loads a model on
-     * the main thread.
-     *
-     * On any exception: cleans up the partially stored adapter, logs structured
-     * fallback metadata, and returns null so callers can apply PiP fallback.
-     */
-    private fun buildGreenScreenAdapter(session: VGDuetAndroidSession): AndroidDuetGreenScreenAdapter? {
-        if (session.greenScreenAdapter != null) return session.greenScreenAdapter
-        val renderLoop = session.previewRenderLoop ?: return null
-        return try {
-            // Debug-only opt-in: a physical smoke harness can start this session
-            // on a GPU rung by setting
-            //   layoutConfigMap["debugSegmentationBackend"] = "raw_tflite_gpu"
-            // If the selector does not support that rung (asset missing, no context,
-            // API too low), the opt-in is silently ignored and the selector's normal primary is used.
-            // The session latch wins over the debug key if already set (degradation
-            // never climbs back up within a session).
-            val debugBackend = session.layoutConfigMap["debugSegmentationBackend"] as? String
-
-            // Read the raw GPU delegate mode only when the debug backend is raw_tflite_gpu.
-            // Validate against the allowlist; fall back to default on invalid/missing values
-            // without failing session start.
-            val rawGpuDelegateMode: String? = if (debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU) {
-                val rawMode = session.layoutConfigMap["debugRawTfliteGpuDelegateMode"] as? String
-                if (rawMode != null) {
-                    if (rawMode in RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST) {
-                        rawMode
-                    } else {
-                        Log.w("DuetCoordinator",
-                            "debugRawTfliteGpuDelegateMode='$rawMode' is not in allowlist " +
-                                "$RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST; " +
-                                "falling back to compat_best_or_default (session=${session.sessionId})")
-                        null
-                    }
-                } else {
-                    null // absent → backend default (compat_best_or_default)
-                }
-            } else {
-                null
-            }
-
-            // Read the raw GPU model asset path only when the debug backend is raw_tflite_gpu.
-            // Validate against the model allowlist; warn and fall back to the selector default
-            // (selfie_multiclass_256x256.tflite) on invalid/missing values without failing session start.
-            val rawGpuModelAssetPath: String? = if (debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU) {
-                val rawModel = session.layoutConfigMap["debugRawTfliteGpuModelAssetPath"] as? String
-                if (rawModel != null) {
-                    if (rawModel in AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST) {
-                        rawModel
-                    } else {
-                        Log.w("DuetCoordinator",
-                            "debugRawTfliteGpuModelAssetPath='$rawModel' is not in allowlist " +
-                                "${AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST}; " +
-                                "falling back to default model (session=${session.sessionId})")
-                        null
-                    }
-                } else {
-                    null // absent → selector default (selfie_multiclass_256x256.tflite)
-                }
-            } else {
-                null
-            }
-
-            // Debug-only MediaPipe CPU model override, used by sustained R&D
-            // smokes to compare bundled model assets without changing the
-            // production default.
-            val mediaPipeCpuModelAssetPath: String? =
-                (session.layoutConfigMap["debugMediaPipeCpuModelAssetPath"] as? String)?.let { model ->
-                    if (model in AndroidDuetSegmentationBackendSelector.MEDIAPIPE_MODEL_ALLOWLIST) {
-                        model
-                    } else {
-                        Log.w("DuetCoordinator",
-                            "debugMediaPipeCpuModelAssetPath='$model' is not in allowlist " +
-                                "${AndroidDuetSegmentationBackendSelector.MEDIAPIPE_MODEL_ALLOWLIST}; " +
-                                "using production default (session=${session.sessionId})")
-                        null
-                    }
-                }
-
-            val selector = AndroidDuetSegmentationBackendSelector(
-                context,
-                rawGpuDelegateMode,
-                rawGpuModelAssetPath,
-                mediaPipeCpuModelAssetPath,
-            )
-
-            val initialBackendId: String = when {
-                session.greenScreenLatchedBackendId != null ->
-                    session.greenScreenLatchedBackendId!!
-                debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU &&
-                    selector.supports(DuetSegmentationBackend.RAW_TFLITE_GPU) -> {
-                    Log.d("DuetCoordinator",
-                        "debugSegmentationBackend=raw_tflite_gpu: starting adapter on raw_tflite_gpu " +
-                            "(delegateMode=${rawGpuDelegateMode ?: "compat_best_or_default"}, " +
-                            "model=${rawGpuModelAssetPath ?: AndroidDuetSegmentationBackendSelector.TFLITE_GPU_MODEL_ASSET_PATH}, " +
-                            "session=${session.sessionId})")
-                    DuetSegmentationBackend.RAW_TFLITE_GPU
-                }
-                else -> selector.primaryBackendId()
-            }
-
-            var adapterRef: AndroidDuetGreenScreenAdapter? = null
-            // Start barrier: hop the FIRST mask (CPU or GPU path) onto the main
-            // thread exactly once per adapter. The per-frame mask upload itself
-            // stays on the analysis thread; nothing else is posted per frame.
-            val firstMaskSignaled = AtomicBoolean(false)
-            val signalFirstMask: () -> Unit = {
-                if (firstMaskSignaled.compareAndSet(false, true)) {
-                    mainHandler.post { handleGreenScreenFirstMask(session, adapterRef) }
-                }
-            }
-            val adapter = AndroidDuetGreenScreenAdapter(
-                selector = selector,
-                initialBackendId = initialBackendId,
-                onMask = { frame ->
-                    renderLoop.updateGreenScreenMask(frame)
-                    signalFirstMask()
-                },
-                onGpuMask = { hardwareBuffer, widthPx, heightPx, timestampUs ->
-                    renderLoop.updateGreenScreenMaskHardwareBuffer(hardwareBuffer, widthPx, heightPx, timestampUs)
-                    signalFirstMask()
-                },
-                onDegraded = { prev, next, reason, userMessage ->
-                    Log.w("DuetCoordinator",
-                        "[GreenScreen degraded] $prev->$next ($reason): $userMessage")
-                    mainHandler.post {
-                        handleGreenScreenDegraded(session, adapterRef, prev, next, reason, userMessage)
-                    }
-                },
-                onFallback = { prev, next, reason, userMessage ->
-                    Log.w("DuetCoordinator",
-                        "[GreenScreen fallback] $prev->$next ($reason): $userMessage")
-                    mainHandler.post {
-                        handleGreenScreenFallback(session, prev, next, reason)
-                    }
-                },
-            )
-            adapterRef = adapter
-            session.greenScreenAdapter = adapter
-            adapter.start()
-            Log.d("DuetCoordinator",
-                "Green-screen adapter built and started for session ${session.sessionId} " +
-                    "(initial backend=$initialBackendId, latched=${session.greenScreenLatchedBackendId})")
-            adapter
-        } catch (t: Throwable) {
-            Log.w("DuetCoordinator",
-                "[GreenScreen fallback] ${reportedSegmentationBackend(session)}->none " +
-                    "(adapter_start_failed): ${t.message}")
-            // Ensure no partial adapter reference is left in the session.
-            try { session.greenScreenAdapter?.stop() } catch (_: Throwable) {}
-            session.greenScreenAdapter = null
-            null
-        }
-    }
-
-    /**
-     * Stops and nulls the session's green-screen adapter (idempotent). The
-     * adapter's stop() closes its active and any fallback backend.
-     */
-    private fun stopGreenScreenAdapter(session: VGDuetAndroidSession) {
-        val adapter = session.greenScreenAdapter ?: return
-        try { adapter.stop() } catch (_: Throwable) {}
-        session.greenScreenAdapter = null
-        // A rebuilt adapter must deliver a fresh first mask before a start may proceed.
-        session.firstGreenScreenMaskReady = false
-        Log.d("DuetCoordinator", "Green-screen adapter stopped for session ${session.sessionId}")
-    }
-
-    /**
-     * Segmentation backend to report as `previousBackend` when green screen
-     * fails before/outside the adapter's own ladder (bind failures): the live
-     * adapter's rung, else the session latch, else the selector's primary.
-     */
-    private fun reportedSegmentationBackend(session: VGDuetAndroidSession): String =
-        session.greenScreenAdapter?.currentBackendId
-            ?: session.greenScreenLatchedBackendId
-            ?: AndroidDuetSegmentationBackendSelector(context).primaryBackendId()
+    // Adapter/camera building, debug backend policy, the segmentation ladder,
+    // and the ladder latch now live in AndroidDuetForegroundProvider — see
+    // AndroidDuetLegacyForegroundProvider.buildGreenScreenAdapter.
 
     /**
      * Handles a NON-terminal backend degradation (MediaPipe -> ML Kit): green
      * screen stays live, the layout is untouched, and the reached rung is
-     * latched on the session so no later adapter climbs back up. Emits
-     * `green_screen_degraded` via [onDuetEvent] only when [adapter] is still
-     * the session's current adapter (stale adapters latch but stay silent).
+     * latched inside [provider] so no later adapter climbs back up. Emits
+     * `green_screen_degraded` via [onDuetEvent] only when [provider] is still
+     * the session's live foreground provider (the provider itself has already
+     * filtered stale/replaced adapters before invoking this callback).
      *
-     * Called on the main thread from the adapter's onDegraded callback.
+     * Called on the main thread from the provider's onDegraded callback.
      */
     private fun handleGreenScreenDegraded(
         session: VGDuetAndroidSession,
-        adapter: AndroidDuetGreenScreenAdapter?,
+        provider: AndroidDuetForegroundProvider,
         previousBackend: String,
         currentBackend: String,
         reason: String,
         userMessage: String,
     ) {
         if (activeSession !== session) return
-        // Latch regardless of adapter staleness: the degradation really happened.
-        session.greenScreenLatchedBackendId = currentBackend
-        if (adapter == null || session.greenScreenAdapter !== adapter) {
-            Log.d("DuetCoordinator",
-                "Green-screen degrade from a stale adapter latched ($currentBackend) without event")
-            return
-        }
+        if (session.foregroundProvider !== provider) return
         Log.w("DuetCoordinator",
             "Green screen degraded $previousBackend -> $currentBackend ($reason); staying live on $currentBackend")
         onDuetEvent?.invoke(
@@ -1266,34 +1039,33 @@ class AndroidDuetSessionCoordinator(
     /**
      * Handles the TERMINAL segmentation fallback (ladder exhausted — ML Kit
      * failed, or green screen could not be bound at all): switches the session
-     * to a safe PiP layout, stops the adapter (closing every backend), disables
+     * to a safe PiP layout, stops the foreground provider's keying, disables
      * green-screen in the render loop, and updates layout rects. Session is
      * preserved; no restart. Non-terminal MediaPipe -> ML Kit degradation never
      * reaches here (see [handleGreenScreenDegraded]).
      *
-     * Called on the main thread from the onFallback callback.
+     * Called on the main thread, either from the provider's onFallback and
+     * onError callbacks (both identity-check their captured provider against
+     * [VGDuetAndroidSession.foregroundProvider] at the call site before
+     * reaching here, since those callbacks may land after an async gap) or
+     * directly from updateLayout, which calls in synchronously within the
+     * same stack frame that read `session.foregroundProvider`, so no separate
+     * identity check is needed there. This function itself only re-checks
+     * [activeSession].
      *
      * Safe PiP rect per spec: left=0.58, top=0.05, width=0.36, height=0.24.
      */
     private fun handleGreenScreenFallback(
         session: VGDuetAndroidSession,
         previousBackend: String,
-        currentBackend: String,
         reason: String,
     ) {
         if (activeSession !== session) return
         Log.w("DuetCoordinator",
-            "Falling back from $previousBackend to $currentBackend ($reason) — switching to PiP")
+            "Falling back from $previousBackend to none ($reason) — switching to PiP")
 
-        // Remove the analysis use-case from CameraX before stopping the adapter,
-        // so no new frames arrive during teardown.
-        session.cameraSource?.setAnalysisAnalyzer(null)
-
-        // Stop the adapter immediately.
-        stopGreenScreenAdapter(session)
-
-        // Disable green-screen in the render loop.
-        session.previewRenderLoop?.setGreenScreenEnabled(false)
+        // Remove the analysis use-case and stop keying immediately.
+        session.foregroundProvider?.setGreenScreenEnabled(false, session.layoutConfigMap)
 
         // Build and apply the safe fallback PiP layout.
         val fallbackPipRect = mapOf(
@@ -1326,7 +1098,7 @@ class AndroidDuetSessionCoordinator(
         // Emit onDuetEvent only after the PiP fallback layout above has been
         // applied — currentBackend in the event payload is always "pip" (the
         // resulting preview backend), distinct from the internal segmentation
-        // backend value ("none") passed in as [currentBackend].
+        // backend value ("none").
         onDuetEvent?.invoke(
             mapOf(
                 "event" to "green_screen_fallback",
@@ -1356,8 +1128,8 @@ class AndroidDuetSessionCoordinator(
     // ── Preview release helper ────────────────────────────────────────────────
 
     /**
-     * Releases and nulls the session's preview producer, camera source, and
-     * render loop.
+     * Releases and nulls the session's preview producer, foreground provider,
+     * and render loop.
      *
      * Opus P1 stop ordering (prevents CameraX writing into a concurrently
      * releasing SurfaceTexture or a live drawFrame consuming an OES frame mid-stop):
@@ -1365,7 +1137,8 @@ class AndroidDuetSessionCoordinator(
      *   2. renderLoop.prepareForCameraStop()  — stops active ticking, stops camera
      *      idle redraw, sets canSubmit=false and bumps surfaceGeneration so no
      *      pending swaps continue while CameraX is draining its last OES frame
-     *   3. cameraSource.stop()               — stops CameraX writes into cameraInputSurface
+     *   3. provider.stopKeying(); provider.stop() — stops keying, then stops
+     *      CameraX writes into cameraInputSurface
      *   4. renderLoop.stopBlocking(...)      — unbinds decoder, releases compositor
      *      (which releases cameraInputSurface in its terminal release())
      *   5. producer.finishRelease()          — drops the Flutter SurfaceProducer
@@ -1376,10 +1149,9 @@ class AndroidDuetSessionCoordinator(
     private fun releasePreviewProducer(session: VGDuetAndroidSession) {
         val producer = session.previewProducer
         val renderLoop = session.previewRenderLoop
-        val camSource = session.cameraSource
-        val gsAdapter = session.greenScreenAdapter
+        val provider = session.foregroundProvider
         // Phase 0: a start parked behind the green-screen barrier can never be
-        // satisfied once the preview (and its adapter) is gone — fail it now so
+        // satisfied once the preview (and its keying) is gone — fail it now so
         // neither the MethodChannel reply nor the timeout runnable leaks.
         cancelPendingStart(session, "preview_released")
         // Phase 1: stop new producer submissions.
@@ -1388,18 +1160,16 @@ class AndroidDuetSessionCoordinator(
         // swap acceptance BEFORE CameraX is stopped. This prevents a drawFrame
         // updateTexImage racing the last CameraX OES write during drain.
         renderLoop?.prepareForCameraStop()
-        // Phase 2b: stop the green-screen adapter so ML Kit is not dispatching
-        // new frames into the (soon-to-be-released) render loop.
-        try { gsAdapter?.stop() } catch (_: Throwable) {}
-        session.greenScreenAdapter = null
-        session.firstGreenScreenMaskReady = false
+        // Phase 2b: stop keying so ML Kit is not dispatching new frames into
+        // the (soon-to-be-released) render loop.
+        provider?.stopKeying()
         // Phase 3: stop camera — render loop is already quiet, safe to drain.
-        camSource?.stop()
+        provider?.stop()
         // Phase 4: unwind decoder and release compositor (releases cameraInputSurface).
         renderLoop?.stopBlocking(session.previewClock.currentSourcePtsMs().toLong())
         // Phase 5: drop the Flutter SurfaceProducer.
         producer?.finishRelease()
-        session.cameraSource       = null
+        session.foregroundProvider = null
         session.previewProducer    = null
         session.previewRenderLoop  = null
         session.previewWidthPx     = null
