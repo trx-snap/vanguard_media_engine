@@ -2,7 +2,11 @@
 // VG-DUET-SLICE-3: Duet source video decoder & frame provider seam.
 //
 // Responsibilities:
-//   - Encapsulates AVAssetReader and AVAssetReaderTrackOutput.
+//   - Encapsulates AVAssetReader and AVAssetReaderVideoCompositionOutput.
+//   - Applies AVAssetTrack.preferredTransform via AVMutableVideoComposition so
+//     rotated source clips (e.g. portrait .mov with rotation metadata) decode
+//     orientation-normalized instead of sideways. See VGTimelineCompositorNode.m
+//     "Phase 7.9" for the equivalent Objective-C pattern.
 //   - Uses 32BGRA, Metal compatibility, IOSurface backing, alwaysCopiesSampleData = false.
 //   - Prepares and primes first frame at trimStartMs.
 //   - Steps / seeks on demand (no free-running decode loop).
@@ -58,7 +62,7 @@ final class VGDuetSourceVideoDecoder: VGDuetFrameProvider {
 
     private var asset: AVURLAsset?
     private var assetReader: AVAssetReader?
-    private var trackOutput: AVAssetReaderTrackOutput?
+    private var trackOutput: AVAssetReaderVideoCompositionOutput?
     private var videoTrack: AVAssetTrack?
     private var isReleased: Bool = false
 
@@ -111,13 +115,23 @@ final class VGDuetSourceVideoDecoder: VGDuetFrameProvider {
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
 
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        // AVAssetReaderTrackOutput vends raw encoded-orientation pixel buffers
+        // and ignores AVAssetTrack.preferredTransform, so rotated source clips
+        // (e.g. portrait .mov files with rotation=90 metadata) decode sideways.
+        // AVAssetReaderVideoCompositionOutput applies the video composition's
+        // layer instructions (built from the asset's preferredTransform) at
+        // decode time, producing orientation-normalized BGRA buffers.
+        let videoComposition = AVMutableVideoComposition(propertiesOf: asset)
+
+        let output = AVAssetReaderVideoCompositionOutput(videoTracks: [track], videoSettings: outputSettings)
+        // videoComposition must be set before reader.startReading() (Apple requirement).
+        output.videoComposition = videoComposition
         output.alwaysCopiesSampleData = false
 
         if reader.canAdd(output) {
             reader.add(output)
         } else {
-            throw VGDuetDecoderError.readerInitializationFailed("Cannot add track output to AVAssetReader")
+            throw VGDuetDecoderError.readerInitializationFailed("Cannot add video composition output to AVAssetReader")
         }
 
         let startTime = CMTime(value: Int64(startPtsMs), timescale: 1000)

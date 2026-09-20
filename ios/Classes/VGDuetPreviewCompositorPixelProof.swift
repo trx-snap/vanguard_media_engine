@@ -13,8 +13,28 @@
 // the `runIosDuetPixelProof` method channel route (VGDuetMethodHandler.swift) hardcode
 // that exact contract and are out of scope for this slice. Internally the proof now
 // builds a VGLiveGreenScreenCompositor — the type that actually owns the CIBlendWithMask
-// green-screen path being proved — instead of VGDuetPreviewCompositor; every gate,
-// sample point, tolerance, and expected-value computation is unchanged.
+// green-screen path being proved — instead of VGDuetPreviewCompositor; every gate and
+// sample point is unchanged, but the fractional-blend expected values are not (see below).
+//
+// Fractional expected-value correction: `VGLiveGreenScreenCompositor.composite()` never
+// feeds the raw authored mask byte to CIBlendWithMask — it always runs
+// `VGMatteRefinementPipeline.refineLiveGreenScreenMask(...)` on the aspect-filled mask
+// first (morphology close, feather, trimap, then the production live default
+// `.s4SoftAlphaR2` camera-guided alpha refinement), and only the refined mask reaches
+// CIBlendWithMask. Interior 0/255 quadrant values survive that pipeline unchanged (no
+// stage moves a flat interior region far from any mask edge), which is why the
+// boundary-keying and viewport-exterior assertions below still compare against literal
+// background/foreground colors. Interior fractional values (the 128/64 quadrant sample
+// points) do not survive unchanged — they sit close enough to multiple quadrant
+// boundaries that feather/trimap/S4 refinement measurably shifts them. So the fractional
+// assertions below render the exact same `.s4SoftAlphaR2` refined mask
+// `VGLiveGreenScreenCompositor.composite()` used internally (via
+// `greenScreenMatteStages(..., refinementMode: .s4SoftAlphaR2).finalMask`), sample its
+// actual byte value at each fraction sample coordinate, and assert the composited output
+// against the linear foreground/background mix of *that* sampled value — a real
+// after-the-fact check of CIBlendWithMask's own linear-interpolation math against
+// whatever mask value the production refinement pipeline actually produced, rather than
+// a stale assumption that the raw quadrant byte reaches the filter unchanged.
 //
 // Proves that VGLiveGreenScreenCompositor's CIBlendWithMask green-screen path blends a
 // synthetic camera foreground over a synthetic source/background through a single-channel
@@ -169,6 +189,44 @@ extension VGDuetPreviewCompositor {
         details["sourceRect"] = ["x": 0, "y": 0, "width": 64, "height": 64]
         details["canvasSize"] = ["width": 64, "height": 64]
 
+        // 3b. Reproduce the exact refined mask CIImage the composite() call above already
+        // fed to CIBlendWithMask internally, so the fractional-blend assertions in step 4
+        // can be checked against the real post-refinement mask value instead of the raw
+        // authored quadrant byte (see this file's header). `compositor` above was built
+        // with no explicit `liveMatteRefinementMode` override, so it already runs the
+        // production default (`VGMatteRefinementPipeline.defaultLiveMatteRefinementMode`
+        // == `.s4SoftAlphaR2`); this mirrors that exact mode for expected-mask sampling.
+        let refinementModeUsedForExpected = "s4SoftAlphaR2"
+        let ciCameraRect = compositor.ciRect(fromTopLeft: cameraRect)
+        let maskFilledForExpected = compositor.aspectFill(CIImage(cvPixelBuffer: maskBuffer), into: ciCameraRect)
+        let cameraFilledForExpected = compositor.aspectFill(CIImage(cvPixelBuffer: cameraBuffer), into: ciCameraRect)
+        let expectedMaskStages = compositor.greenScreenMatteStages(aspectFilledMask: maskFilledForExpected,
+                                                                    in: ciCameraRect,
+                                                                    guidedBy: cameraFilledForExpected,
+                                                                    refinementMode: .s4SoftAlphaR2)
+        let refinedMaskDebugBuffer = renderMaskDebugBuffer(expectedMaskStages.finalMask,
+                                                            using: compositor,
+                                                            bounds: sourceRect,
+                                                            width: 64, height: 64)
+
+        var sampledRefinedMaskAlpha128: Int?
+        var sampledRefinedMaskAlpha64: Int?
+        if let maskDebugBuffer = refinedMaskDebugBuffer {
+            CVPixelBufferLockBaseAddress(maskDebugBuffer, .readOnly)
+            sampledRefinedMaskAlpha128 = readBGRAPixel(maskDebugBuffer, x: 20, y: 40)?.r
+            sampledRefinedMaskAlpha64  = readBGRAPixel(maskDebugBuffer, x: 40, y: 40)?.r
+            CVPixelBufferUnlockBaseAddress(maskDebugBuffer, .readOnly)
+        } else {
+            fail("refined_mask_debug_buffer_creation_failed")
+        }
+        // -1 sentinel (never a valid 0-255 mask byte) marks a sample that could not be
+        // read, instead of bridging a Swift Optional through the Flutter method channel.
+        details["refinedMaskForExpected"] = [
+            "refinementMode": refinementModeUsedForExpected,
+            "sampledAlphaAt_20_40": sampledRefinedMaskAlpha128 ?? -1,
+            "sampledAlphaAt_40_40": sampledRefinedMaskAlpha64 ?? -1,
+        ]
+
         // 4. Sample and assert.
         //
         // Orientation: an offline standalone CoreImage probe run against this exact
@@ -185,7 +243,10 @@ extension VGDuetPreviewCompositor {
             "Mask memory row 0 (top) renders to the top of cameraRect in the output buffer " +
             "for this symmetric geometry; verified via an offline CoreImage probe, not assumed."
         details["blendFormula"] =
-            "output = round(foreground * (maskByte/255) + background * (1 - maskByte/255)) per channel"
+            "output = round(foreground * (refinedMaskByte/255) + background * (1 - refinedMaskByte/255)) " +
+            "per channel, where refinedMaskByte is the actual VGMatteRefinementPipeline-refined " +
+            "(s4SoftAlphaR2) mask value sampled at the same output coordinate, not the raw authored " +
+            "quadrant byte fed into VGLiveGreenScreenCompositor.composite()'s greenScreenMask argument"
 
         CVPixelBufferLockBaseAddress(output, .readOnly)
         var lockedReadsOk = true
@@ -229,9 +290,24 @@ extension VGDuetPreviewCompositor {
         sample("mask_alpha0_quadrant",   x: 20, y: 20, expected: bg, group: "boundary")
         sample("mask_alpha255_quadrant", x: 40, y: 20, expected: fg, group: "boundary")
 
-        // Fractional blend math: alpha=128 and alpha=64 linear mixes.
-        sample("mask_alpha128_quadrant", x: 20, y: 40, expected: expectedMix(alpha: 128), group: "fraction")
-        sample("mask_alpha64_quadrant",  x: 40, y: 40, expected: expectedMix(alpha: 64),  group: "fraction")
+        // Fractional blend math: assert the composited pixel against the linear
+        // foreground/background mix of the *actual* refined mask byte sampled at this
+        // coordinate (see step 3b) rather than the raw authored quadrant byte (128/64),
+        // since VGMatteRefinementPipeline measurably shifts these interior sample points.
+        if let alpha128 = sampledRefinedMaskAlpha128 {
+            sample("mask_alpha128_quadrant", x: 20, y: 40, expected: expectedMix(alpha: alpha128), group: "fraction")
+        } else {
+            fractionalAllOk = false
+            fail("refined_mask_sample_failed_mask_alpha128_quadrant")
+            mismatches.append("label=mask_alpha128_quadrant group=fraction refined_mask_sample_unavailable")
+        }
+        if let alpha64 = sampledRefinedMaskAlpha64 {
+            sample("mask_alpha64_quadrant", x: 40, y: 40, expected: expectedMix(alpha: alpha64), group: "fraction")
+        } else {
+            fractionalAllOk = false
+            fail("refined_mask_sample_failed_mask_alpha64_quadrant")
+            mismatches.append("label=mask_alpha64_quadrant group=fraction refined_mask_sample_unavailable")
+        }
 
         CVPixelBufferUnlockBaseAddress(output, .readOnly)
         gates["cleanupOk"] = lockedReadsOk
@@ -309,6 +385,29 @@ extension VGDuetPreviewCompositor {
                 row[x] = isTop ? (isLeft ? tl : tr) : (isLeft ? bl : br)
             }
         }
+        return buffer
+    }
+
+    /// Renders a mask `CIImage` (e.g. a `VGMatteRefinementPipeline`-refined mask) into a
+    /// scratch BGRA buffer using the same `compositor`-owned `CIContext` and the same
+    /// `bounds` rect `VGLiveGreenScreenCompositor.composite()` renders its own output
+    /// with, so a later `readBGRAPixel` call against this buffer maps to the same
+    /// top-left (x,y) coordinates already verified for the real output buffer (see the
+    /// orientation note above). Never touches the compositor's own pool; purely a local
+    /// diagnostic scratch buffer for expected-value sampling. Grayscale-sourced images
+    /// render with R == G == B == the mask byte, so any channel (here `.r`) reads it back.
+    private static func renderMaskDebugBuffer(_ mask: CIImage,
+                                               using compositor: VGLiveGreenScreenCompositor,
+                                               bounds: CGRect,
+                                               width: Int, height: Int) -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                          kCVPixelFormatType_32BGRA, attributes as CFDictionary, &pixelBuffer)
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return nil }
+        compositor.ciContext.render(mask, to: buffer, bounds: bounds, colorSpace: nil)
         return buffer
     }
 
