@@ -1412,6 +1412,7 @@ class VanguardNativeBridge(
         // VulkanSurfaceSwapchain attached to the ANativeWindow from outputSurface
         // (Vulkan path), or EGLDisplay/EGLContext/EGLSurface (GLES fallback).
         // Returns an opaque session handle (pointer cast to Long), or 0 on failure.
+        @JvmStatic
         external fun nativeCreateDualCamSession(
             outputSurface: Surface,
             width: Int,
@@ -1423,6 +1424,7 @@ class VanguardNativeBridge(
         // frontHardwareBuffer / backHardwareBuffer as AHardwareBuffer, renders
         // via swapchain. GLES path clears + swaps (both HardwareBuffers null).
         // Returns true on success.
+        @JvmStatic
         external fun nativeDualCamCompositeFrame(
             sessionHandle: Long,
             frontHardwareBuffer: HardwareBuffer?,
@@ -1433,6 +1435,7 @@ class VanguardNativeBridge(
         // nativeComputeMultiCamLayout: Thin JSON wrapper over ComputeMultiCamLayout().
         // Returns a JSON string with primaryViewport, secondaryViewport, and
         // secondaryOpacity fields in normalized coordinates.
+        @JvmStatic
         external fun nativeComputeMultiCamLayout(
             layoutParamsJson: String,
             canvasWidth: Int,
@@ -1441,6 +1444,7 @@ class VanguardNativeBridge(
 
         // nativeDestroyDualCamSession: Idempotent teardown. Waits for device idle,
         // destroys all Vulkan/GLES resources, and frees the session handle.
+        @JvmStatic
         external fun nativeDestroyDualCamSession(sessionHandle: Long)
 
     }
@@ -3308,6 +3312,26 @@ class VanguardNativeBridge(
         modelBytes: Int,
         repeatCount: Int,
     ): String
+
+    // -- LIVE-CAMERA-BEAUTY-PARITY: production JNI entry point for real-time
+    // live camera beauty filter. Called from AndroidCameraBeautySurfaceProcessor
+    // on its GPU HandlerThread with a caller-current EGL ES3 context. Applies
+    // the 3-pass bilateral skin smoothing filter via GlesBeautyV2Compositor.
+    // Returns true on success, false on any failure.
+    external fun drawLiveCameraBeauty(
+        inputTextureId: Int,
+        targetFbo: Int,
+        width: Int,
+        height: Int,
+        intensity: Float,
+    ): Boolean
+
+    // Releases cached GL resources (shader programs, FBOs, textures, VAO/VBO)
+    // held by the native GlesBeautyV2Compositor singleton. Must be called on
+    // the GL thread before the EGL context is destroyed. Safe to call multiple
+    // times or when no resources are cached.
+    external fun releaseLiveCameraBeauty()
+
 
     fun initialize() {
         val report = probeCapabilities()

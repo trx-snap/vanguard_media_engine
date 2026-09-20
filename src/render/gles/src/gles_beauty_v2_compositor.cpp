@@ -65,7 +65,7 @@ namespace vanguard {
 namespace render {
 
 GlesBeautyV2Compositor::GlesBeautyV2Compositor() = default;
-GlesBeautyV2Compositor::~GlesBeautyV2Compositor() = default;
+GlesBeautyV2Compositor::~GlesBeautyV2Compositor() { Release(); }
 
 // ── Pure validation + ramp math (all platforms) ─────────────────────────────
 
@@ -504,43 +504,137 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
     bool ok = true;
     std::string stageError;
 
-    GLuint texA = 0, texB = 0, fboA = 0, fboB = 0;
-    GLuint vao = 0, vbo = 0;
-    TemporaryProgram blurProgram;
-    TemporaryProgram compositeProgram;
-
-    texA = CreateBeautyTexture(width, height);
-    texB = CreateBeautyTexture(width, height);
-    if (texA == 0 || texB == 0) {
-        ok = false;
-        SetError(&stageError, kErrDrawFailed);
-    }
-    if (ok) {
-        fboA = CreateBeautyFramebuffer(texA);
-        if (fboA == 0) {
+    // ── Lazy shader compilation (once per compositor lifetime). ─────────────
+    if (blurProgram_ == 0 && ok) {
+        GLuint vs = CompileShader(GL_VERTEX_SHADER, kVertexShaderSrc);
+        if (vs == 0) {
             ok = false;
-            SetError(&stageError, kErrFboIncomplete);
+            SetError(&stageError, kErrShaderCompileFailed);
+        } else {
+            GLuint fs = CompileShader(GL_FRAGMENT_SHADER, kBlurFragmentShaderSrc);
+            if (fs == 0) {
+                glDeleteShader(vs);
+                ok = false;
+                SetError(&stageError, kErrShaderCompileFailed);
+            } else {
+                GLuint prog = glCreateProgram();
+                if (prog == 0) {
+                    glDeleteShader(fs);
+                    glDeleteShader(vs);
+                    ok = false;
+                    SetError(&stageError, kErrProgramLinkFailed);
+                } else {
+                    glAttachShader(prog, vs);
+                    glAttachShader(prog, fs);
+                    glLinkProgram(prog);
+                    GLint linked = GL_FALSE;
+                    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+                    if (linked != GL_TRUE) {
+                        glDeleteProgram(prog);
+                        glDeleteShader(fs);
+                        glDeleteShader(vs);
+                        ok = false;
+                        SetError(&stageError, kErrProgramLinkFailed);
+                    } else {
+                        blurVertexShader_ = vs;
+                        blurFragmentShader_ = fs;
+                        blurProgram_ = prog;
+                    }
+                }
+            }
         }
     }
-    if (ok) {
-        fboB = CreateBeautyFramebuffer(texB);
-        if (fboB == 0) {
+
+    if (compositeProgram_ == 0 && ok) {
+        GLuint vs = CompileShader(GL_VERTEX_SHADER, kVertexShaderSrc);
+        if (vs == 0) {
             ok = false;
-            SetError(&stageError, kErrFboIncomplete);
+            SetError(&stageError, kErrShaderCompileFailed);
+        } else {
+            GLuint fs = CompileShader(GL_FRAGMENT_SHADER, kCompositeFragmentShaderSrc);
+            if (fs == 0) {
+                glDeleteShader(vs);
+                ok = false;
+                SetError(&stageError, kErrShaderCompileFailed);
+            } else {
+                GLuint prog = glCreateProgram();
+                if (prog == 0) {
+                    glDeleteShader(fs);
+                    glDeleteShader(vs);
+                    ok = false;
+                    SetError(&stageError, kErrProgramLinkFailed);
+                } else {
+                    glAttachShader(prog, vs);
+                    glAttachShader(prog, fs);
+                    glLinkProgram(prog);
+                    GLint linked = GL_FALSE;
+                    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+                    if (linked != GL_TRUE) {
+                        glDeleteProgram(prog);
+                        glDeleteShader(fs);
+                        glDeleteShader(vs);
+                        ok = false;
+                        SetError(&stageError, kErrProgramLinkFailed);
+                    } else {
+                        compositeVertexShader_ = vs;
+                        compositeFragmentShader_ = fs;
+                        compositeProgram_ = prog;
+                    }
+                }
+            }
         }
     }
 
-    if (ok) {
-        ok = blurProgram.Build(kBlurFragmentShaderSrc, &stageError);
-    }
-    if (ok) {
-        ok = compositeProgram.Build(kCompositeFragmentShaderSrc, &stageError);
+    // ── Lazy FBO/texture allocation (re-created on dimension change). ───────
+    if (ok && (cachedWidth_ != width || cachedHeight_ != height)) {
+        // Dimension change: delete old FBOs/textures if they exist.
+        if (fboA_ != 0) { glDeleteFramebuffers(1, &fboA_); fboA_ = 0; }
+        if (fboB_ != 0) { glDeleteFramebuffers(1, &fboB_); fboB_ = 0; }
+        if (texA_ != 0) { glDeleteTextures(1, &texA_); texA_ = 0; }
+        if (texB_ != 0) { glDeleteTextures(1, &texB_); texB_ = 0; }
+
+        GLuint tA = CreateBeautyTexture(width, height);
+        GLuint tB = CreateBeautyTexture(width, height);
+        if (tA == 0 || tB == 0) {
+            if (tA != 0) glDeleteTextures(1, &tA);
+            if (tB != 0) glDeleteTextures(1, &tB);
+            ok = false;
+            SetError(&stageError, kErrDrawFailed);
+        } else {
+            GLuint fA = CreateBeautyFramebuffer(tA);
+            if (fA == 0) {
+                glDeleteTextures(1, &tA);
+                glDeleteTextures(1, &tB);
+                ok = false;
+                SetError(&stageError, kErrFboIncomplete);
+            } else {
+                GLuint fB = CreateBeautyFramebuffer(tB);
+                if (fB == 0) {
+                    glDeleteFramebuffers(1, &fA);
+                    glDeleteTextures(1, &tA);
+                    glDeleteTextures(1, &tB);
+                    ok = false;
+                    SetError(&stageError, kErrFboIncomplete);
+                } else {
+                    texA_ = tA;
+                    texB_ = tB;
+                    fboA_ = fA;
+                    fboB_ = fB;
+                    cachedWidth_ = width;
+                    cachedHeight_ = height;
+                }
+            }
+        }
     }
 
-    if (ok) {
+    // ── Lazy VAO/VBO creation (once per compositor lifetime). ────────────────
+    if (vao_ == 0 && ok) {
+        GLuint vao = 0, vbo = 0;
         glGenVertexArrays(1, &vao);
         glGenBuffers(1, &vbo);
         if (vao == 0 || vbo == 0) {
+            if (vbo != 0) glDeleteBuffers(1, &vbo);
+            if (vao != 0) glDeleteVertexArrays(1, &vao);
             ok = false;
             SetError(&stageError, kErrDrawFailed);
         } else {
@@ -550,10 +644,22 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
             glEnableVertexAttribArray(0);
             glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
             if (glGetError() != GL_NO_ERROR) {
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                glBindVertexArray(0);
+                glDeleteBuffers(1, &vbo);
+                glDeleteVertexArrays(1, &vao);
                 ok = false;
                 SetError(&stageError, kErrDrawFailed);
+            } else {
+                vao_ = vao;
+                vbo_ = vbo;
             }
         }
+    }
+
+    // Bind cached VAO for the three render passes.
+    if (ok) {
+        glBindVertexArray(static_cast<GLuint>(vao_));
     }
 
     const GLint w = static_cast<GLint>(width);
@@ -561,17 +667,17 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
 
     // ── Pass 1: blur_h — inputTexture -> fboA (texA). ───────────────────────
     if (ok) {
-        glBindFramebuffer(GL_FRAMEBUFFER, fboA);
-        glUseProgram(blurProgram.program);
+        glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(fboA_));
+        glUseProgram(static_cast<GLuint>(blurProgram_));
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, inputTexture);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uInputTex"), 0);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uWidth"), w);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uHeight"), h);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uRadius"), params.radius);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uAxis"), 0);
-        glUniform1f(glGetUniformLocation(blurProgram.program, "uSigma"), params.sigma);
-        glUniform1f(glGetUniformLocation(blurProgram.program, "uRangeSigma"), params.rangeSigma);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uInputTex"), 0);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uWidth"), w);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uHeight"), h);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uRadius"), params.radius);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uAxis"), 0);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uSigma"), params.sigma);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uRangeSigma"), params.rangeSigma);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         if (glGetError() != GL_NO_ERROR) {
             ok = false;
@@ -581,17 +687,17 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
 
     // ── Pass 2: blur_v — texA -> fboB (texB). ───────────────────────────────
     if (ok) {
-        glBindFramebuffer(GL_FRAMEBUFFER, fboB);
-        glUseProgram(blurProgram.program);
+        glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(fboB_));
+        glUseProgram(static_cast<GLuint>(blurProgram_));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texA);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uInputTex"), 0);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uWidth"), w);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uHeight"), h);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uRadius"), params.radius);
-        glUniform1i(glGetUniformLocation(blurProgram.program, "uAxis"), 1);
-        glUniform1f(glGetUniformLocation(blurProgram.program, "uSigma"), params.sigma);
-        glUniform1f(glGetUniformLocation(blurProgram.program, "uRangeSigma"), params.rangeSigma);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texA_));
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uInputTex"), 0);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uWidth"), w);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uHeight"), h);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uRadius"), params.radius);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uAxis"), 1);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uSigma"), params.sigma);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(blurProgram_), "uRangeSigma"), params.rangeSigma);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         if (glGetError() != GL_NO_ERROR) {
             ok = false;
@@ -602,21 +708,21 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
     // ── Pass 3: composite — inputTexture + texB -> targetFbo. ───────────────
     if (ok) {
         glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(targetFbo));
-        glUseProgram(compositeProgram.program);
+        glUseProgram(static_cast<GLuint>(compositeProgram_));
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, inputTexture);
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, texB);
-        glUniform1i(glGetUniformLocation(compositeProgram.program, "uOrigTex"), 0);
-        glUniform1i(glGetUniformLocation(compositeProgram.program, "uMeanTex"), 1);
-        glUniform1i(glGetUniformLocation(compositeProgram.program, "uWidth"), w);
-        glUniform1i(glGetUniformLocation(compositeProgram.program, "uHeight"), h);
-        glUniform1f(glGetUniformLocation(compositeProgram.program, "uSmoothStrength"), params.smoothStrength);
-        glUniform1f(glGetUniformLocation(compositeProgram.program, "uSharpenStrength"), params.sharpenStrength);
-        glUniform1f(glGetUniformLocation(compositeProgram.program, "uTheta"), params.theta);
-        glUniform1f(glGetUniformLocation(compositeProgram.program, "uDetailDamping"), params.detailDamping);
-        glUniform1f(glGetUniformLocation(compositeProgram.program, "uToneStrength"), params.toneStrength);
-        glUniform1f(glGetUniformLocation(compositeProgram.program, "uMidtoneLift"), params.midtoneLift);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texB_));
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uOrigTex"), 0);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uMeanTex"), 1);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uWidth"), w);
+        glUniform1i(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uHeight"), h);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uSmoothStrength"), params.smoothStrength);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uSharpenStrength"), params.sharpenStrength);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uTheta"), params.theta);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uDetailDamping"), params.detailDamping);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uToneStrength"), params.toneStrength);
+        glUniform1f(glGetUniformLocation(static_cast<GLuint>(compositeProgram_), "uMidtoneLift"), params.midtoneLift);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         if (glGetError() != GL_NO_ERROR) {
             ok = false;
@@ -624,7 +730,7 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
         }
     }
 
-    // ── Teardown: every object this call created, on every path. ────────────
+    // ── Unbind transient state; cached objects are NOT deleted. ──────────────
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -632,15 +738,13 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
     glBindVertexArray(0);
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    if (vbo != 0) glDeleteBuffers(1, &vbo);
-    if (vao != 0) glDeleteVertexArrays(1, &vao);
-    compositeProgram.Release();
-    blurProgram.Release();
-    if (fboA != 0) glDeleteFramebuffers(1, &fboA);
-    if (fboB != 0) glDeleteFramebuffers(1, &fboB);
-    if (texA != 0) glDeleteTextures(1, &texA);
-    if (texB != 0) glDeleteTextures(1, &texB);
     DrainGlErrors();
+
+    // On failure, release all cached state so the next call gets a clean
+    // retry instead of reusing potentially-corrupt handles.
+    if (!ok) {
+        Release();
+    }
 
     snapshot.Restore();
 
@@ -658,5 +762,69 @@ bool GlesBeautyV2Compositor::DrawBeautyV2(uint32_t inputTexture,
 #endif
 }
 
+// ── Explicit GL resource release ────────────────────────────────────────────
+
+void GlesBeautyV2Compositor::Release() {
+#if defined(__ANDROID__)
+    if (blurProgram_ != 0) {
+        glDeleteProgram(static_cast<GLuint>(blurProgram_));
+        blurProgram_ = 0;
+    }
+    if (blurFragmentShader_ != 0) {
+        glDeleteShader(static_cast<GLuint>(blurFragmentShader_));
+        blurFragmentShader_ = 0;
+    }
+    if (blurVertexShader_ != 0) {
+        glDeleteShader(static_cast<GLuint>(blurVertexShader_));
+        blurVertexShader_ = 0;
+    }
+    if (compositeProgram_ != 0) {
+        glDeleteProgram(static_cast<GLuint>(compositeProgram_));
+        compositeProgram_ = 0;
+    }
+    if (compositeFragmentShader_ != 0) {
+        glDeleteShader(static_cast<GLuint>(compositeFragmentShader_));
+        compositeFragmentShader_ = 0;
+    }
+    if (compositeVertexShader_ != 0) {
+        glDeleteShader(static_cast<GLuint>(compositeVertexShader_));
+        compositeVertexShader_ = 0;
+    }
+    if (fboA_ != 0) {
+        GLuint fbo = static_cast<GLuint>(fboA_);
+        glDeleteFramebuffers(1, &fbo);
+        fboA_ = 0;
+    }
+    if (fboB_ != 0) {
+        GLuint fbo = static_cast<GLuint>(fboB_);
+        glDeleteFramebuffers(1, &fbo);
+        fboB_ = 0;
+    }
+    if (texA_ != 0) {
+        GLuint tex = static_cast<GLuint>(texA_);
+        glDeleteTextures(1, &tex);
+        texA_ = 0;
+    }
+    if (texB_ != 0) {
+        GLuint tex = static_cast<GLuint>(texB_);
+        glDeleteTextures(1, &tex);
+        texB_ = 0;
+    }
+    if (vbo_ != 0) {
+        GLuint buf = static_cast<GLuint>(vbo_);
+        glDeleteBuffers(1, &buf);
+        vbo_ = 0;
+    }
+    if (vao_ != 0) {
+        GLuint arr = static_cast<GLuint>(vao_);
+        glDeleteVertexArrays(1, &arr);
+        vao_ = 0;
+    }
+    cachedWidth_ = 0;
+    cachedHeight_ = 0;
+#endif
+}
+
 } // namespace render
 } // namespace vanguard
+

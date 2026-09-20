@@ -532,6 +532,10 @@ if (ANDROID)
     # nativeDualCamCompositeFrame, nativeComputeMultiCamLayout, and
     # nativeDestroyDualCamSession. No Camera2 / TextureRegistry interaction.
     "platform/android/src/android_dualcam_compositor_jni.cpp"
+    # LIVE-CAMERA-BEAUTY-PARITY: production JNI entry point for real-time live
+    # camera beauty filter (3-pass bilateral blur via GlesBeautyV2Compositor).
+    # Called from AndroidCameraBeautySurfaceProcessor on its GPU HandlerThread.
+    "platform/android/src/android_live_camera_beauty_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

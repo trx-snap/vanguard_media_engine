@@ -45,6 +45,7 @@ import android.view.Surface
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
@@ -52,6 +53,7 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.MirrorMode
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.SurfaceProcessor
 import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -68,6 +70,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.camera.AndroidCameraBeautySurfaceProcessor
 import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalFpsActuator
 import io.flutter.view.TextureRegistry
 import java.io.File
@@ -92,6 +96,7 @@ class VanguardCameraSource(
     private val textureEntry: TextureRegistry.SurfaceTextureEntry,
     private var lensFacing: Int = CameraSelector.LENS_FACING_BACK,
     private val frameRate: Int = 30,
+    private val nativeBridge: VanguardNativeBridge? = null,
 ) {
 
     companion object {
@@ -192,6 +197,10 @@ class VanguardCameraSource(
     @Volatile private var appliedAeTargetFpsUpper: Int? = null
     @Volatile private var consecutiveAppliedRangeCompletedCaptures = 0
     private var thermalFpsActuator: AndroidCameraXThermalFpsActuator? = null
+
+    // ── LIVE-CAMERA-BEAUTY-PARITY: beauty filter state ────────────────────────
+    private var beautyProcessor: AndroidCameraBeautySurfaceProcessor? = null
+    @Volatile private var beautyIntensity: Float = 0f
 
     // Telemetry from the most recent applyThermalTargetFps() attempt (any
     // outcome -- applied, rejected, or stale). Reset to null on every fresh
@@ -405,16 +414,49 @@ class VanguardCameraSource(
             .build()
             .also { videoCapture = it }
 
+        // ── LIVE-CAMERA-BEAUTY-PARITY: CameraEffect with SurfaceProcessor ────
+        // Create the beauty SurfaceProcessor that intercepts camera frames for
+        // real-time bilateral blur. Targets both PREVIEW and VIDEO_CAPTURE so
+        // recorded video also receives the beauty filter (WYSIWYG parity with iOS).
+        beautyProcessor?.release()
+        val bridge = nativeBridge ?: run {
+            val diag = com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics()
+            VanguardNativeBridge(
+                com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver(diag),
+                diag,
+                null
+            )
+        }
+        val processor = AndroidCameraBeautySurfaceProcessor(bridge).also {
+            it.intensity = beautyIntensity
+            beautyProcessor = it
+        }
+
+        val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder()
+            .addUseCase(previewUseCase)
+            .addUseCase(imageCaptureUseCase)
+            .addUseCase(videoCaptureUseCase)
+            .apply {
+                if (processor != null) {
+                    addEffect(
+                        CameraBeautyEffect(
+                            CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE,
+                            mainExecutor,
+                            processor,
+                        )
+                    )
+                }
+            }
+            .build()
+
         // ── Bind to fake LifecycleOwner ───────────────────────────────────────
         // CameraX manages the camera session lifecycle internally.
-        // All three use-cases are bound in one call to avoid USB-headset-rotation
-        // race conditions that can occur when use-cases are added incrementally.
+        // All use-cases bound in one call via UseCaseGroup to include the
+        // CameraEffect for the beauty SurfaceProcessor pipeline.
         val boundCamera = provider.bindToLifecycle(
             lifecycleOwner,
             selector,
-            previewUseCase,
-            imageCaptureUseCase,
-            videoCaptureUseCase,
+            useCaseGroup,
         )
         camera = boundCamera
 
@@ -422,7 +464,7 @@ class VanguardCameraSource(
         // the freshly-bound Camera instance for this bind generation.
         thermalFpsActuator = AndroidCameraXThermalFpsActuator(boundCamera, mainExecutor)
 
-        Log.d(TAG, "bindUseCases() — bound Preview + ImageCapture + VideoCapture")
+        Log.d(TAG, "bindUseCases() — bound Preview + ImageCapture + VideoCapture + BeautyEffect")
     }
 
     // ── SurfaceProvider — bridges CameraX Preview → Flutter SurfaceTexture ───
@@ -492,6 +534,10 @@ class VanguardCameraSource(
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
 
         cameraProvider?.unbindAll()
+
+        // LIVE-CAMERA-BEAUTY-PARITY: release the GPU processor on stop.
+        beautyProcessor?.release()
+        beautyProcessor = null
 
         camera        = null
         preview       = null
@@ -1140,6 +1186,21 @@ class VanguardCameraSource(
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // LIVE-CAMERA-BEAUTY-PARITY: beauty filter control
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Sets the beauty filter intensity.
+     * 0.0 = off (direct passthrough), 0.5 = soft, 0.75 = strong, 1.0 = max.
+     * Thread-safe: updates are forwarded to the GPU processor's volatile field.
+     */
+    fun setBeautyIntensity(intensity: Float) {
+        beautyIntensity = intensity.coerceIn(0f, 1f)
+        beautyProcessor?.intensity = beautyIntensity
+        Log.d(TAG, "setBeautyIntensity: $beautyIntensity")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Accessors for plugin (Step 2 wiring)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1159,3 +1220,14 @@ class VanguardCameraSource(
      */
     val isCameraReady: Boolean get() = cameraReadyFlag
 }
+
+// ── LIVE-CAMERA-BEAUTY-PARITY: concrete CameraEffect subclass ────────────────
+// CameraEffect is abstract with a protected constructor; this minimal subclass
+// only exposes the constructor so we can register our SurfaceProcessor with
+// the CameraX UseCaseGroup builder.
+
+private class CameraBeautyEffect(
+    targets: Int,
+    executor: java.util.concurrent.Executor,
+    surfaceProcessor: SurfaceProcessor,
+) : CameraEffect(targets, executor, surfaceProcessor, { })

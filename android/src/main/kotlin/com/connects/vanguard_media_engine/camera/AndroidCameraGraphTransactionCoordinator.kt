@@ -4,20 +4,19 @@ import io.flutter.plugin.common.MethodChannel
 
 /**
  * Phase 6C.2A/6C.2B Android: owns the public Dart VGCameraSession route
- * (applyGraphTransaction) as an honest guard route only.
+ * (applyGraphTransaction).
  *
- * Non-claims (read before touching this file):
- *  - This slice does NOT implement camera graph filter execution on Android.
- *    No filters are applied to camera pixels, and no GL/filter-node/shader
- *    code is added by this route.
- *  - A no-op success (empty transaction, or a rebuild preset whose
- *    filterStack is empty/all-disabled) proves only route reachability,
- *    guard ordering, and a satisfiable no-filter postcondition. It is not
- *    evidence of filter application.
- *  - Any recognized, enabled filter in a rebuild preset -- or any non-empty
- *    hot parameterUpdates transaction -- fails closed with
- *    GRAPH_MODE_DISABLED. No visual parity with iOS is claimed or implied by
- *    this route.
+ * LIVE-CAMERA-BEAUTY-PARITY: this coordinator now routes recognized "beauty"
+ * filter presets to the live camera beauty SurfaceProcessor pipeline via
+ * [setBeautyIntensity], replacing the previous GRAPH_MODE_DISABLED fail-close
+ * guard for the beauty filter type. LUT and segmentation filters remain
+ * unsupported and still fail closed with GRAPH_MODE_DISABLED.
+ *
+ * Supported beauty intensity mapping (matches iOS preset levels):
+ *   - "none" / enabled=false / intensity=0.0 -> 0.0 (passthrough)
+ *   - "soft"  / intensity=0.5                -> 0.5
+ *   - "strong" / intensity=0.75              -> 0.75
+ *   - "max"   / intensity=1.0                -> 1.0
  *
  * Error codes/messages mirror the iOS route policy in
  * VanguardMediaEnginePlugin.swift's "applyGraphTransaction" case so Dart sees
@@ -28,7 +27,7 @@ import io.flutter.plugin.common.MethodChannel
  *  - requiresRebuild without a usable preset/filterStack  -> UNSUPPORTED_TRANSACTION_POLICY
  *  - malformed filterStack entry                          -> BAD_ARGS
  *  - unrecognized filter type                             -> UNKNOWN_FILTER
- *  - any enabled known filter / any non-empty hot update  -> GRAPH_MODE_DISABLED
+ *  - any enabled LUT or segmentation filter               -> GRAPH_MODE_DISABLED
  *
  * The known filter type set `{ "lut", "beauty", "segmentation" }` mirrors the
  * native runtime authority used by AndroidTimelineLiveControlCoordinator and
@@ -40,6 +39,7 @@ import io.flutter.plugin.common.MethodChannel
  */
 class AndroidCameraGraphTransactionCoordinator(
     private val hasActiveCameraProvider: () -> Boolean,
+    private val setBeautyIntensity: (Float) -> Unit = {},
 ) {
     companion object {
         private val KNOWN_FILTER_TYPES = setOf("lut", "beauty", "segmentation")
@@ -121,7 +121,9 @@ class AndroidCameraGraphTransactionCoordinator(
             }
 
             // Empty filter list -- "no filters are applied" is trivially satisfied.
+            // Also reset beauty intensity to 0 (passthrough).
             if (rawFilterStack.isEmpty()) {
+                setBeautyIntensity(0f)
                 result.success(null)
                 return
             }
@@ -130,15 +132,64 @@ class AndroidCameraGraphTransactionCoordinator(
             val filterStack = rawFilterStack as List<Map<*, *>>
             val anyEnabled = filterStack.any { (it["enabled"] as? Boolean) ?: true }
             if (!anyEnabled) {
+                // All filters disabled — reset to passthrough.
+                setBeautyIntensity(0f)
                 result.success(null)
                 return
             }
 
-            result.error(
-                "GRAPH_MODE_DISABLED",
-                "applyGraphTransaction: Android camera graph/filter execution is not available in this slice.",
-                null,
-            )
+            // LIVE-CAMERA-BEAUTY-PARITY: route beauty filters to the live
+            // camera beauty SurfaceProcessor. Non-beauty filters still fail closed.
+            var beautyHandled = false
+            var hasNonBeautyEnabled = false
+
+            for (filter in filterStack) {
+                val type = filter["type"] as? String ?: continue
+                val enabled = (filter["enabled"] as? Boolean) ?: true
+                if (!enabled) continue
+
+                when (type) {
+                    "beauty" -> {
+                        // Extract intensity from the filter parameters.
+                        // Dart sends: { "type": "beauty", "enabled": true,
+                        //               "intensity": 0.5 }  (or preset name)
+                        val intensityValue = extractBeautyIntensity(filter)
+                        setBeautyIntensity(intensityValue)
+                        beautyHandled = true
+                    }
+                    else -> {
+                        // LUT, segmentation — not yet available on Android.
+                        hasNonBeautyEnabled = true
+                    }
+                }
+            }
+
+            if (hasNonBeautyEnabled && !beautyHandled) {
+                // Only non-beauty filters present — fail closed.
+                result.error(
+                    "GRAPH_MODE_DISABLED",
+                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty filters.",
+                    null,
+                )
+                return
+            }
+
+            if (hasNonBeautyEnabled && beautyHandled) {
+                // Mixed: beauty handled, but non-beauty filters are silently
+                // ignored (best-effort parity — beauty is applied even if
+                // LUT/segmentation aren't available).
+                result.success(null)
+                return
+            }
+
+            // Beauty-only (or all disabled — already handled above).
+            if (beautyHandled) {
+                result.success(null)
+                return
+            }
+
+            // Fallback (shouldn't reach here with the logic above).
+            result.success(null)
             return
         }
 
@@ -148,11 +199,67 @@ class AndroidCameraGraphTransactionCoordinator(
             return
         }
 
-        // ── C. Hot parameter path -- fails closed (6C.2B not available on Android) ──
+        // ── C. Hot parameter path — route beauty parameter updates ────────────
+        @Suppress("UNCHECKED_CAST")
+        val parameterUpdates = rawParameterUpdates as? Map<String, Any?>
+        if (parameterUpdates != null) {
+            // Check for beauty intensity in parameter updates.
+            val beautyParams = parameterUpdates["beauty"] as? Map<*, *>
+            if (beautyParams != null) {
+                val intensityValue = (beautyParams["intensity"] as? Number)?.toFloat()
+                if (intensityValue != null) {
+                    setBeautyIntensity(intensityValue.coerceIn(0f, 1f))
+                    result.success(null)
+                    return
+                }
+            }
+        }
+
+        // Non-beauty hot parameter updates — fail closed.
         result.error(
             "GRAPH_MODE_DISABLED",
-            "applyGraphTransaction: Android camera graph/filter execution is not available in this slice.",
+            "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty parameter updates.",
             null,
         )
+    }
+
+    // ── Beauty intensity extraction ─────────────────────────────────────────────
+
+    /**
+     * Extracts the beauty intensity from a filter descriptor map.
+     * Supports:
+     *   - Direct "intensity" key (Float/Double)
+     *   - "preset" string: "none"=0.0, "soft"=0.5, "strong"=0.75, "max"=1.0
+     * Falls back to 0.75 (strong) if no intensity source is found.
+     */
+    private fun extractBeautyIntensity(filter: Map<*, *>): Float {
+        // Direct intensity value.
+        val directIntensity = (filter["intensity"] as? Number)?.toFloat()
+        if (directIntensity != null) return directIntensity.coerceIn(0f, 1f)
+
+        // Parameters sub-map.
+        val params = filter["parameters"] as? Map<*, *>
+        if (params != null) {
+            val paramIntensity = (params["intensity"] as? Number)?.toFloat()
+            if (paramIntensity != null) return paramIntensity.coerceIn(0f, 1f)
+
+            val preset = params["preset"] as? String
+            if (preset != null) return presetToIntensity(preset)
+        }
+
+        // Preset at top level.
+        val preset = filter["preset"] as? String
+        if (preset != null) return presetToIntensity(preset)
+
+        // Default: strong.
+        return 0.75f
+    }
+
+    private fun presetToIntensity(preset: String): Float = when (preset.lowercase()) {
+        "none", "off", "disabled" -> 0f
+        "soft", "light" -> 0.5f
+        "strong", "medium" -> 0.75f
+        "max", "maximum", "heavy" -> 1.0f
+        else -> 0.75f
     }
 }

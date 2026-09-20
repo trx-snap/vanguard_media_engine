@@ -96,6 +96,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScre
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenProductionExportSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenExportApiPixelProofSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenQuantLabSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -614,6 +615,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // ── VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator ──
     private var greenScreenExportApiPixelProofSmokeCoordinator: AndroidGreenScreenExportApiPixelProofSmokeCoordinator? = null
 
+    // ── VG-GREENSCREEN-QUANT-LAB: quantitative lab capture & candidate replay coordinator ──
+    private var greenScreenQuantLabSmokeCoordinator: AndroidGreenScreenQuantLabSmokeCoordinator? = null
+
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
 
@@ -710,6 +714,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         cameraGraphTransactionCoordinator = AndroidCameraGraphTransactionCoordinator(
             hasActiveCameraProvider = { cameraSource != null },
+            setBeautyIntensity = { intensity -> cameraSource?.setBeautyIntensity(intensity) },
         )
         multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
             context               = binding.applicationContext,
@@ -1002,6 +1007,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator
         greenScreenExportApiPixelProofSmokeCoordinator = AndroidGreenScreenExportApiPixelProofSmokeCoordinator(mainHandler)
+        // VG-GREENSCREEN-QUANT-LAB: quantitative lab capture & candidate replay coordinator
+        greenScreenQuantLabSmokeCoordinator = AndroidGreenScreenQuantLabSmokeCoordinator(mainHandler)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -1049,6 +1056,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android green screen export API pixel proof coordinator unavailable", null)
+            }
+            return
+        }
+
+        // ── VG-GREENSCREEN-QUANT-LAB: quantitative lab capture & replay dispatch ──
+        if (AndroidGreenScreenQuantLabSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = greenScreenQuantLabSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android green screen quant lab coordinator unavailable", null)
             }
             return
         }
@@ -4039,6 +4057,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: shutdown background executor.
         greenScreenExportApiPixelProofSmokeCoordinator?.disposeAll()
         greenScreenExportApiPixelProofSmokeCoordinator = null
+        // VG-GREENSCREEN-QUANT-LAB: shutdown coordinator and reset recorder.
+        greenScreenQuantLabSmokeCoordinator?.disposeAll()
+        greenScreenQuantLabSmokeCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─
