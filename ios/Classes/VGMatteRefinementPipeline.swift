@@ -145,18 +145,22 @@
 // .s4SoftAlphaR2; no other live mode is selectable from
 // Objective-C) and call `refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:`,
 // which runs the exact `refineLiveGreenScreenMask(aspectFilledMask:in:guidedBy:)` live path
-// and wraps its result in VGMatteRefinementLiveResult (mask + the four S1 applied flags).
+// and wraps its result in VGMatteRefinementLiveResult (mask, the four S1 applied flags, the
+// live mode raw value, and the S4-family/tightAlphaR1 applied flags), so an Objective-C
+// caller's telemetry reports the actual live mode/proof (production default S4 soft-alpha
+// R2, built on the S1 base stages) instead of a stale S1-only assumption.
 // The S1 production constants are also exported (read-only class properties) so an
 // Objective-C caller's logs print the pipeline's own values and cannot drift from them.
-// Nothing else — the diagnostic stage tap, S4/S5, tightAlphaR1, and every nested
-// Swift type — is visible to Objective-C.
+// Nothing else — the diagnostic stage tap, S4/S5, and every nested Swift type not on
+// LiveGreenScreenMaskRefinement — is visible to Objective-C.
 
 import CoreGraphics
 import CoreImage
 import Foundation
 
 /// Objective-C view of `VGMatteRefinementPipeline.LiveGreenScreenMaskRefinement`:
-/// the refined live mask plus the four S1 per-stage applied flags. Immutable; built only
+/// the refined live mask, the four S1 per-stage applied flags, and the live refinement
+/// mode/S4-family metadata. Immutable; built only
 /// by `VGMatteRefinementPipeline.refineLiveGreenScreenMaskBridged(aspectFilledMask:in:guidedBy:)`
 /// (the Objective-C bridge method, selector
 /// `refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:`). Swift callers keep using the struct directly.
@@ -170,6 +174,19 @@ public final class VGMatteRefinementLiveResult: NSObject {
     @objc public let featherApplied: Bool
     @objc public let trimapApplied: Bool
     @objc public let guidedEdgeApplied: Bool
+    /// Raw value of the instance's `LiveMatteRefinementMode` (e.g. `"s4SoftAlphaR2"`, the
+    /// production default via Objective-C `init`, or `"s1"`). Exposes the mode this specific
+    /// refinement ran under so an Objective-C caller's diagnostics track the pipeline's own
+    /// live mode instead of a stale assumption.
+    @objc public let liveMatteRefinementMode: String
+    /// True only when this refinement ran `.tightAlphaR1` and the post-pass fully applied.
+    @objc public let tightAlphaR1Applied: Bool
+    /// True only when this refinement ran `.s4GuidedAlphaR1` (R1-only) and every S4 step
+    /// applied; false on S4 fail-open and in every other mode, including `.s4SoftAlphaR2`.
+    @objc public let s4GuidedAlphaR1Applied: Bool
+    /// True in any live S4-family mode (`.s4GuidedAlphaR1`, `.s4SoftAlphaR2`) when every S4
+    /// step applied; false on S4 fail-open to S1 and in every non-S4 mode.
+    @objc public let s4GuidedAlphaApplied: Bool
 
     init(_ refinement: VGMatteRefinementPipeline.LiveGreenScreenMaskRefinement) {
         self.mask                   = refinement.mask
@@ -177,6 +194,10 @@ public final class VGMatteRefinementLiveResult: NSObject {
         self.featherApplied         = refinement.featherApplied
         self.trimapApplied          = refinement.trimapApplied
         self.guidedEdgeApplied      = refinement.guidedEdgeApplied
+        self.liveMatteRefinementMode = refinement.liveMatteRefinementMode.rawValue
+        self.tightAlphaR1Applied     = refinement.tightAlphaR1Applied
+        self.s4GuidedAlphaR1Applied  = refinement.s4GuidedAlphaR1Applied
+        self.s4GuidedAlphaApplied    = refinement.s4GuidedAlphaApplied
         super.init()
     }
 }
@@ -767,12 +788,13 @@ public final class VGMatteRefinementPipeline: NSObject {
     /// Objective-C bridge over `refineLiveGreenScreenMask(aspectFilledMask:in:guidedBy:)`
     /// (selector `refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:`). Runs
     /// exactly that live path — the same instance mode, stages, constants, and per-stage
-    /// fail-open — and returns its mask plus the four S1 applied flags as a
+    /// fail-open — and returns its mask, the four S1 applied flags, the live mode raw
+    /// value, and the S4-family/tightAlphaR1 applied flags as a
     /// `VGMatteRefinementLiveResult`. Never returns nil: every stage fails open to its
     /// input, so the worst case is the unmodified `mask`. An Objective-C instance always
-    /// runs `defaultLiveMatteRefinementMode` (see `init()`); the `tightAlphaR1Applied`,
-    /// `s4GuidedAlphaR1Applied`, and `s4GuidedAlphaApplied` flags are not exposed to
-    /// Objective-C (only the mask and the four S1 flags are).
+    /// runs `defaultLiveMatteRefinementMode` (see `init()`, `.s4SoftAlphaR2`); the mode raw
+    /// value and every applied flag on `LiveGreenScreenMaskRefinement` are exposed to
+    /// Objective-C through `VGMatteRefinementLiveResult`.
     @objc(refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:)
     public func refineLiveGreenScreenMaskBridged(aspectFilledMask mask: CIImage,
                                                  in rect: CGRect,

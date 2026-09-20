@@ -2,9 +2,11 @@
 // ios_ufm_camera_green_screen_filter_physical_smoke.dart
 //
 // iOS physical smoke harness proving the new UFM camera graph greenScreen filter
-// route is accepted, the S1-refined node is invoked by the active camera graph
-// and actually keys frames (proved through native telemetry, not log
-// visibility), and does NOT use standalone live green-screen, ARKit, or Duet paths.
+// route is accepted, the live-refined node (production default S4 soft-alpha
+// R2, built on the S1 base stages; see kExpectedLiveMatteRefinementMode) is
+// invoked by the active camera graph and actually keys frames (proved through
+// native telemetry, not log visibility), and does NOT use standalone live
+// green-screen, ARKit, or Duet paths.
 //
 // Optional Beauty V2 + greenScreen combined physical proof mode:
 //   Set UFM_ENABLE_BEAUTY_V2=true to apply the combined chain:
@@ -20,7 +22,8 @@
 //   Set UFM_GREENSCREEN_OUTPUT_MODE=alpha to apply
 //     [VGFilterSpecs.greenScreenAlpha()]
 //   instead of the solid-colour spec. The node then emits the camera foreground
-//   RGB with the S1-refined matte in the output alpha (32BGRA, straight alpha,
+//   RGB with the live-refined matte (production default S4 soft-alpha R2, built
+//   on the S1 base stages) in the output alpha (32BGRA, straight alpha,
 //   no background composite). Asserted from native telemetry: outputMode ==
 //   'alpha', backgroundType == 'alpha', alphaEncoding == 'straight' (native
 //   reports it only when its byte self-test passed), alphaByteSelfTestPassed
@@ -66,11 +69,18 @@
 //      not standalone live green-screen API.
 //      After a bounded settle period, read the native telemetry snapshot with
 //      VanguardEngine.getCameraGreenScreenDiagnostics() and assert:
-//        non-null, proofLevel == 'S1', matteSource == 'visionPersonFast',
+//        non-null, matteSource == 'visionPersonFast',
 //        backgroundARGB == 0xFF00796B, processedFrameCount > 0,
 //        morphologyCloseApplied / featherApplied / trimapApplied /
-//        guidedEdgeApplied / allS1StagesApplied all true,
-//        allS1StagesAppliedFrameCount > 0.
+//        guidedEdgeApplied / allS1StagesApplied all true (the S1 base
+//        stages every live mode runs first),
+//        allS1StagesAppliedFrameCount > 0,
+//        liveMatteRefinementMode == proofLevel == edgeRefinement ==
+//        kExpectedLiveMatteRefinementMode ('s4SoftAlphaR2', the production
+//        live default; proofLevel/edgeRefinement no longer report the stale
+//        'S1' claim), liveS4GuidedAlphaApplied true and
+//        liveS4GuidedAlphaAppliedFrameCount > 0 (the S4 camera-guided
+//        refinement of the S1 base mask actually applied on keyed frames).
 //      Steady window & throughput:
 //        Computes steadyWindowSeconds from actual time between warmup and final
 //        diagnostics, and steadyProcessedFps = steadyFrameCount / steadyWindowSeconds.
@@ -102,9 +112,9 @@
 //   - When Beauty V2 enabled: combined Beauty V2 + greenScreen filter chain accepted and co-executes
 //   - When Beauty V2 enabled: combined-chain throughput/co-execution proven via steady processed FPS (>= 20.0 fps across steady frames >= 50)
 //   - When Beauty V2 enabled: native cumulative active filter-chain timing proven via getCameraFilterChainDiagnostics (filterChainTimingV1; steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms)
-//   - When greenScreen only: greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph
+//   - When greenScreen only: greenScreen filter route is accepted and the live-refined node (production default S4 soft-alpha R2, built on the S1 base stages) is invoked by the active camera graph
 //   - When greenScreen only: warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)
-//   - native S1 stage telemetry proof is available and asserted (getCameraGreenScreenDiagnostics)
+//   - native live matte refinement telemetry proof is available and asserted (getCameraGreenScreenDiagnostics): S1 base-stage flags plus liveMatteRefinementMode == 's4SoftAlphaR2' and liveS4GuidedAlphaApplied
 //   - objective pixel metrics sampled from active video texture
 //   - same texture remains mounted
 //   - clear returns to passthrough (greenScreen and filter-chain native telemetry both return null after clear)
@@ -262,15 +272,15 @@ List<String> get kClaimsAllowed => <String>[
     'combined-chain throughput/co-execution proven via steady processed FPS (>= 20.0 fps across steady frames >= 50)',
     'native cumulative active filter-chain timing proven via getCameraFilterChainDiagnostics (filterChainTimingV1; beauty + greenScreen active, steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms)',
   ] else if (kUfmAlphaOutputMode) ...<String>[
-    'greenScreen alpha-output route (VGFilterSpecs.greenScreenAlpha) is accepted and the S1-refined node is invoked by the active camera graph',
-    'native telemetry reports outputMode == alpha, backgroundType == alpha, alphaEncoding == straight (native reports it only when its byte self-test passed), backgroundARGB == 0, processedFrameCount > 0 and all four S1 stages applied',
+    'greenScreen alpha-output route (VGFilterSpecs.greenScreenAlpha) is accepted and the live-refined node (production default S4 soft-alpha R2, built on the S1 base stages) is invoked by the active camera graph',
+    'native telemetry reports outputMode == alpha, backgroundType == alpha, alphaEncoding == straight (native reports it only when its byte self-test passed), backgroundARGB == 0, processedFrameCount > 0, all four S1 base-stage flags applied, liveMatteRefinementMode == s4SoftAlphaR2 and liveS4GuidedAlphaApplied',
     'native one-time synthetic alpha byte self-test passed at node init (alphaByteSelfTestPassed == true: the alpha construction rendered on a 48x16 synthetic input through the production un-premultiplied alpha render path and read back shows background A~0, foreground A~255, edge 0<A<255 with foreground RGB preserved in the edge and foreground bands — straight, not premultiplied; background RGB at A~0 is reported, not evaluated)',
     'alpha-lane latency and steady-window metrics are reported, not gated',
   ] else ...<String>[
-    'greenScreen filter route is accepted and S1-refined node is invoked by the active camera graph',
+    'greenScreen filter route is accepted and the live-refined node (production default S4 soft-alpha R2, built on the S1 base stages) is invoked by the active camera graph',
     'warmup-excluded latency reporting (steadyFrameCount >= 50, total < 50ms, vision < 40ms, blend < 30ms)',
   ],
-  'native S1 stage telemetry proof is available and asserted (getCameraGreenScreenDiagnostics)',
+  'native live matte refinement telemetry proof is available and asserted (getCameraGreenScreenDiagnostics): S1 base-stage flags, liveMatteRefinementMode == s4SoftAlphaR2, liveS4GuidedAlphaApplied and its frame count',
   if (kUfmAlphaOutputMode)
     'Flutter texture pixel metrics sampled and reported only (not asserted) in alpha mode'
   else
@@ -309,11 +319,20 @@ const int kExpectedBgR = 0;
 const int kExpectedBgG = 121;
 const int kExpectedBgB = 107;
 
+/// The production live matte refinement mode this node's pipeline instance
+/// always tracks (VGMatteRefinementPipeline.defaultLiveMatteRefinementMode,
+/// set via the node's Objective-C `init`): the S4 soft-alpha R2 candidate run
+/// on top of the unchanged S1 base stages, physically A/B proven against S1
+/// on device before promotion. Asserted against native telemetry's
+/// liveMatteRefinementMode / proofLevel / edgeRefinement fields.
+const String kExpectedLiveMatteRefinementMode = 's4SoftAlphaR2';
+
 /// Total keyed-output observe window (lane 5).
 const Duration kGreenScreenObserveDuration = Duration(seconds: 10);
 
 /// Bounded settle period after the filter is applied before the first native
-/// telemetry read; the graph needs a few frames through the S1 path.
+/// telemetry read; the graph needs a few frames through the live refinement
+/// path (S1 base stages plus the S4 soft-alpha R2 default).
 const Duration kDiagnosticsSettleDelay = Duration(seconds: 3);
 
 /// Bounded poll for the first snapshot with processedFrameCount > 0. The
@@ -440,13 +459,16 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
     if (!mounted) return;
     setState(() {
       var summary =
-          'Native S1 telemetry (outputMode=${d['outputMode']} '
+          'Native live refinement telemetry (mode=${d['liveMatteRefinementMode']} '
+          'outputMode=${d['outputMode']} '
           'alphaEncoding=${d['alphaEncoding']} '
           'alphaByteSelfTest=${d['alphaByteSelfTestPassed']}): '
           'processed=${d['processedFrameCount']} '
           'entered=${d['frameCount']} failOpen=${d['failOpenCount']} '
           'allS1=${d['allS1StagesApplied']} '
           '(allS1Frames=${d['allS1StagesAppliedFrameCount']}) '
+          'liveS4GuidedAlphaApplied=${d['liveS4GuidedAlphaApplied']} '
+          '(liveS4Frames=${d['liveS4GuidedAlphaAppliedFrameCount']}) '
           'src=${d['sourceWidth']}x${d['sourceHeight']} '
           'matte=${d['matteWidth']}x${d['matteHeight']}\n'
           'total ms last/mean/max='
@@ -646,9 +668,31 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       }
     }
 
+    // Native reports the actual live matte refinement mode run, not a stale
+    // 'S1' claim: the node's pipeline instance always tracks the production
+    // default (currently 's4SoftAlphaR2', built on the S1 base stages).
     check(
-      d['proofLevel'] == 'S1',
-      "proofLevel == 'S1' (got ${d['proofLevel']})",
+      d['proofLevel'] != 'S1',
+      "proofLevel != 'S1' (stale claim; got ${d['proofLevel']})",
+    );
+    check(
+      d['edgeRefinement'] != 'S1',
+      "edgeRefinement != 'S1' (stale claim; got ${d['edgeRefinement']})",
+    );
+    check(
+      d['liveMatteRefinementMode'] == kExpectedLiveMatteRefinementMode,
+      "liveMatteRefinementMode == '$kExpectedLiveMatteRefinementMode' "
+      '(got ${d['liveMatteRefinementMode']})',
+    );
+    check(
+      d['proofLevel'] == kExpectedLiveMatteRefinementMode,
+      "proofLevel == '$kExpectedLiveMatteRefinementMode' "
+      '(got ${d['proofLevel']})',
+    );
+    check(
+      d['edgeRefinement'] == kExpectedLiveMatteRefinementMode,
+      "edgeRefinement == '$kExpectedLiveMatteRefinementMode' "
+      '(got ${d['edgeRefinement']})',
     );
     check(
       d['matteSource'] == 'visionPersonFast',
@@ -717,6 +761,20 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
       _asInt(d['allS1StagesAppliedFrameCount']) > 0,
       'allS1StagesAppliedFrameCount > 0 '
       '(got ${d['allS1StagesAppliedFrameCount']})',
+    );
+    // Production live refinement: the S4 soft-alpha R2 candidate that runs on
+    // top of the unchanged S1 base stages by default. Physically A/B proven
+    // against S1 on device before promotion; this is the quality path the
+    // node actually keys frames with, not just the S1 base stages above.
+    check(
+      d['liveS4GuidedAlphaApplied'] == true,
+      'liveS4GuidedAlphaApplied == true '
+      '(got ${d['liveS4GuidedAlphaApplied']})',
+    );
+    check(
+      _asInt(d['liveS4GuidedAlphaAppliedFrameCount']) > 0,
+      'liveS4GuidedAlphaAppliedFrameCount > 0 '
+      '(got ${d['liveS4GuidedAlphaAppliedFrameCount']})',
     );
     return d;
   }
@@ -851,7 +909,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         _updateStatus(
           'APPLY_FILTER',
           'Applying UFM camera graph Beauty V2 + greenScreen filter chain '
-              '(Beauty V2 intensity=0.5, solid teal 0xFF00796B, S1-refined)...',
+              '(Beauty V2 intensity=0.5, solid teal 0xFF00796B, live-refined)...',
         );
         await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
           VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5),
@@ -861,7 +919,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
           setState(() {
             _isGreenScreenActive = true;
             _cameraModeDescription =
-                'UFM camera graph Beauty V2 + greenScreen filter chain active (Beauty V2 + S1-refined)';
+                'UFM camera graph Beauty V2 + greenScreen filter chain active (Beauty V2 + live-refined)';
           });
         }
       } else if (kUfmAlphaOutputMode) {
@@ -877,13 +935,13 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
           setState(() {
             _isGreenScreenActive = true;
             _cameraModeDescription =
-                'UFM camera graph greenScreen filter active (alpha output, S1-refined)';
+                'UFM camera graph greenScreen filter active (alpha output, live-refined)';
           });
         }
       } else {
         _updateStatus(
           'APPLY_FILTER',
-          'Applying UFM camera graph greenScreen filter (solid teal 0xFF00796B, S1-refined)...',
+          'Applying UFM camera graph greenScreen filter (solid teal 0xFF00796B, live-refined)...',
         );
         await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
           VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B),
@@ -892,7 +950,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
           setState(() {
             _isGreenScreenActive = true;
             _cameraModeDescription =
-                'UFM camera graph greenScreen filter active (S1-refined)';
+                'UFM camera graph greenScreen filter active (live-refined)';
           });
         }
       }
@@ -900,7 +958,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
 
       // Lane 5: Observe keyed solid-color green screen for 10 seconds.
       // Overlay clearly indicates this is the UFM camera graph greenScreen filter
-      // (S1-refined node), not standalone live green-screen API.
+      // (live-refined node), not standalone live green-screen API.
       //
       // Native telemetry proof (no NSLog dependency): after a bounded settle
       // period the harness reads VGGreenScreenFilterNode's diagnostics
@@ -911,15 +969,15 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
         kUfmEnableBeautyV2
             ? 'Observing UFM camera graph Beauty V2 + greenScreen filter chain for 10 seconds...'
             : kUfmAlphaOutputMode
-            ? 'Observing UFM camera graph greenScreen filter (alpha output, S1-refined) for 10 seconds — preview appearance is not asserted...'
-            : 'Observing UFM camera graph greenScreen filter (S1-refined) for 10 seconds...',
+            ? 'Observing UFM camera graph greenScreen filter (alpha output, live-refined) for 10 seconds — preview appearance is not asserted...'
+            : 'Observing UFM camera graph greenScreen filter (live-refined) for 10 seconds...',
       );
       final observeStart = DateTime.now();
       await Future<void>.delayed(kDiagnosticsSettleDelay);
 
       _updateStatus(
         'GREENSCREEN_DIAGNOSTICS',
-        'Reading native greenScreen S1 telemetry snapshot...',
+        'Reading native greenScreen live refinement telemetry snapshot...',
       );
       final warmupSnapshot = _assertGreenScreenDiagnostics(
         await _awaitProcessedGreenScreenDiagnostics(),
@@ -1011,7 +1069,7 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
 
       _updateStatus(
         'GREENSCREEN_OBSERVE_END',
-        'Reading final native greenScreen S1 telemetry snapshot...',
+        'Reading final native greenScreen live refinement telemetry snapshot...',
       );
       final finalDiagnosticsRaw =
           await VanguardEngine.getCameraGreenScreenDiagnostics();
@@ -1632,8 +1690,8 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                                     ? (kUfmEnableBeautyV2
                                           ? 'UFM CAMERA GRAPH BEAUTY V2 + GREENSCREEN FILTER ACTIVE'
                                           : kUfmAlphaOutputMode
-                                          ? 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (ALPHA OUTPUT, S1-REFINED)'
-                                          : 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (S1-REFINED)')
+                                          ? 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (ALPHA OUTPUT, LIVE-REFINED)'
+                                          : 'UFM CAMERA GRAPH GREENSCREEN FILTER ACTIVE (LIVE-REFINED)')
                                     : 'CAMERA MODE: $_cameraModeDescription',
                                 style: TextStyle(
                                   color: _isGreenScreenActive
@@ -1648,24 +1706,25 @@ class _IosUfmCameraGreenScreenFilterPhysicalSmokeAppState
                                 _isGreenScreenActive
                                     ? (kUfmEnableBeautyV2
                                           ? 'Route: [VGFilterSpecs.beauty(beautyVersion: 2, intensity: 0.5), VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)]\n'
-                                                'Pipeline: Active UFM camera graph Beauty V2 + S1-refined filter chain\n'
+                                                'Pipeline: Active UFM camera graph Beauty V2 + live-refined filter chain\n'
                                                 'Proves: combined Beauty V2 + greenScreen filter chain is accepted and co-executes in active camera graph.\n'
                                                 'Throughput proof: steadyProcessedFps >= 20.0 asserted across steady frames >= 50.\n'
-                                                'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics and asserted (processed frames, all four S1 stages, steadyProcessedFps >= 20.0).\n'
+                                                'Native proof: live refinement telemetry read via getCameraGreenScreenDiagnostics and asserted (processed frames, all four S1 base stages, liveMatteRefinementMode == s4SoftAlphaR2, liveS4GuidedAlphaApplied, steadyProcessedFps >= 20.0).\n'
                                                 'Filter-chain proof: cumulative active filter-chain timing read via getCameraFilterChainDiagnostics (filterChainTimingV1, measured natively around the scheduler call) and asserted (beauty + greenScreen active, steady graph frames >= 50, warmup-excluded meanGraphTotalMs > 0 and < 33.4 ms).\n'
                                                 'Non-claims: neither surface provides Beauty V2 per-node cost; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
                                           : kUfmAlphaOutputMode
                                           ? 'Route: VGFilterSpecs.greenScreenAlpha()\n'
-                                                'Pipeline: Active UFM camera graph S1-refined filter node, alpha output (foreground RGB + matte in alpha, no background)\n'
-                                                'Proves: greenScreen alpha-output route is accepted and the S1-refined node is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
-                                                'Native proof: telemetry read via getCameraGreenScreenDiagnostics and asserted (outputMode alpha, backgroundType alpha, alphaEncoding straight (native reports it only when its byte self-test passed), alphaByteSelfTestPassed true = one-time synthetic byte self-test of the alpha construction at node init, processed frames > 0, all four S1 stages). Latency and pixel metrics are reported only.\n'
+                                                'Pipeline: Active UFM camera graph live-refined filter node, alpha output (foreground RGB + matte in alpha, no background)\n'
+                                                'Proves: greenScreen alpha-output route is accepted and the live-refined node is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
+                                                'Native proof: telemetry read via getCameraGreenScreenDiagnostics and asserted (outputMode alpha, backgroundType alpha, alphaEncoding straight (native reports it only when its byte self-test passed), alphaByteSelfTestPassed true = one-time synthetic byte self-test of the alpha construction at node init, processed frames > 0, all four S1 base stages, liveMatteRefinementMode == s4SoftAlphaR2, liveS4GuidedAlphaApplied). Latency and pixel metrics are reported only.\n'
                                                 'Non-claims: whatever this preview shows is NOT a keying or Duet proof (the Flutter Texture composites the alpha its own way); no byte-level verification of live camera frames (the self-test covers a synthetic input only); no downstream compositor; does NOT prove TikTok visual quality, temporal smoothing, image/video backgrounds, recording/export/photo, Duet, or Android.'
                                           : 'Route: VGFilterSpecs.greenScreenSolidColor(argb: 0xFF00796B)\n'
-                                                'Pipeline: Active UFM camera graph S1-refined filter node\n'
-                                                'Proves: greenScreen filter route is accepted and S1-refined node '
+                                                'Pipeline: Active UFM camera graph live-refined filter node\n'
+                                                'Proves: greenScreen filter route is accepted and live-refined node '
                                                 'is invoked by the active camera graph (not standalone live green-screen / ARKit / Duet).\n'
-                                                'Native proof: S1 stage telemetry read via getCameraGreenScreenDiagnostics '
-                                                'and asserted (processed frames, all four S1 stages, measured latency, '
+                                                'Native proof: live refinement telemetry read via getCameraGreenScreenDiagnostics '
+                                                'and asserted (processed frames, all four S1 base stages, '
+                                                'liveMatteRefinementMode == s4SoftAlphaR2, liveS4GuidedAlphaApplied, measured latency, '
                                                 'warmup-excluded steady latency, and objective pixel metrics).\n'
                                                 'Non-claims: Does NOT prove TikTok visual quality, temporal smoothing, '
                                                 'image/video backgrounds, recording/export/photo, Duet, or Android.')

@@ -529,6 +529,16 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     BOOL                 _tmLastFeatherApplied;
     BOOL                 _tmLastTrimapApplied;
     BOOL                 _tmLastGuidedEdgeApplied;
+    // Live refinement mode/S4-family metadata from the last successful refinement
+    // (VGMatteRefinementLiveResult). liveMatteRefinementMode is @"unknown" until the
+    // first keyed frame; the node's pipeline instance always tracks
+    // VGMatteRefinementPipeline.defaultLiveMatteRefinementMode (.s4SoftAlphaR2) via its
+    // Objective-C init, so every keyed frame after that reports "s4SoftAlphaR2".
+    NSString            *_tmLastLiveMatteRefinementMode;
+    BOOL                 _tmLastS4GuidedAlphaApplied;
+    uint64_t             _tmS4GuidedAlphaAppliedFrameCount;
+    BOOL                 _tmLastS4GuidedAlphaR1Applied;
+    BOOL                 _tmLastTightAlphaR1Applied;
     double               _tmLastVisionMs;
     double               _tmSumVisionMs;
     double               _tmMaxVisionMs;
@@ -610,6 +620,9 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     // and the initial fail-open reason need explicit values.
     _telemetryLock        = OS_UNFAIR_LOCK_INIT;
     _tmLastFailOpenReason = @"none";
+    // Live mode is unknown until the first successful refinement reports it (the
+    // pipeline instance's mode is not queryable before then); see the ivar comment.
+    _tmLastLiveMatteRefinementMode = @"unknown";
 
     _nodeId     = [[NSUUID UUID] UUIDString];
     _nodeType   = @"VGGreenScreenFilterNode";
@@ -667,11 +680,12 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     }
 
     NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_NODE_CREATED "
-           "proofLevel=S1 matteSource=%@ outputMode=%@ backgroundType=%@ alphaEncoding=%@ "
-           "backgroundARGB=0x%08X alphaByteIgnored=1 pool=%p edgeRefinement=S1 "
+           "proofLevel=liveMatteRefinement matteSource=%@ outputMode=%@ backgroundType=%@ alphaEncoding=%@ "
+           "backgroundARGB=0x%08X alphaByteIgnored=1 pool=%p edgeRefinement=liveMatteRefinement "
+           "liveMatteRefinementModeExpected=s4SoftAlphaR2(confirmedPerFrame) "
            "morphologyCloseRadius=%.1f featherRadius=%.1f trimapLow=%.2f trimapHigh=%.2f "
            "guidedEdgeIntensity=%.1f guidedEdgeBlurRadius=%.1f guidedEdgeLow=%.2f "
-           "guidedEdgeHigh=%.2f temporalSmoothing=none matteQualityClaim=none",
+           "guidedEdgeHigh=%.2f temporalSmoothing=none tikTokParityClaim=none",
           (_matteSource == VGGreenScreenFilterNodeMatteSourceVisionPersonFast)
               ? @"visionPersonFast" : @"unavailable",
           _VGGSFNOutputModeName(_outputMode), _VGGSFNOutputModeName(_outputMode),
@@ -850,6 +864,10 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     featherApplied         = refinement.featherApplied;
     trimapApplied          = refinement.trimapApplied;
     guidedEdgeApplied      = refinement.guidedEdgeApplied;
+    NSString *liveMatteRefinementMode = refinement.liveMatteRefinementMode;
+    BOOL s4GuidedAlphaApplied         = refinement.s4GuidedAlphaApplied;
+    BOOL s4GuidedAlphaR1Applied       = refinement.s4GuidedAlphaR1Applied;
+    BOOL tightAlphaR1Applied          = refinement.tightAlphaR1Applied;
 
     // ── 4. Output stage by outputMode ─────────────────────────────────────
     CIImage *keyed = nil;
@@ -924,6 +942,8 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     // ── 7. Telemetry (keyed frames only; scalar stores under a tiny lock) ─
     //   Reached only after a successful render, so fail-open frames never
     //   count as processed and never enter the latency averages.
+    NSString *liveMatteRefinementModeCopy = [liveMatteRefinementMode copy] ?: @"unknown";
+    NSString *previousLiveMatteRefinementMode;
     os_unfair_lock_lock(&_telemetryLock);
     _tmProcessedFrameCount += 1;
     if (allS1StagesApplied) _tmAllS1StagesAppliedFrameCount += 1;
@@ -935,6 +955,12 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     _tmLastFeatherApplied         = featherApplied;
     _tmLastTrimapApplied          = trimapApplied;
     _tmLastGuidedEdgeApplied      = guidedEdgeApplied;
+    previousLiveMatteRefinementMode = _tmLastLiveMatteRefinementMode;
+    _tmLastLiveMatteRefinementMode  = liveMatteRefinementModeCopy;
+    _tmLastS4GuidedAlphaApplied     = s4GuidedAlphaApplied;
+    if (s4GuidedAlphaApplied) _tmS4GuidedAlphaAppliedFrameCount += 1;
+    _tmLastS4GuidedAlphaR1Applied   = s4GuidedAlphaR1Applied;
+    _tmLastTightAlphaR1Applied      = tightAlphaR1Applied;
     _tmLastVisionMs = visionMs;
     _tmSumVisionMs += visionMs;
     if (visionMs > _tmMaxVisionMs) _tmMaxVisionMs = visionMs;
@@ -945,18 +971,24 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     _tmSumTotalMs += totalMs;
     if (totalMs > _tmMaxTotalMs) _tmMaxTotalMs = totalMs;
     os_unfair_lock_unlock(&_telemetryLock);
+    (void)previousLiveMatteRefinementMode;   // released here, after the unlock
 
     if (shouldLog) {
         NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_FRAME frame=%llu "
-               "src=%zux%zu matte=%zux%zu matteSource=visionPersonFast edgeRefinement=S1 "
+               "src=%zux%zu matte=%zux%zu matteSource=visionPersonFast "
+               "edgeRefinement=%@ liveMatteRefinementMode=%@ "
                "outputMode=%@ "
                "morphologyCloseApplied=%d featherApplied=%d trimapApplied=%d "
-               "guidedEdgeApplied=%d visionMs=%.1f blendRenderMs=%.1f totalMs=%.1f "
+               "guidedEdgeApplied=%d liveS4GuidedAlphaApplied=%d "
+               "liveS4GuidedAlphaR1Applied=%d liveTightAlphaR1Applied=%d "
+               "visionMs=%.1f blendRenderMs=%.1f totalMs=%.1f "
                "pts=%.3f failOpenCount=%llu",
               (unsigned long long)frameIndex, srcW, srcH, matteW, matteH,
+              liveMatteRefinementMode, liveMatteRefinementMode,
               _VGGSFNOutputModeName(_outputMode),
               (int)morphologyCloseApplied, (int)featherApplied, (int)trimapApplied,
-              (int)guidedEdgeApplied,
+              (int)guidedEdgeApplied, (int)s4GuidedAlphaApplied,
+              (int)s4GuidedAlphaR1Applied, (int)tightAlphaR1Applied,
               visionMs, blendRenderMs, totalMs,
               CMTimeGetSeconds(time),
               (unsigned long long)atomic_load(&_failOpenCounter));
@@ -1019,6 +1051,11 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     const BOOL     featherApplied = _tmLastFeatherApplied;
     const BOOL     trimapApplied  = _tmLastTrimapApplied;
     const BOOL     guidedApplied  = _tmLastGuidedEdgeApplied;
+    NSString *liveMatteRefinementMode  = _tmLastLiveMatteRefinementMode;
+    const BOOL     s4GuidedAlphaApplied         = _tmLastS4GuidedAlphaApplied;
+    const uint64_t s4GuidedAlphaAppliedFrames   = _tmS4GuidedAlphaAppliedFrameCount;
+    const BOOL     s4GuidedAlphaR1Applied       = _tmLastS4GuidedAlphaR1Applied;
+    const BOOL     tightAlphaR1Applied          = _tmLastTightAlphaR1Applied;
     const double   lastVision     = _tmLastVisionMs;
     const double   sumVision      = _tmSumVisionMs;
     const double   maxVision      = _tmMaxVisionMs;
@@ -1042,8 +1079,11 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
         @"enabled":                      _enabled ? @YES : @NO,
         @"matteSource":                  (_matteSource == VGGreenScreenFilterNodeMatteSourceVisionPersonFast)
                                              ? @"visionPersonFast" : @"unavailable",
-        @"proofLevel":                   @"S1",
-        @"edgeRefinement":               @"S1",
+        // The actual live mode/proof (production default "s4SoftAlphaR2", built on the S1
+        // base stages below), not a stale "S1" claim. "unknown" until the first keyed frame.
+        @"proofLevel":                   liveMatteRefinementMode ?: @"unknown",
+        @"edgeRefinement":               liveMatteRefinementMode ?: @"unknown",
+        @"liveMatteRefinementMode":      liveMatteRefinementMode ?: @"unknown",
         @"outputMode":                   _VGGSFNOutputModeName(_outputMode),
         @"backgroundType":               _VGGSFNOutputModeName(_outputMode),
         // "opaque" = A is 255 (solidColor). Alpha mode: "straight" (RGB not
@@ -1071,6 +1111,10 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
         @"guidedEdgeApplied":            guidedApplied  ? @YES : @NO,
         @"allS1StagesApplied":           allS1Last      ? @YES : @NO,
         @"allS1StagesAppliedFrameCount": @(allS1Frames),
+        @"liveS4GuidedAlphaApplied":            s4GuidedAlphaApplied   ? @YES : @NO,
+        @"liveS4GuidedAlphaAppliedFrameCount":  @(s4GuidedAlphaAppliedFrames),
+        @"liveS4GuidedAlphaR1Applied":          s4GuidedAlphaR1Applied ? @YES : @NO,
+        @"liveTightAlphaR1Applied":             tightAlphaR1Applied    ? @YES : @NO,
         @"lastVisionMs":                 @(lastVision),
         @"meanVisionMs":                 @(meanVision),
         @"maxVisionMs":                  @(maxVision),

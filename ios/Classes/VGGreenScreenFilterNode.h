@@ -60,27 +60,40 @@
 //     queue (stateless: a fresh VNGeneratePersonSegmentationRequest and
 //     VNImageRequestHandler per frame, nothing retained between frames). The
 //     raw OneComponent8 mask is bilinearly scaled to the frame extent.
-//   • Edge refinement: S1 PRESENT in both output modes. The scaled matte runs
-//     through the proven production S1 refinement pipeline of
-//     VGDuetPreviewCompositor (same stage order, same constants, ported as
-//     private CoreImage recipes; no Duet import): morphology close
-//     (CIMorphologyMaximum→Minimum, r 1.0) → feather (CIGaussianBlur r 4.0) →
-//     trimap smoothstep(0.10, 0.90) → guided edge preserve (CIEdges 2.0 → blur
-//     1.5 → smoothstep(0.08, 0.34) on the camera frame, restoring the feathered
-//     mask over the trimapped one where the frame has strong edges) → output
-//     stage (CIBlendWithMask over the solid colour, or the straight-alpha
+//   • Edge refinement: LIVE matte refinement PRESENT in both output modes. The
+//     scaled matte runs through the node-owned VGMatteRefinementPipeline (Swift;
+//     the single production live-refinement implementation shared with every
+//     other live green-screen caller in this package). The node creates that
+//     pipeline with Objective-C init, which always tracks
+//     VGMatteRefinementPipeline.defaultLiveMatteRefinementMode — currently
+//     `.s4SoftAlphaR2` — never a mode this node selects directly: morphology
+//     close (CIMorphologyMaximum→Minimum, r 1.0) → feather (CIGaussianBlur r
+//     4.0) → trimap smoothstep(0.10, 0.90) → guided edge preserve (CIEdges 2.0
+//     → blur 1.5 → smoothstep(0.08, 0.34) on the camera frame, restoring the
+//     feathered mask over the trimapped one where the frame has strong edges)
+//     — the S1 base stages every live mode runs first — then the S4 camera-
+//     guided soft-alpha refinement of the S1 final mask (fails open to the S1
+//     final mask if any S4 step is unavailable/degenerate) → output stage
+//     (CIBlendWithMask over the solid colour, or the straight-alpha
 //     construction). Every stage fails open to its input mask and the frame
 //     log AND -diagnosticsSnapshot report morphologyCloseApplied /
-//     featherApplied / trimapApplied / guidedEdgeApplied. S4/S5/tightAlphaR1
-//     lab candidates are NOT ported.
-//   • Non-claims (still true after S1 and alpha mode): NO temporal smoothing;
-//     NO image or video backgrounds; NO Duet proof (this node is not on the
-//     Duet path and nothing consumes its alpha yet); NO recording/export/photo
-//     proof of the keyed output beyond the graph topology argument above; NO
-//     TikTok-grade matte parity; NO byte-level proof of the alpha encoding on
-//     LIVE camera frames (the one-time synthetic self-test at init proves the
-//     construction on a synthetic input only). S1 improves edge quality over
-//     the raw FAST matte; it does not prove parity — do not present it as such.
+//     featherApplied / trimapApplied / guidedEdgeApplied (the S1 base stages)
+//     plus liveMatteRefinementMode / liveS4GuidedAlphaApplied /
+//     liveS4GuidedAlphaAppliedFrameCount / liveS4GuidedAlphaR1Applied /
+//     liveTightAlphaR1Applied (the live mode actually run and its S4-family
+//     outcome). S5 and the lab-only tightAlphaR1/S4-tight-R2 candidates are NOT
+//     ported; they never run live in this pipeline instance.
+//   • Non-claims (still true after S4-default live refinement and alpha mode):
+//     NO temporal smoothing; NO image or video backgrounds; NO Duet proof
+//     (this node is not on the Duet path and nothing consumes its alpha yet);
+//     NO recording/export/photo proof of the keyed output beyond the graph
+//     topology argument above; NO TikTok-grade matte parity; NO byte-level
+//     proof of the alpha encoding on LIVE camera frames (the one-time
+//     synthetic self-test at init proves the construction on a synthetic
+//     input only). The S4 soft-alpha refinement improves edge quality over the
+//     S1 base stages (physically A/B proven against S1 on device before
+//     promotion to the live default); it does not prove TikTok parity — do
+//     not present it as such.
 //   • Latency: the synchronous Vision call is charged to the graph execution
 //     queue. VGCameraGraphSession's drop-latest backpressure keeps the queue
 //     from backing up, so a slow frame lowers preview frame rate rather than
@@ -190,8 +203,10 @@
 //   alphaEncoding and the alpha byte self-test result) and what it has done
 //   so far: frame, processed and fail-open
 //   counts, the last fail-open reason, and — for the last successfully keyed
-//   frame — the source/matte dimensions, the four S1 stage flags, and
-//   last/mean/max Vision, blend-render and total latency in ms. The counters
+//   frame — the source/matte dimensions, the four S1 base-stage flags, the
+//   live matte refinement mode actually run and its S4-family/tightAlphaR1
+//   applied flags, and last/mean/max Vision, blend-render and total latency in
+//   ms. The counters
 //   are written on the graph execution queue and read under a tiny
 //   os_unfair_lock (plain scalar copies only; no allocation while the lock is
 //   held), so a snapshot may be taken from any thread. The camera graph
@@ -343,7 +358,33 @@ typedef NS_ENUM(NSInteger, VGGreenScreenFilterNodeOutputMode) {
 /// "Diagnostics / native telemetry" header comment for the contract. Keys:
 ///   nodeId, filterName, enabled (BOOL)
 ///   matteSource                  "visionPersonFast" | "unavailable"
-///   proofLevel, edgeRefinement   both "S1"
+///   proofLevel, edgeRefinement   the actual live matte refinement mode run
+///                                (mirrors liveMatteRefinementMode below), NOT
+///                                a stale "S1" claim: "unknown" until the
+///                                first keyed frame, then "s4SoftAlphaR2" for
+///                                this node's fixed production default
+///   liveMatteRefinementMode      "unknown" until the first keyed frame, then
+///                                the raw value of the live mode this
+///                                pipeline instance actually ran (this node's
+///                                Objective-C init always tracks
+///                                VGMatteRefinementPipeline.defaultLiveMatteRefinementMode,
+///                                currently "s4SoftAlphaR2") — last keyed frame
+///   liveS4GuidedAlphaApplied,
+///   liveS4GuidedAlphaR1Applied,
+///   liveTightAlphaR1Applied      BOOL — last keyed frame's S4-family /
+///                                tightAlphaR1 applied flags from
+///                                VGMatteRefinementLiveResult. NO for every
+///                                flag until the first keyed frame.
+///                                liveS4GuidedAlphaApplied is true for any
+///                                live S4-family mode (including the
+///                                production default) whose S4 stage fully
+///                                applied; liveS4GuidedAlphaR1Applied is R1-only
+///                                (false for the soft R2 production default,
+///                                kept for parity with the Swift result);
+///                                liveTightAlphaR1Applied is true only in the
+///                                opt-in tightAlphaR1 live mode.
+///   liveS4GuidedAlphaAppliedFrameCount  keyed frames where
+///                                liveS4GuidedAlphaApplied was true
 ///   outputMode                   "solidColor" | "alpha"
 ///   backgroundType               the spec backgroundType the mode was built
 ///                                from: "solidColor" | "alpha"
