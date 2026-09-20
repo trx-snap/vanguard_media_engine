@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
-import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -19,25 +18,43 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.core.content.ContextCompat
+import com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationFrame
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Front-camera source for the MediaPipe GPU green-screen path.
+ * Front-camera source for the independent, tracked-assets-only green-screen segmentation path.
  *
  * Camera2 owns one capture session with two targets:
  *   - the preview/compositor camera preview [Surface]
- *   - an [ImageReader] created with [HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE]
+ *   - a CPU-plane-readable [ImageReader] (YUV_420_888, no HardwareBuffer usage flags)
  *
- * The ImageReader target feeds [AndroidGreenScreenGpuPipeline], producing
- * GPU-resident masks delivered via [onGpuMask].
+ * The ImageReader target feeds [AndroidGreenScreenCleanSegmentationPipeline] directly with each
+ * acquired [Image] (never wrapped as an `androidx.camera.core.ImageProxy` — that wrapping was
+ * proven on physical SM-A566B hardware to make CameraX/ML Kit's ImageProxy handling recurse into a
+ * native StackOverflowError), which runs the same production segmentation ladder as Duet
+ * (mediapipe_cpu -> mlkit) and delivers CPU mask frames via [onMask]. This path never opens the
+ * MediaPipe GPU graph or its untracked binary graph / JNI library.
  */
 class AndroidGreenScreenCamera2Source(private val context: Context) {
 
     companion object {
         private const val TAG = "GreenScreenCam2Source"
-        private const val TARGET_SHORT_SIDE = 256
         private const val MAX_IMAGES = 3
+
+        /**
+         * Analysis geometry target, matching the proven meshed Duet green-screen path
+         * (see AndroidDuetCameraSource's ImageAnalysis ResolutionSelector: 16:9 aspect-ratio
+         * family + ResolutionStrategy(Size(256, 144), FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)),
+         * so this independent Camera2 path's analysis stream sees the same field of view as the
+         * live preview instead of a 4:3 crop with a different FOV.
+         */
+        private const val TARGET_ANALYSIS_WIDTH = 256
+        private const val TARGET_ANALYSIS_HEIGHT = 144
+        private val TARGET_ANALYSIS_SIZE = Size(TARGET_ANALYSIS_WIDTH, TARGET_ANALYSIS_HEIGHT)
+
+        /** Tolerance (relative) around the 16:9 ratio used to classify a Size as "16:9 family". */
+        private const val SIXTEEN_BY_NINE_RATIO_TOLERANCE = 0.08
     }
 
     private val running = AtomicBoolean(false)
@@ -48,7 +65,8 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
-    @Volatile private var pipeline: AndroidGreenScreenGpuPipeline? = null
+    @Volatile private var pipeline: AndroidGreenScreenCleanSegmentationPipeline? = null
+    @Volatile private var cameraRotationDegrees: Int = 0
     @Volatile private var acquiredFrameCount: Long = 0
     @Volatile private var submittedFrameCount: Long = 0
     @Volatile private var skippedFrameCount: Long = 0
@@ -56,15 +74,11 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
     // reported in the stop() summary and diagnosticsSnapshot().
     private val skippedFrameCountLock = Any()
     private val skippedFrameCountByReason = LinkedHashMap<String, Long>()
-    // Coalesces AndroidGreenScreenGpuPipeline.onInputCapacityAvailable posts (which can fire
-    // once per released in-flight permit, from any thread) into at most one pending re-drain on
-    // the camera handler at a time, so a burst of releases cannot flood the handler with posts.
-    private val capacityRetryPosted = AtomicBoolean(false)
 
     fun start(
         targetSurface: Surface,
         onCameraFrameTransform: (rotationDegrees: Int, mirrorHorizontal: Boolean) -> Unit = { _, _ -> },
-        onGpuMask: (HardwareBuffer, Int, Int, Long, ((HardwareBuffer) -> Unit)?, Int) -> Unit,
+        onMask: (AndroidDuetSegmentationFrame) -> Unit,
         onStarted: () -> Unit = {},
         onError: (Exception) -> Unit = {},
     ) {
@@ -81,12 +95,12 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            failStart(onError, IllegalStateException("Camera2 GPU green screen requires Android Q+"))
+            failStart(onError, IllegalStateException("Camera2 green screen requires Android Q+"))
             return
         }
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) !=
             PackageManager.PERMISSION_GRANTED) {
-            failStart(onError, SecurityException("CAMERA permission not granted for Camera2 GPU green screen"))
+            failStart(onError, SecurityException("CAMERA permission not granted for Camera2 green screen"))
             return
         }
         if (!targetSurface.isValid) {
@@ -119,7 +133,7 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         // The ImageReader delivers frames in raw sensor space, and the compositor
         // expects the rotation to apply as the sensor's own mounting angle (verified against
         // a physical-device proof: sensorOrientation=270 requires rotation=270 to land upright).
-        val cameraRotationDegrees = normalizeCameraRotationDegrees(sensorOrientation)
+        cameraRotationDegrees = normalizeCameraRotationDegrees(sensorOrientation)
         val cameraMirrorHorizontal = true // frontCameraId() only ever selects LENS_FACING_FRONT.
         Log.i(
             TAG,
@@ -132,8 +146,8 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         val analysisSize = try {
             chooseAnalysisSize(cameraManager, cameraId)
         } catch (t: Throwable) {
-            Log.w(TAG, "chooseAnalysisSize failed; falling back to 320x240", t)
-            Size(320, 240)
+            Log.w(TAG, "chooseAnalysisSize failed; falling back to $TARGET_ANALYSIS_SIZE", t)
+            TARGET_ANALYSIS_SIZE
         }
 
         val ht = HandlerThread("vg.greenscreen.cam2")
@@ -148,25 +162,19 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
                 analysisSize.height,
                 ImageFormat.YUV_420_888,
                 MAX_IMAGES,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
             )
         } catch (t: Throwable) {
-            failStart(onError, IllegalStateException("ImageReader GPU target creation failed", t))
+            failStart(onError, IllegalStateException("ImageReader target creation failed", t))
             return
         }
         imageReader = reader
 
-        val pipe = AndroidGreenScreenGpuPipeline(
+        val pipe = AndroidGreenScreenCleanSegmentationPipeline(
             context = context.applicationContext ?: context,
-            widthPx = analysisSize.width,
-            heightPx = analysisSize.height,
-            modelSelection = 1,
-            enableMaskBufferPool = true,
-            onInputCapacityAvailable = { onPipelineInputCapacityAvailable() },
-            onGpuMask = onGpuMask,
+            onMask = onMask,
         )
         if (!pipe.open()) {
-            failStart(onError, IllegalStateException("MediaPipe GPU graph pipeline failed to open"))
+            failStart(onError, IllegalStateException("Green screen segmentation pipeline failed to open"))
             return
         }
         pipeline = pipe
@@ -187,15 +195,15 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    Log.w(TAG, "Camera2 GPU source disconnected")
+                    Log.w(TAG, "Camera2 green screen source disconnected")
                     camera.close()
-                    if (!stopped.get()) onError(IllegalStateException("Camera2 GPU source disconnected"))
+                    if (!stopped.get()) onError(IllegalStateException("Camera2 green screen source disconnected"))
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    Log.w(TAG, "Camera2 GPU source error=$error")
+                    Log.w(TAG, "Camera2 green screen source error=$error")
                     camera.close()
-                    if (!stopped.get()) onError(IllegalStateException("Camera2 GPU source error=$error"))
+                    if (!stopped.get()) onError(IllegalStateException("Camera2 green screen source error=$error"))
                 }
             }, h)
         } catch (e: Exception) {
@@ -243,8 +251,8 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
      */
     fun diagnosticsSnapshot(): Map<String, Any?> {
         val snapshot = LinkedHashMap<String, Any?>()
-        snapshot["proofLevel"] = "android_green_screen_camera2_gpu_source_v1"
-        snapshot["source"] = "camera2_front_gpu_hardwarebuffer"
+        snapshot["proofLevel"] = "android_green_screen_camera2_clean_segmentation_source_v1"
+        snapshot["source"] = "camera2_front_clean_segmentation_cpu"
         snapshot["running"] = running.get()
         snapshot["stopped"] = stopped.get()
         snapshot["acquiredFrameCount"] = acquiredFrameCount
@@ -291,7 +299,7 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        onError(IllegalStateException("Camera2 GPU source session configure failed"))
+                        onError(IllegalStateException("Camera2 green screen source session configure failed"))
                     }
                 },
                 handler,
@@ -302,54 +310,44 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
     }
 
     private fun drainLatestImage(reader: ImageReader) {
-        // Camera-pressure fix: check pipeline capacity BEFORE acquireLatestImage(), not after.
-        // The ImageReader has only MAX_IMAGES(3) slots; acquiring an Image the pipeline cannot
-        // accept yet (MAX_INPUT_IN_FLIGHT already owned by MediaPipe) leaves it unclosed until a
-        // later drain, and enough of those in flight makes the next acquireLatestImage() throw
+        // Check pipeline capacity BEFORE acquireLatestImage(), not after. The ImageReader has
+        // only MAX_IMAGES(3) slots; acquiring an Image the pipeline cannot accept yet (busy with
+        // the single in-flight frame) leaves it unclosed until a later drain, and enough of those
+        // in flight makes the next acquireLatestImage() throw
         // IllegalStateException("maxImages has already been acquired"), starving the stream.
         val currentPipeline = pipeline
-        if (currentPipeline != null && !currentPipeline.canAcceptCameraInput()) {
+        if (currentPipeline == null || !currentPipeline.canAcceptCameraInput()) {
             skippedFrameCount += 1
-            val reason = "input_capacity_full"
+            val reason = if (currentPipeline == null) "pipeline_missing" else "input_capacity_full"
             synchronized(skippedFrameCountLock) {
                 skippedFrameCountByReason[reason] = (skippedFrameCountByReason[reason] ?: 0L) + 1L
             }
-            Log.v(TAG, "GPU graph frame skipped before acquire: $reason")
+            Log.v(TAG, "clean segmentation frame skipped before acquire: $reason")
             return
         }
         var image: Image? = null
-        var frameOwnership: CameraFrameOwnership? = null
         var handoffAccepted = false
         try {
-            image = reader.acquireLatestImage() ?: return
+            val acquired = reader.acquireLatestImage() ?: return
+            image = acquired
             acquiredFrameCount += 1
-            val buffer = image.hardwareBuffer
-            if (buffer == null) {
-                Log.v(TAG, "ImageReader frame has no HardwareBuffer")
-                return
-            }
-            frameOwnership = CameraFrameOwnership(image, buffer)
-            val pipe = pipeline ?: run {
-                return
-            }
-            val owner = frameOwnership
-            val submitted = pipe.processCameraHardwareBufferAsync(
-                cameraHardwareBuffer = buffer,
-                widthPx = image.width,
-                heightPx = image.height,
-                timestampUs = image.timestamp / 1_000L,
+            val timestampMs = acquired.timestamp / 1_000_000L
+            val submitted = currentPipeline.processImageAsync(
+                image = acquired,
+                rotationDegrees = cameraRotationDegrees,
+                timestampMs = timestampMs,
             ) {
-                owner.close()
+                try { acquired.close() } catch (_: Throwable) {}
             }
             if (!submitted) {
                 skippedFrameCount += 1
-                val reason = pipe.lastRejectReason
+                val reason = currentPipeline.lastRejectReason
                 synchronized(skippedFrameCountLock) {
                     skippedFrameCountByReason[reason] = (skippedFrameCountByReason[reason] ?: 0L) + 1L
                 }
-                // Verbose only: per-frame skips are expected under MediaPipe
+                // Verbose only: per-frame skips are expected under normal single-in-flight
                 // backpressure; the aggregate lands in the stop() summary.
-                Log.v(TAG, "GPU graph frame skipped: $reason")
+                Log.v(TAG, "clean segmentation frame skipped: $reason")
             } else {
                 handoffAccepted = true
                 submittedFrameCount += 1
@@ -358,53 +356,8 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
             Log.w(TAG, "drainLatestImage failed: ${t.javaClass.simpleName}: ${t.message}", t)
         } finally {
             if (!handoffAccepted) {
-                frameOwnership?.close()
-            } else {
-                image = null
+                try { image?.close() } catch (_: Throwable) {}
             }
-            try { image?.close() } catch (_: Throwable) {}
-        }
-    }
-
-    /**
-     * [AndroidGreenScreenGpuPipeline.onInputCapacityAvailable] callback: capacity may have
-     * freed up, so post one coalesced re-drain of the current [imageReader] back onto the camera
-     * handler thread. Runs from whatever thread released the permit (MediaPipe's callback thread
-     * or the GL worker); [capacityRetryPosted] ensures at most one pending post regardless of how
-     * many permits release in a burst.
-     */
-    private fun onPipelineInputCapacityAvailable() {
-        if (!capacityRetryPosted.compareAndSet(false, true)) return
-        val h = handler
-        if (h == null) {
-            capacityRetryPosted.set(false)
-            return
-        }
-        val posted = try {
-            h.post {
-                capacityRetryPosted.set(false)
-                if (stopped.get() || !running.get()) return@post
-                val reader = imageReader ?: return@post
-                drainLatestImage(reader)
-            }
-        } catch (t: Throwable) {
-            false
-        }
-        if (!posted) {
-            capacityRetryPosted.set(false)
-        }
-    }
-
-    private class CameraFrameOwnership(
-        private val image: Image,
-        private val hardwareBuffer: HardwareBuffer,
-    ) {
-        private val closed = AtomicBoolean(false)
-
-        fun close() {
-            if (!closed.compareAndSet(false, true)) return
-            try { hardwareBuffer.close() } catch (_: Throwable) {}
-            try { image.close() } catch (_: Throwable) {}
         }
     }
 
@@ -435,16 +388,67 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         throw IllegalStateException("No front-facing camera")
     }
 
+    /**
+     * Selects the YUV_420_888 analysis output size using the same geometry policy as the proven
+     * meshed Duet path (AndroidDuetCameraSource.bindPreview()'s analysisResolutionSelector):
+     * prefer the 16:9 aspect-ratio family, target [TARGET_ANALYSIS_SIZE] (256x144), and pick the
+     * closest supported 16:9 size using closest-higher-then-lower behavior. Only when no 16:9-ish
+     * size is available at all does this fall back to the closest size by aspect-ratio distance
+     * across every supported size (logged as a warning) — 4:3 is never silently preferred over an
+     * available 16:9 option.
+     */
     private fun chooseAnalysisSize(cameraManager: CameraManager, cameraId: String): Size {
         val map = cameraManager
             .getCameraCharacteristics(cameraId)
             .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?: return Size(320, 240)
+            ?: return TARGET_ANALYSIS_SIZE
         val sizes = map.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
-        if (sizes.isEmpty()) return Size(320, 240)
-        return sizes.minWithOrNull(
-            compareBy<Size> { kotlin.math.abs(minOf(it.width, it.height) - TARGET_SHORT_SIDE) }
-                .thenBy { it.width * it.height }
-        ) ?: Size(320, 240)
+        if (sizes.isEmpty()) return TARGET_ANALYSIS_SIZE
+
+        val sixteenByNineSizes = sizes.filter { isSixteenByNineFamily(it) }
+        val chosen = if (sixteenByNineSizes.isNotEmpty()) {
+            pickClosestToTargetSize(sixteenByNineSizes)
+        } else {
+            Log.w(
+                TAG,
+                "chooseAnalysisSize: no 16:9-family YUV_420_888 size among $sizes; " +
+                    "falling back to closest-aspect-ratio selection instead of 4:3",
+            )
+            pickClosestByAspectRatio(sizes)
+        }
+        val result = chosen ?: TARGET_ANALYSIS_SIZE
+        Log.i(TAG, "ANDROID_GREENSCREEN_CAMERA2_SOURCE_ANALYSIS_SIZE chosen=$result target=$TARGET_ANALYSIS_SIZE")
+        return result
+    }
+
+    private fun isSixteenByNineFamily(size: Size): Boolean {
+        val ratio = size.width.toDouble() / size.height.toDouble()
+        val targetRatio = TARGET_ANALYSIS_WIDTH.toDouble() / TARGET_ANALYSIS_HEIGHT.toDouble()
+        return kotlin.math.abs(ratio - targetRatio) <= SIXTEEN_BY_NINE_RATIO_TOLERANCE
+    }
+
+    /**
+     * Among [candidates] (already filtered to the 16:9 family), picks the smallest size whose
+     * width is >= [TARGET_ANALYSIS_WIDTH] (closest from above); if none qualify, picks the
+     * largest size below the target width (closest from below). Mirrors CameraX's
+     * ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER used by the proven Duet path.
+     */
+    private fun pickClosestToTargetSize(candidates: List<Size>): Size? {
+        val higherOrEqual = candidates
+            .filter { it.width >= TARGET_ANALYSIS_WIDTH }
+            .minWithOrNull(compareBy({ it.width }, { it.height }))
+        if (higherOrEqual != null) return higherOrEqual
+        return candidates
+            .filter { it.width < TARGET_ANALYSIS_WIDTH }
+            .maxWithOrNull(compareBy({ it.width }, { it.height }))
+    }
+
+    /** Fallback used only when no 16:9-family size exists at all: closest size by aspect-ratio distance to the target. */
+    private fun pickClosestByAspectRatio(candidates: List<Size>): Size? {
+        val targetRatio = TARGET_ANALYSIS_WIDTH.toDouble() / TARGET_ANALYSIS_HEIGHT.toDouble()
+        return candidates.minWithOrNull(
+            compareBy<Size> { kotlin.math.abs((it.width.toDouble() / it.height.toDouble()) - targetRatio) }
+                .thenBy { kotlin.math.abs(it.width * it.height - TARGET_ANALYSIS_WIDTH * TARGET_ANALYSIS_HEIGHT) }
+        )
     }
 }

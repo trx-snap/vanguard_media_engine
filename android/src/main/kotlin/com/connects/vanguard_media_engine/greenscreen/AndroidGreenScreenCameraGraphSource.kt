@@ -245,10 +245,8 @@ class AndroidGreenScreenCameraGraphSource(
             onCameraFrameTransform = { rotationDegrees, mirrorHorizontal ->
                 loop?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
             },
-            onGpuMask = { hardwareBuffer, maskWidthPx, maskHeightPx, timestampUs, onReleased, acquireFenceFd ->
-                loop?.updateGreenScreenMaskHardwareBuffer(
-                    hardwareBuffer, maskWidthPx, maskHeightPx, timestampUs, onReleased, acquireFenceFd,
-                )
+            onMask = { frame ->
+                loop?.updateGreenScreenMask(frame)
             },
             onStarted = {
                 cameraStarted = true

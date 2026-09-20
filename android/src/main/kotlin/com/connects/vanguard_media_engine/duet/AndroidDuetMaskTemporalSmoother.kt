@@ -22,17 +22,22 @@ import java.nio.ByteOrder
 // [lock] so a concurrent [reset] can never observe or leave behind partially
 // updated temporal state.
 
-class AndroidDuetMaskTemporalSmoother {
+class AndroidDuetMaskTemporalSmoother(
+    val currentWeightQ8: Int = DEFAULT_CURRENT_WEIGHT_Q8,
+    val maxGapMs: Long = DEFAULT_MAX_GAP_MS,
+) {
 
     companion object {
         private const val TAG = "DuetMaskTemporalSmoother"
 
         /** Fixed-point (Q8) blend weights approximating current=0.65 / previous=0.35. */
-        private const val CURRENT_WEIGHT_Q8 = 166
-        private const val PREVIOUS_WEIGHT_Q8 = 256 - CURRENT_WEIGHT_Q8
-
-        private const val MAX_GAP_MS = 250L
+        const val DEFAULT_CURRENT_WEIGHT_Q8 = 166
+        const val DEFAULT_MAX_GAP_MS = 250L
     }
+
+    private val effectiveCurrentWeightQ8 = currentWeightQ8.coerceIn(0, 256)
+    private val effectivePreviousWeightQ8 = 256 - effectiveCurrentWeightQ8
+    private val effectiveMaxGapMs = maxGapMs.coerceAtLeast(0L)
 
     private val lock = Any()
 
@@ -99,7 +104,7 @@ class AndroidDuetMaskTemporalSmoother {
             previousHeight == frame.height &&
             previousBackend == frame.backend &&
             frame.timestampMs > previousTimestampMs &&
-            (frame.timestampMs - previousTimestampMs) <= MAX_GAP_MS
+            (frame.timestampMs - previousTimestampMs) <= effectiveMaxGapMs
 
         // Adopted by the returned frame; must stay a fresh, uniquely-owned
         // allocation on every call (never pooled, never aliased with
@@ -110,7 +115,7 @@ class AndroidDuetMaskTemporalSmoother {
             for (i in 0 until pixelCount) {
                 val cur = normalized.get(i).toInt() and 0xFF
                 val old = previous.get(i).toInt() and 0xFF
-                val blended = (cur * CURRENT_WEIGHT_Q8 + old * PREVIOUS_WEIGHT_Q8) shr 8
+                val blended = (cur * effectiveCurrentWeightQ8 + old * effectivePreviousWeightQ8) shr 8
                 output.put(i, blended.toByte())
             }
         } else {
@@ -133,11 +138,12 @@ class AndroidDuetMaskTemporalSmoother {
 
         if (!loggedFirst) {
             loggedFirst = true
+            val weightFloat = String.format(java.util.Locale.US, "%.2f", effectiveCurrentWeightQ8.toFloat() / 256f)
             Log.i(
                 TAG,
                 "ANDROID_DUET_GREENSCREEN_TEMPORAL_SMOOTHING_FIRST width=${frame.width} " +
                     "height=${frame.height} backend=${frame.backend} format=uint8_alpha " +
-                    "currentWeight=0.65 maxGapMs=250",
+                    "currentWeight=$weightFloat maxGapMs=$effectiveMaxGapMs",
             )
         }
 

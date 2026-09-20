@@ -5,27 +5,19 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
-import androidx.camera.core.ImageAnalysis
 import androidx.core.content.ContextCompat
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
-import com.connects.vanguard_media_engine.duet.AndroidDuetCameraSource
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenAdapter
 import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackground
 import com.connects.vanguard_media_engine.duet.AndroidDuetLayoutGeometry
 import com.connects.vanguard_media_engine.duet.AndroidDuetPreviewRenderLoop
 import com.connects.vanguard_media_engine.duet.AndroidDuetPreviewSurfaceProducer
-import com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationBackendSelector
-import com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationFrame
 import com.connects.vanguard_media_engine.duet.DuetSegmentationBackend
-import com.connects.vanguard_media_engine.duet.DuetSegmentationMaskFormat
 import com.connects.vanguard_media_engine.duet.DuetSurfaceState
 import com.connects.vanguard_media_engine.duet.NativeForegroundTransform
 import com.connects.vanguard_media_engine.duet.VGDuetLayoutRects
 import io.flutter.view.TextureRegistry
-import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -47,28 +39,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 //                                          so no decoder is ever bound and the
 //                                          camera-idle redraw pump presents
 //                                          every camera frame.
-//   - AndroidDuetCameraSource            → CameraX front Preview + optional
-//                                          ImageAnalysis.
-//   - AndroidDuetGreenScreenAdapter      → segmentation ladder
-//                                          (mediapipe_cpu -> mlkit -> none).
+//   - AndroidGreenScreenCamera2Source    → independent front-camera Camera2
+//                                          source feeding the production
+//                                          segmentation ladder (mediapipe_cpu
+//                                          -> mlkit -> none) directly against
+//                                          a Camera2 Image (see its class doc
+//                                          for why it never uses CameraX/
+//                                          ImageAnalysis or an ImageProxy).
+//                                          The ladder walk itself is owned and
+//                                          contained inside that source/its
+//                                          segmentation pipeline; this
+//                                          coordinator only sees `onMask`,
+//                                          `onCameraFrameTransform`,
+//                                          `onStarted`, and `onError`, so it
+//                                          reports a coarse mediapipe_cpu/none
+//                                          backend rather than the live rung.
 //   - AndroidDuetGreenScreenBackground   → static background spec (from the
 //                                          very first frame; never VIDEO here).
 //   - AndroidDuetLayoutGeometry.greenScreen(canvas, transform) → source rect =
 //     full canvas, camera rect = transformed keyed layer.
-//
-// Fallback semantics (differ from Duet on purpose):
-//   - degraded : the adapter moved to a lower rung, keying continues; the rung
-//                is latched so a rebuilt adapter never climbs back up; emits
-//                `green_screen_degraded`.
-//   - fallback : the ladder is exhausted. The analysis use-case is unbound and
-//                the adapter stopped, but green-screen compositing stays
-//                ENABLED with a constant fully-opaque mask, so the compositor
-//                keeps drawing the same static background with the unkeyed
-//                live camera on top. No PiP, no layout rewrite, no Duet
-//                event; emits `green_screen_fallback` with currentBackend
-//                `none`. (Disabling green screen in the compositor would
-//                drop the static background entirely, which is why the
-//                opaque-mask path is used instead.)
 //
 // Camera admission: the engine-wide AndroidCameraSessionAdmission lane is
 // acquired after validation and before any resource is created, and released
@@ -77,16 +66,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 // coordinator holds it.
 //
 // Threading: every public method runs on the main thread (called by
-// AndroidLiveGreenScreenMethodHandler). Adapter callbacks hop to the main
-// thread before touching session state; the render loop confines compositor
-// work to its own render thread; a private decoder-lane HandlerThread exists
-// only because the render loop requires one (no decoder op ever does work).
+// AndroidLiveGreenScreenMethodHandler). The camera source's callbacks
+// (`onCameraFrameTransform`, `onMask`, `onStarted`, `onError`) are posted to
+// the render thread or hopped to the main thread by the render loop itself
+// before touching compositor/session state; a private decoder-lane
+// HandlerThread exists only because the render loop requires one (no decoder
+// op ever does work).
 //
 // Cleanup order on stop/dispose (matches the render loop's documented
-// contract — prepareForCameraStop must precede the CameraX stop so no
+// contract — prepareForCameraStop must precede the Camera2 stop so no
 // drawFrame races the last OES write):
-//   producer.beginRelease -> renderLoop.prepareForCameraStop -> adapter.stop
-//   -> camera.stop -> renderLoop.stopBlocking(0) -> producer.finishRelease
+//   producer.beginRelease -> renderLoop.prepareForCameraStop -> camera.stop
+//   -> renderLoop.stopBlocking(0) -> producer.finishRelease
 //   -> admission.release. No Surface.release on producer-owned surfaces.
 
 class AndroidLiveGreenScreenSessionCoordinator(
@@ -119,12 +110,6 @@ class AndroidLiveGreenScreenSessionCoordinator(
         const val EVENT_SUSPENDED = "suspended"
         const val EVENT_RESUMED = "resumed"
         const val EVENT_ERROR = "error"
-
-        private const val FALLBACK_USER_MESSAGE =
-            "Green screen is unavailable on this device. Showing the live camera over the background."
-
-        /** Side length of the constant fully-opaque mask uploaded on terminal fallback. */
-        private const val OPAQUE_MASK_DIMENSION = 4
     }
 
     /** Validated start arguments (built by the method handler). */
@@ -147,12 +132,7 @@ class AndroidLiveGreenScreenSessionCoordinator(
     ) {
         var producer: AndroidDuetPreviewSurfaceProducer? = null
         var renderLoop: AndroidDuetPreviewRenderLoop? = null
-        var cameraSource: AndroidDuetCameraSource? = null
-        var adapter: AndroidDuetGreenScreenAdapter? = null
-        /** One-way ladder latch: rung reached after a degrade; a rebuilt adapter starts here. */
-        var latchedBackendId: String? = null
-        /** Set once the terminal fallback (unkeyed camera over background) has been applied. */
-        var fallbackApplied: Boolean = false
+        var cameraSource: AndroidGreenScreenCamera2Source? = null
         /** True between an output-surface loss and its re-availability. */
         var suspended: Boolean = false
     }
@@ -376,9 +356,14 @@ class AndroidLiveGreenScreenSessionCoordinator(
      * Idempotent camera start. No-ops when the session was torn down between
      * the render-thread post and this main-thread run, when the compositor
      * surface is already dead, or when the camera is already running (it
-     * survives output loss). On CameraX failure the source is stopped and
-     * nulled so a later re-attach can retry, and an `error` event is emitted;
-     * the session stays alive for the caller to stop.
+     * survives output loss). [AndroidGreenScreenCamera2Source] owns its own
+     * segmentation ladder (mediapipe_cpu -> mlkit -> none) internally and only
+     * ever calls back here with `onCameraFrameTransform` (forwarded to the
+     * render loop so the compositor corrects for sensor orientation/mirroring),
+     * `onMask` (forwarded to the render loop), `onStarted`, and `onError`. On
+     * failure the source is stopped and nulled so a later re-attach can retry,
+     * and an `error` event is emitted; the session stays alive for the caller
+     * to stop.
      */
     private fun startCameraSourceIfNeeded(session: LiveSession, surface: Surface) {
         if (activeSession !== session) return
@@ -387,35 +372,25 @@ class AndroidLiveGreenScreenSessionCoordinator(
         val ctx = context ?: return
         if (session.cameraSource != null) return
 
-        val camSource = AndroidDuetCameraSource(ctx)
+        val camSource = AndroidGreenScreenCamera2Source(ctx)
         session.cameraSource = camSource
-
-        // Bind the analyzer as part of the first use-case set. After a terminal
-        // fallback no analyzer is ever rebuilt for this session.
-        val analyzer: ImageAnalysis.Analyzer? = if (session.fallbackApplied) {
-            null
-        } else {
-            val adapter = buildGreenScreenAdapter(session)
-            if (adapter == null) {
-                applyFallback(session, reportedBackend(session), "adapter_creation_failed")
-            }
-            adapter
-        }
 
         camSource.start(
             targetSurface = surface,
-            analyzer      = analyzer,
+            onCameraFrameTransform = { rotationDegrees, mirrorHorizontal ->
+                session.renderLoop?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
+            },
+            onMask = { frame -> session.renderLoop?.updateGreenScreenMask(frame) },
             onStarted = {
                 Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_CAMERA_STARTED session=${session.sessionId} " +
-                    "keyed=${analyzer != null} backend=${reportedBackend(session)}")
+                    "source=camera2_clean_segmentation backend=${DuetSegmentationBackend.MEDIAPIPE_CPU}")
             },
             onError = { e ->
                 Log.w(TAG, "Camera source failed for live session ${session.sessionId}: ${e.message}")
                 camSource.stop()
                 if (activeSession === session && session.cameraSource === camSource) {
                     session.cameraSource = null
-                    stopGreenScreenAdapter(session)
-                    emit(session, EVENT_ERROR, reportedBackend(session), DuetSegmentationBackend.NONE,
+                    emit(session, EVENT_ERROR, DuetSegmentationBackend.MEDIAPIPE_CPU, DuetSegmentationBackend.NONE,
                         "camera_start_failed",
                         "The camera could not be started: ${e.message ?: e.javaClass.simpleName}")
                 }
@@ -423,153 +398,14 @@ class AndroidLiveGreenScreenSessionCoordinator(
         )
     }
 
-    // ── Segmentation adapter ──────────────────────────────────────────────────
-
     /**
-     * Creates, stores and arms the session's [AndroidDuetGreenScreenAdapter]
-     * on the production ladder (or the session-latched rung after a prior
-     * degrade). Returns null when construction/start throws; the partial
-     * adapter is stopped and cleared so the caller can fall back.
+     * Coarse backend label for `suspended`/`resumed`/`error` events: the
+     * independent Camera2 source's internal ladder (mediapipe_cpu -> mlkit ->
+     * none) is not observable from here, so this reports `mediapipe_cpu`
+     * while the camera source is running and `none` once it is gone.
      */
-    private fun buildGreenScreenAdapter(session: LiveSession): AndroidDuetGreenScreenAdapter? {
-        session.adapter?.let { return it }
-        val renderLoop = session.renderLoop ?: return null
-        return try {
-            val selector = AndroidDuetSegmentationBackendSelector(context)
-            val initialBackendId = session.latchedBackendId ?: selector.primaryBackendId()
-            var adapterRef: AndroidDuetGreenScreenAdapter? = null
-            val adapter = AndroidDuetGreenScreenAdapter(
-                selector = selector,
-                initialBackendId = initialBackendId,
-                onMask = { frame -> renderLoop.updateGreenScreenMask(frame) },
-                onGpuMask = { hardwareBuffer, widthPx, heightPx, timestampUs ->
-                    renderLoop.updateGreenScreenMaskHardwareBuffer(hardwareBuffer, widthPx, heightPx, timestampUs)
-                },
-                onDegraded = { prev, next, reason, userMessage ->
-                    Log.w(TAG, "[LiveGreenScreen degraded] $prev->$next ($reason): $userMessage")
-                    mainHandler.post {
-                        handleGreenScreenDegraded(session, adapterRef, prev, next, reason, userMessage)
-                    }
-                },
-                onFallback = { prev, next, reason, userMessage ->
-                    Log.w(TAG, "[LiveGreenScreen fallback] $prev->$next ($reason): $userMessage")
-                    mainHandler.post {
-                        handleGreenScreenFallback(session, adapterRef, prev, reason)
-                    }
-                },
-            )
-            adapterRef = adapter
-            session.adapter = adapter
-            adapter.start()
-            Log.d(TAG, "Live green-screen adapter started for session ${session.sessionId} " +
-                "(initial backend=$initialBackendId, latched=${session.latchedBackendId})")
-            adapter
-        } catch (t: Throwable) {
-            Log.w(TAG, "[LiveGreenScreen fallback] ${reportedBackend(session)}->none " +
-                "(adapter_start_failed): ${t.message}")
-            try { session.adapter?.stop() } catch (_: Throwable) {}
-            session.adapter = null
-            null
-        }
-    }
-
-    /** Stops and clears the adapter (idempotent); its stop() closes every opened backend. */
-    private fun stopGreenScreenAdapter(session: LiveSession) {
-        val adapter = session.adapter ?: return
-        try { adapter.stop() } catch (_: Throwable) {}
-        session.adapter = null
-    }
-
-    /**
-     * Non-terminal degrade: keying continues on [currentBackend]. The rung is
-     * latched regardless of adapter staleness; the event is emitted only for
-     * the session's live adapter.
-     */
-    private fun handleGreenScreenDegraded(
-        session: LiveSession,
-        adapter: AndroidDuetGreenScreenAdapter?,
-        previousBackend: String,
-        currentBackend: String,
-        reason: String,
-        userMessage: String,
-    ) {
-        if (activeSession !== session) return
-        session.latchedBackendId = currentBackend
-        if (adapter == null || session.adapter !== adapter) {
-            Log.d(TAG, "Live green-screen degrade from a stale adapter latched ($currentBackend) without event")
-            return
-        }
-        Log.w(TAG, "Live green screen degraded $previousBackend -> $currentBackend ($reason); " +
-            "staying keyed on $currentBackend")
-        emit(session, EVENT_DEGRADED, previousBackend, currentBackend, reason, userMessage)
-    }
-
-    /**
-     * Terminal ladder exhaustion for the session's live adapter. Never touches
-     * Duet's PiP path: see [applyFallback].
-     */
-    private fun handleGreenScreenFallback(
-        session: LiveSession,
-        adapter: AndroidDuetGreenScreenAdapter?,
-        previousBackend: String,
-        reason: String,
-    ) {
-        if (activeSession !== session) return
-        if (adapter == null || session.adapter !== adapter) {
-            Log.d(TAG, "Live green-screen fallback from a stale adapter ignored")
-            return
-        }
-        applyFallback(session, previousBackend, reason)
-    }
-
-    /**
-     * Unkeyed live camera over the SAME static background, applied once:
-     *   1. unbind the analysis use-case so no new frames reach the adapter,
-     *   2. stop/clear the adapter (closes every backend),
-     *   3. keep green-screen compositing enabled and upload a constant
-     *      fully-opaque mask, so the compositor still draws the static
-     *      background and now draws the whole camera rect opaque,
-     *   4. emit `green_screen_fallback` with currentBackend `none`.
-     * The layout rects are untouched (no PiP); the camera keeps running.
-     */
-    private fun applyFallback(session: LiveSession, previousBackend: String, reason: String) {
-        if (session.fallbackApplied) return
-        session.fallbackApplied = true
-        session.cameraSource?.setAnalysisAnalyzer(null)
-        stopGreenScreenAdapter(session)
-        session.renderLoop?.updateGreenScreenMask(opaqueMaskFrame())
-        Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_FALLBACK session=${session.sessionId} " +
-            "previous=$previousBackend reason=$reason -> unkeyed camera over static background")
-        emit(session, EVENT_FALLBACK, previousBackend, DuetSegmentationBackend.NONE, reason,
-            FALLBACK_USER_MESSAGE)
-    }
-
-    /**
-     * Constant 255 (fully foreground) uint8 mask. Through the compositor's
-     * erosion + smoothstep this yields alpha 1.0 everywhere, i.e. the camera
-     * is drawn unkeyed inside its rect while the background draw is unchanged.
-     */
-    private fun opaqueMaskFrame(): AndroidDuetSegmentationFrame {
-        val n = OPAQUE_MASK_DIMENSION
-        val bytes = ByteBuffer.allocateDirect(n * n)
-        for (i in 0 until n * n) bytes.put(0xFF.toByte())
-        bytes.rewind()
-        return AndroidDuetSegmentationFrame.adoptOwned(
-            ownedBytes = bytes,
-            width = n,
-            height = n,
-            timestampMs = SystemClock.elapsedRealtime(),
-            backend = DuetSegmentationBackend.NONE,
-            format = DuetSegmentationMaskFormat.UINT8_ALPHA,
-        )
-    }
-
-    /** Backend to report: live adapter rung, else the latch, else `none` after fallback, else the primary. */
     private fun reportedBackend(session: LiveSession): String =
-        session.adapter?.currentBackendId
-            ?: session.latchedBackendId
-            ?: if (session.fallbackApplied) DuetSegmentationBackend.NONE
-            else AndroidDuetSegmentationBackendSelector(context).primaryBackendId()
+        if (session.cameraSource != null) DuetSegmentationBackend.MEDIAPIPE_CPU else DuetSegmentationBackend.NONE
 
     // ── Release ───────────────────────────────────────────────────────────────
 
@@ -580,20 +416,20 @@ class AndroidLiveGreenScreenSessionCoordinator(
         // Phase 1: stop new producer submissions (no hook fires).
         producer?.beginRelease()
         // Phase 2: halt render-thread pumps and block swap acceptance BEFORE
-        // CameraX is stopped, so no drawFrame races the last OES write.
+        // the Camera2 source is stopped, so no drawFrame races the last OES
+        // write.
         renderLoop?.prepareForCameraStop()
-        // Phase 3: stop segmentation so nothing dispatches into the dying loop.
-        stopGreenScreenAdapter(session)
-        // Phase 4: stop CameraX (also clears its analyzer/executor).
+        // Phase 3: stop the camera source (also closes its segmentation
+        // pipeline and every backend it opened).
         camSource?.stop()
-        // Phase 5: release the compositor (releases cameraInputSurface).
+        // Phase 4: release the compositor (releases cameraInputSurface).
         renderLoop?.stopBlocking(0L)
-        // Phase 6: drop the Flutter SurfaceProducer.
+        // Phase 5: drop the Flutter SurfaceProducer.
         producer?.finishRelease()
         session.cameraSource = null
         session.producer = null
         session.renderLoop = null
-        // Phase 7: free the engine-wide camera lane.
+        // Phase 6: free the engine-wide camera lane.
         cameraAdmission.release(ADMISSION_OWNER, session.sessionId)
         Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_SESSION_RELEASED session=${session.sessionId} reason=$why")
     }
