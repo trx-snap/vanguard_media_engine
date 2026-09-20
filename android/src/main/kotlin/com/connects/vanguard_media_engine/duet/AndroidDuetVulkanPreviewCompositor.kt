@@ -427,6 +427,7 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                 greenScreen,
                 nativeSourceRect.x, nativeSourceRect.y, nativeSourceRect.width, nativeSourceRect.height,
                 nativeCameraRect.x, nativeCameraRect.y, nativeCameraRect.width, nativeCameraRect.height,
+                0, 0, false,
             )
             if (success && greenScreen && previewFrameLoggedOnce.compareAndSet(false, true)) {
                 Log.i(TAG, "ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST")

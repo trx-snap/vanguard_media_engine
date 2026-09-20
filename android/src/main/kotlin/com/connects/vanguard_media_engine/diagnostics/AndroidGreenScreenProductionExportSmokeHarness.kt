@@ -125,7 +125,7 @@ object AndroidGreenScreenProductionExportSmokeHarness {
                 buildMaskFrame(if (frameIndex % 2 == 1) 255 else 0)
             }
             val request = AndroidGreenScreenExportEngine.Request(
-                backgroundVideoPath = bgFixturePath,
+                background = AndroidGreenScreenExportEngine.BackgroundSource.VideoFile(bgFixturePath),
                 foregroundVideoPath = fgFixturePath,
                 outputPath = outputPath,
                 width = width,

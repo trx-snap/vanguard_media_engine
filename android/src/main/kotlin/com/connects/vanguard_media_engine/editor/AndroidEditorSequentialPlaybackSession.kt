@@ -28,6 +28,8 @@ data class AndroidEditorClipPlaybackSpec(
     val sourceTrimStartUs: Long,
     val sourceTrimEndUs: Long,
     val timelineDurationUs: Long,
+    val clipId: String = "",
+    val originalAudioGain: Float = 1.0f,
 )
 
 /**
