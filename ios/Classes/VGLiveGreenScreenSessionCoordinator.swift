@@ -69,9 +69,13 @@
 //                      allow_precision_loss; iosSegmentationBackend → "auto"
 //                      (default, see above) | "arkit" | visionFast | litert |
 //                      visionBalanced | ...; iosLiveMatteRefinement →
-//                      VGMatteRefinementPipeline.LiveMatteRefinementMode, "s1"
-//                      (production default, unchanged) | "tightAlphaR1" (opt-in
-//                      RND candidate); applied on BOTH engines — the adapter
+//                      VGMatteRefinementPipeline.LiveMatteRefinementMode,
+//                      "s4SoftAlphaR2" (production live default,
+//                      VGMatteRefinementPipeline.defaultLiveMatteRefinementMode;
+//                      runs when no option is sent) | "s1" (explicit S1-only
+//                      fallback, the previous default) | "tightAlphaR1" (opt-in
+//                      RND candidate) | "s4GuidedAlphaR1" (opt-in S4 R1
+//                      guided-alpha RND live mode); applied on BOTH engines — the adapter
 //                      path's VGDuetPreviewCompositor (which owns a
 //                      VGMatteRefinementPipeline internally) and the ARKit
 //                      engine's own VGMatteRefinementPipeline refiner
@@ -172,13 +176,17 @@ struct VGLiveGreenScreenDiagnosticsOptions {
     /// the VGLiveGreenScreenSegmentationBackend* constants before reaching here.
     var iosSegmentationBackend: String = VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
 
-    /// Opt-in live matte refinement RND candidate for the NEXT session start only
-    /// (see VGMatteRefinementPipeline.LiveMatteRefinementMode). Default "s1" is exactly
-    /// current production live behavior, byte-for-byte unchanged; "tightAlphaR1" opts
-    /// into the bounded CoreImage post-pass A/B candidate ("A tight alpha"). Validated
-    /// by the method handler against VGMatteRefinementPipeline.LiveMatteRefinementMode
+    /// Live matte refinement mode for the NEXT session start only (see
+    /// VGMatteRefinementPipeline.LiveMatteRefinementMode). Default "s4SoftAlphaR2"
+    /// (VGMatteRefinementPipeline.defaultLiveMatteRefinementMode) is the production
+    /// live pipeline: S1 stages plus the S4 soft R2 refinement; "s1" is the explicit
+    /// fallback that runs exactly the previous S1-only production path, byte-for-byte
+    /// unchanged; "tightAlphaR1" opts into the bounded CoreImage post-pass A/B candidate
+    /// ("A tight alpha"); "s4GuidedAlphaR1" opts into the S4 R1 guided-alpha RND
+    /// candidate live (physical comparison only; never the default). Validated by the
+    /// method handler against VGMatteRefinementPipeline.LiveMatteRefinementMode.allCases
     /// (exposed as VGDuetPreviewCompositor.LiveMatteRefinementMode) before reaching here.
-    var iosLiveMatteRefinement: String = VGMatteRefinementPipeline.LiveMatteRefinementMode.s1.rawValue
+    var iosLiveMatteRefinement: String = VGMatteRefinementPipeline.defaultLiveMatteRefinementMode.rawValue
 
     static let `default` = VGLiveGreenScreenDiagnosticsOptions()
 
@@ -280,7 +288,8 @@ final class VGLiveGreenScreenSessionCoordinator {
         var segmentationBackendSelection: String
 
         /// Live matte refinement mode requested for this session (diagnostics options
-        /// at start; "s1" by default). Kept so diagnostics can always echo it,
+        /// at start; "s4SoftAlphaR2", the production default, when no option was sent).
+        /// Kept so diagnostics can always echo it,
         /// independent of the compositor / adapter lifecycle.
         let requestedLiveMatteRefinement: String
 
@@ -413,10 +422,12 @@ final class VGLiveGreenScreenSessionCoordinator {
         let diagnosticsOptions = pendingDiagnosticsOptions
         pendingDiagnosticsOptions = .default
 
-        // Fail open to .s1 if the stored string is somehow not a known raw value
-        // (the method handler already validates it exactly; this is defense in depth).
+        // Fail open to the production default (Soft R2) if the stored string is somehow
+        // not a known raw value (the method handler already validates it exactly; this is
+        // defense in depth). Explicit "s1" still resolves to the S1-only fallback.
         let liveMatteRefinementMode = VGMatteRefinementPipeline.LiveMatteRefinementMode(
-            rawValue: diagnosticsOptions.iosLiveMatteRefinement) ?? .s1
+            rawValue: diagnosticsOptions.iosLiveMatteRefinement)
+            ?? VGMatteRefinementPipeline.defaultLiveMatteRefinementMode
 
         let rects = VGDuetLayoutGeometry.greenScreen(canvasWidth: CGFloat(width),
                                                      canvasHeight: CGFloat(height),
@@ -680,7 +691,7 @@ final class VGLiveGreenScreenSessionCoordinator {
             payload["failureReason"]          = "adapter_released_without_terminal_diagnostics"
         }
         payload["cameraSelectedSessionPreset"] = cameraSelectedSessionPreset
-        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_DIAGNOSTICS sessionId=\(session.sessionId) isKeyed=\(session.isKeyed) terminalState=\(payload["terminalState"] ?? "?") failureReason=\(payload["failureReason"] ?? "?") adapterReleased=\(payload["adapterReleased"] ?? false) segmentationEngine=\(engineName) cameraSelectedSessionPreset=\(cameraSelectedSessionPreset) providerKind=\(payload["providerKind"] ?? "?") providerMode=\(payload["providerMode"] ?? "?") requestedSegmentationBackend=\(session.requestedSegmentationBackend) segmentationBackend=\(payload["segmentationBackend"] ?? "?") segmentationBackendSelection=\(session.segmentationBackendSelection) liveMatteRefinement=\(payload["liveMatteRefinement"] ?? "?") timingSemantics=\(payload["timingSemantics"] ?? "?") fastMetalPrecision=\(payload["fastMetalPrecision"] ?? false) metalAllowPrecisionLoss=\(payload["metalAllowPrecisionLoss"] ?? false) sampleCount=\(payload["sampleCount"] ?? 0) avgTotalMs=\(payload["avgTotalMs"] ?? -1) maxTotalMs=\(payload["maxTotalMs"] ?? -1) avgInferenceMs=\(payload["avgInferenceMs"] ?? -1) avgInputCopyMs=\(payload["avgInputCopyMs"] ?? -1) avgInvokeMs=\(payload["avgInvokeMs"] ?? -1) avgOutputAccessMs=\(payload["avgOutputAccessMs"] ?? -1) avgCadenceMs=\(payload["avgCadenceMs"] ?? -1) maskPublishCount=\(payload["maskPublishCount"] ?? 0) lastMaskCoveragePercent=\(payload["lastMaskCoveragePercent"] ?? -1) firstMaskLatencyMs=\(payload["firstMaskLatencyMs"] ?? -1) avgMatteGenerationMs=\(payload["avgMatteGenerationMs"] ?? "n/a") avgCompositeMs=\(payload["avgCompositeMs"] ?? "n/a") effectiveFps=\(payload["effectiveFps"] ?? "n/a") maskRefinementPath=\(payload["maskRefinementPath"] ?? "n/a") maskRefinementApplied=\(payload["maskRefinementApplied"] ?? "n/a") maskMorphologyCloseApplied=\(payload["maskMorphologyCloseApplied"] ?? "n/a") maskFeatherApplied=\(payload["maskFeatherApplied"] ?? "n/a") maskTrimapApplied=\(payload["maskTrimapApplied"] ?? "n/a") maskGuidedEdgeApplied=\(payload["maskGuidedEdgeApplied"] ?? "n/a") liveTightAlphaR1Applied=\(payload["liveTightAlphaR1Applied"] ?? "n/a")")
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_DIAGNOSTICS sessionId=\(session.sessionId) isKeyed=\(session.isKeyed) terminalState=\(payload["terminalState"] ?? "?") failureReason=\(payload["failureReason"] ?? "?") adapterReleased=\(payload["adapterReleased"] ?? false) segmentationEngine=\(engineName) cameraSelectedSessionPreset=\(cameraSelectedSessionPreset) providerKind=\(payload["providerKind"] ?? "?") providerMode=\(payload["providerMode"] ?? "?") requestedSegmentationBackend=\(session.requestedSegmentationBackend) segmentationBackend=\(payload["segmentationBackend"] ?? "?") segmentationBackendSelection=\(session.segmentationBackendSelection) liveMatteRefinement=\(payload["liveMatteRefinement"] ?? "?") timingSemantics=\(payload["timingSemantics"] ?? "?") fastMetalPrecision=\(payload["fastMetalPrecision"] ?? false) metalAllowPrecisionLoss=\(payload["metalAllowPrecisionLoss"] ?? false) sampleCount=\(payload["sampleCount"] ?? 0) avgTotalMs=\(payload["avgTotalMs"] ?? -1) maxTotalMs=\(payload["maxTotalMs"] ?? -1) avgInferenceMs=\(payload["avgInferenceMs"] ?? -1) avgInputCopyMs=\(payload["avgInputCopyMs"] ?? -1) avgInvokeMs=\(payload["avgInvokeMs"] ?? -1) avgOutputAccessMs=\(payload["avgOutputAccessMs"] ?? -1) avgCadenceMs=\(payload["avgCadenceMs"] ?? -1) maskPublishCount=\(payload["maskPublishCount"] ?? 0) lastMaskCoveragePercent=\(payload["lastMaskCoveragePercent"] ?? -1) firstMaskLatencyMs=\(payload["firstMaskLatencyMs"] ?? -1) avgMatteGenerationMs=\(payload["avgMatteGenerationMs"] ?? "n/a") avgCompositeMs=\(payload["avgCompositeMs"] ?? "n/a") effectiveFps=\(payload["effectiveFps"] ?? "n/a") maskRefinementPath=\(payload["maskRefinementPath"] ?? "n/a") maskRefinementApplied=\(payload["maskRefinementApplied"] ?? "n/a") maskMorphologyCloseApplied=\(payload["maskMorphologyCloseApplied"] ?? "n/a") maskFeatherApplied=\(payload["maskFeatherApplied"] ?? "n/a") maskTrimapApplied=\(payload["maskTrimapApplied"] ?? "n/a") maskGuidedEdgeApplied=\(payload["maskGuidedEdgeApplied"] ?? "n/a") liveTightAlphaR1Applied=\(payload["liveTightAlphaR1Applied"] ?? "n/a") liveS4GuidedAlphaR1Applied=\(payload["liveS4GuidedAlphaR1Applied"] ?? "n/a") liveS4GuidedAlphaApplied=\(payload["liveS4GuidedAlphaApplied"] ?? "n/a")")
         reply(payload, nil)
     }
 
@@ -999,7 +1010,8 @@ final class VGLiveGreenScreenSessionCoordinator {
     /// droppedPoolExhaustedFrames, videoFormat*, engineState, foregroundRect,
     /// liveMatteRefinement, maskRefinementPath, maskRefinementApplied,
     /// maskMorphologyCloseApplied, maskFeatherApplied, maskTrimapApplied,
-    /// maskGuidedEdgeApplied, liveTightAlphaR1Applied, …).
+    /// maskGuidedEdgeApplied, liveTightAlphaR1Applied, liveS4GuidedAlphaR1Applied,
+    /// liveS4GuidedAlphaApplied, …).
     /// Timing semantics "arkit_matte_generator_spans": invoke = ARMatteGenerator
     /// generateMatte + GPU wait, inputCopy = 0, outputAccess = matte texture →
     /// CVPixelBuffer copy, policy = CoreImage blend + render, total = matte +

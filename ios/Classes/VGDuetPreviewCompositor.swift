@@ -20,14 +20,27 @@
 //
 // Production green-screen mask refinement pipeline:
 // The aspect-filled L8 mask is refined at output (canvas) scale, then composited via
-// CIBlendWithMask. The refinement policy and CoreImage filter graph (S1 production stages,
-// diagnostic-only S4/S5 RND candidates, and the opt-in live tightAlphaR1 post-pass) are
+// CIBlendWithMask. The refinement policy and CoreImage filter graph (S1 base stages,
+// the S4/S5 candidates — S5 lab-only; S4 soft R2 the production live default and S4 R1
+// an opt-in live RND mode — and the opt-in live tightAlphaR1 post-pass) are
 // owned by VGMatteRefinementPipeline (VGMatteRefinementPipeline.swift), not by this
 // compositor — see that file for the full stage-by-stage algorithm description. This
 // compositor owns exactly one `mattePipeline` instance (created in init with
 // `liveMatteRefinementMode`) and delegates to it:
 //   - composite() calls `mattePipeline.refineLiveGreenScreenMask(...)` before
-//     CIBlendWithMask (S1 stages, plus tightAlphaR1 when opted in).
+//     CIBlendWithMask (S1 stages only in the neutral `.s1` default; S1 stages plus the
+//     S4 soft R2 refinement when a green-screen caller passes
+//     VGMatteRefinementPipeline.defaultLiveMatteRefinementMode explicitly; tightAlphaR1
+//     or S4 R1 when opted in through `liveMatteRefinementMode`).
+//
+// Default-mode boundary: this compositor is generic (Duet and green-screen share it), so
+// its `init` default is the neutral `.s1` path and it never inherits green-screen visual
+// tuning on its own. Constructing it with no mode (the Duet native session coordinator,
+// the deterministic pixel proof) yields exactly the S1-only path. Green-screen callers that
+// want the production Soft R2 default (VGLiveGreenScreenSessionCoordinator via the session
+// mode, VGLiveGreenScreenReplayDiagnostics.replay) must pass
+// `VGMatteRefinementPipeline.defaultLiveMatteRefinementMode` explicitly; that constant is
+// owned by the green-screen pipeline, not by this compositor.
 //   - greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:) and
 //     refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask:in:guidedBy:) are thin
 //     wrappers over the pipeline, kept here so existing callers
@@ -82,10 +95,14 @@ final class VGDuetPreviewCompositor {
     let canvasHeight: Int
 
     /// Live-selectable matte refinement mode for this compositor instance (see
-    /// `LiveMatteRefinementMode`). Defaults to `.s1` (current production behavior,
-    /// unchanged when no argument is passed to `init`). Set once at session start from
-    /// the diagnostic-only `setLiveGreenScreenDiagnosticsOptions` route; never mutated
-    /// for the lifetime of the instance.
+    /// `LiveMatteRefinementMode`). Defaults to the neutral `.s1` (S1-only path) when no
+    /// argument is passed to `init`: the generic compositor never inherits green-screen
+    /// tuning by construction alone. Green-screen callers that want the production Soft R2
+    /// default pass `VGMatteRefinementPipeline.defaultLiveMatteRefinementMode`
+    /// (`.s4SoftAlphaR2`) explicitly (the live green-screen coordinator forwards the
+    /// session mode, itself defaulted from the diagnostic-only
+    /// `setLiveGreenScreenDiagnosticsOptions` route at session start). Never mutated for
+    /// the lifetime of the instance.
     let liveMatteRefinementMode: LiveMatteRefinementMode
 
     /// Owns the actual matte refinement filter graph (S1/S4/S5/tightAlphaR1); this
@@ -234,7 +251,7 @@ final class VGDuetPreviewCompositor {
                     // Grep marker: IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST
                     if !_hasLoggedFirstMaskBlend {
                         _hasLoggedFirstMaskBlend = true
-                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame maskFeatherRadius=\(VGMatteRefinementPipeline.greenScreenMaskFeatherRadius) maskFeatherApplied=\(refined.featherApplied) maskTrimapEnabled=\(VGMatteRefinementPipeline.greenScreenTrimapEnabled) maskTrimapApplied=\(refined.trimapApplied) maskTrimapLow=\(VGMatteRefinementPipeline.greenScreenTrimapLow) maskTrimapHigh=\(VGMatteRefinementPipeline.greenScreenTrimapHigh) maskGuidedEdgeEnabled=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeEnabled) maskGuidedEdgeApplied=\(refined.guidedEdgeApplied) maskGuidedEdgeIntensity=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeIntensity) maskGuidedEdgeBlurRadius=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeBlurRadius) maskGuidedEdgeLow=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeLow) maskGuidedEdgeHigh=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeHigh) maskMorphologyCloseEnabled=\(VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseEnabled) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskMorphologyCloseRadius=\(VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseRadius) liveMatteRefinementMode=\(liveMatteRefinementMode.rawValue) liveTightAlphaR1Applied=\(refined.tightAlphaR1Applied)")
+                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame maskFeatherRadius=\(VGMatteRefinementPipeline.greenScreenMaskFeatherRadius) maskFeatherApplied=\(refined.featherApplied) maskTrimapEnabled=\(VGMatteRefinementPipeline.greenScreenTrimapEnabled) maskTrimapApplied=\(refined.trimapApplied) maskTrimapLow=\(VGMatteRefinementPipeline.greenScreenTrimapLow) maskTrimapHigh=\(VGMatteRefinementPipeline.greenScreenTrimapHigh) maskGuidedEdgeEnabled=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeEnabled) maskGuidedEdgeApplied=\(refined.guidedEdgeApplied) maskGuidedEdgeIntensity=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeIntensity) maskGuidedEdgeBlurRadius=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeBlurRadius) maskGuidedEdgeLow=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeLow) maskGuidedEdgeHigh=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeHigh) maskMorphologyCloseEnabled=\(VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseEnabled) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskMorphologyCloseRadius=\(VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseRadius) liveMatteRefinementMode=\(liveMatteRefinementMode.rawValue) liveTightAlphaR1Applied=\(refined.tightAlphaR1Applied) liveS4GuidedAlphaR1Applied=\(refined.s4GuidedAlphaR1Applied) liveS4GuidedAlphaApplied=\(refined.s4GuidedAlphaApplied)")
                     }
                 } else {
                     // Filter unavailable (should not happen on supported iOS): fall back to

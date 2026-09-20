@@ -41,7 +41,11 @@
 // refinement owned by the caller-agnostic VGMatteRefinementPipeline
 // (refineLiveGreenScreenMask: morphology close → feather → trimap →
 // camera-guided edge preserve, plus the opt-in tightAlphaR1 post-pass
-// when StartRequest.liveMatteRefinementMode is .tightAlphaR1; default .s1), so
+// when StartRequest.liveMatteRefinementMode is .tightAlphaR1, or the S4
+// guided-alpha refinement when it is .s4SoftAlphaR2 (soft R2 set; the
+// production default, VGMatteRefinementPipeline.defaultLiveMatteRefinementMode)
+// or the opt-in .s4GuidedAlphaR1 (R1 set); explicit .s1 is the S1-only
+// fallback), so
 // the ARKit path and the Vision adapter path (which runs the same pipeline
 // through its own VGDuetPreviewCompositor) share one refinement pipeline and
 // one set of constants. The VGMatteRefinementPipeline instance held in
@@ -205,9 +209,12 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         /// Swappable live through `updateForegroundRect`.
         let foregroundRect: CGRect?
         /// Live mask refinement mode run by the VGMatteRefinementPipeline refiner
-        /// before every blend (see header). `.s1` (default) is the production
-        /// pipeline; `.tightAlphaR1` adds the opt-in post-pass exactly as on
-        /// the adapter path.
+        /// before every blend (see header). `.s4SoftAlphaR2` (default,
+        /// VGMatteRefinementPipeline.defaultLiveMatteRefinementMode) is the
+        /// production pipeline (S1 stages plus the S4 soft R2 refinement);
+        /// `.s1` is the explicit S1-only fallback; `.tightAlphaR1` adds the
+        /// opt-in post-pass and `.s4GuidedAlphaR1` the opt-in S4 R1 RND
+        /// candidate, exactly as on the adapter path.
         let liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode
 
         init(canvasWidth: Int,
@@ -220,7 +227,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
              captureBundleAfterPublishedFrames: Int = 1,
              background: CVPixelBuffer? = nil,
              foregroundRect: CGRect? = nil,
-             liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode = .s1) {
+             liveMatteRefinementMode: VGMatteRefinementPipeline.LiveMatteRefinementMode
+                 = VGMatteRefinementPipeline.defaultLiveMatteRefinementMode) {
             self.canvasWidth = canvasWidth
             self.canvasHeight = canvasHeight
             self.targetFps = targetFps
@@ -389,6 +397,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
     private var maskTrimapApplied = false
     private var maskGuidedEdgeApplied = false
     private var liveTightAlphaR1Applied = false
+    private var liveS4GuidedAlphaR1Applied = false
+    private var liveS4GuidedAlphaApplied = false
     private var hasLoggedFirstMaskRefinement = false
 
     // Optional one-shot replay-bundle capture (all guarded by `lock`; mutated
@@ -682,7 +692,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         currentBackground = nil
         lock.unlock()
 
-        NSLog("IOS_ARKIT_LIVE_PREVIEW_NATIVE_STOP sessionId=\(sessionId) textureId=\(textureId) ownsTexture=\(ownsTexture) pass=\(summary["pass"] ?? false) frameCount=\(summary["frameCount"] ?? 0) maskCount=\(summary["maskCount"] ?? 0) publishedFrames=\(summary["publishedFrames"] ?? 0) droppedBusyFrames=\(summary["droppedBusyFrames"] ?? 0) skippedNoMaskFrames=\(summary["skippedNoMaskFrames"] ?? 0) throttledFrames=\(summary["throttledFrames"] ?? 0) droppedPoolExhaustedFrames=\(summary["droppedPoolExhaustedFrames"] ?? 0) effectiveFps=\(summary["effectiveFps"] ?? "null") avgMatteGenerationMs=\(summary["avgMatteGenerationMs"] ?? "null") p95MatteGenerationMs=\(summary["p95MatteGenerationMs"] ?? "null") avgCompositeMs=\(summary["avgCompositeMs"] ?? "null") p95CompositeMs=\(summary["p95CompositeMs"] ?? "null") failureReason=\(summary["failureReason"] ?? "null") liveMatteRefinement=\(summary["liveMatteRefinement"] ?? "null") maskRefinementFrames=\(summary["maskRefinementFrames"] ?? 0) maskMorphologyCloseApplied=\(summary["maskMorphologyCloseApplied"] ?? false) maskFeatherApplied=\(summary["maskFeatherApplied"] ?? false) maskTrimapApplied=\(summary["maskTrimapApplied"] ?? false) maskGuidedEdgeApplied=\(summary["maskGuidedEdgeApplied"] ?? false) liveTightAlphaR1Applied=\(summary["liveTightAlphaR1Applied"] ?? false) captureBundleRequested=\(summary["captureBundleRequested"] ?? false) captureBundleCaptured=\(summary["captureBundleCaptured"] ?? false) captureBundleAfterPublishedFrames=\(request.captureBundleAfterPublishedFrames)")
+        NSLog("IOS_ARKIT_LIVE_PREVIEW_NATIVE_STOP sessionId=\(sessionId) textureId=\(textureId) ownsTexture=\(ownsTexture) pass=\(summary["pass"] ?? false) frameCount=\(summary["frameCount"] ?? 0) maskCount=\(summary["maskCount"] ?? 0) publishedFrames=\(summary["publishedFrames"] ?? 0) droppedBusyFrames=\(summary["droppedBusyFrames"] ?? 0) skippedNoMaskFrames=\(summary["skippedNoMaskFrames"] ?? 0) throttledFrames=\(summary["throttledFrames"] ?? 0) droppedPoolExhaustedFrames=\(summary["droppedPoolExhaustedFrames"] ?? 0) effectiveFps=\(summary["effectiveFps"] ?? "null") avgMatteGenerationMs=\(summary["avgMatteGenerationMs"] ?? "null") p95MatteGenerationMs=\(summary["p95MatteGenerationMs"] ?? "null") avgCompositeMs=\(summary["avgCompositeMs"] ?? "null") p95CompositeMs=\(summary["p95CompositeMs"] ?? "null") failureReason=\(summary["failureReason"] ?? "null") liveMatteRefinement=\(summary["liveMatteRefinement"] ?? "null") maskRefinementFrames=\(summary["maskRefinementFrames"] ?? 0) maskMorphologyCloseApplied=\(summary["maskMorphologyCloseApplied"] ?? false) maskFeatherApplied=\(summary["maskFeatherApplied"] ?? false) maskTrimapApplied=\(summary["maskTrimapApplied"] ?? false) maskGuidedEdgeApplied=\(summary["maskGuidedEdgeApplied"] ?? false) liveTightAlphaR1Applied=\(summary["liveTightAlphaR1Applied"] ?? false) liveS4GuidedAlphaR1Applied=\(summary["liveS4GuidedAlphaR1Applied"] ?? false) liveS4GuidedAlphaApplied=\(summary["liveS4GuidedAlphaApplied"] ?? false) captureBundleRequested=\(summary["captureBundleRequested"] ?? false) captureBundleCaptured=\(summary["captureBundleCaptured"] ?? false) captureBundleAfterPublishedFrames=\(request.captureBundleAfterPublishedFrames)")
         return summary
     }
 
@@ -1013,6 +1023,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
             maskTrimapApplied          = refined.trimapApplied
             maskGuidedEdgeApplied      = refined.guidedEdgeApplied
             liveTightAlphaR1Applied    = refined.tightAlphaR1Applied
+            liveS4GuidedAlphaR1Applied = refined.s4GuidedAlphaR1Applied
+            liveS4GuidedAlphaApplied   = refined.s4GuidedAlphaApplied
             if !hasLoggedFirstMaskRefinement {
                 hasLoggedFirstMaskRefinement = true
                 logFirstRefinement = true
@@ -1026,7 +1038,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         if logFirstRefinement, let refined = refinement {
             // One-time proof that the active ARKit path blended a REFINED mask
             // (grep marker: IOS_ARKIT_LIVE_MASK_REFINEMENT_FIRST).
-            NSLog("\(VGARKitLiveGreenScreenPreviewCoordinator.maskRefinementFirstMarker) sessionId=\(sessionId) textureId=\(textureId) maskRefinementPath=\(VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsMaskRefinementPath) liveMatteRefinement=\(refined.liveMatteRefinementMode.rawValue) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskFeatherApplied=\(refined.featherApplied) maskTrimapApplied=\(refined.trimapApplied) maskGuidedEdgeApplied=\(refined.guidedEdgeApplied) liveTightAlphaR1Applied=\(refined.tightAlphaR1Applied) targetRect=\(VGARKitLiveGreenScreenPreviewCoordinator.describe(targetRect)) matte=\(matteTexture.width)x\(matteTexture.height) compositeMs=\(compositeMs)")
+            NSLog("\(VGARKitLiveGreenScreenPreviewCoordinator.maskRefinementFirstMarker) sessionId=\(sessionId) textureId=\(textureId) maskRefinementPath=\(VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsMaskRefinementPath) liveMatteRefinement=\(refined.liveMatteRefinementMode.rawValue) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskFeatherApplied=\(refined.featherApplied) maskTrimapApplied=\(refined.trimapApplied) maskGuidedEdgeApplied=\(refined.guidedEdgeApplied) liveTightAlphaR1Applied=\(refined.tightAlphaR1Applied) liveS4GuidedAlphaR1Applied=\(refined.s4GuidedAlphaR1Applied) liveS4GuidedAlphaApplied=\(refined.s4GuidedAlphaApplied) targetRect=\(VGARKitLiveGreenScreenPreviewCoordinator.describe(targetRect)) matte=\(matteTexture.width)x\(matteTexture.height) compositeMs=\(compositeMs)")
         }
 
         let registry = textureRegistry
@@ -1507,6 +1519,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
             "maskTrimapApplied": maskTrimapApplied,
             "maskGuidedEdgeApplied": maskGuidedEdgeApplied,
             "liveTightAlphaR1Applied": liveTightAlphaR1Applied,
+            "liveS4GuidedAlphaR1Applied": liveS4GuidedAlphaR1Applied,
+            "liveS4GuidedAlphaApplied": liveS4GuidedAlphaApplied,
             "width": request.canvasWidth,
             "height": request.canvasHeight,
             "targetFps": request.targetFps,

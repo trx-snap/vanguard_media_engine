@@ -59,21 +59,33 @@
 //                                                            "visionAccurate" | "litertSelfie"
 //                                                            (adapter path, RND);
 //                                                            non-string / unknown → INVALID_ARG)
-//                         iosLiveMatteRefinement?: String}  (optional; "s1" default = live
-//                                                            production pipeline, unchanged |
-//                                                            "tightAlphaR1" opt-in RND candidate
-//                                                            ("A tight alpha" offline A/B);
+//                         iosLiveMatteRefinement?: String}  (optional; missing / null →
+//                                                            "s4SoftAlphaR2", the production
+//                                                            live default (S1 stages + S4 soft
+//                                                            R2 refinement) | "s1" explicit
+//                                                            fallback = the previous S1-only
+//                                                            production path | "tightAlphaR1"
+//                                                            opt-in RND candidate ("A tight
+//                                                            alpha" offline A/B) |
+//                                                            "s4GuidedAlphaR1" opt-in S4 R1
+//                                                            guided-alpha RND live mode
+//                                                            (physical comparison only);
+//                                                            "s4TightAlphaR2" is lab-only and
+//                                                            NOT accepted here;
 //                                                            non-string / unknown → INVALID_ARG)
 //                      ← {iosFastMetalPrecision, iosSegmentationBackend, iosLiveMatteRefinement}
 //                        (stored for the next start)
 //   replay   → {inputDir: String, outputPath: String, label?: String}
 //            ← VGLiveGreenScreenReplayDiagnostics.replay result map
 //   matteLab → {inputDir: String, outputDir: String, label?: String,
-//               refinementMode?: String}   (optional; "s1" default = live pipeline |
+//               refinementMode?: String}   (optional; "s1" default = S1 base stages (lab
+//                                            default, independent of the live default) |
 //                                            "s4GuidedAlphaR1" | "s5GuidedFilterR1" RND
-//                                            candidates, lab only; non-string / unknown →
-//                                            INVALID_ARG. Never forwarded to replay or any
-//                                            live session.)
+//                                            candidates on this lab route (the live mode,
+//                                            s4SoftAlphaR2 by default, is selected only via
+//                                            iosLiveMatteRefinement above); non-string /
+//                                            unknown → INVALID_ARG. Never forwarded to
+//                                            replay or any live session.)
 //            ← VGLiveGreenScreenReplayDiagnostics.runMatteStageLab result map
 //   Replay/lab errors: INVALID_ARG for bad args and file collisions
 //   (VGLiveGreenScreenReplayError.isInvalidArgument); every other failure is
@@ -515,10 +527,13 @@ final class VGLiveGreenScreenMethodHandler {
     /// `segmentationBackends` ("auto" | "arkit" | the
     /// VGLiveGreenScreenSegmentationBackend* constants); any other type or
     /// value is rejected for the same reason.
-    /// `iosLiveMatteRefinement` is optional (missing / null → "s1") but, when
-    /// present, must be a string equal to one of
-    /// VGDuetPreviewCompositor.LiveMatteRefinementMode's raw values ("s1" |
-    /// "tightAlphaR1"); any other type or value is rejected for the same reason.
+    /// `iosLiveMatteRefinement` is optional (missing / null → "s4SoftAlphaR2", the
+    /// production live default, VGMatteRefinementPipeline.defaultLiveMatteRefinementMode)
+    /// but, when present, must be a string equal to one of
+    /// VGDuetPreviewCompositor.LiveMatteRefinementMode's raw values ("s4SoftAlphaR2"
+    /// default | "s1" explicit S1-only fallback | "tightAlphaR1" | "s4GuidedAlphaR1"
+    /// opt-in RND live modes; "s4TightAlphaR2" is lab-only and rejected); any other
+    /// type or value is rejected for the same reason.
     static func parseDiagnosticsOptions(_ args: [String: Any]?) throws -> VGLiveGreenScreenDiagnosticsOptions {
         guard let args = args else {
             throw ParseError(message: "missing arguments")
@@ -568,16 +583,19 @@ final class VGLiveGreenScreenMethodHandler {
     }
 
     /// Exact strings accepted for `iosLiveMatteRefinement` (single source of truth:
-    /// VGDuetPreviewCompositor.LiveMatteRefinementMode's raw values).
+    /// VGDuetPreviewCompositor.LiveMatteRefinementMode's raw values, currently "s1" |
+    /// "tightAlphaR1" | "s4GuidedAlphaR1" | "s4SoftAlphaR2"; never a hand-written list;
+    /// the lab-only "s4TightAlphaR2" is not a live case and is therefore rejected).
     static let liveMatteRefinementModes: [String] =
         VGDuetPreviewCompositor.LiveMatteRefinementMode.allCases.map { $0.rawValue }
 
-    /// Missing (nil / NSNull) defaults to `s1` (current production live behavior,
-    /// unchanged); a non-string or unknown value is rejected so an opt-in RND request
-    /// can never silently fall back to s1.
+    /// Missing (nil / NSNull) defaults to the production live default
+    /// (`VGMatteRefinementPipeline.defaultLiveMatteRefinementMode`, "s4SoftAlphaR2");
+    /// explicit "s1" selects the S1-only fallback. A non-string or unknown value is
+    /// rejected so an explicit request can never silently fall back to the default.
     static func parseLiveMatteRefinement(_ raw: Any?) throws -> String {
         guard let raw = raw, !(raw is NSNull) else {
-            return VGDuetPreviewCompositor.LiveMatteRefinementMode.s1.rawValue
+            return VGMatteRefinementPipeline.defaultLiveMatteRefinementMode.rawValue
         }
         guard let name = raw as? String else {
             throw ParseError(message: "iosLiveMatteRefinement must be a string")
@@ -622,9 +640,9 @@ final class VGLiveGreenScreenMethodHandler {
     static let refinementModes: [String] =
         VGDuetPreviewCompositor.GreenScreenRefinementMode.allCases.map { $0.rawValue }
 
-    /// Optional matte-lab `refinementMode`: missing / NSNull → `.s1` (the live
-    /// pipeline); a non-string or unknown value is rejected so an RND lab run can
-    /// never silently fall back to S1.
+    /// Optional matte-lab `refinementMode`: missing / NSNull → `.s1` (the S1 base
+    /// stages; this lab default is independent of the live default); a non-string or
+    /// unknown value is rejected so an RND lab run can never silently fall back to S1.
     static func parseRefinementMode(_ raw: Any?) throws -> VGDuetPreviewCompositor.GreenScreenRefinementMode {
         guard let raw = raw, !(raw is NSNull) else { return .s1 }
         guard let name = raw as? String else {

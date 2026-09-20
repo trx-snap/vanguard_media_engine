@@ -95,16 +95,32 @@
 //     note, never a failure). For a Vision backend the split spans mean:
 //     invoke = Vision request perform, inputCopy = 0, outputAccess =
 //     observation lookup, policy = mask copy (see `timingSemantics`).
-//     Live matte refinement (RND): the default run leaves the live matte
-//     refinement at its native production default (`s1`, the unchanged live
-//     pipeline): when `LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT` is absent or
-//     empty, no `iosLiveMatteRefinement` key is passed in
-//     `setLiveGreenScreenDiagnosticsOptions`. To opt into the "A tight alpha"
-//     offline A/B candidate, pass:
+//     Live matte refinement: the default run leaves the live matte
+//     refinement at its native production default (`s4SoftAlphaR2`: the S1
+//     stages plus the S4 soft R2 refinement): when
+//     `LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT` is absent or empty, no
+//     `iosLiveMatteRefinement` key is passed in
+//     `setLiveGreenScreenDiagnosticsOptions`, so the run proves the native
+//     default. To prove the explicit S1-only fallback (the previous default),
+//     pass:
+//         --dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=s1
+//     To opt into the "A tight alpha" offline A/B candidate, pass:
 //         --dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=tightAlphaR1
+//     To opt into the S4 guided-alpha R1 RND live mode (physical comparison
+//     only; never the default), pass:
+//         --dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=s4GuidedAlphaR1
+//     An explicit s4SoftAlphaR2 is accepted and identical to the default;
+//     the lab-only s4TightAlphaR2 is rejected natively
 //     (an unknown value is rejected natively with INVALID_ARG, which fails that
-//     step). The request is recorded as `requestedLiveMatteRefinement` ('s1'
-//     when no override is requested); the native echo `liveMatteRefinement`
+//     step). Whether the opt-in actually ran is visible only in the native
+//     logs (liveS4GuidedAlphaApplied (any S4-family mode) /
+//     liveS4GuidedAlphaR1Applied (R1 only) / liveTightAlphaR1Applied on
+//     IOS_ARKIT_LIVE_MASK_REFINEMENT_FIRST, IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST,
+//     and IOS_LIVE_GREENSCREEN_DIAGNOSTICS); this harness never asserts it.
+//     The request is recorded as `requestedLiveMatteRefinement`
+//     ('s4SoftAlphaR2', mirroring the native default, when no override is
+//     requested; `liveMatteRefinementOverrideRequested` tells the two
+//     apart); the native echo `liveMatteRefinement`
 //     from the diagnostics route is reported next to it as
 //     `nativeLiveMatteRefinement`. This option never changes the overlay/PIP
 //     phase, which stays independently opt-in and defaults to false.
@@ -220,11 +236,13 @@
 //         timingSemantics reported side by side for a LiteRT vs Apple Vision
 //         A/B on the same harness
 //       * live matte refinement native default proof (when no override is
-//         passed) proving the unconfigured native default stays "s1"; or
-//         explicit opt-in request (dart-define: tightAlphaR1) delivered
-//         through the same setLiveGreenScreenDiagnosticsOptions route before
-//         START, with the native echoed `liveMatteRefinement` reported side
-//         by side with the request
+//         passed) proving the unconfigured native default is "s4SoftAlphaR2"
+//         (S4 soft R2, the promoted production default); or explicit request
+//         (dart-define: s1 (the S1-only fallback) | tightAlphaR1 |
+//         s4GuidedAlphaR1 | s4SoftAlphaR2) delivered through the same
+//         setLiveGreenScreenDiagnosticsOptions route before START, with the
+//         native echoed `liveMatteRefinement` reported side by side with the
+//         request
 //   - Non-claims:
 //       * no automated pixel or matte quality proof; the image background
 //         step is proved by accepted route/lifecycle/acceptance plus a
@@ -248,7 +266,10 @@
 //       * no live matte refinement assertion or quality claim: the requested
 //         vs native `liveMatteRefinement` value is reported only, never used
 //         to fail the smoke; this option carries no visual quality proof for
-//         "tightAlphaR1" beyond route acceptance
+//         "s1", "tightAlphaR1", "s4GuidedAlphaR1", or "s4SoftAlphaR2" beyond
+//         route acceptance (s4SoftAlphaR2 is the production default and s1
+//         its explicit fallback; tightAlphaR1 and s4GuidedAlphaR1 are RND
+//         comparison modes, not production promotions)
 //       * no video background proof (solid/image background only; video
 //         backgrounds remain explicitly not proved/deferred)
 //       * no export proof
@@ -383,14 +404,20 @@ const String kSegmentationBackendReported =
         ? kSegmentationBackendRequested
         : 'nativeDefault';
 
-/// Which opt-in live matte refinement RND candidate the next start should use
-/// (see VGDuetPreviewCompositor.LiveMatteRefinementMode). When absent or empty
+/// Which live matte refinement mode the next start should use (see
+/// VGDuetPreviewCompositor.LiveMatteRefinementMode). When absent or empty
 /// (the default), no `iosLiveMatteRefinement` option is sent, letting the
-/// native production default ("s1", the unchanged live pipeline) run and be
-/// proven. Override with
+/// native production default ("s4SoftAlphaR2": S1 stages plus the S4 soft R2
+/// refinement) run and be proven. Override with
+/// `--dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=s1`
+/// to prove the explicit S1-only fallback (the previous default), or
 /// `--dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=tightAlphaR1`
-/// to opt into the "A tight alpha" offline A/B candidate. The native route
-/// rejects any other value with INVALID_ARG.
+/// to opt into the "A tight alpha" offline A/B candidate, or
+/// `--dart-define=LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT=s4GuidedAlphaR1`
+/// to opt into the S4 R1 guided-alpha RND live mode (physical comparison
+/// only; never the default). An explicit s4SoftAlphaR2 is accepted and
+/// identical to the default. The native route rejects any other value
+/// (including the lab-only s4TightAlphaR2) with INVALID_ARG.
 const String kLiveMatteRefinementRequested = String.fromEnvironment(
   'LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT',
   defaultValue: '',
@@ -398,17 +425,18 @@ const String kLiveMatteRefinementRequested = String.fromEnvironment(
 
 /// Whether an explicit live matte refinement override was requested via
 /// `LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT`. When false, the harness
-/// proves the unconfigured native production default ("s1").
+/// proves the unconfigured native production default ("s4SoftAlphaR2").
 const bool kLiveMatteRefinementOverrideRequested =
     kLiveMatteRefinementRequested != '';
 
 /// Live matte refinement name formatted for display, markers, and payload:
-/// 's1' when [kLiveMatteRefinementRequested] is empty, or the explicit
-/// requested value.
+/// 's4SoftAlphaR2' (mirroring the native production default) when
+/// [kLiveMatteRefinementRequested] is empty, or the explicit requested value.
+/// [kLiveMatteRefinementOverrideRequested] distinguishes the two.
 const String kLiveMatteRefinementReported =
     kLiveMatteRefinementOverrideRequested
         ? kLiveMatteRefinementRequested
-        : 's1';
+        : 's4SoftAlphaR2';
 
 /// Opt-in: run the explicit overlay-style transform phase (scale 0.45
 /// picture-in-picture over a green background) after the image background
@@ -1350,7 +1378,7 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
           'LiteRT matte latency/cadence telemetry captured on device through the diagnostic-only getLiveGreenScreenDiagnostics route and reported verbatim in the diagnostics map',
           'fast-Metal request (LIVE_GREENSCREEN_IOS_FAST_METAL dart-define) delivered through the diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, and the native requested/applied precision option, provider mode, and split inference spans (input copy / invoke / output access) reported side by side when present',
           'segmentation backend request (LIVE_GREENSCREEN_IOS_SEGMENTATION_BACKEND dart-define: auto | arkit | litert | visionFast | visionBalanced | visionAccurate | litertSelfie) delivered through the same diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, and the native echoed backend, requestedSegmentationBackend, segmentationBackendSelection, segmentationEngine, providerKind, providerMode, timingSemantics, modelName, mattePath, inputGeometry, split spans, and ARKit engine spans (avgMatteGenerationMs / avgCompositeMs / effectiveFps) reported side by side so the ARKit ARMatteGenerator engine (native default when supported), the LiteRT/Metal multiclass path, the small selfie model on the same runtime, and Apple Vision person segmentation can be A/B compared on the same harness',
-          'live matte refinement native default proof (when no override is passed) proving the unconfigured native default stays "s1"; or explicit opt-in request (LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT dart-define: tightAlphaR1) delivered through the same diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, with the native echoed liveMatteRefinement reported side by side with the request',
+          'live matte refinement native default proof (when no override is passed) proving the unconfigured native default is "s4SoftAlphaR2" (S4 soft R2, the promoted production default); or explicit request (LIVE_GREENSCREEN_IOS_LIVE_MATTE_REFINEMENT dart-define: s1 (the S1-only fallback) | tightAlphaR1 | s4GuidedAlphaR1 | s4SoftAlphaR2) delivered through the same diagnostic-only setLiveGreenScreenDiagnosticsOptions route before START, with the native echoed liveMatteRefinement reported side by side with the request',
         ],
         'nonClaims': <String>[
           'no automated pixel or matte quality proof; the image background step is proved by accepted route/lifecycle/acceptance plus a bounded observation window, not by visual classification; the keying proof gates prove a real person matte was produced and consumed, not that it was accurate',
@@ -1358,7 +1386,7 @@ class _IosLiveGreenScreenPublicApiPhysicalSmokeAppState
           'no latency threshold assertion: timing values (avg/max/min spans, cadence, first-mask latency) are reported, never used to fail the smoke; only the presence gates (sampleCount > 0, maskPublishCount > 0) and the bounded readiness wait are asserted',
           'no fast-Metal assertion: a requested-but-not-applied precision option or absent split fields are reported (fastMetalApplied / latencySplitFieldsPresent), never used to fail the smoke',
           'no segmentation backend assertion: a requested-but-not-applied backend is reported (segmentationBackendApplied false/null), never used to fail the smoke; Vision split spans are request/observation/copy spans, not TFLite tensor spans (see timingSemantics)',
-          'no live matte refinement assertion or quality claim: the requested vs native liveMatteRefinement value is reported only, never used to fail the smoke; tightAlphaR1 carries no visual quality proof beyond route acceptance',
+          'no live matte refinement assertion or quality claim: the requested vs native liveMatteRefinement value is reported only, never used to fail the smoke; s1, tightAlphaR1, s4GuidedAlphaR1, and s4SoftAlphaR2 carry no visual quality proof beyond route acceptance (s4SoftAlphaR2 is the production live default and s1 its explicit S1-only fallback; tightAlphaR1 and s4GuidedAlphaR1 are RND comparison modes, not production promotions; whether an S4-family mode applied is visible only in native logs as liveS4GuidedAlphaApplied, with liveS4GuidedAlphaR1Applied true for R1 only)',
           'no video background proof (solid/image background only; video backgrounds remain explicitly not proved/deferred)',
           'no export proof',
           'no recording proof',

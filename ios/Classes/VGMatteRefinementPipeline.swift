@@ -2,15 +2,18 @@
 // Caller-agnostic green-screen matte refinement pipeline.
 //
 // Owns only mask refinement policy and CoreImage filter graph construction:
-// the production S1 stage order, the diagnostic-only S4/S5 RND candidates,
-// and the opt-in live "tightAlphaR1" post-pass. It does NOT own a CIContext,
+// the S1 stage order, the S4/S5 candidates (S5 lab-only; the S4 soft-alpha R2
+// variant is the production live default and S4 R1 an opt-in live RND mode),
+// and the opt-in live "tightAlphaR1" post-pass.
+// It does NOT own a CIContext,
 // pixel buffer pools, camera, ARKit, Vision, render loops, sessions,
 // publishing, or background compositing — every caller (the Duet compositor's
 // composite(), the ARKit ARMatteGenerator live engine, and the offline replay
 // / matte-stage diagnostics lab) renders the CIImage recipes this pipeline
 // returns through its own CIContext.
 //
-// Production mask refinement pipeline (S1, default):
+// S1 base mask refinement pipeline (the explicit `s1` live fallback; also the first four
+// stages of every other live mode, including the production default Soft R2):
 // The aspect-filled L8 mask is refined at output (canvas) scale before a caller's own
 // CIBlendWithMask:
 //   morphology close -> feather -> trimap -> guided edge preserve
@@ -33,9 +36,10 @@
 // every caller uses) is a thin view over it, so production and diagnostics share one filter
 // pipeline and cannot drift.
 //
-// S4 camera-guided alpha RND candidate (diagnostic only, NOT live):
+// S4 camera-guided alpha (lab; the soft R2 variant is the production live default and
+// R1 an opt-in live RND mode):
 // greenScreenMatteStages(..., refinementMode: .s4GuidedAlphaR1) additionally runs
-// applyGreenScreenS4GuidedAlphaR1 on the S1 final mask. It builds a narrow unknown band
+// applyGreenScreenS4GuidedAlpha (with the R1 parameter set) on the S1 final mask. It builds a narrow unknown band
 // from the S1 matte (morphological gradient dilate − erode, softened, smoothstepped), a
 // camera luminance edge-confidence map (CIColorMatrix luma → CIEdges → blur → smoothstep),
 // and two in-band alpha candidates (an edge-aligned steepened S1 alpha and a locally
@@ -43,7 +47,21 @@
 // outside the band the S1 mask is returned untouched. Every step is a bounded stock
 // CoreImage filter (no CPU pixel loops, no global blur of the output, no S1 constant
 // changes) and any unavailable/degenerate step fails open to the S1 final mask. The live
-// path never requests S4; the default mode is .s1.
+// path requests S4 in the default LiveMatteRefinementMode.s4SoftAlphaR2 (soft R2 set)
+// and in the opt-in .s4GuidedAlphaR1 (R1 set); the explicit .s1 fallback never requests it.
+//
+// S4-family R2 variants: .s4SoftAlphaR2 and .s4TightAlphaR2 run the exact same
+// applyGreenScreenS4GuidedAlpha recipe as .s4GuidedAlphaR1, each with its own
+// GreenScreenS4Parameters set (a wider/softer band and softer in-band alpha, or a
+// narrower band and steeper in-band alpha, respectively). They populate the same S4 result
+// fields and finalMask and fail open to the S1 final mask identically. Both are reachable
+// through the offline matte-lab GreenScreenRefinementMode; additionally, .s4SoftAlphaR2 is
+// the production live default (LiveMatteRefinementMode.s4SoftAlphaR2 =
+// defaultLiveMatteRefinementMode, see below; promoted after physical A/B proof against
+// S1), while .s4TightAlphaR2 stays lab-only with no
+// LiveMatteRefinementMode counterpart, so the live path never requests it. The R1 parameter
+// values are the unchanged greenScreenS4* constants, so .s4GuidedAlphaR1 output is
+// byte-for-byte as before.
 //
 // S5 "guided filter R1" RND candidate (diagnostic only, NOT live):
 // greenScreenMatteStages(..., refinementMode: .s5GuidedFilterR1) additionally runs
@@ -56,14 +74,41 @@
 // morphological-gradient band construction family as S4, S5-scoped constants); outside the
 // band the S1 mask is returned untouched. Every step is a bounded stock CoreImage filter
 // (no CPU pixel loops, no custom kernel needed) and any unavailable/degenerate step fails
-// open to the S1 final mask. The live path never requests S5; the default mode is .s1.
+// open to the S1 final mask. The live path never requests S5 in any live mode.
+//
+// Live matte refinement modes (LiveMatteRefinementMode; live-selectable):
+// Distinct from the GreenScreenRefinementMode above (which gates the offline matte-lab /
+// replay diagnostics), LiveMatteRefinementMode gates a second, independent knob a caller's
+// live path may select (only through a diagnostic-only route before session start).
+// The production live default is defaultLiveMatteRefinementMode (.s4SoftAlphaR2, see
+// below): sending no option yields Soft R2. Explicit "s1" is the retained fallback and
+// routes to exactly the previous S1-only production path, byte-for-byte unchanged.
+//
+// "s4GuidedAlphaR1" live matte refinement (opt-in RND live mode; NOT the production
+// default): promotes the S4 candidate above from lab-only to an opt-in live mode so it can
+// be compared physically against S1 on device. When a pipeline instance opts into
+// .s4GuidedAlphaR1, refineLiveGreenScreenMask requests greenScreenMatteStages with
+// GreenScreenRefinementMode.s4GuidedAlphaR1 and returns stages.finalMask
+// (postS4GuidedAlpha); on S4 fail-open that is exactly the S1 final mask, unchanged, with
+// s4GuidedAlphaR1Applied == false. The tightAlphaR1 post-pass never runs in this mode. No
+// S1 constant or stage body changes.
+//
+// "s4SoftAlphaR2" live matte refinement (the production live default,
+// defaultLiveMatteRefinementMode): the S4-family "soft alpha R2" variant (the lab-winning
+// candidate in same-frame ARKit replay boundary-step metrics, then physically A/B proven
+// against S1 on device at equal effective fps with no degraded events). When a pipeline
+// instance runs .s4SoftAlphaR2 (the default with no init argument, or explicitly
+// requested), refineLiveGreenScreenMask requests greenScreenMatteStages with
+// GreenScreenRefinementMode.s4SoftAlphaR2 and returns stages.finalMask
+// (postS4GuidedAlpha); on S4 fail-open that is exactly the S1 final mask, unchanged, with
+// s4GuidedAlphaApplied == false. s4GuidedAlphaR1Applied is never true in this mode (it is
+// R1-only, kept for backwards compatibility); the general s4GuidedAlphaApplied flag is
+// true for any live S4-family mode whose S4 stage applied. The tightAlphaR1 post-pass
+// never runs in this mode. No S1 constant, S4 R1 constant, or stage body changes; the
+// Objective-C initializer uses this same default.
 //
 // "tightAlphaR1" live matte refinement (opt-in; live-selectable, NOT lab-only):
-// Distinct from the diagnostic-only GreenScreenRefinementMode above (which gates only the
-// offline matte-lab / replay diagnostics), LiveMatteRefinementMode gates a second,
-// independent knob a caller's live path may opt into (selected only through a
-// diagnostic-only route before session start; default live behavior is always exactly .s1,
-// current production pipeline, byte-for-byte unchanged). When a pipeline instance opts into
+// When a pipeline instance opts into
 // .tightAlphaR1, refineLiveGreenScreenMask runs applyLiveTightAlphaR1 on the S1 final mask
 // (postGuidedEdge) only — never on the raw segmentation mask: a smoothstep remap
 // (approximately 0.28/0.90) tightens the alpha transition, then a small final
@@ -77,7 +122,7 @@
 // can emit objective mask-edge metrics for it next to S1/S4/S5. It reuses the live
 // implementation and constants verbatim, so lab evidence describes exactly what the live
 // opt-in would render; it does not change LiveMatteRefinementMode, its default, or any
-// live caller. The live path never requests it; the default mode is .s1.
+// live caller. The live path never requests it.
 //
 // Fail-open behavior:
 // Each refinement stage is fail-open to its input: if a required CoreImage filter is
@@ -88,35 +133,121 @@
 // LiveMatteRefinementMode, GreenScreenMatteStages, LiveGreenScreenMaskRefinement) to this
 // pipeline's nested types, and delegates its greenScreenMatteStages(...) and
 // refineLiveGreenScreenMaskForExternalEngine(...) methods to a VGMatteRefinementPipeline
-// instance it owns, so existing diagnostics call sites compile unchanged.
+// instance it owns, so existing diagnostics call sites compile unchanged. The compositor
+// is generic (shared by Duet and green screen), so its own `init` default is the neutral
+// .s1 path and does NOT track defaultLiveMatteRefinementMode; green-screen callers pass
+// that constant explicitly when they want Soft R2.
+//
+// Objective-C bridge (VGGreenScreenFilterNode.m, the UMF camera graph green screen node):
+// The class is an NSObject subclass exported through the generated
+// vanguard_media_engine-Swift.h header. Objective-C callers instantiate it with plain
+// `init` (always the production default live mode, defaultLiveMatteRefinementMode =
+// .s4SoftAlphaR2; no other live mode is selectable from
+// Objective-C) and call `refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:`,
+// which runs the exact `refineLiveGreenScreenMask(aspectFilledMask:in:guidedBy:)` live path
+// and wraps its result in VGMatteRefinementLiveResult (mask + the four S1 applied flags).
+// The S1 production constants are also exported (read-only class properties) so an
+// Objective-C caller's logs print the pipeline's own values and cannot drift from them.
+// Nothing else — the diagnostic stage tap, S4/S5, tightAlphaR1, and every nested
+// Swift type — is visible to Objective-C.
 
 import CoreGraphics
 import CoreImage
 import Foundation
 
-final class VGMatteRefinementPipeline {
+/// Objective-C view of `VGMatteRefinementPipeline.LiveGreenScreenMaskRefinement`:
+/// the refined live mask plus the four S1 per-stage applied flags. Immutable; built only
+/// by `VGMatteRefinementPipeline.refineLiveGreenScreenMaskBridged(aspectFilledMask:in:guidedBy:)`
+/// (the Objective-C bridge method, selector
+/// `refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:`). Swift callers keep using the struct directly.
+@objc(VGMatteRefinementLiveResult)
+public final class VGMatteRefinementLiveResult: NSObject {
+    /// Refined mask (the instance-mode final mask: Soft R2 by default, which fails open to
+    /// the S1 final mask), a lazy CoreImage recipe cropped to the rect it was refined in;
+    /// fails open stage by stage to the raw input, never nil.
+    @objc public let mask: CIImage
+    @objc public let morphologyCloseApplied: Bool
+    @objc public let featherApplied: Bool
+    @objc public let trimapApplied: Bool
+    @objc public let guidedEdgeApplied: Bool
+
+    init(_ refinement: VGMatteRefinementPipeline.LiveGreenScreenMaskRefinement) {
+        self.mask                   = refinement.mask
+        self.morphologyCloseApplied = refinement.morphologyCloseApplied
+        self.featherApplied         = refinement.featherApplied
+        self.trimapApplied          = refinement.trimapApplied
+        self.guidedEdgeApplied      = refinement.guidedEdgeApplied
+        super.init()
+    }
+}
+
+@objc(VGMatteRefinementPipeline)
+public final class VGMatteRefinementPipeline: NSObject {
+
+    /// Production default live matte refinement mode: the single source of truth for
+    /// every green-screen-owned entry point that does not receive an explicit mode (this
+    /// class's `init` default, the Objective-C `init()` used by the independent
+    /// green-screen filter node, `VGARKitLiveGreenScreenPreviewCoordinator.StartRequest.init`,
+    /// the method channel's missing-option default, and the replay diagnostics, which
+    /// pass it explicitly). The generic `VGDuetPreviewCompositor.init` deliberately does
+    /// NOT default to this constant: its default is the neutral `.s1`, so Duet never
+    /// inherits green-screen tuning; the live green-screen session coordinator forwards
+    /// the session mode explicitly. `.s4SoftAlphaR2` was promoted from the
+    /// diagnostic-only opt-in after the offline lab tournament (best boundary-step
+    /// metric) and a physical same-harness A/B against S1 on device (equal effective fps,
+    /// no degraded events). `.s1` stays available as the explicit fallback and still
+    /// routes to the exact previous S1-only path; `.s4TightAlphaR2` has no live
+    /// counterpart and is never selectable here.
+    static let defaultLiveMatteRefinementMode: LiveMatteRefinementMode = .s4SoftAlphaR2
 
     /// Live-selectable matte refinement mode for this pipeline instance (see
-    /// `LiveMatteRefinementMode`). Defaults to `.s1` (current production behavior,
-    /// unchanged when no argument is passed to `init`); never mutated for the lifetime of
-    /// the instance.
+    /// `LiveMatteRefinementMode`). Defaults to `defaultLiveMatteRefinementMode`
+    /// (`.s4SoftAlphaR2`) when no argument is passed to `init`; never mutated for the
+    /// lifetime of the instance.
     let liveMatteRefinementMode: LiveMatteRefinementMode
 
-    init(liveMatteRefinementMode: LiveMatteRefinementMode = .s1) {
+    init(liveMatteRefinementMode: LiveMatteRefinementMode
+             = VGMatteRefinementPipeline.defaultLiveMatteRefinementMode) {
         self.liveMatteRefinementMode = liveMatteRefinementMode
+        super.init()
+    }
+
+    /// Objective-C entry point (`[[VGMatteRefinementPipeline alloc] init]`): always the
+    /// production default live mode (`defaultLiveMatteRefinementMode`, `.s4SoftAlphaR2`),
+    /// so Objective-C callers track the promoted default rather than a stale mode. Swift
+    /// callers that want a different live mode use `init(liveMatteRefinementMode:)`; mode
+    /// selection is deliberately not reachable from Objective-C.
+    @objc public override convenience init() {
+        self.init(liveMatteRefinementMode: VGMatteRefinementPipeline.defaultLiveMatteRefinementMode)
     }
 
     // MARK: - Matte refinement stage tap
 
-    /// Diagnostic-only matte refinement modes selectable through
-    /// `greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:)`.
-    /// A caller's live composite path always uses `.s1`; no other mode is reachable from
-    /// production code. Raw values are the exact strings accepted at the method channel.
+    /// Matte refinement modes selectable through
+    /// `greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:)` (the offline
+    /// matte-lab / replay diagnostics tap). A caller's live composite path requests
+    /// `.s4SoftAlphaR2` by default (`defaultLiveMatteRefinementMode`), `.s1` in the
+    /// explicit s1 fallback, or `.s4GuidedAlphaR1` when the pipeline instance opted into
+    /// `LiveMatteRefinementMode.s4GuidedAlphaR1` (see
+    /// `refineLiveGreenScreenMask`). `.s4TightAlphaR2`, `.s5GuidedFilterR1`, and
+    /// `.tightAlphaR1` here are never requested live. Raw values are the exact strings
+    /// accepted at the method channel.
     enum GreenScreenRefinementMode: String, CaseIterable {
-        /// Production pipeline (default): morphology close → feather → trimap → guided edge.
+        /// S1 base stages: morphology close → feather → trimap → guided edge (the explicit
+        /// live `s1` fallback; every other mode runs these first).
         case s1 = "s1"
-        /// RND candidate: S1 final mask plus band-limited camera-guided alpha refinement.
+        /// RND candidate: S1 final mask plus band-limited camera-guided alpha refinement
+        /// (lab, and the opt-in live `LiveMatteRefinementMode.s4GuidedAlphaR1` mode).
         case s4GuidedAlphaR1 = "s4GuidedAlphaR1"
+        /// S4-family variant (lab, and the production live default
+        /// `LiveMatteRefinementMode.s4SoftAlphaR2`): the same S4 guided-alpha recipe
+        /// with the "soft alpha R2" parameter set (wider, softer band; softer in-band
+        /// alpha). See `greenScreenS4SoftAlphaR2Parameters`.
+        case s4SoftAlphaR2 = "s4SoftAlphaR2"
+        /// Lab-only S4-family variant (NOT live; no `LiveMatteRefinementMode` counterpart):
+        /// the same S4 guided-alpha recipe with the "tight alpha R2" parameter set
+        /// (narrower band; steeper in-band alpha). See `greenScreenS4TightAlphaR2Parameters`.
+        case s4TightAlphaR2 = "s4TightAlphaR2"
         /// RND candidate: S1 final mask plus band-limited local-linear guided-filter
         /// refinement (approximate He et al. guided filter) using the camera frame as guide.
         case s5GuidedFilterR1 = "s5GuidedFilterR1"
@@ -127,19 +258,37 @@ final class VGMatteRefinementPipeline {
         case tightAlphaR1 = "tightAlphaR1"
     }
 
-    /// Live-selectable matte refinement mode, opt-in only through a diagnostic-only route
+    /// Live-selectable matte refinement mode, selected only through a diagnostic-only route
     /// before session start; never part of the public Dart API. Distinct from
-    /// `GreenScreenRefinementMode`, which gates only the offline matte-lab / replay
-    /// diagnostics — the two enums are independent so lab-only S4/S5 candidates can never be
-    /// reached live, and this live-only mode never reaches the lab. Raw values are the exact
-    /// strings accepted at the method channel.
+    /// `GreenScreenRefinementMode`, which gates the offline matte-lab / replay diagnostics —
+    /// the two enums stay independent: only `.s4GuidedAlphaR1` and `.s4SoftAlphaR2` map
+    /// onto their lab counterparts (the S5 lab candidate and the lab-only
+    /// `.s4TightAlphaR2` can never be reached live), and `.tightAlphaR1` reaches the
+    /// lab only through its explicit `GreenScreenRefinementMode.tightAlphaR1` parity case.
+    /// `defaultLiveMatteRefinementMode` (`.s4SoftAlphaR2`) runs whenever no option is
+    /// sent; `.s1` is the explicit fallback. Raw values are the exact strings
+    /// accepted at the method channel (`allCases` is the parser's source of truth).
     enum LiveMatteRefinementMode: String, CaseIterable {
-        /// Production default (default with no init argument): unchanged S1 final mask.
+        /// Explicit fallback (the previous production default): the unchanged S1 final
+        /// mask, byte-for-byte the S1-only path.
         case s1 = "s1"
         /// Opt-in RND candidate ("A tight alpha" offline A/B): bounded CoreImage
         /// post-pass over the S1 final mask (smoothstep remap + small final blur). See
         /// `applyLiveTightAlphaR1`.
         case tightAlphaR1 = "tightAlphaR1"
+        /// Opt-in RND live mode (physical S1 vs S4 comparison; NOT the production
+        /// default): the S4 camera-guided alpha candidate run live on top of the unchanged
+        /// S1 stages, i.e. `greenScreenMatteStages(..., refinementMode: .s4GuidedAlphaR1)`
+        /// `finalMask`. Fails open to the S1 final mask; never runs tightAlphaR1. See
+        /// `applyGreenScreenS4GuidedAlpha` (R1 parameter set).
+        case s4GuidedAlphaR1 = "s4GuidedAlphaR1"
+        /// Production live default (`defaultLiveMatteRefinementMode`; the lab-winning S4
+        /// "soft alpha R2" variant, physically A/B proven against S1): the S4 camera-guided
+        /// alpha refinement with the R2 soft parameter set run live on top of the unchanged
+        /// S1 stages, i.e. `greenScreenMatteStages(..., refinementMode: .s4SoftAlphaR2)`
+        /// `finalMask`. Fails open to the S1 final mask; never runs tightAlphaR1. See
+        /// `applyGreenScreenS4GuidedAlpha` (`greenScreenS4SoftAlphaR2Parameters`).
+        case s4SoftAlphaR2 = "s4SoftAlphaR2"
     }
 
     /// Every intermediate image of the production matte refinement pipeline plus the
@@ -147,8 +296,10 @@ final class VGMatteRefinementPipeline {
     /// `greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:)`.
     /// Images are lazy CoreImage recipes cropped to the camera rect; the caller renders
     /// them through its own CIContext. `postGuidedEdge` is exactly the mask a caller's live
-    /// composite path feeds to CIBlendWithMask. The S4 fields are populated only when
-    /// `.s4GuidedAlphaR1` was requested; otherwise they alias `postGuidedEdge`.
+    /// composite path feeds to CIBlendWithMask in the explicit `.s1` live fallback (the
+    /// default `.s4SoftAlphaR2` and opt-in `.s4GuidedAlphaR1` live modes feed `finalMask`). The S4 fields
+    /// are populated only when an S4-family mode (`.s4GuidedAlphaR1`, `.s4SoftAlphaR2`, or
+    /// the lab-only `.s4TightAlphaR2`) was requested; otherwise they alias `postGuidedEdge`.
     struct GreenScreenMatteStages {
         /// The aspect-filled mask exactly as passed in (input to stage 1).
         let aspectFilledInput: CIImage
@@ -166,18 +317,21 @@ final class VGMatteRefinementPipeline {
         let trimapApplied: Bool
         let guidedEdgeApplied: Bool
 
-        /// Mode these stages were requested with. The live path always requests `.s1`.
+        /// Mode these stages were requested with. The live path requests `.s4SoftAlphaR2`
+        /// (default), `.s1` (explicit fallback), or `.s4GuidedAlphaR1` (opt-in live RND
+        /// mode), never `.s4TightAlphaR2` / `.s5GuidedFilterR1` / `.tightAlphaR1`.
         let refinementMode: GreenScreenRefinementMode
-        /// S4 RND candidate output: the band-limited camera-guided refinement of
-        /// `postGuidedEdge` when `refinementMode == .s4GuidedAlphaR1` and every S4 filter
-        /// step succeeded; otherwise exactly `postGuidedEdge` (fail-open to S1).
+        /// S4-family output: the band-limited camera-guided refinement of `postGuidedEdge`
+        /// when `refinementMode` is an S4-family mode (`.s4GuidedAlphaR1`, `.s4SoftAlphaR2`,
+        /// `.s4TightAlphaR2`; each with its own parameter set) and every S4 filter step
+        /// succeeded; otherwise exactly `postGuidedEdge` (fail-open to S1).
         let postS4GuidedAlpha: CIImage
         /// S4 refinement band weight (0 = S1 kept, 1 = fully S4-refined), only when S4 was
         /// applied; nil otherwise. Diagnostic tap so the lab can show where S4 acted.
         let s4RefinementBand: CIImage?
-        /// True only when `.s4GuidedAlphaR1` was requested and fully applied.
+        /// True only when an S4-family mode was requested and fully applied.
         let s4GuidedAlphaApplied: Bool
-        /// Non-nil only when `.s4GuidedAlphaR1` was requested but failed open to S1;
+        /// Non-nil only when an S4-family mode was requested but failed open to S1;
         /// names the first unavailable/degenerate step.
         let s4GuidedAlphaFailOpenReason: String?
 
@@ -206,14 +360,18 @@ final class VGMatteRefinementPipeline {
         let tightAlphaR1FailOpenReason: String?
 
         /// The final mask selected by `refinementMode`: `postGuidedEdge` for `.s1`,
-        /// `postS4GuidedAlpha` for `.s4GuidedAlphaR1`, `postS5GuidedFilter` for
+        /// `postS4GuidedAlpha` for every S4-family mode (`.s4GuidedAlphaR1`,
+        /// `.s4SoftAlphaR2`, `.s4TightAlphaR2`), `postS5GuidedFilter` for
         /// `.s5GuidedFilterR1`, `postTightAlphaR1` for `.tightAlphaR1` (each identical to
         /// `postGuidedEdge` on fail-open). A caller's live composite path reads
-        /// `postGuidedEdge` directly.
+        /// `postGuidedEdge` directly in the `.s1` fallback and `finalMask` in the
+        /// `.s4SoftAlphaR2` (default) / `.s4GuidedAlphaR1` live modes.
         var finalMask: CIImage {
             switch refinementMode {
             case .s1:               return postGuidedEdge
-            case .s4GuidedAlphaR1:  return postS4GuidedAlpha
+            case .s4GuidedAlphaR1,
+                 .s4SoftAlphaR2,
+                 .s4TightAlphaR2:   return postS4GuidedAlpha
             case .s5GuidedFilterR1: return postS5GuidedFilter
             case .tightAlphaR1:     return postTightAlphaR1
             }
@@ -226,19 +384,35 @@ final class VGMatteRefinementPipeline {
     /// blends and renders it through its own CIContext. The applied flags are the exact
     /// per-stage flags the live composite path logs for its own first blend.
     struct LiveGreenScreenMaskRefinement {
-        /// Refined mask (S1 final mask, plus tight-alpha R1 when opted in); fails open
-        /// stage by stage to the raw input, never nil.
+        /// Refined mask (S1 final mask; plus tight-alpha R1, or an S4-family guided-alpha
+        /// candidate, when opted in); fails open stage by stage to the raw input, never nil.
         let mask: CIImage
-        /// Mode this pipeline instance runs live (`.s1` default or `.tightAlphaR1`).
+        /// Mode this pipeline instance runs live (`.s4SoftAlphaR2` default, `.s1`
+        /// fallback, `.tightAlphaR1`, or `.s4GuidedAlphaR1`).
         let liveMatteRefinementMode: LiveMatteRefinementMode
         let morphologyCloseApplied: Bool
         let featherApplied: Bool
         let trimapApplied: Bool
         let guidedEdgeApplied: Bool
+        /// True only in `.tightAlphaR1` mode when the post-pass fully applied.
         let tightAlphaR1Applied: Bool
+        /// True only in `.s4GuidedAlphaR1` mode when every S4 step applied; false on S4
+        /// fail-open to S1 and in every other mode (including `.s4SoftAlphaR2`). Kept for
+        /// backwards compatibility of existing logs/summaries; logged as
+        /// liveS4GuidedAlphaR1Applied by live callers.
+        let s4GuidedAlphaR1Applied: Bool
+        /// True in any live S4-family mode (`.s4GuidedAlphaR1`, `.s4SoftAlphaR2`) when
+        /// every S4 step applied (mirrors `GreenScreenMatteStages.s4GuidedAlphaApplied`);
+        /// false on S4 fail-open to S1 and in every non-S4 mode. Logged as
+        /// liveS4GuidedAlphaApplied by live callers.
+        let s4GuidedAlphaApplied: Bool
     }
 
     // MARK: - S1 production constants
+    //
+    // Exported to Objective-C as read-only class properties (`@objc public static let`)
+    // so VGGreenScreenFilterNode.m logs the pipeline's own S1 values instead of a
+    // duplicated copy; values and Swift call sites are unchanged.
 
     /// Production mask refinement: morphological close (CIMorphologyMaximum dilate then
     /// CIMorphologyMinimum erode, radius 1.0; r1b) applied before feathering to fill tiny
@@ -246,8 +420,8 @@ final class VGMatteRefinementPipeline {
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints
     /// maskMorphologyCloseEnabled / maskMorphologyCloseApplied /
     /// maskMorphologyCloseRadius.
-    static let greenScreenMaskMorphologyCloseEnabled: Bool = true
-    static let greenScreenMaskMorphologyCloseRadius: CGFloat = 1.0
+    @objc public static let greenScreenMaskMorphologyCloseEnabled: Bool = true
+    @objc public static let greenScreenMaskMorphologyCloseRadius: CGFloat = 1.0
 
     /// Production mask refinement: feather radius, in canvas pixels, applied as a
     /// CIGaussianBlur `inputRadius` to soften the closed mask at output scale before
@@ -256,7 +430,7 @@ final class VGMatteRefinementPipeline {
     /// steps on the same captured frame, together with the 0.10 / 0.90 trimap band below).
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints this value as
     /// maskFeatherRadius.
-    static let greenScreenMaskFeatherRadius: CGFloat = 4.0
+    @objc public static let greenScreenMaskFeatherRadius: CGFloat = 4.0
 
     /// Production mask refinement: trimap / alpha-curve pass remapping mask luminance m
     /// through smoothstep(greenScreenTrimapLow, greenScreenTrimapHigh, m) to produce
@@ -264,9 +438,9 @@ final class VGMatteRefinementPipeline {
     /// 0.10 / 0.90, S1; promoted from 0.14 / 0.86 together with the 4.0 px feather above).
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints
     /// maskTrimapEnabled / maskTrimapApplied / maskTrimapLow / maskTrimapHigh.
-    static let greenScreenTrimapEnabled: Bool = true
-    static let greenScreenTrimapLow:  CGFloat = 0.10
-    static let greenScreenTrimapHigh: CGFloat = 0.90
+    @objc public static let greenScreenTrimapEnabled: Bool = true
+    @objc public static let greenScreenTrimapLow:  CGFloat = 0.10
+    @objc public static let greenScreenTrimapHigh: CGFloat = 0.90
 
     /// Production mask refinement: guided-edge-preservation pass restoring the
     /// pre-trimap feathered mask wherever the camera frame has strong edges
@@ -275,13 +449,16 @@ final class VGMatteRefinementPipeline {
     /// The IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST log prints maskGuidedEdgeEnabled /
     /// maskGuidedEdgeApplied / maskGuidedEdgeIntensity / maskGuidedEdgeBlurRadius /
     /// maskGuidedEdgeLow / maskGuidedEdgeHigh.
-    static let greenScreenGuidedEdgeEnabled: Bool = true
-    static let greenScreenGuidedEdgeIntensity: CGFloat = 2.0
-    static let greenScreenGuidedEdgeBlurRadius: CGFloat = 1.5
-    static let greenScreenGuidedEdgeLow: CGFloat = 0.08
-    static let greenScreenGuidedEdgeHigh: CGFloat = 0.34
+    @objc public static let greenScreenGuidedEdgeEnabled: Bool = true
+    @objc public static let greenScreenGuidedEdgeIntensity: CGFloat = 2.0
+    @objc public static let greenScreenGuidedEdgeBlurRadius: CGFloat = 1.5
+    @objc public static let greenScreenGuidedEdgeLow: CGFloat = 0.08
+    @objc public static let greenScreenGuidedEdgeHigh: CGFloat = 0.34
 
-    // MARK: - S4 guided-alpha RND constants (diagnostic only; never read by the live path)
+    // MARK: - S4 guided-alpha constants (the R1 set: lab, and the opt-in live
+    // `.s4GuidedAlphaR1` mode; never read in the `.s1` live fallback). The R2
+    // parameter sets (Soft R2: lab and the production live default; Tight R2: lab only)
+    // follow below and never touch these values.
 
     /// S4 band extraction: morphological gradient radius (dilate − erode of the S1 mask),
     /// in canvas px. Defines how wide the refinable unknown band around the matte edge is.
@@ -301,8 +478,76 @@ final class VGMatteRefinementPipeline {
     private static let greenScreenS4SoftAlphaRadius: CGFloat = 2.0
     private static let greenScreenS4SnapLow: CGFloat = 0.20
     private static let greenScreenS4SnapHigh: CGFloat = 0.80
-    /// Rec.709 luma weights used to derive the S4 camera guide luminance.
+    /// Rec.709 luma weights used to derive the S4 camera guide luminance (shared by every
+    /// S4-family parameter set; not a tunable).
     private static let greenScreenS4LumaWeights = CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0)
+
+    /// One S4-family parameter set: every tunable `applyGreenScreenS4GuidedAlpha` reads.
+    /// The R1 set is built from the `greenScreenS4*` constants above (values unchanged);
+    /// the lab-only R2 variants carry their own literals.
+    private struct GreenScreenS4Parameters {
+        /// Band extraction: morphological gradient radius (dilate − erode), canvas px.
+        let bandRadius: CGFloat
+        /// Band softening blur radius, canvas px.
+        let bandBlurRadius: CGFloat
+        /// Band weight smoothstep thresholds over the softened morphological gradient.
+        let bandLow: CGFloat
+        let bandHigh: CGFloat
+        /// Camera luminance edge confidence: CIEdges intensity, blur radius, smoothstep.
+        let edgeIntensity: CGFloat
+        let edgeBlurRadius: CGFloat
+        let edgeLow: CGFloat
+        let edgeHigh: CGFloat
+        /// In-band candidates: soft-alpha blur radius (flat camera) and the edge-aligned
+        /// steepening smoothstep (strong camera edge).
+        let softAlphaRadius: CGFloat
+        let snapLow: CGFloat
+        let snapHigh: CGFloat
+    }
+
+    /// `.s4GuidedAlphaR1` parameter set: exactly the `greenScreenS4*` constants above, so
+    /// the lab and opt-in live R1 mode are unchanged by the R2 variants.
+    private static let greenScreenS4GuidedAlphaR1Parameters = GreenScreenS4Parameters(
+        bandRadius:      VGMatteRefinementPipeline.greenScreenS4BandRadius,
+        bandBlurRadius:  VGMatteRefinementPipeline.greenScreenS4BandBlurRadius,
+        bandLow:         VGMatteRefinementPipeline.greenScreenS4BandLow,
+        bandHigh:        VGMatteRefinementPipeline.greenScreenS4BandHigh,
+        edgeIntensity:   VGMatteRefinementPipeline.greenScreenS4EdgeIntensity,
+        edgeBlurRadius:  VGMatteRefinementPipeline.greenScreenS4EdgeBlurRadius,
+        edgeLow:         VGMatteRefinementPipeline.greenScreenS4EdgeLow,
+        edgeHigh:        VGMatteRefinementPipeline.greenScreenS4EdgeHigh,
+        softAlphaRadius: VGMatteRefinementPipeline.greenScreenS4SoftAlphaRadius,
+        snapLow:         VGMatteRefinementPipeline.greenScreenS4SnapLow,
+        snapHigh:        VGMatteRefinementPipeline.greenScreenS4SnapHigh)
+    /// `.s4SoftAlphaR2` (lab, and the production live default
+    /// `LiveMatteRefinementMode.s4SoftAlphaR2`): wider, softer band and softer in-band
+    /// alpha than R1.
+    private static let greenScreenS4SoftAlphaR2Parameters = GreenScreenS4Parameters(
+        bandRadius:      2.0,
+        bandBlurRadius:  1.25,
+        bandLow:         0.08,
+        bandHigh:        0.55,
+        edgeIntensity:   2.0,
+        edgeBlurRadius:  1.25,
+        edgeLow:         0.12,
+        edgeHigh:        0.45,
+        softAlphaRadius: 2.5,
+        snapLow:         0.16,
+        snapHigh:        0.84)
+    /// `.s4TightAlphaR2` (lab only, never live): narrower band and steeper in-band alpha
+    /// than R1.
+    private static let greenScreenS4TightAlphaR2Parameters = GreenScreenS4Parameters(
+        bandRadius:      1.5,
+        bandBlurRadius:  0.75,
+        bandLow:         0.12,
+        bandHigh:        0.48,
+        edgeIntensity:   2.8,
+        edgeBlurRadius:  0.75,
+        edgeLow:         0.10,
+        edgeHigh:        0.36,
+        softAlphaRadius: 1.5,
+        snapLow:         0.24,
+        snapHigh:        0.78)
 
     // MARK: - S5 guided-filter RND constants (diagnostic only; never read by the live path)
 
@@ -355,10 +600,15 @@ final class VGMatteRefinementPipeline {
     ///   - guide: camera frame already aspect-filled into `rect`; used as an edge guide
     ///            for stage 4 (and the S4 candidate) only, never composited into the
     ///            returned masks.
-    ///   - refinementMode: `.s1` (default; the four stages above, exactly what a caller's
-    ///            live path uses), `.s4GuidedAlphaR1`, or `.s5GuidedFilterR1`
-    ///            (diagnostic-only RND candidates run on top of the unchanged S1 stages;
-    ///            see `applyGreenScreenS4GuidedAlphaR1` / `applyGreenScreenS5GuidedFilterR1`),
+    ///   - refinementMode: `.s1` (default here; the four stages above, exactly what a
+    ///            caller's live path runs in the explicit s1 fallback), `.s4GuidedAlphaR1`
+    ///            (RND candidate run on top of the unchanged S1 stages; lab, and the opt-in
+    ///            live `LiveMatteRefinementMode.s4GuidedAlphaR1` mode), `.s4SoftAlphaR2`
+    ///            (the same recipe with the soft R2 parameter set; lab, and the production
+    ///            live default `LiveMatteRefinementMode.s4SoftAlphaR2`),
+    ///            `.s4TightAlphaR2` (lab-only S4-family variant; never live), or `.s5GuidedFilterR1`
+    ///            (diagnostic-only RND candidate on top of the unchanged S1 stages;
+    ///            see `applyGreenScreenS4GuidedAlpha` / `applyGreenScreenS5GuidedFilterR1`),
     ///            or `.tightAlphaR1` (offline lab evaluation of the live opt-in
     ///            `applyLiveTightAlphaR1` post-pass on the unchanged S1 final mask).
     func greenScreenMatteStages(aspectFilledMask mask: CIImage,
@@ -384,7 +634,22 @@ final class VGMatteRefinementPipeline {
             s5 = s5NotRequested
             tightAlpha = tightAlphaNotRequested
         case .s4GuidedAlphaR1:
-            s4 = applyGreenScreenS4GuidedAlphaR1(base: guided.mask, guide: guide, in: rect)
+            // Lab, and the opt-in live RND mode: the R1 parameter set, values unchanged.
+            s4 = applyGreenScreenS4GuidedAlpha(base: guided.mask, guide: guide, in: rect,
+                                               parameters: VGMatteRefinementPipeline.greenScreenS4GuidedAlphaR1Parameters)
+            s5 = s5NotRequested
+            tightAlpha = tightAlphaNotRequested
+        case .s4SoftAlphaR2:
+            // Lab, and the diagnostic-only opt-in live mode: the same S4 recipe with the
+            // "soft alpha R2" set.
+            s4 = applyGreenScreenS4GuidedAlpha(base: guided.mask, guide: guide, in: rect,
+                                               parameters: VGMatteRefinementPipeline.greenScreenS4SoftAlphaR2Parameters)
+            s5 = s5NotRequested
+            tightAlpha = tightAlphaNotRequested
+        case .s4TightAlphaR2:
+            // Lab only: the same S4 recipe with the "tight alpha R2" set. Never requested live.
+            s4 = applyGreenScreenS4GuidedAlpha(base: guided.mask, guide: guide, in: rect,
+                                               parameters: VGMatteRefinementPipeline.greenScreenS4TightAlphaR2Parameters)
             s5 = s5NotRequested
             tightAlpha = tightAlphaNotRequested
         case .s5GuidedFilterR1:
@@ -422,13 +687,25 @@ final class VGMatteRefinementPipeline {
     }
 
     /// Live mask refinement: refines an already aspect-filled green-screen mask at output
-    /// scale through `greenScreenMatteStages` (S1 default mode; never S4/S5 — those are
-    /// lab-only) and then, only when this instance opted into `.tightAlphaR1` via
-    /// `liveMatteRefinementMode`, runs `applyLiveTightAlphaR1` on the S1 final mask
-    /// (`postGuidedEdge`). The default `.s1` mode returns `postGuidedEdge` unchanged. Shared
-    /// verbatim by every live caller (the Duet compositor's composite() and the ARKit
-    /// engine), so there is exactly one implementation of the live refinement and callers
-    /// cannot drift.
+    /// scale through `greenScreenMatteStages`, selected by this instance's
+    /// `liveMatteRefinementMode`:
+    ///   - `.s1` (explicit fallback; the previous default): S1 stages; returns
+    ///     `postGuidedEdge` unchanged.
+    ///   - `.tightAlphaR1`: S1 stages, then `applyLiveTightAlphaR1` on the S1 final mask
+    ///     (`postGuidedEdge`).
+    ///   - `.s4GuidedAlphaR1` (opt-in RND live mode): S1 stages plus the S4 guided-alpha
+    ///     candidate (`refinementMode: .s4GuidedAlphaR1`); returns `stages.finalMask`
+    ///     (`postS4GuidedAlpha`), which is exactly the S1 final mask when S4 fails open.
+    ///     tightAlphaR1 never runs in this mode.
+    ///   - `.s4SoftAlphaR2` (production live default, `defaultLiveMatteRefinementMode`):
+    ///     S1 stages plus the S4
+    ///     guided-alpha candidate with the soft R2 parameter set
+    ///     (`refinementMode: .s4SoftAlphaR2`); returns `stages.finalMask`
+    ///     (`postS4GuidedAlpha`) with the same fail-open semantics as R1. tightAlphaR1
+    ///     never runs in this mode.
+    /// S5 and the lab-only `.s4TightAlphaR2` are never requested live. Shared verbatim by every live caller (the Duet
+    /// compositor's composite() and the ARKit engine), so there is exactly one
+    /// implementation of the live refinement and callers cannot drift.
     ///
     /// - Parameters:
     ///   - mask:  single-channel matte already oriented and aspect-filled into `rect`
@@ -440,13 +717,41 @@ final class VGMatteRefinementPipeline {
     func refineLiveGreenScreenMask(aspectFilledMask mask: CIImage,
                                    in rect: CGRect,
                                    guidedBy guide: CIImage) -> LiveGreenScreenMaskRefinement {
-        let stages = greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide)
-        var finalMask = stages.postGuidedEdge
+        let stages: GreenScreenMatteStages
+        let finalMask: CIImage
         var tightAlphaR1Applied = false
-        if liveMatteRefinementMode == .tightAlphaR1 {
+        var s4GuidedAlphaR1Applied = false
+        var s4GuidedAlphaApplied = false
+        switch liveMatteRefinementMode {
+        case .s1:
+            // Explicit s1 fallback (the previous production default): S1 final mask,
+            // byte-for-byte as before.
+            stages = greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide)
+            finalMask = stages.postGuidedEdge
+        case .tightAlphaR1:
+            // S1 final mask, then the opt-in tight-alpha post-pass (fails open to S1).
+            stages = greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide)
             let tightAlpha = applyLiveTightAlphaR1(stages.postGuidedEdge, in: rect)
             finalMask = tightAlpha.mask
             tightAlphaR1Applied = tightAlpha.applied
+        case .s4GuidedAlphaR1:
+            // Opt-in RND live mode: the S4 candidate on top of the unchanged S1 stages.
+            // `finalMask` is `postS4GuidedAlpha`, which the stage tap already fails open to
+            // `postGuidedEdge` (S1) when any S4 step is unavailable/degenerate. No tightAlpha.
+            stages = greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide,
+                                            refinementMode: .s4GuidedAlphaR1)
+            finalMask = stages.finalMask
+            s4GuidedAlphaR1Applied = stages.s4GuidedAlphaApplied
+            s4GuidedAlphaApplied = stages.s4GuidedAlphaApplied
+        case .s4SoftAlphaR2:
+            // Production live default: the S4 soft R2 refinement on top of the
+            // unchanged S1 stages. Same fail-open as R1: `finalMask` is `postS4GuidedAlpha`,
+            // which the stage tap already fails open to `postGuidedEdge` (S1) when any S4
+            // step is unavailable/degenerate. No tightAlpha. The R1-only flag stays false.
+            stages = greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide,
+                                            refinementMode: .s4SoftAlphaR2)
+            finalMask = stages.finalMask
+            s4GuidedAlphaApplied = stages.s4GuidedAlphaApplied
         }
         return LiveGreenScreenMaskRefinement(mask: finalMask,
                                              liveMatteRefinementMode: liveMatteRefinementMode,
@@ -454,7 +759,27 @@ final class VGMatteRefinementPipeline {
                                              featherApplied: stages.featherApplied,
                                              trimapApplied: stages.trimapApplied,
                                              guidedEdgeApplied: stages.guidedEdgeApplied,
-                                             tightAlphaR1Applied: tightAlphaR1Applied)
+                                             tightAlphaR1Applied: tightAlphaR1Applied,
+                                             s4GuidedAlphaR1Applied: s4GuidedAlphaR1Applied,
+                                             s4GuidedAlphaApplied: s4GuidedAlphaApplied)
+    }
+
+    /// Objective-C bridge over `refineLiveGreenScreenMask(aspectFilledMask:in:guidedBy:)`
+    /// (selector `refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:`). Runs
+    /// exactly that live path — the same instance mode, stages, constants, and per-stage
+    /// fail-open — and returns its mask plus the four S1 applied flags as a
+    /// `VGMatteRefinementLiveResult`. Never returns nil: every stage fails open to its
+    /// input, so the worst case is the unmodified `mask`. An Objective-C instance always
+    /// runs `defaultLiveMatteRefinementMode` (see `init()`); the `tightAlphaR1Applied`,
+    /// `s4GuidedAlphaR1Applied`, and `s4GuidedAlphaApplied` flags are not exposed to
+    /// Objective-C (only the mask and the four S1 flags are).
+    @objc(refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:)
+    public func refineLiveGreenScreenMaskBridged(aspectFilledMask mask: CIImage,
+                                                 in rect: CGRect,
+                                                 guidedBy guide: CIImage) -> VGMatteRefinementLiveResult {
+        return VGMatteRefinementLiveResult(refineLiveGreenScreenMask(aspectFilledMask: mask,
+                                                                     in: rect,
+                                                                     guidedBy: guide))
     }
 
     // MARK: - S1 stage implementations
@@ -677,7 +1002,8 @@ final class VGMatteRefinementPipeline {
         return (blended.cropped(to: rect), true)
     }
 
-    // MARK: - S4 guided-alpha RND candidate (diagnostic only)
+    // MARK: - S4 guided-alpha (lab `.s4GuidedAlphaR1` / `.s4SoftAlphaR2` /
+    // `.s4TightAlphaR2`; live `.s4SoftAlphaR2` (default) and opt-in `.s4GuidedAlphaR1` only)
 
     /// Result of the S4 candidate: `mask` is the refined mask (or `base` on fail-open),
     /// `band` the 0..1 refinement band weight when applied.
@@ -688,41 +1014,53 @@ final class VGMatteRefinementPipeline {
         let failOpenReason: String?
     }
 
-    /// S4 "guided alpha R1": band-limited, camera-guided refinement of the S1 final mask.
+    /// S4 "guided alpha": band-limited, camera-guided refinement of the S1 final mask,
+    /// shared by every S4-family mode. `parameters` selects the variant:
+    /// `greenScreenS4GuidedAlphaR1Parameters` (`.s4GuidedAlphaR1`; lab, and opt-in live),
+    /// `greenScreenS4SoftAlphaR2Parameters` (`.s4SoftAlphaR2`; lab, and the production
+    /// live default), or the lab-only `greenScreenS4TightAlphaR2Parameters`.
+    /// The filter graph is identical for every set; only the numbers differ.
     ///
-    /// Pipeline (all stock CoreImage filters, evaluated only over the camera `rect`):
+    /// Pipeline (all stock CoreImage filters, evaluated only over the camera `rect`; the
+    /// values in parentheses are the R1 set):
     ///   1. Unknown band from the S1 matte: morphological gradient (CIMorphologyMaximum −
-    ///      CIMorphologyMinimum via CIDifferenceBlendMode, radius 2.0) → CIGaussianBlur 1.0
-    ///      → smoothstep(0.10, 0.50). ≈1 on the matte edge, 0 in solid regions.
+    ///      CIMorphologyMinimum via CIDifferenceBlendMode, `bandRadius` 2.0) →
+    ///      CIGaussianBlur `bandBlurRadius` 1.0 → smoothstep(`bandLow` 0.10, `bandHigh`
+    ///      0.50). ≈1 on the matte edge, 0 in solid regions.
     ///   2. Camera edge confidence from `guide` luminance (Rec.709 CIColorMatrix) → CIEdges
-    ///      intensity 2.5 → CIGaussianBlur 1.0 → smoothstep(0.10, 0.40).
-    ///   3. In-band candidates from the S1 mask: `snapped` = smoothstep(0.20, 0.80, base)
-    ///      (edge-aligned, steeper transition) and `soft` = CIGaussianBlur(base, 2.0).
+    ///      `edgeIntensity` 2.5 → CIGaussianBlur `edgeBlurRadius` 1.0 →
+    ///      smoothstep(`edgeLow` 0.10, `edgeHigh` 0.40).
+    ///   3. In-band candidates from the S1 mask: `snapped` = smoothstep(`snapLow` 0.20,
+    ///      `snapHigh` 0.80, base) (edge-aligned, steeper transition) and `soft` =
+    ///      CIGaussianBlur(base, `softAlphaRadius` 2.0).
     ///   4. `guidedInBand` = CIBlendWithMask(fg: snapped, bg: soft, mask: edgeConfidence):
     ///      steeper where the camera has a real edge, softer where it is flat.
     ///   5. `refined` = CIBlendWithMask(fg: guidedInBand, bg: base, mask: band): only band
     ///      pixels change; everything else is the S1 mask bit-for-bit.
     ///
     /// Fail-open: any nil filter, degenerate rect/extent, or inconsistent constant returns
-    /// `base` unchanged with `applied == false` and a reason naming the step. Never called
-    /// by the live path; S1 constants and stage bodies are untouched.
-    private func applyGreenScreenS4GuidedAlphaR1(base: CIImage,
-                                                 guide: CIImage,
-                                                 in rect: CGRect) -> GreenScreenS4Result {
+    /// `base` unchanged with `applied == false` and a reason naming the step. Called by the
+    /// live path in `LiveMatteRefinementMode.s4SoftAlphaR2` (soft R2 set; the production
+    /// default) and when the pipeline instance opted into `.s4GuidedAlphaR1` (R1 set) —
+    /// never in the explicit `.s1` fallback; S1 constants and stage bodies are untouched.
+    private func applyGreenScreenS4GuidedAlpha(base: CIImage,
+                                               guide: CIImage,
+                                               in rect: CGRect,
+                                               parameters: GreenScreenS4Parameters) -> GreenScreenS4Result {
         func failOpen(_ reason: String) -> GreenScreenS4Result {
             return GreenScreenS4Result(mask: base, band: nil, applied: false, failOpenReason: reason)
         }
 
-        let bandRadius = VGMatteRefinementPipeline.greenScreenS4BandRadius
-        let bandBlur   = VGMatteRefinementPipeline.greenScreenS4BandBlurRadius
-        let bandLow    = VGMatteRefinementPipeline.greenScreenS4BandLow
-        let bandHigh   = VGMatteRefinementPipeline.greenScreenS4BandHigh
-        let edgeBlur   = VGMatteRefinementPipeline.greenScreenS4EdgeBlurRadius
-        let edgeLow    = VGMatteRefinementPipeline.greenScreenS4EdgeLow
-        let edgeHigh   = VGMatteRefinementPipeline.greenScreenS4EdgeHigh
-        let softRadius = VGMatteRefinementPipeline.greenScreenS4SoftAlphaRadius
-        let snapLow    = VGMatteRefinementPipeline.greenScreenS4SnapLow
-        let snapHigh   = VGMatteRefinementPipeline.greenScreenS4SnapHigh
+        let bandRadius = parameters.bandRadius
+        let bandBlur   = parameters.bandBlurRadius
+        let bandLow    = parameters.bandLow
+        let bandHigh   = parameters.bandHigh
+        let edgeBlur   = parameters.edgeBlurRadius
+        let edgeLow    = parameters.edgeLow
+        let edgeHigh   = parameters.edgeHigh
+        let softRadius = parameters.softAlphaRadius
+        let snapLow    = parameters.snapLow
+        let snapHigh   = parameters.snapHigh
 
         guard bandRadius > 0, bandBlur > 0, bandHigh > bandLow,
               edgeBlur > 0, edgeHigh > edgeLow,
@@ -782,7 +1120,7 @@ final class VGMatteRefinementPipeline {
         }
         let edgesParams: [String: Any] = [
             "inputImage":     luma,
-            "inputIntensity": VGMatteRefinementPipeline.greenScreenS4EdgeIntensity,
+            "inputIntensity": parameters.edgeIntensity,
         ]
         guard let edges = CIFilter(name: "CIEdges", parameters: edgesParams)?.outputImage?.cropped(to: rect) else {
             return failOpen("edge_detect_unavailable")
@@ -1118,7 +1456,8 @@ final class VGMatteRefinementPipeline {
 
     /// Opt-in live matte refinement candidate ("A tight alpha" from the offline A/B lab).
     /// Runs live only when `liveMatteRefinementMode == .tightAlphaR1` (selected through a
-    /// diagnostic-only route before session start); the default `.s1` mode never calls
+    /// diagnostic-only route before session start); no other live mode (including the
+    /// default `.s4SoftAlphaR2` and the `.s1` fallback) calls
     /// this function. The offline stage tap also calls it, unchanged, when
     /// `GreenScreenRefinementMode.tightAlphaR1` is requested so lab metrics describe the
     /// same recipe and constants the live opt-in renders.

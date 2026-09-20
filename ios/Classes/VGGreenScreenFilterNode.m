@@ -18,6 +18,17 @@
 #import <os/lock.h>               // telemetry lock (os_unfair_lock)
 #import <stdatomic.h>
 
+// Swift bridge: VGMatteRefinementPipeline + VGMatteRefinementLiveResult
+// (VGMatteRefinementPipeline.swift) own live matte refinement. The
+// framework build exports them through the generated Swift header; the quoted
+// fallback covers a static-library integration, where the generated header is
+// not copied into a framework Headers directory.
+#if __has_include(<vanguard_media_engine/vanguard_media_engine-Swift.h>)
+#import <vanguard_media_engine/vanguard_media_engine-Swift.h>
+#else
+#import "vanguard_media_engine-Swift.h"
+#endif
+
 // ─── VGGreenScreenFilterNode (UMF camera graph green screen, iOS-first MVP) ──
 //
 // Contract, scope and explicit non-claims are documented in
@@ -32,13 +43,16 @@
 //      mirrored the frame). Error / no observation / wrong format → passthrough.
 //   4. CIImage wrap of the input (foreground) and the OneComponent8 matte; the
 //      matte is scaled (non-uniform) to the frame extent.
-//   5. S1 matte refinement over the scaled matte — the proven production order
-//      and constants of VGDuetPreviewCompositor, ported verbatim:
-//        morphology close (r 1.0) → feather (r 4.0) → trimap smoothstep
-//        (0.10/0.90) → guided edge preserve (CIEdges 2.0, blur 1.5,
-//        smoothstep 0.08/0.34, guided by the camera frame itself).
-//      Each stage fails open to its input mask and reports an applied flag.
-//      S4/S5/tightAlphaR1 lab candidates are deliberately NOT ported.
+//   5. Live matte refinement over the scaled matte through the node-owned
+//      VGMatteRefinementPipeline (Swift; the single production implementation
+//      shared with every other live green-screen caller). The node owns one
+//      VGMatteRefinementPipeline created with Objective-C init, tracking
+//      VGMatteRefinementPipeline.defaultLiveMatteRefinementMode (current
+//      production default is .s4SoftAlphaR2). Explicit S1 fallback still exists
+//      elsewhere, but this Objective-C node does not select modes directly.
+//      Each stage fails open to its input mask inside the pipeline and reports
+//      an applied flag; a nil bridge result (never expected) fails the frame
+//      open with reason matte_refinement_failed.
 //   6. Output stage, selected by outputMode (fixed at init):
 //        solidColor — CIBlendWithMask: inputImage = foreground,
 //                     inputBackgroundImage = solid colour, inputMaskImage =
@@ -148,171 +162,22 @@ static BOOL _VGGSFNRenderStraightAlpha(id<MTLDevice> device, CIImage *keyed,
     return YES;
 }
 
-// ─── S1 matte refinement (ported from VGDuetPreviewCompositor, production) ───
+// ─── Live matte refinement (VGMatteRefinementPipeline, Swift; production) ───
 //
-// Stage order and constants are the proven live green-screen S1 pipeline:
-//   morphology close → feather → trimap → guided edge preserve → CIBlendWithMask
-// Every stage is a pure CIImage recipe (lazy; the GPU work lands in the single
-// render at the end of processBuffer:). Each stage returns its refined mask and
-// sets *applied = YES, or returns its INPUT mask unchanged with *applied = NO
-// (fail open) when a filter is unavailable, produces nil, or the inputs are
-// degenerate. Nothing here allocates buffers, touches the pool or the device,
-// or retains anything beyond the call. S4/S5/tightAlphaR1 are NOT ported.
-
-static const CGFloat kVGGSFNMorphologyCloseRadius = 1.0;   // dilate then erode
-static const CGFloat kVGGSFNFeatherRadius         = 4.0;   // CIGaussianBlur px
-static const CGFloat kVGGSFNTrimapLow             = 0.10;  // smoothstep(low, high)
-static const CGFloat kVGGSFNTrimapHigh            = 0.90;
-static const CGFloat kVGGSFNGuidedEdgeIntensity   = 2.0;   // CIEdges
-static const CGFloat kVGGSFNGuidedEdgeBlurRadius  = 1.5;   // CIGaussianBlur px
-static const CGFloat kVGGSFNGuidedEdgeLow         = 0.08;  // smoothstep(low, high)
-static const CGFloat kVGGSFNGuidedEdgeHigh        = 0.34;
-
-// smoothstep(low, high, m) on R, G, B (alpha identity), cropped to `rect`:
-//   CIColorMatrix (linear ramp t = (m - low) / (high - low))
-//   → CIColorClamp (t ∈ [0, 1]) → CIColorPolynomial (3t² − 2t³).
-// Returns nil on any filter failure so callers fail open to their input.
-static CIImage * _Nullable _VGGSFNSmoothstep(CIImage *image, CGFloat low, CGFloat high, CGRect rect) {
-    if (!image || high <= low) return nil;
-    const CGFloat scale = 1.0 / (high - low);
-    const CGFloat bias  = -low * scale;
-
-    CIFilter *ramp = [CIFilter filterWithName:@"CIColorMatrix"];
-    if (!ramp) return nil;
-    [ramp setValue:image forKey:kCIInputImageKey];
-    [ramp setValue:[CIVector vectorWithX:scale Y:0     Z:0     W:0] forKey:@"inputRVector"];
-    [ramp setValue:[CIVector vectorWithX:0     Y:scale Z:0     W:0] forKey:@"inputGVector"];
-    [ramp setValue:[CIVector vectorWithX:0     Y:0     Z:scale W:0] forKey:@"inputBVector"];
-    [ramp setValue:[CIVector vectorWithX:0     Y:0     Z:0     W:1] forKey:@"inputAVector"];
-    [ramp setValue:[CIVector vectorWithX:bias  Y:bias  Z:bias  W:0] forKey:@"inputBiasVector"];
-    CIImage *ramped = ramp.outputImage;
-    if (!ramped) return nil;
-
-    CIFilter *clamp = [CIFilter filterWithName:@"CIColorClamp"];
-    if (!clamp) return nil;
-    [clamp setValue:ramped forKey:kCIInputImageKey];
-    [clamp setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:0] forKey:@"inputMinComponents"];
-    [clamp setValue:[CIVector vectorWithX:1 Y:1 Z:1 W:1] forKey:@"inputMaxComponents"];
-    CIImage *clamped = clamp.outputImage;
-    if (!clamped) return nil;
-
-    CIFilter *curve = [CIFilter filterWithName:@"CIColorPolynomial"];
-    if (!curve) return nil;
-    CIVector *smoothstep = [CIVector vectorWithX:0 Y:0 Z:3 W:-2];   // 0 + 0t + 3t² − 2t³
-    [curve setValue:clamped    forKey:kCIInputImageKey];
-    [curve setValue:smoothstep forKey:@"inputRedCoefficients"];
-    [curve setValue:smoothstep forKey:@"inputGreenCoefficients"];
-    [curve setValue:smoothstep forKey:@"inputBlueCoefficients"];
-    [curve setValue:[CIVector vectorWithX:0 Y:1 Z:0 W:0] forKey:@"inputAlphaCoefficients"];
-    CIImage *curved = curve.outputImage;
-    if (!curved) return nil;
-    return [curved imageByCroppingToRect:rect];
-}
-
-// Stage 1 — morphological close: CIMorphologyMaximum (dilate) then
-// CIMorphologyMinimum (erode), radius 1.0. Clamped to extent before dilate; the
-// dilated image still carries the infinite extent, and feeding that into the
-// second morphology filter crashed on-device (EXC_BAD_ACCESS), so it is cropped
-// to a finite radius-padded rect before erode (NOT re-clamped), then cropped
-// back to `rect`. Fills pinholes and stair-step bites before the feather.
-static CIImage *_VGGSFNMorphologyClose(CIImage *mask, CGRect rect, BOOL *applied) {
-    *applied = NO;
-    const CGFloat radius = kVGGSFNMorphologyCloseRadius;
-    if (radius <= 0 || CGRectIsEmpty(rect) || CGRectIsEmpty(mask.extent)) return mask;
-
-    CIFilter *dilate = [CIFilter filterWithName:@"CIMorphologyMaximum"];
-    if (!dilate) return mask;
-    [dilate setValue:[mask imageByClampingToExtent] forKey:kCIInputImageKey];
-    [dilate setValue:@(radius) forKey:kCIInputRadiusKey];
-    CIImage *dilated = dilate.outputImage;
-    if (!dilated) return mask;
-
-    const CGFloat pad = MAX(radius * 2, 2);
-    CIImage *boundedDilated = [dilated imageByCroppingToRect:CGRectInset(rect, -pad, -pad)];
-
-    CIFilter *erode = [CIFilter filterWithName:@"CIMorphologyMinimum"];
-    if (!erode) return mask;
-    [erode setValue:boundedDilated forKey:kCIInputImageKey];
-    [erode setValue:@(radius) forKey:kCIInputRadiusKey];
-    CIImage *eroded = erode.outputImage;
-    if (!eroded) return mask;
-
-    *applied = YES;
-    return [eroded imageByCroppingToRect:rect];
-}
-
-// Stage 2 — feather: CIGaussianBlur radius 4.0, clamped to extent before the
-// blur (no edge darkening) and cropped back to `rect`.
-static CIImage *_VGGSFNFeather(CIImage *mask, CGRect rect, BOOL *applied) {
-    *applied = NO;
-    const CGFloat radius = kVGGSFNFeatherRadius;
-    if (radius <= 0 || CGRectIsEmpty(rect) || CGRectIsEmpty(mask.extent)) return mask;
-
-    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
-    if (!blur) return mask;
-    [blur setValue:[mask imageByClampingToExtent] forKey:kCIInputImageKey];
-    [blur setValue:@(radius) forKey:kCIInputRadiusKey];
-    CIImage *blurred = blur.outputImage;
-    if (!blurred) return mask;
-
-    *applied = YES;
-    return [blurred imageByCroppingToRect:rect];
-}
-
-// Stage 3 — trimap: smoothstep(0.10, 0.90, m). Values ≤ low become solid
-// background, ≥ high solid foreground, the band between stays soft.
-static CIImage *_VGGSFNTrimap(CIImage *mask, CGRect rect, BOOL *applied) {
-    *applied = NO;
-    if (CGRectIsEmpty(rect) || CGRectIsEmpty(mask.extent)) return mask;
-    CIImage *curved = _VGGSFNSmoothstep(mask, kVGGSFNTrimapLow, kVGGSFNTrimapHigh, rect);
-    if (!curved) return mask;
-    *applied = YES;
-    return curved;
-}
-
-// Stage 4 — guided edge preserve: restores the pre-trimap `feathered` mask over
-// the `trimapped` mask wherever the camera frame (`guide`) has a strong edge,
-// keeping thin detail (hair, fingers) while flat regions stay cleanly keyed.
-// Edge confidence = CIEdges(guide ∩ rect, 2.0) → CIGaussianBlur 1.5 →
-// smoothstep(0.08, 0.34); composite = CIBlendWithMask(feathered over trimapped
-// using that confidence). Fails open to `trimapped`.
-static CIImage *_VGGSFNGuidedEdgePreserve(CIImage *trimapped, CIImage *feathered,
-                                          CIImage *guide, CGRect rect, BOOL *applied) {
-    *applied = NO;
-    if (CGRectIsEmpty(rect) || CGRectIsEmpty(trimapped.extent) ||
-        CGRectIsEmpty(feathered.extent) || CGRectIsEmpty(guide.extent)) {
-        return trimapped;
-    }
-
-    CIFilter *edges = [CIFilter filterWithName:@"CIEdges"];
-    if (!edges) return trimapped;
-    [edges setValue:[guide imageByCroppingToRect:rect] forKey:kCIInputImageKey];
-    [edges setValue:@(kVGGSFNGuidedEdgeIntensity) forKey:kCIInputIntensityKey];
-    CIImage *edgeImage = edges.outputImage;
-    if (!edgeImage) return trimapped;
-
-    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
-    if (!blur) return trimapped;
-    [blur setValue:[edgeImage imageByClampingToExtent] forKey:kCIInputImageKey];
-    [blur setValue:@(kVGGSFNGuidedEdgeBlurRadius) forKey:kCIInputRadiusKey];
-    CIImage *blurredEdges = blur.outputImage;
-    if (!blurredEdges) return trimapped;
-
-    CIImage *edgeConfidence = _VGGSFNSmoothstep(blurredEdges, kVGGSFNGuidedEdgeLow,
-                                                kVGGSFNGuidedEdgeHigh, rect);
-    if (!edgeConfidence) return trimapped;
-
-    CIFilter *blend = [CIFilter filterWithName:@"CIBlendWithMask"];
-    if (!blend) return trimapped;
-    [blend setValue:feathered      forKey:kCIInputImageKey];
-    [blend setValue:trimapped      forKey:kCIInputBackgroundImageKey];
-    [blend setValue:edgeConfidence forKey:kCIInputMaskImageKey];
-    CIImage *blended = blend.outputImage;
-    if (!blended) return trimapped;
-
-    *applied = YES;
-    return [blended imageByCroppingToRect:rect];
-}
+// The node owns one VGMatteRefinementPipeline created with Objective-C init
+// ([[VGMatteRefinementPipeline alloc] init]), which tracks
+// VGMatteRefinementPipeline.defaultLiveMatteRefinementMode (current production
+// default is .s4SoftAlphaR2). Explicit S1 fallback still exists elsewhere, but
+// this Objective-C node does not select modes directly. The node shares the
+// same live refinement implementation as other green-screen callers in this
+// package, refining every frame's matte through its Objective-C bridge,
+// refineLiveGreenScreenMaskWithAspectFilledMask:inRect:guidedBy:.
+// The bridge returns a VGMatteRefinementLiveResult: the refined mask (a lazy
+// CIImage recipe; the GPU work still lands in the single render at the end of
+// processBuffer:) plus the four S1 applied flags that feed telemetry and logs.
+// The pipeline is stateless per frame and thread-confined to the graph
+// execution queue like the rest of processBuffer:. Nothing here allocates
+// buffers, touches the pool or the device, or retains anything beyond the call.
 
 // ─── Alpha output stage (outputMode = alpha) ─────────────────────────────────
 //
@@ -634,6 +499,7 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     id<MTLDevice>        _device;
     VGGreenScreenFilterNodeOutputMode _outputMode;   // fixed at init
     CIImage             *_backgroundImage;    // solidColor: infinite-extent solid colour, cropped per frame; alpha: nil
+    VGMatteRefinementPipeline *_mattePipeline; // Swift live matte refiner (tracks defaultLiveMatteRefinementMode, .s4SoftAlphaR2; stateless per frame)
     // Alpha byte self-test result (alpha mode only). Written once in init and
     // immutable afterwards, so -diagnosticsSnapshot reads it without the lock.
     // solidColor: NO / @"not_applicable" / 0×0.
@@ -749,6 +615,13 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     _nodeType   = @"VGGreenScreenFilterNode";
     _filterName = @"GreenScreen";
 
+    // Live matte refiner: the node owns one VGMatteRefinementPipeline created
+    // with Objective-C init, tracking VGMatteRefinementPipeline.defaultLiveMatteRefinementMode
+    // (current production default is .s4SoftAlphaR2). Explicit S1 fallback still
+    // exists elsewhere, but this Objective-C node does not select modes directly;
+    // it shares the same live refinement implementation as other green-screen callers.
+    _mattePipeline = [[VGMatteRefinementPipeline alloc] init];
+
     if (_outputMode == VGGreenScreenFilterNodeOutputModeSolidColor) {
         // Solid background: raw sRGB components, alpha forced opaque. With the
         // unmanaged CIContext these component values reach the output bytes as-is.
@@ -804,10 +677,14 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
           _VGGSFNOutputModeName(_outputMode), _VGGSFNOutputModeName(_outputMode),
           _VGGSFNAlphaEncodingName(_outputMode, _alphaByteSelfTestPassed),
           _backgroundARGB, _pool,
-          (double)kVGGSFNMorphologyCloseRadius, (double)kVGGSFNFeatherRadius,
-          (double)kVGGSFNTrimapLow, (double)kVGGSFNTrimapHigh,
-          (double)kVGGSFNGuidedEdgeIntensity, (double)kVGGSFNGuidedEdgeBlurRadius,
-          (double)kVGGSFNGuidedEdgeLow, (double)kVGGSFNGuidedEdgeHigh);
+          (double)VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseRadius,
+          (double)VGMatteRefinementPipeline.greenScreenMaskFeatherRadius,
+          (double)VGMatteRefinementPipeline.greenScreenTrimapLow,
+          (double)VGMatteRefinementPipeline.greenScreenTrimapHigh,
+          (double)VGMatteRefinementPipeline.greenScreenGuidedEdgeIntensity,
+          (double)VGMatteRefinementPipeline.greenScreenGuidedEdgeBlurRadius,
+          (double)VGMatteRefinementPipeline.greenScreenGuidedEdgeLow,
+          (double)VGMatteRefinementPipeline.greenScreenGuidedEdgeHigh);
     return self;
 }
 
@@ -954,16 +831,25 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
                                             (CGFloat)srcH / (CGFloat)matteH)];
     }
 
-    // ── 3. S1 matte refinement (each stage fails open to its input mask) ──
-    //   close → feather → trimap → guided edge (guide = camera foreground).
-    //   The guided stage needs BOTH the feathered and the trimapped masks.
+    // ── 3. Live matte refinement (VGMatteRefinementPipeline live path) ─────
+    //   Refines the scaled matte through the node-owned pipeline (tracking
+    //   production default .s4SoftAlphaR2; explicit S1 fallback exists elsewhere).
+    //   Each stage fails open inside the pipeline. A nil result or mask
+    //   (never expected from the bridge) fails the frame open.
     BOOL morphologyCloseApplied = NO, featherApplied = NO;
     BOOL trimapApplied = NO, guidedEdgeApplied = NO;
-    CIImage *closed    = _VGGSFNMorphologyClose(matte, srcBounds, &morphologyCloseApplied);
-    CIImage *feathered = _VGGSFNFeather(closed, srcBounds, &featherApplied);
-    CIImage *trimapped = _VGGSFNTrimap(feathered, srcBounds, &trimapApplied);
-    CIImage *refined   = _VGGSFNGuidedEdgePreserve(trimapped, feathered, foreground,
-                                                   srcBounds, &guidedEdgeApplied);
+    VGMatteRefinementLiveResult *refinement =
+        [_mattePipeline refineLiveGreenScreenMaskWithAspectFilledMask:matte
+                                                               inRect:srcBounds
+                                                             guidedBy:foreground];
+    CIImage *refined = refinement.mask;
+    if (!refinement || !refined) {
+        return [self _failOpenWithInput:input reason:@"matte_refinement_failed"];
+    }
+    morphologyCloseApplied = refinement.morphologyCloseApplied;
+    featherApplied         = refinement.featherApplied;
+    trimapApplied          = refinement.trimapApplied;
+    guidedEdgeApplied      = refinement.guidedEdgeApplied;
 
     // ── 4. Output stage by outputMode ─────────────────────────────────────
     CIImage *keyed = nil;
