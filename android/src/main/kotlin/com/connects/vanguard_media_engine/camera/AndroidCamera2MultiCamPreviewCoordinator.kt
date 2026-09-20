@@ -205,6 +205,7 @@ class AndroidCamera2MultiCamPreviewCoordinator(
         val backDeviceId  = (args?.get("backDeviceId")  as? String)?.trim()
         val targetWidth   = (args?.get("width") as? Number)?.toInt() ?: 1080
         val targetHeight  = (args?.get("height") as? Number)?.toInt() ?: 1920
+        val initialConfig = args?.get("config") as? Map<*, *>
 
         if (frontDeviceId.isNullOrEmpty() || backDeviceId.isNullOrEmpty()) {
             result.error(
@@ -275,6 +276,13 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             try { producer.release() } catch (e: Throwable) { /* ignore */ }
             result.error("CAMERA_ERROR", "Failed to start dual-camera compositor: ${t.message}", null)
             return
+        }
+
+        // Apply initial layout config if provided by the caller.
+        if (initialConfig != null) {
+            val initialParams = AndroidDualCameraCompositor.parseConfigMap(initialConfig)
+            compositor.updateLayout(initialParams)
+            Log.d(TAG, "startMultiCamPreview: applied initial layout layoutMode=${initialParams.layoutMode} anchor=${initialParams.anchor}")
         }
 
         val compositorFrontSurface = compositor.frontInputSurface
@@ -608,16 +616,20 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             return
         }
 
-        if (dualCameraSource != null) {
-            result.success(null)
+        val compositor = dualCamCompositor
+        if (compositor == null || dualCameraSource == null) {
+            result.error(
+                "NOT_RUNNING",
+                "Android MultiCam preview is not running",
+                null,
+            )
             return
         }
 
-        result.error(
-            "NOT_RUNNING",
-            "Android MultiCam preview is not running",
-            null,
-        )
+        val params = AndroidDualCameraCompositor.parseConfigMap(config)
+        compositor.updateLayout(params)
+        Log.d(TAG, "updateMultiCamPreviewConfig: applied layoutMode=${params.layoutMode} anchor=${params.anchor} splitDir=${params.splitDirection}")
+        result.success(null)
     }
 
     // -- takeMultiCamPhoto ------------------------------------------------------

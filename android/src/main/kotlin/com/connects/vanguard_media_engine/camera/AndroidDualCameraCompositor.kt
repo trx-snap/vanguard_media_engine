@@ -69,6 +69,42 @@ class AndroidDualCameraCompositor(
         val pipCenterY: Double = 0.5,             // normalized [0,1]; only used when anchor == "freeFloating"
     )
 
+    companion object {
+        /**
+         * Parses a Dart-side VGLivePreviewConfig.toMap() into [LayoutParams].
+         *
+         * Fail-safe: unknown/missing values fall back to [LayoutParams] defaults.
+         * Never throws.
+         */
+        fun parseConfigMap(config: Map<*, *>?): LayoutParams {
+            if (config == null) return LayoutParams()
+
+            val layoutMode = (config["layoutMode"] as? String) ?: "pip"
+
+            // PiP sub-map
+            val pipMap = config["pipLayout"] as? Map<*, *>
+            val anchor = (pipMap?.get("anchor") as? String) ?: "bottomRight"
+            val pipWidthFraction = (pipMap?.get("widthFraction") as? Number)?.toDouble() ?: 0.3
+            val pipCenterX = (pipMap?.get("centerX") as? Number)?.toDouble() ?: 0.5
+            val pipCenterY = (pipMap?.get("centerY") as? Number)?.toDouble() ?: 0.5
+
+            // Split sub-map — Dart key is "direction", NOT "splitDirection"
+            val splitMap = config["splitLayout"] as? Map<*, *>
+            val splitDirection = (splitMap?.get("direction") as? String) ?: "leftRight"
+            val splitRatio = (splitMap?.get("splitRatio") as? Number)?.toDouble() ?: 0.5
+
+            return LayoutParams(
+                layoutMode = layoutMode,
+                anchor = anchor,
+                splitDirection = splitDirection,
+                splitRatio = splitRatio,
+                pipWidthFraction = pipWidthFraction,
+                pipCenterX = pipCenterX,
+                pipCenterY = pipCenterY,
+            )
+        }
+    }
+
     // ── Internal state ──────────────────────────────────────────────────────
 
     @Volatile var isVulkanBackend: Boolean = false
