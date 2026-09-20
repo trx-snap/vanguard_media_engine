@@ -118,6 +118,17 @@ VGDCPiPGeometry VGDCLayoutComputePiPGeometry(size_t primW,
             pipOriginX = margin;
             pipOriginY = margin;
             break;
+        case VGPiPAnchorFreeFloating: {
+            // Free-floating: position PiP by normalized center coordinates.
+            // Dart Y-down (0=top, 1=bottom) → CIImage Y-up (0=bottom, primH=top).
+            double cx = config.centerX;
+            double cy = config.centerY;
+            if (cx < 0.0) { cx = 0.0; } if (cx > 1.0) { cx = 1.0; }
+            if (cy < 0.0) { cy = 0.0; } if (cy > 1.0) { cy = 1.0; }
+            pipOriginX = (double)primW * cx - pipW * 0.5;
+            pipOriginY = (double)primH * (1.0 - cy) - pipH * 0.5;
+            break;
+        }
         case VGPiPAnchorBottomRight:
         default:
             pipOriginX = (double)primW - pipW - margin;
@@ -204,6 +215,42 @@ VGDCSplitRects VGDCLayoutComputeSplitRects(size_t canvasW,
     result.topRect    = CGRectMake(0.0, bottomH, cW, topH);
     result.bottomRect = CGRectMake(0.0, 0.0,     cW, bottomH);
     result.isValid    = YES;
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - VGDCLayoutComputeSplitRectsLeftRight
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Left/Right split is always 50/50 locked. splitRatio is intentionally ignored.
+// Uses CIImage Y-up coordinate space (origin at bottom-left).
+
+VGDCSplitRectsLR VGDCLayoutComputeSplitRectsLeftRight(size_t canvasW,
+                                                       size_t canvasH,
+                                                       VGSplitScreenLayoutConfig config) {
+    (void)config; // splitRatio intentionally unused for left/right.
+
+    VGDCSplitRectsLR result;
+    result.leftRect  = CGRectZero;
+    result.rightRect = CGRectZero;
+    result.isValid   = NO;
+
+    if (canvasW == 0 || canvasH == 0) {
+        return result;
+    }
+
+    double leftW  = floor((double)canvasW * 0.5);
+    double rightW = (double)canvasW - leftW;
+
+    if (leftW < 1.0 || rightW < 1.0) {
+        return result;
+    }
+
+    double cH = (double)canvasH;
+    // CIImage Y-up: both bands span full canvas height, origin at bottom-left.
+    result.leftRect  = CGRectMake(0.0,   0.0, leftW,  cH);
+    result.rightRect = CGRectMake(leftW, 0.0, rightW, cH);
+    result.isValid   = YES;
     return result;
 }
 

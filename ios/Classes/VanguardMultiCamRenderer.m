@@ -436,10 +436,11 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     NSDictionary *pip = [map objectForKey:@"pipLayout"];
     if ([pip isKindOfClass:[NSDictionary class]]) {
         NSString *anchorStr = [pip objectForKey:@"anchor"];
-        if      ([anchorStr isEqualToString:@"topLeft"])    cfg.pipConfig.anchor = VGPiPAnchorTopLeft;
-        else if ([anchorStr isEqualToString:@"topRight"])   cfg.pipConfig.anchor = VGPiPAnchorTopRight;
-        else if ([anchorStr isEqualToString:@"bottomLeft"]) cfg.pipConfig.anchor = VGPiPAnchorBottomLeft;
-        else                                                 cfg.pipConfig.anchor = VGPiPAnchorBottomRight;
+        if      ([anchorStr isEqualToString:@"topLeft"])       cfg.pipConfig.anchor = VGPiPAnchorTopLeft;
+        else if ([anchorStr isEqualToString:@"topRight"])      cfg.pipConfig.anchor = VGPiPAnchorTopRight;
+        else if ([anchorStr isEqualToString:@"bottomLeft"])    cfg.pipConfig.anchor = VGPiPAnchorBottomLeft;
+        else if ([anchorStr isEqualToString:@"freeFloating"])  cfg.pipConfig.anchor = VGPiPAnchorFreeFloating;
+        else                                                    cfg.pipConfig.anchor = VGPiPAnchorBottomRight;
 
         NSNumber *wf = [pip objectForKey:@"widthFraction"];
         if (wf && [wf doubleValue] > 0) cfg.pipConfig.widthFraction = [wf doubleValue];
@@ -449,6 +450,10 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         if (cr && [cr doubleValue] >= 0) cfg.pipConfig.cornerRadius = [cr doubleValue];
         NSNumber *op = [pip objectForKey:@"opacity"];
         if (op) cfg.pipConfig.opacity = MAX(0.0, MIN(1.0, [op doubleValue]));
+        NSNumber *cx = [pip objectForKey:@"centerX"];
+        if (cx) cfg.pipConfig.centerX = [cx doubleValue];
+        NSNumber *cy = [pip objectForKey:@"centerY"];
+        if (cy) cfg.pipConfig.centerY = [cy doubleValue];
     }
 
     // splitLayout
@@ -457,6 +462,12 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         NSNumber *sr = [split objectForKey:@"splitRatio"];
         if (sr && [sr doubleValue] > 0.0 && [sr doubleValue] < 1.0) {
             cfg.splitConfig.splitRatio = [sr doubleValue];
+        }
+        NSString *dirStr = [split objectForKey:@"direction"];
+        if ([dirStr isEqualToString:@"leftRight"]) {
+            cfg.splitConfig.direction = VGSplitScreenDirectionLeftRight;
+        } else {
+            cfg.splitConfig.direction = VGSplitScreenDirectionTopBottom;
         }
     }
 
@@ -1144,42 +1155,85 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     CIImage *composited = nil;
 
     if (_layoutConfig.layoutMode == VGDualCameraLayoutModeSplitScreen) {
-        // ── Split-screen path ─────────────────────────────────────────────────
-        VGDCSplitRects rects = VGDCLayoutComputeSplitRects(primW, primH,
-                                                            _layoutConfig.splitConfig);
-        if (rects.isValid) {
-            // Scale and crop primary into top band.
-            VGDCAspectFillResult primFill = VGDCLayoutComputeAspectFill(primW, primH, rects.topRect);
-            CGPoint primOrigin = primaryCI.extent.origin;
-            CIImage *primNorm = (primOrigin.x != 0.0 || primOrigin.y != 0.0)
-                ? [primaryCI imageByApplyingTransform:
-                    CGAffineTransformMakeTranslation(-primOrigin.x, -primOrigin.y)]
-                : primaryCI;
-            CIImage *primFilled = [[primNorm
-                imageByApplyingTransform:CGAffineTransformMakeScale(primFill.scale, primFill.scale)]
-                imageByApplyingTransform:CGAffineTransformMakeTranslation(primFill.offsetX, primFill.offsetY)];
-            CIImage *primCropped = [primFilled imageByCroppingToRect:rects.topRect];
 
-            // Scale and crop secondary into bottom band.
-            VGDCAspectFillResult secFill = VGDCLayoutComputeAspectFill(secW, secH, rects.bottomRect);
-            CGPoint secOrigin = secondaryCI.extent.origin;
-            CIImage *secNorm = (secOrigin.x != 0.0 || secOrigin.y != 0.0)
-                ? [secondaryCI imageByApplyingTransform:
-                    CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)]
-                : secondaryCI;
-            CIImage *secFilled = [[secNorm
-                imageByApplyingTransform:CGAffineTransformMakeScale(secFill.scale, secFill.scale)]
-                imageByApplyingTransform:CGAffineTransformMakeTranslation(secFill.offsetX, secFill.offsetY)];
-            CIImage *secCropped = [secFilled imageByCroppingToRect:rects.bottomRect];
+        if (_layoutConfig.splitConfig.direction == VGSplitScreenDirectionLeftRight) {
+            // ── Left/Right V-split path (always 50/50 locked) ─────────────────
+            VGDCSplitRectsLR lrRects = VGDCLayoutComputeSplitRectsLeftRight(
+                primW, primH, _layoutConfig.splitConfig);
+            if (lrRects.isValid) {
+                // Scale and crop primary into left band.
+                VGDCAspectFillResult primFill = VGDCLayoutComputeAspectFill(
+                    primW, primH, lrRects.leftRect);
+                CGPoint primOrigin = primaryCI.extent.origin;
+                CIImage *primNorm = (primOrigin.x != 0.0 || primOrigin.y != 0.0)
+                    ? [primaryCI imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(-primOrigin.x, -primOrigin.y)]
+                    : primaryCI;
+                CIImage *primFilled = [[primNorm
+                    imageByApplyingTransform:CGAffineTransformMakeScale(primFill.scale, primFill.scale)]
+                    imageByApplyingTransform:CGAffineTransformMakeTranslation(primFill.offsetX, primFill.offsetY)];
+                CIImage *primCropped = [primFilled imageByCroppingToRect:lrRects.leftRect];
 
-            // Composite onto a black canvas.
-            CIImage *black = [[CIImage imageWithColor:[CIColor blackColor]]
-                imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH)];
-            composited = [primCropped imageByCompositingOverImage:
-                            [secCropped imageByCompositingOverImage:black]];
+                // Scale and crop secondary into right band.
+                VGDCAspectFillResult secFill = VGDCLayoutComputeAspectFill(
+                    secW, secH, lrRects.rightRect);
+                CGPoint secOrigin = secondaryCI.extent.origin;
+                CIImage *secNorm = (secOrigin.x != 0.0 || secOrigin.y != 0.0)
+                    ? [secondaryCI imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)]
+                    : secondaryCI;
+                CIImage *secFilled = [[secNorm
+                    imageByApplyingTransform:CGAffineTransformMakeScale(secFill.scale, secFill.scale)]
+                    imageByApplyingTransform:CGAffineTransformMakeTranslation(secFill.offsetX, secFill.offsetY)];
+                CIImage *secCropped = [secFilled imageByCroppingToRect:lrRects.rightRect];
+
+                // Composite onto a black canvas.
+                CIImage *black = [[CIImage imageWithColor:[CIColor blackColor]]
+                    imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH)];
+                composited = [primCropped imageByCompositingOverImage:
+                                [secCropped imageByCompositingOverImage:black]];
+            } else {
+                NSLog(@"[VanguardMultiCamRenderer] leftRight split rects invalid — "
+                      "falling back to default PiP.");
+            }
         } else {
-            NSLog(@"[VanguardMultiCamRenderer][MC-12] split rects invalid — "
-                  "falling back to default PiP.");
+            // ── Top/Bottom H-split path ───────────────────────────────────────
+            VGDCSplitRects rects = VGDCLayoutComputeSplitRects(primW, primH,
+                                                                _layoutConfig.splitConfig);
+            if (rects.isValid) {
+                // Scale and crop primary into top band.
+                VGDCAspectFillResult primFill = VGDCLayoutComputeAspectFill(primW, primH, rects.topRect);
+                CGPoint primOrigin = primaryCI.extent.origin;
+                CIImage *primNorm = (primOrigin.x != 0.0 || primOrigin.y != 0.0)
+                    ? [primaryCI imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(-primOrigin.x, -primOrigin.y)]
+                    : primaryCI;
+                CIImage *primFilled = [[primNorm
+                    imageByApplyingTransform:CGAffineTransformMakeScale(primFill.scale, primFill.scale)]
+                    imageByApplyingTransform:CGAffineTransformMakeTranslation(primFill.offsetX, primFill.offsetY)];
+                CIImage *primCropped = [primFilled imageByCroppingToRect:rects.topRect];
+
+                // Scale and crop secondary into bottom band.
+                VGDCAspectFillResult secFill = VGDCLayoutComputeAspectFill(secW, secH, rects.bottomRect);
+                CGPoint secOrigin = secondaryCI.extent.origin;
+                CIImage *secNorm = (secOrigin.x != 0.0 || secOrigin.y != 0.0)
+                    ? [secondaryCI imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)]
+                    : secondaryCI;
+                CIImage *secFilled = [[secNorm
+                    imageByApplyingTransform:CGAffineTransformMakeScale(secFill.scale, secFill.scale)]
+                    imageByApplyingTransform:CGAffineTransformMakeTranslation(secFill.offsetX, secFill.offsetY)];
+                CIImage *secCropped = [secFilled imageByCroppingToRect:rects.bottomRect];
+
+                // Composite onto a black canvas.
+                CIImage *black = [[CIImage imageWithColor:[CIColor blackColor]]
+                    imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH)];
+                composited = [primCropped imageByCompositingOverImage:
+                                [secCropped imageByCompositingOverImage:black]];
+            } else {
+                NSLog(@"[VanguardMultiCamRenderer][MC-12] split rects invalid — "
+                      "falling back to default PiP.");
+            }
         }
     }
 

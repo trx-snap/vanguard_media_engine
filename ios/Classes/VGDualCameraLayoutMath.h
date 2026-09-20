@@ -69,10 +69,11 @@ typedef NS_ENUM(NSInteger, VGDualCameraLayoutMode) {
 ///
 /// Wire values mirror the Dart `VGPiPAnchor` enum.
 typedef NS_ENUM(NSInteger, VGPiPAnchor) {
-    VGPiPAnchorTopLeft     = 0,
-    VGPiPAnchorTopRight    = 1,
-    VGPiPAnchorBottomLeft  = 2,
-    VGPiPAnchorBottomRight = 3,  ///< Default.
+    VGPiPAnchorTopLeft       = 0,
+    VGPiPAnchorTopRight      = 1,
+    VGPiPAnchorBottomLeft    = 2,
+    VGPiPAnchorBottomRight   = 3,  ///< Default.
+    VGPiPAnchorFreeFloating  = 4,  ///< Position via centerX/centerY (Dart Y-down, normalized 0–1).
 };
 
 // ─── VGPiPLayoutConfig ───────────────────────────────────────────────────────
@@ -84,21 +85,38 @@ typedef NS_ENUM(NSInteger, VGPiPAnchor) {
 ///   marginFraction = 0.018
 ///   cornerRadius   = 24.0
 ///   opacity        = 1.0
+///   centerX        = 0.5
+///   centerY        = 0.5
 typedef struct {
     VGPiPAnchor anchor;         ///< Corner anchor for PiP inset.
     double      widthFraction;  ///< PiP width as fraction of primary canvas (0.05–0.75).
     double      marginFraction; ///< Margin from edge as fraction of primary canvas (>= 0.0).
     double      cornerRadius;   ///< Corner radius in points (>= 0.0).
     double      opacity;        ///< PiP opacity (0.0–1.0).
+    double      centerX;        ///< Normalized PiP center X (0.0–1.0). Used only when anchor == freeFloating.
+    double      centerY;        ///< Normalized PiP center Y (0.0–1.0, Dart Y-down). Used only when anchor == freeFloating.
 } VGPiPLayoutConfig;
+
+// ─── VGSplitScreenDirection ──────────────────────────────────────────────────
+/// The directional mode for split-screen composition.
+///
+/// Wire values mirror the Dart `VGSplitScreenDirection` enum.
+typedef NS_ENUM(NSInteger, VGSplitScreenDirection) {
+    /// Top/Bottom: primary on top, secondary on bottom. splitRatio is active.
+    VGSplitScreenDirectionTopBottom = 0,
+    /// Left/Right: primary on left, secondary on right. Always 50/50 locked.
+    VGSplitScreenDirectionLeftRight = 1,
+};
 
 // ─── VGSplitScreenLayoutConfig ───────────────────────────────────────────────
 /// Parsed split-screen layout configuration.
 ///
 /// splitRatio: fraction of canvas height for primary (top). Range 0.2–0.8.
-/// Default: 0.5.
+/// Default: 0.5. Ignored when direction == leftRight (always 50/50).
+/// direction: topBottom or leftRight. Default: topBottom.
 typedef struct {
-    double splitRatio; ///< Primary (top) height fraction. Default 0.5.
+    double                  splitRatio; ///< Primary (top) height fraction. Default 0.5. Ignored for leftRight.
+    VGSplitScreenDirection  direction;  ///< Split direction. Default: topBottom.
 } VGSplitScreenLayoutConfig;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +157,17 @@ typedef struct {
     CGRect bottomRect; ///< Secondary (bottom) band rect in CIImage Y-up space.
     BOOL   isValid;    ///< YES when both bands are at least 1 pixel tall.
 } VGDCSplitRects;
+
+// ─── VGDCSplitRectsLR ────────────────────────────────────────────────────────
+/// Output of VGDCLayoutComputeSplitRectsLeftRight(…).
+///
+/// Both rects are in CoreImage Y-up coordinate space. Left/right split is
+/// always 50/50 locked — splitRatio is ignored.
+typedef struct {
+    CGRect leftRect;   ///< Primary (left) band rect in CIImage Y-up space.
+    CGRect rightRect;  ///< Secondary (right) band rect in CIImage Y-up space.
+    BOOL   isValid;    ///< YES when both bands are at least 1 pixel wide.
+} VGDCSplitRectsLR;
 
 // ─── VGDCAspectFillResult ────────────────────────────────────────────────────
 /// Output of VGDCLayoutComputeAspectFill(…).
@@ -190,6 +219,18 @@ VGDCPiPGeometry VGDCLayoutComputePiPGeometry(size_t primW,
 VGDCSplitRects VGDCLayoutComputeSplitRects(size_t canvasW,
                                             size_t canvasH,
                                             VGSplitScreenLayoutConfig config);
+
+/// Compute primary (left) and secondary (right) band rects for left/right split.
+///
+/// Always 50/50 locked — splitRatio in config is intentionally ignored.
+///
+/// @param canvasW  Canvas width in pixels.
+/// @param canvasH  Canvas height in pixels.
+/// @param config   Split-screen layout configuration (direction/splitRatio — ratio is ignored).
+/// @return         Primary (left) and secondary (right) band rects. Check isValid before using.
+VGDCSplitRectsLR VGDCLayoutComputeSplitRectsLeftRight(size_t canvasW,
+                                                       size_t canvasH,
+                                                       VGSplitScreenLayoutConfig config);
 
 /// Compute the uniform scale and center offsets to aspect-fill a source into
 /// a target rect (scale-to-fill + center crop).

@@ -113,7 +113,10 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
     c.pipConfig.marginFraction = 0.018;
     c.pipConfig.cornerRadius   = 24.0;
     c.pipConfig.opacity        = 1.0;
+    c.pipConfig.centerX        = 0.5;
+    c.pipConfig.centerY        = 0.5;
     c.splitConfig.splitRatio   = 0.5;
+    c.splitConfig.direction    = VGSplitScreenDirectionTopBottom;
     return c;
 }
 
