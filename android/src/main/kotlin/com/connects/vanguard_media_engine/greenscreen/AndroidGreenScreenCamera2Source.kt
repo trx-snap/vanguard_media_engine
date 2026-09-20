@@ -18,7 +18,6 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.core.content.ContextCompat
-import com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationFrame
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -78,7 +77,7 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
     fun start(
         targetSurface: Surface,
         onCameraFrameTransform: (rotationDegrees: Int, mirrorHorizontal: Boolean) -> Unit = { _, _ -> },
-        onMask: (AndroidDuetSegmentationFrame) -> Unit,
+        onMask: (AndroidGreenScreenSegmentationFrame) -> Unit,
         onStarted: () -> Unit = {},
         onError: (Exception) -> Unit = {},
     ) {

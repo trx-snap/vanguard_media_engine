@@ -4,19 +4,12 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Handler
-import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackground
-import com.connects.vanguard_media_engine.duet.AndroidDuetLayoutGeometry
-import com.connects.vanguard_media_engine.duet.AndroidDuetPreviewRenderLoop
-import com.connects.vanguard_media_engine.duet.AndroidDuetPreviewSurfaceProducer
-import com.connects.vanguard_media_engine.duet.DuetSegmentationBackend
-import com.connects.vanguard_media_engine.duet.DuetSurfaceState
-import com.connects.vanguard_media_engine.duet.NativeForegroundTransform
-import com.connects.vanguard_media_engine.duet.VGDuetLayoutRects
+import com.connects.vanguard_media_engine.camera.AndroidPreviewSurfaceProducer
+import com.connects.vanguard_media_engine.camera.AndroidPreviewSurfaceState
 import io.flutter.view.TextureRegistry
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -32,13 +25,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 // the four `*LiveGreenScreenSession` routes; nothing here is Duet-owned.
 //
 // Reuses the production GL preview stack as-is (no diagnostics Canvas code):
-//   - AndroidDuetPreviewSurfaceProducer  → Flutter texture / output Surface
-//   - AndroidDuetPreviewRenderLoop       → render thread + GLES compositor,
-//                                          constructed with decoderProvider =
-//                                          { null }: no source video exists,
-//                                          so no decoder is ever bound and the
-//                                          camera-idle redraw pump presents
-//                                          every camera frame.
+//   - AndroidPreviewSurfaceProducer      → Flutter texture / output Surface
+//   - AndroidGreenScreenPreviewRenderLoop → independent single-camera render
+//                                          thread + GLES compositor: no
+//                                          decoderProvider, no source-video
+//                                          clock, no Duet layout modes — the
+//                                          camera redraw pump presents every
+//                                          camera frame directly.
 //   - AndroidGreenScreenCamera2Source    → independent front-camera Camera2
 //                                          source feeding the production
 //                                          segmentation ladder (mediapipe_cpu
@@ -54,9 +47,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 //                                          `onStarted`, and `onError`, so it
 //                                          reports a coarse mediapipe_cpu/none
 //                                          backend rather than the live rung.
-//   - AndroidDuetGreenScreenBackground   → static background spec (from the
+//   - AndroidGreenScreenBackground   → static background spec (from the
 //                                          very first frame; never VIDEO here).
-//   - AndroidDuetLayoutGeometry.greenScreen(canvas, transform) → source rect =
+//   - AndroidGreenScreenLayoutGeometry.greenScreen(canvas, transform) → source rect =
 //     full canvas, camera rect = transformed keyed layer.
 //
 // Camera admission: the engine-wide AndroidCameraSessionAdmission lane is
@@ -69,15 +62,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 // AndroidLiveGreenScreenMethodHandler). The camera source's callbacks
 // (`onCameraFrameTransform`, `onMask`, `onStarted`, `onError`) are posted to
 // the render thread or hopped to the main thread by the render loop itself
-// before touching compositor/session state; a private decoder-lane
-// HandlerThread exists only because the render loop requires one (no decoder
-// op ever does work).
+// before touching compositor/session state.
 //
 // Cleanup order on stop/dispose (matches the render loop's documented
 // contract — prepareForCameraStop must precede the Camera2 stop so no
 // drawFrame races the last OES write):
 //   producer.beginRelease -> renderLoop.prepareForCameraStop -> camera.stop
-//   -> renderLoop.stopBlocking(0) -> producer.finishRelease
+//   -> renderLoop.stopBlocking() -> producer.finishRelease
 //   -> admission.release. No Surface.release on producer-owned surfaces.
 
 class AndroidLiveGreenScreenSessionCoordinator(
@@ -116,8 +107,8 @@ class AndroidLiveGreenScreenSessionCoordinator(
     class StartRequest(
         val widthPx: Int,
         val heightPx: Int,
-        val background: AndroidDuetGreenScreenBackground,
-        val foregroundTransform: NativeForegroundTransform?,
+        val background: AndroidGreenScreenBackground,
+        val foregroundTransform: AndroidGreenScreenForegroundTransform?,
     )
 
     // ── Session ───────────────────────────────────────────────────────────────
@@ -126,12 +117,12 @@ class AndroidLiveGreenScreenSessionCoordinator(
         val sessionId: String,
         val widthPx: Int,
         val heightPx: Int,
-        var background: AndroidDuetGreenScreenBackground,
-        var foregroundTransform: NativeForegroundTransform?,
-        var layoutRects: VGDuetLayoutRects,
+        var background: AndroidGreenScreenBackground,
+        var foregroundTransform: AndroidGreenScreenForegroundTransform?,
+        var layoutRects: AndroidGreenScreenLayoutRects,
     ) {
-        var producer: AndroidDuetPreviewSurfaceProducer? = null
-        var renderLoop: AndroidDuetPreviewRenderLoop? = null
+        var producer: AndroidPreviewSurfaceProducer? = null
+        var renderLoop: AndroidGreenScreenPreviewRenderLoop? = null
         var cameraSource: AndroidGreenScreenCamera2Source? = null
         /** True between an output-surface loss and its re-availability. */
         var suspended: Boolean = false
@@ -141,12 +132,6 @@ class AndroidLiveGreenScreenSessionCoordinator(
 
     @Volatile private var activeSession: LiveSession? = null
     private val disposed = AtomicBoolean(false)
-
-    // The render loop requires a decoder-lane Handler even though this
-    // coordinator never has a decoder: every decoder op it posts resolves
-    // decoderProvider() == null and completes immediately.
-    private val decoderThread = HandlerThread("vg.livegs.decoder").also { it.start() }
-    private val decoderHandler = Handler(decoderThread.looper)
 
     // ── start ─────────────────────────────────────────────────────────────────
 
@@ -193,13 +178,13 @@ class AndroidLiveGreenScreenSessionCoordinator(
             heightPx = heightPx,
             background = request.background,
             foregroundTransform = request.foregroundTransform,
-            layoutRects = AndroidDuetLayoutGeometry.greenScreen(
+            layoutRects = AndroidGreenScreenLayoutGeometry.greenScreen(
                 widthPx.toDouble(), heightPx.toDouble(), request.foregroundTransform,
             ),
         )
 
         val producer = try {
-            AndroidDuetPreviewSurfaceProducer(
+            AndroidPreviewSurfaceProducer(
                 textureRegistry    = registry,
                 mainHandler        = mainHandler,
                 widthPx            = widthPx,
@@ -215,10 +200,8 @@ class AndroidLiveGreenScreenSessionCoordinator(
         }
 
         val renderLoop = try {
-            AndroidDuetPreviewRenderLoop(
-                mainHandler     = mainHandler,
-                decoderHandler  = decoderHandler,
-                decoderProvider = { null },
+            AndroidGreenScreenPreviewRenderLoop(
+                mainHandler = mainHandler,
                 cameraInputSurfaceReady = { camSurface ->
                     startCameraSourceIfNeeded(session, camSurface)
                 },
@@ -243,13 +226,12 @@ class AndroidLiveGreenScreenSessionCoordinator(
         // The producer's eager availability probe never fires the hook, so
         // bootstrap the output here when the surface already exists. Camera
         // start is driven exclusively by cameraInputSurfaceReady.
-        if (producer.state == DuetSurfaceState.SURFACE_AVAILABLE) {
+        if (producer.state == AndroidPreviewSurfaceState.SURFACE_AVAILABLE) {
             val surface = producer.acquireSurface()
             if (surface != null) {
                 renderLoop.attachOutputSurface(
                     surface, widthPx, heightPx,
                     session.layoutRects.source, session.layoutRects.camera,
-                    0L,
                 )
             }
         }
@@ -264,7 +246,7 @@ class AndroidLiveGreenScreenSessionCoordinator(
 
     fun updateBackground(
         sessionId: String,
-        background: AndroidDuetGreenScreenBackground,
+        background: AndroidGreenScreenBackground,
         reply: (Any?, String?) -> Unit,
     ) {
         val session = resolveSession(sessionId, "updateLiveGreenScreenBackground", reply) ?: return
@@ -277,16 +259,16 @@ class AndroidLiveGreenScreenSessionCoordinator(
 
     fun updateTransform(
         sessionId: String,
-        transform: NativeForegroundTransform?,
+        transform: AndroidGreenScreenForegroundTransform?,
         reply: (Any?, String?) -> Unit,
     ) {
         val session = resolveSession(sessionId, "updateLiveGreenScreenTransform", reply) ?: return
         session.foregroundTransform = transform
-        val rects = AndroidDuetLayoutGeometry.greenScreen(
+        val rects = AndroidGreenScreenLayoutGeometry.greenScreen(
             session.widthPx.toDouble(), session.heightPx.toDouble(), transform,
         )
         session.layoutRects = rects
-        session.renderLoop?.updateLayout(rects.source, rects.camera, 0L)
+        session.renderLoop?.updateLayout(rects.source, rects.camera)
         reply(null, null)
     }
 
@@ -311,7 +293,6 @@ class AndroidLiveGreenScreenSessionCoordinator(
         val session = activeSession
         activeSession = null
         if (session != null) releaseSession(session, "dispose")
-        try { decoderThread.quitSafely() } catch (_: Throwable) {}
     }
 
     // ── Output surface lifecycle (platform thread, synchronous) ───────────────
@@ -325,7 +306,6 @@ class AndroidLiveGreenScreenSessionCoordinator(
         renderLoop.attachOutputSurface(
             surface, session.widthPx, session.heightPx,
             session.layoutRects.source, session.layoutRects.camera,
-            0L,
         )
         if (session.suspended) {
             session.suspended = false
@@ -383,14 +363,14 @@ class AndroidLiveGreenScreenSessionCoordinator(
             onMask = { frame -> session.renderLoop?.updateGreenScreenMask(frame) },
             onStarted = {
                 Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_CAMERA_STARTED session=${session.sessionId} " +
-                    "source=camera2_clean_segmentation backend=${DuetSegmentationBackend.MEDIAPIPE_CPU}")
+                    "source=camera2_clean_segmentation backend=${AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU}")
             },
             onError = { e ->
                 Log.w(TAG, "Camera source failed for live session ${session.sessionId}: ${e.message}")
                 camSource.stop()
                 if (activeSession === session && session.cameraSource === camSource) {
                     session.cameraSource = null
-                    emit(session, EVENT_ERROR, DuetSegmentationBackend.MEDIAPIPE_CPU, DuetSegmentationBackend.NONE,
+                    emit(session, EVENT_ERROR, AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU, AndroidGreenScreenSegmentationBackend.NONE,
                         "camera_start_failed",
                         "The camera could not be started: ${e.message ?: e.javaClass.simpleName}")
                 }
@@ -405,7 +385,7 @@ class AndroidLiveGreenScreenSessionCoordinator(
      * while the camera source is running and `none` once it is gone.
      */
     private fun reportedBackend(session: LiveSession): String =
-        if (session.cameraSource != null) DuetSegmentationBackend.MEDIAPIPE_CPU else DuetSegmentationBackend.NONE
+        if (session.cameraSource != null) AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU else AndroidGreenScreenSegmentationBackend.NONE
 
     // ── Release ───────────────────────────────────────────────────────────────
 
@@ -423,7 +403,7 @@ class AndroidLiveGreenScreenSessionCoordinator(
         // pipeline and every backend it opened).
         camSource?.stop()
         // Phase 4: release the compositor (releases cameraInputSurface).
-        renderLoop?.stopBlocking(0L)
+        renderLoop?.stopBlocking()
         // Phase 5: drop the Flutter SurfaceProducer.
         producer?.finishRelease()
         session.cameraSource = null

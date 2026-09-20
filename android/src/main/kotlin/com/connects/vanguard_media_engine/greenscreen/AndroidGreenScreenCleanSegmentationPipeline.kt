@@ -7,13 +7,6 @@ import android.graphics.Matrix
 import android.media.Image
 import android.os.SystemClock
 import android.util.Log
-import com.connects.vanguard_media_engine.duet.AndroidDuetMaskTemporalSmoother
-import com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationBackendSelector
-import com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationFrame
-import com.connects.vanguard_media_engine.duet.DuetSegmentationBackend
-import com.connects.vanguard_media_engine.duet.DuetSegmentationFailureReason
-import com.connects.vanguard_media_engine.duet.DuetSegmentationMaskFormat
-import com.connects.vanguard_media_engine.duet.DuetSegmentationOutcome
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferExtractor
 import com.google.mediapipe.framework.image.MPImage
@@ -43,9 +36,9 @@ import kotlin.math.roundToInt
  * Independent, tracked-assets-only segmentation pipeline for the Green Screen Camera2 path
  * ([AndroidGreenScreenCamera2Source]).
  *
- * Implements the same production ladder policy as the Duet green-screen adapter (mediapipe_cpu ->
- * mlkit -> none), reusing [AndroidDuetSegmentationBackendSelector] for the ladder/model-asset
- * decision only. It deliberately does NOT reuse the Duet backend classes
+ * Implements the neutral, green-screen-owned production ladder policy (mediapipe_cpu -> mlkit ->
+ * none) via [AndroidGreenScreenBackendSelector] for the ladder/model-asset decision only. It
+ * deliberately does NOT reuse the Duet backend classes
  * ([com.connects.vanguard_media_engine.duet.AndroidDuetSegmentationBackend] and its
  * implementations), because those take an [androidx.camera.core.ImageProxy]. Physical proof on
  * SM-A566B showed wrapping a Camera2 [Image] as an [androidx.camera.core.ImageProxy] (via the
@@ -63,7 +56,7 @@ import kotlin.math.roundToInt
 class AndroidGreenScreenCleanSegmentationPipeline(
     private val context: Context,
     /** Called with each owned CPU mask frame. May fire off the calling thread. */
-    private val onMask: (AndroidDuetSegmentationFrame) -> Unit,
+    private val onMask: (AndroidGreenScreenSegmentationFrame) -> Unit,
 ) {
     companion object {
         private const val TAG = "GreenScreenCleanSegPipe"
@@ -72,23 +65,23 @@ class AndroidGreenScreenCleanSegmentationPipeline(
         private const val WARMUP_MASK_EXCLUSION_COUNT = 4L
     }
 
-    private val selector = AndroidDuetSegmentationBackendSelector(context)
+    private val selector = AndroidGreenScreenBackendSelector(context)
 
     /**
      * Single owned temporal smoother between backend output and [onMask] delivery.
      * Restored to the engineering/Duet default current weight (166, approximating
      * current=0.65 / previous=0.35) and DEFAULT_MAX_GAP_MS (250ms).
      */
-    private val temporalSmoother = AndroidDuetMaskTemporalSmoother(
-        currentWeightQ8 = AndroidDuetMaskTemporalSmoother.DEFAULT_CURRENT_WEIGHT_Q8,
-        maxGapMs = AndroidDuetMaskTemporalSmoother.DEFAULT_MAX_GAP_MS,
+    private val temporalSmoother = AndroidGreenScreenMaskTemporalSmoother(
+        currentWeightQ8 = AndroidGreenScreenMaskTemporalSmoother.DEFAULT_CURRENT_WEIGHT_Q8,
+        maxGapMs = AndroidGreenScreenMaskTemporalSmoother.DEFAULT_MAX_GAP_MS,
     )
 
     private val lock = Any()
 
     /** Guarded by [lock] for writes; volatile so reads (diagnostics, frame submission) never block. */
     @Volatile private var activeBackend: CleanCameraImageSegmentationBackend? = null
-    @Volatile private var currentBackendId: String = DuetSegmentationBackend.NONE
+    @Volatile private var currentBackendId: String = AndroidGreenScreenSegmentationBackend.NONE
 
     private val isOpen = AtomicBoolean(false)
     private val isClosed = AtomicBoolean(false)
@@ -135,7 +128,7 @@ class AndroidGreenScreenCleanSegmentationPipeline(
                 }
                 val failedRung = rung
                 degradeCount += 1
-                lastDegradeReason = DuetSegmentationFailureReason.initFailed(failedRung)
+                lastDegradeReason = GreenScreenSegmentationFailureReason.initFailed(failedRung)
                 rung = selector.nextBackendId(failedRung)
             }
             if (result != null) {
@@ -217,8 +210,8 @@ class AndroidGreenScreenCleanSegmentationPipeline(
             try {
                 handleOutcome(
                     backend,
-                    DuetSegmentationOutcome.Failure(
-                        DuetSegmentationFailureReason.segmentThrew(backend.backendId),
+                    GreenScreenSegmentationOutcome.Failure(
+                        GreenScreenSegmentationFailureReason.segmentThrew(backend.backendId),
                         "${backend.backendId}.segment() threw: ${t.javaClass.simpleName}: ${t.message}",
                         t,
                     ),
@@ -290,11 +283,11 @@ class AndroidGreenScreenCleanSegmentationPipeline(
 
     private fun handleOutcome(
         backend: CleanCameraImageSegmentationBackend,
-        outcome: DuetSegmentationOutcome,
+        outcome: GreenScreenSegmentationOutcome,
         durationMs: Long,
     ) {
         when (outcome) {
-            is DuetSegmentationOutcome.Mask -> {
+            is GreenScreenSegmentationOutcome.Mask -> {
                 recordMaskTelemetry(durationMs)
                 try {
                     val rawFrame = outcome.frame
@@ -304,7 +297,7 @@ class AndroidGreenScreenCleanSegmentationPipeline(
                     Log.w(TAG, "onMask threw: ${t.message}")
                 }
             }
-            is DuetSegmentationOutcome.GpuMask -> {
+            is GreenScreenSegmentationOutcome.GpuMask -> {
                 // This pipeline never opens a GPU rung (see the class doc), so this is
                 // unreachable in practice; fail closed by releasing the buffer instead of ever
                 // handing a HardwareBuffer to a caller that only expects CPU masks.
@@ -313,10 +306,10 @@ class AndroidGreenScreenCleanSegmentationPipeline(
                     outcome.hardwareBuffer.close()
                 } catch (_: Throwable) {}
             }
-            is DuetSegmentationOutcome.Skipped -> {
+            is GreenScreenSegmentationOutcome.Skipped -> {
                 Log.v(TAG, "frame skipped by ${backend.backendId}: ${outcome.reason}")
             }
-            is DuetSegmentationOutcome.Failure -> {
+            is GreenScreenSegmentationOutcome.Failure -> {
                 handleBackendFailure(backend, outcome)
             }
         }
@@ -330,7 +323,7 @@ class AndroidGreenScreenCleanSegmentationPipeline(
      */
     private fun handleBackendFailure(
         backend: CleanCameraImageSegmentationBackend,
-        failure: DuetSegmentationOutcome.Failure,
+        failure: GreenScreenSegmentationOutcome.Failure,
     ) {
         synchronized(lock) {
             if (backend !== activeBackend) {
@@ -366,7 +359,7 @@ class AndroidGreenScreenCleanSegmentationPipeline(
                         "${replacement.backendId} (${failure.reason}): ${failure.message}",
                 )
             } else {
-                currentBackendId = DuetSegmentationBackend.NONE
+                currentBackendId = AndroidGreenScreenSegmentationBackend.NONE
                 temporalSmoother.reset()
                 Log.w(
                     TAG,
@@ -391,15 +384,15 @@ class AndroidGreenScreenCleanSegmentationPipeline(
     /**
      * Creates and opens the backend for [rung]; returns null (after closing any partial instance)
      * when unsupported, or construction/open() throws. Must be called with [lock] held. Only
-     * `mediapipe_cpu` and `mlkit` are ever constructed — [AndroidDuetSegmentationBackendSelector]
-     * never returns `mediapipe_gpu` or `raw_tflite_gpu` from [AndroidDuetSegmentationBackendSelector.primaryBackendId]
+     * `mediapipe_cpu` and `mlkit` are ever constructed — [AndroidGreenScreenBackendSelector]
+     * never returns `mediapipe_gpu` or `raw_tflite_gpu` from [AndroidGreenScreenBackendSelector.primaryBackendId]
      * or the default ladder walked here, so this class is CPU-only by construction.
      */
     private fun openRungLocked(rung: String): CleanCameraImageSegmentationBackend? {
         val instance = when (rung) {
-            DuetSegmentationBackend.MEDIAPIPE_CPU ->
-                CleanMediaPipeCpuImageSegmentationBackend(context, AndroidDuetSegmentationBackendSelector.MODEL_ASSET_PATH)
-            DuetSegmentationBackend.MLKIT -> CleanMlKitImageSegmentationBackend()
+            AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU ->
+                CleanMediaPipeCpuImageSegmentationBackend(context, AndroidGreenScreenBackendSelector.MODEL_ASSET_PATH)
+            AndroidGreenScreenSegmentationBackend.MLKIT -> CleanMlKitImageSegmentationBackend()
             else -> {
                 Log.w(TAG, "rung $rung unsupported by this pipeline — skipping")
                 null
@@ -434,7 +427,7 @@ class AndroidGreenScreenCleanSegmentationPipeline(
  *   - [close] is idempotent, never throws, and may be called from any thread.
  */
 private interface CleanCameraImageSegmentationBackend {
-    /** One of [DuetSegmentationBackend] (`mediapipe_cpu`, `mlkit`). */
+    /** One of [AndroidGreenScreenSegmentationBackend] (`mediapipe_cpu`, `mlkit`). */
     val backendId: String
 
     /** Loads the segmenter. Called once; may throw. */
@@ -448,7 +441,7 @@ private interface CleanCameraImageSegmentationBackend {
         image: Image,
         rotationDegrees: Int,
         timestampMs: Long,
-        completion: (DuetSegmentationOutcome) -> Unit,
+        completion: (GreenScreenSegmentationOutcome) -> Unit,
     )
 
     /** Releases the segmenter. Idempotent; never throws. */
@@ -479,7 +472,7 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
         private const val SEGMENT_INPUT_LONG_EDGE_PX = 256
     }
 
-    override val backendId: String = DuetSegmentationBackend.MEDIAPIPE_CPU
+    override val backendId: String = AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU
 
     private val closed = AtomicBoolean(false)
 
@@ -547,26 +540,26 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
         image: Image,
         rotationDegrees: Int,
         timestampMs: Long,
-        completion: (DuetSegmentationOutcome) -> Unit,
+        completion: (GreenScreenSegmentationOutcome) -> Unit,
     ) {
         if (closed.get()) {
-            completion(DuetSegmentationOutcome.Skipped("mediapipe_closed"))
+            completion(GreenScreenSegmentationOutcome.Skipped("mediapipe_closed"))
             return
         }
         val executorService = executor
         if (executorService == null) {
-            completion(DuetSegmentationOutcome.Skipped("mediapipe_closed"))
+            completion(GreenScreenSegmentationOutcome.Skipped("mediapipe_closed"))
             return
         }
         try {
             executorService.execute { segmentOnOwnedThread(image, rotationDegrees, timestampMs, completion) }
         } catch (t: RejectedExecutionException) {
             if (closed.get()) {
-                completion(DuetSegmentationOutcome.Skipped("mediapipe_closed"))
+                completion(GreenScreenSegmentationOutcome.Skipped("mediapipe_closed"))
             } else {
                 completion(
-                    DuetSegmentationOutcome.Failure(
-                        DuetSegmentationFailureReason.inferenceFailed(backendId),
+                    GreenScreenSegmentationOutcome.Failure(
+                        GreenScreenSegmentationFailureReason.inferenceFailed(backendId),
                         "segment() executor rejected task: ${t.message}",
                         t,
                     )
@@ -614,11 +607,11 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
         image: Image,
         rotationDegrees: Int,
         timestampMs: Long,
-        completion: (DuetSegmentationOutcome) -> Unit,
+        completion: (GreenScreenSegmentationOutcome) -> Unit,
     ) {
         val seg = segmenter
         if (seg == null || closed.get()) {
-            completion(DuetSegmentationOutcome.Skipped("mediapipe_closed"))
+            completion(GreenScreenSegmentationOutcome.Skipped("mediapipe_closed"))
             return
         }
 
@@ -628,8 +621,8 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
             imageToUprightMirroredBitmap(image, rotationDegrees)
         } catch (t: Throwable) {
             completion(
-                DuetSegmentationOutcome.Failure(
-                    DuetSegmentationFailureReason.frameConvertFailed(backendId),
+                GreenScreenSegmentationOutcome.Failure(
+                    GreenScreenSegmentationFailureReason.frameConvertFailed(backendId),
                     "Image -> Bitmap conversion failed: ${t.message}",
                     t,
                 )
@@ -644,13 +637,13 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
         // 3. Inference + mask conversion, both on this owned thread.
         var mpImage: MPImage? = null
         var result: ImageSegmenterResult? = null
-        val outcome: DuetSegmentationOutcome = try {
+        val outcome: GreenScreenSegmentationOutcome = try {
             mpImage = BitmapImageBuilder(bitmap).build()
             result = seg.segmentForVideo(mpImage, ts)
             extractPersonMask(result, ts)
         } catch (t: Throwable) {
-            DuetSegmentationOutcome.Failure(
-                DuetSegmentationFailureReason.inferenceFailed(backendId),
+            GreenScreenSegmentationOutcome.Failure(
+                GreenScreenSegmentationFailureReason.inferenceFailed(backendId),
                 "ImageSegmenter.segmentForVideo failed: ${t.javaClass.simpleName}: ${t.message}",
                 t,
             )
@@ -709,11 +702,11 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
      * Picks the person confidence mask out of [result] and converts it to a UINT8_ALPHA frame.
      * Identical logic to the proven Duet MediaPipe CPU backend's extraction.
      */
-    private fun extractPersonMask(result: ImageSegmenterResult, timestampMs: Long): DuetSegmentationOutcome {
+    private fun extractPersonMask(result: ImageSegmenterResult, timestampMs: Long): GreenScreenSegmentationOutcome {
         val masks = result.confidenceMasks().orElse(null)
         if (masks == null || masks.isEmpty()) {
-            return DuetSegmentationOutcome.Failure(
-                DuetSegmentationFailureReason.emptyResult(backendId),
+            return GreenScreenSegmentationOutcome.Failure(
+                GreenScreenSegmentationFailureReason.emptyResult(backendId),
                 "ImageSegmenter returned no confidence masks (outputConfidenceMasks=true)",
             )
         }
@@ -721,8 +714,8 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
         val width = mask.width
         val height = mask.height
         if (width <= 0 || height <= 0) {
-            return DuetSegmentationOutcome.Failure(
-                DuetSegmentationFailureReason.maskSizeMismatch(backendId),
+            return GreenScreenSegmentationOutcome.Failure(
+                GreenScreenSegmentationFailureReason.maskSizeMismatch(backendId),
                 "Confidence mask has invalid dimensions ${width}x$height",
             )
         }
@@ -732,8 +725,8 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
         val floats = floatBytes.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
         floats.rewind()
         if (floats.remaining() < pixelCount) {
-            return DuetSegmentationOutcome.Failure(
-                DuetSegmentationFailureReason.maskSizeMismatch(backendId),
+            return GreenScreenSegmentationOutcome.Failure(
+                GreenScreenSegmentationFailureReason.maskSizeMismatch(backendId),
                 "Confidence mask buffer holds ${floats.remaining()} floats, need $pixelCount for ${width}x$height",
             )
         }
@@ -758,14 +751,14 @@ private class CleanMediaPipeCpuImageSegmentationBackend(
             )
         }
 
-        return DuetSegmentationOutcome.Mask(
-            AndroidDuetSegmentationFrame.adoptOwned(
+        return GreenScreenSegmentationOutcome.Mask(
+            AndroidGreenScreenSegmentationFrame.adoptOwned(
                 ownedBytes = alpha,
                 width = width,
                 height = height,
                 timestampMs = timestampMs,
                 backend = backendId,
-                format = DuetSegmentationMaskFormat.UINT8_ALPHA,
+                format = GreenScreenSegmentationMaskFormat.UINT8_ALPHA,
             )
         )
     }
@@ -884,7 +877,7 @@ private class CleanMlKitImageSegmentationBackend : CleanCameraImageSegmentationB
         private const val TAG = "GreenScreenCleanMlKit"
     }
 
-    override val backendId: String = DuetSegmentationBackend.MLKIT
+    override val backendId: String = AndroidGreenScreenSegmentationBackend.MLKIT
 
     private val closed = AtomicBoolean(false)
     private val segmenterRef = AtomicReference<Segmenter?>(null)
@@ -909,11 +902,11 @@ private class CleanMlKitImageSegmentationBackend : CleanCameraImageSegmentationB
         image: Image,
         rotationDegrees: Int,
         timestampMs: Long,
-        completion: (DuetSegmentationOutcome) -> Unit,
+        completion: (GreenScreenSegmentationOutcome) -> Unit,
     ) {
         val segmenter = segmenterRef.get()
         if (segmenter == null || closed.get()) {
-            completion(DuetSegmentationOutcome.Skipped("mlkit_closed"))
+            completion(GreenScreenSegmentationOutcome.Skipped("mlkit_closed"))
             return
         }
 
@@ -921,27 +914,27 @@ private class CleanMlKitImageSegmentationBackend : CleanCameraImageSegmentationB
         segmenter.process(inputImage)
             .addOnSuccessListener { mask: SegmentationMask ->
                 val outcome = try {
-                    DuetSegmentationOutcome.Mask(
-                        AndroidDuetSegmentationFrame.copyFrom(
+                    GreenScreenSegmentationOutcome.Mask(
+                        AndroidGreenScreenSegmentationFrame.copyFrom(
                             source = mask.buffer,
                             width = mask.width,
                             height = mask.height,
                             timestampMs = timestampMs,
                             backend = backendId,
-                            format = DuetSegmentationMaskFormat.FLOAT32_CONFIDENCE,
+                            format = GreenScreenSegmentationMaskFormat.FLOAT32_CONFIDENCE,
                         )
                     )
                 } catch (t: Throwable) {
                     Log.w(TAG, "Mask copy threw: ${t.message}")
-                    DuetSegmentationOutcome.Skipped("mlkit_mask_copy_failed")
+                    GreenScreenSegmentationOutcome.Skipped("mlkit_mask_copy_failed")
                 }
                 completion(outcome)
             }
             .addOnFailureListener { e: Exception ->
                 Log.w(TAG, "Segmentation failed: ${e.message}")
                 completion(
-                    DuetSegmentationOutcome.Failure(
-                        DuetSegmentationFailureReason.MLKIT_FAILURE,
+                    GreenScreenSegmentationOutcome.Failure(
+                        GreenScreenSegmentationFailureReason.MLKIT_FAILURE,
                         "ML Kit segmentation failed: ${e.message}",
                         e,
                     )

@@ -2,19 +2,11 @@ package com.connects.vanguard_media_engine.greenscreen
 
 import android.content.Context
 import android.os.Handler
-import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
-import com.connects.vanguard_media_engine.duet.AndroidDuetBackgroundScaleMode
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackground
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackgroundType
-import com.connects.vanguard_media_engine.duet.AndroidDuetLayoutGeometry
-import com.connects.vanguard_media_engine.duet.AndroidDuetPreviewRenderLoop
-import com.connects.vanguard_media_engine.duet.AndroidDuetPreviewSurfaceProducer
-import com.connects.vanguard_media_engine.duet.DuetSurfaceState
-import com.connects.vanguard_media_engine.duet.NativeForegroundTransform
-import com.connects.vanguard_media_engine.duet.VGDuetLayoutRects
+import com.connects.vanguard_media_engine.camera.AndroidPreviewSurfaceProducer
+import com.connects.vanguard_media_engine.camera.AndroidPreviewSurfaceState
 import io.flutter.view.TextureRegistry
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -23,10 +15,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Independent camera-graph source for the Green Screen capability.
  *
  * Green Screen is not owned by Duet: this class exposes the only public
- * green-screen camera API and lives in its own package. It reuses the
- * existing Duet preview renderer and surface producer internally (they are
- * generic frame-pump/EGL plumbing, not Duet-specific business logic), but no
- * Duet type or session ever appears in this class's public surface.
+ * green-screen camera API and lives in its own package, and owns its own
+ * neutral single-camera [AndroidGreenScreenPreviewRenderLoop] — no Duet type
+ * or session ever appears in this class's public surface or its dependencies.
  */
 class AndroidGreenScreenCameraGraphSource(
     private val context: Context,
@@ -39,11 +30,11 @@ class AndroidGreenScreenCameraGraphSource(
     companion object {
         private const val TAG = "GreenScreenCamGraphSrc"
         private const val GRAPH_MODE = "greenScreenGpu"
-        private val DEFAULT_TEAL_BACKGROUND = AndroidDuetGreenScreenBackground(
-            type = AndroidDuetGreenScreenBackgroundType.SOLID_COLOR,
+        private val DEFAULT_TEAL_BACKGROUND = AndroidGreenScreenBackground(
+            type = AndroidGreenScreenBackgroundType.SOLID_COLOR,
             argbColor = 0xFF008080.toInt(),
             filePath = null,
-            scaleMode = AndroidDuetBackgroundScaleMode.ASPECT_FILL,
+            scaleMode = AndroidGreenScreenBackgroundScaleMode.ASPECT_FILL,
         )
     }
 
@@ -51,19 +42,18 @@ class AndroidGreenScreenCameraGraphSource(
     private val stopped = AtomicBoolean(true)
     private val cameraStartGuard = AtomicBoolean(false)
 
-    private var producer: AndroidDuetPreviewSurfaceProducer? = null
-    private var renderLoop: AndroidDuetPreviewRenderLoop? = null
+    private var producer: AndroidPreviewSurfaceProducer? = null
+    private var renderLoop: AndroidGreenScreenPreviewRenderLoop? = null
     private var cameraSource: AndroidGreenScreenCamera2Source? = null
-    private var decoderThread: HandlerThread? = null
 
     @Volatile private var outputAttached = false
     @Volatile private var greenScreenEnabled = true
-    @Volatile private var background: AndroidDuetGreenScreenBackground = DEFAULT_TEAL_BACKGROUND
+    @Volatile private var background: AndroidGreenScreenBackground = DEFAULT_TEAL_BACKGROUND
     @Volatile private var outputMode: AndroidGreenScreenCameraFilterChain.OutputMode =
         AndroidGreenScreenCameraFilterChain.OutputMode.SOLID_COLOR
-    @Volatile private var foregroundTransform: NativeForegroundTransform? = null
-    @Volatile private var layoutRects: VGDuetLayoutRects =
-        AndroidDuetLayoutGeometry.greenScreen(widthPx.toDouble(), heightPx.toDouble(), null)
+    @Volatile private var foregroundTransform: AndroidGreenScreenForegroundTransform? = null
+    @Volatile private var layoutRects: AndroidGreenScreenLayoutRects =
+        AndroidGreenScreenLayoutGeometry.greenScreen(widthPx.toDouble(), heightPx.toDouble(), null)
     @Volatile private var lastError: String? = null
     @Volatile private var cameraStarted = false
 
@@ -83,11 +73,7 @@ class AndroidGreenScreenCameraGraphSource(
         outputAttached = false
         cameraStartGuard.set(false)
 
-        val dt = HandlerThread("vg.greenscreen.decoder").apply { start() }
-        decoderThread = dt
-        val decoderHandler = Handler(dt.looper)
-
-        val prod = AndroidDuetPreviewSurfaceProducer(
+        val prod = AndroidPreviewSurfaceProducer(
             textureRegistry = textureRegistry,
             mainHandler = mainHandler,
             widthPx = widthPx,
@@ -97,10 +83,8 @@ class AndroidGreenScreenCameraGraphSource(
         )
         producer = prod
 
-        val loop = AndroidDuetPreviewRenderLoop(
+        val loop = AndroidGreenScreenPreviewRenderLoop(
             mainHandler = mainHandler,
-            decoderHandler = decoderHandler,
-            decoderProvider = { null },
             cameraInputSurfaceReady = { camSurface -> startCameraSourceIfNeeded(camSurface) },
         )
         renderLoop = loop
@@ -122,7 +106,7 @@ class AndroidGreenScreenCameraGraphSource(
         return diagnosticsSnapshot()
     }
 
-    fun setGreenScreenBackground(background: AndroidDuetGreenScreenBackground): Map<String, Any?> {
+    fun setGreenScreenBackground(background: AndroidGreenScreenBackground): Map<String, Any?> {
         this.background = background
         renderLoop?.setGreenScreenBackground(background)
         return diagnosticsSnapshot()
@@ -142,13 +126,13 @@ class AndroidGreenScreenCameraGraphSource(
         outputMode = mode
     }
 
-    fun updateForegroundTransform(transform: NativeForegroundTransform?): Map<String, Any?> {
+    fun updateForegroundTransform(transform: AndroidGreenScreenForegroundTransform?): Map<String, Any?> {
         foregroundTransform = transform
         recomputeLayoutRects()
         if (renderLoop != null) {
             if (outputAttached) {
                 val rects = layoutRects
-                renderLoop?.updateLayout(rects.source, rects.camera, 0L)
+                renderLoop?.updateLayout(rects.source, rects.camera)
             } else {
                 attachOutputIfPossible()
             }
@@ -193,22 +177,16 @@ class AndroidGreenScreenCameraGraphSource(
         val prod = producer
         val loop = renderLoop
         val cam = cameraSource
-        val dt = decoderThread
 
         try { prod?.beginRelease() } catch (_: Throwable) {}
         try { loop?.prepareForCameraStop() } catch (_: Throwable) {}
         try { cam?.stop() } catch (_: Throwable) {}
-        try { loop?.stopBlocking(0L) } catch (_: Throwable) {}
+        try { loop?.stopBlocking() } catch (_: Throwable) {}
         try { prod?.finishRelease() } catch (_: Throwable) {}
-        try {
-            dt?.quitSafely()
-            dt?.join(500)
-        } catch (_: Throwable) {}
 
         producer = null
         renderLoop = null
         cameraSource = null
-        decoderThread = null
     }
 
     // ── Internal wiring ──────────────────────────────────────────────────────
@@ -226,10 +204,10 @@ class AndroidGreenScreenCameraGraphSource(
     private fun attachOutputIfPossible() {
         val prod = producer ?: return
         val loop = renderLoop ?: return
-        if (prod.state != DuetSurfaceState.SURFACE_AVAILABLE) return
+        if (prod.state != AndroidPreviewSurfaceState.SURFACE_AVAILABLE) return
         val surface: Surface = prod.acquireSurface() ?: return
         val rects = layoutRects
-        loop.attachOutputSurface(surface, widthPx, heightPx, rects.source, rects.camera, 0L)
+        loop.attachOutputSurface(surface, widthPx, heightPx, rects.source, rects.camera)
         outputAttached = true
     }
 
@@ -261,7 +239,7 @@ class AndroidGreenScreenCameraGraphSource(
     }
 
     private fun recomputeLayoutRects() {
-        layoutRects = AndroidDuetLayoutGeometry.greenScreen(widthPx.toDouble(), heightPx.toDouble(), foregroundTransform)
+        layoutRects = AndroidGreenScreenLayoutGeometry.greenScreen(widthPx.toDouble(), heightPx.toDouble(), foregroundTransform)
     }
 
     private fun layoutRectsMap(): Map<String, Any> {

@@ -91,12 +91,10 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidBeautyV2VulkanRende
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPixelProofSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPreviewPresentationSmokeCoordinator
-import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGreenScreenTasksLiveSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenProductionExportSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenExportApiPixelProofSmokeCoordinator
-import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenQuantLabSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -524,13 +522,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var duetVulkanPreviewPresentationSmokeCoordinator:
         AndroidDuetVulkanPreviewPresentationSmokeCoordinator? = null
 
-    // ── ANDROID-DUET-GREENSCREEN-TASKS-LIVE: RND-only diagnostic proof of ────
-    // CameraX ImageAnalysis -> MediaPipe Tasks ImageSegmenter LIVE_STREAM ->
-    // static background Canvas composite -> Flutter SurfaceProducer texture.
-    // Not wired into production Duet preview/export.
-    private var duetGreenScreenTasksLiveSmokeCoordinator:
-        AndroidDuetGreenScreenTasksLiveSmokeCoordinator? = null
-
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent ingest smoke ────────
     private var camera2ConcurrentSmokeCoordinator: AndroidCamera2ConcurrentSmokeCoordinator? = null
 
@@ -614,9 +605,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator ──
     private var greenScreenExportApiPixelProofSmokeCoordinator: AndroidGreenScreenExportApiPixelProofSmokeCoordinator? = null
-
-    // ── VG-GREENSCREEN-QUANT-LAB: quantitative lab capture & candidate replay coordinator ──
-    private var greenScreenQuantLabSmokeCoordinator: AndroidGreenScreenQuantLabSmokeCoordinator? = null
 
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
@@ -929,11 +917,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             textureRegistry = binding.textureRegistry,
             mainHandler = mainHandler,
         )
-        duetGreenScreenTasksLiveSmokeCoordinator = AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
-            context = binding.applicationContext,
-            textureRegistry = binding.textureRegistry,
-            mainHandler = mainHandler,
-        )
         camera2ConcurrentSmokeCoordinator = AndroidCamera2ConcurrentSmokeCoordinator(
             context     = binding.applicationContext,
             mainHandler = mainHandler,
@@ -1007,8 +990,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator
         greenScreenExportApiPixelProofSmokeCoordinator = AndroidGreenScreenExportApiPixelProofSmokeCoordinator(mainHandler)
-        // VG-GREENSCREEN-QUANT-LAB: quantitative lab capture & candidate replay coordinator
-        greenScreenQuantLabSmokeCoordinator = AndroidGreenScreenQuantLabSmokeCoordinator(mainHandler)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -1056,17 +1037,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android green screen export API pixel proof coordinator unavailable", null)
-            }
-            return
-        }
-
-        // ── VG-GREENSCREEN-QUANT-LAB: quantitative lab capture & replay dispatch ──
-        if (AndroidGreenScreenQuantLabSmokeCoordinator.ownsMethod(call.method)) {
-            val coord = greenScreenQuantLabSmokeCoordinator
-            if (coord != null) {
-                coord.handleMethodCall(call.method, args, result)
-            } else {
-                result.error("UNAVAILABLE", "Android green screen quant lab coordinator unavailable", null)
             }
             return
         }
@@ -1929,20 +1899,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android Duet Vulkan pixel proof smoke coordinator unavailable",
-                    null,
-                )
-            }
-            return
-        }
-
-        if (AndroidDuetGreenScreenTasksLiveSmokeCoordinator.ownsMethod(call.method)) {
-            val coord = duetGreenScreenTasksLiveSmokeCoordinator
-            if (coord != null) {
-                coord.handleMethodCall(call.method, args, result)
-            } else {
-                result.error(
-                    "UNAVAILABLE",
-                    "AndroidDuetGreenScreenTasksLiveSmokeCoordinator unavailable",
                     null,
                 )
             }
@@ -3987,11 +3943,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         duetVulkanPreviewIngestCombinedSmokeCoordinator = null
         duetVulkanPreviewPresentationSmokeCoordinator?.disposeAll()
         duetVulkanPreviewPresentationSmokeCoordinator = null
-        // ANDROID-DUET-GREENSCREEN-TASKS-LIVE: stop the camera, close the
-        // segmenter on its owned thread, release the offscreen preview sink and
-        // the SurfaceProducer; later method calls are ignored.
-        duetGreenScreenTasksLiveSmokeCoordinator?.disposeAll()
-        duetGreenScreenTasksLiveSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
         editorExportCoordinator?.disposeAll()
@@ -4059,9 +4010,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: shutdown background executor.
         greenScreenExportApiPixelProofSmokeCoordinator?.disposeAll()
         greenScreenExportApiPixelProofSmokeCoordinator = null
-        // VG-GREENSCREEN-QUANT-LAB: shutdown coordinator and reset recorder.
-        greenScreenQuantLabSmokeCoordinator?.disposeAll()
-        greenScreenQuantLabSmokeCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

@@ -72,6 +72,163 @@ android {
     androidResources {
         noCompress "tflite"
     }
+
+    // Abandoned local RND prototypes and their packaging inputs excluded from
+    // package builds, not production source. The Duet duet/ and diagnostics/
+    // Kotlin entries below are tracked historical RND left on disk; the
+    // greenscreen/ Kotlin entries excluded from compilation below, the
+    // `assets/mediapipe/**` tree, and the `jniLibs` MediaPipe/OpenCV/libc++
+    // native libs excluded from packaging further below (see the `packaging`
+    // block after this sourceSets block) are untracked local
+    // engineering/lab output from the same abandoned GPU graph prototype.
+    // None of this is part of the production GreenScreen closure: the
+    // production Android GreenScreen CPU Tasks path loads the committed
+    // top-level `selfie_segmentation_landscape.tflite` asset (and its sibling
+    // top-level .tflite assets), not `assets/mediapipe/modules/...`, and it
+    // links the MediaPipe Tasks Vision AAR declared in `dependencies` below,
+    // not these hand-copied jniLibs .so files.
+    // Both a bare relative-path pattern and a "**/<filename>" wildcard
+    // pattern are listed per Kotlin file: PatternFilterable exclude matching
+    // is ANT-style, and a bare path only matches when it resolves against
+    // the exact source-root-relative path, so the wildcard form is kept as a
+    // defensive fallback that matches by filename regardless of which
+    // source root contributes the file.
+    sourceSets {
+        main {
+            java {
+                exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetGpuGreenScreenPipelineSmokeCoordinator.kt"
+                exclude "**/AndroidDuetGpuGreenScreenPipelineSmokeCoordinator.kt"
+                exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator.kt"
+                exclude "**/AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator.kt"
+                exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator.kt"
+                exclude "**/AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator.kt"
+                exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetGreenScreenTasksLiveSmokeCoordinator.kt"
+                exclude "**/AndroidDuetGreenScreenTasksLiveSmokeCoordinator.kt"
+                exclude "com/connects/vanguard_media_engine/duet/AndroidDuetCamera2GpuGreenScreenSource.kt"
+                exclude "**/AndroidDuetCamera2GpuGreenScreenSource.kt"
+                exclude "com/connects/vanguard_media_engine/duet/AndroidDuetGpuGreenScreenPipeline.kt"
+                exclude "**/AndroidDuetGpuGreenScreenPipeline.kt"
+                exclude "com/connects/vanguard_media_engine/duet/AndroidDuetGpuTextureBridge.kt"
+                exclude "**/AndroidDuetGpuTextureBridge.kt"
+                exclude "com/connects/vanguard_media_engine/duet/AndroidDuetMediaPipeGpuGraphSegmentationBackend.kt"
+                exclude "**/AndroidDuetMediaPipeGpuGraphSegmentationBackend.kt"
+                exclude "com/connects/vanguard_media_engine/duet/AndroidDuetMediaPipeGpuGraphSession.kt"
+                exclude "**/AndroidDuetMediaPipeGpuGraphSession.kt"
+                exclude "com/connects/vanguard_media_engine/diagnostics/AndroidGreenScreenQuantLabSmokeCoordinator.kt"
+                exclude "**/AndroidGreenScreenQuantLabSmokeCoordinator.kt"
+                exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenQuantLabRecorder.kt"
+                exclude "**/AndroidGreenScreenQuantLabRecorder.kt"
+                exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenGpuPipeline.kt"
+                exclude "**/AndroidGreenScreenGpuPipeline.kt"
+                exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenGpuTextureBridge.kt"
+                exclude "**/AndroidGreenScreenGpuTextureBridge.kt"
+                exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenMediaPipeGpuGraphSession.kt"
+                exclude "**/AndroidGreenScreenMediaPipeGpuGraphSession.kt"
+            }
+        }
+    }
+
+    // `sourceSets.main.{assets,jniLibs}.exclude(...)` is deliberately not used
+    // for the RND assets/native-libs below: unlike `java.exclude(...)` above,
+    // AGP's asset and jniLibs merge tasks (`mergeDebugAssets`,
+    // `mergeDebugJniLibFolders`) do not consult those source-set exclude
+    // patterns, so a source-set-level exclude silently has no effect on
+    // packaged output (verified: the files still appeared in the merged
+    // intermediates and final debug APK with such an exclude in place).
+    // `packaging.jniLibs.excludes` below is AGP's actual native-lib
+    // package-exclusion mechanism and is honored by the jniLibs packaging
+    // task for this module. `packaging.resources.excludes` does NOT reach
+    // the Android `assets/` merge pipeline, though, so it cannot remove
+    // `assets/mediapipe/**`; that merged asset output is scrubbed instead by
+    // the `merge*Assets` task hook further below.
+    packaging {
+        resources {
+            // NOTE: this excludes from merged Java resources only; it does
+            // NOT remove `assets/mediapipe/**` from the APK (verified: the
+            // tree still appeared in the final APK with only this exclude in
+            // place), since Android asset merging is a separate pipeline
+            // from Java resources packaging. The actual scrub of the
+            // untracked local RND asset tree from the abandoned MediaPipe
+            // GPU graph prototype out of merged `assets/mediapipe/**` output
+            // is performed by the `merge*Assets` task hook further below,
+            // which leaves the committed top-level
+            // `selfie_segmentation_landscape.tflite` / `selfie_segmentation.tflite`
+            // / other top-level model assets declared directly under
+            // `src/main/assets` packaged.
+            excludes += ["mediapipe/**"]
+        }
+        jniLibs {
+            // Untracked local RND native libs hand-copied for the same
+            // abandoned MediaPipe GPU graph prototype; production
+            // GreenScreen links MediaPipe Tasks Vision via the AAR
+            // dependency declared in `dependencies` below instead.
+            excludes += [
+                "**/libmediapipe_jni.so",
+                "**/libopencv_java4.so",
+                "**/libc++_shared.so",
+            ]
+        }
+    }
+}
+
+// `ignoreAssetsPatterns` on `MergeSourceSetFolders` does not remove
+// `assets/mediapipe/**` from the packaged APK (verified: the tree, including
+// `assets/mediapipe/modules/selfie_segmentation/...`, still appeared in the
+// final APK with that property set). Instead, scrub the generated
+// `merge*Assets` task output directly: after each variant's merge asset task
+// runs, delete the generated `mediapipe/**` output (and the generated
+// `mediapipe` directory itself) from that task's own output directories.
+// This only touches generated merge output, never `android/src/main/assets`.
+tasks.matching { task ->
+    task.name.startsWith("merge") && task.name.endsWith("Assets")
+}.configureEach { task ->
+    task.doLast {
+        task.outputs.files.files.each { outDir ->
+            delete(fileTree(outDir) {
+                include "mediapipe/**"
+            })
+            delete(file("${outDir}/mediapipe"))
+        }
+    }
+}
+
+// The `android.sourceSets.main.java.exclude(...)` above only affects AGP's
+// own bookkeeping (lint, resource merging); the Kotlin Gradle plugin builds
+// compileDebugKotlin's source list from its own KotlinSourceSet, which does
+// not consult that exclude. KotlinCompile itself implements PatternFilterable,
+// so the same exclude set (bare path + "**/<filename>" wildcard per file) is
+// also applied directly on the compile tasks to keep these abandoned RND
+// prototypes and GreenScreen engineering/lab files out of every variant's
+// Kotlin compilation.
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetGpuGreenScreenPipelineSmokeCoordinator.kt"
+    exclude "**/AndroidDuetGpuGreenScreenPipelineSmokeCoordinator.kt"
+    exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator.kt"
+    exclude "**/AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator.kt"
+    exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator.kt"
+    exclude "**/AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator.kt"
+    exclude "com/connects/vanguard_media_engine/diagnostics/AndroidDuetGreenScreenTasksLiveSmokeCoordinator.kt"
+    exclude "**/AndroidDuetGreenScreenTasksLiveSmokeCoordinator.kt"
+    exclude "com/connects/vanguard_media_engine/duet/AndroidDuetCamera2GpuGreenScreenSource.kt"
+    exclude "**/AndroidDuetCamera2GpuGreenScreenSource.kt"
+    exclude "com/connects/vanguard_media_engine/duet/AndroidDuetGpuGreenScreenPipeline.kt"
+    exclude "**/AndroidDuetGpuGreenScreenPipeline.kt"
+    exclude "com/connects/vanguard_media_engine/duet/AndroidDuetGpuTextureBridge.kt"
+    exclude "**/AndroidDuetGpuTextureBridge.kt"
+    exclude "com/connects/vanguard_media_engine/duet/AndroidDuetMediaPipeGpuGraphSegmentationBackend.kt"
+    exclude "**/AndroidDuetMediaPipeGpuGraphSegmentationBackend.kt"
+    exclude "com/connects/vanguard_media_engine/duet/AndroidDuetMediaPipeGpuGraphSession.kt"
+    exclude "**/AndroidDuetMediaPipeGpuGraphSession.kt"
+    exclude "com/connects/vanguard_media_engine/diagnostics/AndroidGreenScreenQuantLabSmokeCoordinator.kt"
+    exclude "**/AndroidGreenScreenQuantLabSmokeCoordinator.kt"
+    exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenQuantLabRecorder.kt"
+    exclude "**/AndroidGreenScreenQuantLabRecorder.kt"
+    exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenGpuPipeline.kt"
+    exclude "**/AndroidGreenScreenGpuPipeline.kt"
+    exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenGpuTextureBridge.kt"
+    exclude "**/AndroidGreenScreenGpuTextureBridge.kt"
+    exclude "com/connects/vanguard_media_engine/greenscreen/AndroidGreenScreenMediaPipeGpuGraphSession.kt"
+    exclude "**/AndroidGreenScreenMediaPipeGpuGraphSession.kt"
 }
 
 // ── CameraX dependencies (B2: Android camera pipeline) ───────────────────────

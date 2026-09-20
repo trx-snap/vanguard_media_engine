@@ -1,9 +1,5 @@
 package com.connects.vanguard_media_engine.greenscreen
 
-import com.connects.vanguard_media_engine.duet.AndroidDuetBackgroundScaleMode
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackground
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackgroundType
-
 /**
  * Parses the `filters` list sent to `setCameraFilterChain` for the
  * independent Green Screen camera graph.
@@ -42,7 +38,7 @@ object AndroidGreenScreenCameraFilterChain {
     sealed class ParseResult {
         data class Parsed(
             val greenScreenEnabled: Boolean,
-            val background: AndroidDuetGreenScreenBackground?,
+            val background: AndroidGreenScreenBackground?,
             val activeFilterTypes: List<String>,
             val outputMode: OutputMode,
         ) : ParseResult()
@@ -95,7 +91,7 @@ object AndroidGreenScreenCameraFilterChain {
             return clearedResult()
         }
 
-        var resolvedBackground: AndroidDuetGreenScreenBackground? = null
+        var resolvedBackground: AndroidGreenScreenBackground? = null
         var resolvedOutputMode: OutputMode? = null
         for (filter in enabledFilters) {
             if (filter.type != "greenScreen") {
@@ -118,11 +114,11 @@ object AndroidGreenScreenCameraFilterChain {
                             "BAD_ARGS",
                             "setCameraFilterChain: greenScreen solidColor requires an int 'argb'.",
                         )
-                    resolvedBackground = AndroidDuetGreenScreenBackground(
-                        type = AndroidDuetGreenScreenBackgroundType.SOLID_COLOR,
+                    resolvedBackground = AndroidGreenScreenBackground(
+                        type = AndroidGreenScreenBackgroundType.SOLID_COLOR,
                         argbColor = argb,
                         filePath = null,
-                        scaleMode = AndroidDuetBackgroundScaleMode.ASPECT_FILL,
+                        scaleMode = AndroidGreenScreenBackgroundScaleMode.ASPECT_FILL,
                     )
                     resolvedOutputMode = OutputMode.SOLID_COLOR
                 }

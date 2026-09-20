@@ -3,10 +3,6 @@ package com.connects.vanguard_media_engine.greenscreen
 import android.content.Context
 import android.os.Handler
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
-import com.connects.vanguard_media_engine.duet.AndroidDuetBackgroundScaleMode
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackground
-import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackgroundType
-import com.connects.vanguard_media_engine.duet.NativeForegroundTransform
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.io.File
@@ -145,17 +141,17 @@ class AndroidLiveGreenScreenMethodHandler(
      * `{type: image, filePath, scaleMode?}`. The image file must exist so a
      * missing background fails closed here instead of silently drawing black.
      */
-    private fun parseBackground(raw: Any?): AndroidDuetGreenScreenBackground {
+    private fun parseBackground(raw: Any?): AndroidGreenScreenBackground {
         val map = raw as? Map<*, *> ?: throw IllegalArgumentException("'background' map required")
         return when (val type = map["type"] as? String) {
             "solidColor" -> {
                 val argb = (map["argbColor"] as? Number)?.toInt()
                     ?: throw IllegalArgumentException("'background.argbColor' integer required")
-                AndroidDuetGreenScreenBackground(
-                    type = AndroidDuetGreenScreenBackgroundType.SOLID_COLOR,
+                AndroidGreenScreenBackground(
+                    type = AndroidGreenScreenBackgroundType.SOLID_COLOR,
                     argbColor = argb,
                     filePath = null,
-                    scaleMode = AndroidDuetBackgroundScaleMode.ASPECT_FILL,
+                    scaleMode = AndroidGreenScreenBackgroundScaleMode.ASPECT_FILL,
                 )
             }
             "image" -> {
@@ -167,15 +163,15 @@ class AndroidLiveGreenScreenMethodHandler(
                     throw IllegalArgumentException("'background.filePath' does not exist: $path")
                 }
                 val scaleMode = when (val rawMode = map["scaleMode"]) {
-                    null, "aspectFill" -> AndroidDuetBackgroundScaleMode.ASPECT_FILL
-                    "aspectFit" -> AndroidDuetBackgroundScaleMode.ASPECT_FIT
+                    null, "aspectFill" -> AndroidGreenScreenBackgroundScaleMode.ASPECT_FILL
+                    "aspectFit" -> AndroidGreenScreenBackgroundScaleMode.ASPECT_FIT
                     else -> throw IllegalArgumentException(
                         "'background.scaleMode' must be aspectFill or aspectFit (got $rawMode)",
                     )
                 }
-                AndroidDuetGreenScreenBackground(
-                    type = AndroidDuetGreenScreenBackgroundType.IMAGE,
-                    argbColor = AndroidDuetGreenScreenBackground.VIDEO.argbColor,
+                AndroidGreenScreenBackground(
+                    type = AndroidGreenScreenBackgroundType.IMAGE,
+                    argbColor = AndroidGreenScreenBackground.VIDEO.argbColor,
                     filePath = path,
                     scaleMode = scaleMode,
                 )
@@ -192,7 +188,7 @@ class AndroidLiveGreenScreenMethodHandler(
      * when not [required]. Scale must be finite and positive; components, when
      * present, must be finite numbers (offset defaults 0.0, anchor 0.5).
      */
-    private fun parseForegroundTransform(raw: Any?, required: Boolean): NativeForegroundTransform? {
+    private fun parseForegroundTransform(raw: Any?, required: Boolean): AndroidGreenScreenForegroundTransform? {
         if (raw == null) {
             if (required) throw IllegalArgumentException("'foregroundTransform' map required")
             return null
@@ -202,7 +198,7 @@ class AndroidLiveGreenScreenMethodHandler(
         if (scale <= 0.0) throw IllegalArgumentException("'foregroundTransform.scale' must be > 0")
         val (offsetX, offsetY) = parsePoint(map["offset"], "foregroundTransform.offset", 0.0)
         val (anchorX, anchorY) = parsePoint(map["anchor"], "foregroundTransform.anchor", 0.5)
-        return NativeForegroundTransform(
+        return AndroidGreenScreenForegroundTransform(
             scale = scale,
             offsetX = offsetX,
             offsetY = offsetY,
