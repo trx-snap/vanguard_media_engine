@@ -4,16 +4,34 @@
 // Focused Android physical smoke harness proving the independent UFM camera
 // green-screen path via the public Dart API.
 //
+// Output mode is selected via the ANDROID_UFM_GREENSCREEN_OUTPUT_MODE
+// dart-define ('solidColor', the default, or 'alpha'):
+//   - solidColor: unchanged behavior — applies
+//     VGFilterSpecs.greenScreenSolidColor(argb: parsed argb) and proves mask
+//     frames via diagnostics, exactly as before this slice.
+//   - alpha: applies VGFilterSpecs.greenScreenAlpha() and asserts
+//     getCameraGreenScreenDiagnostics() reports outputMode=='alpha',
+//     backgroundType=='alpha', backgroundARGB==null,
+//     alphaByteSelfTestPassed==true, alphaEncoding=='straight'. This proves
+//     native API acceptance plus a byte-level straight-alpha diagnostic
+//     self-test only — no visual transparent-preview claim is made.
+//
 // Sequence:
 //   1. print ANDROID_UFM_GREENSCREEN_PHYSICAL_START
 //   2. startCamera with greenScreenLowLatency (front camera: position 2, fps 30);
 //      if texture id valid, print ANDROID_UFM_GREENSCREEN_STEP_START_CAMERA_PASS
 //   3. During warmup, keep filter cleared/off and show normal camera.
-//   4. Apply exactly one filter: VGFilterSpecs.greenScreenSolidColor(argb: parsed argb).
-//      Print ANDROID_UFM_GREENSCREEN_STEP_APPLY_FILTER_PASS
-//   5. Poll diagnostics until both greenScreenDiagnostics and filterChainDiagnostics
-//      are non-null and graphFrameCount or maskFrameCount/steadyMaskFrameCount is > 0,
-//      or time out after 12 seconds. Print ANDROID_UFM_GREENSCREEN_STEP_DIAGNOSTICS_PASS
+//   4. Apply exactly one filter — solidColor mode:
+//      VGFilterSpecs.greenScreenSolidColor(argb: parsed argb); alpha mode:
+//      VGFilterSpecs.greenScreenAlpha(). Print
+//      ANDROID_UFM_GREENSCREEN_STEP_APPLY_FILTER_PASS
+//   5. solidColor mode: poll diagnostics until both greenScreenDiagnostics and
+//      filterChainDiagnostics are non-null and graphFrameCount or
+//      maskFrameCount/steadyMaskFrameCount is > 0, or time out after 12
+//      seconds. alpha mode: poll until greenScreenDiagnostics is non-null and
+//      reports the alpha contract fields above, or time out after 12 seconds.
+//      Print ANDROID_UFM_GREENSCREEN_STEP_DIAGNOSTICS_PASS, then for alpha
+//      mode also print ANDROID_UFM_GREENSCREEN_ALPHA_DIAGNOSTICS_PASS.
 //   6. Hold visual for hold seconds while periodically refreshing diagnostics.
 //   7. Clear filters with setCameraFilterChain([]). Assert both diagnostics return
 //      null within a short bounded wait; print ANDROID_UFM_GREENSCREEN_STEP_CLEAR_FILTERS_PASS
@@ -48,6 +66,15 @@ const bool kHideOverlay = bool.fromEnvironment(
   'ANDROID_UFM_GREENSCREEN_HIDE_OVERLAY',
   defaultValue: false,
 );
+
+const String kDefaultOutputMode = 'solidColor';
+
+const String kOutputMode = String.fromEnvironment(
+  'ANDROID_UFM_GREENSCREEN_OUTPUT_MODE',
+  defaultValue: kDefaultOutputMode,
+);
+
+final bool kIsAlphaMode = kOutputMode == 'alpha';
 
 int _resolveArgb() {
   const String raw = String.fromEnvironment(
@@ -203,6 +230,21 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
     return null;
   }
 
+  /// Alpha-mode diagnostics contract asserted from native telemetry only:
+  /// outputMode=='alpha', backgroundType=='alpha', backgroundARGB==null,
+  /// alphaByteSelfTestPassed==true (native's deterministic byte-level
+  /// straight-alpha construction self-test), alphaEncoding=='straight'. This
+  /// proves API acceptance and the native self-test only — no Flutter preview
+  /// transparency or export/recording alpha claim.
+  static bool _alphaDiagnosticsSatisfied(Map<String, dynamic>? gsDiag) {
+    if (gsDiag == null) return false;
+    return gsDiag['outputMode'] == 'alpha' &&
+        gsDiag['backgroundType'] == 'alpha' &&
+        gsDiag['backgroundARGB'] == null &&
+        gsDiag['alphaByteSelfTestPassed'] == true &&
+        gsDiag['alphaEncoding'] == 'straight';
+  }
+
   static double? _extractMaxLatency(
     Map<String, dynamic>? fcDiag,
     Map<String, dynamic>? gsDiag,
@@ -264,19 +306,28 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         if (mounted) setState(() {});
       }
 
-      // 4. Apply exactly one filter: VGFilterSpecs.greenScreenSolidColor(argb: parsed argb)
+      // 4. Apply exactly one filter — solidColor mode:
+      // VGFilterSpecs.greenScreenSolidColor(argb: parsed argb); alpha mode:
+      // VGFilterSpecs.greenScreenAlpha().
       _updatePhase('APPLY_FILTER');
       await VanguardEngine.setCameraFilterChain(<VGFilterSpec>[
-        VGFilterSpecs.greenScreenSolidColor(argb: kParsedArgb),
+        if (kIsAlphaMode)
+          VGFilterSpecs.greenScreenAlpha()
+        else
+          VGFilterSpecs.greenScreenSolidColor(argb: kParsedArgb),
       ]);
       print('ANDROID_UFM_GREENSCREEN_STEP_APPLY_FILTER_PASS');
 
-      // 5. Poll diagnostics until both greenScreenDiagnostics and filterChainDiagnostics
-      // are non-null and graphFrameCount or maskFrameCount/steadyMaskFrameCount is > 0,
-      // or time out after 12 seconds.
+      // 5. solidColor mode: poll diagnostics until both greenScreenDiagnostics
+      // and filterChainDiagnostics are non-null and graphFrameCount or
+      // maskFrameCount/steadyMaskFrameCount is > 0, or time out after 12
+      // seconds. alpha mode: poll until greenScreenDiagnostics reports the
+      // alpha contract (outputMode/backgroundType/backgroundARGB/
+      // alphaByteSelfTestPassed/alphaEncoding), or time out after 12 seconds.
       _updatePhase('POLL_DIAGNOSTICS');
       final pollDeadline = DateTime.now().add(const Duration(seconds: 12));
       var diagSatisfied = false;
+      var alphaDiagSatisfied = false;
 
       while (DateTime.now().isBefore(pollDeadline)) {
         final gs = await VanguardEngine.getCameraGreenScreenDiagnostics();
@@ -286,13 +337,21 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
           lastFcDiag = fc;
           _updateDiagnostics(gs, fc);
 
-          final gCount = _extractGraphFrameCount(fc);
-          final mCount = _extractMaskFrameCount(gs);
-          final sCount = _extractSteadyMaskFrameCount(gs);
+          if (kIsAlphaMode) {
+            if (_alphaDiagnosticsSatisfied(gs)) {
+              diagSatisfied = true;
+              alphaDiagSatisfied = true;
+              break;
+            }
+          } else {
+            final gCount = _extractGraphFrameCount(fc);
+            final mCount = _extractMaskFrameCount(gs);
+            final sCount = _extractSteadyMaskFrameCount(gs);
 
-          if (gCount > 0 || mCount > 0 || sCount > 0) {
-            diagSatisfied = true;
-            break;
+            if (gCount > 0 || mCount > 0 || sCount > 0) {
+              diagSatisfied = true;
+              break;
+            }
           }
         }
         await Future<void>.delayed(const Duration(milliseconds: 250));
@@ -300,11 +359,21 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
 
       if (!diagSatisfied) {
         throw TimeoutException(
-          'Timed out after 12s waiting for green-screen diagnostics with frame count > 0: '
-          'gsDiag=${lastGsDiag != null}, fcDiag=${lastFcDiag != null}',
+          kIsAlphaMode
+              ? 'Timed out after 12s waiting for alpha green-screen diagnostics contract: '
+                    'gsDiag=${lastGsDiag != null} (outputMode=${lastGsDiag?['outputMode']}, '
+                    'backgroundType=${lastGsDiag?['backgroundType']}, '
+                    'backgroundARGB=${lastGsDiag?['backgroundARGB']}, '
+                    'alphaByteSelfTestPassed=${lastGsDiag?['alphaByteSelfTestPassed']}, '
+                    'alphaEncoding=${lastGsDiag?['alphaEncoding']})'
+              : 'Timed out after 12s waiting for green-screen diagnostics with frame count > 0: '
+                    'gsDiag=${lastGsDiag != null}, fcDiag=${lastFcDiag != null}',
         );
       }
       print('ANDROID_UFM_GREENSCREEN_STEP_DIAGNOSTICS_PASS');
+      if (alphaDiagSatisfied) {
+        print('ANDROID_UFM_GREENSCREEN_ALPHA_DIAGNOSTICS_PASS');
+      }
 
       // 6. Hold visual for hold seconds while periodically refreshing diagnostics.
       _updatePhase('HOLD_VISUAL');
@@ -374,23 +443,45 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         'captureProfile': 'greenScreenLowLatency',
         'position': 2,
         'fps': 30,
-        'argb': kParsedArgb,
+        'outputMode': kOutputMode,
+        if (!kIsAlphaMode) 'argb': kParsedArgb,
         'warmupSeconds': kWarmupSeconds,
         'holdSeconds': kHoldSeconds,
-        'claimsAllowed': <String>[
-          'public UFM capture profile selected Android green-screen graph path',
-          'solid-color green-screen filter activated through setCameraFilterChain',
-          'preview texture was shown for manual observation',
-          'native diagnostics proved mask frames',
-          'filter clear returns diagnostics to null',
-        ],
-        'nonClaims': <String>[
-          'no automated pixel-quality proof',
-          'no beauty filter',
-          'no alpha output',
-          'no export/recording',
-          'no Duet',
-        ],
+        'claimsAllowed': kIsAlphaMode
+            ? <String>[
+                'public UFM capture profile selected Android green-screen graph path',
+                'VGFilterSpecs.greenScreenAlpha() was accepted by setCameraFilterChain '
+                    '(not UNSUPPORTED_FILTER_TYPE)',
+                'native telemetry reports outputMode==alpha, backgroundType==alpha, '
+                    'backgroundARGB==null, alphaEncoding==straight',
+                'native alphaByteSelfTestPassed==true: a deterministic Kotlin byte-level '
+                    'self-test proved straight-alpha pixel construction (foreground RGB '
+                    'unchanged, alpha equals mask, across transparent/edge/opaque cases)',
+                'filter clear returns diagnostics to null',
+              ]
+            : <String>[
+                'public UFM capture profile selected Android green-screen graph path',
+                'solid-color green-screen filter activated through setCameraFilterChain',
+                'preview texture was shown for manual observation',
+                'native diagnostics proved mask frames',
+                'filter clear returns diagnostics to null',
+              ],
+        'nonClaims': kIsAlphaMode
+            ? <String>[
+                'alpha mode proves native API acceptance plus a byte-level straight-alpha '
+                    'diagnostic self-test only',
+                'no visual transparent-preview claim: the Flutter Texture composites the '
+                    'frame with its own alpha interpretation',
+                'no export/recording alpha proof',
+                'no Duet/beauty/app wiring claim',
+                'no automated pixel-quality proof of the live camera matte',
+              ]
+            : <String>[
+                'no automated pixel-quality proof',
+                'no beauty filter',
+                'no export/recording',
+                'no Duet',
+              ],
         'greenScreenDiagnostics': ?lastGsDiag,
         'filterChainDiagnostics': ?lastFcDiag,
         'error': ?errorMessage,

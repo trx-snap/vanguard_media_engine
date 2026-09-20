@@ -3190,17 +3190,34 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     }
                     is AndroidGreenScreenCameraFilterChain.ParseResult.Parsed -> {
                         val background = parsed.background
-                        if (parsed.greenScreenEnabled && background != null) {
-                            graph.setGreenScreenBackground(background)
-                            graph.setGreenScreenEnabled(true)
-                            greenScreenFilterActive = true
-                            greenScreenBackgroundARGB = background.argbColor
-                            greenScreenActiveFilterTypes = parsed.activeFilterTypes
-                        } else {
-                            graph.setGreenScreenEnabled(false)
-                            greenScreenFilterActive = false
-                            greenScreenBackgroundARGB = null
-                            greenScreenActiveFilterTypes = emptyList()
+                        when {
+                            parsed.greenScreenEnabled &&
+                                parsed.outputMode == AndroidGreenScreenCameraFilterChain.OutputMode.SOLID_COLOR &&
+                                background != null -> {
+                                graph.setGreenScreenBackground(background)
+                                graph.setGreenScreenOutputMode(parsed.outputMode)
+                                graph.setGreenScreenEnabled(true)
+                                greenScreenFilterActive = true
+                                greenScreenBackgroundARGB = background.argbColor
+                                greenScreenActiveFilterTypes = parsed.activeFilterTypes
+                            }
+                            parsed.greenScreenEnabled &&
+                                parsed.outputMode == AndroidGreenScreenCameraFilterChain.OutputMode.ALPHA -> {
+                                // Alpha output does not composite over any background —
+                                // no solid color is required or sent to the graph.
+                                graph.setGreenScreenOutputMode(parsed.outputMode)
+                                graph.setGreenScreenEnabled(true)
+                                greenScreenFilterActive = true
+                                greenScreenBackgroundARGB = null
+                                greenScreenActiveFilterTypes = parsed.activeFilterTypes
+                            }
+                            else -> {
+                                graph.setGreenScreenOutputMode(AndroidGreenScreenCameraFilterChain.OutputMode.SOLID_COLOR)
+                                graph.setGreenScreenEnabled(false)
+                                greenScreenFilterActive = false
+                                greenScreenBackgroundARGB = null
+                                greenScreenActiveFilterTypes = emptyList()
+                            }
                         }
                         result.success(null)
                     }
@@ -3214,7 +3231,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     return
                 }
                 val snapshot = LinkedHashMap<String, Any?>(graph.diagnosticsSnapshot())
-                snapshot["outputMode"] = "composited"
                 snapshot["backgroundARGB"] = greenScreenBackgroundARGB
                 snapshot["activeFilterTypes"] = greenScreenActiveFilterTypes
                 result.success(snapshot)
@@ -3251,7 +3267,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     "android camera2 gpu source to mediapipe gpu mask and compositor present"
                 snapshot["nonClaims"] = listOf(
                     "beauty filters are not implemented in the Android UFM camera graph yet",
-                    "alpha-output is not implemented in the Android UFM camera graph yet",
+                    "alpha diagnostic route is implemented (backgroundType=alpha is accepted and reports " +
+                        "outputMode/backgroundType/alphaEncoding/alphaByteSelfTestPassed) but this is a " +
+                        "byte-level self-test and API-acceptance proof only",
+                    "no Flutter preview transparency pixel assertion is made for alpha mode",
+                    "no export/recording alpha proof exists",
+                    "no Duet/beauty/app wiring claim is made for alpha mode",
                 )
                 result.success(snapshot)
             }

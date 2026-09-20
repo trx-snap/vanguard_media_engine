@@ -11,26 +11,40 @@ import com.connects.vanguard_media_engine.duet.AndroidDuetGreenScreenBackgroundT
  * Contract (Android UFM green-screen parity slice):
  *   - An empty list, or a list whose filters are all disabled, means
  *     "disable green screen" ([ParseResult.Parsed.greenScreenEnabled] = false).
- *   - Exactly one enabled `greenScreen` filter with
- *     `parameters.backgroundType == "solidColor"` and an int `parameters.argb`
- *     is the only supported active state. More than one enabled `greenScreen`
- *     filter fails with `BAD_ARGS` rather than silently using the first.
+ *   - Exactly one enabled `greenScreen` filter is the only supported active
+ *     state. More than one enabled `greenScreen` filter fails with
+ *     `BAD_ARGS` rather than silently using the first.
+ *   - `parameters.backgroundType == "solidColor"` with an int `parameters.argb`
+ *     resolves to [OutputMode.SOLID_COLOR]; [ParseResult.Parsed.background] is
+ *     the parsed solid-color background.
+ *   - `parameters.backgroundType == "alpha"` resolves to [OutputMode.ALPHA];
+ *     [ParseResult.Parsed.background] is `null` — alpha output does not
+ *     composite over any background and no `argb` is required or read. This
+ *     is a diagnostics/API-acceptance route only: no Flutter preview
+ *     transparency or native renderer alpha-output proof is implied.
  *   - Any enabled filter whose `type` is not `"greenScreen"` fails with
  *     `UNKNOWN_FILTER`.
  *   - Any enabled `greenScreen` filter whose `backgroundType` is not
- *     `"solidColor"` (including `"alpha"`) fails with `UNSUPPORTED_FILTER_TYPE`
- *     — Android live alpha output is not implemented in this slice.
+ *     `"solidColor"` or `"alpha"` fails with `UNSUPPORTED_FILTER_TYPE`.
  *   - Structurally malformed entries fail with `BAD_ARGS`.
  *
  * Never throws for caller mistakes — every failure path is a [ParseResult.Failure].
  */
 object AndroidGreenScreenCameraFilterChain {
 
+    /**
+     * Output routing for a parsed `greenScreen` filter, tracked independently
+     * of [ParseResult.Parsed.greenScreenEnabled] and
+     * [ParseResult.Parsed.background].
+     */
+    enum class OutputMode { SOLID_COLOR, ALPHA }
+
     sealed class ParseResult {
         data class Parsed(
             val greenScreenEnabled: Boolean,
             val background: AndroidDuetGreenScreenBackground?,
             val activeFilterTypes: List<String>,
+            val outputMode: OutputMode,
         ) : ParseResult()
 
         data class Failure(val code: String, val message: String) : ParseResult()
@@ -82,6 +96,7 @@ object AndroidGreenScreenCameraFilterChain {
         }
 
         var resolvedBackground: AndroidDuetGreenScreenBackground? = null
+        var resolvedOutputMode: OutputMode? = null
         for (filter in enabledFilters) {
             if (filter.type != "greenScreen") {
                 return ParseResult.Failure(
@@ -89,36 +104,44 @@ object AndroidGreenScreenCameraFilterChain {
                     "Unknown filter type: ${filter.type}",
                 )
             }
-            val backgroundType = filter.parameters?.get("backgroundType") as? String
-            if (backgroundType != "solidColor") {
-                return ParseResult.Failure(
-                    "UNSUPPORTED_FILTER_TYPE",
-                    "Unsupported greenScreen backgroundType: ${backgroundType ?: "<missing>"}",
-                )
-            }
-            val argb = (filter.parameters["argb"] as? Number)?.toInt()
-                ?: return ParseResult.Failure(
-                    "BAD_ARGS",
-                    "setCameraFilterChain: greenScreen solidColor requires an int 'argb'.",
-                )
-            if (resolvedBackground != null) {
+            if (resolvedOutputMode != null) {
                 return ParseResult.Failure(
                     "BAD_ARGS",
                     "setCameraFilterChain: only one enabled greenScreen filter is supported.",
                 )
             }
-            resolvedBackground = AndroidDuetGreenScreenBackground(
-                type = AndroidDuetGreenScreenBackgroundType.SOLID_COLOR,
-                argbColor = argb,
-                filePath = null,
-                scaleMode = AndroidDuetBackgroundScaleMode.ASPECT_FILL,
-            )
+            val backgroundType = filter.parameters?.get("backgroundType") as? String
+            when (backgroundType) {
+                "solidColor" -> {
+                    val argb = (filter.parameters["argb"] as? Number)?.toInt()
+                        ?: return ParseResult.Failure(
+                            "BAD_ARGS",
+                            "setCameraFilterChain: greenScreen solidColor requires an int 'argb'.",
+                        )
+                    resolvedBackground = AndroidDuetGreenScreenBackground(
+                        type = AndroidDuetGreenScreenBackgroundType.SOLID_COLOR,
+                        argbColor = argb,
+                        filePath = null,
+                        scaleMode = AndroidDuetBackgroundScaleMode.ASPECT_FILL,
+                    )
+                    resolvedOutputMode = OutputMode.SOLID_COLOR
+                }
+                "alpha" -> {
+                    resolvedBackground = null
+                    resolvedOutputMode = OutputMode.ALPHA
+                }
+                else -> return ParseResult.Failure(
+                    "UNSUPPORTED_FILTER_TYPE",
+                    "Unsupported greenScreen backgroundType: ${backgroundType ?: "<missing>"}",
+                )
+            }
         }
 
         return ParseResult.Parsed(
             greenScreenEnabled = true,
             background = resolvedBackground,
             activeFilterTypes = listOf("greenScreen"),
+            outputMode = resolvedOutputMode ?: OutputMode.SOLID_COLOR,
         )
     }
 
@@ -126,5 +149,6 @@ object AndroidGreenScreenCameraFilterChain {
         greenScreenEnabled = false,
         background = null,
         activeFilterTypes = emptyList(),
+        outputMode = OutputMode.SOLID_COLOR,
     )
 }
