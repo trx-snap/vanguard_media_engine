@@ -15,6 +15,15 @@ interface IVanguardDualCameraSource {
     val frontTextureId: Long
     val backTextureId: Long
 
+    /**
+     * Non-null Flutter texture ID when this source's output is composited into a
+     * single [io.flutter.view.TextureRegistry.SurfaceProducer] texture by a
+     * compositor (e.g. [AndroidDualCameraCompositor]) rather than exposed as two
+     * separate per-camera textures. Defaults to `null` for implementations that
+     * do not route through a compositor.
+     */
+    val compositorTextureId: Long? get() = null
+
     fun start(
         onStarted: (Map<String, Any>) -> Unit,
         onError: (Exception) -> Unit,

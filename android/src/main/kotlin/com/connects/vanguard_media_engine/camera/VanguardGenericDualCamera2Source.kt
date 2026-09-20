@@ -34,12 +34,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class VanguardGenericDualCamera2Source(
     private val context: Context,
-    private val frontTextureEntry: TextureRegistry.SurfaceTextureEntry,
-    private val backTextureEntry: TextureRegistry.SurfaceTextureEntry,
+    private val frontTextureEntry: TextureRegistry.SurfaceTextureEntry? = null,
+    private val backTextureEntry: TextureRegistry.SurfaceTextureEntry? = null,
     private val frontCameraId: String = "1",
     private val backCameraId: String = "0",
     private val targetWidth: Int = 1080,
     private val targetHeight: Int = 1920,
+    // Compositor-provided external surfaces — when non-null, bypass SurfaceTextureEntry entirely.
+    // The compositor owns sizing and lifecycle of these surfaces; this source must not
+    // call setDefaultBufferSize() or release() on them.
+    private val externalFrontSurface: Surface? = null,
+    private val externalBackSurface: Surface? = null,
 ) : IVanguardDualCameraSource {
 
     companion object {
@@ -70,9 +75,13 @@ class VanguardGenericDualCamera2Source(
     private var backCaptureSession: CameraCaptureSession? = null
     private var backSurface: Surface? = null
 
+    // True when this source streams into compositor-owned external surfaces instead
+    // of allocating its own Surfaces from Flutter SurfaceTextureEntry instances.
+    private val usingExternalSurfaces = externalFrontSurface != null && externalBackSurface != null
+
     override val running: Boolean get() = isRunning
-    override val frontTextureId: Long get() = frontTextureEntry.id()
-    override val backTextureId: Long get() = backTextureEntry.id()
+    override val frontTextureId: Long get() = frontTextureEntry?.id() ?: -1L
+    override val backTextureId: Long get() = backTextureEntry?.id() ?: -1L
 
     @SuppressLint("MissingPermission")
     override fun start(
@@ -193,15 +202,26 @@ class VanguardGenericDualCamera2Source(
 
             // Configure Front Session
             val frontDevice = frontCameraDevice!!
-            val frontSurfaceTexture = frontTextureEntry.surfaceTexture()
-            frontSurfaceTexture.setDefaultBufferSize(frontSize.width, frontSize.height)
-            val frontSrf = Surface(frontSurfaceTexture).also { frontSurface = it }
-
-            // Configure Back Session
             val backDevice = backCameraDevice!!
-            val backSurfaceTexture = backTextureEntry.surfaceTexture()
-            backSurfaceTexture.setDefaultBufferSize(backSize.width, backSize.height)
-            val backSrf = Surface(backSurfaceTexture).also { backSurface = it }
+
+            val frontSrf: Surface
+            val backSrf: Surface
+            if (usingExternalSurfaces) {
+                // Compositor already sized and owns these surfaces — use directly.
+                frontSrf = externalFrontSurface!!
+                backSrf = externalBackSurface!!
+                Log.i(TAG, "Using external compositor surfaces for front/back camera streams")
+            } else {
+                val frontTex = frontTextureEntry!!
+                val frontSurfaceTexture = frontTex.surfaceTexture()
+                frontSurfaceTexture.setDefaultBufferSize(frontSize.width, frontSize.height)
+                frontSrf = Surface(frontSurfaceTexture).also { frontSurface = it }
+
+                val backTex = backTextureEntry!!
+                val backSurfaceTexture = backTex.surfaceTexture()
+                backSurfaceTexture.setDefaultBufferSize(backSize.width, backSize.height)
+                backSrf = Surface(backSurfaceTexture).also { backSurface = it }
+            }
 
             val frontSessionLatch = CountDownLatch(1)
             val backSessionLatch = CountDownLatch(1)
@@ -282,11 +302,11 @@ class VanguardGenericDualCamera2Source(
 
                 isRunning = true
                 isStarting = false
-                Log.i(TAG, "SUCCESS: Generic Dual Camera streaming! Front: #${frontTextureEntry.id()}, Back: #${backTextureEntry.id()}")
+                Log.i(TAG, "SUCCESS: Generic Dual Camera streaming! Front: #${frontTextureId}, Back: #${backTextureId}")
 
                 val resultMap: Map<String, Any> = mapOf(
-                    "textureId" to frontTextureEntry.id(),
-                    "backTextureId" to backTextureEntry.id(),
+                    "textureId" to frontTextureId,
+                    "backTextureId" to backTextureId,
                     "outputWidth" to targetWidth,
                     "outputHeight" to targetHeight,
                     "frontBufferWidth" to frontSize.width,

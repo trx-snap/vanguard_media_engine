@@ -77,8 +77,14 @@ import java.util.concurrent.Executor
  */
 class VanguardDualCameraSource(
     private val context: Context,
-    private val frontTextureEntry: TextureRegistry.SurfaceTextureEntry,
-    private val backTextureEntry: TextureRegistry.SurfaceTextureEntry,
+    private val frontTextureEntry: TextureRegistry.SurfaceTextureEntry? = null,
+    private val backTextureEntry: TextureRegistry.SurfaceTextureEntry? = null,
+    // Compositor-provided external surfaces — when non-null, bind CameraX's
+    // SurfaceRequest directly to these instead of a Flutter SurfaceTexture.
+    // The compositor owns sizing and lifecycle of these surfaces; this source
+    // must not release them.
+    private val externalFrontSurface: Surface? = null,
+    private val externalBackSurface: Surface? = null,
 ) : IVanguardDualCameraSource {
 
     companion object {
@@ -221,7 +227,7 @@ class VanguardDualCameraSource(
 
         val frontPreviewUseCase = frontPreviewBuilder.build().also { frontPreview = it }
         frontPreviewUseCase.setSurfaceProvider { request ->
-            provideSurface(request, frontTextureEntry, "front")
+            provideSurface(request, frontTextureEntry, externalFrontSurface, "front")
         }
 
         // ── Back camera Preview use-case ───────────────────────────────────
@@ -241,7 +247,7 @@ class VanguardDualCameraSource(
 
         val backPreviewUseCase = backPreviewBuilder.build().also { backPreview = it }
         backPreviewUseCase.setSurfaceProvider { request ->
-            provideSurface(request, backTextureEntry, "back")
+            provideSurface(request, backTextureEntry, externalBackSurface, "back")
         }
 
         // ── Build SingleCameraConfigs ──────────────────────────────────────
@@ -282,17 +288,18 @@ class VanguardDualCameraSource(
         Log.d(
             TAG,
             "bindConcurrentUseCases: both cameras bound — " +
-                "frontTextureId=${frontTextureEntry.id()} backTextureId=${backTextureEntry.id()}",
+                "frontTextureId=${frontTextureId} backTextureId=${backTextureId}",
         )
 
         // Deliver the result map. textureId is the front camera (primary display
-        // texture for VGMultiCamPreview). outputWidth/Height are 0 until a
-        // compositor is wired (Phase 2). Dart VGMultiCamRenderTextureSession
+        // texture for VGMultiCamPreview) when no compositor is wired, or -1 when
+        // streaming into compositor-owned external surfaces. outputWidth/Height
+        // are 0 until a compositor is wired. Dart VGMultiCamRenderTextureSession
         // handles outputWidth=0 gracefully (defaults to 9:16 aspect ratio).
         onStarted(
             mapOf(
-                "textureId"     to frontTextureEntry.id(),
-                "backTextureId" to backTextureEntry.id(),
+                "textureId"     to frontTextureId,
+                "backTextureId" to backTextureId,
                 "outputWidth"   to 0,
                 "outputHeight"  to 0,
             )
@@ -303,14 +310,32 @@ class VanguardDualCameraSource(
     // provideSurface()
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Bridges a CameraX Preview surface request → Flutter SurfaceTexture.
-    // Mirrors VanguardCameraSource.kt:430-455 exactly.
+    // Bridges a CameraX Preview surface request → Flutter SurfaceTexture, or
+    // directly to a compositor-owned external surface when one is supplied.
+    // Mirrors VanguardCameraSource.kt:430-455 exactly for the SurfaceTexture path.
     private fun provideSurface(
         request: SurfaceRequest,
-        textureEntry: TextureRegistry.SurfaceTextureEntry,
+        textureEntry: TextureRegistry.SurfaceTextureEntry?,
+        externalSurface: Surface?,
         tag: String,
     ) {
-        val surfaceTexture: SurfaceTexture = textureEntry.surfaceTexture()
+        if (externalSurface != null) {
+            // The compositor owns sizing and lifecycle of this surface — bind
+            // directly and do NOT release it in the completion callback.
+            request.provideSurface(externalSurface, mainExecutor) { result ->
+                Log.d(TAG, "provideSurface[$tag]: CameraX released external compositor surface (result=${result.resultCode})")
+            }
+            Log.d(TAG, "provideSurface[$tag]: bound external compositor surface (requested ${request.resolution.width}×${request.resolution.height})")
+            return
+        }
+
+        val entry = textureEntry ?: run {
+            Log.e(TAG, "provideSurface[$tag]: neither textureEntry nor externalSurface supplied — cannot satisfy SurfaceRequest")
+            request.willNotProvideSurface()
+            return
+        }
+
+        val surfaceTexture: SurfaceTexture = entry.surfaceTexture()
         val size = request.resolution
         surfaceTexture.setDefaultBufferSize(size.width, size.height)
 
@@ -323,7 +348,7 @@ class VanguardDualCameraSource(
             surface.release()
         }
 
-        Log.d(TAG, "provideSurface[$tag]: ${size.width}×${size.height} → textureId=${textureEntry.id()}")
+        Log.d(TAG, "provideSurface[$tag]: ${size.width}×${size.height} → textureId=${entry.id()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -427,9 +452,9 @@ class VanguardDualCameraSource(
     /** True once the back camera has delivered at least one completed capture. */
     val isBackCameraReady: Boolean get() = backCameraReadyFlag
 
-    /** Flutter texture ID for the front camera stream. */
-    override val frontTextureId: Long get() = frontTextureEntry.id()
+    /** Flutter texture ID for the front camera stream, or -1 when streaming into a compositor's external surface. */
+    override val frontTextureId: Long get() = frontTextureEntry?.id() ?: -1L
 
-    /** Flutter texture ID for the back camera stream. */
-    override val backTextureId: Long get() = backTextureEntry.id()
+    /** Flutter texture ID for the back camera stream, or -1 when streaming into a compositor's external surface. */
+    override val backTextureId: Long get() = backTextureEntry?.id() ?: -1L
 }

@@ -10,6 +10,10 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.diagnostics.BackendCapabilityReport
+import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
+import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.CountDownLatch
@@ -68,6 +72,8 @@ class AndroidCamera2MultiCamPreviewCoordinator(
     private var dualCameraSource: IVanguardDualCameraSource? = null
     private var frontTexture: TextureRegistry.SurfaceTextureEntry? = null
     private var backTexture: TextureRegistry.SurfaceTextureEntry? = null
+    private var dualCamCompositor: AndroidDualCameraCompositor? = null
+    private var surfaceProducer: TextureRegistry.SurfaceProducer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cameraManager by lazy { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
     companion object {
@@ -229,10 +235,86 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             return
         }
 
-        // Allocate two Flutter texture entries — one per camera stream.
-        val front = textureRegistry.createSurfaceTexture()
-        val back  = textureRegistry.createSurfaceTexture()
-        Log.i(TAG, "startMultiCamPreview: allocated front textureId=${front.id()} back textureId=${back.id()}")
+        // Probe GPU backend capability for the compositor (Vulkan preferred, GLES fallback).
+        // Uses a throwaway VanguardNativeBridge purely to call probeCapabilities() —
+        // this coordinator does not own a bridge instance otherwise.
+        val diagnostics = VanguardDiagnostics()
+        val probeBridge = VanguardNativeBridge(VanguardLifecycleObserver(diagnostics), diagnostics, null)
+        val capabilityReport: BackendCapabilityReport = try {
+            probeBridge.probeCapabilities()
+        } catch (t: Throwable) {
+            Log.e(TAG, "startMultiCamPreview: probeCapabilities failed: ${t.javaClass.simpleName}: ${t.message}")
+            result.error("CAMERA_ERROR", "Unable to probe backend capabilities: ${t.message}", null)
+            return
+        }
+
+        // Allocate a single Flutter SurfaceProducer for the composited output —
+        // architectural parity with iOS (one texture, backTextureId=null).
+        val producer = textureRegistry.createSurfaceProducer()
+        producer.setSize(targetWidth, targetHeight)
+        val outputSurface = producer.getSurface()
+        if (outputSurface == null) {
+            Log.e(TAG, "startMultiCamPreview: SurfaceProducer.getSurface() returned null")
+            try { producer.release() } catch (t: Throwable) { /* ignore */ }
+            result.error("CAMERA_ERROR", "SurfaceProducer.getSurface() returned null", null)
+            return
+        }
+
+        // Create and start the compositor — it owns the camera input surfaces,
+        // the GPU render loop, and renders composited frames into outputSurface.
+        val compositor = AndroidDualCameraCompositor(
+            outputSurface = outputSurface,
+            backendCapability = capabilityReport,
+            canvasWidth = targetWidth,
+            canvasHeight = targetHeight,
+        )
+        try {
+            compositor.start()
+        } catch (t: Throwable) {
+            Log.e(TAG, "startMultiCamPreview: compositor.start() failed: ${t.javaClass.simpleName}: ${t.message}")
+            try { producer.release() } catch (e: Throwable) { /* ignore */ }
+            result.error("CAMERA_ERROR", "Failed to start dual-camera compositor: ${t.message}", null)
+            return
+        }
+
+        val compositorFrontSurface = compositor.frontInputSurface
+        val compositorBackSurface = compositor.backInputSurface
+
+        fun onCompositorPipelineStarted(source: IVanguardDualCameraSource) {
+            dualCameraSource = source
+            dualCamCompositor = compositor
+            surfaceProducer = producer
+            frontTexture = null
+            backTexture = null
+            Log.i(
+                TAG,
+                "startMultiCamPreview: compositor pipeline live — textureId=${producer.id()} " +
+                    "backend=${if (compositor.isVulkanBackend) "Vulkan" else "GLES"}",
+            )
+            result.success(
+                mapOf(
+                    "textureId" to producer.id(),
+                    "backTextureId" to null,
+                    "outputWidth" to targetWidth,
+                    "outputHeight" to targetHeight,
+                    "frontDeviceId" to frontDeviceId,
+                    "backDeviceId" to backDeviceId,
+                    "backend" to if (compositor.isVulkanBackend) "Vulkan" else "GLES",
+                )
+            )
+        }
+
+        fun onCompositorPipelineError(e: Exception) {
+            Log.e(TAG, "startMultiCamPreview: camera source failed: ${e.javaClass.simpleName}: ${e.message}")
+            try { compositor.stop() } catch (t: Throwable) { /* ignore */ }
+            try { producer.release() } catch (t: Throwable) { /* ignore */ }
+            dualCameraSource = null
+            dualCamCompositor = null
+            surfaceProducer = null
+            frontTexture = null
+            backTexture = null
+            result.error("CAMERA_ERROR", e.message, null)
+        }
 
         // Check whether HAL advertises concurrent camera IDs for CameraX
         val probeResult = try {
@@ -249,68 +331,55 @@ class AndroidCamera2MultiCamPreviewCoordinator(
         }
 
         if (supportsConcurrent && hasMatchingConcurrentSet) {
-            // Attempt CameraX ConcurrentCamera path first
+            // Attempt CameraX ConcurrentCamera path first, streaming into the
+            // compositor's input surfaces instead of Flutter SurfaceTextures.
             val source = VanguardDualCameraSource(
-                context           = context,
-                frontTextureEntry = front,
-                backTextureEntry  = back,
+                context = context,
+                frontTextureEntry = null,
+                backTextureEntry = null,
+                externalFrontSurface = compositorFrontSurface,
+                externalBackSurface = compositorBackSurface,
             )
             source.start(
-                onStarted = { resultMap ->
-                    dualCameraSource = source
-                    frontTexture     = front
-                    backTexture      = back
-                    Log.i(TAG, "startMultiCamPreview: CameraX live — frontTextureId=${front.id()} backTextureId=${back.id()}")
-                    result.success(resultMap)
-                },
+                onStarted = { _ -> onCompositorPipelineStarted(source) },
                 onError = { e ->
-                    Log.w(TAG, "startMultiCamPreview: CameraX start failed (${e.message}) — falling back to generic Camera2")
-                    startGenericDualCamera2(frontDeviceId, backDeviceId, targetWidth, targetHeight, front, back, result)
+                    Log.w(TAG, "startMultiCamPreview: CameraX compositor path failed (${e.message}) — falling back to generic Camera2")
+                    val genericSource = VanguardGenericDualCamera2Source(
+                        context = context,
+                        frontTextureEntry = null,
+                        backTextureEntry = null,
+                        frontCameraId = frontDeviceId,
+                        backCameraId = backDeviceId,
+                        targetWidth = targetWidth,
+                        targetHeight = targetHeight,
+                        externalFrontSurface = compositorFrontSurface,
+                        externalBackSurface = compositorBackSurface,
+                    )
+                    genericSource.start(
+                        onStarted = { _ -> onCompositorPipelineStarted(genericSource) },
+                        onError = { e2 -> onCompositorPipelineError(e2) },
+                    )
                 },
             )
         } else {
-            // Direct generic raw Camera2 path (bypasses missing HAL concurrentCameraIds table)
-            startGenericDualCamera2(frontDeviceId, backDeviceId, targetWidth, targetHeight, front, back, result)
+            // Direct generic raw Camera2 path (bypasses missing HAL concurrentCameraIds
+            // table), streaming into the compositor's input surfaces.
+            val source = VanguardGenericDualCamera2Source(
+                context = context,
+                frontTextureEntry = null,
+                backTextureEntry = null,
+                frontCameraId = frontDeviceId,
+                backCameraId = backDeviceId,
+                targetWidth = targetWidth,
+                targetHeight = targetHeight,
+                externalFrontSurface = compositorFrontSurface,
+                externalBackSurface = compositorBackSurface,
+            )
+            source.start(
+                onStarted = { _ -> onCompositorPipelineStarted(source) },
+                onError = { e -> onCompositorPipelineError(e) },
+            )
         }
-    }
-
-    private fun startGenericDualCamera2(
-        frontDeviceId: String,
-        backDeviceId: String,
-        targetWidth: Int,
-        targetHeight: Int,
-        front: TextureRegistry.SurfaceTextureEntry,
-        back: TextureRegistry.SurfaceTextureEntry,
-        result: MethodChannel.Result,
-    ) {
-        val source = VanguardGenericDualCamera2Source(
-            context           = context,
-            frontTextureEntry = front,
-            backTextureEntry  = back,
-            frontCameraId     = frontDeviceId,
-            backCameraId      = backDeviceId,
-            targetWidth       = targetWidth,
-            targetHeight      = targetHeight,
-        )
-
-        source.start(
-            onStarted = { resultMap ->
-                dualCameraSource = source
-                frontTexture     = front
-                backTexture      = back
-                Log.i(TAG, "startMultiCamPreview: Generic Camera2 live — frontTextureId=${front.id()} backTextureId=${back.id()}")
-                result.success(resultMap)
-            },
-            onError = { e ->
-                Log.e(TAG, "startMultiCamPreview: Generic Camera2 failed: ${e.javaClass.simpleName}: ${e.message}")
-                try { front.release() } catch (t: Throwable) { /* ignore */ }
-                try { back.release()  } catch (t: Throwable) { /* ignore */ }
-                dualCameraSource = null
-                frontTexture     = null
-                backTexture      = null
-                result.error("CAMERA_ERROR", e.message, null)
-            },
-        )
     }
 
     // -- discoverDualCameraPairs (hardware enumeration) ------------------------
@@ -488,13 +557,28 @@ class AndroidCamera2MultiCamPreviewCoordinator(
         }
 
         Log.i(TAG, "stopMultiCamPreview: stopping dual camera session")
+
+        // 1. Stop camera source first (it streams into compositor surfaces)
         source.stop()
 
-        // Release the Flutter texture entries now that CameraX is unbound.
+        // 2. Stop compositor (owns input surfaces, render loop, GPU resources)
+        try { dualCamCompositor?.stop() } catch (t: Throwable) {
+            Log.w(TAG, "dualCamCompositor.stop failed: ${t.message}")
+        }
+
+        // 3. Release SurfaceProducer (Flutter texture)
+        try { surfaceProducer?.release() } catch (t: Throwable) {
+            Log.w(TAG, "surfaceProducer.release failed: ${t.message}")
+        }
+
+        // 4. Release legacy texture entries if they exist (backward compat safety)
         try { frontTexture?.release() } catch (t: Throwable) { Log.w(TAG, "frontTexture.release failed: ${t.message}") }
         try { backTexture?.release()  } catch (t: Throwable) { Log.w(TAG, "backTexture.release failed: ${t.message}")  }
 
+        // 5. Clear all state
         dualCameraSource = null
+        dualCamCompositor = null
+        surfaceProducer  = null
         frontTexture     = null
         backTexture      = null
 
@@ -521,6 +605,11 @@ class AndroidCamera2MultiCamPreviewCoordinator(
                 "updateMultiCamPreviewConfig requires a config map",
                 null,
             )
+            return
+        }
+
+        if (dualCameraSource != null) {
+            result.success(null)
             return
         }
 
