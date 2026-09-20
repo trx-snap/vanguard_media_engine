@@ -548,17 +548,6 @@ class AndroidEditorSequentialPlaybackSession(
                     }
                 }
             },
-            // Phase 10-Autoplay-Fix: resume audio when video auto-resumes
-            // after a transient surface loss restore.
-            onPlaybackResumed = {
-                orchHandler?.post {
-                    if (sessionToken.get() == mySessionToken && !disposed.get()) {
-                        Log.i(TAG, "onPlaybackResumed: resuming audio after surface restoration")
-                        isPlaying = true
-                        activeAudioRuntime?.play()
-                    }
-                }
-            },
             context = context,
         )
 
