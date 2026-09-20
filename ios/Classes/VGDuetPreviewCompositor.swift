@@ -1,15 +1,22 @@
 // VGDuetPreviewCompositor.swift
 // VG-DUET-SLICE-4B-B: CoreImage compositor for the Duet preview texture.
 //
+// Duet is a 2-input spatial compositor: source media + a foreground camera/effects
+// frame. It must NOT own mask refinement, CIBlendWithMask, raw masks, or standalone
+// live GreenScreen camera ingress — that live/static GreenScreen compositing
+// responsibility lives in VGLiveGreenScreenCompositor.swift instead (see that file for
+// the CIBlendWithMask green-screen path and VGMatteRefinementPipeline ownership).
+//
 // Responsibilities:
 //   - Owns a Metal-backed CIContext (CPU fallback when no Metal device exists).
 //   - Owns a BGRA, Metal-compatible, IOSurface-backed CVPixelBufferPool at a
 //     fixed canvas size.
 //   - composite(): dark canvas + aspect-filled source frame in sourceRect +
-//     deterministic camera placeholder in cameraRect.
+//     either a foreground camera frame (opaque, or already keyed upstream as
+//     straight-alpha) in cameraRect, or a deterministic camera placeholder.
 //
-// Explicitly NOT in this slice: camera capture, green-screen keying, audio,
-// export.  The camera placeholder is a static visual so that layout geometry
+// Explicitly NOT in this slice: camera capture, green-screen keying/mask refinement,
+// audio, export.  The camera placeholder is a static visual so that layout geometry
 // can be verified on-device before camera capture lands.
 //
 // Coordinate systems:
@@ -18,78 +25,16 @@
 //   flips Y and snaps edges to whole pixels, so geometry intent is preserved to
 //   within 1 px.
 //
-// Production green-screen mask refinement pipeline:
-// The aspect-filled L8 mask is refined at output (canvas) scale, then composited via
-// CIBlendWithMask. The refinement policy and CoreImage filter graph (S1 base stages,
-// the S4/S5 candidates — S5 lab-only; S4 soft R2 the production live default and S4 R1
-// an opt-in live RND mode — and the opt-in live tightAlphaR1 post-pass) are
-// owned by VGMatteRefinementPipeline (VGMatteRefinementPipeline.swift), not by this
-// compositor — see that file for the full stage-by-stage algorithm description. This
-// compositor owns exactly one `mattePipeline` instance (created in init with
-// `liveMatteRefinementMode`) and delegates to it:
-//   - composite() calls `mattePipeline.refineLiveGreenScreenMask(...)` before
-//     CIBlendWithMask (S1 stages only in the neutral `.s1` default; S1 stages plus the
-//     S4 soft R2 refinement when a green-screen caller passes
-//     VGMatteRefinementPipeline.defaultLiveMatteRefinementMode explicitly; tightAlphaR1
-//     or S4 R1 when opted in through `liveMatteRefinementMode`).
-//
-// Default-mode boundary: this compositor is generic (Duet and green-screen share it), so
-// its `init` default is the neutral `.s1` path and it never inherits green-screen visual
-// tuning on its own. Constructing it with no mode (the Duet native session coordinator,
-// the deterministic pixel proof) yields exactly the S1-only path. Green-screen callers that
-// want the production Soft R2 default (VGLiveGreenScreenSessionCoordinator via the session
-// mode, VGLiveGreenScreenReplayDiagnostics.replay) must pass
-// `VGMatteRefinementPipeline.defaultLiveMatteRefinementMode` explicitly; that constant is
-// owned by the green-screen pipeline, not by this compositor.
-//   - greenScreenMatteStages(aspectFilledMask:in:guidedBy:refinementMode:) and
-//     refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask:in:guidedBy:) are thin
-//     wrappers over the pipeline, kept here so existing callers
-//     (VGLiveGreenScreenReplayDiagnostics's offline matte-stage lab, and the ARKit
-//     ARMatteGenerator engine's external refinement seam) compile unchanged.
-//   - GreenScreenRefinementMode, LiveMatteRefinementMode, GreenScreenMatteStages, and
-//     LiveGreenScreenMaskRefinement are typealiases to the pipeline's nested types, so
-//     `VGDuetPreviewCompositor.LiveMatteRefinementMode` etc. keep resolving.
-// ciRect(fromTopLeft:), aspectFill(_:into:), and ciContext are internal (not private) so
-// VGLiveGreenScreenReplayDiagnostics can reproduce composite()'s exact geometry and render
-// the pipeline's stage taps through the same context. The compositor itself never writes
-// files.
-//
-// Fail-open behavior:
-// Each refinement stage is fail-open to its input: if a required CoreImage filter is
-// unavailable or inputs are degenerate, the stage is skipped and the previous stage's
-// output is used unchanged, so the worst case is the raw unmodified mask. CIBlendWithMask
-// is never skipped due to refinement failure; only if CIBlendWithMask itself is unavailable
-// does composition fall back to opaque camera overlay.
-//
-// Phase 4B-A straight-alpha foreground ingest:
+// Straight-alpha foreground ingest (Phase 4B-A; the proven Duet production path):
 // composite(cameraFrameUsesStraightAlpha: true) treats `cameraFrame` as a foreground that
 // was ALREADY keyed upstream: BGRA with STRAIGHT (non-premultiplied) alpha, RGB = 0 where
 // alpha = 0 (the VGGreenScreenFilterNode alpha output convention).  The frame is
 // premultiplied (CIImage.premultiplyingAlpha), aspect-filled into cameraRect and
 // source-over composited onto the composed source canvas.  No matte is required, no matte
-// refinement runs, and `isGreenScreen` / `greenScreenMask` are ignored for that call.  The
-// default (`false`) leaves every existing caller and the matte-keyed CIBlendWithMask path
-// byte-for-byte unchanged.  Keying is therefore decided by the caller's mode, never by
-// whether a mask happens to be non-nil.  Straight-alpha frames may come from
-// VGGreenScreenFilterNode alpha mode via the graph-backed foreground provider
-// (VGDuetGraphGreenScreenForegroundProvider); this compositor remains unaware of
-// ML/matte policy — it only composites whatever it is handed.
-//
-// Production stack & physical proof summary:
-// iOS live green-screen edge smoothness A/B S1: Vision Fast default + compositor refinement
-// (morphology close r1b radius 1.0, feather 4.0, trimap 0.10/0.90, guided edge
-// constants 2.0/1.5/0.08/0.34).
-// Rationale: S1 widens output-scale anti-aliased alpha transition to reduce visible edge pixelation
-// while preserving the already-proved Vision Fast backend, 512 matte publish geometry,
-// camera aspect/orientation, and morphology r1b crash fix.
-// Physical proof baseline: clean-copy Vision Fast avgTotalMs ≈ 13.9 ms, degradedEventCount 0.
-//
-// Deterministic pixel proof note:
-// The in-file deterministic pixel proof (runDeterministicPixelProof, reached via
-// VGDuetMethodHandler) was authored for linear blending. Because mask refinement is
-// nonlinear (specifically, trimap smoothstep remaps mask byte 64 [~0.251] to ~0.034,
-// which trips fractionalBlendMathOk), deterministic pixel proof must be rebaselined
-// separately if used with the production refinement pipeline active.
+// refinement runs.  The default (`false`) composites `cameraFrame` as an opaque overlay
+// instead.  Straight-alpha frames may come from VGGreenScreenFilterNode alpha mode via the
+// graph-backed foreground provider (VGDuetGraphGreenScreenForegroundProvider); this
+// compositor remains unaware of ML/matte policy — it only composites whatever it is handed.
 //
 // Threading: composite() is expected to be called from a single serial queue
 // (the render loop's render queue).  The CIContext and pool are immutable
@@ -108,23 +53,6 @@ final class VGDuetPreviewCompositor {
     let canvasWidth: Int
     let canvasHeight: Int
 
-    /// Live-selectable matte refinement mode for this compositor instance (see
-    /// `LiveMatteRefinementMode`). Defaults to the neutral `.s1` (S1-only path) when no
-    /// argument is passed to `init`: the generic compositor never inherits green-screen
-    /// tuning by construction alone. Green-screen callers that want the production Soft R2
-    /// default pass `VGMatteRefinementPipeline.defaultLiveMatteRefinementMode`
-    /// (`.s4SoftAlphaR2`) explicitly (the live green-screen coordinator forwards the
-    /// session mode, itself defaulted from the diagnostic-only
-    /// `setLiveGreenScreenDiagnosticsOptions` route at session start). Never mutated for
-    /// the lifetime of the instance.
-    let liveMatteRefinementMode: LiveMatteRefinementMode
-
-    /// Owns the actual matte refinement filter graph (S1/S4/S5/tightAlphaR1); this
-    /// compositor delegates `greenScreenMatteStages(...)` and
-    /// `refineLiveGreenScreenMaskForExternalEngine(...)` to it instead of implementing
-    /// refinement itself. See VGMatteRefinementPipeline.swift.
-    private let mattePipeline: VGMatteRefinementPipeline
-
     var canvasSize: CGSize { CGSize(width: canvasWidth, height: canvasHeight) }
     private var canvasBounds: CGRect { CGRect(origin: .zero, size: canvasSize) }
 
@@ -133,8 +61,6 @@ final class VGDuetPreviewCompositor {
     /// Compositor-owned CIContext.  Backed by a single process-wide context
     /// (CIContext is thread-safe and expensive to create), so repeated
     /// attach/detach cycles do not pay the Metal pipeline warm-up cost again.
-    /// Internal (not private) so the offline replay lab can render matte stage
-    /// taps through the same context composite() uses.
     let ciContext: CIContext
 
     /// Output pool.  BGRA + Metal compatible + IOSurface backed so Flutter's
@@ -152,24 +78,18 @@ final class VGDuetPreviewCompositor {
 
     // MARK: - Palette (deterministic)
 
-    /// Internal (not private) so the offline replay lab can rebuild composite()'s canvas
-    /// when composing a diagnostic-only (non-S1) final mask; composite() itself is unchanged.
-    static let canvasColor              = CIColor(red: 0.04, green: 0.04, blue: 0.05, alpha: 1.0)
+    private static let canvasColor      = CIColor(red: 0.04, green: 0.04, blue: 0.05, alpha: 1.0)
     private static let placeholderFill  = CIColor(red: 0.16, green: 0.18, blue: 0.22, alpha: 1.0)
     private static let placeholderEdge  = CIColor(red: 0.34, green: 0.37, blue: 0.44, alpha: 1.0)
     private static let placeholderGlow  = CIColor(red: 0.30, green: 0.33, blue: 0.40, alpha: 1.0)
     private static let placeholderEdgePx: CGFloat = 2.0
 
-    /// Alpha used when the camera rect fully covers the source rect (green
-    /// screen / degenerate layouts).  Keeps the source visible instead of
-    /// occluding it with an opaque placeholder.
+    /// Alpha used when the camera rect fully covers the source rect (degenerate
+    /// layouts).  Keeps the source visible instead of occluding it with an
+    /// opaque placeholder.
     private static let overlayAlpha: CGFloat = 0.28
 
-    /// One-time diagnostic marker: set to true after the first successful
-    /// CIBlendWithMask composite.  Guards against log spam on every frame.
-    private var _hasLoggedFirstMaskBlend = false
-
-    /// One-time diagnostic marker for the Phase 4B-A straight-alpha foreground path
+    /// One-time diagnostic marker for the straight-alpha foreground path
     /// (`cameraFrameUsesStraightAlpha: true`).  Guards against log spam on every frame.
     private var _hasLoggedFirstStraightAlphaComposite = false
 
@@ -187,16 +107,13 @@ final class VGDuetPreviewCompositor {
 
     // MARK: - Init
 
-    init(canvasWidth: Double, canvasHeight: Double,
-         liveMatteRefinementMode: LiveMatteRefinementMode = .s1) {
+    init(canvasWidth: Double, canvasHeight: Double) {
         let width  = max(2, Int(canvasWidth.rounded()))
         let height = max(2, Int(canvasHeight.rounded()))
         self.canvasWidth  = width
         self.canvasHeight = height
         self.ciContext    = VGDuetPreviewCompositor.sharedContext
         self.pool         = VGDuetPreviewCompositor.makePool(width: width, height: height)
-        self.liveMatteRefinementMode = liveMatteRefinementMode
-        self.mattePipeline = VGMatteRefinementPipeline(liveMatteRefinementMode: liveMatteRefinementMode)
     }
 
     // MARK: - Composite
@@ -209,23 +126,17 @@ final class VGDuetPreviewCompositor {
     ///   - cameraRect:      top-left-origin canvas rect for the camera slot.
     ///   - cameraFrame:     live camera frame (BGRA).  When non-nil, aspect-filled into cameraRect.
     ///                      When nil, the deterministic camera placeholder is drawn instead.
-    ///   - isGreenScreen:   when true, attempt CIBlendWithMask keying instead of opaque overlay.
-    ///   - greenScreenMask: single-channel (L8) mask buffer; 255 = subject (foreground).
-    ///                      Nil or unavailable falls back to the camera-over-source preview.
     ///   - cameraFrameUsesStraightAlpha:
     ///                      Phase 4B-A.  When true, `cameraFrame` is a foreground already
     ///                      keyed upstream (BGRA, STRAIGHT alpha): it is premultiplied,
     ///                      aspect-filled into cameraRect and source-over composited onto
-    ///                      the composed canvas.  No mask is required, no matte refinement
-    ///                      runs, and `isGreenScreen` / `greenScreenMask` are ignored.
-    ///                      Default false: every existing caller is unchanged.
+    ///                      the composed canvas.  Default false composites `cameraFrame`
+    ///                      as an opaque overlay instead.
     /// - Returns: a pool-backed BGRA buffer, or nil when the pool is exhausted / unavailable.
     func composite(sourceFrame: CVPixelBuffer?,
                    sourceRect: CGRect,
                    cameraRect: CGRect,
                    cameraFrame: CVPixelBuffer? = nil,
-                   isGreenScreen: Bool = false,
-                   greenScreenMask: CVPixelBuffer? = nil,
                    cameraFrameUsesStraightAlpha: Bool = false) -> CVPixelBuffer? {
         guard let pool = pool else { return nil }
 
@@ -248,13 +159,12 @@ final class VGDuetPreviewCompositor {
         let ciCamera = ciRect(fromTopLeft: cameraRect)
         if !ciCamera.isEmpty {
             if cameraFrameUsesStraightAlpha, let camFrame = cameraFrame {
-                // Phase 4B-A straight-alpha foreground path (pre-keyed upstream).
+                // Straight-alpha foreground path (pre-keyed upstream).
                 //   The frame's bytes are STRAIGHT alpha (fg.rgb, a).  CoreImage treats a
                 //   BGRA pixel buffer as premultiplied, so premultiply first, giving
                 //   (fg.rgb*a, a), and do it BEFORE resampling so transparent texels never
                 //   bleed colour into edges; then aspect-fill and source-over onto the
-                //   canvas (C = C_fg*a + C_bg*(1-a)).  No mask, no refinement, no
-                //   CIBlendWithMask.  `isGreenScreen` / `greenScreenMask` are ignored here.
+                //   canvas (C = C_fg*a + C_bg*(1-a)).
                 let camPremultiplied = CIImage(cvPixelBuffer: camFrame).premultiplyingAlpha()
                 image = aspectFill(camPremultiplied, into: ciCamera).composited(over: image)
                 // One-time diagnostic: first frame composited through the straight-alpha path.
@@ -263,47 +173,8 @@ final class VGDuetPreviewCompositor {
                     _hasLoggedFirstStraightAlphaComposite = true
                     NSLog("[VGDuetPreviewCompositor] IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST pre-keyed straight-alpha foreground premultiplied and source-over composited into cameraRect; no matte, no refinement")
                 }
-            } else if isGreenScreen, let camFrame = cameraFrame, let maskBuffer = greenScreenMask {
-                // Green-screen path: CIBlendWithMask.
-                //   foreground = aspect-filled camera into cameraRect
-                //   background = current composed source canvas (image)
-                //   mask       = aspect-filled segmentation mask into cameraRect
-                // The filter replaces pixels where mask ~= 255 (subject) with the foreground.
-                // The mapped mask is refined at output scale first (see
-                // VGMatteRefinementPipeline.refineLiveGreenScreenMask: morphology close,
-                // then 4.0 px feather, then trimap smoothstep, then camera-guided edge
-                // preservation);
-                // a failed morphology close falls back to the raw mask, a failed
-                // feather falls back to the (possibly closed) unblurred mask, a
-                // failed trimap falls back to the blurred mask, and a failed
-                // guided-edge pass falls back to the trimapped mask — never to
-                // the camera overlay.
-                // Falls through to the opaque-overlay path if the blend filter is unavailable.
-                let camFilled  = aspectFill(CIImage(cvPixelBuffer: camFrame),   into: ciCamera)
-                let maskFilled = aspectFill(CIImage(cvPixelBuffer: maskBuffer), into: ciCamera)
-                let refined    = mattePipeline.refineLiveGreenScreenMask(aspectFilledMask: maskFilled, in: ciCamera, guidedBy: camFilled)
-                let params: [String: Any] = [
-                    "inputBackgroundImage": image,
-                    "inputImage":           camFilled,
-                    "inputMaskImage":       refined.mask,
-                ]
-                if let blended = CIFilter(name: "CIBlendWithMask", parameters: params)?.outputImage {
-                    image = blended.cropped(to: bounds)
-                    // One-time diagnostic: log the first frame where a mask was actually blended.
-                    // Grep marker: IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST
-                    if !_hasLoggedFirstMaskBlend {
-                        _hasLoggedFirstMaskBlend = true
-                        NSLog("[VGDuetPreviewCompositor] IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST — CIBlendWithMask reached CoreImage blend for first masked frame maskFeatherRadius=\(VGMatteRefinementPipeline.greenScreenMaskFeatherRadius) maskFeatherApplied=\(refined.featherApplied) maskTrimapEnabled=\(VGMatteRefinementPipeline.greenScreenTrimapEnabled) maskTrimapApplied=\(refined.trimapApplied) maskTrimapLow=\(VGMatteRefinementPipeline.greenScreenTrimapLow) maskTrimapHigh=\(VGMatteRefinementPipeline.greenScreenTrimapHigh) maskGuidedEdgeEnabled=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeEnabled) maskGuidedEdgeApplied=\(refined.guidedEdgeApplied) maskGuidedEdgeIntensity=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeIntensity) maskGuidedEdgeBlurRadius=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeBlurRadius) maskGuidedEdgeLow=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeLow) maskGuidedEdgeHigh=\(VGMatteRefinementPipeline.greenScreenGuidedEdgeHigh) maskMorphologyCloseEnabled=\(VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseEnabled) maskMorphologyCloseApplied=\(refined.morphologyCloseApplied) maskMorphologyCloseRadius=\(VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseRadius) liveMatteRefinementMode=\(liveMatteRefinementMode.rawValue) liveTightAlphaR1Applied=\(refined.tightAlphaR1Applied) liveS4GuidedAlphaR1Applied=\(refined.s4GuidedAlphaR1Applied) liveS4GuidedAlphaApplied=\(refined.s4GuidedAlphaApplied)")
-                    }
-                } else {
-                    // Filter unavailable (should not happen on supported iOS): fall back to
-                    // opaque camera overlay so green-screen does not silently show only source.
-                    NSLog("[VGDuetPreviewCompositor] CIBlendWithMask unavailable — camera overlay fallback")
-                    image = camFilled.composited(over: image)
-                }
             } else if let camFrame = cameraFrame {
-                // Opaque live camera frame (opaque mode, or matte-keyed with the mask missing):
-                // aspect-fill into the slot.
+                // Opaque live camera frame: aspect-fill into the slot.
                 let camImage = CIImage(cvPixelBuffer: camFrame)
                 image = aspectFill(camImage, into: ciCamera).composited(over: image)
             } else {
@@ -321,7 +192,6 @@ final class VGDuetPreviewCompositor {
 
     /// Converts a top-left-origin canvas rect to CoreImage bottom-left space,
     /// snapping edges to whole pixels and clipping to the canvas.
-    /// Internal so the offline replay lab maps cameraRect exactly as composite() does.
     func ciRect(fromTopLeft rect: CGRect) -> CGRect {
         guard rect.width > 0, rect.height > 0 else { return .zero }
         let x0 = rect.minX.rounded()
@@ -338,7 +208,6 @@ final class VGDuetPreviewCompositor {
     }
 
     /// Scale-to-fill + center-crop `image` into `rect` (CI coordinates).
-    /// Internal so the offline replay lab fills camera/mask exactly as composite() does.
     func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {
         let extent = image.extent
         guard extent.width > 0, extent.height > 0 else { return CIImage.empty() }
@@ -349,50 +218,6 @@ final class VGDuetPreviewCompositor {
         let ty = rect.minY + (rect.height - scaledH) / 2 - extent.minY * scale
         let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
         return image.transformed(by: transform).cropped(to: rect)
-    }
-
-    // MARK: - Matte refinement stage tap
-    //
-    // Refinement policy and CoreImage filter graph construction now live in
-    // VGMatteRefinementPipeline (VGMatteRefinementPipeline.swift); this compositor keeps
-    // source-compatible typealiases to its nested types and delegates to the
-    // `mattePipeline` instance it owns, so composite() and the diagnostics call sites below
-    // are unchanged.
-
-    typealias GreenScreenRefinementMode = VGMatteRefinementPipeline.GreenScreenRefinementMode
-    typealias LiveMatteRefinementMode = VGMatteRefinementPipeline.LiveMatteRefinementMode
-    typealias GreenScreenMatteStages = VGMatteRefinementPipeline.GreenScreenMatteStages
-    typealias LiveGreenScreenMaskRefinement = VGMatteRefinementPipeline.LiveGreenScreenMaskRefinement
-
-    /// Delegates to `VGMatteRefinementPipeline.greenScreenMatteStages(...)`. Kept on the
-    /// compositor so `VGLiveGreenScreenReplayDiagnostics` (offline matte-stage lab) keeps
-    /// calling `compositor.greenScreenMatteStages(...)` unchanged.
-    func greenScreenMatteStages(aspectFilledMask mask: CIImage,
-                                in rect: CGRect,
-                                guidedBy guide: CIImage,
-                                refinementMode: GreenScreenRefinementMode = .s1) -> GreenScreenMatteStages {
-        return mattePipeline.greenScreenMatteStages(aspectFilledMask: mask, in: rect, guidedBy: guide, refinementMode: refinementMode)
-    }
-
-    /// Live mask refinement for an external live engine that owns its own camera, matte
-    /// source, CIContext, output pool, and publishing, and uses this method only to refine
-    /// its mask with the identical production pipeline `composite()` runs. Delegates to
-    /// `VGMatteRefinementPipeline.refineLiveGreenScreenMask(...)` — the same pipeline
-    /// instance `composite()` uses — so there is exactly one implementation of the live
-    /// refinement and callers cannot drift. `composite()` and its default behavior are
-    /// untouched.
-    ///
-    /// - Parameters:
-    ///   - mask:  single-channel matte already oriented and aspect-filled into `rect`
-    ///            (mask ~= 1 → subject), the same geometry the caller blends with.
-    ///   - rect:  CI-space (bottom-left origin) foreground rect the mask and guide were
-    ///            filled into; every stage is evaluated only over this rect.
-    ///   - guide: camera frame already oriented and aspect-filled into `rect`, used only
-    ///            as the edge guide for the guided-edge-preserve stage.
-    func refineLiveGreenScreenMaskForExternalEngine(aspectFilledMask mask: CIImage,
-                                                    in rect: CGRect,
-                                                    guidedBy guide: CIImage) -> LiveGreenScreenMaskRefinement {
-        return mattePipeline.refineLiveGreenScreenMask(aspectFilledMask: mask, in: rect, guidedBy: guide)
     }
 
     /// Deterministic camera placeholder: slate fill, 2 px lighter edge, soft
@@ -452,313 +277,5 @@ final class VGDuetPreviewCompositor {
             return nil
         }
         return created
-    }
-}
-
-// MARK: - Diagnostic: deterministic CoreImage pixel proof (simulator-safe)
-//
-// Proof boundary: ios_duet_coreimage_pixel_proof_synthetic_mask_blend_only
-//
-// Proves that composite()'s CIBlendWithMask green-screen path (lines above, "Green-screen
-// path" block) blends a synthetic camera foreground over a synthetic source/background
-// through a single-channel L8 mask with the expected linear-interpolation math, using only
-// synthetic CVPixelBuffers built in-process. Diagnostic only.
-//
-// Non-claims: no real camera hardware or AVCaptureSession lifecycle, no Vision/ML
-// segmentation quality, no video decoder, no MP4 export, no audio, no ConnectsApp /
-// Universal Editor / upload wiring.
-extension VGDuetPreviewCompositor {
-
-    static let iosDuetPixelProofBoundary = "ios_duet_coreimage_pixel_proof_synthetic_mask_blend_only"
-
-    private static let pixelProofStartMarker = "IOS_DUET_PIXEL_PROOF_START"
-    private static let pixelProofPassMarker  = "IOS_DUET_PIXEL_PROOF_PASS"
-    private static let pixelProofFailMarker  = "IOS_DUET_PIXEL_PROOF_FAIL"
-
-    /// Max per-channel 0-255 delta tolerated between an actual sampled pixel and the
-    /// expected linear-mix pixel. CIBlendWithMask matched exact rounded math (delta 0)
-    /// in an offline CoreImage probe against this same geometry; 2 leaves headroom for
-    /// Metal-vs-CPU CIContext backend differences.
-    private static let pixelProofTolerance = 2
-
-    private static let pixelProofNonClaims: [String] = [
-        "No real camera hardware or AVCaptureSession lifecycle claim.",
-        "No Vision/ML segmentation quality claim; synthetic mask patterns only.",
-        "No video decoder claim.",
-        "No MP4/export pipeline claim.",
-        "No audio pipeline claim.",
-        "No ConnectsApp/Universal Editor/upload wiring claim.",
-    ]
-
-    /// Deterministic, simulator-safe pixel proof for the CIBlendWithMask green-screen path
-    /// in `composite(...)`. Renders synthetic BGRA source/camera buffers and an L8 mask
-    /// through a real `VGDuetPreviewCompositor(canvasWidth: 64, canvasHeight: 64)` instance
-    /// and asserts pixel values in the resulting output buffer. Never throws; every failure
-    /// mode is captured in the returned map's `failureReason`/`mismatches` instead.
-    /// Markers: IOS_DUET_PIXEL_PROOF_START / IOS_DUET_PIXEL_PROOF_PASS / IOS_DUET_PIXEL_PROOF_FAIL.
-    static func runDeterministicPixelProof() -> [String: Any] {
-        NSLog("[VGDuetPreviewCompositor] \(pixelProofStartMarker)")
-
-        var gates: [String: Bool] = [
-            "compositorInitOk":      false,
-            "syntheticBuffersOk":    false,
-            "blendFilterOk":         false,
-            "boundaryKeyingOk":      false,
-            "fractionalBlendMathOk": false,
-            "viewportExteriorOk":    false,
-            "cleanupOk":             false,
-            "canonical":             false,
-        ]
-        var failureReason = ""
-        var mismatches: [String] = []
-        var maxDelta = 0
-        var sampleCount = 0
-        var details: [String: Any] = [:]
-        var viewportExteriorAllOk = true
-        var boundaryKeyingAllOk = true
-        var fractionalAllOk = true
-
-        let backgroundColor: (r: Int, g: Int, b: Int) = (40, 160, 80)
-        let foregroundColor: (r: Int, g: Int, b: Int) = (220, 60, 140)
-
-        func fail(_ reason: String) {
-            if failureReason.isEmpty { failureReason = reason }
-        }
-
-        func expectedMix(alpha: Int) -> (r: Int, g: Int, b: Int) {
-            let m = Double(alpha) / 255.0
-            let r = (Double(foregroundColor.r) * m + Double(backgroundColor.r) * (1 - m)).rounded()
-            let g = (Double(foregroundColor.g) * m + Double(backgroundColor.g) * (1 - m)).rounded()
-            let b = (Double(foregroundColor.b) * m + Double(backgroundColor.b) * (1 - m)).rounded()
-            return (Int(r), Int(g), Int(b))
-        }
-
-        func finalize() -> [String: Any] {
-            let allGatesPass = gates.values.allSatisfy { $0 }
-            let overallPass = allGatesPass && maxDelta <= pixelProofTolerance && failureReason.isEmpty
-            let marker = overallPass ? pixelProofPassMarker : pixelProofFailMarker
-            NSLog("[VGDuetPreviewCompositor] \(marker) failureReason=\(failureReason) maxDelta=\(maxDelta) gates=\(gates)")
-            var result: [String: Any] = [:]
-            result["pass"] = overallPass
-            result["status"] = overallPass ? "PASS" : "FAIL"
-            result["marker"] = marker
-            result["proofBoundary"] = iosDuetPixelProofBoundary
-            result["gates"] = gates
-            result["tolerance"] = pixelProofTolerance
-            result["maxDelta"] = maxDelta
-            result["sampleCount"] = sampleCount
-            result["mismatches"] = mismatches
-            result["details"] = details
-            result["failureReason"] = failureReason
-            result["nonClaims"] = pixelProofNonClaims
-            return result
-        }
-
-        // 1. Blend filter availability.
-        guard CIFilter(name: "CIBlendWithMask") != nil else {
-            fail("blend_filter_unavailable")
-            return finalize()
-        }
-        gates["blendFilterOk"] = true
-
-        // 2. Synthetic buffers: 64x64 BGRA background, 32x32 BGRA foreground,
-        //    32x32 L8 mask (quadrants: topLeft=0, topRight=255, bottomLeft=128, bottomRight=64).
-        guard let sourceBuffer = makeConstantBGRABuffer(width: 64, height: 64,
-                                                         r: backgroundColor.r, g: backgroundColor.g, b: backgroundColor.b),
-              let cameraBuffer = makeConstantBGRABuffer(width: 32, height: 32,
-                                                         r: foregroundColor.r, g: foregroundColor.g, b: foregroundColor.b),
-              let maskBuffer = makeQuadrantMaskBuffer(width: 32, height: 32,
-                                                       topLeft: 0, topRight: 255, bottomLeft: 128, bottomRight: 64)
-        else {
-            fail("synthetic_buffer_creation_failed")
-            return finalize()
-        }
-        gates["syntheticBuffersOk"] = true
-        details["syntheticBuffers"] = [
-            "source": ["width": 64, "height": 64, "rgb": [backgroundColor.r, backgroundColor.g, backgroundColor.b]],
-            "camera": ["width": 32, "height": 32, "rgb": [foregroundColor.r, foregroundColor.g, foregroundColor.b]],
-            "mask": [
-                "width": 32, "height": 32, "format": "OneComponent8",
-                "quadrants": ["topLeft": 0, "topRight": 255, "bottomLeft": 128, "bottomRight": 64],
-            ],
-        ]
-
-        // 3. Composite through the real green-screen path.
-        let compositor = VGDuetPreviewCompositor(canvasWidth: 64, canvasHeight: 64)
-        let sourceRect = CGRect(x: 0, y: 0, width: 64, height: 64)
-        let cameraRect = CGRect(x: 16, y: 16, width: 32, height: 32)
-        guard let output = compositor.composite(sourceFrame: sourceBuffer,
-                                                 sourceRect: sourceRect,
-                                                 cameraRect: cameraRect,
-                                                 cameraFrame: cameraBuffer,
-                                                 isGreenScreen: true,
-                                                 greenScreenMask: maskBuffer)
-        else {
-            fail("composite_returned_nil_pool_exhausted_or_unavailable")
-            return finalize()
-        }
-        // Only observable proof that the compositor + its pool initialized correctly:
-        // a nil-returning composite() means the pool never came up (see makePool()).
-        gates["compositorInitOk"] = true
-        details["cameraRect"] = ["x": 16, "y": 16, "width": 32, "height": 32]
-        details["sourceRect"] = ["x": 0, "y": 0, "width": 64, "height": 64]
-        details["canvasSize"] = ["width": 64, "height": 64]
-
-        // 4. Sample and assert.
-        //
-        // Orientation: an offline standalone CoreImage probe run against this exact
-        // geometry (64x64 canvas, cameraRect x=16 y=16 width=32 height=32, mask quadrants
-        // as above) confirmed that the mask buffer's memory row 0 (top, as authored) renders
-        // to the TOP of the camera rect in the OUTPUT buffer's memory — i.e. no additional
-        // vertical flip is introduced by ciRect(fromTopLeft:) + aspectFill + CIBlendWithMask
-        // beyond the rect-position flip already documented at the top of this file. This
-        // cameraRect is vertically symmetric in the 64-tall canvas (top offset 16 == bottom
-        // offset 64-16-32=16), which is why the position flip is a no-op here. Sample
-        // coordinates below are output-buffer (x,y) in top-left terms and match the probe's
-        // observed quadrant layout exactly.
-        details["orientationNote"] =
-            "Mask memory row 0 (top) renders to the top of cameraRect in the output buffer " +
-            "for this symmetric geometry; verified via an offline CoreImage probe, not assumed."
-        details["blendFormula"] =
-            "output = round(foreground * (maskByte/255) + background * (1 - maskByte/255)) per channel"
-
-        CVPixelBufferLockBaseAddress(output, .readOnly)
-        var lockedReadsOk = true
-
-        func sample(_ label: String, x: Int, y: Int, expected: (r: Int, g: Int, b: Int), group: String) {
-            guard let pixel = readBGRAPixel(output, x: x, y: y) else {
-                lockedReadsOk = false
-                fail("sample_read_failed_\(label)")
-                return
-            }
-            let dR = abs(pixel.r - expected.r)
-            let dG = abs(pixel.g - expected.g)
-            let dB = abs(pixel.b - expected.b)
-            let delta = max(dR, max(dG, dB))
-            maxDelta = max(maxDelta, delta)
-            sampleCount += 1
-            if delta > pixelProofTolerance {
-                mismatches.append(
-                    "label=\(label) group=\(group) loc=(\(x),\(y)) " +
-                    "actual=(\(pixel.r),\(pixel.g),\(pixel.b)) " +
-                    "expected=(\(expected.r),\(expected.g),\(expected.b)) delta=\(delta)")
-                switch group {
-                case "exterior": viewportExteriorAllOk = false
-                case "boundary": boundaryKeyingAllOk = false
-                case "fraction": fractionalAllOk = false
-                default: break
-                }
-            }
-        }
-
-        let bg = backgroundColor
-        let fg = foregroundColor
-
-        // Exterior: outside camera rect [16,48) x [16,48) — must remain untouched background.
-        sample("ext_top_left_corner",     x: 2,  y: 2,  expected: bg, group: "exterior")
-        sample("ext_bottom_right_corner", x: 61, y: 61, expected: bg, group: "exterior")
-        sample("ext_above_camera",        x: 32, y: 2,  expected: bg, group: "exterior")
-        sample("ext_left_of_camera",      x: 2,  y: 32, expected: bg, group: "exterior")
-
-        // Boundary keying: alpha=0 keys out to pure background, alpha=255 keys in pure foreground.
-        sample("mask_alpha0_quadrant",   x: 20, y: 20, expected: bg, group: "boundary")
-        sample("mask_alpha255_quadrant", x: 40, y: 20, expected: fg, group: "boundary")
-
-        // Fractional blend math: alpha=128 and alpha=64 linear mixes.
-        sample("mask_alpha128_quadrant", x: 20, y: 40, expected: expectedMix(alpha: 128), group: "fraction")
-        sample("mask_alpha64_quadrant",  x: 40, y: 40, expected: expectedMix(alpha: 64),  group: "fraction")
-
-        CVPixelBufferUnlockBaseAddress(output, .readOnly)
-        gates["cleanupOk"] = lockedReadsOk
-        if !lockedReadsOk {
-            fail("sample_readback_or_cleanup_failed")
-        }
-
-        gates["viewportExteriorOk"] = viewportExteriorAllOk
-        gates["boundaryKeyingOk"] = boundaryKeyingAllOk
-        gates["fractionalBlendMathOk"] = fractionalAllOk
-        if !viewportExteriorAllOk { fail("viewport_exterior_mismatch") }
-        if !boundaryKeyingAllOk { fail("boundary_keying_mismatch") }
-        if !fractionalAllOk { fail("fractional_blend_math_mismatch") }
-
-        // "canonical": this run actually exercised the primary CIBlendWithMask code path
-        // (not the "filter unavailable" opaque-overlay fallback) and every gate agrees.
-        gates["canonical"] = gates["blendFilterOk"] == true
-            && gates["compositorInitOk"] == true
-            && gates["syntheticBuffersOk"] == true
-            && viewportExteriorAllOk && boundaryKeyingAllOk && fractionalAllOk
-
-        return finalize()
-    }
-
-    // MARK: - Diagnostic buffer helpers (synthetic inputs only; never touch live camera/decoder)
-
-    private static func makeConstantBGRABuffer(width: Int, height: Int, r: Int, g: Int, b: Int, a: Int = 255) -> CVPixelBuffer? {
-        var pixelBuffer: CVPixelBuffer?
-        let attributes: [String: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-        ]
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                          kCVPixelFormatType_32BGRA, attributes as CFDictionary, &pixelBuffer)
-        guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return nil }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let byteR = UInt8(clamping: r), byteG = UInt8(clamping: g), byteB = UInt8(clamping: b), byteA = UInt8(clamping: a)
-        for y in 0..<height {
-            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-            for x in 0..<width {
-                row[x * 4 + 0] = byteB
-                row[x * 4 + 1] = byteG
-                row[x * 4 + 2] = byteR
-                row[x * 4 + 3] = byteA
-            }
-        }
-        return buffer
-    }
-
-    private static func makeQuadrantMaskBuffer(width: Int, height: Int,
-                                                topLeft: Int, topRight: Int,
-                                                bottomLeft: Int, bottomRight: Int) -> CVPixelBuffer? {
-        var pixelBuffer: CVPixelBuffer?
-        let attributes: [String: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-        ]
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                          kCVPixelFormatType_OneComponent8, attributes as CFDictionary, &pixelBuffer)
-        guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return nil }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let halfW = width / 2
-        let halfH = height / 2
-        let tl = UInt8(clamping: topLeft), tr = UInt8(clamping: topRight)
-        let bl = UInt8(clamping: bottomLeft), br = UInt8(clamping: bottomRight)
-        for y in 0..<height {
-            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-            let isTop = y < halfH
-            for x in 0..<width {
-                let isLeft = x < halfW
-                row[x] = isTop ? (isLeft ? tl : tr) : (isLeft ? bl : br)
-            }
-        }
-        return buffer
-    }
-
-    /// Reads one BGRA pixel from a buffer already locked (`.readOnly`) by the caller.
-    private static func readBGRAPixel(_ buffer: CVPixelBuffer, x: Int, y: Int) -> (r: Int, g: Int, b: Int, a: Int)? {
-        let width = CVPixelBufferGetWidth(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-        guard x >= 0, y >= 0, x < width, y < height else { return nil }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
-        let b = Int(row[x * 4 + 0])
-        let g = Int(row[x * 4 + 1])
-        let r = Int(row[x * 4 + 2])
-        let a = Int(row[x * 4 + 3])
-        return (r, g, b, a)
     }
 }

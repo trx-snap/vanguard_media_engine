@@ -14,7 +14,7 @@
 //      nearest that PTS so mask and foreground describe the same instant; with
 //      no mask, or no frame inside the pairing window, the latest camera frame
 //      is used instead (never a dropped render),
-//   3. composites on renderQueue via VGDuetPreviewCompositor.composite with
+//   3. composites on renderQueue via VGLiveGreenScreenCompositor.composite with
 //      sourceFrame = static background (full canvas), cameraRect = foreground
 //      rect, isGreenScreen = keying flag (CIBlendWithMask when a fresh mask
 //      exists; unkeyed camera-over-background otherwise),
@@ -83,7 +83,7 @@ final class VGLiveGreenScreenRenderLoop {
     /// Invoked on main, only while not stopped, with a composited output buffer.
     typealias PresentHandler = (CVPixelBuffer) -> Void
 
-    private let compositor: VGDuetPreviewCompositor
+    private let compositor: VGLiveGreenScreenCompositor
     private let cameraFrameProvider: CameraFrameProvider
     private let maskProvider: MaskProvider
     private let presentHandler: PresentHandler
@@ -116,7 +116,7 @@ final class VGLiveGreenScreenRenderLoop {
 
     // MARK: - Init
 
-    init(compositor: VGDuetPreviewCompositor,
+    init(compositor: VGLiveGreenScreenCompositor,
          background: CVPixelBuffer,
          foregroundRect: CGRect,
          cameraFrameProvider: @escaping CameraFrameProvider,

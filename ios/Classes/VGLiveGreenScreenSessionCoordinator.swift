@@ -11,18 +11,17 @@
 //     ARMatteGenerator matte per frame refined through the production
 //     VGMatteRefinementPipeline live mask pipeline (session
 //     liveMatteRefinementMode; the same caller-agnostic pipeline the adapter
-//     path's VGDuetPreviewCompositor runs internally), CoreImage composite
+//     path's VGLiveGreenScreenCompositor runs internally), CoreImage composite
 //     into the current foreground rect over the current background. It owns
-//     the camera through its ARSession; no VGDuetCameraSource exists while
+//     the camera through its ARSession; no VGLiveGreenScreenCameraSource exists while
 //     it runs.
 //   - Adapter path (fallback, and every explicitly requested adapter backend):
 //     VGLiveGreenScreenMaskProviderAdapter (Vision Fast; or LiteRT/Metal over
 //     selfie_multiclass_256x256.tflite with heuristic fallback; or diagnostics
 //     options for Vision Balanced / Vision Accurate / litertSelfie),
-//     VGDuetCameraSource (front camera ingress), VGDuetPreviewCompositor,
+//     VGLiveGreenScreenCameraSource (front camera ingress), VGLiveGreenScreenCompositor,
 //     VGLiveGreenScreenRenderLoop.
-// The Duet-named primitives are reused as generic building blocks only. An
-// ARSession and a VGDuetCameraSource are never running at the same time.
+// An ARSession and a VGLiveGreenScreenCameraSource are never running at the same time.
 //
 // Backend selection (`iosSegmentationBackend`, diagnostics options; "auto" by
 // default):
@@ -76,7 +75,7 @@
 //                      fallback, the previous default) | "tightAlphaR1" (opt-in
 //                      RND candidate) | "s4GuidedAlphaR1" (opt-in S4 R1
 //                      guided-alpha RND live mode); applied on BOTH engines — the adapter
-//                      path's VGDuetPreviewCompositor (which owns a
+//                      path's VGLiveGreenScreenCompositor (which owns a
 //                      VGMatteRefinementPipeline internally) and the ARKit
 //                      engine's own VGMatteRefinementPipeline refiner
 //                      (StartRequest.liveMatteRefinementMode, the same
@@ -126,7 +125,7 @@
 //
 // Mask/camera PTS pairing: the render loop fetches the mask (with the camera
 // PTS it was computed from) first, then the camera provider returns the
-// history frame nearest that PTS (VGDuetCameraSource.snapshotRetained(near:
+// history frame nearest that PTS (VGLiveGreenScreenCameraSource.snapshotRetained(near:
 // maxDeltaSeconds:), window `maskPairingMaxDeltaSeconds`). With no numeric
 // PTS or no frame in the window it returns the latest frame, so a render is
 // never dropped. The first aligned pair logs
@@ -185,7 +184,7 @@ struct VGLiveGreenScreenDiagnosticsOptions {
     /// ("A tight alpha"); "s4GuidedAlphaR1" opts into the S4 R1 guided-alpha RND
     /// candidate live (physical comparison only; never the default). Validated by the
     /// method handler against VGMatteRefinementPipeline.LiveMatteRefinementMode.allCases
-    /// (exposed as VGDuetPreviewCompositor.LiveMatteRefinementMode) before reaching here.
+    /// before reaching here.
     var iosLiveMatteRefinement: String = VGMatteRefinementPipeline.defaultLiveMatteRefinementMode.rawValue
 
     static let `default` = VGLiveGreenScreenDiagnosticsOptions()
@@ -306,7 +305,7 @@ final class VGLiveGreenScreenSessionCoordinator {
         var foregroundRect: CGRect
 
         // Adapter path components (nil while the ARKit engine drives the session).
-        var cameraSource: VGDuetCameraSource?
+        var cameraSource: VGLiveGreenScreenCameraSource?
         var adapter: VGLiveGreenScreenMaskProviderAdapter?
         var renderLoop: VGLiveGreenScreenRenderLoop?
         // ARKit path component (nil on the adapter path).
@@ -452,9 +451,9 @@ final class VGLiveGreenScreenSessionCoordinator {
         activeSession = session
 
         // Backend resolution. Exactly one engine is created: the ARKit engine
-        // owns the camera through its ARSession and no VGDuetCameraSource
+        // owns the camera through its ARSession and no VGLiveGreenScreenCameraSource
         // exists while it runs; the adapter path owns the camera through
-        // VGDuetCameraSource and no ARSession exists.
+        // VGLiveGreenScreenCameraSource and no ARSession exists.
         let requestedBackend = diagnosticsOptions.iosSegmentationBackend
         let wantsARKit =
             requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
@@ -772,7 +771,7 @@ final class VGLiveGreenScreenSessionCoordinator {
     /// Starts the ARKit engine on the session's texture with the session's
     /// current background, foreground rect, and live matte refinement mode
     /// (the engine refines its matte through its own VGMatteRefinementPipeline
-    /// instance — the same refinement pipeline the VGDuetPreviewCompositor
+    /// instance — the same refinement pipeline the VGLiveGreenScreenCompositor
     /// `startCameraPipeline` builds runs internally). Returns nil on success
     /// (the engine is stored on the session) or the engine's exact start
     /// failure reason; a failed start registers and retains nothing.
@@ -810,8 +809,8 @@ final class VGLiveGreenScreenSessionCoordinator {
     }
 
     /// Starts the adapter-path pipeline on the session's texture: optional
-    /// mask adapter (nil → camera-only, unkeyed presentation), VGDuetCameraSource
-    /// front camera ingress, VGDuetPreviewCompositor, VGLiveGreenScreenRenderLoop,
+    /// mask adapter (nil → camera-only, unkeyed presentation), VGLiveGreenScreenCameraSource
+    /// front camera ingress, VGLiveGreenScreenCompositor, VGLiveGreenScreenRenderLoop,
     /// all on the session's current background and foreground rect. Never
     /// called while an ARKit engine is alive on the session.
     private func startCameraPipeline(session: LiveSession,
@@ -820,7 +819,7 @@ final class VGLiveGreenScreenSessionCoordinator {
         assert(Thread.isMainThread)
         assert(session.arkitEngine == nil)
 
-        let compositor = VGDuetPreviewCompositor(canvasWidth: Double(session.canvasWidth),
+        let compositor = VGLiveGreenScreenCompositor(canvasWidth: Double(session.canvasWidth),
                                                  canvasHeight: Double(session.canvasHeight),
                                                  liveMatteRefinementMode: session.liveMatteRefinementMode)
 
@@ -844,7 +843,7 @@ final class VGLiveGreenScreenSessionCoordinator {
         // capture/input cost than 720p; segmentation and compositing do not
         // need full 1080p. Where iFrame960x540 is unsupported the source falls
         // back to 720p before its generic 1080p-first default.
-        let camera = VGDuetCameraSource(sessionPresets: [
+        let camera = VGLiveGreenScreenCameraSource(sessionPresets: [
             AVCaptureSession.Preset.iFrame960x540.rawValue,
             AVCaptureSession.Preset.hd1280x720.rawValue,
         ])

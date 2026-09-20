@@ -22,8 +22,10 @@
 //     never from raw matte presence:
 //       nil sample     -> no camera frame; the compositor draws its placeholder.
 //       .opaque        -> frame is the opaque camera overlay; the matte is not used.
-//       .matteKeyed    -> matte-keyed CIBlendWithMask path when the matte exists;
-//                         a matte-less .matteKeyed sample fails open to .opaque.
+//       .matteKeyed    -> the purified Duet compositor no longer accepts a raw mask
+//                         (mask blending now lives in VGLiveGreenScreenCompositor), so
+//                         this fails open to the same opaque overlay as `.opaque`; any
+//                         matte the sample carries is released, never composited.
 //       .straightAlpha -> frame is a pre-keyed straight-alpha foreground composited
 //                         source-over; the matte is not used and no refinement runs.
 //     Layout mode only drives the rects the coordinator hands to updateLayout.
@@ -350,22 +352,15 @@ final class VGDuetPreviewRenderLoop {
         let sample: VGDuetForegroundSample? = foregroundSampleProvider?()
         let cameraBuffer: CVPixelBuffer? = sample.map { $0.frame.takeUnretainedValue() }
         // Keying follows `sample.compositeMode`, never the layout mode and never raw
-        // matte presence.  Only the .matteKeyed mode hands the matte to the compositor.
-        var matteBuffer: CVPixelBuffer? = nil
-        var isKeyed = false
+        // matte presence.  The purified Duet compositor accepts no raw mask, so
+        // `.matteKeyed` fails open to the same opaque path as `.opaque`.
         var usesStraightAlpha = false
         if let sample = sample {
             switch sample.compositeMode {
-            case .opaque:
-                // Opaque camera overlay.  A carried matte is released below, never used.
+            case .opaque, .matteKeyed:
+                // Opaque camera overlay.  Any matte the sample carries is released
+                // below, never composited.
                 break
-            case .matteKeyed:
-                // Matte path only when the matte actually exists; a matte-less
-                // .matteKeyed sample fails open to the opaque overlay.
-                if let matte = sample.matte {
-                    matteBuffer = matte.takeUnretainedValue()
-                    isKeyed = true
-                }
             case .straightAlpha:
                 // Pre-keyed foreground: the frame already carries straight alpha.  No
                 // matte is passed and no mask refinement runs in the compositor.
@@ -377,8 +372,6 @@ final class VGDuetPreviewRenderLoop {
                                               sourceRect: sRect,
                                               cameraRect: cRect,
                                               cameraFrame: cameraBuffer,
-                                              isGreenScreen: isKeyed,
-                                              greenScreenMask: matteBuffer,
                                               cameraFrameUsesStraightAlpha: usesStraightAlpha)
             // Release the retained sample now that compositing is done (all modes).
             sample?.release()

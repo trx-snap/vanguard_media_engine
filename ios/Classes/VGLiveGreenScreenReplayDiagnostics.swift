@@ -4,10 +4,10 @@
 // Three offline, deterministic, diagnostic-only entry points (none is public Dart API):
 //   - writeReplayInputBundle: captures the exact background/camera/mask CVPixelBuffers
 //     and layout rects into a replay bundle directory.
-//   - replay(inputDir:outputPath:label:): re-runs VGDuetPreviewCompositor.composite on a
+//   - replay(inputDir:outputPath:label:): re-runs VGLiveGreenScreenCompositor.composite on a
 //     bundle (a compositor constructed explicitly with the production live green-screen
-//     default mode, VGMatteRefinementPipeline.defaultLiveMatteRefinementMode; the generic
-//     compositor's own init default is the neutral .s1) and encodes the result to one PNG.
+//     default mode, VGMatteRefinementPipeline.defaultLiveMatteRefinementMode, which is also
+//     this compositor's own init default) and encodes the result to one PNG.
 //   - runMatteStageLab(inputDir:outputDir:label:refinementMode:): re-runs the same bundle
 //     through the compositor's matte refinement stage tap and dumps one PNG per stage (raw
 //     mask, aspect-filled mask, post morphology, post feather, post trimap, post guided edge,
@@ -581,7 +581,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
 
     // MARK: - Replay Execution
 
-    /// Offline deterministic replay of a captured input bundle through VGDuetPreviewCompositor.
+    /// Offline deterministic replay of a captured input bundle through VGLiveGreenScreenCompositor.
     /// Encodes the composited output CVPixelBuffer as PNG at [outputPath].
     /// Refuses overwrite if [outputPath] already exists.
     static func replay(inputDir: String,
@@ -608,10 +608,9 @@ final class VGLiveGreenScreenReplayDiagnostics {
 
         // Explicitly the production live green-screen default mode
         // (VGMatteRefinementPipeline.defaultLiveMatteRefinementMode), exactly what a
-        // live green-screen session runs when no option is sent. Passed explicitly because
-        // the generic compositor's own init default is the neutral .s1 (Duet must not
-        // inherit green-screen tuning by construction).
-        let compositor = VGDuetPreviewCompositor(
+        // live green-screen session runs when no option is sent (also this compositor's
+        // own init default, since it is GreenScreen-scoped).
+        let compositor = VGLiveGreenScreenCompositor(
             canvasWidth: Double(bundle.canvasWidth),
             canvasHeight: Double(bundle.canvasHeight),
             liveMatteRefinementMode: VGMatteRefinementPipeline.defaultLiveMatteRefinementMode)
@@ -624,7 +623,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
             isGreenScreen: true,
             greenScreenMask: bundle.mask
         ) else {
-            throw VGLiveGreenScreenReplayError.compositionFailed("VGDuetPreviewCompositor.composite returned nil during replay.")
+            throw VGLiveGreenScreenReplayError.compositionFailed("VGLiveGreenScreenCompositor.composite returned nil during replay.")
         }
 
         let width  = CVPixelBufferGetWidth(composited)
@@ -654,7 +653,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
             "proofBoundary": "ios_live_green_screen_deterministic_replay",
             "claims": [
                 "offline deterministic replay of exact captured camera, mask, and background CVPixelBuffers",
-                "exact sourceRect and cameraRect layout passed to VGDuetPreviewCompositor.composite",
+                "exact sourceRect and cameraRect layout passed to VGLiveGreenScreenCompositor.composite",
                 "output encoded as PNG at specified output path without overwriting",
             ],
             "nonClaims": [
@@ -693,7 +692,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
     /// Stage files for a mode: the seven S1 files, plus the mode's own extra RND band file
     /// (S4/S5 only). `.tightAlphaR1` is a global remap with no band tap, so it writes
     /// exactly the seven standard files.
-    static func matteStageFiles(for mode: VGDuetPreviewCompositor.GreenScreenRefinementMode) -> [(key: String, file: String)] {
+    static func matteStageFiles(for mode: VGMatteRefinementPipeline.GreenScreenRefinementMode) -> [(key: String, file: String)] {
         switch mode {
         case .s1:               return matteStageFiles
         case .s4GuidedAlphaR1,
@@ -708,7 +707,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
     /// variants `.s4SoftAlphaR2` (lab mode and the production live default) and
     /// lab-only `.s4TightAlphaR2`. All three run the same S4 guided-alpha
     /// recipe, populate the same S4 result fields, and write the same S4 band file.
-    private static func isS4FamilyMode(_ mode: VGDuetPreviewCompositor.GreenScreenRefinementMode) -> Bool {
+    private static func isS4FamilyMode(_ mode: VGMatteRefinementPipeline.GreenScreenRefinementMode) -> Bool {
         switch mode {
         case .s4GuidedAlphaR1, .s4SoftAlphaR2, .s4TightAlphaR2: return true
         case .s1, .s5GuidedFilterR1, .tightAlphaR1:            return false
@@ -717,7 +716,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
 
     /// Short parameter-set label for an S4-family mode, embedded in stage descriptions and
     /// claims so lab output names the exact variant. Nil for non-S4 modes.
-    private static func s4VariantLabel(for mode: VGDuetPreviewCompositor.GreenScreenRefinementMode) -> String? {
+    private static func s4VariantLabel(for mode: VGMatteRefinementPipeline.GreenScreenRefinementMode) -> String? {
         switch mode {
         case .s4GuidedAlphaR1: return "R1 parameter set (the unchanged live-S4 constants)"
         case .s4SoftAlphaR2:   return "soft-alpha R2 parameter set (wider, softer band; softer in-band alpha; offline lab mode and the production live default)"
@@ -753,7 +752,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
     static func runMatteStageLab(inputDir: String,
                                  outputDir: String,
                                  label: String,
-                                 refinementMode: VGDuetPreviewCompositor.GreenScreenRefinementMode = .s1) throws -> [String: Any] {
+                                 refinementMode: VGMatteRefinementPipeline.GreenScreenRefinementMode = .s1) throws -> [String: Any] {
         let trimmedOutputDir = outputDir.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedOutputDir.isEmpty else {
             throw VGLiveGreenScreenReplayError.invalidArgument("outputDir must not be empty.")
@@ -780,7 +779,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
         // S1-only path regardless of the production live default; every other lab mode
         // builds 07 from stages.finalMask, independent of the compositor's live mode
         // (greenScreenMatteStages takes refinementMode explicitly).
-        let compositor = VGDuetPreviewCompositor(canvasWidth: Double(bundle.canvasWidth),
+        let compositor = VGLiveGreenScreenCompositor(canvasWidth: Double(bundle.canvasWidth),
                                                 canvasHeight: Double(bundle.canvasHeight),
                                                 liveMatteRefinementMode: .s1)
 
@@ -818,7 +817,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 greenScreenMask: bundle.mask
             ) else {
                 throw VGLiveGreenScreenReplayError.compositionFailed(
-                    "VGDuetPreviewCompositor.composite returned nil during matte stage lab."
+                    "VGLiveGreenScreenCompositor.composite returned nil during matte stage lab."
                 )
             }
             composited = pooled
@@ -1103,13 +1102,13 @@ final class VGLiveGreenScreenReplayDiagnostics {
     /// `finalMask` as mask, cropped to the canvas — and renders it through the compositor's
     /// CIContext into a fresh BGRA canvas buffer (same render call composite() uses on its
     /// pool buffer). Used only for diagnostic refinement modes composite() cannot run.
-    private static func composeWithSelectedMask(compositor: VGDuetPreviewCompositor,
+    private static func composeWithSelectedMask(compositor: VGLiveGreenScreenCompositor,
                                                 bundle: LoadedBundle,
                                                 cameraFilled: CIImage,
                                                 finalMask: CIImage,
                                                 modeName: String) throws -> CVPixelBuffer {
         let bounds = CGRect(origin: .zero, size: compositor.canvasSize)
-        var image = CIImage(color: VGDuetPreviewCompositor.canvasColor).cropped(to: bounds)
+        var image = CIImage(color: VGLiveGreenScreenCompositor.canvasColor).cropped(to: bounds)
 
         let ciSource = compositor.ciRect(fromTopLeft: bundle.sourceRect)
         if !ciSource.isEmpty {

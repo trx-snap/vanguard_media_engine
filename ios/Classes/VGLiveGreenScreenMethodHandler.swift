@@ -279,7 +279,7 @@ final class VGLiveGreenScreenMethodHandler {
             let inputDir: String
             let outputDir: String
             let label: String
-            let refinementMode: VGDuetPreviewCompositor.GreenScreenRefinementMode
+            let refinementMode: VGMatteRefinementPipeline.GreenScreenRefinementMode
             do {
                 inputDir       = try VGLiveGreenScreenMethodHandler.requireString(args, key: "inputDir")
                 outputDir      = try VGLiveGreenScreenMethodHandler.requireString(args, key: "outputDir")
@@ -530,7 +530,7 @@ final class VGLiveGreenScreenMethodHandler {
     /// `iosLiveMatteRefinement` is optional (missing / null → "s4SoftAlphaR2", the
     /// production live default, VGMatteRefinementPipeline.defaultLiveMatteRefinementMode)
     /// but, when present, must be a string equal to one of
-    /// VGDuetPreviewCompositor.LiveMatteRefinementMode's raw values ("s4SoftAlphaR2"
+    /// VGMatteRefinementPipeline.LiveMatteRefinementMode's raw values ("s4SoftAlphaR2"
     /// default | "s1" explicit S1-only fallback | "tightAlphaR1" | "s4GuidedAlphaR1"
     /// opt-in RND live modes; "s4TightAlphaR2" is lab-only and rejected); any other
     /// type or value is rejected for the same reason.
@@ -583,11 +583,11 @@ final class VGLiveGreenScreenMethodHandler {
     }
 
     /// Exact strings accepted for `iosLiveMatteRefinement` (single source of truth:
-    /// VGDuetPreviewCompositor.LiveMatteRefinementMode's raw values, currently "s1" |
+    /// VGMatteRefinementPipeline.LiveMatteRefinementMode's raw values, currently "s1" |
     /// "tightAlphaR1" | "s4GuidedAlphaR1" | "s4SoftAlphaR2"; never a hand-written list;
     /// the lab-only "s4TightAlphaR2" is not a live case and is therefore rejected).
     static let liveMatteRefinementModes: [String] =
-        VGDuetPreviewCompositor.LiveMatteRefinementMode.allCases.map { $0.rawValue }
+        VGMatteRefinementPipeline.LiveMatteRefinementMode.allCases.map { $0.rawValue }
 
     /// Missing (nil / NSNull) defaults to the production live default
     /// (`VGMatteRefinementPipeline.defaultLiveMatteRefinementMode`, "s4SoftAlphaR2");
@@ -638,17 +638,17 @@ final class VGLiveGreenScreenMethodHandler {
     /// Exact strings accepted for the matte-lab `refinementMode` argument (single
     /// source of truth: the compositor's diagnostic-only mode enum raw values).
     static let refinementModes: [String] =
-        VGDuetPreviewCompositor.GreenScreenRefinementMode.allCases.map { $0.rawValue }
+        VGMatteRefinementPipeline.GreenScreenRefinementMode.allCases.map { $0.rawValue }
 
     /// Optional matte-lab `refinementMode`: missing / NSNull → `.s1` (the S1 base
     /// stages; this lab default is independent of the live default); a non-string or
     /// unknown value is rejected so an RND lab run can never silently fall back to S1.
-    static func parseRefinementMode(_ raw: Any?) throws -> VGDuetPreviewCompositor.GreenScreenRefinementMode {
+    static func parseRefinementMode(_ raw: Any?) throws -> VGMatteRefinementPipeline.GreenScreenRefinementMode {
         guard let raw = raw, !(raw is NSNull) else { return .s1 }
         guard let name = raw as? String else {
             throw ParseError(message: "'refinementMode' must be a string")
         }
-        guard let mode = VGDuetPreviewCompositor.GreenScreenRefinementMode(rawValue: name) else {
+        guard let mode = VGMatteRefinementPipeline.GreenScreenRefinementMode(rawValue: name) else {
             throw ParseError(message: "'refinementMode' must be one of \(refinementModes.joined(separator: ", ")) (got '\(name)')")
         }
         return mode
