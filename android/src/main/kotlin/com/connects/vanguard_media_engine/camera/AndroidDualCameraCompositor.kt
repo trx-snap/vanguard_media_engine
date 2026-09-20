@@ -16,6 +16,7 @@
 
 package com.connects.vanguard_media_engine.camera
 
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.HardwareBuffer
@@ -26,6 +27,7 @@ import android.opengl.GLES20
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.view.PixelCopy
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.BackendCapabilityReport
@@ -34,6 +36,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 
 private const val TAG = "AndroidDualCamCompositor"
 private const val FRAME_INTERVAL_MS = 33L // ~30fps
@@ -140,6 +143,16 @@ class AndroidDualCameraCompositor(
     val backInputSurface: Surface
         get() = _backInputSurface ?: error("Compositor not started")
 
+    // ── Frame snapshot for photo capture ────────────────────────────────────
+    // Architecturally parallel to iOS's _lastCompositedBuffer: a lock-guarded
+    // reference to the most recently read-back composited frame, refreshed by
+    // PixelCopy after every successful render. The lock is held only for a
+    // trivial reference read/write — JPEG encoding happens outside of it.
+    private val bitmapLock = ReentrantLock()
+    private var snapshotBitmap: Bitmap? = null
+    private var lastCompositedBitmap: Bitmap? = null
+    private val pixelCopyInFlight = AtomicBoolean(false)
+
     // ── Public API ──────────────────────────────────────────────────────────
 
     /**
@@ -202,6 +215,9 @@ class AndroidDualCameraCompositor(
             allocateGlesInputSurfaces()
         }
 
+        // Pre-allocate the PixelCopy readback target for photo capture snapshots.
+        snapshotBitmap = Bitmap.createBitmap(canvasWidth, canvasHeight, Bitmap.Config.ARGB_8888)
+
         scheduleNextFrame()
 
         Log.i(TAG, "Render loop started backend=${if (isVulkanBackend) "Vulkan" else "GLES"}")
@@ -214,6 +230,25 @@ class AndroidDualCameraCompositor(
     fun updateLayout(params: LayoutParams) {
         currentLayout.set(params)
         Log.d(TAG, "updateLayout mode=${params.layoutMode} anchor=${params.anchor}")
+    }
+
+    /**
+     * Returns a caller-owned copy of the most recently composited frame, or
+     * `null` if no frame has been captured yet (e.g. called immediately after
+     * [start], before the first PixelCopy readback completes).
+     *
+     * Thread-safe and callable from any thread. Mirrors iOS's snapshot
+     * pattern: the internal lock is held only long enough to copy the
+     * [Bitmap] reference's pixel data — JPEG encoding and disk I/O must
+     * happen on the returned copy, outside of any compositor-owned lock.
+     */
+    fun captureSnapshot(): Bitmap? {
+        bitmapLock.lock()
+        try {
+            return lastCompositedBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+        } finally {
+            bitmapLock.unlock()
+        }
     }
 
     /**
@@ -268,6 +303,16 @@ class AndroidDualCameraCompositor(
         _frontInputSurface = null
         _backInputSurface?.release()
         _backInputSurface = null
+
+        // Release frame snapshot resources.
+        bitmapLock.lock()
+        try {
+            lastCompositedBitmap = null
+            snapshotBitmap?.recycle()
+            snapshotBitmap = null
+        } finally {
+            bitmapLock.unlock()
+        }
 
         Log.i(TAG, "stop() complete")
     }
@@ -339,36 +384,41 @@ class AndroidDualCameraCompositor(
         val params = currentLayout.get()
         val layoutJson = buildLayoutJson(params)
 
-        if (isVulkanBackend) {
+        val composited = if (isVulkanBackend) {
             renderFrameVulkan(handle, layoutJson)
         } else {
             renderFrameGles(handle, layoutJson)
         }
 
+        if (composited) {
+            captureFrameSnapshot()
+        }
+
         scheduleNextFrame()
     }
 
-    private fun renderFrameVulkan(handle: Long, layoutJson: String) {
-        val front = frontImageReader ?: return
-        val back = backImageReader ?: return
+    private fun renderFrameVulkan(handle: Long, layoutJson: String): Boolean {
+        val front = frontImageReader ?: return false
+        val back = backImageReader ?: return false
 
         // Acquire latest available images (non-blocking — drop frame if none available yet).
         val frontImage = try { front.acquireLatestImage() } catch (_: Throwable) { null }
         val backImage = try { back.acquireLatestImage() } catch (_: Throwable) { null }
 
+        var composited = false
         try {
             val frontAhb = frontImage?.hardwareBuffer
             val backAhb = backImage?.hardwareBuffer
             try {
                 // Only composite when both camera frames are available.
                 if (frontAhb != null && backAhb != null) {
-                    val ok = VanguardNativeBridge.nativeDualCamCompositeFrame(
+                    composited = VanguardNativeBridge.nativeDualCamCompositeFrame(
                         handle,
                         frontAhb,
                         backAhb,
                         layoutJson,
                     )
-                    if (!ok) {
+                    if (!composited) {
                         Log.w(TAG, "nativeDualCamCompositeFrame returned false")
                     }
                 }
@@ -382,11 +432,12 @@ class AndroidDualCameraCompositor(
             frontImage?.close()
             backImage?.close()
         }
+        return composited
     }
 
-    private fun renderFrameGles(handle: Long, layoutJson: String) {
-        val frontSt = frontSurfaceTexture ?: return
-        val backSt = backSurfaceTexture ?: return
+    private fun renderFrameGles(handle: Long, layoutJson: String): Boolean {
+        val frontSt = frontSurfaceTexture ?: return false
+        val backSt = backSurfaceTexture ?: return false
 
         // Update SurfaceTexture with latest camera frame.
         frontSt.updateTexImage()
@@ -401,6 +452,46 @@ class AndroidDualCameraCompositor(
         )
         if (!ok) {
             Log.w(TAG, "nativeDualCamCompositeFrame (GLES) returned false")
+        }
+        return ok
+    }
+
+    // ── Private: frame snapshot readback ────────────────────────────────────
+
+    /**
+     * Issues an async PixelCopy readback of [outputSurface] into the
+     * pre-allocated [snapshotBitmap], swapping it into [lastCompositedBitmap]
+     * under [bitmapLock] on success. Never blocks the render loop: skips this
+     * frame's readback if a previous PixelCopy request is still in flight
+     * (avoids overlapping writes into the same target Bitmap), and any
+     * failure is logged without disrupting rendering.
+     */
+    private fun captureFrameSnapshot() {
+        val target = snapshotBitmap ?: return
+        val handler = renderHandler ?: return
+        if (stopped.get()) return
+
+        if (!pixelCopyInFlight.compareAndSet(false, true)) {
+            return
+        }
+
+        try {
+            PixelCopy.request(outputSurface, target, { copyResult ->
+                pixelCopyInFlight.set(false)
+                if (copyResult == PixelCopy.SUCCESS) {
+                    bitmapLock.lock()
+                    try {
+                        lastCompositedBitmap = target
+                    } finally {
+                        bitmapLock.unlock()
+                    }
+                } else {
+                    Log.w(TAG, "captureFrameSnapshot: PixelCopy failed with result=$copyResult")
+                }
+            }, handler)
+        } catch (t: Throwable) {
+            pixelCopyInFlight.set(false)
+            Log.w(TAG, "captureFrameSnapshot: PixelCopy.request threw: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 

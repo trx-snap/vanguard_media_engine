@@ -2,6 +2,7 @@ package com.connects.vanguard_media_engine.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -16,6 +17,8 @@ import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -40,10 +43,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    no-op successes: there is no Android multicam preview/diagnostic
  *    session in this slice, so neither touches the single-camera
  *    [hasActiveSingleCamera] state.
- *  - updateMultiCamPreviewConfig/takeMultiCamPhoto/startMultiCamRecording/
- *    stopMultiCamRecording all reject with NOT_RUNNING (after arg
- *    validation) because there is never a running Android MultiCam preview
- *    session in this slice to update, photograph, or record.
+ *  - updateMultiCamPreviewConfig and takeMultiCamPhoto are real
+ *    implementations that operate on the live [dualCamCompositor] (layout
+ *    updates and PixelCopy-based composited-frame snapshots respectively);
+ *    both still reject with NOT_RUNNING when no MultiCam preview is active.
+ *    startMultiCamRecording/stopMultiCamRecording remain fail-closed guard
+ *    routes that reject with NOT_RUNNING (after arg validation) because
+ *    there is no Android MultiCam recording lifecycle owner in this slice.
  *  - measureMultiCamHardwareCost/runMultiCamStreamingDiagnostic/
  *    runMultiCamSyncDiagnostic/runMultiCamSourceLifecycleDiagnostic
  *    (P3-CAM-CONCURRENT-DIAGNOSTIC-FAIL-CLOSED-ANDROID-HANDLER) are explicit
@@ -645,11 +651,73 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             return
         }
 
-        result.error(
-            "NOT_RUNNING",
-            "Android MultiCam preview is not running",
-            null,
-        )
+        val compositor = dualCamCompositor
+        if (compositor == null || dualCameraSource == null) {
+            result.error(
+                "NOT_RUNNING",
+                "Android MultiCam preview is not running",
+                null,
+            )
+            return
+        }
+
+        // Retain a caller-owned snapshot under the compositor's lock (nanosecond
+        // hold — see AndroidDualCameraCompositor.captureSnapshot). JPEG encoding
+        // and disk I/O run outside that lock, on a background thread.
+        val bitmap = compositor.captureSnapshot()
+        if (bitmap == null) {
+            result.error(
+                "NO_FRAME",
+                "No composited frame available yet",
+                null,
+            )
+            return
+        }
+
+        Thread {
+            val out = try {
+                FileOutputStream(path)
+            } catch (t: Throwable) {
+                Log.e(TAG, "takeMultiCamPhoto: failed to open output file: ${t.javaClass.simpleName}: ${t.message}")
+                bitmap.recycle()
+                mainHandler.post { result.error("WRITE_FAIL", t.message, null) }
+                return@Thread
+            }
+
+            val encoded = try {
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            } catch (t: Throwable) {
+                Log.e(TAG, "takeMultiCamPhoto: JPEG compress threw: ${t.javaClass.simpleName}: ${t.message}")
+                false
+            } finally {
+                try { out.close() } catch (t: Throwable) { /* ignore */ }
+            }
+
+            if (!encoded) {
+                bitmap.recycle()
+                mainHandler.post { result.error("ENCODE_FAIL", "JPEG encoding failed", null) }
+                return@Thread
+            }
+
+            val width = bitmap.width
+            val height = bitmap.height
+            bitmap.recycle()
+
+            val sizeBytes = try { File(path).length() } catch (t: Throwable) { 0L }
+
+            Log.i(TAG, "takeMultiCamPhoto: wrote ${sizeBytes}b to $path (${width}x$height)")
+            mainHandler.post {
+                result.success(
+                    mapOf(
+                        "filePath" to path,
+                        "width" to width,
+                        "height" to height,
+                        "sizeBytes" to sizeBytes,
+                        "format" to "jpeg",
+                    )
+                )
+            }
+        }.start()
     }
 
     // -- startMultiCamRecording ---------------------------------------------------
