@@ -487,10 +487,6 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   if ([_session canAddOutput:_videoOutput])
     [_session addOutput:_videoOutput];
 
-  // Orientation + mirroring: follow physical device orientation.
-  // Uses shared helper (Phase 6A-3J-F) for consistency with
-  // moveCameraToPosition: and the device-orientation observer.
-  [self _applyConnectionOrientationContract];
 
   // Frame rate
   [cam lockForConfiguration:nil];
@@ -573,6 +569,11 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   }
 
   [_session commitConfiguration];
+
+  // Orientation + mirroring: apply contract after commitConfiguration so that
+  // both video and photo connections are resolved and configured with portrait
+  // orientation and front-camera mirroring.
+  [self _applyConnectionOrientationContract];
 
   // ── Voice Isolation (iOS 15+) ─────────────────────────────────────────────
   [self _configureVoiceIsolation];
@@ -1959,21 +1960,16 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
       [_session addInput:_videoInput];
   }
 
-  // Phase 6A-3J-F: Set orientation and mirroring inside the configuration
-  // block so AVFoundation batches all mutations into the single
-  // commitConfiguration call. Uses shared helper for consistency.
-  [self _applyConnectionOrientationContract];
-
   [_session commitConfiguration];
 
-  // Phase 6C: re-apply portrait lock if it was active before the switch.
-  // _applyConnectionOrientationContract above already enforces portrait when
-  // locked, but calling the public method logs the event for diagnostics.
+  // Re-apply orientation and mirroring contract on the newly formed connection
+  // after commitConfiguration resolves the camera input swap.
+  [self _applyConnectionOrientationContract];
+
   if (_previewOrientationLocked) {
-    NSLog(@"[Vanguard][6C] moveCameraToPosition: re-applying portrait lock "
-          @"after camera switch");
-    // Lock already enforced by _applyConnectionOrientationContract; no further
-    // work.
+    NSLog(@"[Vanguard][6C] moveCameraToPosition: portrait lock active after "
+          @"camera switch (position=%ld, mirroring=%d)",
+          (long)_position, (int)(_position == AVCaptureDevicePositionFront));
   }
 
   // Reconfiguration complete — photo capture allowed again.
@@ -2000,13 +1996,11 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 
 - (void)lockPreviewOrientationToPortrait {
   _previewOrientationLocked = YES;
-  // Force portrait immediately on the active video connection.
-  AVCaptureConnection *vidConn =
-      [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
-  if (vidConn && vidConn.isVideoOrientationSupported) {
-    vidConn.videoOrientation = AVCaptureVideoOrientationPortrait;
-  }
-  NSLog(@"[Vanguard][6C] preview orientation locked to portrait");
+  // Force portrait and correct mirroring immediately on the active connection.
+  [self _applyConnectionOrientationContract];
+  NSLog(@"[Vanguard][6C] preview orientation locked to portrait (position=%ld, "
+        @"mirroring=%d)",
+        (long)_position, (int)(_position == AVCaptureDevicePositionFront));
 }
 
 - (void)unlockPreviewOrientation {
