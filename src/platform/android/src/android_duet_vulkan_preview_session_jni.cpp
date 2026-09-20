@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <memory>
+#include <unistd.h>
 
 using vanguard::android::AndroidDuetVulkanPreviewSession;
 
@@ -15,6 +16,12 @@ namespace {
     std::atomic<jlong> gNextSessionId{1};
     std::mutex gSessionMutex;
     std::unordered_map<jlong, std::shared_ptr<AndroidDuetVulkanPreviewSession>> gSessions;
+
+    void CloseFenceFdIfValid(int fd) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
 
     std::shared_ptr<AndroidDuetVulkanPreviewSession> GetSession(jlong handle) {
         std::lock_guard<std::mutex> lock(gSessionMutex);
@@ -64,17 +71,60 @@ namespace {
         return ok ? JNI_TRUE : JNI_FALSE;
     }
 
+    // ANDROID-DUET-VULKAN-GPU-MASK: format/timestampUs are accepted at the
+    // JNI boundary as caller metadata (see VanguardNativeBridge.kt) but are
+    // not passed to UpdateGpuMask, which trusts the AHardwareBuffer's own
+    // imported descriptor dimensions for rendering.
+    jboolean UpdateGpuMaskImpl(
+        JNIEnv* env, jlong handle, jobject gpuMaskHardwareBuffer, jint width, jint height,
+        jint acquireFenceFd) {
+        if (!gpuMaskHardwareBuffer || width <= 0 || height <= 0) {
+            CloseFenceFdIfValid(acquireFenceFd);
+            return JNI_FALSE;
+        }
+
+        auto session = GetSession(handle);
+        if (!session) {
+            CloseFenceFdIfValid(acquireFenceFd);
+            return JNI_FALSE;
+        }
+
+        AHardwareBuffer* buffer = ResolveAHardwareBufferFromJObject(env, gpuMaskHardwareBuffer);
+        if (!buffer) {
+            CloseFenceFdIfValid(acquireFenceFd);
+            return JNI_FALSE;
+        }
+
+        const bool ok = session->UpdateGpuMask(
+            static_cast<void*>(buffer), static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+            static_cast<int>(acquireFenceFd));
+        return ok ? JNI_TRUE : JNI_FALSE;
+    }
+
     // ANDROID-DUET-VULKAN-LAYOUT: greenScreenEnabled selects the session's
     // mask-composite path (rects ignored) or the opaque two-layer layout path
     // (decoder aspect-filled into the source rect, camera into the camera
     // rect). Rects are canvas pixel rects already rounded / clamped by the
     // Kotlin compositor; a non-positive layout rect size fails closed here
     // without touching the session.
+    // ANDROID-DUET-VULKAN-CAMERA-CONTENT-DIMENSIONS: sourceContentWidth/
+    // sourceContentHeight and cameraContentWidth/cameraContentHeight are the
+    // caller's logical content size (e.g. the originating Image's
+    // width/height) for the decoder/camera layer respectively, forwarded to
+    // AndroidDuetVulkanPreviewSession::RenderFrame as the preferred
+    // aspect-fill crop dimensions over each layer's imported AHardwareBuffer
+    // descriptor size. Negative values are clamped to 0 (native's "use the
+    // descriptor fallback" sentinel) before crossing into unsigned native
+    // types.
     jboolean RenderFrameImpl(
         JNIEnv* env, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer,
         jboolean greenScreenEnabled,
         jint sourceX, jint sourceY, jint sourceWidth, jint sourceHeight,
-        jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight) {
+        jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
+        jint sourceRotationDegrees, jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
+        jint sourceContentWidth, jint sourceContentHeight,
+        jint cameraContentWidth, jint cameraContentHeight,
+        jint debugMode) {
         if (!decoderHardwareBuffer || !cameraHardwareBuffer) {
             return JNI_FALSE;
         }
@@ -109,9 +159,69 @@ namespace {
         cameraRect.width = static_cast<int32_t>(cameraWidth);
         cameraRect.height = static_cast<int32_t>(cameraHeight);
 
+        const uint32_t safeSourceContentWidth =
+            sourceContentWidth > 0 ? static_cast<uint32_t>(sourceContentWidth) : 0u;
+        const uint32_t safeSourceContentHeight =
+            sourceContentHeight > 0 ? static_cast<uint32_t>(sourceContentHeight) : 0u;
+        const uint32_t safeCameraContentWidth =
+            cameraContentWidth > 0 ? static_cast<uint32_t>(cameraContentWidth) : 0u;
+        const uint32_t safeCameraContentHeight =
+            cameraContentHeight > 0 ? static_cast<uint32_t>(cameraContentHeight) : 0u;
+
         const bool ok = session->RenderFrame(
             static_cast<void*>(decoderBuffer), static_cast<void*>(cameraBuffer),
-            !layoutMode, sourceRect, cameraRect);
+            !layoutMode, sourceRect, cameraRect,
+            static_cast<uint32_t>(sourceRotationDegrees), static_cast<uint32_t>(cameraRotationDegrees),
+            cameraMirrorHorizontal == JNI_TRUE, static_cast<int32_t>(debugMode),
+            safeSourceContentWidth, safeSourceContentHeight,
+            safeCameraContentWidth, safeCameraContentHeight);
+        return ok ? JNI_TRUE : JNI_FALSE;
+    }
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
+    // only): camera-only green-screen frame over a static background
+    // (backgroundMode 1 = solid_teal; anything else fails closed natively).
+    // Same camera rect / rotation / mirror / content-dimension / debugMode
+    // contract as RenderFrameImpl above, minus the decoder buffer and source
+    // layer entirely. A non-positive camera rect size fails closed here
+    // without touching the session.
+    jboolean RenderStaticBackgroundFrameImpl(
+        JNIEnv* env, jlong handle, jobject cameraHardwareBuffer,
+        jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
+        jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
+        jint cameraContentWidth, jint cameraContentHeight,
+        jint debugMode, jint backgroundMode) {
+        if (!cameraHardwareBuffer || cameraWidth <= 0 || cameraHeight <= 0) {
+            return JNI_FALSE;
+        }
+
+        auto session = GetSession(handle);
+        if (!session) {
+            return JNI_FALSE;
+        }
+
+        AHardwareBuffer* cameraBuffer = ResolveAHardwareBufferFromJObject(env, cameraHardwareBuffer);
+        if (!cameraBuffer) {
+            return JNI_FALSE;
+        }
+
+        vanguard::android::AndroidDuetVulkanPreviewLayoutRect cameraRect;
+        cameraRect.x = static_cast<int32_t>(cameraX);
+        cameraRect.y = static_cast<int32_t>(cameraY);
+        cameraRect.width = static_cast<int32_t>(cameraWidth);
+        cameraRect.height = static_cast<int32_t>(cameraHeight);
+
+        const uint32_t safeCameraContentWidth =
+            cameraContentWidth > 0 ? static_cast<uint32_t>(cameraContentWidth) : 0u;
+        const uint32_t safeCameraContentHeight =
+            cameraContentHeight > 0 ? static_cast<uint32_t>(cameraContentHeight) : 0u;
+
+        const bool ok = session->RenderStaticBackgroundFrame(
+            static_cast<void*>(cameraBuffer), cameraRect,
+            static_cast<uint32_t>(cameraRotationDegrees),
+            cameraMirrorHorizontal == JNI_TRUE,
+            static_cast<int32_t>(debugMode), static_cast<int32_t>(backgroundMode),
+            safeCameraContentWidth, safeCameraContentHeight);
         return ok ? JNI_TRUE : JNI_FALSE;
     }
 
@@ -204,15 +314,44 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_updateAndroidDuetVulkanPreviewGpuMask(
+    JNIEnv* env, jobject /*companion*/, jlong handle, jobject gpuMaskHardwareBuffer,
+    jint width, jint height, jint /*format*/, jlong /*timestampUs*/, jint acquireFenceFd) {
+    return UpdateGpuMaskImpl(env, handle, gpuMaskHardwareBuffer, width, height, acquireFenceFd);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_renderAndroidDuetVulkanPreviewFrame(
     JNIEnv* env, jobject /*companion*/, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer,
     jboolean greenScreenEnabled,
     jint sourceX, jint sourceY, jint sourceWidth, jint sourceHeight,
-    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight) {
+    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
+    jint sourceRotationDegrees, jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
+    jint sourceContentWidth, jint sourceContentHeight,
+    jint cameraContentWidth, jint cameraContentHeight,
+    jint debugMode) {
     return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer,
                            greenScreenEnabled,
                            sourceX, sourceY, sourceWidth, sourceHeight,
-                           cameraX, cameraY, cameraWidth, cameraHeight);
+                           cameraX, cameraY, cameraWidth, cameraHeight,
+                           sourceRotationDegrees, cameraRotationDegrees, cameraMirrorHorizontal,
+                           sourceContentWidth, sourceContentHeight,
+                           cameraContentWidth, cameraContentHeight,
+                           debugMode);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_renderAndroidDuetVulkanPreviewStaticBackgroundFrame(
+    JNIEnv* env, jobject /*companion*/, jlong handle, jobject cameraHardwareBuffer,
+    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
+    jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
+    jint cameraContentWidth, jint cameraContentHeight,
+    jint debugMode, jint backgroundMode) {
+    return RenderStaticBackgroundFrameImpl(env, handle, cameraHardwareBuffer,
+                                           cameraX, cameraY, cameraWidth, cameraHeight,
+                                           cameraRotationDegrees, cameraMirrorHorizontal,
+                                           cameraContentWidth, cameraContentHeight,
+                                           debugMode, backgroundMode);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,13 +388,42 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_updateAndr
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_updateAndroidDuetVulkanPreviewGpuMask(
+    JNIEnv* env, jclass /*clazz*/, jlong handle, jobject gpuMaskHardwareBuffer,
+    jint width, jint height, jint /*format*/, jlong /*timestampUs*/, jint acquireFenceFd) {
+    return UpdateGpuMaskImpl(env, handle, gpuMaskHardwareBuffer, width, height, acquireFenceFd);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDuetVulkanPreviewFrame(
     JNIEnv* env, jclass /*clazz*/, jlong handle, jobject decoderHardwareBuffer, jobject cameraHardwareBuffer,
     jboolean greenScreenEnabled,
     jint sourceX, jint sourceY, jint sourceWidth, jint sourceHeight,
-    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight) {
+    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
+    jint sourceRotationDegrees, jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
+    jint sourceContentWidth, jint sourceContentHeight,
+    jint cameraContentWidth, jint cameraContentHeight,
+    jint debugMode) {
     return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer,
                            greenScreenEnabled,
                            sourceX, sourceY, sourceWidth, sourceHeight,
-                           cameraX, cameraY, cameraWidth, cameraHeight);
+                           cameraX, cameraY, cameraWidth, cameraHeight,
+                           sourceRotationDegrees, cameraRotationDegrees, cameraMirrorHorizontal,
+                           sourceContentWidth, sourceContentHeight,
+                           cameraContentWidth, cameraContentHeight,
+                           debugMode);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDuetVulkanPreviewStaticBackgroundFrame(
+    JNIEnv* env, jclass /*clazz*/, jlong handle, jobject cameraHardwareBuffer,
+    jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
+    jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
+    jint cameraContentWidth, jint cameraContentHeight,
+    jint debugMode, jint backgroundMode) {
+    return RenderStaticBackgroundFrameImpl(env, handle, cameraHardwareBuffer,
+                                           cameraX, cameraY, cameraWidth, cameraHeight,
+                                           cameraRotationDegrees, cameraMirrorHorizontal,
+                                           cameraContentWidth, cameraContentHeight,
+                                           debugMode, backgroundMode);
 }

@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <android/hardware_buffer.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -24,8 +25,14 @@ using vanguard::android_diag::dual_decoder_sync::ScratchBuffer;
 using vanguard::android_diag::dual_decoder_sync::ScratchImage;
 using vanguard::android_diag::dual_decoder_sync::VulkanScratch;
 
+using vanguard::render::ComputeVulkanGreenScreenReferencePixel;
+using vanguard::render::kVulkanGreenScreenBlendFormula;
+using vanguard::render::kVulkanGreenScreenColorContract;
+using vanguard::render::kVulkanGreenScreenReferenceColorTolerance;
+using vanguard::render::MapVulkanGreenScreenMaskTexel;
 using vanguard::render::VulkanGreenScreenCompositor;
 using vanguard::render::VulkanGreenScreenInputs;
+using vanguard::render::VulkanGreenScreenPixelWithinTolerance;
 using vanguard::render::VulkanGreenScreenRenderTarget;
 using vanguard::render::VulkanGreenScreenSampledImage;
 
@@ -35,12 +42,90 @@ constexpr uint8_t kMaskRowValues[kMaskHeight] = {
     0, 0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255, 255,
 };
 
+constexpr uint8_t kBackground[4] = {30, 60, 200, 255};
+constexpr uint8_t kForeground[4] = {230, 120, 20, 180};
+
 constexpr const char* kProofBoundary =
-    "native_android_duet_preview_ingest_combined_camera_ahb_decoder_ahb_vulkan_greenscreen_mask_blend_diagnostic_only_no_camerax_no_production_preview_no_export";
+    "native_android_duet_preview_ingest_combined_camera_ahb_decoder_ahb_vulkan_greenscreen_mask_blend_diagnostic_only_no_camerax_no_production_preview_no_export_no_segmentation_model";
 constexpr const char* kPassMarker =
     "ANDROID_DUET_VULKAN_PREVIEW_INGEST_COMBINED_PHYSICAL_PASS";
 constexpr const char* kFailMarker =
     "ANDROID_DUET_VULKAN_PREVIEW_INGEST_COMBINED_PHYSICAL_FAIL";
+
+static uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& props,
+                               uint32_t typeBits,
+                               VkMemoryPropertyFlags required) {
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+        if ((typeBits & (1u << i)) != 0 &&
+            (props.memoryTypes[i].propertyFlags & required) == required) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static bool CreateDeviceImageExplicit(const VulkanScratch& vk,
+                                      VkFormat format,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      VkImageUsageFlags usage,
+                                      ScratchImage& out,
+                                      std::string* outError) {
+    VkImageCreateInfo imgCI{};
+    imgCI.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgCI.imageType     = VK_IMAGE_TYPE_2D;
+    imgCI.format        = format;
+    imgCI.extent        = {width, height, 1};
+    imgCI.mipLevels     = 1;
+    imgCI.arrayLayers   = 1;
+    imgCI.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imgCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    imgCI.usage         = usage;
+    imgCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    imgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(vk.device, &imgCI, nullptr, &out.image) != VK_SUCCESS) {
+        out.image = VK_NULL_HANDLE;
+        *outError = "scratch_image_create_failed";
+        return false;
+    }
+    out.width  = width;
+    out.height = height;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(vk.device, out.image, &req);
+    uint32_t typeIndex = FindMemoryType(vk.memProps, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (typeIndex == UINT32_MAX) typeIndex = FindMemoryType(vk.memProps, req.memoryTypeBits, 0);
+    if (typeIndex == UINT32_MAX) {
+        *outError = "scratch_image_memory_type_not_found";
+        return false;
+    }
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize  = req.size;
+    alloc.memoryTypeIndex = typeIndex;
+    if (vkAllocateMemory(vk.device, &alloc, nullptr, &out.memory) != VK_SUCCESS) {
+        out.memory = VK_NULL_HANDLE;
+        *outError = "scratch_image_memory_alloc_failed";
+        return false;
+    }
+    if (vkBindImageMemory(vk.device, out.image, out.memory, 0) != VK_SUCCESS) {
+        *outError = "scratch_image_bind_failed";
+        return false;
+    }
+    VkImageViewCreateInfo viewCI{};
+    viewCI.sType                       = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewCI.image                       = out.image;
+    viewCI.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
+    viewCI.format                      = format;
+    viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewCI.subresourceRange.levelCount = 1;
+    viewCI.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(vk.device, &viewCI, nullptr, &out.view) != VK_SUCCESS) {
+        out.view = VK_NULL_HANDLE;
+        *outError = "scratch_image_view_create_failed";
+        return false;
+    }
+    return true;
+}
 
 static void FlushIfNeeded(const VulkanScratch& vk, const ScratchBuffer& buf) {
     if (buf.coherent) return;
@@ -169,11 +254,18 @@ static std::string JsonEscape(const std::string& in) {
     return out;
 }
 
+static std::string RgbaString(const uint8_t* p) {
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%u,%u,%u,%u", p[0], p[1], p[2], p[3]);
+    return buf;
+}
+
 class DetailsBuilder {
 public:
     void Str(const char* key, const std::string& value) { Raw(key, "\"" + JsonEscape(value) + "\""); }
     void Bool(const char* key, bool value) { Raw(key, value ? "true" : "false"); }
     void U64(const char* key, uint64_t value) { Raw(key, std::to_string(value)); }
+    void Int(const char* key, int64_t value) { Raw(key, std::to_string(value)); }
     std::string Json() const {
         std::string out = "{";
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -208,6 +300,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     bool maskUploadOk = false;
     bool blendRenderOk = false;
     bool readbackOk = false;
+    bool cpuReferenceParityOk = false;
+    bool alphaZeroPreservesBackgroundOk = false;
+    bool alphaFullForegroundOk = false;
+    bool alphaFractionalBlendOk = false;
+    bool maskResolutionMismatchOk = false;
     bool resourceReleaseOk = false;
     bool diagnosticTeardownOk = false;
     bool allNativeLanesPass = false;
@@ -225,6 +322,20 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     ScratchImage maskScratch;
     ScratchImage targetScratch;
     ScratchBuffer readbackScratch;
+
+    ScratchImage syntheticBackground;
+    ScratchImage syntheticForeground;
+    ScratchImage syntheticTarget;
+    ScratchBuffer syntheticReadback;
+
+    VulkanGreenScreenCompositor compositorStack;
+
+    uint64_t realNonZero = 0;
+    uint64_t mismatchCount = 0;
+    std::string firstMismatch;
+    uint64_t zeroCount = 0, fullCount = 0, fractionalCount = 0;
+    bool zeroOk = true, fullOk = true, fractionalOk = true;
+
     bool unsupported = false;
     if (!api.Load(&failureReason)) {
         goto end;
@@ -246,17 +357,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     }
     decoderImportOk = true;
 
-    if (!CreateDeviceImage(vk, cameraImported.cropWidth, cameraImported.cropHeight,
-                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, true,
-                           cameraResolved, &failureReason)) {
-        goto end;
-    }
     if (!ResolveImportedFrame(vk, cameraImported, cameraResolved, &failureReason)) {
-        goto end;
-    }
-    if (!CreateDeviceImage(vk, decoderImported.cropWidth, decoderImported.cropHeight,
-                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, true,
-                           decoderResolved, &failureReason)) {
         goto end;
     }
     if (!ResolveImportedFrame(vk, decoderImported, decoderResolved, &failureReason)) {
@@ -264,9 +365,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     }
     resolveOk = true;
 
-    if (!CreateDeviceImage(vk, kMaskWidth, kMaskHeight,
-                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, false,
-                           maskScratch, &failureReason)) {
+    if (!CreateDeviceImageExplicit(vk, VK_FORMAT_R8_UNORM, kMaskWidth, kMaskHeight,
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   maskScratch, &failureReason)) {
         goto end;
     }
     {
@@ -282,6 +383,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     }
     maskUploadOk = true;
 
+    // 1. Real camera AHB + decoder AHB blend into 128x128 target with non-zero readback check
     if (!CreateDeviceImage(vk, 128, 128,
                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false,
                            targetScratch, &failureReason)) {
@@ -292,8 +394,6 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     }
 
     {
-        VulkanGreenScreenCompositor compositorStack;
-        
         VulkanGreenScreenInputs inputs;
         inputs.background.imageView = decoderResolved.view;
         inputs.background.sampler = decoderResolved.sampler;
@@ -324,16 +424,135 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     {
         InvalidateIfNeeded(vk, readbackScratch);
-        
-        uint64_t nonZero = 0;
         const uint8_t* pixels = static_cast<const uint8_t*>(readbackScratch.mapped);
         for (uint32_t i = 0; i < 128 * 128 * 4; ++i) {
-            if (pixels[i] != 0) nonZero++;
+            if (pixels[i] != 0) realNonZero++;
         }
-        if (nonZero > 0) {
+        if (realNonZero > 0) {
             readbackOk = true;
         } else {
-            failureReason = "readback_empty";
+            failureReason = "real_readback_empty";
+            goto end;
+        }
+    }
+
+    // 2. Deterministic synthetic sub-lane in the same Vulkan context proving full pixel parity
+    if (!CreateDeviceImageExplicit(vk, VK_FORMAT_R8G8B8A8_UNORM, 1, 1,
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   syntheticBackground, &failureReason)) {
+        goto end;
+    }
+    if (!UploadSampledImage(vk, syntheticBackground, kBackground, 1, 1, 4, &failureReason)) {
+        goto end;
+    }
+
+    if (!CreateDeviceImageExplicit(vk, VK_FORMAT_R8G8B8A8_UNORM, 1, 1,
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   syntheticForeground, &failureReason)) {
+        goto end;
+    }
+    if (!UploadSampledImage(vk, syntheticForeground, kForeground, 1, 1, 4, &failureReason)) {
+        goto end;
+    }
+
+    if (!CreateDeviceImage(vk, 128, 128,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false,
+                           syntheticTarget, &failureReason)) {
+        goto end;
+    }
+    if (!CreateHostBuffer(vk, 128 * 128 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, syntheticReadback, &failureReason)) {
+        goto end;
+    }
+
+    {
+        VulkanGreenScreenInputs synInputs;
+        synInputs.background.imageView = syntheticBackground.view;
+        synInputs.background.sampler = syntheticBackground.sampler;
+        synInputs.foreground.imageView = syntheticForeground.view;
+        synInputs.foreground.sampler = syntheticForeground.sampler;
+        synInputs.mask.imageView = maskScratch.view;
+        synInputs.mask.sampler = maskScratch.sampler;
+        synInputs.maskWidth = kMaskWidth;
+        synInputs.maskHeight = kMaskHeight;
+
+        VulkanGreenScreenRenderTarget synTarget;
+        synTarget.device = vk.device;
+        synTarget.queue = vk.queue;
+        synTarget.commandPool = vk.commandPool;
+        synTarget.colorImage = syntheticTarget.image;
+        synTarget.colorImageView = syntheticTarget.view;
+        synTarget.colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        synTarget.readbackBuffer = syntheticReadback.buffer;
+        synTarget.readbackBufferSizeBytes = 128 * 128 * 4;
+        synTarget.extentWidth = 128;
+        synTarget.extentHeight = 128;
+
+        if (!compositorStack.blendGreenScreen(synTarget, synInputs, &failureReason)) {
+            goto end;
+        }
+    }
+
+    {
+        InvalidateIfNeeded(vk, syntheticReadback);
+        const uint8_t* pixels = static_cast<const uint8_t*>(syntheticReadback.mapped);
+
+        for (uint32_t y = 0; y < 128; ++y) {
+            for (uint32_t x = 0; x < 128; ++x) {
+                uint32_t mx = 0, my = 0;
+                MapVulkanGreenScreenMaskTexel(x, y, 128, 128, kMaskWidth, kMaskHeight, &mx, &my);
+                const uint8_t maskValue = kMaskRowValues[my];
+                uint8_t expected[4];
+                ComputeVulkanGreenScreenReferencePixel(kBackground, kForeground, maskValue, expected);
+
+                const uint8_t* actual = &pixels[(static_cast<size_t>(y) * 128 + x) * 4];
+                int maxDelta = 0;
+                const bool withinTolerance = VulkanGreenScreenPixelWithinTolerance(
+                    actual, expected, kVulkanGreenScreenReferenceColorTolerance, &maxDelta);
+                if (!withinTolerance) {
+                    if (mismatchCount == 0) {
+                        firstMismatch = std::to_string(x) + "," + std::to_string(y) +
+                                       " mask=" + std::to_string(maskValue) +
+                                       " actual=" + RgbaString(actual) +
+                                       " expected=" + RgbaString(expected);
+                    }
+                    ++mismatchCount;
+                }
+
+                if (maskValue == 0) {
+                    ++zeroCount;
+                    int delta = 0;
+                    if (!VulkanGreenScreenPixelWithinTolerance(actual, kBackground, 0, &delta)) zeroOk = false;
+                } else if (maskValue == 255) {
+                    ++fullCount;
+                    int delta = 0;
+                    if (!VulkanGreenScreenPixelWithinTolerance(actual, kForeground, 0, &delta)) fullOk = false;
+                } else {
+                    ++fractionalCount;
+                    const bool matchesBackground = std::memcmp(actual, kBackground, 4) == 0;
+                    const bool matchesForeground = std::memcmp(actual, kForeground, 4) == 0;
+                    if (!withinTolerance || matchesBackground || matchesForeground) {
+                        fractionalOk = false;
+                    }
+                }
+            }
+        }
+
+        cpuReferenceParityOk = (mismatchCount == 0);
+        alphaZeroPreservesBackgroundOk = zeroOk && (zeroCount > 0);
+        alphaFullForegroundOk = fullOk && (fullCount > 0);
+        alphaFractionalBlendOk = fractionalOk && (fractionalCount > 0);
+        maskResolutionMismatchOk = (kMaskWidth != 128) && (kMaskHeight != 128) && cpuReferenceParityOk;
+
+        if (!cpuReferenceParityOk) {
+            if (failureReason.empty()) failureReason = "cpu_reference_parity_failed";
+        } else if (!alphaZeroPreservesBackgroundOk) {
+            if (failureReason.empty()) failureReason = "alpha_zero_preserves_background_failed";
+        } else if (!alphaFullForegroundOk) {
+            if (failureReason.empty()) failureReason = "alpha_full_foreground_failed";
+        } else if (!alphaFractionalBlendOk) {
+            if (failureReason.empty()) failureReason = "alpha_fractional_blend_failed";
+        } else if (!maskResolutionMismatchOk) {
+            if (failureReason.empty()) failureReason = "mask_resolution_mismatch_failed";
         }
     }
 
@@ -341,28 +560,70 @@ end:
     if (vk.queue != VK_NULL_HANDLE) {
         vkQueueWaitIdle(vk.queue);
     }
-    
-    cameraResolved.Destroy(vk.device);
-    decoderResolved.Destroy(vk.device);
-    maskScratch.Destroy(vk.device);
+
+    syntheticTarget.Destroy(vk.device);
+    syntheticReadback.Destroy(vk.device);
+    syntheticForeground.Destroy(vk.device);
+    syntheticBackground.Destroy(vk.device);
+
     targetScratch.Destroy(vk.device);
     readbackScratch.Destroy(vk.device);
-    
+    maskScratch.Destroy(vk.device);
+    decoderResolved.Destroy(vk.device);
+    cameraResolved.Destroy(vk.device);
+
     cameraImported.Destroy(vk, api);
     decoderImported.Destroy(vk, api);
-    
-    resourceReleaseOk = true;
+
+    const bool allScratchNull =
+        cameraResolved.IsNull() && decoderResolved.IsNull() &&
+        maskScratch.IsNull() && targetScratch.IsNull() && readbackScratch.IsNull() &&
+        syntheticBackground.IsNull() && syntheticForeground.IsNull() &&
+        syntheticTarget.IsNull() && syntheticReadback.IsNull() &&
+        cameraImported.IsNull() && decoderImported.IsNull();
+    const bool helperClean =
+        compositorStack.temporaryObjectsCreated() == compositorStack.temporaryObjectsReleased();
+    resourceReleaseOk = allScratchNull && helperClean;
+
     vk.Teardown();
     diagnosticTeardownOk = vk.AllHandlesNull();
     api.Unload();
 
-    allNativeLanesPass = vulkanSetupOk && cameraImportOk && decoderImportOk && resolveOk && maskUploadOk && blendRenderOk && readbackOk && resourceReleaseOk && diagnosticTeardownOk;
-    
-    if (allNativeLanesPass) {
+    allNativeLanesPass = vulkanSetupOk && cameraImportOk && decoderImportOk && resolveOk &&
+                         maskUploadOk && blendRenderOk && readbackOk &&
+                         cpuReferenceParityOk && alphaZeroPreservesBackgroundOk &&
+                         alphaFullForegroundOk && alphaFractionalBlendOk &&
+                         maskResolutionMismatchOk &&
+                         resourceReleaseOk && diagnosticTeardownOk;
+
+    if (allNativeLanesPass && failureReason.empty()) {
         pass = true;
         status = "PASS";
     }
-    
+
+    details.Str("proofBoundary", kProofBoundary);
+    details.U64("realOutputWidth", 128);
+    details.U64("realOutputHeight", 128);
+    details.U64("realReadbackNonZeroCount", realNonZero);
+    details.Bool("syntheticPixelParityLane", true);
+    details.Str("pixelParityMode", "synthetic_deterministic_sublane");
+    details.U64("syntheticMismatchCount", mismatchCount);
+    details.Str("firstMismatch", mismatchCount == 0 ? "" : firstMismatch);
+    details.U64("alphaZeroPixelCount", zeroCount);
+    details.U64("alphaFullPixelCount", fullCount);
+    details.U64("alphaFractionalPixelCount", fractionalCount);
+    details.Int("colorTolerance", kVulkanGreenScreenReferenceColorTolerance);
+    details.Str("colorContract", kVulkanGreenScreenColorContract);
+    details.Str("blendFormula", kVulkanGreenScreenBlendFormula);
+    details.U64("maskWidth", kMaskWidth);
+    details.U64("maskHeight", kMaskHeight);
+    details.U64("syntheticOutputWidth", 128);
+    details.U64("syntheticOutputHeight", 128);
+    details.U64("helperTemporaryObjectsCreated", compositorStack.temporaryObjectsCreated());
+    details.U64("helperTemporaryObjectsReleased", compositorStack.temporaryObjectsReleased());
+    details.Bool("pixelParityIsSynthetic", true);
+    details.Str("diagnosticNote", "diagnostic_proof_only_no_camerax_no_production_preview_no_export_no_segmentation_model");
+
     std::string json = "{";
     json += "\"pass\":" + std::string(pass ? "true" : "false") + ",";
     json += "\"status\":\"" + status + "\",";
@@ -376,6 +637,11 @@ end:
     json += "\"maskUploadOk\":" + std::string(maskUploadOk ? "true" : "false") + ",";
     json += "\"blendRenderOk\":" + std::string(blendRenderOk ? "true" : "false") + ",";
     json += "\"readbackOk\":" + std::string(readbackOk ? "true" : "false") + ",";
+    json += "\"cpuReferenceParityOk\":" + std::string(cpuReferenceParityOk ? "true" : "false") + ",";
+    json += "\"alphaZeroPreservesBackgroundOk\":" + std::string(alphaZeroPreservesBackgroundOk ? "true" : "false") + ",";
+    json += "\"alphaFullForegroundOk\":" + std::string(alphaFullForegroundOk ? "true" : "false") + ",";
+    json += "\"alphaFractionalBlendOk\":" + std::string(alphaFractionalBlendOk ? "true" : "false") + ",";
+    json += "\"maskResolutionMismatchOk\":" + std::string(maskResolutionMismatchOk ? "true" : "false") + ",";
     json += "\"resourceReleaseOk\":" + std::string(resourceReleaseOk ? "true" : "false") + ",";
     json += "\"diagnosticTeardownOk\":" + std::string(diagnosticTeardownOk ? "true" : "false") + ",";
     json += "\"allNativeLanesPass\":" + std::string(allNativeLanesPass ? "true" : "false") + ",";

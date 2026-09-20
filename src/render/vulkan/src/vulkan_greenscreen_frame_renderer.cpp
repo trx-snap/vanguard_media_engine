@@ -1,6 +1,7 @@
 // vulkan_greenscreen_frame_renderer.cpp
-// DUET-VULKAN-GREENSCREEN-FRAME-RENDERER: VulkanGreenScreenFrameRenderer
-// implementation.
+// ANDROID-DUET-VULKAN-GREENSCREEN-VISUAL: VulkanGreenScreenFrameRenderer
+// implementation (alpha-masked camera layer over an already-drawn source
+// layer; see the header for the draw model and caching contract).
 //
 // Android-only real implementation is inside #if defined(__ANDROID__).
 // Non-Android translation unit compiles to a safe stub that performs no
@@ -23,8 +24,7 @@
 #include <android/log.h>
 
 #include "shaders/greenscreen_blend_frag_spv.h"
-#include "shaders/passthrough_vert_spv.h"
-#include "vanguard/render/render_transform.h"
+#include "shaders/greenscreen_camera_mask_vert_spv.h"
 
 #define VGLOG_GSFR(...) \
     __android_log_print(ANDROID_LOG_DEBUG, "VanguardVkGreenScreenFrameRnd", __VA_ARGS__)
@@ -34,44 +34,53 @@ namespace render {
 
 namespace {
 
-constexpr const char* kErrInvalidArgument    = "vulkan_greenscreen_frame_renderer_invalid_argument";
-constexpr const char* kErrInvalidImage        = "vulkan_greenscreen_frame_renderer_invalid_image";
-constexpr const char* kErrInvalidMaskSize     = "vulkan_greenscreen_frame_renderer_invalid_mask_size";
-constexpr const char* kErrRenderPassMismatch = "vulkan_greenscreen_frame_renderer_render_pass_mismatch";
-constexpr const char* kErrShaderModuleFailed = "vulkan_greenscreen_frame_renderer_shader_module_failed";
-constexpr const char* kErrDescriptorFailed   = "vulkan_greenscreen_frame_renderer_descriptor_failed";
-constexpr const char* kErrPipelineFailed     = "vulkan_greenscreen_frame_renderer_pipeline_failed";
+constexpr const char* kErrInvalidArgument     = "vulkan_greenscreen_frame_renderer_invalid_argument";
+constexpr const char* kErrInvalidImage         = "vulkan_greenscreen_frame_renderer_invalid_image";
+constexpr const char* kErrInvalidMaskSize      = "vulkan_greenscreen_frame_renderer_invalid_mask_size";
+constexpr const char* kErrInvalidPlacement     = "vulkan_greenscreen_frame_renderer_invalid_placement";
+constexpr const char* kErrPipelineKeyMismatch  = "vulkan_greenscreen_frame_renderer_pipeline_key_mismatch";
+constexpr const char* kErrShaderModuleFailed   = "vulkan_greenscreen_frame_renderer_shader_module_failed";
+constexpr const char* kErrDescriptorFailed     = "vulkan_greenscreen_frame_renderer_descriptor_failed";
+constexpr const char* kErrSamplerFailed        = "vulkan_greenscreen_frame_renderer_sampler_failed";
+constexpr const char* kErrPipelineFailed       = "vulkan_greenscreen_frame_renderer_pipeline_failed";
 
 void SetErr(std::string* outError, const char* reason) {
     if (outError) *outError = reason;
 }
 
+// Private 128-byte push-constant block pushed for the camera-mask draw: the
+// shared 112-byte VideoTransformFullPushConstants (vertex UV transform +
+// fragment colour matrix) plus a trailing fragment-only vec4 maskDebug
+// (debugMode, 1/maskWidth, 1/maskHeight, reserved), matching the GLSL
+// `Transform` block in glsl/greenscreen_blend.frag /
+// glsl/greenscreen_camera_mask.vert exactly.
+struct alignas(16) VulkanGreenScreenCameraMaskPushConstants {
+    VideoTransformFullPushConstants transform;
+    float maskDebug[4];
+};
+
+static_assert(sizeof(VulkanGreenScreenCameraMaskPushConstants) == 128,
+              "VulkanGreenScreenCameraMaskPushConstants must be exactly 128 bytes");
+static_assert(alignof(VulkanGreenScreenCameraMaskPushConstants) == 16,
+              "VulkanGreenScreenCameraMaskPushConstants must be 16-byte aligned");
+
 // Non-dispatchable Vulkan handles are exactly 8 bytes on every ABI Vulkan
 // supports (a pointer on LP64/64-bit targets, a plain uint64_t otherwise),
 // so a byte-for-byte memcpy round-trips through uint64_t on either ABI.
 static_assert(sizeof(VkImageView) == sizeof(uint64_t),
-             "VkImageView must be 8 bytes to round-trip through uint64_t");
-static_assert(sizeof(VkSampler) == sizeof(uint64_t),
-             "VkSampler must be 8 bytes to round-trip through uint64_t");
+              "VkImageView must be 8 bytes to round-trip through uint64_t");
 static_assert(sizeof(VkRenderPass) == sizeof(uint64_t),
-             "VkRenderPass must be 8 bytes to round-trip through uint64_t");
+              "VkRenderPass must be 8 bytes to round-trip through uint64_t");
+static_assert(sizeof(VkDescriptorSetLayout) == sizeof(uint64_t),
+              "VkDescriptorSetLayout must be 8 bytes to round-trip through uint64_t");
+static_assert(sizeof(VkDescriptorSet) == sizeof(uint64_t),
+              "VkDescriptorSet must be 8 bytes to round-trip through uint64_t");
 
-VkImageView ToImageView(uint64_t handle) {
-    VkImageView view = VK_NULL_HANDLE;
-    std::memcpy(&view, &handle, sizeof(view));
-    return view;
-}
-
-VkSampler ToSampler(uint64_t handle) {
-    VkSampler sampler = VK_NULL_HANDLE;
-    std::memcpy(&sampler, &handle, sizeof(sampler));
-    return sampler;
-}
-
-VkRenderPass ToRenderPass(uint64_t handle) {
-    VkRenderPass renderPass = VK_NULL_HANDLE;
-    std::memcpy(&renderPass, &handle, sizeof(renderPass));
-    return renderPass;
+template <typename VkHandle>
+VkHandle ToHandle(uint64_t value) {
+    VkHandle handle = VK_NULL_HANDLE;
+    std::memcpy(&handle, &value, sizeof(handle));
+    return handle;
 }
 
 } // namespace
@@ -79,25 +88,28 @@ VkRenderPass ToRenderPass(uint64_t handle) {
 struct VulkanGreenScreenFrameRenderer::Impl {
     static constexpr uint32_t kPoolCapacity = 16;
 
+    // Cached until shutdown().
     VkShaderModule vertexShaderModule   = VK_NULL_HANDLE;
     VkShaderModule fragmentShaderModule = VK_NULL_HANDLE;
-
-    VkDescriptorSetLayout setLayout     = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout     = VK_NULL_HANDLE;
-
+    VkDescriptorSetLayout maskSetLayout = VK_NULL_HANDLE;
+    VkSampler maskSampler               = VK_NULL_HANDLE;
     VkDescriptorPool pool               = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> descriptorSets;
     uint32_t nextSetIndex               = 0;
 
-    VkPipeline pipeline                 = VK_NULL_HANDLE;
-    VkRenderPass cachedRenderPass       = VK_NULL_HANDLE;
+    // Cached against (cachedCameraSetLayout, cachedRenderPass) until
+    // invalidate() / shutdown().
+    VkPipelineLayout pipelineLayout          = VK_NULL_HANDLE;
+    VkDescriptorSetLayout cachedCameraSetLayout = VK_NULL_HANDLE;
+    VkPipeline pipeline                      = VK_NULL_HANDLE;
+    VkRenderPass cachedRenderPass            = VK_NULL_HANDLE;
 
     bool ensureShaderModules(VkDevice device, std::string* outFailureReason) {
         if (vertexShaderModule == VK_NULL_HANDLE) {
             VkShaderModuleCreateInfo ci{};
             ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-            ci.codeSize = shaders::kPassthroughVertSpvSize;
-            ci.pCode    = shaders::kPassthroughVertSpv;
+            ci.codeSize = shaders::kGreenScreenCameraMaskVertSpvSize;
+            ci.pCode    = shaders::kGreenScreenCameraMaskVertSpv;
             if (vkCreateShaderModule(device, &ci, nullptr, &vertexShaderModule) != VK_SUCCESS) {
                 vertexShaderModule = VK_NULL_HANDLE;
                 SetErr(outFailureReason, kErrShaderModuleFailed);
@@ -107,8 +119,8 @@ struct VulkanGreenScreenFrameRenderer::Impl {
         if (fragmentShaderModule == VK_NULL_HANDLE) {
             VkShaderModuleCreateInfo ci{};
             ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-            ci.codeSize = shaders::kGreenScreenBlendFragSpvSize;
-            ci.pCode    = shaders::kGreenScreenBlendFragSpv;
+            ci.codeSize = shaders::kGreenScreenCameraMaskFragSpvSize;
+            ci.pCode    = shaders::kGreenScreenCameraMaskFragSpv;
             if (vkCreateShaderModule(device, &ci, nullptr, &fragmentShaderModule) != VK_SUCCESS) {
                 fragmentShaderModule = VK_NULL_HANDLE;
                 SetErr(outFailureReason, kErrShaderModuleFailed);
@@ -118,91 +130,128 @@ struct VulkanGreenScreenFrameRenderer::Impl {
         return true;
     }
 
-    bool ensureSharedLayouts(VkDevice device, std::string* outFailureReason) {
-        if (setLayout == VK_NULL_HANDLE) {
-            VkDescriptorSetLayoutBinding bindings[3]{};
-            for (uint32_t i = 0; i < 3; ++i) {
-                bindings[i].binding            = i;
-                bindings[i].descriptorType     = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                bindings[i].descriptorCount    = 1;
-                bindings[i].stageFlags         = VK_SHADER_STAGE_FRAGMENT_BIT;
-                bindings[i].pImmutableSamplers = nullptr;
-            }
+    // Mask set layout (set 1, binding 0, mutable sampler), the LINEAR /
+    // CLAMP_TO_EDGE mask sampler, and the descriptor pool + set ring.
+    bool ensureMaskResources(VkDevice device, std::string* outFailureReason) {
+        if (maskSetLayout == VK_NULL_HANDLE) {
+            VkDescriptorSetLayoutBinding binding{};
+            binding.binding            = 0;
+            binding.descriptorType     = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            binding.descriptorCount    = 1;
+            binding.stageFlags         = VK_SHADER_STAGE_FRAGMENT_BIT;
+            binding.pImmutableSamplers = nullptr;
 
             VkDescriptorSetLayoutCreateInfo layoutCI{};
             layoutCI.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-            layoutCI.bindingCount = 3;
-            layoutCI.pBindings    = bindings;
-            if (vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &setLayout) != VK_SUCCESS) {
-                setLayout = VK_NULL_HANDLE;
+            layoutCI.bindingCount = 1;
+            layoutCI.pBindings    = &binding;
+            if (vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &maskSetLayout) != VK_SUCCESS) {
+                maskSetLayout = VK_NULL_HANDLE;
                 SetErr(outFailureReason, kErrDescriptorFailed);
                 return false;
             }
         }
 
-        if (pipelineLayout == VK_NULL_HANDLE) {
-            VkPushConstantRange pushRange{};
-            pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-            pushRange.offset     = 0;
-            pushRange.size       = static_cast<uint32_t>(sizeof(VideoTransformFullPushConstants));
+        if (maskSampler == VK_NULL_HANDLE) {
+            VkSamplerCreateInfo samplerCI{};
+            samplerCI.sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            samplerCI.magFilter               = VK_FILTER_LINEAR;
+            samplerCI.minFilter               = VK_FILTER_LINEAR;
+            samplerCI.mipmapMode              = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerCI.addressModeU            = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerCI.addressModeV            = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerCI.addressModeW            = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerCI.mipLodBias              = 0.0f;
+            samplerCI.anisotropyEnable        = VK_FALSE;
+            samplerCI.maxAnisotropy           = 1.0f;
+            samplerCI.compareEnable           = VK_FALSE;
+            samplerCI.compareOp               = VK_COMPARE_OP_ALWAYS;
+            samplerCI.minLod                  = 0.0f;
+            samplerCI.maxLod                  = 0.0f;
+            samplerCI.borderColor             = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+            samplerCI.unnormalizedCoordinates = VK_FALSE;
+            if (vkCreateSampler(device, &samplerCI, nullptr, &maskSampler) != VK_SUCCESS) {
+                maskSampler = VK_NULL_HANDLE;
+                SetErr(outFailureReason, kErrSamplerFailed);
+                return false;
+            }
+        }
 
-            VkPipelineLayoutCreateInfo plCI{};
-            plCI.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-            plCI.setLayoutCount         = 1;
-            plCI.pSetLayouts            = &setLayout;
-            plCI.pushConstantRangeCount = 1;
-            plCI.pPushConstantRanges    = &pushRange;
-            if (vkCreatePipelineLayout(device, &plCI, nullptr, &pipelineLayout) != VK_SUCCESS) {
-                pipelineLayout = VK_NULL_HANDLE;
+        if (pool == VK_NULL_HANDLE) {
+            VkDescriptorPoolSize poolSize{};
+            poolSize.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            poolSize.descriptorCount = kPoolCapacity;
+
+            VkDescriptorPoolCreateInfo poolCI{};
+            poolCI.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            poolCI.maxSets       = kPoolCapacity;
+            poolCI.poolSizeCount = 1;
+            poolCI.pPoolSizes    = &poolSize;
+            if (vkCreateDescriptorPool(device, &poolCI, nullptr, &pool) != VK_SUCCESS) {
+                pool = VK_NULL_HANDLE;
                 SetErr(outFailureReason, kErrDescriptorFailed);
                 return false;
             }
+
+            std::vector<VkDescriptorSetLayout> layouts(kPoolCapacity, maskSetLayout);
+            descriptorSets.assign(kPoolCapacity, VK_NULL_HANDLE);
+            VkDescriptorSetAllocateInfo allocInfo{};
+            allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocInfo.descriptorPool     = pool;
+            allocInfo.descriptorSetCount = kPoolCapacity;
+            allocInfo.pSetLayouts        = layouts.data();
+            if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+                vkDestroyDescriptorPool(device, pool, nullptr);
+                pool = VK_NULL_HANDLE;
+                descriptorSets.clear();
+                SetErr(outFailureReason, kErrDescriptorFailed);
+                return false;
+            }
+            nextSetIndex = 0;
         }
         return true;
     }
 
-    bool ensureDescriptorPool(VkDevice device, std::string* outFailureReason) {
-        if (pool != VK_NULL_HANDLE) {
+    // Pipeline layout keyed by the camera import's descriptor set layout:
+    // set 0 = camera (borrowed handle), set 1 = mask, one VERTEX|FRAGMENT
+    // push-constant range identical to the shared import pipeline layouts.
+    bool ensurePipelineLayout(VkDevice device,
+                              VkDescriptorSetLayout cameraSetLayout,
+                              std::string* outFailureReason) {
+        if (pipelineLayout != VK_NULL_HANDLE) {
+            if (cachedCameraSetLayout != cameraSetLayout) {
+                SetErr(outFailureReason, kErrPipelineKeyMismatch);
+                return false;
+            }
             return true;
         }
 
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 3 * kPoolCapacity;
+        const VkDescriptorSetLayout setLayouts[2] = {cameraSetLayout, maskSetLayout};
 
-        VkDescriptorPoolCreateInfo poolCI{};
-        poolCI.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolCI.maxSets       = kPoolCapacity;
-        poolCI.poolSizeCount = 1;
-        poolCI.pPoolSizes    = &poolSize;
-        if (vkCreateDescriptorPool(device, &poolCI, nullptr, &pool) != VK_SUCCESS) {
-            pool = VK_NULL_HANDLE;
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushRange.offset     = 0;
+        pushRange.size       = static_cast<uint32_t>(sizeof(VulkanGreenScreenCameraMaskPushConstants));
+
+        VkPipelineLayoutCreateInfo plCI{};
+        plCI.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plCI.setLayoutCount         = 2;
+        plCI.pSetLayouts            = setLayouts;
+        plCI.pushConstantRangeCount = 1;
+        plCI.pPushConstantRanges    = &pushRange;
+        if (vkCreatePipelineLayout(device, &plCI, nullptr, &pipelineLayout) != VK_SUCCESS) {
+            pipelineLayout = VK_NULL_HANDLE;
             SetErr(outFailureReason, kErrDescriptorFailed);
             return false;
         }
-
-        std::vector<VkDescriptorSetLayout> layouts(kPoolCapacity, setLayout);
-        descriptorSets.resize(kPoolCapacity, VK_NULL_HANDLE);
-        VkDescriptorSetAllocateInfo allocInfo{};
-        allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocInfo.descriptorPool     = pool;
-        allocInfo.descriptorSetCount = kPoolCapacity;
-        allocInfo.pSetLayouts        = layouts.data();
-        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
-            vkDestroyDescriptorPool(device, pool, nullptr);
-            pool = VK_NULL_HANDLE;
-            descriptorSets.clear();
-            SetErr(outFailureReason, kErrDescriptorFailed);
-            return false;
-        }
-        nextSetIndex = 0;
+        cachedCameraSetLayout = cameraSetLayout;
         return true;
     }
 
     bool ensurePipeline(VkDevice device, VkRenderPass renderPass, std::string* outFailureReason) {
         if (pipeline != VK_NULL_HANDLE) {
             if (renderPass != cachedRenderPass) {
-                SetErr(outFailureReason, kErrRenderPassMismatch);
+                SetErr(outFailureReason, kErrPipelineKeyMismatch);
                 return false;
             }
             return true;
@@ -224,6 +273,7 @@ struct VulkanGreenScreenFrameRenderer::Impl {
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
         inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
         inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
 
         const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         VkPipelineDynamicStateCreateInfo dynamicState{};
@@ -248,11 +298,19 @@ struct VulkanGreenScreenFrameRenderer::Impl {
         multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         multisampling.minSampleShading     = 1.0f;
 
-        // Fixed-function blend disabled; fragment shader mix() output is written directly
+        // Straight-alpha "over" blend: the fragment shader writes the camera
+        // colour with alpha = camera.a * matte, composited over the already
+        // drawn opaque source layer.
         VkPipelineColorBlendAttachmentState attachment{};
-        attachment.blendEnable    = VK_FALSE;
-        attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        attachment.blendEnable         = VK_TRUE;
+        attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        attachment.colorBlendOp        = VK_BLEND_OP_ADD;
+        attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        attachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+        attachment.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
         VkPipelineColorBlendStateCreateInfo colorBlend{};
         colorBlend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -275,6 +333,7 @@ struct VulkanGreenScreenFrameRenderer::Impl {
         pipelineCI.layout              = pipelineLayout;
         pipelineCI.renderPass          = renderPass;
         pipelineCI.subpass             = 0;
+        pipelineCI.basePipelineHandle  = VK_NULL_HANDLE;
         pipelineCI.basePipelineIndex   = -1;
 
         VkPipeline created = VK_NULL_HANDLE;
@@ -287,29 +346,34 @@ struct VulkanGreenScreenFrameRenderer::Impl {
         return true;
     }
 
-    void destroyPipeline(VkDevice device) {
+    void destroyPipelineObjects(VkDevice device) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, pipeline, nullptr);
             pipeline = VK_NULL_HANDLE;
         }
         cachedRenderPass = VK_NULL_HANDLE;
-    }
-
-    void destroyAll(VkDevice device) {
-        destroyPipeline(device);
         if (pipelineLayout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
             pipelineLayout = VK_NULL_HANDLE;
         }
-        if (setLayout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
-            setLayout = VK_NULL_HANDLE;
-        }
+        cachedCameraSetLayout = VK_NULL_HANDLE;
+    }
+
+    void destroyAll(VkDevice device) {
+        destroyPipelineObjects(device);
         if (pool != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(device, pool, nullptr);
             pool = VK_NULL_HANDLE;
             descriptorSets.clear();
             nextSetIndex = 0;
+        }
+        if (maskSampler != VK_NULL_HANDLE) {
+            vkDestroySampler(device, maskSampler, nullptr);
+            maskSampler = VK_NULL_HANDLE;
+        }
+        if (maskSetLayout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(device, maskSetLayout, nullptr);
+            maskSetLayout = VK_NULL_HANDLE;
         }
         if (fragmentShaderModule != VK_NULL_HANDLE) {
             vkDestroyShaderModule(device, fragmentShaderModule, nullptr);
@@ -325,13 +389,28 @@ struct VulkanGreenScreenFrameRenderer::Impl {
 VulkanGreenScreenFrameRenderer::VulkanGreenScreenFrameRenderer() : impl_(std::make_unique<Impl>()) {}
 VulkanGreenScreenFrameRenderer::~VulkanGreenScreenFrameRenderer() = default;
 
-bool VulkanGreenScreenFrameRenderer::recordGreenScreenDraw(
+bool VulkanGreenScreenFrameRenderer::needsPipelineRebuild(uint64_t cameraDescriptorSetLayout,
+                                                          uint64_t renderPass) const {
+    if (!impl_) return false;
+    const VkDescriptorSetLayout cameraSetLayout =
+        ToHandle<VkDescriptorSetLayout>(cameraDescriptorSetLayout);
+    const VkRenderPass pass = ToHandle<VkRenderPass>(renderPass);
+    if (impl_->pipelineLayout != VK_NULL_HANDLE && impl_->cachedCameraSetLayout != cameraSetLayout) {
+        return true;
+    }
+    if (impl_->pipeline != VK_NULL_HANDLE && impl_->cachedRenderPass != pass) {
+        return true;
+    }
+    return false;
+}
+
+bool VulkanGreenScreenFrameRenderer::recordCameraDraw(
     void* devicePtr,
     void* commandBufferPtr,
     uint64_t renderPassHandle,
     uint32_t canvasWidth,
     uint32_t canvasHeight,
-    const VulkanGreenScreenFrameInputs& inputs,
+    const VulkanGreenScreenCameraDraw& draw,
     std::string* outFailureReason) {
     if (outFailureReason) outFailureReason->clear();
 
@@ -340,84 +419,94 @@ bool VulkanGreenScreenFrameRenderer::recordGreenScreenDraw(
         SetErr(outFailureReason, kErrInvalidArgument);
         return false;
     }
-
-    if (inputs.backgroundImageView == 0 || inputs.backgroundSampler == 0 ||
-        inputs.foregroundImageView == 0 || inputs.foregroundSampler == 0 ||
-        inputs.maskImageView == 0 || inputs.maskSampler == 0) {
+    if (draw.cameraDescriptorSetLayout == 0 || draw.cameraDescriptorSet == 0 ||
+        draw.maskImageView == 0) {
         SetErr(outFailureReason, kErrInvalidImage);
         return false;
     }
-
-    if (inputs.maskWidth == 0 || inputs.maskHeight == 0) {
+    if (draw.maskWidth == 0 || draw.maskHeight == 0) {
         SetErr(outFailureReason, kErrInvalidMaskSize);
+        return false;
+    }
+    // Same placement rules VulkanGraphicsCommandRecorder enforces for a
+    // transition layer draw: the viewport may extend beyond the canvas, the
+    // scissor must be a non-empty sub-rect of it.
+    if (draw.viewportWidth == 0 || draw.viewportHeight == 0 ||
+        draw.scissorWidth == 0 || draw.scissorHeight == 0 ||
+        draw.scissorX < 0 || draw.scissorY < 0) {
+        SetErr(outFailureReason, kErrInvalidPlacement);
+        return false;
+    }
+    const uint64_t scissorRight =
+        static_cast<uint64_t>(draw.scissorX) + static_cast<uint64_t>(draw.scissorWidth);
+    const uint64_t scissorBottom =
+        static_cast<uint64_t>(draw.scissorY) + static_cast<uint64_t>(draw.scissorHeight);
+    if (scissorRight > canvasWidth || scissorBottom > canvasHeight) {
+        SetErr(outFailureReason, kErrInvalidPlacement);
         return false;
     }
 
     VkDevice device               = reinterpret_cast<VkDevice>(devicePtr);
     VkCommandBuffer commandBuffer = reinterpret_cast<VkCommandBuffer>(commandBufferPtr);
-    VkRenderPass renderPass       = ToRenderPass(renderPassHandle);
+    VkRenderPass renderPass       = ToHandle<VkRenderPass>(renderPassHandle);
+    const VkDescriptorSetLayout cameraSetLayout =
+        ToHandle<VkDescriptorSetLayout>(draw.cameraDescriptorSetLayout);
+    const VkDescriptorSet cameraSet = ToHandle<VkDescriptorSet>(draw.cameraDescriptorSet);
 
+    // Vulkan work below. Every check above ran with zero Vulkan calls.
     if (!impl_->ensureShaderModules(device, outFailureReason)) return false;
-    if (!impl_->ensureSharedLayouts(device, outFailureReason)) return false;
-    if (!impl_->ensureDescriptorPool(device, outFailureReason)) return false;
+    if (!impl_->ensureMaskResources(device, outFailureReason)) return false;
+    if (!impl_->ensurePipelineLayout(device, cameraSetLayout, outFailureReason)) return false;
     if (!impl_->ensurePipeline(device, renderPass, outFailureReason)) return false;
 
-    VkDescriptorSet currentSet = impl_->descriptorSets[impl_->nextSetIndex];
-    impl_->nextSetIndex = (impl_->nextSetIndex + 1) % impl_->kPoolCapacity;
+    VkDescriptorSet maskSet = impl_->descriptorSets[impl_->nextSetIndex];
+    impl_->nextSetIndex = (impl_->nextSetIndex + 1) % Impl::kPoolCapacity;
 
-    VkDescriptorImageInfo imageInfos[3]{};
-    imageInfos[0].sampler     = ToSampler(inputs.backgroundSampler);
-    imageInfos[0].imageView   = ToImageView(inputs.backgroundImageView);
-    imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo maskInfo{};
+    maskInfo.sampler     = impl_->maskSampler;
+    maskInfo.imageView   = ToHandle<VkImageView>(draw.maskImageView);
+    maskInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    imageInfos[1].sampler     = ToSampler(inputs.foregroundSampler);
-    imageInfos[1].imageView   = ToImageView(inputs.foregroundImageView);
-    imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    imageInfos[2].sampler     = ToSampler(inputs.maskSampler);
-    imageInfos[2].imageView   = ToImageView(inputs.maskImageView);
-    imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkWriteDescriptorSet writes[3]{};
-    for (uint32_t i = 0; i < 3; ++i) {
-        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet          = currentSet;
-        writes[i].dstBinding      = i;
-        writes[i].dstArrayElement = 0;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[i].pImageInfo      = &imageInfos[i];
-    }
-    vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+    VkWriteDescriptorSet write{};
+    write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet          = maskSet;
+    write.dstBinding      = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo      = &maskInfo;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->pipeline);
 
     VkViewport viewport{};
-    viewport.x        = 0.0f;
-    viewport.y        = 0.0f;
-    viewport.width    = static_cast<float>(canvasWidth);
-    viewport.height   = static_cast<float>(canvasHeight);
+    viewport.x        = static_cast<float>(draw.viewportX);
+    viewport.y        = static_cast<float>(draw.viewportY);
+    viewport.width    = static_cast<float>(draw.viewportWidth);
+    viewport.height   = static_cast<float>(draw.viewportHeight);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 
     VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = {canvasWidth, canvasHeight};
+    scissor.offset = {draw.scissorX, draw.scissorY};
+    scissor.extent = {draw.scissorWidth, draw.scissorHeight};
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+    const VkDescriptorSet sets[2] = {cameraSet, maskSet};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->pipelineLayout,
-                            0, 1, &currentSet, 0, nullptr);
+                            0, 2, sets, 0, nullptr);
 
-    VideoTransformFullPushConstants pc{};
-    pc.uv.uvTransform0[0] = 1.0f;
-    pc.uv.uvTransform1[1] = 1.0f;
-    pc.color.row0[0] = 1.0f;
-    pc.color.row1[1] = 1.0f;
-    pc.color.row2[2] = 1.0f;
-    pc.color.row3[3] = 1.0f;
-    vkCmdPushConstants(commandBuffer, impl_->pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                       0, static_cast<uint32_t>(sizeof(pc)), &pc);
+    VulkanGreenScreenCameraMaskPushConstants pushConstants{};
+    pushConstants.transform    = draw.pushConstants;
+    pushConstants.maskDebug[0] = static_cast<float>(draw.debugMode);
+    pushConstants.maskDebug[1] = 1.0f / static_cast<float>(draw.maskWidth);
+    pushConstants.maskDebug[2] = 1.0f / static_cast<float>(draw.maskHeight);
+    pushConstants.maskDebug[3] = 0.0f;
+
+    vkCmdPushConstants(commandBuffer, impl_->pipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, static_cast<uint32_t>(sizeof(pushConstants)), &pushConstants);
 
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 
@@ -427,7 +516,7 @@ bool VulkanGreenScreenFrameRenderer::recordGreenScreenDraw(
 void VulkanGreenScreenFrameRenderer::invalidate(void* devicePtr) {
     VkDevice device = reinterpret_cast<VkDevice>(devicePtr);
     if (device == VK_NULL_HANDLE || !impl_) return;
-    impl_->destroyPipeline(device);
+    impl_->destroyPipelineObjects(device);
 }
 
 void VulkanGreenScreenFrameRenderer::shutdown(void* devicePtr) {
@@ -449,13 +538,18 @@ struct VulkanGreenScreenFrameRenderer::Impl {};
 VulkanGreenScreenFrameRenderer::VulkanGreenScreenFrameRenderer() : impl_(std::make_unique<Impl>()) {}
 VulkanGreenScreenFrameRenderer::~VulkanGreenScreenFrameRenderer() = default;
 
-bool VulkanGreenScreenFrameRenderer::recordGreenScreenDraw(
+bool VulkanGreenScreenFrameRenderer::needsPipelineRebuild(uint64_t /*cameraDescriptorSetLayout*/,
+                                                          uint64_t /*renderPass*/) const {
+    return false;
+}
+
+bool VulkanGreenScreenFrameRenderer::recordCameraDraw(
     void* /*device*/,
     void* /*commandBuffer*/,
     uint64_t /*renderPass*/,
     uint32_t /*canvasWidth*/,
     uint32_t /*canvasHeight*/,
-    const VulkanGreenScreenFrameInputs& /*inputs*/,
+    const VulkanGreenScreenCameraDraw& /*draw*/,
     std::string* outFailureReason) {
     if (outFailureReason) {
         *outFailureReason = "vulkan_greenscreen_frame_renderer_unavailable_on_host";
