@@ -525,6 +525,8 @@ if (ANDROID)
     "platform/android/src/android_duet_vulkan_preview_presentation_smoke_jni.cpp"
     "platform/android/src/android_duet_vulkan_preview_session.cpp"
     "platform/android/src/android_duet_vulkan_preview_session_jni.cpp"
+    # VanguardNativeBridge.Companion.createAndroidDuetGpuTextureBridge JNI export.
+    "platform/android/src/android_duet_gpu_texture_bridge_jni.cpp"
     # SLICE-1: Dual-camera compositor core — Vulkan direct swapchain render loop
     # and GLES EGL fallback. Exposes nativeCreateDualCamSession,
     # nativeDualCamCompositeFrame, nativeComputeMultiCamLayout, and

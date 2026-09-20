@@ -112,6 +112,8 @@ import com.connects.vanguard_media_engine.streaming.AndroidMedia3StreamSourceCoo
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import com.connects.vanguard_media_engine.duet.AndroidDuetMethodHandler
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenCameraFilterChain
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenCameraGraphSource
 import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenExportMethodHandler
 import com.connects.vanguard_media_engine.greenscreen.AndroidLiveGreenScreenMethodHandler
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
@@ -620,6 +622,15 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // Exactly one VanguardCameraSource may exist at a time.
     private var cameraSource: VanguardCameraSource? = null
     private var cameraTexture: TextureRegistry.SurfaceTextureEntry? = null
+
+    // ── UFM-GREENSCREEN-CAM-GRAPH: independent green-screen camera graph ─────
+    // source. Selected only when Dart sends
+    // cameraCaptureProfile=greenScreenLowLatency to startCamera; mutually
+    // exclusive with cameraSource (see startCamera/stopCamera/detach).
+    private var greenScreenCameraGraphSource: AndroidGreenScreenCameraGraphSource? = null
+    private var greenScreenFilterActive: Boolean = false
+    private var greenScreenBackgroundARGB: Int? = null
+    private var greenScreenActiveFilterTypes: List<String> = emptyList()
 
     // -- P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: CameraX thermal FPS router ----
     private var cameraXThermalActuationRouter: AndroidCameraXThermalActuationRouter? = null
@@ -2805,6 +2816,96 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             // ─── Camera pipeline (B2) ────────────────────────────────────────────────
 
             "startCamera" -> {
+                // UFM-GREENSCREEN-CAM-GRAPH: an explicit, non-empty
+                // cameraCaptureProfile other than "greenScreenLowLatency" is
+                // rejected before touching any existing session. Absent/empty
+                // profile preserves the default CameraX path unchanged below.
+                val captureProfile = (args?.get("cameraCaptureProfile") as? String)
+                    ?.takeIf { it.isNotEmpty() }
+                if (captureProfile != null && captureProfile != "greenScreenLowLatency") {
+                    result.error(
+                        "INVALID_CAMERA_CAPTURE_PROFILE",
+                        "Unknown cameraCaptureProfile: $captureProfile",
+                        null
+                    )
+                    return
+                }
+
+                if (captureProfile == "greenScreenLowLatency") {
+                    // Stop any existing legacy camera session first.
+                    cameraSource?.stop()
+                    cameraSource = null
+                    val prevTex = cameraTexture
+                    if (prevTex != null) {
+                        Log.i("VanguardTex", "[RELEASE/reset] textureId=${prevTex.id()}")
+                        prevTex.release()
+                    }
+                    cameraTexture = null
+                    // Stop any existing graph source before creating a new one.
+                    greenScreenCameraGraphSource?.stop()
+                    greenScreenCameraGraphSource = null
+                    greenScreenFilterActive = false
+                    greenScreenBackgroundARGB = null
+                    greenScreenActiveFilterTypes = emptyList()
+
+                    var graphSource: AndroidGreenScreenCameraGraphSource? = null
+                    try {
+                        graphSource = AndroidGreenScreenCameraGraphSource(
+                            context = binding.applicationContext,
+                            textureRegistry = binding.textureRegistry,
+                            mainHandler = mainHandler,
+                        )
+                        greenScreenCameraGraphSource = graphSource
+                        val startResult = graphSource.start()
+                        val textureId = (startResult["textureId"] as? Number)?.toLong()
+                        if (textureId == null) {
+                            graphSource.stop()
+                            greenScreenCameraGraphSource = null
+                            greenScreenFilterActive = false
+                            greenScreenBackgroundARGB = null
+                            greenScreenActiveFilterTypes = emptyList()
+                            result.error(
+                                "CAMERA_ERROR",
+                                "greenScreenLowLatency: graph source start() did not return a textureId",
+                                null
+                            )
+                            return
+                        }
+                        // cameraCaptureProfile only selects the graph/capture path;
+                        // the visual green-screen effect is activated only by a
+                        // subsequent setCameraFilterChain call.
+                        graphSource.setGreenScreenEnabled(false)
+                        result.success(textureId)
+                        return
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "startCamera: greenScreenLowLatency failed — ${t.message}", t)
+                        try {
+                            graphSource?.stop()
+                        } catch (stopError: Throwable) {
+                            Log.e(TAG, "startCamera: greenScreenLowLatency cleanup stop() failed — ${stopError.message}", stopError)
+                        }
+                        greenScreenCameraGraphSource = null
+                        greenScreenFilterActive = false
+                        greenScreenBackgroundARGB = null
+                        greenScreenActiveFilterTypes = emptyList()
+                        result.error(
+                            "CAMERA_ERROR",
+                            "greenScreenLowLatency: ${t.javaClass.simpleName}: ${t.message}",
+                            null
+                        )
+                        return
+                    }
+                }
+
+                // Default path (no cameraCaptureProfile): stop any active graph
+                // source, then preserve the existing VanguardCameraSource path
+                // exactly as before this slice.
+                greenScreenCameraGraphSource?.stop()
+                greenScreenCameraGraphSource = null
+                greenScreenFilterActive = false
+                greenScreenBackgroundARGB = null
+                greenScreenActiveFilterTypes = emptyList()
+
                 // Extract Dart args — mirrors iOS: position (1=back, 2=front), fps.
                 val positionInt = (args?.get("position") as? Number)?.toInt() ?: 1
                 val fps         = (args?.get("fps")      as? Number)?.toInt() ?: 30
@@ -2861,6 +2962,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             "stopCamera" -> {
                 // Idempotent: safe to call even if no camera is running.
                 Log.d(TAG, "stopCamera")
+                greenScreenCameraGraphSource?.stop()
+                greenScreenCameraGraphSource = null
+                greenScreenFilterActive = false
+                greenScreenBackgroundARGB = null
+                greenScreenActiveFilterTypes = emptyList()
                 cameraSource?.stop()
                 cameraSource = null
                 val tex = cameraTexture
@@ -2873,6 +2979,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             }
 
             "switchCamera" -> {
+                if (greenScreenCameraGraphSource != null) {
+                    result.error(
+                        "UNSUPPORTED_CAMERA_GRAPH_MODE",
+                        "switchCamera is not supported while the green-screen camera graph is active",
+                        null
+                    )
+                    return
+                }
                 val src = cameraSource
                 if (src == null) {
                     result.error("NO_CAMERA", "Camera not started", null)
@@ -2891,6 +3005,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             }
 
             "takePhoto" -> {
+                if (greenScreenCameraGraphSource != null) {
+                    result.error(
+                        "UNSUPPORTED_CAMERA_GRAPH_MODE",
+                        "takePhoto is not supported while the green-screen camera graph is active",
+                        null
+                    )
+                    return
+                }
                 val src = cameraSource
                 if (src == null) {
                     result.error("NO_CAMERA", "Camera not started", null)
@@ -2909,6 +3031,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             }
 
             "startRecording" -> {
+                if (greenScreenCameraGraphSource != null) {
+                    result.error(
+                        "UNSUPPORTED_CAMERA_GRAPH_MODE",
+                        "startRecording is not supported while the green-screen camera graph is active",
+                        null
+                    )
+                    return
+                }
                 val src = cameraSource
                 if (src == null) {
                     result.error("NO_CAMERA", "Camera not started", null)
@@ -2969,6 +3099,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             }
 
             "getCameraZoomCapabilities" -> {
+                if (greenScreenCameraGraphSource != null) {
+                    result.error(
+                        "UNSUPPORTED_CAMERA_GRAPH_MODE",
+                        "getCameraZoomCapabilities is not supported while the green-screen camera graph is active",
+                        null
+                    )
+                    return
+                }
                 val src = cameraSource
                 if (src == null) {
                     result.error("NO_CAMERA", "getCameraZoomCapabilities: no active camera session", null)
@@ -3008,7 +3146,114 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             // Backs the Dart post-startCamera readiness poll (vg_camera_session.dart).
             // Read-only — does not allocate, start, or stop any camera session.
             "isCameraReady" -> {
-                result.success(cameraSource?.isCameraReady ?: false)
+                val graph = greenScreenCameraGraphSource
+                if (graph != null) {
+                    result.success(graph.diagnosticsSnapshot()["cameraStarted"] as? Boolean ?: false)
+                } else {
+                    result.success(cameraSource?.isCameraReady ?: false)
+                }
+            }
+
+            // ── UFM-GREENSCREEN-CAM-GRAPH: filter chain + diagnostics routes ──────
+            // Owns setCameraFilterChain / getCameraGreenScreenDiagnostics /
+            // getCameraFilterChainDiagnostics for the independent green-screen
+            // camera graph. Green Screen is not Duet-owned; parsing lives in
+            // AndroidGreenScreenCameraFilterChain, this plugin is a thin router.
+            "setCameraFilterChain" -> {
+                val graph = greenScreenCameraGraphSource
+                if (graph == null) {
+                    if (cameraSource != null) {
+                        result.error(
+                            "GRAPH_MODE_DISABLED",
+                            "setCameraFilterChain requires the green-screen camera graph; the legacy camera is active instead.",
+                            null
+                        )
+                    } else {
+                        result.error(
+                            "NO_CAMERA_GRAPH",
+                            "setCameraFilterChain requires an active green-screen camera graph session.",
+                            null
+                        )
+                    }
+                    return
+                }
+
+                val filtersArg = args?.get("filters") as? List<*>
+                if (filtersArg == null) {
+                    result.error("BAD_ARGS", "setCameraFilterChain expects filters: List.", null)
+                    return
+                }
+
+                when (val parsed = AndroidGreenScreenCameraFilterChain.parse(filtersArg)) {
+                    is AndroidGreenScreenCameraFilterChain.ParseResult.Failure -> {
+                        result.error(parsed.code, parsed.message, null)
+                    }
+                    is AndroidGreenScreenCameraFilterChain.ParseResult.Parsed -> {
+                        val background = parsed.background
+                        if (parsed.greenScreenEnabled && background != null) {
+                            graph.setGreenScreenBackground(background)
+                            graph.setGreenScreenEnabled(true)
+                            greenScreenFilterActive = true
+                            greenScreenBackgroundARGB = background.argbColor
+                            greenScreenActiveFilterTypes = parsed.activeFilterTypes
+                        } else {
+                            graph.setGreenScreenEnabled(false)
+                            greenScreenFilterActive = false
+                            greenScreenBackgroundARGB = null
+                            greenScreenActiveFilterTypes = emptyList()
+                        }
+                        result.success(null)
+                    }
+                }
+            }
+
+            "getCameraGreenScreenDiagnostics" -> {
+                val graph = greenScreenCameraGraphSource
+                if (graph == null || !greenScreenFilterActive) {
+                    result.success(null)
+                    return
+                }
+                val snapshot = LinkedHashMap<String, Any?>(graph.diagnosticsSnapshot())
+                snapshot["outputMode"] = "composited"
+                snapshot["backgroundARGB"] = greenScreenBackgroundARGB
+                snapshot["activeFilterTypes"] = greenScreenActiveFilterTypes
+                result.success(snapshot)
+            }
+
+            "getCameraFilterChainDiagnostics" -> {
+                val graph = greenScreenCameraGraphSource
+                if (graph == null || !greenScreenFilterActive) {
+                    result.success(null)
+                    return
+                }
+                val diagnostics = graph.diagnosticsSnapshot()
+                val camera = diagnostics["camera"] as? Map<*, *>
+                val pipeline = camera?.get("pipeline") as? Map<*, *>
+
+                val graphFrameCount = (pipeline?.get("steadyMaskFrameCount") as? Number)?.toLong()
+                    ?: (pipeline?.get("maskFrameCount") as? Number)?.toLong()
+                    ?: 0L
+                val meanGraphTotalMs = (pipeline?.get("meanSteadyMaskLatencyMs") as? Number)?.toLong()
+                    ?: (pipeline?.get("meanMaskLatencyMs") as? Number)?.toLong()
+                    ?: 0L
+                val maxGraphTotalMs = (pipeline?.get("maxSteadyMaskLatencyMs") as? Number)?.toLong()
+                    ?: (pipeline?.get("maxMaskLatencyMs") as? Number)?.toLong()
+                    ?: 0L
+
+                val snapshot = LinkedHashMap<String, Any?>()
+                snapshot["proofLevel"] = "androidGreenScreenFilterChainTimingV1"
+                snapshot["activeFilterCount"] = greenScreenActiveFilterTypes.size
+                snapshot["activeFilterTypes"] = greenScreenActiveFilterTypes
+                snapshot["graphFrameCount"] = graphFrameCount
+                snapshot["meanGraphTotalMs"] = meanGraphTotalMs
+                snapshot["maxGraphTotalMs"] = maxGraphTotalMs
+                snapshot["timingBoundary"] =
+                    "android camera2 gpu source to mediapipe gpu mask and compositor present"
+                snapshot["nonClaims"] = listOf(
+                    "beauty filters are not implemented in the Android UFM camera graph yet",
+                    "alpha-output is not implemented in the Android UFM camera graph yet",
+                )
+                result.success(snapshot)
             }
 
             // -- MultiCam capability query (read-only Camera2 probe) ---------------------
@@ -3372,6 +3617,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         channel.setMethodCallHandler(null)
         // B2: Tear down camera session first — prevents leaked CameraX session
         // on hot-restart (Flutter re-attaches the engine to a new surface).
+        // UFM-GREENSCREEN-CAM-GRAPH: stop the independent green-screen graph
+        // source in this same camera teardown block, before dropping the
+        // legacy texture/session refs below.
+        greenScreenCameraGraphSource?.stop()
+        greenScreenCameraGraphSource = null
+        greenScreenFilterActive = false
+        greenScreenBackgroundARGB = null
+        greenScreenActiveFilterTypes = emptyList()
         cameraSource?.stop()
         cameraSource = null
         val detachTex = cameraTexture
