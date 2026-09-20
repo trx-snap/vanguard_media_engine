@@ -91,9 +91,6 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidBeautyV2VulkanRende
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPixelProofSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPreviewIngestCombinedSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanPreviewPresentationSmokeCoordinator
-import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGpuGreenScreenPipelineSmokeCoordinator
-import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator
-import com.connects.vanguard_media_engine.diagnostics.AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetGreenScreenTasksLiveSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
@@ -524,24 +521,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var duetVulkanPreviewPresentationSmokeCoordinator:
         AndroidDuetVulkanPreviewPresentationSmokeCoordinator? = null
 
-    // ── ANDROID-DUET-GPU-GREEN-SCREEN-PIPELINE: diagnostic-only physical ─────
-    // smoke for AndroidDuetGpuGreenScreenPipeline (texture bridge + MediaPipe
-    // graph coordination seam). Not wired into any production route.
-    private var duetGpuGreenScreenPipelineSmokeCoordinator:
-        AndroidDuetGpuGreenScreenPipelineSmokeCoordinator? = null
-
-    // ── ANDROID-DUET-GPU-GREEN-SCREEN-VULKAN-PREVIEW: diagnostic-only ───────
-    // physical proof for real camera HardwareBuffer -> MediaPipe GPU mask ->
-    // Vulkan preview GPU-mask import. Not wired into production Duet.
-    private var duetGpuGreenScreenVulkanPreviewSmokeCoordinator:
-        AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator? = null
-
-    // ── ANDROID-DUET-TFLITE-GPU-NATIVE-CAPABILITY: diagnostic-only native ────
-    // capability probe for the packaged TFLite GPU delegate (dlopen/dlsym,
-    // no build-time link). Not wired into any production route.
-    private var duetTfliteGpuNativeCapabilitySmokeCoordinator:
-        AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator? = null
-
     // ── ANDROID-DUET-GREENSCREEN-TASKS-LIVE: RND-only diagnostic proof of ────
     // CameraX ImageAnalysis -> MediaPipe Tasks ImageSegmenter LIVE_STREAM ->
     // static background Canvas composite -> Flutter SurfaceProducer texture.
@@ -723,6 +702,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
             context               = binding.applicationContext,
+            textureRegistry       = binding.textureRegistry,
             hasActiveSingleCamera = { cameraSource != null },
         )
         cameraXThermalActuationRouter = AndroidCameraXThermalActuationRouter(
@@ -931,19 +911,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         duetVulkanPreviewPresentationSmokeCoordinator = AndroidDuetVulkanPreviewPresentationSmokeCoordinator(
             context = binding.applicationContext,
             textureRegistry = binding.textureRegistry,
-            mainHandler = mainHandler,
-        )
-        duetGpuGreenScreenPipelineSmokeCoordinator = AndroidDuetGpuGreenScreenPipelineSmokeCoordinator(
-            context = binding.applicationContext,
-            mainHandler = mainHandler,
-        )
-        duetGpuGreenScreenVulkanPreviewSmokeCoordinator = AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator(
-            context = binding.applicationContext,
-            textureRegistry = binding.textureRegistry,
-            mainHandler = mainHandler,
-        )
-        duetTfliteGpuNativeCapabilitySmokeCoordinator = AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator(
-            context = binding.applicationContext,
             mainHandler = mainHandler,
         )
         duetGreenScreenTasksLiveSmokeCoordinator = AndroidDuetGreenScreenTasksLiveSmokeCoordinator(
@@ -1933,48 +1900,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android Duet Vulkan pixel proof smoke coordinator unavailable",
-                    null,
-                )
-            }
-            return
-        }
-
-        if (AndroidDuetGpuGreenScreenPipelineSmokeCoordinator.ownsMethod(call.method)) {
-            val coord = duetGpuGreenScreenPipelineSmokeCoordinator
-            if (coord != null) {
-                coord.handleMethodCall(call.method, args, result)
-            } else {
-                result.error(
-                    "UNAVAILABLE",
-                    "AndroidDuetGpuGreenScreenPipelineSmokeCoordinator unavailable",
-                    null,
-                )
-            }
-            return
-        }
-
-        if (AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator.ownsMethod(call.method)) {
-            val coord = duetGpuGreenScreenVulkanPreviewSmokeCoordinator
-            if (coord != null) {
-                coord.handleMethodCall(call.method, args, result)
-            } else {
-                result.error(
-                    "UNAVAILABLE",
-                    "AndroidDuetGpuGreenScreenVulkanPreviewSmokeCoordinator unavailable",
-                    null,
-                )
-            }
-            return
-        }
-
-        if (AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator.ownsMethod(call.method)) {
-            val coord = duetTfliteGpuNativeCapabilitySmokeCoordinator
-            if (coord != null) {
-                coord.handleMethodCall(call.method, args, result)
-            } else {
-                result.error(
-                    "UNAVAILABLE",
-                    "AndroidDuetTfliteGpuNativeCapabilitySmokeCoordinator unavailable",
                     null,
                 )
             }
@@ -3068,7 +2993,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             "setFocusPoint" -> {
                 val x = (args?.get("x") as? Number)?.toFloat() ?: 0.5f
                 val y = (args?.get("y") as? Number)?.toFloat() ?: 0.5f
-                cameraSource?.setFocusPoint(x, y)
+                // Route to the dual-camera source when a multicam preview is
+                // active; otherwise fall through to the single-camera source.
+                val mcCoord = multiCamPreviewCoordinator
+                if (mcCoord != null && mcCoord.isMultiCamRunning) {
+                    mcCoord.setFocusPoint(x, y)
+                } else {
+                    cameraSource?.setFocusPoint(x, y)
+                }
                 result.success(null)
             }
 
@@ -3761,12 +3693,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         duetVulkanPreviewIngestCombinedSmokeCoordinator = null
         duetVulkanPreviewPresentationSmokeCoordinator?.disposeAll()
         duetVulkanPreviewPresentationSmokeCoordinator = null
-        duetGpuGreenScreenPipelineSmokeCoordinator?.disposeAll()
-        duetGpuGreenScreenPipelineSmokeCoordinator = null
-        duetGpuGreenScreenVulkanPreviewSmokeCoordinator?.disposeAll()
-        duetGpuGreenScreenVulkanPreviewSmokeCoordinator = null
-        duetTfliteGpuNativeCapabilitySmokeCoordinator?.disposeAll()
-        duetTfliteGpuNativeCapabilitySmokeCoordinator = null
         // ANDROID-DUET-GREENSCREEN-TASKS-LIVE: stop the camera, close the
         // segmenter on its owned thread, release the offscreen preview sink and
         // the SurfaceProducer; later method calls are ignored.

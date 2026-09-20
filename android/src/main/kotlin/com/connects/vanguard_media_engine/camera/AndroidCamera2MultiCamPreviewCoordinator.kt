@@ -975,4 +975,18 @@ class AndroidCamera2MultiCamPreviewCoordinator(
             ),
         )
     }
+
+    // ── Public accessors for plugin-level routing ──────────────────────────
+
+    /** True when a dual-camera preview session is live and streaming. */
+    val isMultiCamRunning: Boolean get() = dualCameraSource != null
+
+    /**
+     * Forwards a tap-to-focus request to the active dual-camera source's back
+     * camera. No-op when the active source is not a [VanguardDualCameraSource]
+     * (the generic Camera2 path manages its own repeating AF mode).
+     */
+    fun setFocusPoint(x: Float, y: Float) {
+        (dualCameraSource as? VanguardDualCameraSource)?.setFocusPoint(x, y)
+    }
 }

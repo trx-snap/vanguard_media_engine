@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 namespace vanguard {
 namespace render {
@@ -110,7 +111,32 @@ bool ResolveVulkanDuetLayoutLayerPlacement(const VulkanDuetLayoutLayerGeometry& 
     }
 
     VideoFrameTransform transform{};
-    applyAspectFillCrop(r.width, r.height, layer.bufferWidth, layer.bufferHeight, &transform);
+    const uint32_t rotation = normalizeRotation(layer.rotationDegrees);
+    transform.rotationDegrees = rotation;
+    transform.mirrorHorizontal = layer.mirrorHorizontal;
+
+    // The aspect-fill crop compares the buffer's content aspect against the
+    // rect's (display-space) aspect, so a buffer that is displayed rotated
+    // 90/270 must have its width/height swapped here first -- otherwise a
+    // portrait buffer rotated to landscape display would be cropped as if it
+    // were still portrait.
+    uint32_t effectiveBufferWidth = layer.bufferWidth;
+    uint32_t effectiveBufferHeight = layer.bufferHeight;
+    if (rotation == 90 || rotation == 270) {
+        std::swap(effectiveBufferWidth, effectiveBufferHeight);
+    }
+    applyAspectFillCrop(r.width, r.height, effectiveBufferWidth, effectiveBufferHeight, &transform);
+
+    // After crop computation, 90°/270° rotation transposes the UV axes in the
+    // shader relative to the display axes: texture U (buffer horizontal) becomes
+    // the display's vertical axis, and texture V becomes horizontal.  Swap the
+    // crop scales and biases so that the display-width crop targets texture V
+    // and the display-height crop targets texture U.  PiP is unaffected because
+    // its crop scales are both 1.0 (identity).
+    if (rotation == 90 || rotation == 270) {
+        std::swap(transform.cropScaleU, transform.cropScaleV);
+        std::swap(transform.cropBiasU,  transform.cropBiasV);
+    }
 
     out->viewport = viewport;
     out->scissor = scissor;

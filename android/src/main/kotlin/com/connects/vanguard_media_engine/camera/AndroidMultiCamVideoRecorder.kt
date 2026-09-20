@@ -56,6 +56,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -80,6 +81,7 @@ class AndroidMultiCamVideoRecorder(
         private const val BITMAP_POOL_SIZE = 2
         private const val STOP_JOIN_TIMEOUT_MS = 3_000L
         private const val FRAME_POLL_TIMEOUT_MS = 100L
+        private const val MAX_PENDING_SAMPLES = 120
     }
 
     private val tmpPath = "$outputPath.tmp"
@@ -89,6 +91,14 @@ class AndroidMultiCamVideoRecorder(
     private val stopped = AtomicBoolean(false)
     private var startNanos = 0L
     private var endNanos = 0L
+    private var firstVideoFrameNanos = -1L
+
+    // Wall-clock origin for both audio and video PTS.  Set atomically in
+    // submitFrame() on the first delivered composited frame so that the audio
+    // thread can observe it and drop pre-origin mic samples.  Both streams
+    // measure their presentation timestamps relative to this instant, ensuring
+    // the MP4 container has start_time = 0.000000 for both tracks.
+    @Volatile private var recordingOriginNanos = -1L
 
     // ── Frame counters (stats contract) ─────────────────────────────────────
     private val framesOffered = AtomicInteger(0)
@@ -150,6 +160,11 @@ class AndroidMultiCamVideoRecorder(
     @Volatile private var audioPermanentlyDisabled = false
 
     // ── Muxer (shared between video and audio threads under muxerLock) ─────
+    private class PendingSample(
+        val data: ByteArray,
+        val info: MediaCodec.BufferInfo,
+    )
+
     private val muxerLock = Any()
     private var muxer: MediaMuxer? = null
     @Volatile private var muxerStarted = false
@@ -157,6 +172,8 @@ class AndroidMultiCamVideoRecorder(
     private var audioTrackIndex = -1
     @Volatile private var videoFormatReady = false
     @Volatile private var videoFormatArrivedAtNanos = 0L
+    private val pendingVideoSamples = ArrayDeque<PendingSample>()
+    private val pendingAudioSamples = ArrayDeque<PendingSample>()
 
     // ─────────────────────────────────────────────────────────────────────────
     // start()
@@ -274,6 +291,13 @@ class AndroidMultiCamVideoRecorder(
         if (!running || stopped.get()) return
         framesOffered.incrementAndGet()
 
+        // Establish the shared recording origin on the very first offered frame.
+        // volatile-write is safe from the compositor render thread; the audio
+        // thread observes it via volatile-read before stamping any audio chunk.
+        if (recordingOriginNanos < 0L) {
+            recordingOriginNanos = System.nanoTime()
+        }
+
         val pooled = bitmapPool.poll()
         if (pooled == null) {
             framesDropped.incrementAndGet()
@@ -332,6 +356,11 @@ class AndroidMultiCamVideoRecorder(
         }
         try { muxer?.release() } catch (_: Throwable) {}
 
+        synchronized(muxerLock) {
+            pendingVideoSamples.clear()
+            pendingAudioSamples.clear()
+        }
+
         releaseVideoResources()
 
         if (!finalizeOk) {
@@ -387,6 +416,11 @@ class AndroidMultiCamVideoRecorder(
 
         try { if (muxerStarted) muxer?.stop() } catch (_: Throwable) {}
         try { muxer?.release() } catch (_: Throwable) {}
+
+        synchronized(muxerLock) {
+            pendingVideoSamples.clear()
+            pendingAudioSamples.clear()
+        }
 
         deleteQuietly(File(tmpPath))
         Log.i(TAG, "abort: recording aborted, resources released")
@@ -551,11 +585,10 @@ class AndroidMultiCamVideoRecorder(
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
 
-        // Wall-clock PTS relative to start(): MediaCodec derives info.presentationTimeUs
-        // from this producer-side timestamp for surface input, so the drain loop below
-        // must trust info.presentationTimeUs as-is rather than recomputing it from a
-        // frame counter (frames here are not delivered at a fixed cadence).
-        val ptsNs = System.nanoTime() - startNanos
+        // PTS relative to the shared recording origin established in
+        // submitFrame().  recordingOriginNanos is always set before any frame
+        // reaches the video thread, so the coerceAtLeast guard is defensive.
+        val ptsNs = (System.nanoTime() - recordingOriginNanos).coerceAtLeast(0L)
         EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsNs)
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
     }
@@ -602,11 +635,28 @@ class AndroidMultiCamVideoRecorder(
                             var wrote = false
                             synchronized(muxerLock) {
                                 if (muxerStarted && videoTrackIndex >= 0) {
-                                    mx.writeSampleData(videoTrackIndex, buf, info)
-                                    wrote = true
+                                    try {
+                                        mx.writeSampleData(videoTrackIndex, buf, info)
+                                        wrote = true
+                                    } catch (t: Throwable) {
+                                        Log.w(TAG, "drainVideoEncoder: writeSampleData failed: ${t.message}")
+                                    }
+                                } else {
+                                    // Buffer pre-muxer video samples so Frame 0 (IDR keyframe)
+                                    // is preserved while audio initializes.
+                                    if (pendingVideoSamples.size < MAX_PENDING_SAMPLES) {
+                                        val data = ByteArray(info.size)
+                                        buf.get(data)
+                                        val copyInfo = MediaCodec.BufferInfo().apply {
+                                            set(0, info.size, info.presentationTimeUs, info.flags)
+                                        }
+                                        pendingVideoSamples.add(PendingSample(data, copyInfo))
+                                    } else {
+                                        framesDropped.incrementAndGet()
+                                    }
                                 }
                             }
-                            if (wrote) framesAppended.incrementAndGet() else framesDropped.incrementAndGet()
+                            if (wrote) framesAppended.incrementAndGet()
                         }
                     }
                     enc.releaseOutputBuffer(outIdx, false)
@@ -644,7 +694,42 @@ class AndroidMultiCamVideoRecorder(
         try {
             mx.start()
             muxerStarted = true
-            Log.i(TAG, "maybeStartMuxerLocked: muxer started (audioConfigured=$audioConfigured audioTrackIndex=$audioTrackIndex)")
+            Log.i(TAG, "maybeStartMuxerLocked: muxer started (audioConfigured=$audioConfigured audioTrackIndex=$audioTrackIndex pendingVideo=${pendingVideoSamples.size} pendingAudio=${pendingAudioSamples.size})")
+
+            // Flush buffered pre-muxer video frames starting with Frame 0 (IDR keyframe)
+            while (pendingVideoSamples.isNotEmpty()) {
+                val sample = pendingVideoSamples.removeFirst()
+                try {
+                    val byteBuf = ByteBuffer.allocateDirect(sample.data.size).apply {
+                        put(sample.data)
+                        position(0)
+                        limit(sample.data.size)
+                    }
+                    mx.writeSampleData(videoTrackIndex, byteBuf, sample.info)
+                    framesAppended.incrementAndGet()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "maybeStartMuxerLocked: failed to flush pending video frame: ${t.message}")
+                }
+            }
+
+            // Flush buffered pre-muxer audio frames
+            if (audioTrackIndex >= 0) {
+                while (pendingAudioSamples.isNotEmpty()) {
+                    val sample = pendingAudioSamples.removeFirst()
+                    try {
+                        val byteBuf = ByteBuffer.allocateDirect(sample.data.size).apply {
+                            put(sample.data)
+                            position(0)
+                            limit(sample.data.size)
+                        }
+                        mx.writeSampleData(audioTrackIndex, byteBuf, sample.info)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "maybeStartMuxerLocked: failed to flush pending audio frame: ${t.message}")
+                    }
+                }
+            } else {
+                pendingAudioSamples.clear()
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "maybeStartMuxerLocked: muxer.start() failed: ${t.javaClass.simpleName}: ${t.message}", t)
         }
@@ -725,7 +810,6 @@ class AndroidMultiCamVideoRecorder(
         }
 
         val pcmBuffer = ShortArray(audioMinBufferSize / 2)
-        var samplesRead = 0L
 
         while (audioActive) {
             val n = try {
@@ -735,43 +819,65 @@ class AndroidMultiCamVideoRecorder(
                 break
             }
             if (n > 0) {
-                feedAudioEncoder(pcmBuffer, n, samplesRead)
-                samplesRead += n
+                // Drop mic audio captured before the first video frame arrives.
+                // recordingOriginNanos is set in submitFrame() on the compositor
+                // render thread and is read here via volatile.
+                val origin = recordingOriginNanos
+                if (origin < 0L) continue  // video not started yet — discard
+
+                feedAudioEncoder(pcmBuffer, n, origin)
                 drainAudioEncoder(endOfStream = false)
             }
         }
 
-        feedAudioEncoderEos(samplesRead)
+        feedAudioEncoderEos()
         drainAudioEncoder(endOfStream = true)
 
         try { record.stop() } catch (_: Throwable) {}
     }
 
-    private fun feedAudioEncoder(pcm: ShortArray, count: Int, samplesReadSoFar: Long) {
+    /**
+     * Feeds PCM audio into the AAC encoder with PTS relative to [originNanos].
+     *
+     * [originNanos] is the wall-clock nanoTime of the first composited video
+     * frame — all audio PTS are computed as `(now - originNanos)` so both
+     * streams share the same t=0 reference in the muxed MP4.
+     */
+    private fun feedAudioEncoder(pcm: ShortArray, count: Int, originNanos: Long) {
         val enc = audioEncoder ?: return
-        try {
-            val inIdx = enc.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
-            if (inIdx >= 0) {
-                val buf = enc.getInputBuffer(inIdx) ?: return
-                buf.clear()
-                buf.order(ByteOrder.nativeOrder())
-                val capacityShorts = buf.remaining() / 2
-                val n = minOf(capacityShorts, count)
-                buf.asShortBuffer().put(pcm, 0, n)
-                val ptsUs = samplesReadSoFar * 1_000_000L / AUDIO_SAMPLE_RATE
-                enc.queueInputBuffer(inIdx, 0, n * 2, ptsUs, 0)
+        var offset = 0
+        while (offset < count && audioActive) {
+            try {
+                val inIdx = enc.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+                if (inIdx >= 0) {
+                    val buf = enc.getInputBuffer(inIdx) ?: break
+                    buf.clear()
+                    buf.order(ByteOrder.nativeOrder())
+                    val capacityShorts = buf.remaining() / 2
+                    val toWrite = minOf(capacityShorts, count - offset)
+                    buf.asShortBuffer().put(pcm, offset, toWrite)
+                    // PTS relative to the shared recording origin, in microseconds.
+                    val ptsUs = ((System.nanoTime() - originNanos) / 1000L).coerceAtLeast(0L)
+                    enc.queueInputBuffer(inIdx, 0, toWrite * 2, ptsUs, 0)
+                    offset += toWrite
+                    drainAudioEncoder(endOfStream = false)
+                } else {
+                    drainAudioEncoder(endOfStream = false)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "feedAudioEncoder failed: ${t.message}")
+                break
             }
-        } catch (t: Throwable) {
-            Log.w(TAG, "feedAudioEncoder failed: ${t.message}")
         }
     }
 
-    private fun feedAudioEncoderEos(samplesReadSoFar: Long) {
+    private fun feedAudioEncoderEos() {
         val enc = audioEncoder ?: return
         try {
             val inIdx = enc.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
             if (inIdx >= 0) {
-                val ptsUs = samplesReadSoFar * 1_000_000L / AUDIO_SAMPLE_RATE
+                val origin = recordingOriginNanos
+                val ptsUs = if (origin > 0L) ((System.nanoTime() - origin) / 1000L).coerceAtLeast(0L) else 0L
                 enc.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             }
         } catch (t: Throwable) {
@@ -815,7 +921,20 @@ class AndroidMultiCamVideoRecorder(
                             buf.limit(info.offset + info.size)
                             synchronized(muxerLock) {
                                 if (muxerStarted && audioTrackIndex >= 0) {
-                                    mx.writeSampleData(audioTrackIndex, buf, info)
+                                    try {
+                                        mx.writeSampleData(audioTrackIndex, buf, info)
+                                    } catch (t: Throwable) {
+                                        Log.w(TAG, "drainAudioEncoder: writeSampleData failed: ${t.message}")
+                                    }
+                                } else if (!audioPermanentlyDisabled) {
+                                    if (pendingAudioSamples.size < MAX_PENDING_SAMPLES) {
+                                        val data = ByteArray(info.size)
+                                        buf.get(data)
+                                        val copyInfo = MediaCodec.BufferInfo().apply {
+                                            set(0, info.size, info.presentationTimeUs, info.flags)
+                                        }
+                                        pendingAudioSamples.add(PendingSample(data, copyInfo))
+                                    }
                                 }
                             }
                         }
@@ -883,6 +1002,10 @@ class AndroidMultiCamVideoRecorder(
         releaseVideoResources()
         try { muxer?.release() } catch (_: Throwable) {}
         muxer = null
+        synchronized(muxerLock) {
+            pendingVideoSamples.clear()
+            pendingAudioSamples.clear()
+        }
         deleteQuietly(File(tmpPath))
         // Mark as already stopped so a stray stop()/abort() call from the
         // caller's error path is a safe no-op rather than double-releasing.

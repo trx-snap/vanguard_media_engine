@@ -45,7 +45,9 @@ import android.view.Surface
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -109,6 +111,7 @@ class VanguardDualCameraSource(
     private var cameraProvider: ProcessCameraProvider? = null
     private var frontPreview: Preview? = null
     private var backPreview: Preview? = null
+    private var concurrentCamera: ConcurrentCamera? = null
 
     // ── State ─────────────────────────────────────────────────────────────────
     private var isRunning = false
@@ -213,6 +216,10 @@ class VanguardDualCameraSource(
             .setResolutionSelector(resolutionSelector)
 
         Camera2Interop.Extender<Preview>(frontPreviewBuilder)
+            .setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            )
             .setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(
                     session: CameraCaptureSession,
@@ -235,6 +242,10 @@ class VanguardDualCameraSource(
             .setResolutionSelector(resolutionSelector)
 
         Camera2Interop.Extender<Preview>(backPreviewBuilder)
+            .setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            )
             .setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(
                     session: CameraCaptureSession,
@@ -268,7 +279,8 @@ class VanguardDualCameraSource(
 
         // ── Bind concurrent cameras ────────────────────────────────────────
         try {
-            provider.bindToLifecycle(listOf(frontConfig, backConfig))
+            val cc = provider.bindToLifecycle(listOf(frontConfig, backConfig))
+            concurrentCamera = cc
         } catch (e: IllegalArgumentException) {
             // Thrown when the device does not support the requested concurrent
             // combination (CameraX validates this at bind time).
@@ -386,6 +398,7 @@ class VanguardDualCameraSource(
         cameraProvider  = null
         frontPreview    = null
         backPreview     = null
+        concurrentCamera = null
         isRunning       = false
         frontCameraReadyFlag = false
         backCameraReadyFlag  = false
@@ -457,4 +470,33 @@ class VanguardDualCameraSource(
 
     /** Flutter texture ID for the back camera stream, or -1 when streaming into a compositor's external surface. */
     override val backTextureId: Long get() = backTextureEntry?.id() ?: -1L
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Tap-to-focus
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Triggers a one-shot autofocus + auto-exposure metering action on the back
+     * camera at the normalised coordinates ([x], [y]) ∈ [0, 1].
+     *
+     * Falls back silently when the ConcurrentCamera reference is unavailable
+     * (e.g. the generic Camera2 path was used instead of CameraX).
+     */
+    fun setFocusPoint(x: Float, y: Float) {
+        val cameras = concurrentCamera?.cameras
+        // ConcurrentCamera returns cameras in the same order as the
+        // SingleCameraConfig list passed to bindToLifecycle.  Index 1 is the
+        // back camera (see backConfig above).
+        val backCamera = cameras?.getOrNull(1) ?: return
+        try {
+            val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
+            val point = factory.createPoint(x, y)
+            val action = FocusMeteringAction.Builder(point)
+                .disableAutoCancel()
+                .build()
+            backCamera.cameraControl.startFocusAndMetering(action)
+        } catch (t: Throwable) {
+            Log.w(TAG, "setFocusPoint: startFocusAndMetering failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
 }
