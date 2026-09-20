@@ -1,10 +1,12 @@
 package com.connects.vanguard_media_engine.audio
 
+import android.content.Context
 import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.nio.ByteOrder
 
 // ── AndroidWaveformExtractor (Phase 5-Unit W / Phase 4-Unit E) ────────────────
@@ -32,11 +34,12 @@ object AndroidWaveformExtractor {
         path: String?,
         samplesPerSecond: Int?,
         maxDurationSeconds: Double?,
+        context: Context? = null,
     ): AndroidWaveformResult {
         return try {
             val invalidArg = validateArgs(path, samplesPerSecond, maxDurationSeconds)
             if (invalidArg != null) return invalidArg
-            decode(path!!, samplesPerSecond!!, maxDurationSeconds!!)
+            decode(path!!, samplesPerSecond!!, maxDurationSeconds!!, context)
         } catch (t: Throwable) {
             Log.e(TAG, "extract: unexpected failure: $t")
             AndroidWaveformResult.Failure("WAVEFORM_ERROR", t.message ?: t.javaClass.simpleName)
@@ -64,12 +67,13 @@ object AndroidWaveformExtractor {
         path: String,
         samplesPerSecond: Int,
         maxDurationSeconds: Double,
+        context: Context?,
     ): AndroidWaveformResult {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         try {
             try {
-                extractor.setDataSource(path)
+                AndroidUriDataSourceHelper.setExtractorDataSource(extractor, path, context)
             } catch (t: Throwable) {
                 return AndroidWaveformResult.Failure(
                     "READER_SETUP_FAILED", "setDataSource failed: ${t.message ?: t.javaClass.simpleName}")

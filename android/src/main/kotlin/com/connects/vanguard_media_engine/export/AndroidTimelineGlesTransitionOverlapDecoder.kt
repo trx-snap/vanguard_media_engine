@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -7,6 +8,7 @@ import android.media.MediaFormat
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.view.Surface
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 
 // ── AndroidTimelineGlesTransitionDecodeSlot (P5-GLES-EXPORT-TRANSITION-PRODUCTION-ROUTE-A) ──
 //
@@ -127,6 +129,14 @@ internal class AndroidTimelineGlesTransitionDecodeSlot {
 internal class AndroidTimelineGlesTransitionOverlapDecoder(
     private val fromSource: Source,
     private val toSource: Source?,
+    // Android reference-video export: optional Context used ONLY to open a
+    // `content://` clip sourcePath through the ContentResolver
+    // (AndroidUriDataSourceHelper) in each [Pipeline.open]. POSIX sources
+    // never touch it; a `content://` source with a null Context fails closed
+    // as `<label>:open_exception:IllegalArgumentException` through the
+    // existing never-throws open contract. Declared before [isCancelled] so
+    // trailing-lambda call sites keep compiling.
+    private val context: Context? = null,
     private val isCancelled: () -> Boolean,
 ) {
     data class Source(
@@ -220,7 +230,7 @@ internal class AndroidTimelineGlesTransitionOverlapDecoder(
 
         fun open(): String? {
             return try {
-                extractor.setDataSource(source.clip.sourcePath)
+                AndroidUriDataSourceHelper.setExtractorDataSource(extractor, source.clip.sourcePath, context)
                 var trackIndex = -1
                 var trackFormat: MediaFormat? = null
                 for (i in 0 until extractor.trackCount) {

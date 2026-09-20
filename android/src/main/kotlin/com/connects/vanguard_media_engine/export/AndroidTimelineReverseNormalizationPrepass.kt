@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.media.ExifInterface
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -60,6 +61,12 @@ internal class AndroidTimelineReverseNormalizationPrepass(
     private val requestedWidth: Int,
     private val requestedHeight: Int,
     private val requestedBitrateBps: Int,
+    // Android reference-video export: optional Context threaded into the
+    // normalizer AndroidTimelineVideoEncoder so a reversed clip whose
+    // sourcePath is a `content://` URI can be opened through the
+    // ContentResolver. The forward temp this prepass writes is always a
+    // POSIX cache file, so [probeTemp] stays File-based.
+    private val context: Context? = null,
 ) {
     sealed class Result {
         /// [clips] is the replacement pass-1 clip list (same order/size as
@@ -138,6 +145,7 @@ internal class AndroidTimelineReverseNormalizationPrepass(
                 fps = fps,
                 bitrateBps = tempBitrateBps,
                 nativeBridge = null,
+                context = context,
             )
             val encodeResult = try {
                 trackActiveEncoder(encoder)

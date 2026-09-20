@@ -9,9 +9,12 @@ import android.util.Log
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.max
 
 // ── AndroidTimelineExportSession (Export Unit C) ──────────────────────────────
 //
@@ -36,8 +39,28 @@ import kotlin.math.floor
 // by Unit G with rotation metadata + canvas scaling normalization, and by
 // Phase 10 with per-clip colorMatrix parity):
 //   - video-only clips, speed == 1.0, no canvas
-//     contentMode other than "fit", no per-clip transform/crop/freeze/
-//     time-remap/dual-camera.
+//     contentMode other than "fit", no per-clip crop/freeze/
+//     time-remap/dual-camera/transformTrack.
+//   - P5-CLIP-STATIC-TRANSFORM-EXPORT-A: a narrow static `clip.transform`
+//     subset is accepted for VIDEO clips only: finite uniform scale
+//     (scaleX ≈ scaleY, both > 0, at most MAX_CLIP_TRANSFORM_SCALE), finite
+//     translationX/translationY (draft-canvas pixels, converted here into
+//     requested-output pixels), rotation ≈ 0, opacity absent/≈ 1.0,
+//     anchorX/anchorY absent/≈ 0.5. It is the shape the ConnectsApp
+//     Universal Editor emits for TikTok-style crop/aspect/fill/pan framing.
+//     Non-uniform scale, any rotation, partial opacity, off-center anchors,
+//     a transform on a still-image or reversed clip, a requested output
+//     whose aspect ratio differs from the draft canvas, or a transform whose
+//     placement cannot be represented as an in-bounds crop (nothing visible,
+//     empty/odd crop -- see AndroidTimelineClipStaticTransformGeometry) all
+//     fail closed with UNSUPPORTED_EXPORT_FEATURE and a precise reason
+//     before pass-1. `transformTrack` and `cropRect` stay unsupported.
+//     Supported transforms keep Vulkan-first selection
+//     (AndroidTimelineVulkanVideoEncoder renders them as a source crop +
+//     in-bounds destination rect); the hard-cut GLES fallback
+//     (AndroidTimelineVideoEncoder) applies the same placement in vertex
+//     space, while the GLES transition route and reversed-clip
+//     normalization are excluded by AndroidExportRenderBackendSelector.
 //   - P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: a narrow reversed-video export
 //     route. A hard-cut clip (forward or reversed) with isReversed=true is
 //     accepted when it is a local video clip with zero rotation metadata;
@@ -213,6 +236,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         // and guardrails around isReversed below for the narrow scope this
         // slice accepts.
         val isReversed: Boolean = false,
+        // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: accepted static transform with
+        // translation still in DRAFT-CANVAS pixels (converted to output
+        // pixels when the ClipInput is built). Null = no transform.
+        val canvasTransform: AndroidTimelineVideoEncoder.StaticClipTransform? = null,
     )
 
     private data class ClipContext(
@@ -227,7 +254,106 @@ class AndroidTimelineExportSession(private val context: Context) {
         val colorMatrix: FloatArray? = null,
         val beautyIntensity: Double? = null,
         val isReversed: Boolean = false,
+        val canvasTransform: AndroidTimelineVideoEncoder.StaticClipTransform? = null,
     )
+
+    /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: outcome of parsing one clip's
+    /// optional `transform` wire map -- see [parseStaticClipTransform].
+    private sealed class ClipTransformParse {
+        object Absent : ClipTransformParse()
+        data class Present(val transform: AndroidTimelineVideoEncoder.StaticClipTransform) : ClipTransformParse()
+        data class Failure(val code: String, val message: String) : ClipTransformParse()
+    }
+
+    /// Parses the optional `clip.transform` map (VGClipTransformDescriptor
+    /// wire shape: scaleX, scaleY, translationX, translationY, rotation,
+    /// opacity, anchorX, anchorY -- every key optional with identity
+    /// defaults) into the narrow static subset this route renders. A
+    /// malformed/non-finite value is INVALID_ARG; a well-formed value
+    /// outside the subset (non-uniform scale, oversized scale, rotation,
+    /// partial opacity, off-center anchor) is UNSUPPORTED_EXPORT_FEATURE
+    /// with the exact offending field. An effectively-identity transform
+    /// parses as [ClipTransformParse.Absent]. Translation is returned in
+    /// draft-canvas pixels, exactly as received.
+    private fun parseStaticClipTransform(raw: Any?): ClipTransformParse {
+        if (raw == null) return ClipTransformParse.Absent
+        if (raw !is Map<*, *>) {
+            return ClipTransformParse.Failure("INVALID_ARG", "exportTimeline: clip.transform must be a map")
+        }
+        val values = HashMap<String, Double>()
+        for ((key, default) in CLIP_TRANSFORM_DEFAULTS) {
+            val entry = raw[key]
+            if (entry == null) {
+                values[key] = default
+                continue
+            }
+            val number = entry as? Number
+                ?: return ClipTransformParse.Failure("INVALID_ARG", "exportTimeline: clip.transform.$key must be a number")
+            val value = number.toDouble()
+            if (!value.isFinite()) {
+                return ClipTransformParse.Failure("INVALID_ARG", "exportTimeline: clip.transform.$key must be finite")
+            }
+            values[key] = value
+        }
+        val scaleX = values.getValue("scaleX")
+        val scaleY = values.getValue("scaleY")
+        val translationX = values.getValue("translationX")
+        val translationY = values.getValue("translationY")
+        val rotation = values.getValue("rotation")
+        val opacity = values.getValue("opacity")
+        val anchorX = values.getValue("anchorX")
+        val anchorY = values.getValue("anchorY")
+
+        if (scaleX <= 0.0 || scaleY <= 0.0) {
+            return ClipTransformParse.Failure(
+                "INVALID_ARG",
+                "exportTimeline: clip.transform scaleX/scaleY must be > 0 (scaleX=$scaleX, scaleY=$scaleY)",
+            )
+        }
+        if (abs(scaleX - scaleY) > CLIP_TRANSFORM_UNIFORM_SCALE_EPSILON * max(scaleX, scaleY)) {
+            return ClipTransformParse.Failure(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: clip.transform non-uniform scale is not supported " +
+                    "(scaleX=$scaleX, scaleY=$scaleY)",
+            )
+        }
+        val scale = (scaleX + scaleY) / 2.0
+        if (scale > MAX_CLIP_TRANSFORM_SCALE) {
+            return ClipTransformParse.Failure(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: clip.transform scale $scale exceeds the supported maximum of $MAX_CLIP_TRANSFORM_SCALE",
+            )
+        }
+        if (abs(rotation) > CLIP_TRANSFORM_ROTATION_EPSILON_RADIANS) {
+            return ClipTransformParse.Failure(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: clip.transform.rotation $rotation is not supported (only 0)",
+            )
+        }
+        if (abs(opacity - 1.0) > CLIP_TRANSFORM_UNIT_EPSILON) {
+            return ClipTransformParse.Failure(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: clip.transform.opacity $opacity is not supported (only 1.0)",
+            )
+        }
+        if (abs(anchorX - 0.5) > CLIP_TRANSFORM_UNIT_EPSILON || abs(anchorY - 0.5) > CLIP_TRANSFORM_UNIT_EPSILON) {
+            return ClipTransformParse.Failure(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: clip.transform anchor ($anchorX, $anchorY) is not supported (only 0.5, 0.5)",
+            )
+        }
+        val isIdentity = abs(scale - 1.0) <= CLIP_TRANSFORM_IDENTITY_EPSILON &&
+            abs(translationX) <= CLIP_TRANSFORM_IDENTITY_EPSILON &&
+            abs(translationY) <= CLIP_TRANSFORM_IDENTITY_EPSILON
+        if (isIdentity) return ClipTransformParse.Absent
+        return ClipTransformParse.Present(
+            AndroidTimelineVideoEncoder.StaticClipTransform(
+                scale = scale,
+                translationX = translationX,
+                translationY = translationY,
+            ),
+        )
+    }
 
     private fun run(
         args: Map<*, *>?,
@@ -383,6 +509,37 @@ class AndroidTimelineExportSession(private val context: Context) {
                     return
                 }
             }
+            // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: `transform` is parsed into
+            // the narrow static subset (see [parseStaticClipTransform]) and
+            // admitted for forward VIDEO clips only -- the still-image and
+            // reversed render routes never apply it, so it fails closed for
+            // them rather than exporting unframed content. Placement
+            // feasibility against the probed geometry is validated further
+            // below, once decoded dimensions/rotation and the requested
+            // output are known.
+            val canvasTransform: AndroidTimelineVideoEncoder.StaticClipTransform? =
+                when (val parse = parseStaticClipTransform(map["transform"])) {
+                    is ClipTransformParse.Failure -> {
+                        onError(parse.code, parse.message)
+                        return
+                    }
+                    ClipTransformParse.Absent -> null
+                    is ClipTransformParse.Present -> parse.transform
+                }
+            if (canvasTransform != null && mediaKind != "video") {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: clip.transform is only supported for video clips (mediaKind '$mediaKind')",
+                )
+                return
+            }
+            if (canvasTransform != null && isReversed) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: clip.transform on a reversed clip is not supported",
+                )
+                return
+            }
             // Phase 10: colorMatrix is accepted (not in UNSUPPORTED_CLIP_KEYS).
             // A missing/null key means no filter. When present it must be a
             // list of exactly 20 finite numbers (4x5 row-major, matching
@@ -450,12 +607,33 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: remote clip sources are not supported")
                 return
             }
-            if (!sourcePath.startsWith("/")) {
+            // Android reference-video export: a `content://` clip source is
+            // admitted only for mediaKind == "video" and only when the
+            // ContentResolver can open it right now
+            // (AndroidUriDataSourceHelper.isReadable). Every pass-0/1/2
+            // decoder/probe below opens it again through the same helper with
+            // this session's [context]; a provider revocation mid-export then
+            // surfaces as that stage's existing structured failure
+            // (clip_decode_exception / open_exception / remux:<reason>)
+            // rather than a crash. Still-image `content://` sources stay
+            // fail-closed here with a precise reason -- the still-image
+            // decode/probe path is File-based and is not part of this route.
+            // Plain POSIX paths keep the byte-identical File.exists/canRead
+            // preflight via the helper's non-content branch.
+            val isContentUriSource = AndroidUriDataSourceHelper.isContentUri(sourcePath)
+            if (isContentUriSource && mediaKind != "video") {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: content:// clip sources are only supported for video clips " +
+                        "(mediaKind '$mediaKind'): $sourcePath",
+                )
+                return
+            }
+            if (!isContentUriSource && !sourcePath.startsWith("/")) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: non-local clip sources are not supported")
                 return
             }
-            val file = File(sourcePath)
-            if (!file.exists() || !file.canRead()) {
+            if (!AndroidUriDataSourceHelper.isReadable(sourcePath, context)) {
                 onError("FILE_UNREADABLE", "exportTimeline: cannot read clip source: $sourcePath")
                 return
             }
@@ -469,6 +647,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     colorMatrix = colorMatrix,
                     beautyIntensity = beautyIntensity,
                     isReversed = isReversed,
+                    canvasTransform = canvasTransform,
                 ),
             )
         }
@@ -605,6 +784,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                         colorMatrix = clip.colorMatrix,
                         beautyIntensity = clip.beautyIntensity,
                         isReversed = clip.isReversed,
+                        canvasTransform = clip.canvasTransform,
                     ),
                 )
                 continue
@@ -650,6 +830,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     colorMatrix = clip.colorMatrix,
                     beautyIntensity = clip.beautyIntensity,
                     isReversed = clip.isReversed,
+                    canvasTransform = clip.canvasTransform,
                 ),
             )
         }
@@ -705,6 +886,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             requestedWidth = requestWidth,
             requestedHeight = requestHeight,
             requestedBitrateBps = requestBitrate,
+            context = context,
         )
 
         fun deleteOwnedTemps() {
@@ -745,6 +927,35 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
+        // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: clip transform translations are
+        // draft-canvas pixels (the Dart builder's canvas), while every
+        // encoder places clips in requested-output pixels. The two agree
+        // only when the requested output is a uniform scaling of the draft
+        // canvas; a differing aspect ratio would change the fit and silently
+        // reframe the clip, so it fails closed instead. The translation is
+        // scaled by the (uniform) output/canvas ratio below.
+        val hasCanvasTransform = clipContexts.any { it.canvasTransform != null }
+        val transformTranslationScale: Double
+        if (hasCanvasTransform) {
+            val aspectMismatch = abs(
+                requestWidth.toDouble() * draftCanvasHeight - requestHeight.toDouble() * draftCanvasWidth,
+            )
+            if (aspectMismatch > CLIP_TRANSFORM_ASPECT_TOLERANCE * requestWidth.toDouble() * draftCanvasHeight) {
+                deleteOwnedTemps()
+                logTerminal("clip_transform_unsupported", backend = null)
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: clip.transform requires the requested output " +
+                        "(${requestWidth}x$requestHeight) to have the same aspect ratio as the draft canvas " +
+                        "(${draftCanvasWidth}x$draftCanvasHeight)",
+                )
+                return
+            }
+            transformTranslationScale = requestWidth.toDouble() / draftCanvasWidth.toDouble()
+        } else {
+            transformTranslationScale = 1.0
+        }
+
         val clipInputs = mutableListOf<AndroidTimelineVideoEncoder.ClipInput>()
         for (ctx in clipContexts) {
             var stillFrameCount = 0
@@ -760,6 +971,52 @@ class AndroidTimelineExportSession(private val context: Context) {
                     return
                 }
             }
+            // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: output-space transform, then
+            // a fail-closed placement check against the probed geometry with
+            // the exact computation AndroidTimelineVulkanVideoEncoder will
+            // run per clip -- a transform that leaves nothing visible or
+            // yields an empty/odd/out-of-range source crop is rejected here
+            // with a precise reason rather than surfacing as a pass-1 render
+            // failure (or, on the GLES fallback, as unframed/black output).
+            var outputTransform: AndroidTimelineVideoEncoder.StaticClipTransform? = null
+            val canvasTransform = ctx.canvasTransform
+            if (canvasTransform != null) {
+                val scaledTransform = AndroidTimelineVideoEncoder.StaticClipTransform(
+                    scale = canvasTransform.scale,
+                    translationX = canvasTransform.translationX * transformTranslationScale,
+                    translationY = canvasTransform.translationY * transformTranslationScale,
+                )
+                outputTransform = scaledTransform
+                val placement = AndroidTimelineClipStaticTransformGeometry.compute(
+                    outputWidth = requestWidth,
+                    outputHeight = requestHeight,
+                    decodedWidth = ctx.decodedWidth,
+                    decodedHeight = ctx.decodedHeight,
+                    rotationDegrees = ctx.rotationDegrees,
+                    transform = scaledTransform,
+                )
+                val resolved = placement.placement
+                if (resolved == null) {
+                    deleteOwnedTemps()
+                    logTerminal("clip_transform_unsupported", backend = null)
+                    onError(
+                        "UNSUPPORTED_EXPORT_FEATURE",
+                        "exportTimeline: clip.transform cannot be represented as an in-bounds crop " +
+                            "(${placement.failure ?: "unresolved"}) for ${ctx.sourcePath}",
+                    )
+                    return
+                }
+                Log.i(
+                    TAG,
+                    "VG_EXPORT_CLIP_TRANSFORM source=${ctx.sourcePath} " +
+                        "canvasScale=${canvasTransform.scale} canvasTx=${canvasTransform.translationX} " +
+                        "canvasTy=${canvasTransform.translationY} translationScale=$transformTranslationScale " +
+                        "decoded=${ctx.decodedWidth}x${ctx.decodedHeight} rotation=${ctx.rotationDegrees} " +
+                        "crop=${resolved.sourceLeft},${resolved.sourceTop}-${resolved.sourceRight},${resolved.sourceBottom} " +
+                        "dest=${resolved.destX},${resolved.destY}-${resolved.destWidth}x${resolved.destHeight} " +
+                        "out=${requestWidth}x$requestHeight",
+                )
+            }
             clipInputs.add(
                 AndroidTimelineVideoEncoder.ClipInput(
                     sourcePath = ctx.sourcePath,
@@ -774,6 +1031,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     colorMatrix = ctx.colorMatrix,
                     beautyIntensity = ctx.beautyIntensity,
                     isReversed = ctx.isReversed,
+                    transform = outputTransform,
                 ),
             )
         }
@@ -1002,6 +1260,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         // ClipInput.beautyIntensity is non-null (see its own [encode] doc).
         // [hasNonHardCutTransitionForEncoder] was already computed above,
         // before backend selection, to derive the debug-force routing.
+        // Every pass-1 encoder receives this session's [context] so a
+        // `content://` clip source admitted above can be opened by its
+        // MediaExtractor/MediaMetadataRetriever through the ContentResolver
+        // (AndroidUriDataSourceHelper); POSIX sources are unaffected.
         fun buildPass1Encoder(backend: ExportRenderBackend): AndroidTimelineVideoPassEncoder {
             return if (backend == ExportRenderBackend.VULKAN) {
                 AndroidTimelineVulkanVideoEncoder(
@@ -1011,6 +1273,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     fps = requestFps,
                     bitrateBps = requestBitrate,
                     nativeBridge = sessionNativeBridge,
+                    context = context,
                 )
             } else if (hasNonHardCutTransitionForEncoder) {
                 AndroidTimelineGlesTransitionVideoEncoder(
@@ -1020,6 +1283,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     fps = requestFps,
                     bitrateBps = requestBitrate,
                     nativeBridge = sessionNativeBridge,
+                    context = context,
                 )
             } else {
                 AndroidTimelineVideoEncoder(
@@ -1029,6 +1293,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     fps = requestFps,
                     bitrateBps = requestBitrate,
                     nativeBridge = sessionNativeBridge,
+                    context = context,
                 )
             }
         }
@@ -1147,7 +1412,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         // audioSpecs was already parsed once, above, before the transition
         // admission gate -- reused here rather than re-parsing the raw wire
         // list again.
-        val pass2Failure = AndroidTimelineAudioPass2Muxer().run(
+        // [context] is threaded so an original-sound sidecar track whose url
+        // is the clip's own `content://` source can be probed/decoded/remuxed
+        // through the ContentResolver; the video/audio temps stay POSIX.
+        val pass2Failure = AndroidTimelineAudioPass2Muxer(context = context).run(
             specs = audioSpecs,
             videoTempPath = videoTempPath,
             audioTempPath = audioTempPath,
@@ -1232,6 +1500,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "beautyFrameCount" to encodeResult.beautyFrameCount,
                 "overlayCount" to overlays.size,
                 "renderedOverlayFrameCount" to encodeResult.overlayFrameCount,
+                "transformedClipCount" to clipInputs.count { it.transform != null },
             ),
         )
     }
@@ -1269,7 +1538,8 @@ class AndroidTimelineExportSession(private val context: Context) {
     private fun probeVideoTrack(path: String): VideoProbe? {
         val extractor = MediaExtractor()
         try {
-            extractor.setDataSource(path)
+            // POSIX path or `content://` URI -- the helper picks the overload.
+            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, path, context)
             for (i in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(i)
                 if (format.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
@@ -1295,7 +1565,7 @@ class AndroidTimelineExportSession(private val context: Context) {
     private fun probeMediaDurationSeconds(path: String): Double? {
         val retriever = MediaMetadataRetriever()
         try {
-            retriever.setDataSource(path)
+            AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, path, context)
             val ms = retriever
                 .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: return null
@@ -1344,14 +1614,54 @@ class AndroidTimelineExportSession(private val context: Context) {
         // parsed and validated explicitly above, then carried through
         // ParsedClip/ClipContext/ClipInput and applied by whichever backend
         // renders the clip -- see AndroidTimelineVulkanVideoEncoder (Vulkan)
-        // and AndroidTimelineVideoEncoder (GLES).
+        // and AndroidTimelineVideoEncoder (GLES). `transform` is likewise
+        // absent (P5-CLIP-STATIC-TRANSFORM-EXPORT-A): it is parsed by
+        // [parseStaticClipTransform] into the narrow static subset that the
+        // same two backends render, and everything outside that subset
+        // still fails closed there. `transformTrack` and `cropRect` remain
+        // unsupported.
         private val UNSUPPORTED_CLIP_KEYS = listOf(
             "freezePTS",
             "dualCamera",
             "timeRemap",
             "transformTrack",
-            "transform",
             "cropRect",
         )
+
+        // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: `clip.transform` wire keys with
+        // their VGClipTransformDescriptor identity defaults, and the
+        // tolerances of the accepted static subset.
+        private val CLIP_TRANSFORM_DEFAULTS = listOf(
+            "scaleX" to 1.0,
+            "scaleY" to 1.0,
+            "translationX" to 0.0,
+            "translationY" to 0.0,
+            "rotation" to 0.0,
+            "opacity" to 1.0,
+            "anchorX" to 0.5,
+            "anchorY" to 0.5,
+        )
+
+        /// Relative tolerance under which scaleX/scaleY count as one uniform scale.
+        private const val CLIP_TRANSFORM_UNIFORM_SCALE_EPSILON = 1e-3
+
+        /// |rotation| above this (radians) is a real rotation and fails closed.
+        private const val CLIP_TRANSFORM_ROTATION_EPSILON_RADIANS = 1e-4
+
+        /// Tolerance for opacity == 1.0 and anchorX/anchorY == 0.5.
+        private const val CLIP_TRANSFORM_UNIT_EPSILON = 1e-3
+
+        /// Scale == 1 / translation == 0 within this tolerance parses as no transform.
+        private const val CLIP_TRANSFORM_IDENTITY_EPSILON = 1e-6
+
+        /// Upper bound on the accepted uniform scale. The Universal Editor
+        /// clamps its user scale to [1, 8] on top of a cover scale, so
+        /// anything beyond this is not a product shape and would reduce the
+        /// source crop to a handful of pixels.
+        private const val MAX_CLIP_TRANSFORM_SCALE = 32.0
+
+        /// Relative tolerance on requested-output vs draft-canvas aspect
+        /// ratio for transformed clips (see the translation scaling above).
+        private const val CLIP_TRANSFORM_ASPECT_TOLERANCE = 5e-3
     }
 }

@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.media.ExifInterface
@@ -22,6 +23,7 @@ import android.opengl.GLUtils
 import android.util.Log
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import org.json.JSONObject
 import java.io.File
 import java.nio.ByteBuffer
@@ -29,6 +31,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -94,6 +97,15 @@ class AndroidTimelineVideoEncoder(
     // with no overlay-aware use of this encoder (existing constructor call
     // sites) keep working unchanged via the default.
     private val nativeBridge: VanguardNativeBridge? = null,
+    // Android reference-video export: optional Context used ONLY to open a
+    // `content://` ClipInput.sourcePath through the ContentResolver
+    // (AndroidUriDataSourceHelper) in [decodeClipIntoEncoder] /
+    // [renderReversedClipIntoEncoder]. POSIX sources never touch it. A
+    // `content://` clip with a null Context fails closed through the same
+    // clip_decode_exception / reversed_clip_render_exception reasons as any
+    // other open failure -- it never crashes the encode. Diagnostics/harness
+    // constructors keep working unchanged via the default.
+    private val context: Context? = null,
 ) : AndroidTimelineVideoPassEncoder {
     data class ClipInput(
         val sourcePath: String,
@@ -122,6 +134,33 @@ class AndroidTimelineVideoEncoder(
         // (AndroidTimelineVulkanVideoEncoder) has no render support for this
         // and fails closed defensively if it ever receives one.
         val isReversed: Boolean = false,
+        // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: optional static clip transform
+        // (uniform scale around the clip's fitted center plus a translation
+        // already converted by AndroidTimelineExportSession into OUTPUT
+        // pixels). Null means the plain centered aspect-fit placement.
+        // Applied by AndroidTimelineVulkanVideoEncoder as a source crop +
+        // in-bounds destination rect
+        // (AndroidTimelineClipStaticTransformGeometry) and by this GLES
+        // encoder's hard-cut route in vertex space ([updateClipGeometry]).
+        // AndroidTimelineGlesTransitionVideoEncoder and the reversed-clip
+        // normalization prepass do not apply it, so
+        // AndroidExportRenderBackendSelector / AndroidTimelineExportSession
+        // keep transformed clips away from those routes.
+        val transform: StaticClipTransform? = null,
+    )
+
+    /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: the narrow static clip transform
+    /// subset the Android export route renders -- see
+    /// AndroidTimelineClipStaticTransformGeometry. [scale] is a finite,
+    /// positive uniform scale applied around the fitted clip's center;
+    /// [translationX]/[translationY] are finite output-pixel offsets
+    /// (positive X = right, positive Y = down). Rotation, opacity and
+    /// off-center anchors are not representable here; the session fails
+    /// closed for them at parse time instead of constructing this value.
+    data class StaticClipTransform(
+        val scale: Double,
+        val translationX: Double,
+        val translationY: Double,
     )
 
     data class EncodeResult(
@@ -684,7 +723,7 @@ class AndroidTimelineVideoEncoder(
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
         try {
-            extractor.setDataSource(clip.sourcePath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, clip.sourcePath, context)
             var trackIndex = -1
             var trackFormat: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -846,6 +885,18 @@ class AndroidTimelineVideoEncoder(
     /// a vertex-space rotation, so the fit geometry here must be computed
     /// against the EXIF-adjusted display bounds -- not the raw decode
     /// dimensions -- while [ClipInput.rotationDegrees] stays 0 for images.
+    ///
+    /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: when [ClipInput.transform] is
+    /// non-null, the rotated fit quad is additionally scaled uniformly
+    /// around the output center by [StaticClipTransform.scale] and then
+    /// translated by the transform's output-pixel offsets (canvas Y-down is
+    /// negated into NDC Y-up) -- the same placement
+    /// AndroidTimelineClipStaticTransformGeometry derives for the Vulkan
+    /// crop seam, expressed in vertex space. Any part of the quad that lands
+    /// outside the output is clipped by the fixed viewport, so no
+    /// destination-bounds work is needed on this backend. A transform whose
+    /// values are not finite/positive fails closed here rather than
+    /// rendering a degenerate quad.
     private fun updateClipGeometry(clip: ClipInput): String? {
         val decodedWidth: Int
         val decodedHeight: Int
@@ -876,12 +927,37 @@ class AndroidTimelineVideoEncoder(
         val halfPixelX = decodedWidth.toFloat() * scale / 2f
         val halfPixelY = decodedHeight.toFloat() * scale / 2f
 
+        // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: uniform scale + output-pixel
+        // translation applied after rotation, in pixel space (see doc).
+        val transform = clip.transform
+        val transformScale: Float
+        val transformTxPixels: Float
+        val transformTyPixels: Float
+        if (transform != null) {
+            if (!transform.scale.isFinite() || transform.scale <= 0.0 ||
+                !transform.translationX.isFinite() || !transform.translationY.isFinite()
+            ) {
+                return "invalid_clip_transform:${clip.sourcePath}"
+            }
+            transformScale = transform.scale.toFloat()
+            transformTxPixels = transform.translationX.toFloat()
+            // Canvas/output Y is down; NDC Y is up.
+            transformTyPixels = -transform.translationY.toFloat()
+        } else {
+            transformScale = 1f
+            transformTxPixels = 0f
+            transformTyPixels = 0f
+        }
+
         // Mathematical positive angles are CCW; clip rotation metadata is
         // clockwise, hence the negated angle here.
         val radians = Math.toRadians(-clip.rotationDegrees.toDouble())
         val cosR = cos(radians).toFloat()
         val sinR = sin(radians).toFloat()
-        fun rotatedPixel(x: Float, y: Float) = floatArrayOf(x * cosR - y * sinR, x * sinR + y * cosR)
+        fun rotatedPixel(x: Float, y: Float) = floatArrayOf(
+            (x * cosR - y * sinR) * transformScale + transformTxPixels,
+            (x * sinR + y * cosR) * transformScale + transformTyPixels,
+        )
         // Rotate in pixel space first, then convert per-axis to NDC -- on
         // non-square canvases NDC is anisotropic, so rotating already-
         // normalized NDC coordinates would transpose/distort 90/270 fit.
@@ -1242,7 +1318,7 @@ class AndroidTimelineVideoEncoder(
         var textureId = 0
         var bitmapToRecycle: Bitmap? = null
         try {
-            retriever.setDataSource(clip.sourcePath)
+            AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, clip.sourcePath, context)
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
             val geometryFailure = updateClipGeometry(clip)
@@ -1414,4 +1490,244 @@ class AndroidTimelineVideoEncoder(
         private const val ENCODE_DRAIN_DEADLINE_MS = 2_000L
         private const val ENCODE_EOS_DEADLINE_MS = 5_000L
     }
+}
+
+// ── AndroidTimelineClipStaticTransformGeometry (P5-CLIP-STATIC-TRANSFORM-EXPORT-A) ──
+//
+// Pure placement geometry for the narrow static clip transform subset the
+// Android export route accepts ([AndroidTimelineVideoEncoder.StaticClipTransform]:
+// uniform scale around the fitted clip's center plus an output-pixel
+// translation; zero rotation, full opacity, centered anchor). Owns no
+// GL/Vulkan/codec state. Shared by AndroidTimelineExportSession (fail-closed
+// validation before pass-1) and AndroidTimelineVulkanVideoEncoder (per-clip
+// source crop + destination rect for the native cropped render seam, which
+// requires the destination rect to lie fully inside the output).
+//
+// Model (output pixel space, top-left origin, Y down), matching the Dart
+// builder's semantics (universal_editor_render_export_builder.dart):
+//   1. the clip's rotated display extent (decoded width/height, swapped for
+//      90/270) is centered and aspect-preserving-fit into the output
+//      (fitScale = min(outW/displayW, outH/displayH)) -- the null-transform
+//      placement;
+//   2. that fitted rect is scaled by [scale] around the output center;
+//   3. the result is translated by (translationX, translationY).
+// The visible region is the intersection of that rendered rect with the
+// output. The source crop is the display-space pre-image of the visible
+// region, mapped back into decoded buffer orientation through the inverse
+// of the clockwise cardinal rotation the native render transform applies
+// (render_transform.h: 90 CW -> u = y, v = 1 - x; 180 -> u = 1 - x,
+// v = 1 - y; 270 CW -> u = 1 - y, v = x), then rounded OUTWARD to
+// even-aligned integers (the decoder crop guard requires even bounds); the
+// destination rect is re-derived from that rounded crop so crop and
+// destination stay a uniform scaling of each other, then clamped to the
+// output. Rounding therefore never drops visible content; it can stretch
+// the frame by at most two source pixels per clipped edge.
+//
+// Every failure (nothing visible, empty/odd/out-of-range crop, degenerate
+// dimensions) is reported as a machine-readable reason; callers fail closed
+// with UNSUPPORTED_EXPORT_FEATURE instead of exporting wrong framing.
+internal object AndroidTimelineClipStaticTransformGeometry {
+    /// Source crop in the clip's decoded (buffer-orientation, pre-rotation)
+    /// pixel space, relative to the decoded extent's own origin, plus the
+    /// destination rect in output pixel space. Both are non-empty; the crop
+    /// bounds are even-aligned and inside the decoded extent, and the
+    /// destination lies fully inside the output.
+    data class Placement(
+        val sourceLeft: Int,
+        val sourceTop: Int,
+        val sourceRight: Int,
+        val sourceBottom: Int,
+        val destX: Int,
+        val destY: Int,
+        val destWidth: Int,
+        val destHeight: Int,
+    )
+
+    /// Exactly one of [placement] / [failure] is non-null.
+    class Result private constructor(val placement: Placement?, val failure: String?) {
+        companion object {
+            fun success(placement: Placement) = Result(placement, null)
+            fun failure(reason: String) = Result(null, reason)
+        }
+    }
+
+    /// Sub-pixel slack absorbed before floor/ceil so float noise at an exact
+    /// integer boundary never widens a crop by a full even step.
+    private const val ROUNDING_EPSILON = 1e-6
+
+    /// Computes the [Placement] for one clip, or a failure reason.
+    /// [rotationDegrees] must be cardinal (0/90/180/270).
+    fun compute(
+        outputWidth: Int,
+        outputHeight: Int,
+        decodedWidth: Int,
+        decodedHeight: Int,
+        rotationDegrees: Int,
+        transform: AndroidTimelineVideoEncoder.StaticClipTransform,
+    ): Result {
+        if (outputWidth <= 0 || outputHeight <= 0 || decodedWidth <= 0 || decodedHeight <= 0) {
+            return Result.failure(
+                "invalid_dimensions:outW=$outputWidth:outH=$outputHeight:" +
+                    "decodedW=$decodedWidth:decodedH=$decodedHeight",
+            )
+        }
+        val (displayWidth, displayHeight) = when (rotationDegrees) {
+            0, 180 -> decodedWidth to decodedHeight
+            90, 270 -> decodedHeight to decodedWidth
+            else -> return Result.failure("unsupported_rotation:$rotationDegrees")
+        }
+        val scale = transform.scale
+        val translationX = transform.translationX
+        val translationY = transform.translationY
+        if (!scale.isFinite() || scale <= 0.0 || !translationX.isFinite() || !translationY.isFinite()) {
+            return Result.failure("invalid_transform_values:scale=$scale:tx=$translationX:ty=$translationY")
+        }
+
+        // 1-3: fit, scale around center, translate (all in output pixels).
+        val fitScale = min(
+            outputWidth.toDouble() / displayWidth.toDouble(),
+            outputHeight.toDouble() / displayHeight.toDouble(),
+        )
+        val k = fitScale * scale // display px -> output px
+        if (!k.isFinite() || k <= 0.0) {
+            return Result.failure("degenerate_scale:fit=$fitScale:scale=$scale")
+        }
+        val renderedWidth = displayWidth * k
+        val renderedHeight = displayHeight * k
+        val centerX = outputWidth / 2.0 + translationX
+        val centerY = outputHeight / 2.0 + translationY
+        val renderedLeft = centerX - renderedWidth / 2.0
+        val renderedTop = centerY - renderedHeight / 2.0
+        val renderedRight = renderedLeft + renderedWidth
+        val renderedBottom = renderedTop + renderedHeight
+
+        // Visible region = rendered rect ∩ output.
+        val visibleLeft = max(renderedLeft, 0.0)
+        val visibleTop = max(renderedTop, 0.0)
+        val visibleRight = min(renderedRight, outputWidth.toDouble())
+        val visibleBottom = min(renderedBottom, outputHeight.toDouble())
+        if (visibleRight - visibleLeft < 1.0 || visibleBottom - visibleTop < 1.0) {
+            return Result.failure(
+                "not_visible:rendered=${fmt(renderedLeft)},${fmt(renderedTop)}-" +
+                    "${fmt(renderedRight)},${fmt(renderedBottom)}:outW=$outputWidth:outH=$outputHeight",
+            )
+        }
+
+        // Display-space pre-image of the visible region.
+        val cropLeftDisplay = ((visibleLeft - renderedLeft) / k).coerceIn(0.0, displayWidth.toDouble())
+        val cropTopDisplay = ((visibleTop - renderedTop) / k).coerceIn(0.0, displayHeight.toDouble())
+        val cropRightDisplay = ((visibleRight - renderedLeft) / k).coerceIn(0.0, displayWidth.toDouble())
+        val cropBottomDisplay = ((visibleBottom - renderedTop) / k).coerceIn(0.0, displayHeight.toDouble())
+
+        // Display -> decoded buffer orientation (inverse of the clockwise
+        // cardinal rotation; see the file-level doc).
+        val bufferLeft: Double
+        val bufferTop: Double
+        val bufferRight: Double
+        val bufferBottom: Double
+        when (rotationDegrees) {
+            0 -> {
+                bufferLeft = cropLeftDisplay; bufferTop = cropTopDisplay
+                bufferRight = cropRightDisplay; bufferBottom = cropBottomDisplay
+            }
+            90 -> {
+                // bx = dy ; by = decodedHeight - dx   (decodedHeight == displayWidth)
+                bufferLeft = cropTopDisplay; bufferRight = cropBottomDisplay
+                bufferTop = displayWidth - cropRightDisplay; bufferBottom = displayWidth - cropLeftDisplay
+            }
+            180 -> {
+                bufferLeft = displayWidth - cropRightDisplay; bufferRight = displayWidth - cropLeftDisplay
+                bufferTop = displayHeight - cropBottomDisplay; bufferBottom = displayHeight - cropTopDisplay
+            }
+            else -> { // 270
+                // bx = decodedWidth - dy ; by = dx   (decodedWidth == displayHeight)
+                bufferLeft = displayHeight - cropBottomDisplay; bufferRight = displayHeight - cropTopDisplay
+                bufferTop = cropLeftDisplay; bufferBottom = cropRightDisplay
+            }
+        }
+
+        // Outward, even-aligned integer crop inside the decoded extent.
+        val sourceLeft = floorEven(bufferLeft)
+        val sourceTop = floorEven(bufferTop)
+        val sourceRight = ceilEven(bufferRight, decodedWidth)
+        val sourceBottom = ceilEven(bufferBottom, decodedHeight)
+        if (sourceLeft < 0 || sourceTop < 0 || sourceRight > decodedWidth || sourceBottom > decodedHeight ||
+            sourceRight <= sourceLeft || sourceBottom <= sourceTop
+        ) {
+            return Result.failure(
+                "crop_invalid:crop=$sourceLeft,$sourceTop-$sourceRight,$sourceBottom:" +
+                    "decodedW=$decodedWidth:decodedH=$decodedHeight",
+            )
+        }
+        if (sourceLeft % 2 != 0 || sourceTop % 2 != 0 || sourceRight % 2 != 0 || sourceBottom % 2 != 0) {
+            return Result.failure(
+                "crop_odd_bounds:crop=$sourceLeft,$sourceTop-$sourceRight,$sourceBottom:" +
+                    "decodedW=$decodedWidth:decodedH=$decodedHeight",
+            )
+        }
+
+        // Rounded crop back to display space, then forward to output space.
+        val roundedLeftDisplay: Double
+        val roundedTopDisplay: Double
+        val roundedRightDisplay: Double
+        val roundedBottomDisplay: Double
+        when (rotationDegrees) {
+            0 -> {
+                roundedLeftDisplay = sourceLeft.toDouble(); roundedTopDisplay = sourceTop.toDouble()
+                roundedRightDisplay = sourceRight.toDouble(); roundedBottomDisplay = sourceBottom.toDouble()
+            }
+            90 -> {
+                roundedLeftDisplay = displayWidth - sourceBottom.toDouble()
+                roundedRightDisplay = displayWidth - sourceTop.toDouble()
+                roundedTopDisplay = sourceLeft.toDouble(); roundedBottomDisplay = sourceRight.toDouble()
+            }
+            180 -> {
+                roundedLeftDisplay = displayWidth - sourceRight.toDouble()
+                roundedRightDisplay = displayWidth - sourceLeft.toDouble()
+                roundedTopDisplay = displayHeight - sourceBottom.toDouble()
+                roundedBottomDisplay = displayHeight - sourceTop.toDouble()
+            }
+            else -> { // 270
+                roundedLeftDisplay = sourceTop.toDouble(); roundedRightDisplay = sourceBottom.toDouble()
+                roundedTopDisplay = displayHeight - sourceRight.toDouble()
+                roundedBottomDisplay = displayHeight - sourceLeft.toDouble()
+            }
+        }
+        val destLeft = Math.round(renderedLeft + roundedLeftDisplay * k).toInt().coerceIn(0, outputWidth)
+        val destTop = Math.round(renderedTop + roundedTopDisplay * k).toInt().coerceIn(0, outputHeight)
+        val destRight = Math.round(renderedLeft + roundedRightDisplay * k).toInt().coerceIn(0, outputWidth)
+        val destBottom = Math.round(renderedTop + roundedBottomDisplay * k).toInt().coerceIn(0, outputHeight)
+        val destWidth = destRight - destLeft
+        val destHeight = destBottom - destTop
+        if (destWidth < 1 || destHeight < 1) {
+            return Result.failure(
+                "dest_empty:dest=$destLeft,$destTop-$destRight,$destBottom:outW=$outputWidth:outH=$outputHeight",
+            )
+        }
+        return Result.success(
+            Placement(
+                sourceLeft = sourceLeft,
+                sourceTop = sourceTop,
+                sourceRight = sourceRight,
+                sourceBottom = sourceBottom,
+                destX = destLeft,
+                destY = destTop,
+                destWidth = destWidth,
+                destHeight = destHeight,
+            ),
+        )
+    }
+
+    private fun floorEven(value: Double): Int {
+        val floored = kotlin.math.floor(value + ROUNDING_EPSILON).toInt().coerceAtLeast(0)
+        return floored - (floored % 2)
+    }
+
+    private fun ceilEven(value: Double, maxValue: Int): Int {
+        val ceiled = ceil(value - ROUNDING_EPSILON).toInt().coerceAtLeast(0)
+        val even = if (ceiled % 2 == 0) ceiled else ceiled + 1
+        return min(even, maxValue)
+    }
+
+    private fun fmt(value: Double): String = String.format(java.util.Locale.US, "%.1f", value)
 }

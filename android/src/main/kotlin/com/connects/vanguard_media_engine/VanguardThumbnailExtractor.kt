@@ -9,7 +9,9 @@ package com.connects.vanguard_media_engine
 //   → Bitmap → optional scale (when maxWidth/maxHeight specified) → compress(JPEG) → ByteArray
 //
 // Design decisions:
-//   1. Object singleton — stateless, thread-safe, no context needed.
+//   1. Object singleton — stateless, thread-safe. A nullable Context is accepted
+//      per call (never stored) so `content://` sources can be opened through
+//      AndroidUriDataSourceHelper; POSIX paths never touch the Context.
 //   2. DEFAULT_JPEG_QUALITY = 72 preserves existing Android retriever behavior when omitted.
 //   3. When maxWidth/maxHeight are null, raw decoded dimensions are preserved without forced scaling.
 //   4. OPTION_CLOSEST_SYNC prefers I-frames for speed — matches iOS
@@ -17,9 +19,11 @@ package com.connects.vanguard_media_engine
 //   5. Blocking by design — always called from a background Thread in the plugin.
 //   6. Each Bitmap is immediately recycled after compression to cap heap usage.
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.ByteArrayOutputStream
 import kotlin.math.max
 import kotlin.math.min
@@ -36,13 +40,18 @@ internal object VanguardThumbnailExtractor {
      * so the first frame is always at t=0 and the last at the clip end.
      * If [count] == 1, a single frame at t=0 is returned.
      *
-     * @param videoPath     Absolute path to the source video (mp4 / any MediaCodec-supported).
+     * @param videoPath     Absolute POSIX path or `content://` URI of the source video
+     *   (mp4 / any MediaCodec-supported).
      * @param count         Number of thumbnails to extract (typically 8–10 for a filmstrip).
      * @param durationSeconds Clip duration in seconds — passed from Dart to avoid a
      *   redundant retriever call; used to compute evenly-spaced timestamps.
      * @param maxWidth      Optional max width constraint (null preserves full frame width).
      * @param maxHeight     Optional max height constraint (null preserves full frame height).
      * @param jpegQuality   Optional compression quality 0.0–1.0 (null defaults to 72).
+     * @param context       Optional Android [Context]. Required only when [videoPath] is a
+     *   `content://` URI (opened via ContentResolver through AndroidUriDataSourceHelper).
+     *   A `content://` path with a null context fails closed: the helper throws, the
+     *   error is logged, and emptyList() is returned. Ignored for POSIX paths.
      * @return List of JPEG [ByteArray] frames. May be shorter than [count] if some
      *   frames could not be extracted (e.g. corrupt GOP). Never returns null.
      *   Returns emptyList() on fatal error.
@@ -54,6 +63,7 @@ internal object VanguardThumbnailExtractor {
         maxWidth: Int? = null,
         maxHeight: Int? = null,
         jpegQuality: Double? = null,
+        context: Context? = null,
     ): List<ByteArray> {
         if (count <= 0) return emptyList()
 
@@ -67,7 +77,9 @@ internal object VanguardThumbnailExtractor {
 
         val retriever = MediaMetadataRetriever()
         return try {
-            retriever.setDataSource(videoPath)
+            // POSIX paths keep setDataSource(String); content:// goes through
+            // ContentResolver and requires a non-null context (throws otherwise).
+            AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, videoPath, context)
             (0 until count).mapNotNull { i ->
                 // Distribute timestamps evenly across the clip duration.
                 val fraction = if (count > 1) i.toDouble() / (count - 1).toDouble() else 0.0

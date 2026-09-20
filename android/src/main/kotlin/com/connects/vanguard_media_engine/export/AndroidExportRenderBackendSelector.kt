@@ -207,6 +207,22 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // pass-1 encoders (whose own isReversed defenses remain untouched) never see
 // a reversed clip. Hard-cut reversed-only and reversed+overlay-only scopes
 // keep their direct GLES reversed render route with no normalization.
+//
+// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: a clip carrying
+// [AndroidTimelineVideoEncoder.ClipInput.transform] (static uniform scale +
+// translation, validated by AndroidTimelineExportSession) stays inside the
+// Vulkan safe scope -- AndroidTimelineVulkanVideoEncoder renders it as a
+// source crop + in-bounds destination rect -- so Vulkan-first selection is
+// unchanged for it. On GLES only AndroidTimelineVideoEncoder's hard-cut route
+// applies the transform (vertex-space scale/translate), so a transformed
+// clip is honest on the plain hard-cut GLES fallback, the GLES overlay route
+// and the GLES Beauty route, but NOT on AndroidTimelineGlesTransitionVideoEncoder
+// (own fit geometry) or the reversed-clip normalization prepass (would bake
+// the transform into the temp and re-apply it). [ExportRenderScope
+// .glesTransitionIneligibleReason] therefore reports `clip_transform_present`
+// and [ExportRenderScope.reversedClipNormalizationIneligibleReason] reports
+// `reversed_clip_transform_present`, so such scopes fail closed instead of
+// exporting wrong framing when Vulkan cannot take them.
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -259,18 +275,26 @@ data class ExportRenderScope(
     /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: true when any clip is reversed.
     val hasReversedClip: Boolean get() = clips.any { it.isReversed }
 
+    /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: true when any clip carries a
+    /// static clip transform.
+    val hasTransformedClip: Boolean get() = clips.any { it.transform != null }
+
     /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: null when [clip] is not
     /// reversed, or is a reversed clip AndroidTimelineReverseNormalizationPrepass
     /// can normalize into a forward temp on GLES (video media kind, zero
     /// rotation metadata -- the reverse renderer never applies rotation --
     /// no colorMatrix -- the normalizer strips it and the GLES transition
-    /// route has no colorMatrix path -- and positive decoded dimensions);
-    /// otherwise a precise machine-readable reason.
+    /// route has no colorMatrix path -- no static clip transform
+    /// (P5-CLIP-STATIC-TRANSFORM-EXPORT-A: the prepass would bake the
+    /// transform into the temp and pass-1 would apply it again) -- and
+    /// positive decoded dimensions); otherwise a precise machine-readable
+    /// reason.
     fun reversedClipNormalizationIneligibleReason(clip: AndroidTimelineVideoEncoder.ClipInput): String? {
         if (!clip.isReversed) return null
         if (clip.mediaKind != "video") return "reversed_non_video_clip"
         if (clip.rotationDegrees != 0) return "reversed_non_zero_rotation"
         if (clip.colorMatrix != null) return "reversed_color_matrix_present"
+        if (clip.transform != null) return "reversed_clip_transform_present"
         if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return "reversed_invalid_decoded_dimensions"
         return null
     }
@@ -402,6 +426,11 @@ data class ExportRenderScope(
             // broader check above is ever narrowed.
             if (clips.any { it.mediaKind == "image" && it.beautyIntensity != null }) return "beauty_still_image_unsupported"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
+            // P5-CLIP-STATIC-TRANSFORM-EXPORT-A: AndroidTimelineGlesTransitionVideoEncoder
+            // resolves clips with its own fit geometry and never applies
+            // ClipInput.transform -- routing a transformed clip there would
+            // silently export unframed content.
+            if (hasTransformedClip) return "clip_transform_present"
             if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
             // Video clips keep the standard cardinal rotation set; a still-image
             // clip's rotation metadata is always normalized to 0 upstream (EXIF is
@@ -706,6 +735,12 @@ class AndroidExportRenderBackendSelector {
     /// computation) rather than requiring decoded dimensions to exactly match
     /// the (possibly rotation-swapped) output geometry, so this predicate no
     /// longer checks for that exact/swapped equality.
+    /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: a clip carrying a static clip
+    /// transform is likewise within this safe scope -- the Vulkan encoder
+    /// renders it through the same cropped seam as a source crop +
+    /// in-bounds destination rect (AndroidTimelineClipStaticTransformGeometry),
+    /// and AndroidTimelineExportSession has already validated the transform
+    /// subset and its placement before selection runs.
     ///
     /// Returns null when [scope] is safe for Vulkan, or a machine-readable
     /// failure reason otherwise. Any unsafe shape (still images,

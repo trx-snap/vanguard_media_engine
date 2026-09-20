@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.hardware.HardwareBuffer
@@ -13,6 +14,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -54,6 +56,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 class AndroidTimelineTransitionOverlapDecoder(
     private val fromSource: Source,
     private val toSource: Source,
+    // Android reference-video export: optional Context used ONLY to open a
+    // `content://` Source.sourcePath through the ContentResolver
+    // (AndroidUriDataSourceHelper) in each pipeline's [Pipeline.open]. POSIX
+    // sources never touch it; a `content://` source with a null Context
+    // fails closed as `open_exception:IllegalArgumentException` through the
+    // existing never-throws contract. Declared before [isCancelled] so
+    // trailing-lambda call sites keep compiling.
+    private val context: Context? = null,
     private val isCancelled: () -> Boolean,
 ) {
     /** One pipeline's clip + pts window + expected decoded extent. */
@@ -208,7 +218,7 @@ class AndroidTimelineTransitionOverlapDecoder(
             }
             try {
                 val ex = MediaExtractor().also { extractor = it }
-                ex.setDataSource(source.sourcePath)
+                AndroidUriDataSourceHelper.setExtractorDataSource(ex, source.sourcePath, context)
                 var trackIndex = -1
                 var trackFormat: MediaFormat? = null
                 for (i in 0 until ex.trackCount) {

@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -171,6 +172,13 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     private val fps: Int,
     private val bitrateBps: Int,
     private val nativeBridge: VanguardNativeBridge,
+    // Android reference-video export: optional Context threaded, unchanged,
+    // into every AndroidTimelineGlesTransitionOverlapDecoder this encoder
+    // constructs so a `content://` clip sourcePath can be opened through the
+    // ContentResolver. This class itself never opens a data source. A
+    // `content://` clip with a null Context fails closed through the
+    // decoder's existing `gles_transition_decoder_open_failed:...` reason.
+    private val context: Context? = null,
 ) : AndroidTimelineVideoPassEncoder {
 
     @Volatile private var cancelRequested = false
@@ -561,6 +569,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 "solo", clip, segment.windowStartSeconds, segment.windowEndSeconds, fromSlot,
             ),
             toSource = null,
+            context = context,
         ) { cancelRequested }
 
         val openError = decoder.open()
@@ -679,6 +688,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             toSource = AndroidTimelineGlesTransitionOverlapDecoder.Source(
                 "to", segment.toClip, segment.toWindowStartSeconds, segment.toWindowEndSeconds, toSlot,
             ),
+            context = context,
         ) { cancelRequested }
 
         val openError = decoder.open()
@@ -835,6 +845,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                     "video", videoClip, videoWindowStart, videoWindowEnd, videoSlot,
                 ),
                 toSource = null,
+                context = context,
             ) { cancelRequested }
 
             val openError = decoder.open()

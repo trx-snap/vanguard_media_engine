@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.hardware.HardwareBuffer
@@ -16,6 +17,7 @@ import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -102,6 +104,21 @@ import kotlin.math.min
 // still rendered via the native crop-aware render seam rather than
 // rejected outright; only a genuinely invalid/unsupported crop or buffer
 // geometry fails the frame.
+//
+// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: a clip carrying
+// AndroidTimelineVideoEncoder.ClipInput.transform (uniform scale + output-
+// pixel translation, validated upstream by AndroidTimelineExportSession) is
+// rendered through the very same cropped seam: [computeLayerPlacement]
+// derives -- via AndroidTimelineClipStaticTransformGeometry -- the
+// even-aligned source crop INSIDE the decoded extent that maps onto the
+// visible part of the scaled/panned clip, plus the matching destination
+// rect INSIDE the output. The native seam requires an in-bounds destination
+// rect, so cover/fill framing is never expressed as out-of-bounds
+// destination geometry; it is always expressed as a source crop. The
+// decoder-buffer guard above still runs unchanged on every frame; the
+// clip's source crop is applied as an offset inside the guarded decoder
+// crop. A null transform keeps the byte-identical full-extent crop +
+// centered aspect-fit placement.
 class AndroidTimelineVulkanVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -109,6 +126,15 @@ class AndroidTimelineVulkanVideoEncoder(
     private val fps: Int,
     private val bitrateBps: Int,
     private val nativeBridge: VanguardNativeBridge,
+    // Android reference-video export: optional Context used ONLY to open a
+    // `content://` ClipInput.sourcePath through the ContentResolver
+    // (AndroidUriDataSourceHelper) -- in [decodeClipIntoSession] and, via
+    // AndroidTimelineTransitionOverlapDecoder, in the transition overlap
+    // pipelines. POSIX sources never touch it. A `content://` clip with a
+    // null Context fails closed through the existing clip_decode_exception /
+    // open_exception reasons; it never crashes the encode. Harness
+    // constructors keep working unchanged via the default.
+    private val context: Context? = null,
 ) : AndroidTimelineVideoPassEncoder {
 
     @Volatile private var cancelRequested = false
@@ -397,7 +423,7 @@ class AndroidTimelineVulkanVideoEncoder(
         var thread: HandlerThread? = null
         val imageQueue = LinkedBlockingQueue<Image>(IMAGE_READER_MAX_IMAGES + 2)
         try {
-            extractor.setDataSource(clip.sourcePath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, clip.sourcePath, context)
             var trackIndex = -1
             var trackFormat: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -431,22 +457,31 @@ class AndroidTimelineVulkanVideoEncoder(
             val sourceWidth = clip.decodedWidth
             val sourceHeight = clip.decodedHeight
 
-            // Per-clip aspect-preserving-fit destination rect within the
-            // fixed output surface; letterboxed/pillarboxed over black where
-            // this clip's rotated display aspect ratio differs from the
-            // output's. Fails closed if the computed rect would be invalid
-            // (should not happen given the positive-dimension checks above,
-            // but validated defensively since this is the destination rect
-            // that gates native rendering).
-            val destFitRect = computeAspectFitRect(
-                outputWidth = width,
-                outputHeight = height,
-                decodedWidth = clip.decodedWidth,
-                decodedHeight = clip.decodedHeight,
-                rotationDegrees = clip.rotationDegrees,
-            ) ?: return "vulkan_dest_fit_rect_invalid:" +
-                "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}:" +
-                "rotation=${clip.rotationDegrees}:outW=$width:outH=$height"
+            // Per-clip placement: full-extent source crop + aspect-preserving-
+            // fit destination rect within the fixed output surface
+            // (letterboxed/pillarboxed over black where this clip's rotated
+            // display aspect ratio differs from the output's), or -- for a
+            // clip carrying a static transform -- the derived source crop +
+            // in-bounds destination rect (see [computeLayerPlacement]). Fails
+            // closed if the placement cannot be represented; this is the
+            // geometry that gates native rendering.
+            val placementResolution = computeLayerPlacement(clip)
+            val placement = placementResolution.placement
+                ?: return placementResolution.failure ?: "vulkan_layer_placement_unresolved"
+            val clipTransform = clip.transform
+            if (clipTransform != null) {
+                Log.i(
+                    TAG,
+                    "VG_VULKAN_CLIP_TRANSFORM_PLACEMENT source=${clip.sourcePath} " +
+                        "scale=${clipTransform.scale} tx=${clipTransform.translationX} " +
+                        "ty=${clipTransform.translationY} rotation=${clip.rotationDegrees} " +
+                        "decoded=${clip.decodedWidth}x${clip.decodedHeight} " +
+                        "crop=${placement.sourceLeft},${placement.sourceTop}-" +
+                        "${placement.sourceRight},${placement.sourceBottom} " +
+                        "dest=${placement.dest.x},${placement.dest.y}-" +
+                        "${placement.dest.width}x${placement.dest.height} out=${width}x$height",
+                )
+            }
 
             val trimStartUs = (windowStartSeconds * 1_000_000L).toLong()
             if (trimStartUs > 0L) {
@@ -543,7 +578,7 @@ class AndroidTimelineVulkanVideoEncoder(
                                 clip.rotationDegrees,
                                 sourceWidth,
                                 sourceHeight,
-                                destFitRect,
+                                placement,
                                 clip.colorMatrix,
                                 clip.beautyIntensity,
                             )
@@ -598,10 +633,10 @@ class AndroidTimelineVulkanVideoEncoder(
     /// [expectedCropHeight] are this clip's actual decoded source extent
     /// ([decodeClipIntoSession]'s sourceWidth/sourceHeight, i.e.
     /// clip.decodedWidth/decodedHeight directly, unswapped) -- the real
-    /// decoder crop is validated against this source extent. [destFitRect]
-    /// is the per-clip aspect-preserving-fit destination sub-rect within the
-    /// fixed output surface, computed once by [decodeClipIntoSession] via
-    /// [computeAspectFitRect] and passed through unchanged for every frame
+    /// decoder crop is validated against this source extent. [placement]
+    /// is the per-clip source crop + destination sub-rect within the fixed
+    /// output surface, computed once by [decodeClipIntoSession] via
+    /// [computeLayerPlacement] and passed through unchanged for every frame
     /// of this clip. [colorMatrix] (Phase 10) is the active clip's raw
     /// (un-normalized) 20-element colorMatrix, passed through unchanged to
     /// the native Vulkan render seam -- null means identity (no filter); see
@@ -624,7 +659,7 @@ class AndroidTimelineVulkanVideoEncoder(
         rotationDegrees: Int,
         expectedCropWidth: Int,
         expectedCropHeight: Int,
-        destFitRect: DestFitRect,
+        placement: LayerPlacement,
         colorMatrix: FloatArray?,
         beautyIntensity: Double?,
     ): String? {
@@ -656,7 +691,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 rotationDegrees,
                 expectedCropWidth,
                 expectedCropHeight,
-                destFitRect,
+                placement,
                 colorMatrix,
                 beautyIntensity,
             )
@@ -674,6 +709,12 @@ class AndroidTimelineVulkanVideoEncoder(
     /// The Opus P1 real-buffer geometry guard shared by the solo and
     /// transition routes: cardinal rotation, crop inside the buffer, crop
     /// size equal to the clip's decoded extent, even-aligned crop bounds.
+    /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: the clip's [placement] source
+    /// crop (relative to the decoded extent) is then applied as an offset
+    /// inside that guarded decoder crop, so the native seam samples exactly
+    /// the sub-rect the transform makes visible; the final crop is
+    /// re-validated (inside the decoder crop, non-empty, even-aligned)
+    /// before it is handed to native.
     private fun resolveLayerGeometry(
         cropRect: Rect,
         bufW: Int,
@@ -681,7 +722,7 @@ class AndroidTimelineVulkanVideoEncoder(
         rotationDegrees: Int,
         expectedCropWidth: Int,
         expectedCropHeight: Int,
-        destFitRect: DestFitRect,
+        placement: LayerPlacement,
     ): LayerGeometry {
         if (rotationDegrees != 0 && rotationDegrees != 90 &&
             rotationDegrees != 180 && rotationDegrees != 270
@@ -712,11 +753,34 @@ class AndroidTimelineVulkanVideoEncoder(
         ) {
             return LayerGeometry(null, "vulkan_decoder_crop_unsupported:odd_crop_bounds:crop=$cropRect")
         }
+        // Clip-level source crop, offset into the guarded decoder crop.
+        val finalLeft = cropRect.left + placement.sourceLeft
+        val finalTop = cropRect.top + placement.sourceTop
+        val finalRight = cropRect.left + placement.sourceRight
+        val finalBottom = cropRect.top + placement.sourceBottom
+        if (finalLeft < cropRect.left || finalTop < cropRect.top ||
+            finalRight > cropRect.right || finalBottom > cropRect.bottom ||
+            finalRight <= finalLeft || finalBottom <= finalTop
+        ) {
+            return LayerGeometry(
+                null,
+                "vulkan_clip_transform_crop_outside_decoder_crop:" +
+                    "crop=$cropRect:source=${placement.sourceLeft},${placement.sourceTop}-" +
+                    "${placement.sourceRight},${placement.sourceBottom}",
+            )
+        }
+        if (finalLeft % 2 != 0 || finalTop % 2 != 0 || finalRight % 2 != 0 || finalBottom % 2 != 0) {
+            return LayerGeometry(
+                null,
+                "vulkan_clip_transform_crop_odd_bounds:final=$finalLeft,$finalTop-$finalRight,$finalBottom",
+            )
+        }
+        val dest = placement.dest
         return LayerGeometry(
             intArrayOf(
-                cropRect.left, cropRect.top, cropRect.right, cropRect.bottom,
+                finalLeft, finalTop, finalRight, finalBottom,
                 rotationDegrees,
-                destFitRect.x, destFitRect.y, destFitRect.width, destFitRect.height,
+                dest.x, dest.y, dest.width, dest.height,
             ),
             null,
         )
@@ -732,12 +796,12 @@ class AndroidTimelineVulkanVideoEncoder(
         rotationDegrees: Int,
         expectedCropWidth: Int,
         expectedCropHeight: Int,
-        destFitRect: DestFitRect,
+        placement: LayerPlacement,
         colorMatrix: FloatArray?,
         beautyIntensity: Double?,
     ): String? {
         val geometry = resolveLayerGeometry(
-            cropRect, bufW, bufH, rotationDegrees, expectedCropWidth, expectedCropHeight, destFitRect,
+            cropRect, bufW, bufH, rotationDegrees, expectedCropWidth, expectedCropHeight, placement,
         )
         val g = geometry.values ?: return geometry.failure ?: "vulkan_layer_geometry_unresolved"
 
@@ -903,12 +967,14 @@ class AndroidTimelineVulkanVideoEncoder(
                 return "vulkan_rotation_unsupported:layer=$label:${clip.rotationDegrees}"
             }
         }
-        val fromFit = computeAspectFitRect(width, height, fromClip.decodedWidth, fromClip.decodedHeight, fromClip.rotationDegrees)
-            ?: return "vulkan_dest_fit_rect_invalid:layer=from:decodedW=${fromClip.decodedWidth}:" +
-                "decodedH=${fromClip.decodedHeight}:rotation=${fromClip.rotationDegrees}:outW=$width:outH=$height"
-        val toFit = computeAspectFitRect(width, height, toClip.decodedWidth, toClip.decodedHeight, toClip.rotationDegrees)
-            ?: return "vulkan_dest_fit_rect_invalid:layer=to:decodedW=${toClip.decodedWidth}:" +
-                "decodedH=${toClip.decodedHeight}:rotation=${toClip.rotationDegrees}:outW=$width:outH=$height"
+        val fromResolution = computeLayerPlacement(fromClip)
+        val fromFit = fromResolution.placement
+            ?: return "vulkan_transition_layer_placement:layer=from:" +
+                (fromResolution.failure ?: "vulkan_layer_placement_unresolved")
+        val toResolution = computeLayerPlacement(toClip)
+        val toFit = toResolution.placement
+            ?: return "vulkan_transition_layer_placement:layer=to:" +
+                (toResolution.failure ?: "vulkan_layer_placement_unresolved")
 
         val expectedOverlapFrames = transition.overlapFrameCount(fps)
         val decoder = AndroidTimelineTransitionOverlapDecoder(
@@ -928,6 +994,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 decodedWidth = toClip.decodedWidth,
                 decodedHeight = toClip.decodedHeight,
             ),
+            context = context,
             isCancelled = { cancelRequested },
         )
 
@@ -1044,8 +1111,8 @@ class AndroidTimelineVulkanVideoEncoder(
         transition: AndroidTimelineTransitionDescriptor,
         fromClip: AndroidTimelineVideoEncoder.ClipInput,
         toClip: AndroidTimelineVideoEncoder.ClipInput,
-        fromFit: DestFitRect,
-        toFit: DestFitRect,
+        fromFit: LayerPlacement,
+        toFit: LayerPlacement,
         progress: Double,
     ): String? {
         val fromGeometry = resolveLayerGeometry(
@@ -1148,6 +1215,83 @@ class AndroidTimelineVulkanVideoEncoder(
     /// within the output surface ([x]/[y] >= 0, x+width <= outputWidth,
     /// y+height <= outputHeight) when returned by [computeAspectFitRect].
     private data class DestFitRect(val x: Int, val y: Int, val width: Int, val height: Int)
+
+    /// Per-clip render placement: the source crop, relative to the clip's
+    /// decoded extent (buffer orientation, pre-rotation; applied by
+    /// [resolveLayerGeometry] as an offset inside the guarded decoder crop),
+    /// plus the in-bounds destination rect. The full decoded extent + the
+    /// centered aspect-fit rect for an untransformed clip; the
+    /// AndroidTimelineClipStaticTransformGeometry result for a transformed
+    /// clip (P5-CLIP-STATIC-TRANSFORM-EXPORT-A).
+    private data class LayerPlacement(
+        val sourceLeft: Int,
+        val sourceTop: Int,
+        val sourceRight: Int,
+        val sourceBottom: Int,
+        val dest: DestFitRect,
+    )
+
+    /// Exactly one of [placement] / [failure] is non-null.
+    private class PlacementResolution(val placement: LayerPlacement?, val failure: String?)
+
+    /// Resolves [clip]'s [LayerPlacement]. Untransformed clips keep the
+    /// pre-existing full-extent crop + [computeAspectFitRect] placement
+    /// (byte-identical native geometry); transformed clips route through
+    /// AndroidTimelineClipStaticTransformGeometry and fail closed with a
+    /// `vulkan_clip_transform_placement_invalid:<reason>` reason whenever
+    /// the transform cannot be represented as an in-bounds crop/destination
+    /// pair. AndroidTimelineExportSession runs the same computation before
+    /// pass-1, so a failure here indicates a genuine invariant violation.
+    private fun computeLayerPlacement(clip: AndroidTimelineVideoEncoder.ClipInput): PlacementResolution {
+        val transform = clip.transform
+        if (transform == null) {
+            val fit = computeAspectFitRect(
+                outputWidth = width,
+                outputHeight = height,
+                decodedWidth = clip.decodedWidth,
+                decodedHeight = clip.decodedHeight,
+                rotationDegrees = clip.rotationDegrees,
+            ) ?: return PlacementResolution(
+                null,
+                "vulkan_dest_fit_rect_invalid:" +
+                    "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}:" +
+                    "rotation=${clip.rotationDegrees}:outW=$width:outH=$height",
+            )
+            return PlacementResolution(
+                LayerPlacement(0, 0, clip.decodedWidth, clip.decodedHeight, fit),
+                null,
+            )
+        }
+        val result = AndroidTimelineClipStaticTransformGeometry.compute(
+            outputWidth = width,
+            outputHeight = height,
+            decodedWidth = clip.decodedWidth,
+            decodedHeight = clip.decodedHeight,
+            rotationDegrees = clip.rotationDegrees,
+            transform = transform,
+        )
+        val placement = result.placement
+            ?: return PlacementResolution(
+                null,
+                "vulkan_clip_transform_placement_invalid:${result.failure ?: "unresolved"}",
+            )
+        val dest = DestFitRect(placement.destX, placement.destY, placement.destWidth, placement.destHeight)
+        if (dest.width < 1 || dest.height < 1 || dest.x < 0 || dest.y < 0 ||
+            dest.x + dest.width > width || dest.y + dest.height > height
+        ) {
+            return PlacementResolution(
+                null,
+                "vulkan_clip_transform_placement_invalid:dest_out_of_bounds:" +
+                    "dest=${dest.x},${dest.y}-${dest.width}x${dest.height}:outW=$width:outH=$height",
+            )
+        }
+        return PlacementResolution(
+            LayerPlacement(
+                placement.sourceLeft, placement.sourceTop, placement.sourceRight, placement.sourceBottom, dest,
+            ),
+            null,
+        )
+    }
 
     /// Computes this clip's aspect-preserving-fit destination rect: the
     /// clip's rotated display geometry (decoded width/height, swapped for
