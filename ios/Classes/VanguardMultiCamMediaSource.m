@@ -191,6 +191,10 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
 
     // ── Create session ────────────────────────────────────────────────────────
     _session = [[AVCaptureMultiCamSession alloc] init];
+    // Prevent the capture session from hijacking AVAudioSession category/options.
+    // AppAudioHardwareArbiter (Dart) is the sole owner of AVAudioSession
+    // configuration; AVCaptureMultiCamSession must not override it on startRunning.
+    _session.automaticallyConfiguresApplicationAudioSession = NO;
 
     [_session beginConfiguration];
 
