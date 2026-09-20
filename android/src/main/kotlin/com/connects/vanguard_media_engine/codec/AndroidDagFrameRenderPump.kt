@@ -35,6 +35,11 @@ data class AndroidDagFrameRenderPumpResult(
      * attempt was made (e.g. no image was due/queued).
      */
     val nativeRenderStatus: String? = null,
+    /**
+     * Number of stale queued images this pumpOnce call closed for wall-clock catch-up
+     * (continuous playback with `allowCatchUpDrop` only). Always 0 for proof callers.
+     */
+    val catchUpDroppedFrames: Int = 0,
 )
 
 /**
@@ -45,7 +50,9 @@ data class AndroidDagFrameRenderPumpResult(
  *  - Drain MediaCodec output buffers to ImageReader until queue is warm or EOS.
  *  - Poll at most one Image from [imageQueue], wait SyncFence (API 33+), and render
  *    via [VanguardNativeBridge.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration].
- *  - Close HardwareBuffer, Image, and SyncFence exactly as the session loop did.
+ *  - Close HardwareBuffer, Image, and SyncFence exactly as the session loop did, unless
+ *    the caller's `deferRenderedImageClose` seam takes ownership of the rendered Image
+ *    (see [pumpOnce]); the HardwareBuffer wrapper is always closed by the pump.
  *  - Return updated flags/counters/error - does NOT mutate session fields.
  *
  * Excluded: Choreographer scheduling, target-frame completion, pending callback
@@ -56,11 +63,57 @@ class AndroidDagFrameRenderPump {
     companion object {
         private const val TAG = "DagFrameRenderPump"
 
-        /** Tolerance for treating a slightly-early decoded frame as "due" for render. */
+        /**
+         * Tolerance for treating a slightly-early decoded frame as "due" for render.
+         * Kept tight for target-frame-count proof callers, which need each pump call
+         * to advance by exactly one decoded frame.
+         */
         const val DEFAULT_DUE_TOLERANCE_US = 2_000L
+
+        /**
+         * Frame-pacing tolerance for continuous (non-proof) playback. Kept below half a
+         * 30fps frame period (~33ms, so half is ~16.7ms) so frames are not treated as due
+         * and submitted nearly half a frame early on high-refresh displays, while still
+         * wide enough to absorb normal vsync/codec jitter without tipping into the
+         * pathological late/drop behavior a too-tight tolerance produces.
+         */
+        const val CONTINUOUS_DUE_TOLERANCE_US = 8_000L
 
         /** Bound on how many stale queued images a single pumpOnce call may drop for catch-up. */
         const val DEFAULT_MAX_CATCH_UP_DROPS_PER_PUMP = 2
+
+        /**
+         * Bound on how many non-EOS input buffers a single pumpOnce call may feed to the
+         * codec. Feeding an unbounded backlog of input buffers in one Choreographer tick
+         * can stall the render-thread pump long enough to itself cause uneven render
+         * intervals; a small per-tick cap spreads that feed work across ticks instead.
+         */
+        const val MAX_INPUT_BUFFERS_PER_PUMP = 2
+
+        /**
+         * Small bounded poll timeout for MediaCodec input/output dequeue calls. Zero-timeout
+         * (pure poll) dequeues were returning immediately with nothing available far more often
+         * than the codec actually needed to produce a buffer, starving decode throughput well
+         * below real-time. A short bounded wait lets the codec catch up within the same pump
+         * call without ever blocking the VSYNC thread for a meaningful fraction of a frame.
+         */
+        const val CODEC_DEQUEUE_TIMEOUT_US = 2_000L
+
+        /** Status-string key under which the native PASS status reports the release sync fd. */
+        private const val RELEASE_FENCE_FD_KEY = ";releaseFenceFd="
+
+        /**
+         * Extracts `releaseFenceFd=<fd>` from a native render status string; -1 when the
+         * field is absent or unparsable (older native builds, or no fence exported).
+         */
+        fun parseReleaseFenceFd(nativeRenderStatus: String): Int {
+            val idx = nativeRenderStatus.indexOf(RELEASE_FENCE_FD_KEY)
+            if (idx < 0) return -1
+            return nativeRenderStatus
+                .substring(idx + RELEASE_FENCE_FD_KEY.length)
+                .substringBefore(';')
+                .toIntOrNull() ?: -1
+        }
     }
 
     fun pumpOnce(
@@ -92,6 +145,46 @@ class AndroidDagFrameRenderPump {
          */
         allowCatchUpDrop: Boolean = false,
         maxCatchUpDropsPerPump: Int = DEFAULT_MAX_CATCH_UP_DROPS_PER_PUMP,
+        /**
+         * ImageReader.maxImages() the shared [imageQueue] is bounded by. Used to derive
+         * [queueWarmTarget] instead of hardcoding the decoder-drain stop point.
+         */
+        imageReaderMaxImages: Int = 3,
+        /**
+         * Capacity of the caller's [imageQueue] instance. May be smaller than
+         * [imageReaderMaxImages] so a fully-queued backlog of unrendered Images alone
+         * cannot saturate the ImageReader pool; [queueWarmTarget] is clamped to this so
+         * the decoder-drain loop never targets filling the queue past what it can hold.
+         */
+        imageQueueCapacity: Int = imageReaderMaxImages,
+        /**
+         * Count of rendered Images currently retained off-queue by an async release-fence
+         * waiter (see [deferRenderedImageClose]). Each one still holds an ImageReader
+         * acquisition slot until its GPU fence signals, so it must reduce how many *more*
+         * images the decoder is allowed to queue up — otherwise the queued backlog plus the
+         * retained rendered Images can together saturate `maxImages` and acquireNextImage()
+         * starts throwing. Always 0 for target-frame-count proof callers, which never defer.
+         */
+        deferredRenderedImageCloseInFlight: Int = 0,
+        /**
+         * Continuous-playback-only seam for GPU-to-decoder release synchronization.
+         *
+         * Invoked synchronously on the pump thread immediately after a successful native
+         * render, with the rendered [Image] and the native-reported release sync fd (>= 0).
+         * Native retains ownership of that fd and closes it on the next render call for the
+         * same session, so the fd number is only valid for the duration of the callback: a
+         * callback that wants to wait on it must dup it before returning (for example via
+         * `ParcelFileDescriptor.fromFd`). The callback must never close the reported fd.
+         *
+         * Return true to take ownership of the [Image]: the pump will NOT close it and the
+         * callback is responsible for closing it once the fence signals (or on timeout).
+         * Return false, or throw, to leave the Image with the pump, which then closes it
+         * immediately. Not invoked when the render fails or when no fence was exported
+         * (fd < 0); in both cases the pump closes the Image immediately.
+         *
+         * Defaults to null, preserving the immediate-close behavior proof callers rely on.
+         */
+        deferRenderedImageClose: ((Image, Int) -> Boolean)? = null,
     ): AndroidDagFrameRenderPumpResult {
         var localInputDone = inputDone
         var localOutputDone = outputDone
@@ -101,9 +194,29 @@ class AndroidDagFrameRenderPump {
         var localRenderedFrame = false
         var localNativeRenderStatus: String? = null
 
-        // Feed MediaCodec input buffers
-        while (!localInputDone) {
-            val inIdx = codec?.dequeueInputBuffer(0) ?: -1
+        // Stop feeding the ImageReader once the queue is warm, leaving at least one reader
+        // slot free for in-flight acquisition rather than saturating maxImages. Rendered
+        // Images retained off-queue by the release-fence waiter also occupy a slot, so they
+        // are subtracted from the pool before deriving how many more may be queued.
+        val retainedRenderedImages = deferredRenderedImageCloseInFlight.coerceAtLeast(0)
+        val availableForQueue = imageReaderMaxImages - retainedRenderedImages
+        val queueWarmTarget = (if (availableForQueue <= 1) {
+            0
+        } else {
+            (availableForQueue - 1).coerceAtMost(imageReaderMaxImages - 1)
+        }).coerceAtMost(imageQueueCapacity)
+        if (queueWarmTarget == 0 && retainedRenderedImages > 0) {
+            Log.w(TAG, "queue warm target clamped to 0: retainedRenderedImages=$retainedRenderedImages imageReaderMaxImages=$imageReaderMaxImages")
+        }
+
+        // Feed MediaCodec input buffers, capped at MAX_INPUT_BUFFERS_PER_PUMP non-EOS
+        // buffers per pump call so a large decode backlog can't stall this Choreographer
+        // tick; EOF is still always honored (queues EOS/sets localInputDone) even on the
+        // iteration that reaches the cap, since the cap only gates starting another
+        // iteration, not finishing the one already in progress.
+        var queuedInputBuffers = 0
+        while (!localInputDone && queuedInputBuffers < MAX_INPUT_BUFFERS_PER_PUMP) {
+            val inIdx = codec?.dequeueInputBuffer(CODEC_DEQUEUE_TIMEOUT_US) ?: -1
             if (inIdx < 0) break
             val buf = codec?.getInputBuffer(inIdx)
             if (buf == null) break
@@ -121,13 +234,20 @@ class AndroidDagFrameRenderPump {
                 val pts = extractor?.sampleTime ?: 0L
                 codec?.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
                 extractor?.advance()
+                queuedInputBuffers++
             }
         }
 
-        // Drain MediaCodec output buffers to ImageReader
-        while (!localOutputDone && imageQueue.size < 2) {
+        // Drain MediaCodec output buffers to ImageReader. At most one renderable buffer is
+        // released to the reader per pump call: the ImageReader.OnImageAvailableListener
+        // callback that updates imageQueue.size runs asynchronously on its own thread, so a
+        // loop gated only on imageQueue.size can race ahead and release several renderable
+        // buffers before that size reflects any of them - overfilling ImageReader past
+        // maxImages despite queueWarmTarget. Non-renderable buffers (EOS/zero-size) don't
+        // consume a reader slot, so they keep draining without that cap.
+        while (!localOutputDone && imageQueue.size < queueWarmTarget) {
             val info = MediaCodec.BufferInfo()
-            val outIdx = codec?.dequeueOutputBuffer(info, 0) ?: -1
+            val outIdx = codec?.dequeueOutputBuffer(info, CODEC_DEQUEUE_TIMEOUT_US) ?: -1
             if (outIdx < 0) break
 
             val isEos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
@@ -137,14 +257,15 @@ class AndroidDagFrameRenderPump {
             if (isEos) {
                 localOutputDone = true
             }
+            if (renderable) break
         }
 
         // Catch-up (continuous playback only, opt-in): drop a small bounded number of stale
         // queued images so a decode backlog doesn't keep preview permanently behind wall-clock.
         // Never touches a boundary-or-later frame (left for the playbackEnd drain below) and
         // always leaves at least one queued image behind for the normal render selection.
+        var catchUpDrops = 0
         if (allowCatchUpDrop && dueMediaPtsUs != null) {
-            var catchUpDrops = 0
             val staleThresholdUs = dueMediaPtsUs - dueToleranceUs
             while (catchUpDrops < maxCatchUpDropsPerPump && imageQueue.size > 1) {
                 val front = imageQueue.peek() ?: break
@@ -185,6 +306,9 @@ class AndroidDagFrameRenderPump {
         }
         if (image != null) {
             var hwBuf: HardwareBuffer? = null
+            // Set only when deferRenderedImageClose accepted the rendered Image; the pump then
+            // must not close it (the callback closes it after the release fence signals).
+            var imageOwnedByCallback = false
             try {
                 hwBuf = image.hardwareBuffer
                 if (hwBuf != null) {
@@ -224,6 +348,21 @@ class AndroidDagFrameRenderPump {
                         if (renderStr.startsWith("status=PASS;")) {
                             localRenderedFrames++
                             localRenderedFrame = true
+                            // Hand the Image to the caller's release-fence waiter when one is
+                            // installed and native exported a fence. Any rejection or throw
+                            // falls through to the immediate close in finally.
+                            val deferClose = deferRenderedImageClose
+                            if (deferClose != null) {
+                                val releaseFenceFd = parseReleaseFenceFd(renderStr)
+                                if (releaseFenceFd >= 0) {
+                                    imageOwnedByCallback = try {
+                                        deferClose(image, releaseFenceFd)
+                                    } catch (t: Throwable) {
+                                        Log.w(TAG, "deferRenderedImageClose threw; closing image immediately: $t")
+                                        false
+                                    }
+                                }
+                            }
                         } else {
                             Log.w(TAG, "renderFrame FAIL at index $localRenderedFrames: $renderStr")
                             localFrameRenderError = renderStr
@@ -231,8 +370,14 @@ class AndroidDagFrameRenderPump {
                     }
                 }
             } finally {
+                // The HardwareBuffer wrapper is always closed here: native holds its own
+                // reference to the underlying AHardwareBuffer until the frame retires, and
+                // the Image (which keeps the decoder buffer out of MediaCodec's hands) is
+                // closed here only when nobody deferred it.
                 try { hwBuf?.close() } catch (_: Throwable) {}
-                try { image.close() } catch (_: Throwable) {}
+                if (!imageOwnedByCallback) {
+                    try { image.close() } catch (_: Throwable) {}
+                }
             }
         }
 
@@ -245,6 +390,7 @@ class AndroidDagFrameRenderPump {
             renderedFrame = localRenderedFrame,
             playbackEndReached = hitPlaybackEnd,
             nativeRenderStatus = localNativeRenderStatus,
+            catchUpDroppedFrames = catchUpDrops,
         )
     }
 }

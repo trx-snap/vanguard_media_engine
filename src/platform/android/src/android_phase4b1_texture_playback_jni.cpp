@@ -147,7 +147,52 @@ struct Phase4B1Session {
     int                                  renderedFrames{0};
     std::string                          lastRenderStatus;
     std::string                          sessionId;
+    // Release sync-fd of the most recent successful generation-aware render
+    // on this session (see renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration).
+    // Native retains ownership: the fd stays open until the NEXT render call on
+    // this session (either JNI render entry point) or session destroy closes
+    // it. The fd number is reported to Kotlin in the PASS status string as
+    // releaseFenceFd=<fd>; a Kotlin caller that wants to wait on it must dup it
+    // synchronously (ParcelFileDescriptor.fromFd) before issuing another render
+    // on the same session. Callers that ignore the field never leak: at most one
+    // native-owned release fd exists per session at any time.
+    int                                  pendingReleaseFenceFd{-1};
 };
+
+// Owns a raw fd for the duration of a scope; release() hands the fd back to the
+// caller without closing it. Every early-return path in the generation-aware
+// render entry point therefore closes an un-transferred release fd for free.
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd = -1) : fd_(fd) {}
+    ~ScopedFd() { reset(); }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    int get() const { return fd_; }
+    int release() {
+        const int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+    void reset(int fd = -1) {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+        fd_ = fd;
+    }
+private:
+    int fd_;
+};
+
+// Closes and clears the session's retained release fd from the previous
+// successful generation-aware render. Called at every render entry and on
+// destroy so at most one such fd is ever open per session.
+void ClosePendingReleaseFenceFd(Phase4B1Session* session) {
+    if (session->pendingReleaseFenceFd >= 0) {
+        ::close(session->pendingReleaseFenceFd);
+        session->pendingReleaseFenceFd = -1;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session registry (guarded by mutex)
@@ -333,6 +378,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         return env->NewStringUTF(status);
     }
 
+    // A new render on this session retires the previous generation-aware
+    // render's retained release fd (any Kotlin waiter has already dup'd it).
+    ClosePendingReleaseFenceFd(session);
+
     AHardwareBuffer* ahwb = ResolveAHardwareBufferFromJObject(env, hardwareBufferJ);
     if (!ahwb) {
         std::snprintf(status, sizeof(status),
@@ -498,6 +547,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_destroyAnd
         }
     } catch (...) {}
 
+    // Retained release fd from the last generation-aware render: the backend is
+    // shut down (device idle) so no waiter can still need the original.
+    ClosePendingReleaseFenceFd(session);
+
     if (session->nativeWindow) {
         ANativeWindow_release(session->nativeWindow);
         session->nativeWindow = nullptr;
@@ -573,7 +626,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint     rotationDegrees,
     jboolean mirrorHorizontal) {
 
-    char status[512];
+    // Sized so the PASS status (all existing fields plus releaseFenceFd=<fd>)
+    // and the longest FAIL status with an embedded planStatus/dispatcherStatus
+    // message cannot truncate.
+    char status[768];
 
     if (!sessionIdJ || !hardwareBufferJ || width <= 0 || height <= 0) {
         std::snprintf(status, sizeof(status),
@@ -606,6 +662,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
             static_cast<int>(frameIndex));
         return env->NewStringUTF(status);
     }
+
+    // Retire the previous render's retained release fd before doing anything
+    // that can early-return: the Kotlin waiter (if any) dup'd it synchronously
+    // inside the previous call's pump callback, so the original is no longer
+    // needed and must not outlive this entry.
+    ClosePendingReleaseFenceFd(session);
 
     AHardwareBuffer* ahwb = ResolveAHardwareBufferFromJObject(env, hardwareBufferJ);
     if (!ahwb) {
@@ -684,13 +746,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     const auto dispatchStatus =
         dispatcher.dispatch(plan, tokenSession, callback, dispatchResult);
 
-    int releaseFenceFd = -1;
+    // The release sync-fd exported by the renderer for this frame's GPU reads.
+    // ScopedFd closes it on every failure return below; only the PASS path
+    // hands it to the session's retained slot for Kotlin to dup and wait on.
+    int rawReleaseFenceFd = -1;
     const auto releaseResult =
-        session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
-    if (releaseFenceFd >= 0) {
-        ::close(releaseFenceFd);
-        releaseFenceFd = -1;
-    }
+        session->backend.releaseHardwareBuffer(handle, &rawReleaseFenceFd);
+    ScopedFd releaseFence(rawReleaseFenceFd);
 
     if (!dispatchStatus.ok()) {
         std::snprintf(status, sizeof(status),
@@ -726,11 +788,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     session->renderedFrames++;
     session->lastRenderStatus = "success";
 
+    // PASS: retain the release fd on the session (closed by the next render on
+    // this session or by destroy) and report its number. -1 means the renderer
+    // could not export a release fence; Kotlin must then close the Image
+    // immediately (pre-existing behavior).
+    session->pendingReleaseFenceFd = releaseFence.release();
+
     std::snprintf(status, sizeof(status),
         "status=PASS;frameIndex=%d;renderedFrames=%d;generationId=%llu;"
         "renderResult=%s;releaseResult=%s;rotationDegrees=%d;mirrorHorizontal=%s;"
         "planNodeCount=%zu;planSinkCount=%zu;"
-        "dispatcherNodeCount=%u;dispatcherOutputCount=%u;dispatcherTokenCount=%zu",
+        "dispatcherNodeCount=%u;dispatcherOutputCount=%u;dispatcherTokenCount=%zu;"
+        "releaseFenceFd=%d",
         static_cast<int>(frameIndex),
         session->renderedFrames,
         static_cast<unsigned long long>(generationIdJ),
@@ -742,6 +811,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         plan.sinkNodeIds.size(),
         dispatchResult.nodesDispatched,
         dispatchResult.outputsPublished,
-        tokenSession.publishedCount());
+        tokenSession.publishedCount(),
+        session->pendingReleaseFenceFd);
     return env->NewStringUTF(status);
 }

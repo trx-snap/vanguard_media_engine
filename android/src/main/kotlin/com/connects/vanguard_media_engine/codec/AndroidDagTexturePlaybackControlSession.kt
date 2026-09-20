@@ -7,8 +7,17 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.os.SystemClock
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
+import android.system.StructPollfd
 import android.util.Log
 import android.view.Choreographer
 import android.view.Surface
@@ -16,6 +25,7 @@ import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import io.flutter.view.TextureRegistry
+import java.io.FileDescriptor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -56,7 +66,68 @@ class AndroidDagTexturePlaybackControlSession(
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
-        private const val IMAGE_READER_MAX_IMAGES = 3
+        private const val IMAGE_READER_MAX_IMAGES = 6
+
+        /**
+         * Separate cap on decoded-but-unrendered Images the async ImageReader callback may
+         * hold in [imageQueue], independent of [IMAGE_READER_MAX_IMAGES]. Images retained
+         * off-queue by the release-fence waiter (see [deferRenderedImageClose]) also consume
+         * an ImageReader acquisition slot, so a queue allowed to grow up to the full reader
+         * pool could alone saturate it and trip acquireNextImage()'s maxImages exception.
+         * Kept well below IMAGE_READER_MAX_IMAGES to leave that headroom.
+         */
+        private const val IMAGE_QUEUE_CAPACITY = 2
+
+        /**
+         * Bound on how long the release thread waits for one rendered frame's GPU release
+         * fence before closing the Image anyway (fail-closed for buffer-pool safety; a
+         * warning is logged). GPU work per frame completes in a few milliseconds, so this
+         * only trips on a hung queue or device loss.
+         */
+        private const val RELEASE_FENCE_WAIT_TIMEOUT_MS = 1000
+
+        /**
+         * Frame-rate vote defaults for the Flutter playback Surface (API 30+). The vote
+         * tells SurfaceFlinger the content cadence so it stops re-selecting display modes
+         * (idle 60 Hz / touch 120 Hz) mid-playback on top of an otherwise-clean 30 fps
+         * render cadence. Sources without a usable KEY_FRAME_RATE fall back to 30 fps.
+         */
+        private const val DEFAULT_SOURCE_FRAME_RATE_FPS = 30f
+        private const val MIN_SOURCE_FRAME_RATE_FPS = 1f
+        private const val MAX_SOURCE_FRAME_RATE_FPS = 120f
+    }
+
+    /**
+     * One rendered [Image] whose close is deferred until its GPU release fence signals.
+     * [fence] is this session's own dup of the native-owned release sync fd. Both closes
+     * are idempotent and thread-safe: the release thread closes both after its wait, and
+     * terminal cleanup may close the Image first from the control thread (after the
+     * native session has been destroyed, so the GPU can no longer be reading it).
+     */
+    private class DeferredImageRelease(
+        val image: Image,
+        val fence: ParcelFileDescriptor,
+        val ptsUs: Long,
+    ) {
+        private var imageClosed = false
+        private var fenceClosed = false
+
+        fun closeImage() {
+            synchronized(this) {
+                if (imageClosed) return
+                imageClosed = true
+            }
+            try { image.close() } catch (_: Throwable) {}
+        }
+
+        /** Only the release thread (the poll owner) calls this, so no poll races a close. */
+        fun closeFence() {
+            synchronized(this) {
+                if (fenceClosed) return
+                fenceClosed = true
+            }
+            try { fence.close() } catch (_: Throwable) {}
+        }
     }
 
     private val disposed = AtomicBoolean(false)
@@ -72,7 +143,17 @@ class AndroidDagTexturePlaybackControlSession(
     @Volatile
     private var lastSurfaceLifecycleEvent: String? = null
 
-    private val imageQueue = LinkedBlockingQueue<Image>(IMAGE_READER_MAX_IMAGES)
+    private val imageQueue = LinkedBlockingQueue<Image>(IMAGE_QUEUE_CAPACITY)
+
+    /**
+     * Decoded Images closed unrendered because [imageQueue] was full when the ImageReader
+     * callback tried to enqueue them. Incremented on the ImageReader thread, read on the
+     * control thread for cadence telemetry and diagnostic snapshots.
+     */
+    private val queueOverflowDrops = AtomicInteger(0)
+
+    /** Once-per-second render cadence aggregation; touched only on the control thread. */
+    private val cadenceTelemetry = AndroidDagPlaybackCadenceTelemetry(TAG)
 
     @Volatile
     var state: AndroidDagPlaybackState = AndroidDagPlaybackState.Idle
@@ -89,6 +170,35 @@ class AndroidDagTexturePlaybackControlSession(
     private var flutterSurface: Surface? = null
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
+
+    /**
+     * Dedicated HandlerThread/Handler for ImageReader.OnImageAvailableListener callbacks,
+     * separate from [handlerThread]/[handler] (Choreographer + playback control). Keeping
+     * image acquisition off the VSYNC/control thread lets the decoder hand off a newly
+     * available frame while doFrame's synchronous feed/drain/render pump is still running,
+     * instead of serializing both onto one thread and starving decode throughput.
+     */
+    private var imageReaderHandlerThread: HandlerThread? = null
+    private var imageReaderHandler: Handler? = null
+
+    /**
+     * Dedicated HandlerThread/Handler that waits on each rendered frame's GPU release fence
+     * and only then closes the decoded [Image] (returning its buffer to MediaCodec). This
+     * replaces a blocking post-submit fence wait inside the native render call: the
+     * Choreographer/control thread and the ImageReader acquisition thread never block on
+     * GPU completion, while the decoder still cannot overwrite a buffer the GPU is sampling.
+     */
+    private var releaseHandlerThread: HandlerThread? = null
+    private var releaseHandler: Handler? = null
+
+    /** True only while the session may enqueue new deferred Image closes (prepare -> cleanup). */
+    private val deferredCloseAccepting = AtomicBoolean(false)
+
+    /** Number of rendered Images currently awaiting their release fence on the release thread. */
+    private val deferredCloseInFlight = AtomicInteger(0)
+
+    /** Deferred entries not yet completed by the release thread; guarded by its own monitor. */
+    private val pendingDeferredReleases = ArrayList<DeferredImageRelease>()
     private var nativeBridge: VanguardNativeBridge? = null
     private var sessionId: String? = null
     private var currentGenerationId: Long = 0L
@@ -141,6 +251,13 @@ class AndroidDagTexturePlaybackControlSession(
     private var displayHeight = 0
 
     /**
+     * Source frame rate (fps) derived from track metadata during prepare, clamped to
+     * [MIN_SOURCE_FRAME_RATE_FPS]..[MAX_SOURCE_FRAME_RATE_FPS]. Used only for the
+     * presentation frame-rate vote on the Flutter Surface; never affects pacing.
+     */
+    private var sourceFrameRateFps: Float = DEFAULT_SOURCE_FRAME_RATE_FPS
+
+    /**
      * Freezes [timelineClock] at [ptsUs] (the actually-displayed media position), so a later
      * resume anchors from here rather than an interpolated/stale position.
      */
@@ -180,11 +297,19 @@ class AndroidDagTexturePlaybackControlSession(
         displayHeight = if (swapDims) videoWidth  else videoHeight
         val mime = inspection.mime
         val format = inspection.format!!
+        sourceFrameRateFps = deriveSourceFrameRateFps(format)
 
         try {
+            cadenceTelemetry.resetAll()
+            queueOverflowDrops.set(0)
 
-            // 2. Start HandlerThread for Choreographer loop & ImageReader
-            val ht = HandlerThread("DagPlaybackControlLoop_${surfaceProducer.id()}").also {
+            // 2. Start HandlerThread for Choreographer loop & ImageReader. Display priority
+            //    keeps the vsync-driven pump from being descheduled behind default-priority
+            //    app work while it feeds/drains the codec and submits the render.
+            val ht = HandlerThread(
+                "DagPlaybackControlLoop_${surfaceProducer.id()}",
+                Process.THREAD_PRIORITY_DISPLAY,
+            ).also {
                 handlerThread = it
                 it.start()
             }
@@ -204,6 +329,9 @@ class AndroidDagTexturePlaybackControlSession(
                     // and obtain Surface. ImageReader and MediaCodec use raw decoded dimensions.
                     surfaceProducer.setSize(displayWidth, displayHeight)
                     val surface = surfaceProducer.getSurface().also { flutterSurface = it }
+                    // Presentation cadence hint for SurfaceFlinger (API 30+), applied before
+                    // the native session starts presenting onto this Surface.
+                    applyPlaybackSurfaceFrameRateVote(surface, site = "prepare")
 
                     // 4. Create ImageReader (PRIVATE, GPU_SAMPLED_IMAGE, API 29+)
                     // Uses raw video dimensions: MediaCodec decodes at native resolution.
@@ -215,12 +343,36 @@ class AndroidDagTexturePlaybackControlSession(
                         HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
                     ).also { imageReader = it }
 
+                    // Dedicated thread for image-available callbacks so acquisition can
+                    // happen concurrently with the Choreographer/pump thread's work.
+                    val irHt = HandlerThread(
+                        "DagImageReaderLoop_${surfaceProducer.id()}",
+                        Process.THREAD_PRIORITY_DISPLAY,
+                    ).also {
+                        imageReaderHandlerThread = it
+                        it.start()
+                    }
+                    val irH = Handler(irHt.looper).also { imageReaderHandler = it }
+
+                    // Dedicated thread for rendered-Image release-fence waits, started with
+                    // the other session threads so continuous playback can defer closes
+                    // from its first rendered frame.
+                    val relHt = HandlerThread("DagImageReleaseLoop_${surfaceProducer.id()}").also {
+                        releaseHandlerThread = it
+                        it.start()
+                    }
+                    releaseHandler = Handler(relHt.looper)
+                    deferredCloseAccepting.set(true)
+
                     reader.setOnImageAvailableListener(
                         { r ->
                             try {
                                 val img = r.acquireNextImage()
                                 if (img != null) {
                                     if (!imageQueue.offer(img)) {
+                                        // Counted (not logged) per drop; surfaced by the
+                                        // once-per-second CADENCE_1S line and result maps.
+                                        queueOverflowDrops.incrementAndGet()
                                         img.close()
                                     }
                                 }
@@ -228,7 +380,7 @@ class AndroidDagTexturePlaybackControlSession(
                                 Log.w(TAG, "acquireNextImage failed: $e")
                             }
                         },
-                        h,
+                        irH,
                     )
 
                     // 5. Configure and start MediaCodec
@@ -379,6 +531,10 @@ class AndroidDagTexturePlaybackControlSession(
             }
 
             if (activeFrameCallback == null) {
+                // New playback run (initial play, resume after pause, seek, or surface
+                // restore): drop the stale window so the first measured render interval is
+                // not the gap across the pause. Totals are preserved.
+                cadenceTelemetry.resetWindow()
                 val callback = object : Choreographer.FrameCallback {
                     override fun doFrame(frameTimeNanos: Long) {
                         // Stop the loop immediately if surface has been lost or session is no longer playing.
@@ -391,7 +547,21 @@ class AndroidDagTexturePlaybackControlSession(
                             // play()/resume it anchors the clock at this vsync's frameTimeNanos.
                             val dueMediaPtsUs = timelineClock.resume(frameTimeNanos)
 
+                            // Target-frame-count proof callers need each pump call to advance by
+                            // exactly one decoded frame under a tight due-tolerance; continuous
+                            // (target == null) playback instead paces to a normal frame-interval
+                            // tolerance. Neither path drops frames to catch up to wall-clock -
+                            // catch-up dropping produced uneven/late render intervals worse than
+                            // the backlog it was meant to correct.
+                            val isTargetProof = targetFrameCount != null
+                            val dueToleranceUs = if (isTargetProof) {
+                                AndroidDagFrameRenderPump.DEFAULT_DUE_TOLERANCE_US
+                            } else {
+                                AndroidDagFrameRenderPump.CONTINUOUS_DUE_TOLERANCE_US
+                            }
+
                             // Feed, drain, and render - delegated to AndroidDagFrameRenderPump.
+                            val pumpStartNanos = System.nanoTime()
                             val pumpResult = AndroidDagFrameRenderPump().pumpOnce(
                                 extractor = extractor,
                                 codec = codec,
@@ -409,12 +579,24 @@ class AndroidDagTexturePlaybackControlSession(
                                 renderedFrames = renderedFrames,
                                 lastRenderedPtsUs = lastRenderedPtsUs,
                                 dueMediaPtsUs = dueMediaPtsUs,
+                                dueToleranceUs = dueToleranceUs,
                                 sourceEndPtsUs = playbackEndPtsUs,
-                                // The catch-up pump option remains disabled pending a dedicated
-                                // wall-clock/rate harness because existing public smoke paths
-                                // depend on receiving a post-seek/post-boundary frame event.
                                 allowCatchUpDrop = false,
+                                imageReaderMaxImages = IMAGE_READER_MAX_IMAGES,
+                                imageQueueCapacity = IMAGE_QUEUE_CAPACITY,
+                                // Rendered Images still awaiting their release fence hold an
+                                // ImageReader acquisition slot; proof callers never defer, so
+                                // this is always 0 for them regardless of isTargetProof.
+                                deferredRenderedImageCloseInFlight = deferredCloseInFlight.get(),
+                                // Continuous playback defers each rendered Image's close to the
+                                // release thread; proof callers keep the immediate close.
+                                deferRenderedImageClose = if (isTargetProof) {
+                                    null
+                                } else {
+                                    this@AndroidDagTexturePlaybackControlSession::deferRenderedImageClose
+                                },
                             )
+                            val pumpEndNanos = System.nanoTime()
                             inputDone = pumpResult.inputDone
                             outputDone = pumpResult.outputDone
                             renderedFrames = pumpResult.renderedFrames
@@ -423,6 +605,20 @@ class AndroidDagTexturePlaybackControlSession(
                             if (pumpResult.nativeRenderStatus != null) {
                                 lastNativeRenderStatus = pumpResult.nativeRenderStatus
                             }
+
+                            // Cadence telemetry: measured on System.nanoTime right after the
+                            // pump so intervals reflect when frames were actually submitted,
+                            // not the vsync timestamps they were scheduled against.
+                            cadenceTelemetry.onFrameTick(
+                                nowNanos = pumpEndNanos,
+                                pumpDurationNanos = pumpEndNanos - pumpStartNanos,
+                                renderedFrame = pumpResult.renderedFrame,
+                                catchUpDroppedFrames = pumpResult.catchUpDroppedFrames,
+                                queueDepth = imageQueue.size,
+                                deferredCloseInFlight = deferredCloseInFlight.get(),
+                                queueOverflowDropsTotal = queueOverflowDrops.get().toLong(),
+                                generationId = currentGenerationId,
+                            )
 
                             if (frameRenderError == null && pumpResult.renderedFrame) {
                                 onTimelineFrame?.invoke(surfaceProducer.id(), lastRenderedPtsUs / 1_000_000.0, currentGenerationId)
@@ -442,6 +638,9 @@ class AndroidDagTexturePlaybackControlSession(
                                     "renderedFrames" to renderedFrames,
                                     "lastPtsUs" to lastRenderedPtsUs,
                                     "lastNativeRenderStatus" to lastNativeRenderStatus,
+                                    "cadenceRenderedFrames" to cadenceTelemetry.totalRenderedFrames,
+                                    "cadenceCatchUpDroppedFrames" to cadenceTelemetry.totalCatchUpDroppedFrames,
+                                    "cadenceQueueOverflowDroppedFrames" to queueOverflowDrops.get().toLong(),
                                     "raw" to "status=OK;target_reached;renderedFrames=$renderedFrames",
                                 ))
                             } else if (pumpResult.playbackEndReached) {
@@ -473,6 +672,9 @@ class AndroidDagTexturePlaybackControlSession(
                                     "renderedFrames" to renderedFrames,
                                     "lastPtsUs" to lastRenderedPtsUs,
                                     "lastNativeRenderStatus" to lastNativeRenderStatus,
+                                    "cadenceRenderedFrames" to cadenceTelemetry.totalRenderedFrames,
+                                    "cadenceCatchUpDroppedFrames" to cadenceTelemetry.totalCatchUpDroppedFrames,
+                                    "cadenceQueueOverflowDroppedFrames" to queueOverflowDrops.get().toLong(),
                                     "raw" to raw,
                                 ))
                             } else if (outputDone && imageQueue.isEmpty()) {
@@ -497,6 +699,9 @@ class AndroidDagTexturePlaybackControlSession(
                                     "renderedFrames" to renderedFrames,
                                     "lastPtsUs" to lastRenderedPtsUs,
                                     "lastNativeRenderStatus" to lastNativeRenderStatus,
+                                    "cadenceRenderedFrames" to cadenceTelemetry.totalRenderedFrames,
+                                    "cadenceCatchUpDroppedFrames" to cadenceTelemetry.totalCatchUpDroppedFrames,
+                                    "cadenceQueueOverflowDroppedFrames" to queueOverflowDrops.get().toLong(),
                                     "raw" to raw,
                                 ))
                             } else if (frameRenderError != null) {
@@ -571,6 +776,9 @@ class AndroidDagTexturePlaybackControlSession(
                 "state" to state.name,
                 "renderedFrames" to renderedFrames,
                 "lastPtsUs" to lastRenderedPtsUs,
+                "cadenceRenderedFrames" to cadenceTelemetry.totalRenderedFrames,
+                "cadenceCatchUpDroppedFrames" to cadenceTelemetry.totalCatchUpDroppedFrames,
+                "cadenceQueueOverflowDroppedFrames" to queueOverflowDrops.get().toLong(),
                 "raw" to "status=OK;state=Paused;renderedFrames=$renderedFrames",
             )
 
@@ -619,7 +827,10 @@ class AndroidDagTexturePlaybackControlSession(
 
                 state = AndroidDagPlaybackState.Seeking
 
-                // b. Drain/close queued app-held Images
+                // b. Drain/close queued app-held Images. Only never-rendered images live in
+                // imageQueue; already-rendered images whose GPU release fence has not yet
+                // signaled are owned by the release thread and are deliberately NOT closed
+                // here (the GPU may still be sampling them). They drain on their own.
                 while (true) {
                     val img = imageQueue.poll() ?: break
                     try { img.close() } catch (_: Throwable) {}
@@ -753,6 +964,9 @@ class AndroidDagTexturePlaybackControlSession(
         cancelPendingPlay: Boolean = true,
         releaseJavaResources: Boolean = true,
     ) {
+        // 0. Stop accepting new deferred Image closes: anything rendered from here on
+        //    (nothing should be) is closed immediately by the pump.
+        deferredCloseAccepting.set(false)
         // 1. Remove active Choreographer callback
         val cb = activeFrameCallback
         if (cb != null) {
@@ -775,7 +989,14 @@ class AndroidDagTexturePlaybackControlSession(
             try { bridge.destroyAndroidDagPhase4B1TexturePlaybackSession(sid) } catch (_: Throwable) {}
         }
         sessionId = null
-        // 4. Clear cached Flutter Surface reference (do NOT release SurfaceProducer)
+        // 3b. The native session is gone (backend shutdown idles the device), so no GPU
+        //     read can still target a deferred Image: close any still waiting on their
+        //     release fence now. The release thread's pending runnables find the Image
+        //     already closed and just close their own fence dup.
+        closePendingDeferredImages("cleanup:${targetState.name}")
+        // 4. Clear the frame-rate vote on the cached Flutter Surface, then drop the
+        //    reference (do NOT release SurfaceProducer). Vote failures only warn.
+        clearPlaybackSurfaceFrameRateVote(flutterSurface)
         flutterSurface = null
 
         if (releaseJavaResources) {
@@ -791,22 +1012,31 @@ class AndroidDagTexturePlaybackControlSession(
             try { imageReader?.close() } catch (_: Throwable) {}
             // 8. Release MediaExtractor
             try { extractor?.release() } catch (_: Throwable) {}
-            // 9. Quit HandlerThread safely
+            // 9. Quit HandlerThreads safely. quitSafely still runs already-posted release
+            //    runnables, so every fence dup handed to the release thread is closed.
             try { handlerThread?.quitSafely() } catch (_: Throwable) {}
+            try { imageReaderHandlerThread?.quitSafely() } catch (_: Throwable) {}
+            try { releaseHandlerThread?.quitSafely() } catch (_: Throwable) {}
             // 10. Null heavy resource references
             codec = null
             imageReader = null
             extractor = null
             handler = null
             handlerThread = null
+            imageReaderHandler = null
+            imageReaderHandlerThread = null
+            releaseHandler = null
+            releaseHandlerThread = null
             nativeBridge = null
             choreographer = null
             // 11. Detach lifecycle adapter — final dispose only
             try { surfaceProducer.setCallback(null) } catch (_: Throwable) {}
             lifecycleAdapter = null
         } else {
-            // Surface-loss-only cleanup: preserve codec/extractor/imageReader/handler/nativeBridge for restore.
-            // nativeBridge is kept so handleSurfaceAvailable() can recreate the native session.
+            // Surface-loss-only cleanup: preserve codec/extractor/imageReader/handler/
+            // imageReaderHandler/releaseHandler/nativeBridge for restore. nativeBridge is
+            // kept so handleSurfaceAvailable() can recreate the native session; the release
+            // thread is kept (deferred closes stay disabled until a successful restore).
         }
         activeFrameCallback = null
         state = targetState
@@ -913,6 +1143,9 @@ class AndroidDagTexturePlaybackControlSession(
             )
 
             if (result.success) {
+                // Re-apply the presentation cadence vote to the freshly fetched Surface
+                // (the vote does not carry over from the pre-loss Surface).
+                result.surface?.let { applyPlaybackSurfaceFrameRateVote(it, site = "restore") }
                 flutterSurface = result.surface
                 sessionId = result.sessionId
                 currentGenerationId = result.generationId
@@ -922,6 +1155,9 @@ class AndroidDagTexturePlaybackControlSession(
                 freezeClockAt(lastRenderedPtsUs)
                 surfaceLostFlag.set(false)
                 lastRestoreFailureReason = null
+                // Re-arm deferred closes against the fresh native session (the release
+                // thread survived surface-loss cleanup).
+                deferredCloseAccepting.set(releaseHandler != null)
                 state = AndroidDagPlaybackState.Paused
                 Log.i(TAG, "handleSurfaceAvailable: restore complete; state=$state; gen=$currentGenerationId")
             } else {
@@ -949,7 +1185,179 @@ class AndroidDagTexturePlaybackControlSession(
         "realSurfaceCleanupCallbackCount" to realSurfaceCleanupCallbackCount.get(),
         "realSurfaceAvailableCallbackCount" to realSurfaceAvailableCallbackCount.get(),
         "lastSurfaceLifecycleEvent" to lastSurfaceLifecycleEvent,
+        "deferredImageClosesInFlight" to deferredCloseInFlight.get(),
+        "cadenceRenderedFrames" to cadenceTelemetry.totalRenderedFrames,
+        "cadenceCatchUpDroppedFrames" to cadenceTelemetry.totalCatchUpDroppedFrames,
+        "cadenceQueueOverflowDroppedFrames" to queueOverflowDrops.get().toLong(),
+        "sourceFrameRateFps" to sourceFrameRateFps,
     )
+
+    // ── Playback Surface frame-rate vote (presentation cadence hint) ─────────
+
+    /**
+     * Reads [MediaFormat.KEY_FRAME_RATE] from the selected video track. The key may be
+     * stored as an Integer or a Float depending on the container/extractor, and may be
+     * absent or malformed; every such case falls back to [DEFAULT_SOURCE_FRAME_RATE_FPS].
+     * The result is clamped to a sane range and never throws.
+     */
+    private fun deriveSourceFrameRateFps(format: MediaFormat): Float {
+        val raw: Float? = try {
+            if (!format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                null
+            } else {
+                try {
+                    format.getInteger(MediaFormat.KEY_FRAME_RATE).toFloat()
+                } catch (_: ClassCastException) {
+                    format.getFloat(MediaFormat.KEY_FRAME_RATE)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "source frame-rate metadata read failed; defaulting to $DEFAULT_SOURCE_FRAME_RATE_FPS fps: $t")
+            null
+        }
+        return if (raw != null && raw.isFinite() && raw > 0f) {
+            raw.coerceIn(MIN_SOURCE_FRAME_RATE_FPS, MAX_SOURCE_FRAME_RATE_FPS)
+        } else {
+            DEFAULT_SOURCE_FRAME_RATE_FPS
+        }
+    }
+
+    /**
+     * Votes [sourceFrameRateFps] on [surface] with FIXED_SOURCE compatibility (API 30+) so
+     * SurfaceFlinger keeps a display mode that is a multiple of the content cadence instead
+     * of bouncing between idle/touch modes while 30 fps content is presenting. No-op below
+     * API 30. Failure only warns; it never changes session state or lifecycle.
+     */
+    private fun applyPlaybackSurfaceFrameRateVote(surface: Surface, site: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        try {
+            surface.setFrameRate(sourceFrameRateFps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            Log.i(TAG, "playback surface frame-rate vote fps=$sourceFrameRateFps textureId=${surfaceProducer.id()} site=$site")
+        } catch (t: Throwable) {
+            Log.w(TAG, "playback surface frame-rate vote failed fps=$sourceFrameRateFps textureId=${surfaceProducer.id()} site=$site: $t")
+        }
+    }
+
+    /**
+     * Clears any frame-rate vote on [surface] (API 30+) before the session drops its
+     * reference, so a released/re-used Flutter Surface does not keep voting for the old
+     * content cadence. Null surface and pre-API-30 are no-ops; failure only warns.
+     */
+    private fun clearPlaybackSurfaceFrameRateVote(surface: Surface?) {
+        if (surface == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        try {
+            surface.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            Log.i(TAG, "playback surface frame-rate vote cleared textureId=${surfaceProducer.id()}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "playback surface frame-rate vote clear failed textureId=${surfaceProducer.id()}: $t")
+        }
+    }
+
+    // ── Rendered-Image release-fence deferral ────────────────────────────────
+
+    /**
+     * [AndroidDagFrameRenderPump.pumpOnce] `deferRenderedImageClose` seam for continuous
+     * playback. Runs synchronously on the control thread right after a successful native
+     * render. Dups the native-owned release sync fd (native closes its copy on the next
+     * render call for this session, which can only happen after this returns because both
+     * run on the control thread), enqueues the wait on the release thread, and returns true
+     * so the pump leaves the Image open. Any failure to enqueue closes the dup and returns
+     * false so the pump closes the Image immediately (pre-existing behavior).
+     */
+    private fun deferRenderedImageClose(image: Image, releaseFenceFd: Int): Boolean {
+        if (releaseFenceFd < 0 || disposed.get() || !deferredCloseAccepting.get()) return false
+        val rh = releaseHandler ?: return false
+        val fence: ParcelFileDescriptor = try {
+            ParcelFileDescriptor.fromFd(releaseFenceFd)
+        } catch (t: Throwable) {
+            Log.w(TAG, "release fence dup failed (fd=$releaseFenceFd); closing image immediately: $t")
+            return false
+        }
+        val entry = DeferredImageRelease(image, fence, image.timestamp / 1000L)
+        synchronized(pendingDeferredReleases) { pendingDeferredReleases.add(entry) }
+        deferredCloseInFlight.incrementAndGet()
+        val posted = try {
+            rh.post { completeDeferredRelease(entry) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "release-thread post threw: $t")
+            false
+        }
+        if (!posted) {
+            synchronized(pendingDeferredReleases) { pendingDeferredReleases.remove(entry) }
+            deferredCloseInFlight.decrementAndGet()
+            entry.closeFence()
+            Log.w(TAG, "release thread unavailable; closing image immediately pts=${entry.ptsUs}")
+            return false
+        }
+        return true
+    }
+
+    /** Release-thread body: wait for the frame's GPU reads to finish, then close Image and fence. */
+    private fun completeDeferredRelease(entry: DeferredImageRelease) {
+        try {
+            waitForReleaseFence(entry.fence.fileDescriptor, entry.ptsUs)
+        } catch (t: Throwable) {
+            Log.w(TAG, "release-fence wait threw pts=${entry.ptsUs}; closing image anyway: $t")
+        } finally {
+            synchronized(pendingDeferredReleases) { pendingDeferredReleases.remove(entry) }
+            entry.closeImage()
+            entry.closeFence()
+            deferredCloseInFlight.decrementAndGet()
+        }
+    }
+
+    /**
+     * Polls the sync fd for POLLIN (fence signaled) with a bounded total timeout, retrying
+     * across EINTR. Timeout, poll error, or POLLERR/POLLNVAL/POLLHUP log a warning and
+     * return normally so the caller still closes the Image (fail-closed for the buffer pool).
+     */
+    private fun waitForReleaseFence(syncFd: FileDescriptor, ptsUs: Long) {
+        val pollfd = StructPollfd()
+        pollfd.fd = syncFd
+        pollfd.events = OsConstants.POLLIN.toShort()
+        val fds = arrayOf(pollfd)
+        val deadlineMs = SystemClock.elapsedRealtime() + RELEASE_FENCE_WAIT_TIMEOUT_MS
+        while (true) {
+            val remainingMs = (deadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L).toInt()
+            val ready = try {
+                Os.poll(fds, remainingMs)
+            } catch (e: ErrnoException) {
+                if (e.errno == OsConstants.EINTR) continue
+                Log.w(TAG, "release-fence poll error pts=$ptsUs errno=${e.errno}; closing image anyway")
+                return
+            }
+            if (ready > 0) {
+                val revents = pollfd.revents.toInt()
+                if (revents and (OsConstants.POLLERR or OsConstants.POLLNVAL or OsConstants.POLLHUP) != 0) {
+                    Log.w(TAG, "release-fence poll reported revents=0x${Integer.toHexString(revents)} pts=$ptsUs; closing image anyway")
+                    return
+                }
+                if (revents and OsConstants.POLLIN != 0) return // fence signaled
+            }
+            if (remainingMs <= 0) {
+                Log.w(TAG, "release-fence wait timed out after ${RELEASE_FENCE_WAIT_TIMEOUT_MS}ms pts=$ptsUs; closing image anyway")
+                return
+            }
+            // ready == 0 with time left cannot happen (poll waits the full remaining time),
+            // and a spurious wake without POLLIN simply loops until the deadline.
+        }
+    }
+
+    /**
+     * Terminal close of every rendered Image still awaiting its release fence. Must only be
+     * called after the native session has been destroyed (GPU idle). Fence dups are left to
+     * the release thread, which owns their polls and closes them when its runnables complete.
+     */
+    private fun closePendingDeferredImages(reason: String) {
+        val snapshot: List<DeferredImageRelease> = synchronized(pendingDeferredReleases) {
+            ArrayList(pendingDeferredReleases)
+        }
+        if (snapshot.isEmpty()) return
+        Log.i(TAG, "closing ${snapshot.size} deferred image(s) still awaiting release fence ($reason)")
+        for (entry in snapshot) {
+            entry.closeImage()
+        }
+    }
 
     /**
      * Diagnostic seam: programmatically triggers a surface cleanup event.
@@ -1013,6 +1421,9 @@ class AndroidDagTexturePlaybackControlSession(
                 "pass" to true,
                 "state" to state.name,
                 "renderedFrames" to renderedFrames,
+                "cadenceRenderedFrames" to cadenceTelemetry.totalRenderedFrames,
+                "cadenceCatchUpDroppedFrames" to cadenceTelemetry.totalCatchUpDroppedFrames,
+                "cadenceQueueOverflowDroppedFrames" to queueOverflowDrops.get().toLong(),
                 "raw" to "status=OK;disposed=true",
             ))
         }
