@@ -83,9 +83,10 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
 
   @override
   Widget build(BuildContext context) {
-    // If only one texture exists (iOS AVFoundation CoreImage compositor), render direct texture
+    // If only one texture exists (iOS Metal or Android Vulkan/GLES compositor),
+    // render aspect-correct texture so it never stretches on non-16:9 displays.
     if (widget.session.backTextureId == null) {
-      return Texture(textureId: widget.session.textureId);
+      return _buildAspectCorrectTexture(widget.session.textureId);
     }
 
     final frontTid = widget.session.textureId;
@@ -282,16 +283,18 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
   Widget _buildAspectCorrectTexture(int textureId) {
     final isBack = widget.session.backTextureId != null &&
         textureId == widget.session.backTextureId;
+    final fallbackW = widget.session.outputWidth > 0 ? widget.session.outputWidth : 1080;
+    final fallbackH = widget.session.outputHeight > 0 ? widget.session.outputHeight : 1920;
     final rawW = isBack
         ? (widget.session.backBufferWidth ??
             widget.session.frontBufferWidth ??
-            1080)
-        : (widget.session.frontBufferWidth ?? 1080);
+            fallbackW)
+        : (widget.session.frontBufferWidth ?? fallbackW);
     final rawH = isBack
         ? (widget.session.backBufferHeight ??
             widget.session.frontBufferHeight ??
-            1920)
-        : (widget.session.frontBufferHeight ?? 1920);
+            fallbackH)
+        : (widget.session.frontBufferHeight ?? fallbackH);
 
     // In portrait presentation, maintain minor axis width and major axis height
     final nativeW = (rawW < rawH ? rawW : rawH).toDouble();

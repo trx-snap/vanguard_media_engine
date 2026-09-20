@@ -57,6 +57,7 @@ import androidx.camera.core.SurfaceProcessor
 import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.FallbackStrategy
@@ -389,9 +390,18 @@ class VanguardCameraSource(
         }
 
         // ── ImageCapture use-case ─────────────────────────────────────────────
+        // Dedicated high-resolution still capture selector:
+        // Negotiates the highest 16:9 resolution supported by the camera hardware
+        // sensor (e.g. 9–12+ Megapixels), matching the 9:16 viewfinder framing with
+        // full ISP sharpness, rather than defaulting to the 1080p preview stream.
+        val photoResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            .build()
+
         val imageCaptureUseCase = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-            .setResolutionSelector(resolutionSelector)
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setResolutionSelector(photoResolutionSelector)
             .build()
             .also { imageCapture = it }
 
@@ -617,6 +627,7 @@ class VanguardCameraSource(
      */
     fun takePhoto(
         outputPath: String,
+        captureMode: String? = null,
         onResult: (String) -> Unit,
         onError: (Exception) -> Unit,
     ) {

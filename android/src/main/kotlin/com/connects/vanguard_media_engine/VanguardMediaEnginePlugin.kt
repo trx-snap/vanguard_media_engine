@@ -3041,8 +3041,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     result.error("INVALID_ARG", "takePhoto: path required", null)
                     return
                 }
+                val captureMode = args?.get("captureMode") as? String
                 src.takePhoto(
                     outputPath = path,
+                    captureMode = captureMode,
                     onResult   = { savedPath -> result.success(savedPath) },
                     onError    = { e -> result.error("CAPTURE_ERROR", e.message, null) }
                 )
