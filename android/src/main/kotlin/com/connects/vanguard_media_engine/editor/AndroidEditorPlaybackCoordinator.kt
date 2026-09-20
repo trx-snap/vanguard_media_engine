@@ -578,8 +578,7 @@ class AndroidEditorPlaybackCoordinator(
                     parsedKeyframes.sortBy { it.timeUs }
                 }
 
-                val addedAudioFile = java.io.File(url)
-                if (!addedAudioFile.exists() || !addedAudioFile.canRead()) {
+                if (!AndroidUriDataSourceHelper.isReadable(url, context)) {
                     result.error("FILE_UNREADABLE", "$role track \"$trackId\" url is not readable: $url", null)
                     return
                 }
