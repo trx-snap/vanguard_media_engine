@@ -178,17 +178,21 @@ NS_ASSUME_NONNULL_BEGIN
 /// Supported:
 ///   - "beauty" (V1: no beautyVersion key or beautyVersion:1; V2: beautyVersion:2,
 ///     optionally faceAwareEnabled — see the implementation for the V2 path).
-///   - "greenScreen" — live solid-background green screen as a camera graph
-///     filter (VGGreenScreenFilterNode). iOS-first MVP: solid background only.
-///     Required parameters:
-///       "backgroundType" (NSString) — must be "solidColor"
+///   - "greenScreen" — live green screen as a camera graph filter
+///     (VGGreenScreenFilterNode). Supports two backgroundType values:
+///       "backgroundType" (NSString) — "solidColor" or "alpha"
 ///       "argb"           (NSNumber) — integer 0xAARRGGBB, 0 … 0xFFFFFFFF
-///                                     (alpha byte ignored; background is opaque)
+///                                     (alpha byte ignored; background is
+///                                     opaque). Required for "solidColor";
+///                                     ignored for "alpha" (the node emits a
+///                                     straight-alpha keyed stream instead of
+///                                     compositing over a background).
 ///     Optional: "enabled" (NSNumber/BOOL, default YES).
 ///     Malformed parameters (missing dictionary, missing/non-string
-///     backgroundType, missing/non-number/out-of-range argb) return
-///     INVALID_GREEN_SCREEN_FILTER_SPEC. A well-formed backgroundType other
-///     than "solidColor" returns UNSUPPORTED_FILTER_TYPE. Neither mutates the graph.
+///     backgroundType, or — for "solidColor" — missing/non-number/out-of-range
+///     argb) return INVALID_GREEN_SCREEN_FILTER_SPEC. A well-formed
+///     backgroundType other than "solidColor" or "alpha" returns
+///     UNSUPPORTED_FILTER_TYPE. Neither mutates the graph.
 ///     The node is a plain transform node: it owns no camera, ARSession or
 ///     texture registration, applies no rotation/mirroring, and fails open to
 ///     the input frame on any per-frame failure. Matte quality is MVP-level

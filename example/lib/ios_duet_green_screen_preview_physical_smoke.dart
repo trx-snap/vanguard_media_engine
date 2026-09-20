@@ -4,23 +4,24 @@
 // Frozen iOS Duet green-screen preview physical smoke harness.
 //
 // Proof boundary:
-//   - Prove package-example iOS Duet green-screen preview using bundled
-//     local fixture and native green-screen layout attachment.
+//   - Prove the iOS Duet GreenScreen preview lifecycle reaches the
+//     graph-backed straight-alpha provider route by attaching GreenScreen
+//     layout and keeping preview active.
 //   - Claims allowed:
 //       * local source session initialization
 //       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup
 //       * attach-time native layout rect for creatorOverlay was returned and matched expected geometry
-//       * startRecording activates render loop with green-screen compositor
+//       * startRecording activates render loop with preview compositor
 //       * green-screen preview remains active for bounded wait (5 s)
 //       * layout update to safe-parity PiP rect works while active
 //       * PiP preview remains active for bounded wait (1.5 s)
 //       * stop/detach/dispose cleanup routes complete
 //       * temp fixture cleanup completes
-//       * native IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST may evidence a mask reached CoreImage blend
+//       * native IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST may evidence graph-backed straight-alpha source-over compositing
 //   - Non-claims:
 //       * no Dart frame counter
 //       * no rendered pixel / visual placement proof (rendered pixels not measured)
-//       * no matte quality proof (VanguardMLSegmenter faults are tolerated)
+//       * no matte quality proof; graph-backed provider faults are tolerated by fallback paths
 //       * no export MP4 proof
 //       * no mic/audio proof
 //       * no speed control proof
@@ -404,18 +405,18 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           'local source session initialization',
           'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup',
           'attach-time native layout rect for creatorOverlay was returned and matched expected geometry',
-          'startRecording activates render loop with green-screen compositor',
+          'startRecording activates render loop with preview compositor',
           'green-screen preview remains active for bounded wait (5 s)',
           'layout update to safe-parity PiP rect works while active',
           'PiP preview remains active for bounded wait (1.5 s)',
           'stop/detach/dispose cleanup routes complete',
           'temp fixture cleanup completes',
-          'native IOS_DUET_GREENSCREEN_MASK_BLEND_FIRST may evidence a mask reached CoreImage blend',
+          'native IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST may evidence graph-backed straight-alpha source-over compositing',
         ],
         'nonClaims': <String>[
           'no Dart frame counter',
           'no rendered pixel / visual placement proof (rendered pixels not measured)',
-          'no matte quality proof (VanguardMLSegmenter faults are tolerated)',
+          'no matte quality proof; graph-backed provider faults are tolerated by fallback paths',
           'no export MP4 proof',
           'no mic/audio proof',
           'no speed control proof',

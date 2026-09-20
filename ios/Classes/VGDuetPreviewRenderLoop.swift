@@ -30,8 +30,10 @@
 //   - Each render() call takes the sample on main before crossing the queue boundary,
 //     hands frame/matte/mode to the compositor, and releases the sample exactly once
 //     after compositing, regardless of mode or which compositor path was taken.
-//   - Phase 4B-A only adds the .straightAlpha ingest path.  It does NOT implement or
-//     prove an upstream VGCameraGraphSession / VGGreenScreenFilterNode provider.
+//   - This loop is provider-agnostic: it only consumes whatever sample the injected
+//     foregroundSampleProvider hands it.  The current iOS Duet production provider
+//     (VGDuetGraphGreenScreenForegroundProvider) is graph-backed and emits
+//     straight-alpha samples for GreenScreen.
 //
 // Explicitly NOT here: Flutter imports, session state, decoder ownership,
 // CoreImage drawing (see VGDuetPreviewCompositor).

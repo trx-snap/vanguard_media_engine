@@ -84,10 +84,12 @@
 //     outcome). S5 and the lab-only tightAlphaR1/S4-tight-R2 candidates are NOT
 //     ported; they never run live in this pipeline instance.
 //   • Non-claims (still true after S4-default live refinement and alpha mode):
-//     NO temporal smoothing; NO image or video backgrounds; NO Duet proof
-//     (this node is not on the Duet path and nothing consumes its alpha yet);
-//     NO recording/export/photo proof of the keyed output beyond the graph
-//     topology argument above; NO TikTok-grade matte parity; NO byte-level
+//     NO temporal smoothing; NO image or video backgrounds. Duet preview now
+//     consumes this node's alpha output through the graph-backed foreground
+//     provider (VGDuetGraphGreenScreenForegroundProvider); offline/export/
+//     photo/TikTok parity claims remain out of scope except where proven
+//     below: NO recording/export/photo proof of the keyed output beyond the
+//     graph topology argument above; NO TikTok-grade matte parity; NO byte-level
 //     proof of the alpha encoding on LIVE camera frames (the one-time
 //     synthetic self-test at init proves the construction on a synthetic
 //     input only). The S4 soft-alpha refinement improves edge quality over the
@@ -219,10 +221,7 @@
 //   failOpenCount and never contribute to the latency averages.
 //
 // Implementation note:
-//   The @implementation lives in VGCameraGraphSession.m (see the comment-only
-//   VGGreenScreenFilterNode.m) so the class compiles without a Pods project
-//   regeneration — the same precedent as VGOfflineFilterBundle and
-//   VGStillImageFilterFactory.
+//   The @implementation lives in VGGreenScreenFilterNode.m.
 
 #pragma once
 

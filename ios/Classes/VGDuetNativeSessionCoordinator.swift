@@ -902,11 +902,9 @@ final class VGDuetNativeSessionCoordinator {
 
     // MARK: - Foreground provider fault handler
 
-    /// Called on the main thread by the foreground provider after it has already
-    /// turned keying off for a faulted keyer (the legacy provider reports the
-    /// VanguardMLSegmenter faulted/stalled path).  Deterministically falls back
-    /// to PiP so the session is never left with an opaque unkeyed green-screen
-    /// layout, then emits the fallback event with the provider's metadata.
+    /// Called on the main thread by any foreground provider after keying has already
+    /// been disabled/failed open. The coordinator falls back to PiP and emits the
+    /// provider-supplied metadata.
     ///
     /// Fallback PiP rect: left 0.58, top 0.05, width 0.36, height 0.24, pipAnchor topRight.
     /// These are the cross-platform safe parity values shared with the Android green-screen fallback.

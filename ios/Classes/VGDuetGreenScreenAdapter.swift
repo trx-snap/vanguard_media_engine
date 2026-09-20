@@ -1,48 +1,27 @@
 // VGDuetGreenScreenAdapter.swift
-// VG-DUET-GREEN-SCREEN: Thin adapter that wires VanguardMLSegmenter + VanguardMaskStore
-// into the Duet preview pipeline for person-segmentation keying.
+// VG-DUET-GREEN-SCREEN: Duet foreground-provider seam and the graph-backed
+// GreenScreen foreground provider that is the current iOS Duet production path.
 //
-// Responsibilities:
-//   - Wraps an existing VanguardMLSegmenter + VanguardMaskStore pair; does NOT
-//     duplicate segmentation logic.
-//   - start(): configures delegate/maskStore, calls loadModelAsync, marks active.
-//   - submitFrame(_:presentationTime:): no-op unless active; delegates to segmenter.
-//   - latestMaskRetained(maxAgeSeconds:): reads latestSnapshot, rejects stale entries
-//     by CACurrentMediaTime – snapshot.timestamp, retains the mask buffer, and returns
-//     a +1 Unmanaged the caller MUST release.
-//   - invalidate(): deactivates, clears callbacks, calls segmenter.invalidate(). Idempotent.
-//   - onSessionFailure: called on main when segmenter enters VanguardMLStateFaulted.
-//     Vision fallback readiness is NOT a failure and does NOT fire this callback.
-//
-// Threading:
-//   - start / invalidate must be called on the main thread (coordinator lifecycle).
-//   - submitFrame is called on the capture callback queue (AVFoundation serial queue).
-//   - latestMaskRetained is called on renderQueue or main thread.
-//   - Delegate callbacks from VanguardMLSegmenter arrive on the main queue.
-//   - _active is accessed under _lock for the submitFrame hot path;
-//     start/invalidate only run on main so they need no lock for their own mutations,
-//     but they write _active under _lock to synchronize with the capture-queue reader.
-//
-// Phase 4A Duet foreground-provider seam (kept in this file so no new Swift file
-// needs Xcode/Pods project membership):
+// Contents:
 //   - VGDuetForegroundCompositeMode, VGDuetForegroundSample,
 //     VGDuetForegroundProviderFault and the VGDuetForegroundProvider protocol are
 //     what the Duet render loop and the Duet coordinator depend on.  The provider
 //     decides per sample HOW its frame is composited (`compositeMode`); the
 //     coordinator only owns layout geometry, the PiP fallback on fault, and event
 //     emission.
-//   - VGDuetLegacyForegroundProvider wraps VGDuetCameraSource + this adapter and
-//     preserves the pre-seam Duet lifecycle ordering exactly (see its header).
+//   - VGDuetGraphGreenScreenForegroundProvider is the production provider: a
+//     graph-only VGCameraGraphSession running a VGGreenScreenFilterNode (alpha
+//     output) delivers an already-keyed, straight-alpha BGRA frame per callback.
+//     The old legacy matte adapter path (VanguardMLSegmenter/VanguardMaskStore
+//     wrapped by a Duet-owned adapter) has been retired; this file no longer
+//     contains it.
 //
-// Phase 4B-A straight-alpha foreground ingest:
+// `.straightAlpha` (VGDuetForegroundCompositeMode):
 //   - `compositeMode` replaces "matte present, therefore keyed" as the keying
 //     decision.  The render loop keys on the mode, never on raw matte presence.
 //   - `.straightAlpha` lets a provider hand the render loop a frame that is ALREADY
 //     keyed upstream (BGRA with straight, non-premultiplied alpha, no matte).  The
-//     legacy provider never emits it.
-//   - This phase only adds the ingest seam.  It does NOT implement or prove an
-//     upstream VGCameraGraphSession / VGGreenScreenFilterNode provider; no
-//     production provider emits `.straightAlpha` yet.
+//     graph-backed provider emits it in production for GreenScreen.
 
 import CoreMedia
 import CoreVideo
@@ -50,131 +29,7 @@ import Foundation
 import QuartzCore
 import os.lock
 
-// MARK: - VGDuetGreenScreenAdapter
-
-final class VGDuetGreenScreenAdapter: NSObject {
-
-    // MARK: - Public seam
-
-    /// Called on the main thread when the segmenter enters VanguardMLStateFaulted.
-    /// Vision fallback mode is NOT a failure and does NOT trigger this.
-    var onSessionFailure: (() -> Void)?
-
-    // MARK: - Private state
-
-    private let _segmenter: VanguardMLSegmenter
-    private let _maskStore: VanguardMaskStore
-
-    /// Guards _active for the capture-queue submitFrame path.
-    private var _lock = os_unfair_lock_s()
-    private var _active = false
-
-    // MARK: - Init
-
-    init(segmenter: VanguardMLSegmenter = VanguardMLSegmenter(),
-         maskStore: VanguardMaskStore   = VanguardMaskStore()) {
-        _segmenter = segmenter
-        _maskStore = maskStore
-        super.init()
-    }
-
-    // MARK: - Lifecycle (main thread)
-
-    /// Configure the segmenter and start async model load.
-    /// Safe to call multiple times (idempotent after first activation).
-    func start() {
-        assert(Thread.isMainThread)
-        os_unfair_lock_lock(&_lock)
-        let alreadyActive = _active
-        os_unfair_lock_unlock(&_lock)
-        guard !alreadyActive else { return }
-
-        _segmenter.delegate = self
-        _segmenter.maskStore = _maskStore
-        _segmenter.loadModelAsync()
-
-        os_unfair_lock_lock(&_lock)
-        _active = true
-        os_unfair_lock_unlock(&_lock)
-    }
-
-    /// Deactivate, clear callbacks, and invalidate the underlying segmenter.
-    /// Idempotent — safe to call from main terminal paths.
-    func invalidate() {
-        assert(Thread.isMainThread)
-
-        os_unfair_lock_lock(&_lock)
-        _active = false
-        os_unfair_lock_unlock(&_lock)
-
-        // Clear delegate to prevent any in-flight completion firing our callback.
-        _segmenter.delegate = nil
-        onSessionFailure    = nil
-        _segmenter.invalidate()
-    }
-
-    // MARK: - Frame submission (capture queue)
-
-    /// Submit a camera frame for segmentation inference.
-    /// No-op unless the adapter is active. Non-blocking; segmenter drops frames
-    /// internally when busy/throttled/faulted.
-    func submitFrame(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
-        os_unfair_lock_lock(&_lock)
-        let active = _active
-        os_unfair_lock_unlock(&_lock)
-        guard active else { return }
-        _segmenter.submitFrame(pixelBuffer, presentationTime: presentationTime)
-    }
-
-    // MARK: - Mask snapshot retrieval (renderQueue or main thread)
-
-    /// Returns the latest segmentation mask buffer with a +1 manual retain, or nil
-    /// when:
-    ///   - no snapshot has been committed yet, or
-    ///   - the snapshot's timestamp is older than maxAgeSeconds.
-    ///
-    /// The caller MUST balance the retain (e.g. result?.release()).
-    func latestMaskRetained(maxAgeSeconds: TimeInterval = 0.18) -> Unmanaged<CVPixelBuffer>? {
-        guard let snapshot = _maskStore.latestSnapshot() else { return nil }
-
-        // Reject stale masks so a frame-level fallback is applied by the compositor
-        // rather than compositing a stale mask.
-        let age = CACurrentMediaTime() - snapshot.timestamp
-        guard age <= maxAgeSeconds else { return nil }
-
-        // Manual retain so the returned Unmanaged has a +1 the caller owns.
-        let pb = snapshot.pixelBuffer
-        _ = Unmanaged.passUnretained(pb).retain()
-        return Unmanaged.passUnretained(pb)
-    }
-}
-
-// MARK: - VanguardMLSegmenterDelegate
-
-extension VGDuetGreenScreenAdapter: VanguardMLSegmenterDelegate {
-
-    /// Called on the main queue by VanguardMLSegmenter when its state changes.
-    /// Explicit selector name matches the ObjC selector used in VanguardMLSegmenter.m:
-    /// `segmenterDidTransitionToState:`.
-    @objc(segmenterDidTransitionToState:) func segmenterDidTransition(toState state: VanguardMLState) {
-        assert(Thread.isMainThread)
-        // Vision fallback: VanguardMLStateUnloaded -> VanguardMLStateReady via Vision.
-        // This is NOT a failure.  Only the .faulted case triggers the session failure.
-        guard state == .faulted else { return }
-        onSessionFailure?()
-    }
-
-    /// Called on the main queue by the health monitor when the segmenter stalls.
-    /// Immediately surfaces the failure so the coordinator can fall back to PiP.
-    @objc func segmenterDidStall() {
-        assert(Thread.isMainThread)
-        DispatchQueue.main.async { [weak self] in
-            self?.onSessionFailure?()
-        }
-    }
-}
-
-// MARK: - Duet foreground-provider seam (Phase 4A / 4B-A)
+// MARK: - Duet foreground-provider seam
 
 /// How the Duet render loop must composite a foreground sample's `frame`.
 /// Decided per sample by the provider, never by the layout mode and never by
@@ -189,7 +44,8 @@ enum VGDuetForegroundCompositeMode {
     case matteKeyed
     /// `frame` was keyed upstream and already carries STRAIGHT (non-premultiplied)
     /// alpha in BGRA; source-over it onto the canvas.  No matte is used and no
-    /// mask refinement runs.  Phase 4B-A: no production provider emits this yet.
+    /// mask refinement runs.  The graph-backed provider emits this in production
+    /// for GreenScreen.
     case straightAlpha
 }
 
@@ -260,194 +116,9 @@ protocol VGDuetForegroundProvider: AnyObject {
     func sampleRetained() -> VGDuetForegroundSample?
 }
 
-// MARK: - VGDuetLegacyForegroundProvider
-
-/// Phase 4A legacy provider: `VGDuetCameraSource` for frames plus
-/// `VGDuetGreenScreenAdapter` (VanguardMLSegmenter) for the matte.  Emits only
-/// `.matteKeyed` (a fresh matte was actually retained) or `.opaque` samples; it
-/// never emits `.straightAlpha`.  Preserves the pre-seam Duet coordinator
-/// behavior exactly:
-///   - keying on:  adapter created, failure hook wired, adapter.start() — all BEFORE
-///                 the camera frame observer routes frames into it.  On first
-///                 bring-up the camera starts only after the observer is installed.
-///   - keying off: observer cleared, adapter dropped from the sample path, then
-///                 adapter.invalidate().
-///   - stop:       keying off, then camera observer cleared and camera stopped.
-///   - fault:      keying turned off first, then `onFault` with the legacy metadata
-///                 (`previousBackend` "vision", `reason` "adapter_faulted").
-///
-/// Threading: lifecycle on main (single writer of `_camera` / `_adapter`);
-/// `sampleRetained()` snapshots both references under `_lock` and then calls the
-/// thread-safe `snapshotRetained()` / `latestMaskRetained()` outside it.
-final class VGDuetLegacyForegroundProvider: VGDuetForegroundProvider {
-
-    /// `previousBackend` reported on fault.  The legacy adapter does not surface a
-    /// more precise backend name; this matches the pre-seam Duet event payload.
-    static let backendName = "vision"
-    /// `reason` reported when the segmenter enters VanguardMLStateFaulted or stalls.
-    static let faultReasonAdapterFaulted = "adapter_faulted"
-
-    var onFault: ((VGDuetForegroundProviderFault) -> Void)?
-
-    /// Guards `_camera` / `_adapter`.  Every read goes through `sampleRetained()`
-    /// (main or render queue) or the `cameraSnapshot()` / `adapterSnapshot()`
-    /// helpers; every write goes through `storeCamera` / `storeAdapter`.
-    private var _lock = os_unfair_lock_s()
-    private var _camera: VGDuetCameraSource?
-    private var _adapter: VGDuetGreenScreenAdapter?
-
-    /// Main-thread lifecycle flags.  `_stopped` is terminal.
-    private var _started = false
-    private var _stopped = false
-
-    init() {}
-
-    // MARK: Lifecycle (main thread)
-
-    func start(keyingEnabled: Bool) {
-        assert(Thread.isMainThread)
-        guard !_started, !_stopped else { return }
-        _started = true
-
-        // Keyer first, so frames are routed to the segmenter from the first
-        // delivered camera frame (pre-seam attach ordering).
-        if keyingEnabled {
-            enableKeying()
-        }
-
-        let camera = VGDuetCameraSource()
-        if let adapter = adapterSnapshot() {
-            camera.setFrameObserver { [weak adapter] pixelBuffer, pts in
-                adapter?.submitFrame(pixelBuffer, presentationTime: pts)
-            }
-        }
-        storeCamera(camera)
-        camera.start()
-    }
-
-    func setKeyingEnabled(_ enabled: Bool) {
-        assert(Thread.isMainThread)
-        guard !_stopped else { return }
-        if enabled {
-            enableKeying()
-        } else {
-            disableKeying()
-        }
-    }
-
-    func stop() {
-        assert(Thread.isMainThread)
-        guard !_stopped else { return }
-        _stopped = true
-        onFault = nil
-
-        // 1. Keying off: observer cleared and adapter invalidated BEFORE the camera
-        //    stops, so no frame is submitted to the segmenter after teardown begins.
-        disableKeying()
-
-        // 2. Camera: clear the observer and stop (idempotent; drains the frame slot
-        //    and the PTS-pairing history).
-        let camera = cameraSnapshot()
-        storeCamera(nil)
-        camera?.setFrameObserver(nil)
-        camera?.stop()
-    }
-
-    // MARK: Sample (main thread or render queue)
-
-    func sampleRetained() -> VGDuetForegroundSample? {
-        // One acquisition so both references are snapshotted atomically.
-        os_unfair_lock_lock(&_lock)
-        let camera  = _camera
-        let adapter = _adapter
-        os_unfair_lock_unlock(&_lock)
-
-        // Camera frame first (+1).  No frame → no sample; the matte is not fetched,
-        // so nothing is retained that would need releasing.
-        guard let frame = camera?.snapshotRetained() else { return nil }
-        // Matte (+1) only while keying is enabled (adapter present) and fresh.
-        let matte = adapter?.latestMaskRetained()
-        // Legacy keying decision, unchanged: keyed exactly when a matte was actually
-        // retained.  Never `.straightAlpha`; this provider has no upstream keyer.
-        return VGDuetForegroundSample(frame:         frame,
-                                      matte:         matte,
-                                      compositeMode: matte != nil ? .matteKeyed : .opaque)
-    }
-
-    // MARK: Private (main thread)
-
-    /// Creates, wires and starts the adapter, then routes camera frames into it.
-    /// No-op while an adapter is already active.
-    private func enableKeying() {
-        guard adapterSnapshot() == nil else { return }
-        let adapter = VGDuetGreenScreenAdapter()
-        // Wire the failure hook BEFORE adapter.start() (pre-seam ordering).
-        adapter.onSessionFailure = { [weak self, weak adapter] in
-            guard let self = self, let adapter = adapter else { return }
-            self.handleAdapterFault(adapter)
-        }
-        adapter.start()
-        storeAdapter(adapter)
-        // Route frames into the adapter.  On first bring-up `_camera` is still nil
-        // here and start() installs the observer before the camera starts.
-        cameraSnapshot()?.setFrameObserver { [weak adapter] pixelBuffer, pts in
-            adapter?.submitFrame(pixelBuffer, presentationTime: pts)
-        }
-    }
-
-    /// Clears the observer, drops the adapter from the sample path, invalidates it.
-    /// No-op while no adapter is active.
-    private func disableKeying() {
-        guard let adapter = adapterSnapshot() else { return }
-        cameraSnapshot()?.setFrameObserver(nil)
-        storeAdapter(nil)
-        adapter.invalidate()
-    }
-
-    /// Main thread (adapter delivers on main).  Ignores faults from an adapter that
-    /// is no longer the active one (already disabled or replaced).
-    private func handleAdapterFault(_ faulted: VGDuetGreenScreenAdapter) {
-        assert(Thread.isMainThread)
-        guard adapterSnapshot() === faulted else { return }
-        disableKeying()
-        onFault?(VGDuetForegroundProviderFault(
-            previousBackend: VGDuetLegacyForegroundProvider.backendName,
-            reason:          VGDuetLegacyForegroundProvider.faultReasonAdapterFaulted))
-    }
-
-    private func storeCamera(_ camera: VGDuetCameraSource?) {
-        os_unfair_lock_lock(&_lock)
-        _camera = camera
-        os_unfair_lock_unlock(&_lock)
-    }
-
-    private func storeAdapter(_ adapter: VGDuetGreenScreenAdapter?) {
-        os_unfair_lock_lock(&_lock)
-        _adapter = adapter
-        os_unfair_lock_unlock(&_lock)
-    }
-
-    /// Lock-guarded read of `_camera` for the main-thread lifecycle paths, so no
-    /// unguarded read can race with a concurrent `sampleRetained()` snapshot.
-    private func cameraSnapshot() -> VGDuetCameraSource? {
-        os_unfair_lock_lock(&_lock)
-        let camera = _camera
-        os_unfair_lock_unlock(&_lock)
-        return camera
-    }
-
-    /// Lock-guarded read of `_adapter` (see `cameraSnapshot()`).
-    private func adapterSnapshot() -> VGDuetGreenScreenAdapter? {
-        os_unfair_lock_lock(&_lock)
-        let adapter = _adapter
-        os_unfair_lock_unlock(&_lock)
-        return adapter
-    }
-}
-
 // MARK: - VGDuetGraphGreenScreenForegroundProvider
 
-/// Phase 4B-B graph-backed provider: a graph-only `VGCameraGraphSession` running a
+/// Graph-backed provider: a graph-only `VGCameraGraphSession` running a
 /// `VGGreenScreenFilterNode` (alpha output) delivers an ALREADY-keyed, straight-alpha
 /// BGRA frame per callback — no `VanguardMLSegmenter` matte, no `VanguardMetalRenderer`,
 /// no Flutter texture. Emits `.straightAlpha` while keying is enabled and `.opaque`
@@ -622,8 +293,8 @@ final class VGDuetGraphGreenScreenForegroundProvider: NSObject, VGDuetForeground
         onFault = nil
 
         if let session = _session {
-            // Best-effort keying-off before invalidation, mirroring the legacy
-            // provider's "keying off before camera teardown" ordering.
+            // Best-effort keying-off before invalidation: keying off before
+            // camera teardown.
             try? session.setCameraFilterChainFromSpecs([])
             // Detaches the graph-owned video callback; per contract this does
             // NOT stop the camera — the explicit source.stop() below does that.
@@ -683,7 +354,7 @@ final class VGDuetGraphGreenScreenForegroundProvider: NSObject, VGDuetForeground
     /// a session is live, then reports the fault. Does NOT invalidate/stop the
     /// graph or camera — a fault means "not keyed", not "no foreground feed";
     /// the coordinator falls back to PiP layout while the (unkeyed) camera feed
-    /// continues, matching the legacy provider's fault behavior.
+    /// continues.
     private func _fault() {
         assert(Thread.isMainThread)
         os_unfair_lock_lock(&_lock)

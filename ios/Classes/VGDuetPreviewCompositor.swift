@@ -70,9 +70,10 @@
 // refinement runs, and `isGreenScreen` / `greenScreenMask` are ignored for that call.  The
 // default (`false`) leaves every existing caller and the matte-keyed CIBlendWithMask path
 // byte-for-byte unchanged.  Keying is therefore decided by the caller's mode, never by
-// whether a mask happens to be non-nil.  This phase adds only the ingest path; it does NOT
-// implement or prove an upstream VGCameraGraphSession / VGGreenScreenFilterNode provider
-// feeding it.
+// whether a mask happens to be non-nil.  Straight-alpha frames may come from
+// VGGreenScreenFilterNode alpha mode via the graph-backed foreground provider
+// (VGDuetGraphGreenScreenForegroundProvider); this compositor remains unaware of
+// ML/matte policy — it only composites whatever it is handed.
 //
 // Production stack & physical proof summary:
 // iOS live green-screen edge smoothness A/B S1: Vision Fast default + compositor refinement
