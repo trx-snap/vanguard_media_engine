@@ -73,6 +73,12 @@
 #import <os/log.h>
 
 static os_log_t sExportHelperLog;
+static dispatch_queue_t sTimelineExportLockQueue;
+static VGExportScheduler * _Nullable sActiveExportScheduler;
+static BOOL sActiveExportCancelled;
+static BOOL sPreparationInProgress;
+static VGVideoEncoderSinkNode * _Nullable sActiveSinkNode;
+static VGTimelineCompositorNode * _Nullable sActiveCompositorNode;
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,6 +93,7 @@ static os_log_t sExportHelperLog;
         dispatch_once(&once, ^{
             sExportHelperLog = os_log_create("com.vanguard.engine",
                                              "VGTimelineExportHelper");
+            sTimelineExportLockQueue = dispatch_queue_create("com.vanguard.export.timeline.lock", DISPATCH_QUEUE_SERIAL);
         });
     }
 }
@@ -620,6 +627,13 @@ static os_log_t sExportHelperLog;
     // The group barrier ensures we do not start the scheduler until all nodes
     // are ready. Follows the VGVideoExportSession._prepareAllNodesWithCompletion:
     // pattern.
+    dispatch_sync(sTimelineExportLockQueue, ^{
+        sActiveExportCancelled = NO;
+        sPreparationInProgress = YES;
+        sActiveSinkNode = sinkNode;
+        sActiveCompositorNode = compositor;
+    });
+
     dispatch_group_t prepGroup = dispatch_group_create();
     dispatch_queue_t prepQueue =
         dispatch_queue_create("com.vanguard.export.prepare.timeline", DISPATCH_QUEUE_SERIAL);
@@ -694,6 +708,29 @@ static os_log_t sExportHelperLog;
     }
 
     dispatch_group_notify(prepGroup, prepQueue, ^{
+        __block BOOL cancelledEarly = NO;
+        dispatch_sync(sTimelineExportLockQueue, ^{
+            sPreparationInProgress = NO;
+            sActiveSinkNode = nil;
+            sActiveCompositorNode = nil;
+            cancelledEarly = sActiveExportCancelled;
+        });
+
+        if (cancelledEarly) {
+            os_log(sExportHelperLog, "[cancelActiveExport] cancelled before scheduler started");
+            [strongSink invalidate];
+            [strongCompositor invalidate];
+            if (capturedHasSidecar) {
+                [[NSFileManager defaultManager] removeItemAtPath:capturedVideoWrite error:nil];
+            }
+            completion(NO, nil, 0.0, [NSError errorWithDomain:@"VGTimelineExportHelper"
+                                                         code:999
+                                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"EXPORT_CANCELLED"
+            }]);
+            return;
+        }
+
         NSError *prepError = firstPrepareError;
 
         if (prepError) {
@@ -754,7 +791,9 @@ static os_log_t sExportHelperLog;
         // failure → invalidate sink (cancel AVAssetWriter) then propagate error.
         // MOD-6: sink invalidation on all failure paths.
         scheduler.completionHandler = ^(BOOL success, NSError * _Nullable schedError) {
-
+            dispatch_sync(sTimelineExportLockQueue, ^{
+                sActiveExportScheduler = nil;
+            });
 
             if (success) {
                 // Pull loop reached EOS — finalize: flush VT encoder + finish AVAssetWriter.
@@ -843,21 +882,82 @@ static os_log_t sExportHelperLog;
                 // An explicit invalidate call here triggers node invalidation for
                 // any remaining nodes. Safe to call even after loop exits.
                 [scheduler invalidate];
-                NSError *err = schedError ?: [NSError
-                    errorWithDomain:@"VGTimelineExportHelper"
-                               code:31
-                           userInfo:@{
-                    NSLocalizedDescriptionKey: @"Export scheduler failed or was cancelled"
-                }];
+                if (capturedHasSidecar) {
+                    [[NSFileManager defaultManager] removeItemAtPath:capturedVideoWrite error:nil];
+                }
+
+                __block BOOL wasCancelled = NO;
+                dispatch_sync(sTimelineExportLockQueue, ^{
+                    wasCancelled = sActiveExportCancelled;
+                });
+                if (!wasCancelled && schedError != nil) {
+                    if ([schedError.domain isEqualToString:@"VGExportScheduler"] && schedError.code == 1) {
+                        wasCancelled = YES;
+                    }
+                }
+
+                NSError *err = wasCancelled
+                    ? [NSError errorWithDomain:@"VGTimelineExportHelper"
+                                          code:999
+                                      userInfo:@{
+                        NSLocalizedDescriptionKey: @"EXPORT_CANCELLED"
+                    }]
+                    : (schedError ?: [NSError errorWithDomain:@"VGTimelineExportHelper"
+                                                         code:31
+                                                     userInfo:@{
+                        NSLocalizedDescriptionKey: @"Export scheduler failed or was cancelled"
+                    }]);
 
                 completion(NO, nil, 0.0, err);
             }
         };
 
+        dispatch_sync(sTimelineExportLockQueue, ^{
+            if (sActiveExportCancelled) {
+                cancelledEarly = YES;
+            } else {
+                sActiveExportScheduler = scheduler;
+            }
+        });
+
+        if (cancelledEarly) {
+            os_log(sExportHelperLog, "[cancelActiveExport] cancelled immediately after scheduler creation");
+            [strongSink invalidate];
+            [scheduler invalidate];
+            if (capturedHasSidecar) {
+                [[NSFileManager defaultManager] removeItemAtPath:capturedVideoWrite error:nil];
+            }
+            completion(NO, nil, 0.0, [NSError errorWithDomain:@"VGTimelineExportHelper"
+                                                         code:999
+                                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"EXPORT_CANCELLED"
+            }]);
+            return;
+        }
+
         // Start the pull loop asynchronously on the scheduler's internal queue.
         [scheduler startExport];
         os_log(sExportHelperLog, "[8.14A] VGExportScheduler started");
     });
+}
+
++ (BOOL)cancelActiveExport {
+    __block BOOL cancelled = NO;
+    dispatch_sync(sTimelineExportLockQueue, ^{
+        if (sActiveExportScheduler != nil) {
+            sActiveExportCancelled = YES;
+            [sActiveExportScheduler cancelExport];
+            cancelled = YES;
+            os_log(sExportHelperLog, "[cancelActiveExport] cancelled active scheduler");
+        } else if (sPreparationInProgress) {
+            sActiveExportCancelled = YES;
+            [sActiveSinkNode invalidate];
+            [sActiveCompositorNode invalidate];
+            cancelled = YES;
+            os_log(sExportHelperLog, "[cancelActiveExport] cancelled during preparation");
+        }
+    });
+    return cancelled;
 }
 
 @end

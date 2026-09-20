@@ -740,4 +740,14 @@ void main() {
       expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
     },
   );
+
+  // ── EX-9 ─────────────────────────────────────────────────────────────────────
+  test('EX-9: cancelExport sends method name cancelExport', () async {
+    setHandler((call) async => null);
+
+    await VanguardTimelineExporter.cancelExport(channel: channel);
+
+    expect(capturedCalls.length, 1);
+    expect(capturedCalls.first.method, 'cancelExport');
+  });
 }

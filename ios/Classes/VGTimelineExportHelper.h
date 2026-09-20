@@ -304,6 +304,15 @@ NS_ASSUME_NONNULL_BEGIN
                                          NSTimeInterval durationSeconds,
                                          NSError * _Nullable error))completion;
 
+/// Cancels the currently active timeline export, if any.
+///
+/// Thread-safe. Non-blocking: signals cancellation to the active VGExportScheduler
+/// (or aborts the pending preparation barrier) and ensures the completionHandler
+/// fires with an EXPORT_CANCELLED error.
+///
+/// @return YES if an active export was cancelled; NO if no export was in progress.
++ (BOOL)cancelActiveExport;
+
 /// init is unavailable. Use class methods only.
 - (instancetype)init NS_UNAVAILABLE;
 

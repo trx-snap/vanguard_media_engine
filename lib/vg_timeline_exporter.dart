@@ -199,4 +199,12 @@ final class VanguardTimelineExporter {
       }
     }
   }
+
+  /// Signals cancellation of any in-progress native export (timeline,
+  /// passthrough remux, or normalization) on iOS or Android.
+  static Future<void> cancelExport({
+    MethodChannel channel = _defaultChannel,
+  }) async {
+    await channel.invokeMethod('cancelExport');
+  }
 }

@@ -803,7 +803,9 @@ class VanguardEngine {
       _channel.invokeMethod('dispose', {'textureId': id}); // fire-and-forget
     }
     _activeRenderers.clear();
-    _VanguardFFI.destroy(_enginePtr);
+    if (_enginePtr != nullptr) {
+      _VanguardFFI.destroy(_enginePtr);
+    }
   }
 
   /// T10: Reads the last error code from the C++ layer.
@@ -1602,6 +1604,8 @@ class VanguardEngine {
       await _channel.invokeMethod('dispose', {'textureId': id});
     }
     _activeRenderers.clear();
-    _VanguardFFI.destroy(_enginePtr);
+    if (_enginePtr != nullptr) {
+      _VanguardFFI.destroy(_enginePtr);
+    }
   }
 }

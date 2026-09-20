@@ -1924,6 +1924,9 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
                                     : _activeToken.timelineGeneration;
   [self _cancelAndIncrementSerial:gen];
 
+  NSError *sessionErr = nil;
+  [[AVAudioSession sharedInstance] setActive:YES error:&sessionErr];
+
   [_engine prepare];
   NSError *engineErr = nil;
   BOOL started = [_engine startAndReturnError:&engineErr];

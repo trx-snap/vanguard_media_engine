@@ -3731,12 +3731,24 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                             "fps":             Int(exportFps),
                         ] as [String: Any])
                     } else {
-                        let msg = error?.localizedDescription
-                                  ?? "Production timeline export failed (unknown error)"
-                        result(FlutterError(
-                            code: "COMPOSITOR_INIT_FAILED",
-                            message: msg,
-                            details: nil))
+                        let nsErr = error as NSError?
+                        let isCancelled = nsErr?.userInfo[NSLocalizedDescriptionKey] as? String == "EXPORT_CANCELLED"
+                            || (nsErr?.domain == "VGExportScheduler" && nsErr?.code == 1)
+                            || nsErr?.localizedDescription.contains("EXPORT_CANCELLED") == true
+
+                        if isCancelled {
+                            result(FlutterError(
+                                code: "EXPORT_CANCELLED",
+                                message: "Timeline export cancelled",
+                                details: nil))
+                        } else {
+                            let msg = error?.localizedDescription
+                                      ?? "Production timeline export failed (unknown error)"
+                            result(FlutterError(
+                                code: "COMPOSITOR_INIT_FAILED",
+                                message: msg,
+                                details: nil))
+                        }
                     }
                 }
             }
@@ -4529,9 +4541,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             )
 
         case "cancelExport":
+            let timelineCancelled = VGTimelineExportHelper.cancelActiveExport()
             activeExportSession?.cancel()
             activeExportSession = nil
             currentMode = .idle
+            NSLog("[VanguardMediaEnginePlugin] cancelExport: timelineCancelled=%@", String(timelineCancelled))
             result(nil)
 
         // ── Audio Extraction ──────────────────────────────────────────────────
