@@ -32,10 +32,19 @@ NS_ASSUME_NONNULL_BEGIN
 /// Builds a linear camera graph:
 ///   - Source: wrapped in VGCameraSourceAdapter
 ///   - Filters: wrapped in VGLegacyFilterAdapter / VGMetadataNodeAdapter
-///   - Sink: composite VGFanOutSink wrapping:
-///       • VGRendererSinkAdapter (always, first child)
-///       • platformViewSink (optional, second child when non-nil)
-///       • VGRecordingSinkNode (always, last child, disabled — Phase 6E.1B)
+///   - Sink: composite VGFanOutSink wrapping, in order:
+///       • VGRendererSinkAdapter (first child; present when renderer is non-nil)
+///       • platformViewSink (processed-output receiver sink; present when non-nil)
+///       • VGRecordingSinkNode (always, disabled — Phase 6E.1B)
+///       • VGPhotoSinkNode (always, last child)
+///
+/// Exactly one preview-class sink is mandatory: renderer may be nil ONLY when
+/// platformViewSink is non-nil (graph-only consumers such as the Duet
+/// foreground provider, see VGCameraGraphSession
+/// -initWithSource:processedFrameReceiver:error:). In that mode no
+/// VGRendererSinkAdapter is created and the fan-out is
+/// platformViewSink + recording + photo. When renderer is non-nil the
+/// behaviour is byte-for-byte the pre-existing one.
 ///
 /// Edge policy:
 ///   - Intermediate transform-to-transform edges: synchronous, no admission policy.
@@ -44,21 +53,26 @@ NS_ASSUME_NONNULL_BEGIN
 /// @param source            The camera media source. Must not be nil.
 /// @param filterChain       Optional ordered list of id<VanguardFilterNode> (or VGSegmentationNode).
 ///                          nil treated as empty.
-/// @param renderer          The Metal renderer sink. Must not be nil.
-/// @param platformViewSink  Optional VGFrameSink for PlatformView delivery (POC2).
-///                          When nil: single-child VGFanOutSink (original behaviour).
-///                          When non-nil: two-child VGFanOutSink — renderer first, then platform view.
+/// @param renderer          The Metal renderer sink. May be nil only when
+///                          platformViewSink is non-nil; nil otherwise is an error (code 4).
+/// @param platformViewSink  Optional VGFrameSink receiving the processed graph output
+///                          (VGPlatformViewSinkAdapter → VanguardCameraFrameReceiver;
+///                          PlatformView/MTKView or any other processed-frame consumer).
+///                          When nil with a renderer: renderer + recording + photo (original behaviour).
+///                          When non-nil with a renderer: renderer first, then this sink.
+///                          When non-nil without a renderer: this sink first.
 /// @param outError          On failure, set to a descriptive NSError.
 /// @return A dictionary containing keys @"descriptor", @"nodes", and @"plan" on success, or nil on failure.
 + (nullable NSDictionary<NSString *, id> *)
     buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
                    filterChain:(nullable NSArray *)filterChain
-                      renderer:(VanguardMetalRenderer *)renderer
+                      renderer:(nullable VanguardMetalRenderer *)renderer
               platformViewSink:(nullable id<VGFrameSink>)platformViewSink
                          error:(NSError * _Nullable * _Nullable)outError;
 
 /// Convenience overload without platformViewSink (original single-renderer fan-out behaviour).
 /// Calls buildCameraGraphWithSource:filterChain:renderer:platformViewSink:error: with nil.
+/// renderer must not be nil here (there is no other preview-class sink).
 + (nullable NSDictionary<NSString *, id> *)
     buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
                    filterChain:(nullable NSArray *)filterChain

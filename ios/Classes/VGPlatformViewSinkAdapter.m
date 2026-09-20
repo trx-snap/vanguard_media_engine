@@ -83,18 +83,19 @@
 
     // Extract CVPixelBufferRef. Per VGFrameEnvelope contract, payload.videoBuffer
     // is a void* cast of a CVPixelBufferRef at +0. We cast it and pass at +0 to
-    // onFrame:pts: — VanguardCameraPlatformView retains it via Swift ARC on
-    // assignment to latestBuffer. No extra CVPixelBufferRetain needed here.
+    // onFrame:pts: — the receiver retains what it keeps (VanguardCameraPlatformView
+    // via Swift ARC on assignment to latestBuffer; the Duet graph provider via an
+    // explicit +1). No extra CVPixelBufferRetain needed here.
     CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)envelope.payload.videoBuffer;
     if (!pixelBuffer) return;
 
-    // One-shot log — first graph frame delivered to PlatformView sink.
+    // One-shot log — first graph frame delivered to the receiver sink.
     if (!_poc2FirstFrameLogged) {
         _poc2FirstFrameLogged = YES;
-        NSLog(@"[Vanguard] POC2: first graph frame delivered to PlatformView sink ✓");
+        NSLog(@"[Vanguard] first graph frame delivered to processed-frame receiver sink ✓");
     }
 
-    // Forward to VanguardCameraPlatformView.onFrame:pts: (Swift).
+    // Forward to the receiver's onFrame:pts:.
     // This call is on com.vanguard.cameraGraphExecution (graph exec queue) —
     // onFrame:pts: performs a fast os_unfair_lock swap and returns immediately.
     [r onFrame:pixelBuffer pts:envelope.pts];

@@ -138,7 +138,7 @@
 + (nullable NSDictionary<NSString *, id> *)
     buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
                    filterChain:(nullable NSArray *)filterChain
-                      renderer:(VanguardMetalRenderer *)renderer
+                      renderer:(nullable VanguardMetalRenderer *)renderer
              platformViewSink:(nullable id<VGFrameSink>)platformViewSink
                          error:(NSError * _Nullable * _Nullable)outError
 {
@@ -153,12 +153,16 @@
         }
         return nil;
     }
-    if (!renderer) {
+    // A preview-class sink is mandatory: either the renderer (original
+    // contract) or a processed-output sink (graph-only mode). renderer nil
+    // without a sink is the pre-existing error (code 4).
+    if (!renderer && !platformViewSink) {
         if (outError) {
             *outError = [NSError errorWithDomain:@"VGCameraGraphFactory"
                                             code:4
                                         userInfo:@{
-                NSLocalizedDescriptionKey: @"VGCameraGraphFactory: renderer must not be nil."
+                NSLocalizedDescriptionKey: @"VGCameraGraphFactory: renderer must not be nil "
+                                            "unless a processed-output sink is supplied."
             }];
         }
         return nil;
@@ -188,7 +192,10 @@
     }
 
     // ── (d) Wrap renderer and construct composite VGFanOutSink ─────────────────
-    VGRendererSinkAdapter *rendererSinkAdapter = [[VGRendererSinkAdapter alloc] initWithRenderer:renderer];
+    // Renderer sink only when a renderer exists (graph-only mode has none and
+    // must not register or touch any Flutter texture).
+    VGRendererSinkAdapter *rendererSinkAdapter =
+        renderer ? [[VGRendererSinkAdapter alloc] initWithRenderer:renderer] : nil;
 
     // Phase 6E.1B: Instantiate the recording sink. Disabled by default — presentEnvelope:
     // is an immediate no-op in this step. Held as last child of VGFanOutSink so the
@@ -205,19 +212,25 @@
     VGPhotoSinkNode *photoSink =
         [[VGPhotoSinkNode alloc] initWithNodeId:@"camera_photo_sink"];
 
-    // POC2: when platformViewSink is provided, include it as a second child of
-    // VGFanOutSink so graph output (post-Beauty-V2) reaches the MTKView PlatformView.
-    // When nil: original single-child behaviour is preserved exactly.
+    // Fan-out order: renderer (when present), processed-output sink (when
+    // present), recording sink, photo sink. With a renderer and no sink the
+    // original three-child behaviour is preserved exactly; with a sink and no
+    // renderer (graph-only mode) the processed-output sink is the first child.
     // Recording sink and photo sink are always appended last.
     NSArray<id<VGFrameSink>> *sinkChildren;
-    if (platformViewSink) {
+    if (rendererSinkAdapter && platformViewSink) {
         sinkChildren = @[ rendererSinkAdapter, platformViewSink, recordingSink, photoSink ];
         NSLog(@"[VGCameraGraphFactory] Phase 6E.2A: building four-child VGFanOutSink "
-               "(renderer + platformView + recordingSink + photoSink[skeleton])");
-    } else {
+               "(renderer + processedOutput + recordingSink + photoSink[skeleton])");
+    } else if (rendererSinkAdapter) {
         sinkChildren = @[ rendererSinkAdapter, recordingSink, photoSink ];
         NSLog(@"[VGCameraGraphFactory] Phase 6E.2A: building three-child VGFanOutSink "
                "(renderer + recordingSink + photoSink[skeleton])");
+    } else {
+        // Guard (a) guarantees platformViewSink is non-nil here.
+        sinkChildren = @[ platformViewSink, recordingSink, photoSink ];
+        NSLog(@"[VGCameraGraphFactory] graph-only: building three-child VGFanOutSink "
+               "(processedOutput + recordingSink + photoSink[skeleton]; no renderer)");
     }
 
     VGFanOutSink *fanOutSink = [[VGFanOutSink alloc] initWithNodeId:@"fan_out_sink"

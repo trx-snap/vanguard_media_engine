@@ -5,6 +5,19 @@
 // It instantiates the graph components, coordinates preparation, manages execution
 // state, wires up delegates, and handles thread-safe, idempotent teardown.
 //
+// Two ingress modes (fixed at init, identical graph/filter/recording/photo
+// behaviour in both):
+//   - renderer mode (initWithSource:renderer:error:): the session is the
+//     VanguardMetalRenderer's frameDelegate and graph output reaches the
+//     Flutter texture through VGRendererSinkAdapter.
+//   - graph-only mode (initWithSource:processedFrameReceiver:error:): no
+//     VanguardMetalRenderer is created and no Flutter texture is registered.
+//     The session installs the camera source's video callback itself and the
+//     graph output (post filter chain, e.g. VGGreenScreenFilterNode alpha
+//     frames) is delivered to a VanguardCameraFrameReceiver via
+//     VGPlatformViewSinkAdapter. Used by consumers that composite the
+//     processed stream themselves (Duet foreground provider).
+//
 
 #pragma once
 
@@ -32,6 +45,80 @@ NS_ASSUME_NONNULL_BEGIN
                                renderer:(VanguardMetalRenderer *)renderer
                                   error:(NSError * _Nullable * _Nullable)outError NS_DESIGNATED_INITIALIZER;
 
+/// Graph-only designated initializer (no Flutter renderer, no texture).
+///
+/// Builds, validates, and plans the camera graph via VGCameraGraphFactory with
+/// NO VGRendererSinkAdapter: the VGFanOutSink fans out to a
+/// VGPlatformViewSinkAdapter wrapping @c receiver (first child) plus the
+/// recording and photo sinks. No VanguardMetalRenderer is instantiated and no
+/// Flutter texture is registered.
+///
+/// Ingress: the session installs @c source's video callback itself (before the
+/// scheduler starts and before the caller starts the source). Each callback
+/// buffer arrives +1 retained (VanguardCameraMediaSource contract); the session
+/// forwards it through the same async didReceiveRawFrame: boundary as renderer
+/// mode and releases the callback-owned retain exactly once. No GPU rotation
+/// is applied: the caller must have locked the source orientation before
+/// starting it.
+///
+/// Egress: graph-processed frames (after the committed filter chain) reach
+/// @c receiver's onFrame:pts: at +0 on the graph execution queue
+/// (com.vanguard.cameraGraphExecution). The receiver must retain what it keeps.
+/// The receiver is held WEAKLY (VGPlatformViewSinkAdapter contract) and must
+/// outlive the session.
+///
+/// Every other public method (filter chain, recording, photo, hot updates,
+/// diagnostics, invalidate) behaves exactly as in renderer mode.
+///
+/// @param source   The camera media source. Must not be nil. Must not have
+///                 been started yet (callback is installed here).
+/// @param receiver Processed-frame consumer. Must not be nil.
+/// @param outError On failure, set to a descriptive NSError.
+/// @return An initialized graph session instance, or nil if creation failed.
+///         On failure the source's video callback is left untouched.
+///
+/// Convenience wrapper for -initWithSource:processedFrameReceiver:initialFilterSpecs:error:
+/// with nil initial specs (plain passthrough graph-only session).
+- (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
+                 processedFrameReceiver:(id<VanguardCameraFrameReceiver>)receiver
+                                  error:(NSError * _Nullable * _Nullable)outError;
+
+/// Graph-only designated initializer with an initial filter chain built into the
+/// graph BEFORE the scheduler (and therefore the camera source) starts.
+///
+/// Identical to -initWithSource:processedFrameReceiver:error: in every respect
+/// except: when @c initialFilterSpecs is non-nil/non-empty, the specs are
+/// validated and the corresponding filter nodes constructed using the same
+/// policy as -setCameraFilterChainFromSpecs:error:, and that chain is what the
+/// initial VGCameraGraphFactory graph build uses — i.e. the very first frame
+/// the scheduler dispatches (scheduler start calls the camera source's
+/// startProducing, which starts the underlying AVCaptureSession) already
+/// passes through the requested filter chain. There is no window in which an
+/// unfiltered frame can reach @c receiver.
+///
+/// This is all-or-nothing: if @c initialFilterSpecs fails validation or the
+/// required pool/Metal device resources are unavailable, initialization fails
+/// entirely (no graph, no camera start, source callback left untouched) rather
+/// than falling back to an unkeyed/passthrough graph. -hasActiveFilters and
+/// -activeFilterSpecs reflect the committed initial specs only after the
+/// entire graph (including scheduler creation) has succeeded.
+///
+/// @param source             The camera media source. Must not be nil. Must
+///                           not have been started yet.
+/// @param receiver           Processed-frame consumer. Must not be nil.
+/// @param initialFilterSpecs Optional filter specs (same contract as
+///                           -setCameraFilterChainFromSpecs:error:) to build
+///                           into the graph at construction time. nil or empty
+///                           means passthrough, identical to
+///                           -initWithSource:processedFrameReceiver:error:.
+/// @param outError           On failure, set to a descriptive NSError.
+/// @return An initialized graph session instance, or nil if creation failed.
+///         On failure the source's video callback is left untouched.
+- (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
+                 processedFrameReceiver:(id<VanguardCameraFrameReceiver>)receiver
+                     initialFilterSpecs:(nullable NSArray<NSDictionary *> *)initialFilterSpecs
+                                  error:(NSError * _Nullable * _Nullable)outError NS_DESIGNATED_INITIALIZER;
+
 - (instancetype)init NS_UNAVAILABLE;
 
 // ─── Phase [Beauty-Still]: Active filter state for offline still export ───────
@@ -51,9 +138,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Invalidates and tears down the graph session.
 ///
-/// Idempotent. Clears the renderer's frame delegate to prevent any further frame callbacks
-/// from reaching the scheduler, invalidates the scheduler, transitions the context
-/// state, and releases retained graph resources.
+/// Idempotent. Clears the renderer's frame delegate (renderer mode) or replaces
+/// the source's video callback with a balancing release-only callback
+/// (graph-only mode) to prevent any further frame callbacks from reaching the
+/// scheduler, invalidates the scheduler, transitions the context state, and
+/// releases retained graph resources. Does NOT stop the camera source.
 - (void)invalidate;
 
 /// Rebuilds the camera graph with the given filter chain and swaps the active
@@ -272,24 +361,30 @@ NS_ASSUME_NONNULL_BEGIN
 /// MUST NOT be called from _sessionQueue or _graphExecutionQueue (deadlock).
 - (nullable NSDictionary<NSString *, id> *)filterChainDiagnosticsSnapshot;
 
-// ─── POC2: Platform View graph delivery ──────────────────────────────────────
+// ─── Processed-frame receiver graph delivery ─────────────────────────────────
 
-/// Wires a VanguardCameraFrameReceiver (typically VanguardCameraPlatformView) as
-/// a second child of the VGFanOutSink so graph-processed frames (including
-/// Beauty V2 output) are delivered to the MTKView PlatformView.
+/// Wires (or replaces) a VanguardCameraFrameReceiver as a child of the
+/// VGFanOutSink so graph-processed frames (after the committed filter chain)
+/// are delivered to it via VGPlatformViewSinkAdapter at +0 on the graph
+/// execution queue.
 ///
 /// Behaviour:
-///   - Creates a VGPlatformViewSinkAdapter wrapping the receiver.
-///   - Triggers a graph rebuild via setCameraFilterChain: (preserving the
-///     current filter chain) so the two-child VGFanOutSink is installed.
+///   - Creates a VGPlatformViewSinkAdapter wrapping the receiver (held weakly).
+///   - Rebuilds the graph preserving the current filter chain so the fan-out
+///     includes the receiver sink (renderer mode: renderer + receiver +
+///     recording + photo; graph-only mode: receiver + recording + photo).
 ///   - POC1 raw direct forwarding is disabled on the camera source
 ///     (platformViewRawForwardingEnabled = NO) to prevent double delivery.
 ///
-/// Returns YES on success, NO if the session is invalidated or rebuild fails.
+/// Returns YES on success, NO if the session is invalidated, the receiver is
+/// nil, the source/renderer is gone, or the rebuild fails (current graph kept).
 ///
-/// Thread-safe: serialized on _sessionQueue.
-///
-/// POC2 ONLY — Remove before Phase 7 / production.
+/// Thread-safe: serialized on _sessionQueue. MUST NOT be called from
+/// _sessionQueue (deadlock).
+- (BOOL)connectProcessedFrameReceiver:(id<VanguardCameraFrameReceiver>)receiver;
+
+/// POC2-era selector kept for existing callers (VanguardCameraPlatformView /
+/// MTKView delivery). Identical to -connectProcessedFrameReceiver:.
 - (BOOL)connectPlatformViewReceiver:(id<VanguardCameraFrameReceiver>)receiver;
 
 @end

@@ -21,6 +21,17 @@
 //   the buffer as source-owned (does not release it). After the scheduler returns
 //   we CVPixelBufferRelease our +1.
 //
+// Graph-only mode (initWithSource:processedFrameReceiver:error:):
+//   There is no VanguardMetalRenderer. The session installs the camera
+//   source's video callback itself (_installGraphOnlyVideoCallback). The
+//   callback receives the +1 callback-owned buffer
+//   (VanguardCameraMediaSource.m _videoCallback(CVPixelBufferRetain(...))),
+//   wraps it in a VGFrameEnvelope, calls didReceiveRawFrame: (which takes its
+//   own +1 exactly as above) and then releases the callback-owned +1 exactly
+//   once on every path. No GPU rotation: the caller locks orientation on the
+//   source before starting it. On invalidate the callback is replaced by a
+//   release-only balancing callback before _source is dropped.
+//
 // Scheduler hot-swap safety:
 //   The async block captures the *current* scheduler at enqueue time as a local
 //   strong reference. Even if setCameraFilterChain: swaps _scheduler on the
@@ -243,6 +254,21 @@ _VGStillCreatePool(size_t width, size_t height) {
 - (BOOL)_queryDimensionsWidth:(size_t *)outWidth height:(size_t *)outHeight;
 - (id)_sessionPool;
 - (NSUInteger)_sessionPoolBytes;
+// Shared body of both designated initializers. Exactly one of renderer /
+// receiver is non-nil. Returns NO (with outError) when the session could not
+// be built; the caller then returns nil from init.
+- (BOOL)_setupWithSource:(VanguardCameraMediaSource *)source
+                renderer:(nullable VanguardMetalRenderer *)renderer
+  processedFrameReceiver:(nullable id<VanguardCameraFrameReceiver>)receiver
+      initialFilterSpecs:(nullable NSArray<NSDictionary *> *)initialFilterSpecs
+                   error:(NSError * _Nullable * _Nullable)outError;
+- (void)_installGraphOnlyVideoCallback;
+// Shared validation/construction policy for both setCameraFilterChainFromSpecs:error:
+// and the initial-filter-specs initializer. specs must be non-nil/non-empty
+// (callers handle the empty/clear case themselves). Mutation-free: only
+// constructs filter node objects, never touches session/graph state.
+- (nullable NSArray<id<VGMetalFilterNode>> *)_buildFilterNodesFromSpecs:(NSArray<NSDictionary *> *)specs
+                                                                    error:(NSError * _Nullable * _Nullable)outError;
 @end
 
 @implementation VGCameraGraphSession {
@@ -263,9 +289,16 @@ _VGStillCreatePool(size_t width, size_t height) {
     // the in-flight block completes.
     _Atomic(BOOL) _graphInFlight;
 
-    // POC2: optional platform view sink. Set by connectPlatformViewReceiver:.
+    // Optional processed-frame receiver sink. Set at init in graph-only mode
+    // (initWithSource:processedFrameReceiver:error:) or later by
+    // connectProcessedFrameReceiver: / connectPlatformViewReceiver:.
     // Retained strongly — the VGPlatformViewSinkAdapter itself holds _receiver weakly.
     VGPlatformViewSinkAdapter *_platformViewSink;
+
+    // YES when built by initWithSource:processedFrameReceiver:error: — no
+    // VanguardMetalRenderer exists, the session owns the source video callback,
+    // and _platformViewSink is mandatory (the only preview-class sink).
+    BOOL _graphOnlyMode;
 
     // POC2: cache the most recent filter chain so connectPlatformViewReceiver:
     // can trigger a rebuild that preserves the current filter state.
@@ -292,6 +325,23 @@ _VGStillCreatePool(size_t width, size_t height) {
     // Delta-since-commit count of frames dropped by the _graphInFlight guard
     // (incremented on the capture queue in didReceiveRawFrame:).
     _Atomic(uint64_t) _graphDroppedBusyCounter;
+}
+
+// Deep-copies a validated specs array (including nested "parameters" dictionaries)
+// for committing to _activeFilterSpecs, so the stored snapshot is immutable and
+// isolated from any later mutation of the caller's original spec objects. Shared
+// by the initial-filter-specs initializer and setCameraFilterChainFromSpecs:error:.
+static NSArray<NSDictionary *> *_VGDeepCopyFilterSpecs(NSArray<NSDictionary *> *specs) {
+    NSMutableArray<NSDictionary *> *specsCopy = [NSMutableArray arrayWithCapacity:specs.count];
+    for (NSDictionary *spec in specs) {
+        NSMutableDictionary *specCopy = [spec mutableCopy];
+        id params = spec[@"parameters"];
+        if ([params isKindOfClass:[NSDictionary class]]) {
+            specCopy[@"parameters"] = [(NSDictionary *)params copy];
+        }
+        [specsCopy addObject:[specCopy copy]];
+    }
+    return [specsCopy copy];
 }
 
 // [Beauty-Still]: hasActiveFilters and activeFilterSpecs are backed by _activeFilterSpecs ivar.
@@ -335,9 +385,76 @@ _VGStillCreatePool(size_t width, size_t height) {
     if (!self) {
         return nil;
     }
+    if (![self _setupWithSource:source
+                       renderer:renderer
+         processedFrameReceiver:nil
+             initialFilterSpecs:nil
+                          error:outError]) {
+        return nil;
+    }
+    return self;
+}
 
+- (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
+                 processedFrameReceiver:(id<VanguardCameraFrameReceiver>)receiver
+                                  error:(NSError * _Nullable * _Nullable)outError
+{
+    return [self initWithSource:source
+         processedFrameReceiver:receiver
+             initialFilterSpecs:nil
+                           error:outError];
+}
+
+- (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
+                 processedFrameReceiver:(id<VanguardCameraFrameReceiver>)receiver
+                     initialFilterSpecs:(nullable NSArray<NSDictionary *> *)initialFilterSpecs
+                                  error:(NSError * _Nullable * _Nullable)outError
+{
+    // ── (a) Guard inputs ──────────────────────────────────────────────────────
+    if (!source || !receiver) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"VGCameraGraphSession"
+                                            code:102
+                                        userInfo:@{
+                NSLocalizedDescriptionKey: @"VGCameraGraphSession: source and processedFrameReceiver must not be nil."
+            }];
+        }
+        return nil;
+    }
+
+    self = [super init];
+    if (!self) {
+        return nil;
+    }
+    if (![self _setupWithSource:source
+                       renderer:nil
+         processedFrameReceiver:receiver
+             initialFilterSpecs:initialFilterSpecs
+                          error:outError]) {
+        return nil;
+    }
+    return self;
+}
+
+// Shared initializer body. Renderer mode when renderer != nil (receiver nil);
+// graph-only mode when receiver != nil (renderer nil). Steps (b)–(e) are the
+// pre-existing renderer-mode sequence; graph-only mode differs only in the
+// sink set handed to the factory and in the ingress wiring at step (e).
+- (BOOL)_setupWithSource:(VanguardCameraMediaSource *)source
+                renderer:(nullable VanguardMetalRenderer *)renderer
+  processedFrameReceiver:(nullable id<VanguardCameraFrameReceiver>)receiver
+      initialFilterSpecs:(nullable NSArray<NSDictionary *> *)initialFilterSpecs
+                   error:(NSError * _Nullable * _Nullable)outError
+{
     _source = source;
     _renderer = renderer;
+    _graphOnlyMode = (renderer == nil);
+    if (_graphOnlyMode) {
+        // Graph-only: the receiver sink exists from the first graph build so
+        // the very first processed frame reaches the consumer. Held strongly
+        // here; the adapter holds the receiver weakly.
+        _platformViewSink = [[VGPlatformViewSinkAdapter alloc] initWithReceiver:receiver];
+    }
     atomic_init(&_invalidated, NO);
     atomic_init(&_graphInFlight, NO);
     atomic_init(&_graphDroppedBusyCounter, 0);
@@ -377,18 +494,43 @@ _VGStillCreatePool(size_t width, size_t height) {
         _sessionPoolBytes = 0;
     }
 
+    // ── (a.1) Build the initial filter chain, if requested, BEFORE the graph is
+    // built and BEFORE the scheduler/source start below. This uses the exact
+    // same validation/construction policy as setCameraFilterChainFromSpecs:error:
+    // (via _buildFilterNodesFromSpecs:error:) so an invalid or resource-starved
+    // initial spec fails initialization outright — mutation-free until this
+    // point, so a failure here leaves the source's video callback untouched.
+    // This closes the race where VGGraphSchedulerV2.startWithClock: (below)
+    // starts the camera source (via VGCameraSourceAdapter.startProducing ->
+    // VanguardCameraMediaSource.start) before a caller-applied filter chain is
+    // installed: with a non-empty initialFilterSpecs, the very first frame the
+    // scheduler dispatches already passes through the requested chain.
+    NSArray<id<VGMetalFilterNode>> *initialFilterChain = nil;
+    if (initialFilterSpecs.count > 0) {
+        NSError *initialSpecsError = nil;
+        initialFilterChain = [self _buildFilterNodesFromSpecs:initialFilterSpecs error:&initialSpecsError];
+        if (!initialFilterChain) {
+            if (outError) *outError = initialSpecsError;
+            return NO;
+        }
+    }
+
     // ── (b) Build the camera graph via factory ────────────────────────────────
+    // Renderer mode: renderer + (no receiver sink yet) — the original
+    // single-renderer fan-out. Graph-only mode: renderer nil + receiver sink,
+    // which the factory accepts only because the sink is non-nil.
     NSError *graphError = nil;
     NSDictionary<NSString *, id> *graphData = [VGCameraGraphFactory
         buildCameraGraphWithSource:source
-                       filterChain:nil
+                       filterChain:initialFilterChain
                           renderer:renderer
+                  platformViewSink:_platformViewSink
                              error:&graphError];
     if (!graphData) {
         if (outError) {
             *outError = graphError;
         }
-        return nil;
+        return NO;
     }
 
     VGGraphDescriptor *descriptor = graphData[@"descriptor"];
@@ -405,7 +547,7 @@ _VGStillCreatePool(size_t width, size_t height) {
                 NSLocalizedDescriptionKey: @"VGCameraGraphSession: fan_out_sink node is missing from constructed graph."
             }];
         }
-        return nil;
+        return NO;
     }
 
     // ── (d) Initialize Execution Context and Scheduler ────────────────────────
@@ -424,15 +566,76 @@ _VGStillCreatePool(size_t width, size_t height) {
     _nodes = nodes;
 
     // ── (e) Wire and start ────────────────────────────────────────────────────
-    // 3G-C: Wire the SESSION as the frameDelegate of the renderer (not _scheduler
-    // directly). The session's didReceiveRawFrame: provides the async boundary that
-    // moves graph traversal off the capture delegate queue.
-    renderer.frameDelegate = self;
+    if (renderer) {
+        // 3G-C: Wire the SESSION as the frameDelegate of the renderer (not _scheduler
+        // directly). The session's didReceiveRawFrame: provides the async boundary that
+        // moves graph traversal off the capture delegate queue.
+        renderer.frameDelegate = self;
+    } else {
+        // Graph-only: the session owns the source's video callback. Installed
+        // only now — after the graph build succeeded — so a failed init leaves
+        // the source untouched, and before the scheduler starts / the caller
+        // starts the source so no frame is missed.
+        [self _installGraphOnlyVideoCallback];
+    }
 
-    // Start frame dispatch.
+    // Start frame dispatch. In graph-only mode this is what actually starts the
+    // camera source (VGGraphSchedulerV2.startWithClock: -> _sourceNode
+    // startProducing -> VGCameraSourceAdapter.startProducing ->
+    // VanguardCameraMediaSource.start) — by this point initialFilterChain (if
+    // any) is already built into the graph above, so no unfiltered frame can
+    // be dispatched.
     [_scheduler startWithClock:nil];
 
-    return self;
+    // Commit the initial filter chain/specs only now that graph creation and
+    // scheduler start have both succeeded, mirroring the post-swap commit in
+    // _applyFilterChainInternal:/setCameraFilterChainFromSpecs:error:.
+    if (initialFilterChain.count > 0) {
+        _currentFilterChain = [initialFilterChain copy];
+        _activeFilterSpecs = _VGDeepCopyFilterSpecs(initialFilterSpecs);
+        [self _enqueueFilterChainTimingResetActive:YES];
+    }
+
+    NSLog(@"[VGCameraGraphSession] session ready (mode=%@)",
+          _graphOnlyMode ? @"graphOnly" : @"renderer");
+    return YES;
+}
+
+// ─── Graph-only ingress: source video callback ───────────────────────────────
+//
+// Mirrors the delegate branch of VanguardMetalRenderer._onVideoFrame: minus
+// GPU rotation (the caller portrait-locks the source, as the Duet camera
+// ingress already does). Runs on the source's capture queue
+// (com.vanguard.capture, serial) — the same queue renderer mode reaches
+// didReceiveRawFrame: from, so the scheduler read / in-flight guard
+// assumptions in didReceiveRawFrame: hold unchanged.
+//
+// Ownership: `frame` arrives +1 (callback-owned retain,
+// VanguardCameraMediaSource.m `_videoCallback(CVPixelBufferRetain(pixelBuffer), pts)`).
+// didReceiveRawFrame: takes its own +1 for the async block when it accepts the
+// frame and never releases ours; we release the callback-owned +1 exactly once
+// on every path (accepted, dropped, invalidated, session gone).
+- (void)_installGraphOnlyVideoCallback {
+    __weak __typeof(self) weakSelf = self;
+    [_source setVideoCallback:^(CVPixelBufferRef frame, CMTime pts) {
+        if (!frame) return;
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            // generation is 0 here; the scheduler keeps its own counter
+            // (same as the renderer path). metadata MUST be NULL (DEC-102).
+            VGFrameEnvelope rawEnvelope;
+            memset(&rawEnvelope, 0, sizeof(VGFrameEnvelope));
+            rawEnvelope.pts = pts;
+            rawEnvelope.dts = pts;
+            rawEnvelope.duration = kCMTimeInvalid;
+            rawEnvelope.mediaType = VGMediaTypeVideo;
+            rawEnvelope.payload.videoBuffer = frame;
+            rawEnvelope.metadata = NULL;
+            [strongSelf didReceiveRawFrame:rawEnvelope];
+        }
+        // Balance the callback-owned retain — always, exactly once.
+        CVPixelBufferRelease(frame);
+    }];
 }
 
 // ─── [Beauty-Still]: Private graph-apply helper returning BOOL ────────────────
@@ -467,8 +670,10 @@ _VGStillCreatePool(size_t width, size_t height) {
     NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal: filterChain.count=%lu",
           (unsigned long)(filterChain.count ?: 0));
 
+    // Renderer mode needs the (weak) renderer alive; graph-only mode has none
+    // by design and relies on _platformViewSink (set at init) instead.
     VanguardMetalRenderer *renderer = self->_renderer;
-    if (!self->_source || !renderer) {
+    if (!self->_source || (!renderer && !self->_graphOnlyMode)) {
         NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal skipped — source=%@ renderer=%@",
               self->_source, renderer);
         return NO;
@@ -558,50 +763,61 @@ _VGStillCreatePool(size_t width, size_t height) {
     });
 }
 
-// ─── POC2: connectPlatformViewReceiver: ───────────────────────────────────────
+// ─── connectProcessedFrameReceiver: / connectPlatformViewReceiver: ───────────
 //
-// Wires a VanguardCameraFrameReceiver into the graph as a second VGFanOutSink child.
+// Wires a VanguardCameraFrameReceiver into the graph as a VGFanOutSink child
+// (second child after the renderer sink in renderer mode; first child in
+// graph-only mode, replacing the init-time receiver).
 //
 // Strategy: store a VGPlatformViewSinkAdapter as _platformViewSink ivar, then
-// trigger a full graph rebuild via setCameraFilterChain: (reusing _currentFilterChain)
-// so the factory builds a two-child VGFanOutSink.
+// trigger a full graph rebuild (reusing _currentFilterChain) so the factory
+// builds the fan-out including the receiver sink. The rebuild body below is the
+// same build-then-swap sequence as _applyFilterChainInternal: but deliberately
+// does NOT re-commit _currentFilterChain or reset the filter-chain timing
+// aggregates (the committed chain is unchanged).
 //
 // Also disables POC1 raw direct forwarding on the camera source to prevent
-// double delivery: raw (POC1 path) + graph-processed (POC2 path).
+// double delivery: raw (POC1 path) + graph-processed (fan-out path).
 //
-// REMOVE before Phase 7 / production.
+// connectPlatformViewReceiver: is the POC2-era selector kept for existing
+// callers; it forwards to connectProcessedFrameReceiver: unchanged.
 - (BOOL)connectPlatformViewReceiver:(id<VanguardCameraFrameReceiver>)receiver {
+    return [self connectProcessedFrameReceiver:receiver];
+}
+
+- (BOOL)connectProcessedFrameReceiver:(id<VanguardCameraFrameReceiver>)receiver {
     __block BOOL success = NO;
     dispatch_sync(_sessionQueue, ^{
         if (atomic_load(&self->_invalidated)) {
-            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — session is invalidated");
+            NSLog(@"[Vanguard] connectProcessedFrameReceiver — session is invalidated");
             return;
         }
         if (!receiver) {
-            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — receiver is nil");
+            NSLog(@"[Vanguard] connectProcessedFrameReceiver — receiver is nil");
             return;
         }
 
-        // Create (or replace) the platform view sink adapter.
+        // Create (or replace) the receiver sink adapter.
         self->_platformViewSink = [[VGPlatformViewSinkAdapter alloc] initWithReceiver:receiver];
-        NSLog(@"[Vanguard] POC2: VGPlatformViewSinkAdapter created — will rebuild graph");
+        NSLog(@"[Vanguard] VGPlatformViewSinkAdapter created — will rebuild graph");
 
         // ── Disable POC1 raw direct forwarding ────────────────────────────────
-        // POC1 raw delivery must not run while POC2 graph fan-out is active.
+        // POC1 raw delivery must not run while graph fan-out is active.
         // Setting platformViewRawForwardingEnabled=NO prevents captureOutput: from
         // calling [_frameReceiver onFrame:pixelBuffer pts:pts] directly, so the
-        // MTKView receives only graph-processed frames from VGFanOutSink.
+        // receiver gets only graph-processed frames from VGFanOutSink.
         if (self->_source) {
             self->_source.platformViewRawForwardingEnabled = NO;
-            NSLog(@"[Vanguard] POC2: POC1 raw forwarding DISABLED on camera source ✓");
+            NSLog(@"[Vanguard] POC1 raw forwarding DISABLED on camera source ✓");
         }
 
-        // ── Trigger graph rebuild with two-child VGFanOutSink ─────────────────
+        // ── Trigger graph rebuild including the receiver sink ─────────────────
         // setCameraFilterChain: is called on _sessionQueue (we are already on it),
         // so we cannot dispatch_sync again — call the inner implementation directly.
+        // Graph-only mode has no renderer by design (see _applyFilterChainInternal:).
         VanguardMetalRenderer *renderer = self->_renderer;
-        if (!self->_source || !renderer) {
-            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — source or renderer nil");
+        if (!self->_source || (!renderer && !self->_graphOnlyMode)) {
+            NSLog(@"[Vanguard] connectProcessedFrameReceiver — source or renderer nil");
             return;
         }
 
@@ -613,7 +829,7 @@ _VGStillCreatePool(size_t width, size_t height) {
                                             platformViewSink:self->_platformViewSink
                                                        error:&rebuildError];
         if (!newGraph) {
-            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver graph rebuild failed: %@",
+            NSLog(@"[Vanguard] connectProcessedFrameReceiver graph rebuild failed: %@",
                   rebuildError);
             return;
         }
@@ -624,7 +840,7 @@ _VGStillCreatePool(size_t width, size_t height) {
 
         id<VGFrameSink> newSink = (id<VGFrameSink>)newNodes[@"fan_out_sink"];
         if (!newSink) {
-            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — fan_out_sink missing after rebuild");
+            NSLog(@"[Vanguard] connectProcessedFrameReceiver — fan_out_sink missing after rebuild");
             return;
         }
 
@@ -647,7 +863,7 @@ _VGStillCreatePool(size_t width, size_t height) {
         self->_nodes = newNodes;
 
         // Phase 6E.1D.1: Propagate recording-enabled state onto the new
-        // VGRecordingSinkNode after a POC2 platform-view graph rebuild, for the
+        // VGRecordingSinkNode after a receiver graph rebuild, for the
         // same reason as setCameraFilterChain: — the replacement node starts
         // disabled and would silently drop frames during an active recording.
         if (self->_source.graphRecordingEnabled) {
@@ -658,7 +874,7 @@ _VGStillCreatePool(size_t width, size_t height) {
             }
         }
 
-        NSLog(@"[Vanguard] POC2: graph rebuilt with two-child VGFanOutSink — PlatformView wired ✓");
+        NSLog(@"[Vanguard] graph rebuilt with receiver sink in VGFanOutSink — processed receiver wired ✓");
         success = YES;
     });
     return success;
@@ -759,25 +975,18 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
     return YES;
 }
 
-- (BOOL)setCameraFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
-                                error:(NSError * _Nullable * _Nullable)outError
+// ─── Shared validation/construction policy ───────────────────────────────────
+//
+// Extracted from setCameraFilterChainFromSpecs:error: so the initial-filter-specs
+// initializer can build the exact same filter chain BEFORE the graph/scheduler
+// exist, without duplicating the three-pass validation or node construction.
+// Mutation-free: constructs and returns filter node objects only; never touches
+// _sessionPool/_currentFilterChain/_activeFilterSpecs or any graph/scheduler state.
+// Callers must not pass an empty/nil specs array (the empty/clear case is
+// handled separately by each caller).
+- (nullable NSArray<id<VGMetalFilterNode>> *)_buildFilterNodesFromSpecs:(NSArray<NSDictionary *> *)specs
+                                                                    error:(NSError * _Nullable * _Nullable)outError
 {
-    if (outError) *outError = nil;
-
-    // ── Empty specs: clear to passthrough ────────────────────────────────────
-    // [Fix-3]: Only clear _activeFilterSpecs if the internal graph swap succeeds.
-    if (!specs || specs.count == 0) {
-        __block BOOL cleared = NO;
-        dispatch_sync(_sessionQueue, ^{
-            if (atomic_load(&self->_invalidated)) return;
-            cleared = [self _applyFilterChainInternal:nil];
-            if (cleared) {
-                self->_activeFilterSpecs = nil;
-            }
-        });
-        return cleared;
-    }
-
     // ── Pass 1: resource contract ─────────────────────────────────────────────
     id<MTLDevice> metalDevice = [VGResourceAllocator sharedInstance].metalDevice;
     if (_sessionPool == NULL || !metalDevice) {
@@ -793,7 +1002,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
         }
         NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: resource contract "
                "not satisfied (pool=%p device=%@)", _sessionPool, metalDevice);
-        return NO;
+        return nil;
     }
 
     // ── Pass 2: known-type check ──────────────────────────────────────────────
@@ -819,7 +1028,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
             }
             NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: unknown type '%@'",
                   badType);
-            return NO;
+            return nil;
         }
     }
 
@@ -844,7 +1053,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                 }];
             }
             NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: lut deferred");
-            return NO;
+            return nil;
         }
 
         if ([type isEqualToString:@"segmentation"]) {
@@ -858,7 +1067,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                 }];
             }
             NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: segmentation deferred");
-            return NO;
+            return nil;
         }
 
         if ([type isEqualToString:@"greenScreen"]) {
@@ -867,7 +1076,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                 if (outError) *outError = specError;
                 NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: greenScreen "
                        "rejected (%@): %@", specError.domain, specError.localizedDescription);
-                return NO;
+                return nil;
             }
         }
 
@@ -960,7 +1169,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                 if (outError) *outError = specError;
                 NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: greenScreen "
                        "failed re-validation at construction — aborting without mutation");
-                return NO;
+                return nil;
             }
             VGGreenScreenFilterNode *greenScreen =
                 [[VGGreenScreenFilterNode alloc] initWithPool:_sessionPool
@@ -988,6 +1197,33 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
     NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: constructed %lu node(s)",
           (unsigned long)nodes.count);
 
+    return [nodes copy];
+}
+
+- (BOOL)setCameraFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
+                                error:(NSError * _Nullable * _Nullable)outError
+{
+    if (outError) *outError = nil;
+
+    // ── Empty specs: clear to passthrough ────────────────────────────────────
+    // [Fix-3]: Only clear _activeFilterSpecs if the internal graph swap succeeds.
+    if (!specs || specs.count == 0) {
+        __block BOOL cleared = NO;
+        dispatch_sync(_sessionQueue, ^{
+            if (atomic_load(&self->_invalidated)) return;
+            cleared = [self _applyFilterChainInternal:nil];
+            if (cleared) {
+                self->_activeFilterSpecs = nil;
+            }
+        });
+        return cleared;
+    }
+
+    NSArray<id<VGMetalFilterNode>> *nodes = [self _buildFilterNodesFromSpecs:specs error:outError];
+    if (!nodes) {
+        return NO;
+    }
+
     // [Beauty-Still]: _applyFilterChainInternal: MUST be called on _sessionQueue.
     // Wrap the entire apply + spec-commit in a single dispatch_sync so both are
     // serialized and atomic relative to property reads (hasActiveFilters, activeFilterSpecs).
@@ -998,19 +1234,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
         }
         swapSucceeded = [self _applyFilterChainInternal:nodes];
         if (swapSucceeded) {
-            // Deep-copy specs (including nested parameters) so the snapshot is
-            // immutable and isolated from future Dart-side mutations.
-            NSMutableArray<NSDictionary *> *specsCopy =
-                [NSMutableArray arrayWithCapacity:specs.count];
-            for (NSDictionary *spec in specs) {
-                NSMutableDictionary *specCopy = [spec mutableCopy];
-                id params = spec[@"parameters"];
-                if ([params isKindOfClass:[NSDictionary class]]) {
-                    specCopy[@"parameters"] = [(NSDictionary *)params copy];
-                }
-                [specsCopy addObject:[specCopy copy]];
-            }
-            self->_activeFilterSpecs = [specsCopy copy];
+            self->_activeFilterSpecs = _VGDeepCopyFilterSpecs(specs);
             NSLog(@"[VGCameraGraphSession] activeFilterSpecs committed (%lu spec(s))",
                   (unsigned long)self->_activeFilterSpecs.count);
         }
@@ -1439,6 +1663,18 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
             }
         }
 
+        // Graph-only mode: the session owns the source video callback. Replace
+        // it with a release-only balancing callback (the source keeps handing
+        // out +1 buffers until the caller stops it) BEFORE _source is dropped
+        // below. A callback invocation already running on the capture queue
+        // still holds its strong self; its didReceiveRawFrame: sees
+        // _invalidated and drops the frame, then releases the buffer itself.
+        if (self->_graphOnlyMode && self->_source) {
+            [self->_source setVideoCallback:^(CVPixelBufferRef frame, CMTime pts) {
+                if (frame) CVPixelBufferRelease(frame);
+            }];
+        }
+
         [self->_scheduler invalidate];
 
         if (self->_sessionPool) {
@@ -1581,13 +1817,15 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
 // (com.vanguard.capture) and the graph execution queue
 // (com.vanguard.cameraGraphExecution).
 //
-// Called by VanguardMetalRenderer._onVideoFrame: on com.vanguard.capture
-// (a serial queue). Must return quickly — no GPU work, no filter execution.
+// Called by VanguardMetalRenderer._onVideoFrame: (renderer mode) or by the
+// session's own source video callback (graph-only mode,
+// _installGraphOnlyVideoCallback) on com.vanguard.capture (a serial queue).
+// Must return quickly — no GPU work, no filter execution.
 //
 // Ownership:
-//   envelope.payload.videoBuffer: source-owned (+1). We add our own +1 via
+//   envelope.payload.videoBuffer: caller-owned (+1). We add our own +1 via
 //   CVPixelBufferRetain before the async dispatch so the buffer stays alive
-//   after _onVideoFrame: releases its references. The async block releases
+//   after the caller releases its references. The async block releases
 //   our +1 after [scheduler didReceiveRawFrame:] returns.
 //
 // Backpressure:

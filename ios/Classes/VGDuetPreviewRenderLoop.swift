@@ -14,12 +14,24 @@
 //     passive until asked again.  At trimEnd the target stops changing, so the
 //     loop naturally goes quiet; it never mutates session state.
 //
-// Green-screen seam:
-//   - maskProvider returns a retained mask snapshot (+1) to be released after compositing.
-//   - isGreenScreenLayout is tracked; init from coordinator, updated in updateLayout.
-//   - Each render() call snapshots isGreenScreen + mask before crossing the queue boundary
-//     and passes them to the compositor.  Mask is released after compositing, regardless of
-//     whether the green-screen path was taken.
+// Foreground seam (Phase 4A / 4B-A):
+//   - foregroundSampleProvider returns ONE retained VGDuetForegroundSample per render
+//     pass: the live foreground frame plus an optional matte, each +1, and the
+//     provider's `compositeMode`.
+//   - Keying is derived from `sample.compositeMode`, never from the layout mode and
+//     never from raw matte presence:
+//       nil sample     -> no camera frame; the compositor draws its placeholder.
+//       .opaque        -> frame is the opaque camera overlay; the matte is not used.
+//       .matteKeyed    -> matte-keyed CIBlendWithMask path when the matte exists;
+//                         a matte-less .matteKeyed sample fails open to .opaque.
+//       .straightAlpha -> frame is a pre-keyed straight-alpha foreground composited
+//                         source-over; the matte is not used and no refinement runs.
+//     Layout mode only drives the rects the coordinator hands to updateLayout.
+//   - Each render() call takes the sample on main before crossing the queue boundary,
+//     hands frame/matte/mode to the compositor, and releases the sample exactly once
+//     after compositing, regardless of mode or which compositor path was taken.
+//   - Phase 4B-A only adds the .straightAlpha ingest path.  It does NOT implement or
+//     prove an upstream VGCameraGraphSession / VGGreenScreenFilterNode provider.
 //
 // Explicitly NOT here: Flutter imports, session state, decoder ownership,
 // CoreImage drawing (see VGDuetPreviewCompositor).
@@ -91,15 +103,11 @@ final class VGDuetPreviewRenderLoop {
     typealias DecodeHandler     = (VGDuetPreviewDecodeRequest, @escaping DecodeCompletion) -> Void
     typealias PresentHandler    = (CVPixelBuffer) -> Void
 
-    /// Returns a *retained* CVPixelBuffer snapshot of the live camera frame, or nil
-    /// when no frame has arrived yet.  The render loop balances the retain after
-    /// compositing.  May be called from the main thread or the render queue.
-    typealias CameraFrameProvider = () -> Unmanaged<CVPixelBuffer>?
-
-    /// Returns a *retained* CVPixelBuffer snapshot of the latest segmentation mask, or nil
-    /// when no mask is available or the mask is stale.  The render loop releases the retain
+    /// Returns one *retained* foreground sample (live foreground frame + optional
+    /// matte, each +1, plus the provider's `compositeMode`), or nil when no camera
+    /// frame has arrived yet.  The render loop calls `release()` on it exactly once
     /// after compositing.  May be called from the main thread or the render queue.
-    typealias MaskProvider = () -> Unmanaged<CVPixelBuffer>?
+    typealias ForegroundSampleProvider = () -> VGDuetForegroundSample?
 
     private let compositor: VGDuetPreviewCompositor
     private let trimStartMs: Int
@@ -107,10 +115,9 @@ final class VGDuetPreviewRenderLoop {
     private let targetPtsProvider: TargetPtsProvider
     private let decodeHandler: DecodeHandler
     private let presentHandler: PresentHandler
-    /// Optional live-camera snapshot provider injected by the coordinator.
-    private let cameraFrameProvider: CameraFrameProvider?
-    /// Optional segmentation mask provider for green-screen keying.
-    private let maskProvider: MaskProvider?
+    /// Optional foreground sample provider injected by the coordinator.  nil means
+    /// no live foreground: the compositor draws its camera placeholder.
+    private let foregroundSampleProvider: ForegroundSampleProvider?
 
     private let renderQueue = DispatchQueue(label: "com.connects.vanguard.duet.preview.render",
                                             qos: .userInteractive)
@@ -127,9 +134,6 @@ final class VGDuetPreviewRenderLoop {
 
     private var sourceRect: CGRect
     private var cameraRect: CGRect
-
-    /// Whether the current layout is greenScreen.  Updated in init and updateLayout.
-    private var isGreenScreenLayout: Bool
 
     private var isStopped = false
     private var isActive  = false
@@ -156,23 +160,19 @@ final class VGDuetPreviewRenderLoop {
          trimEndMs: Int,
          sourceRect: CGRect,
          cameraRect: CGRect,
-         isGreenScreenLayout: Bool = false,
          targetPtsProvider: @escaping TargetPtsProvider,
          decodeHandler: @escaping DecodeHandler,
          presentHandler: @escaping PresentHandler,
-         cameraFrameProvider: CameraFrameProvider? = nil,
-         maskProvider: MaskProvider? = nil) {
-        self.compositor          = compositor
-        self.trimStartMs         = trimStartMs
-        self.trimEndMs           = max(trimStartMs, trimEndMs)
-        self.sourceRect          = sourceRect
-        self.cameraRect          = cameraRect
-        self.isGreenScreenLayout = isGreenScreenLayout
-        self.targetPtsProvider   = targetPtsProvider
-        self.decodeHandler       = decodeHandler
-        self.presentHandler      = presentHandler
-        self.cameraFrameProvider = cameraFrameProvider
-        self.maskProvider        = maskProvider
+         foregroundSampleProvider: ForegroundSampleProvider? = nil) {
+        self.compositor               = compositor
+        self.trimStartMs              = trimStartMs
+        self.trimEndMs                = max(trimStartMs, trimEndMs)
+        self.sourceRect               = sourceRect
+        self.cameraRect               = cameraRect
+        self.targetPtsProvider        = targetPtsProvider
+        self.decodeHandler            = decodeHandler
+        self.presentHandler           = presentHandler
+        self.foregroundSampleProvider = foregroundSampleProvider
     }
 
     deinit {
@@ -219,14 +219,13 @@ final class VGDuetPreviewRenderLoop {
     }
 
     /// Applies new layout rects and redraws the held/current frame.  While
-    /// active, subsequent ticks pick up the new rects automatically.
-    func updateLayout(sourceRect: CGRect, cameraRect: CGRect, targetPtsMs: Int,
-                      isGreenScreenLayout: Bool = false) {
+    /// active, subsequent ticks pick up the new rects automatically.  Keying is
+    /// not a layout property here: it follows the provider's next sample.
+    func updateLayout(sourceRect: CGRect, cameraRect: CGRect, targetPtsMs: Int) {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
-        self.sourceRect          = sourceRect
-        self.cameraRect          = cameraRect
-        self.isGreenScreenLayout = isGreenScreenLayout
+        self.sourceRect = sourceRect
+        self.cameraRect = cameraRect
         submit(.decode(.step(targetPtsMs: clamp(targetPtsMs)), forceRender: true))
     }
 
@@ -342,25 +341,45 @@ final class VGDuetPreviewRenderLoop {
         inFlight = true
         let sRect       = sourceRect
         let cRect       = cameraRect
-        let isGS        = isGreenScreenLayout
         let compositor  = self.compositor
-        // Snapshot the live camera frame *before* crossing the queue boundary.
-        // snapshotRetained() returns a +1 retain; we release it after compositing.
-        let cameraSnap: Unmanaged<CVPixelBuffer>? = cameraFrameProvider?()
-        let cameraBuffer: CVPixelBuffer? = cameraSnap.map { $0.takeUnretainedValue() }
-        // Snapshot the segmentation mask for green-screen; +1 retain released after compositing.
-        let maskSnap: Unmanaged<CVPixelBuffer>? = isGS ? maskProvider?() : nil
-        let maskBuffer: CVPixelBuffer? = maskSnap.map { $0.takeUnretainedValue() }
+        // Take ONE foreground sample *before* crossing the queue boundary.  Frame and
+        // matte are each +1; the sample is released exactly once after compositing,
+        // whatever its compositeMode.
+        let sample: VGDuetForegroundSample? = foregroundSampleProvider?()
+        let cameraBuffer: CVPixelBuffer? = sample.map { $0.frame.takeUnretainedValue() }
+        // Keying follows `sample.compositeMode`, never the layout mode and never raw
+        // matte presence.  Only the .matteKeyed mode hands the matte to the compositor.
+        var matteBuffer: CVPixelBuffer? = nil
+        var isKeyed = false
+        var usesStraightAlpha = false
+        if let sample = sample {
+            switch sample.compositeMode {
+            case .opaque:
+                // Opaque camera overlay.  A carried matte is released below, never used.
+                break
+            case .matteKeyed:
+                // Matte path only when the matte actually exists; a matte-less
+                // .matteKeyed sample fails open to the opaque overlay.
+                if let matte = sample.matte {
+                    matteBuffer = matte.takeUnretainedValue()
+                    isKeyed = true
+                }
+            case .straightAlpha:
+                // Pre-keyed foreground: the frame already carries straight alpha.  No
+                // matte is passed and no mask refinement runs in the compositor.
+                usesStraightAlpha = true
+            }
+        }
         renderQueue.async { [weak self] in
             let output = compositor.composite(sourceFrame: frame,
                                               sourceRect: sRect,
                                               cameraRect: cRect,
                                               cameraFrame: cameraBuffer,
-                                              isGreenScreen: isGS,
-                                              greenScreenMask: maskBuffer)
-            // Release the retained snapshots now that compositing is done.
-            cameraSnap?.release()
-            maskSnap?.release()
+                                              isGreenScreen: isKeyed,
+                                              greenScreenMask: matteBuffer,
+                                              cameraFrameUsesStraightAlpha: usesStraightAlpha)
+            // Release the retained sample now that compositing is done (all modes).
+            sample?.release()
             DispatchQueue.main.async {
                 self?.didRender(output)
             }

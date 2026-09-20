@@ -61,6 +61,19 @@
 // is never skipped due to refinement failure; only if CIBlendWithMask itself is unavailable
 // does composition fall back to opaque camera overlay.
 //
+// Phase 4B-A straight-alpha foreground ingest:
+// composite(cameraFrameUsesStraightAlpha: true) treats `cameraFrame` as a foreground that
+// was ALREADY keyed upstream: BGRA with STRAIGHT (non-premultiplied) alpha, RGB = 0 where
+// alpha = 0 (the VGGreenScreenFilterNode alpha output convention).  The frame is
+// premultiplied (CIImage.premultiplyingAlpha), aspect-filled into cameraRect and
+// source-over composited onto the composed source canvas.  No matte is required, no matte
+// refinement runs, and `isGreenScreen` / `greenScreenMask` are ignored for that call.  The
+// default (`false`) leaves every existing caller and the matte-keyed CIBlendWithMask path
+// byte-for-byte unchanged.  Keying is therefore decided by the caller's mode, never by
+// whether a mask happens to be non-nil.  This phase adds only the ingest path; it does NOT
+// implement or prove an upstream VGCameraGraphSession / VGGreenScreenFilterNode provider
+// feeding it.
+//
 // Production stack & physical proof summary:
 // iOS live green-screen edge smoothness A/B S1: Vision Fast default + compositor refinement
 // (morphology close r1b radius 1.0, feather 4.0, trimap 0.10/0.90, guided edge
@@ -155,6 +168,10 @@ final class VGDuetPreviewCompositor {
     /// CIBlendWithMask composite.  Guards against log spam on every frame.
     private var _hasLoggedFirstMaskBlend = false
 
+    /// One-time diagnostic marker for the Phase 4B-A straight-alpha foreground path
+    /// (`cameraFrameUsesStraightAlpha: true`).  Guards against log spam on every frame.
+    private var _hasLoggedFirstStraightAlphaComposite = false
+
     private static let sharedContext: CIContext = {
         let options: [CIContextOption: Any] = [
             .workingColorSpace: NSNull(),
@@ -194,13 +211,21 @@ final class VGDuetPreviewCompositor {
     ///   - isGreenScreen:   when true, attempt CIBlendWithMask keying instead of opaque overlay.
     ///   - greenScreenMask: single-channel (L8) mask buffer; 255 = subject (foreground).
     ///                      Nil or unavailable falls back to the camera-over-source preview.
+    ///   - cameraFrameUsesStraightAlpha:
+    ///                      Phase 4B-A.  When true, `cameraFrame` is a foreground already
+    ///                      keyed upstream (BGRA, STRAIGHT alpha): it is premultiplied,
+    ///                      aspect-filled into cameraRect and source-over composited onto
+    ///                      the composed canvas.  No mask is required, no matte refinement
+    ///                      runs, and `isGreenScreen` / `greenScreenMask` are ignored.
+    ///                      Default false: every existing caller is unchanged.
     /// - Returns: a pool-backed BGRA buffer, or nil when the pool is exhausted / unavailable.
     func composite(sourceFrame: CVPixelBuffer?,
                    sourceRect: CGRect,
                    cameraRect: CGRect,
                    cameraFrame: CVPixelBuffer? = nil,
                    isGreenScreen: Bool = false,
-                   greenScreenMask: CVPixelBuffer? = nil) -> CVPixelBuffer? {
+                   greenScreenMask: CVPixelBuffer? = nil,
+                   cameraFrameUsesStraightAlpha: Bool = false) -> CVPixelBuffer? {
         guard let pool = pool else { return nil }
 
         var outBuffer: CVPixelBuffer?
@@ -221,7 +246,23 @@ final class VGDuetPreviewCompositor {
 
         let ciCamera = ciRect(fromTopLeft: cameraRect)
         if !ciCamera.isEmpty {
-            if isGreenScreen, let camFrame = cameraFrame, let maskBuffer = greenScreenMask {
+            if cameraFrameUsesStraightAlpha, let camFrame = cameraFrame {
+                // Phase 4B-A straight-alpha foreground path (pre-keyed upstream).
+                //   The frame's bytes are STRAIGHT alpha (fg.rgb, a).  CoreImage treats a
+                //   BGRA pixel buffer as premultiplied, so premultiply first, giving
+                //   (fg.rgb*a, a), and do it BEFORE resampling so transparent texels never
+                //   bleed colour into edges; then aspect-fill and source-over onto the
+                //   canvas (C = C_fg*a + C_bg*(1-a)).  No mask, no refinement, no
+                //   CIBlendWithMask.  `isGreenScreen` / `greenScreenMask` are ignored here.
+                let camPremultiplied = CIImage(cvPixelBuffer: camFrame).premultiplyingAlpha()
+                image = aspectFill(camPremultiplied, into: ciCamera).composited(over: image)
+                // One-time diagnostic: first frame composited through the straight-alpha path.
+                // Grep marker: IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST
+                if !_hasLoggedFirstStraightAlphaComposite {
+                    _hasLoggedFirstStraightAlphaComposite = true
+                    NSLog("[VGDuetPreviewCompositor] IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST pre-keyed straight-alpha foreground premultiplied and source-over composited into cameraRect; no matte, no refinement")
+                }
+            } else if isGreenScreen, let camFrame = cameraFrame, let maskBuffer = greenScreenMask {
                 // Green-screen path: CIBlendWithMask.
                 //   foreground = aspect-filled camera into cameraRect
                 //   background = current composed source canvas (image)
@@ -260,7 +301,8 @@ final class VGDuetPreviewCompositor {
                     image = camFilled.composited(over: image)
                 }
             } else if let camFrame = cameraFrame {
-                // Live camera frame (non-green-screen, or mask missing): aspect-fill into the slot.
+                // Opaque live camera frame (opaque mode, or matte-keyed with the mask missing):
+                // aspect-fill into the slot.
                 let camImage = CIImage(cvPixelBuffer: camFrame)
                 image = aspectFill(camImage, into: ciCamera).composited(over: image)
             } else {
