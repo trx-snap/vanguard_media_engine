@@ -41,14 +41,26 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [MediaPlayer] to actually produce sound. When null, focus management is skipped, POSIX-path
  * playback proceeds unaffected, and a `content://` source is treated as unreadable (audio
  * skipped non-fatally, video activation untouched).
+ *
+ * [gain] is the native original-audio preview policy gain (the derived role="original"
+ * sidecar track's `volume * mixGain`, see [AndroidEditorPlaybackCoordinator]) applied as the
+ * [MediaPlayer] left/right volume once the player is prepared, so a reduced originalMixGain is
+ * audible in preview. Defaults to unity; clamped to [0.0, 1.0]; a non-finite value falls back
+ * to unity. A muted clip (gain <= 0) is expected to never construct a runtime at all (see
+ * [AndroidEditorSequentialPlaybackSession.activateClipBlocking]); if one is constructed anyway,
+ * the clamped 0.0 volume keeps it silent as a defensive no-op.
  */
 class AndroidEditorOriginalAudioPreviewRuntime(
     private val context: Context?,
+    gain: Float = 1.0f,
 ) {
     companion object {
         private const val TAG = "EditorOrigAudioPreview"
         private const val LOG_PREFIX = "VG_EDITOR_AUDIO_PREVIEW"
     }
+
+    /** Clamped preview volume applied to the [MediaPlayer] on prepare (see [gain] doc above). */
+    private val volumeGain: Float = if (gain.isFinite()) gain.coerceIn(0.0f, 1.0f) else 1.0f
 
     private val audioThread = HandlerThread("EditorOrigAudioPreview").also { it.start() }
     private val audioHandler = Handler(audioThread.looper)
@@ -103,7 +115,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
             }
 
             val mp = MediaPlayer()
-            Log.i(TAG, "$LOG_PREFIX prepare_start file=${sourcePath.substringAfterLast('/')} initialSourcePtsUs=$initialSourcePtsUs")
+            Log.i(TAG, "$LOG_PREFIX prepare_start file=${sourcePath.substringAfterLast('/')} initialSourcePtsUs=$initialSourcePtsUs gain=$volumeGain")
             try {
                 mp.setOnErrorListener { _, what, extra ->
                     Log.w(TAG, "$LOG_PREFIX prepare_error_listener what=$what extra=$extra")
@@ -119,9 +131,18 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                     }
                     player = mp
                     enabled = true
+                    // Apply the native original-audio policy gain before any seek/start so the
+                    // first audible sample already honors it. A setVolume failure is logged but
+                    // never disables the runtime: the video preview and the audio itself stay
+                    // alive at whatever volume the player retained.
+                    try {
+                        mp.setVolume(volumeGain, volumeGain)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "$LOG_PREFIX prepared_set_volume_error gain=$volumeGain", t)
+                    }
                     val targetMs = (initialSourcePtsUs / 1000L)
                         .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
-                    Log.i(TAG, "$LOG_PREFIX prepared durationMs=${mp.duration} targetMs=$targetMs enabled=$enabled")
+                    Log.i(TAG, "$LOG_PREFIX prepared durationMs=${mp.duration} targetMs=$targetMs gain=$volumeGain enabled=$enabled")
                     if (targetMs > 0L) {
                         mp.setOnSeekCompleteListener {
                             Log.i(TAG, "$LOG_PREFIX prepare_seek_complete targetMs=$targetMs")

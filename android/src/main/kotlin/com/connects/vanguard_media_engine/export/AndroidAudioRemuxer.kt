@@ -1,10 +1,12 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -45,10 +47,19 @@ object AndroidAudioRemuxer {
     /// Remuxes video (+ optional audio) into [finalPath].
     /// When [audioPath] is non-null the audio track is required: a missing
     /// audio track or zero written audio samples is a failure.
+    ///
+    /// [context] is an optional Context used ONLY when [videoPath] or
+    /// [audioPath] is a `content://` URI (a direct-copy original-sound track
+    /// over an Android gallery-reference clip); POSIX inputs never touch it.
+    /// [finalPath] is always a POSIX MediaMuxer output and is unaffected. A
+    /// `content://` input with a null Context fails closed as
+    /// `exception:IllegalArgumentException` through the existing catch --
+    /// extractor/muxer releases in `finally` are unchanged.
     fun remux(
         videoPath: String,
         audioPath: String?,
         finalPath: String,
+        context: Context? = null,
     ): AndroidAudioRemuxResult {
         val videoExtractor = MediaExtractor()
         var audioExtractor: MediaExtractor? = null
@@ -60,7 +71,7 @@ object AndroidAudioRemuxer {
         var failureReason: String? = null
 
         try {
-            videoExtractor.setDataSource(videoPath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(videoExtractor, videoPath, context)
             val videoTrackFormat = selectFirstTrack(videoExtractor, "video/")
             if (videoTrackFormat == null) {
                 failureReason = "no_video_track"
@@ -72,7 +83,7 @@ object AndroidAudioRemuxer {
             if (audioPath != null) {
                 val ae = MediaExtractor()
                 audioExtractor = ae
-                ae.setDataSource(audioPath)
+                AndroidUriDataSourceHelper.setExtractorDataSource(ae, audioPath, context)
                 audioTrackFormat = selectFirstTrack(ae, "audio/")
                 if (audioTrackFormat == null) {
                     failureReason = "no_audio_track"

@@ -16,8 +16,10 @@ import java.nio.ByteOrder
 // MediaCodec/MediaMuxer constraints observed:
 //   - The muxer track is added only on INFO_OUTPUT_FORMAT_CHANGED and the
 //     muxer starts immediately after addTrack, before any writeSampleData.
-//   - EOS is signalled via BUFFER_FLAG_END_OF_STREAM and the final drain is
-//     bounded by a deadline; the EOS output flag is observed before success.
+//   - EOS is signalled via BUFFER_FLAG_END_OF_STREAM and the whole feed +
+//     drain loop is bounded by one deadline scaled from the PCM duration
+//     (30 s floor, 600 s cap — see encodeDeadlineWindowMs); the EOS output
+//     flag is observed before success.
 //   - stop() is only called when the muxer started and samples were written;
 //     release() for codec and muxer always runs in finally.
 //   - The partial output file is deleted on failure.
@@ -36,7 +38,28 @@ object AndroidAacEncoder {
     private const val TAG = "VanguardAacEnc"
     private const val BIT_RATE = 128_000
     private const val DEQUEUE_TIMEOUT_US = 10_000L
-    private const val ENCODE_DEADLINE_MS = 30_000L
+
+    // Duration-scaled, bounded overall encode deadline, derived from the
+    // PCM buffer's own duration (pcm.size / channelCount / sampleRate):
+    //   deadline = clamp(BASE + pcmSec * PER_PCM_SEC, BASE, MAX)
+    // BASE keeps the previous 30 s floor for short mixes. PER_PCM_SEC
+    // (250 ms per PCM second, i.e. the encoder must sustain at least ~4x
+    // realtime beyond the base) gives a 16 min mixed buffer 270 s and a
+    // 3600 s buffer the MAX of 600 s, so a hung encoder still fails closed.
+    private const val ENCODE_DEADLINE_BASE_MS = 30_000L
+    private const val ENCODE_DEADLINE_MS_PER_PCM_SEC = 250.0
+    private const val ENCODE_DEADLINE_MAX_MS = 600_000L
+
+    /// Overall encode deadline window in ms for a PCM buffer of
+    /// [totalShorts] interleaved samples at [sampleRate]/[channelCount].
+    /// Long math for the frame count; the clamp bounds any oversized input.
+    private fun encodeDeadlineWindowMs(totalShorts: Int, sampleRate: Int, channelCount: Int): Long {
+        val frames = totalShorts.toLong() / channelCount.toLong()
+        val pcmSec = frames.toDouble() / sampleRate.toDouble()
+        val scaledMs = (pcmSec * ENCODE_DEADLINE_MS_PER_PCM_SEC).toLong()
+            .coerceIn(0L, ENCODE_DEADLINE_MAX_MS - ENCODE_DEADLINE_BASE_MS)
+        return ENCODE_DEADLINE_BASE_MS + scaledMs
+    }
 
     fun encodePcm16ToM4a(
         pcm: ShortArray,
@@ -78,11 +101,17 @@ object AndroidAacEncoder {
             var framesFed = 0L
             var inputDone = false
             var eosObserved = false
-            val deadlineMs = System.currentTimeMillis() + ENCODE_DEADLINE_MS
+            val deadlineWindowMs = encodeDeadlineWindowMs(totalShorts, sampleRate, channelCount)
+            val deadlineMs = System.currentTimeMillis() + deadlineWindowMs
 
             while (!eosObserved) {
                 if (System.currentTimeMillis() > deadlineMs) {
-                    failureReason = "aac_encode_timeout"
+                    Log.e(
+                        TAG,
+                        "encode timeout — deadlineMs=$deadlineWindowMs framesFed=$framesFed " +
+                            "totalShorts=$totalShorts rate=$sampleRate ch=$channelCount",
+                    )
+                    failureReason = "aac_encode_timeout:${deadlineWindowMs}ms"
                     return failure(failureReason, outputPath)
                 }
 

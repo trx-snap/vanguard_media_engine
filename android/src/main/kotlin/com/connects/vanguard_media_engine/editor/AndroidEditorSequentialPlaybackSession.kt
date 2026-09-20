@@ -21,14 +21,23 @@ import java.util.concurrent.atomic.AtomicLong
  * is this clip's position on the global editor timeline. [timelineDurationUs] is this clip's
  * contribution to the global timeline — for the 1.0x-speed-only clips this slice supports, it
  * equals `sourceTrimEndUs - sourceTrimStartUs`.
+ *
+ * [clipId] is the draft clip's own `id` (VGClipDescriptor.toMap), used by the coordinator to
+ * attach the derived role="original" sidecar policy to the right clip even when one source
+ * file is reused by several clips. [originalAudioGain] is that native original-audio preview
+ * policy: the derived original sidecar track's `volume * mixGain`, clamped to [0.0, 1.0].
+ * Defaults to unity when the draft carries no original sidecar track for this clip. A value
+ * <= 0.0 means the app muted original sound for this clip: [AndroidEditorSequentialPlaybackSession]
+ * then never creates an [AndroidEditorOriginalAudioPreviewRuntime] for it (video preview is
+ * unaffected); a positive value is applied as the runtime's MediaPlayer volume.
  */
 data class AndroidEditorClipPlaybackSpec(
+    val clipId: String,
     val sourcePath: String,
     val timelineStartUs: Long,
     val sourceTrimStartUs: Long,
     val sourceTrimEndUs: Long,
     val timelineDurationUs: Long,
-    val clipId: String = "",
     val originalAudioGain: Float = 1.0f,
 )
 
@@ -59,7 +68,7 @@ data class AndroidEditorClipPlaybackSpec(
  * introduces.
  */
 class AndroidEditorSequentialPlaybackSession(
-    private val clipSpecs: List<AndroidEditorClipPlaybackSpec>,
+    clipSpecs: List<AndroidEditorClipPlaybackSpec>,
     private val surfaceProducer: TextureRegistry.SurfaceProducer,
     private val onTimelineFrame: (textureId: Long, ptsSeconds: Double, generationId: Long) -> Unit,
     private val onTimelineEOS: (textureId: Long) -> Unit,
@@ -79,8 +88,15 @@ class AndroidEditorSequentialPlaybackSession(
         private const val TAG = "EditorSeqPlaybackSession"
         private const val LOG_PREFIX = "VG_EDITOR_AUDIO_PREVIEW"
 
-        /** Tolerance for validating a clip's requested trimEnd against its inspected source duration. */
-        private const val TRIM_DURATION_TOLERANCE_US = 2_000L
+        /**
+         * Bounded container/metadata slack for a clip's requested sourceTrimEndUs against its
+         * inspected source durationUs. A requested trim end that exceeds durationUs by no more
+         * than this (e.g. a Dart/container-derived duration that overstates the actual
+         * decodable video-track length by a few milliseconds) is clamped down to durationUs in
+         * [prepare] rather than failing the whole session; a requested trim end that exceeds
+         * durationUs by more than this still fails closed with trim_exceeds_source_duration.
+         */
+        private const val TRIM_END_CLAMP_SLACK_US = 250_000L
     }
 
     private val disposed = AtomicBoolean(false)
@@ -108,16 +124,37 @@ class AndroidEditorSequentialPlaybackSession(
     private var orchThread: HandlerThread? = null
     private var orchHandler: Handler? = null
 
+    /**
+     * Immutable alias for the raw constructor argument, kept under its own name because the
+     * constructor parameter itself is named `clipSpecs` (matching what
+     * [AndroidEditorPlaybackCoordinator] passes as a named argument) while [effectiveClipSpecs]
+     * below holds the post-clamp, timeline-repositioned specs actually used for playback.
+     */
+    private val requestedClipSpecs: List<AndroidEditorClipPlaybackSpec> = clipSpecs
+
+    /**
+     * Effective per-clip playback specs consumed by everything downstream of [prepare]'s
+     * inspection pass: [resolveClipIndex], [mapGlobalToSourcePts], [sourceToGlobalPtsClamped],
+     * [activateClipBlocking], [handleClipEOS], and [totalDurationUs]. Starts equal to
+     * [requestedClipSpecs]; [prepare] replaces it with a copy whose sourceTrimEndUs is clamped
+     * down to the inspected source duration (see TRIM_END_CLAMP_SLACK_US) for any clip whose
+     * requested trim end overshoots by only a bounded container/metadata slack, with
+     * timelineStartUs/timelineDurationUs recomputed sequentially across all clips so a clamped
+     * clip never leaves a gap before the next clip's original, now-stale timelineStartUs.
+     */
+    private var effectiveClipSpecs: List<AndroidEditorClipPlaybackSpec> = requestedClipSpecs
+
     private var totalDurationUs: Long = 0L
     private var activeClipIndex: Int = -1
     private var activeSession: AndroidDagTexturePlaybackControlSession? = null
     private var isPlaying: Boolean = false
 
     /**
-     * Phase 7.8I-Android: per-clip original-audio availability, indexed by [clipSpecs] position.
+     * Phase 7.8I-Android: per-clip original-audio availability, indexed by [effectiveClipSpecs] position.
      * Populated during [prepare]'s metadata-inspection pass from [AndroidDagSourceInspector]'s
      * `hasAudio`. A clip with no audio track never gets an [AndroidEditorOriginalAudioPreviewRuntime]
-     * instance at all.
+     * instance at all. Neither does a clip whose native original-audio policy is muted
+     * ([AndroidEditorClipPlaybackSpec.originalAudioGain] <= 0.0) — see [activateClipBlocking].
      */
     private var clipHasAudio: List<Boolean> = emptyList()
 
@@ -133,14 +170,14 @@ class AndroidEditorSequentialPlaybackSession(
     /**
      * Inspects every clip (metadata only, verifying readability and that each clip's
      * requested trim window fits within its actual source duration), computes the
-     * global timeline duration from [clipSpecs], then activates clip 0 (prerolling to
+     * global timeline duration from [effectiveClipSpecs], then activates clip 0 (prerolling to
      * its trim start when non-zero). [onResult] receives `{pass, textureId, width,
      * height, durationUs, raw}` on success, matching the shape
      * [AndroidEditorPlaybackCoordinator] already expects from a single-clip
      * [AndroidDagTexturePlaybackControlSession.prepare].
      */
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
-        if (clipSpecs.isEmpty()) {
+        if (requestedClipSpecs.isEmpty()) {
             onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=empty_clip_list"))
             return
         }
@@ -158,7 +195,8 @@ class AndroidEditorSequentialPlaybackSession(
             }
 
             val hasAudioByIndex = mutableListOf<Boolean>()
-            for (spec in clipSpecs) {
+            val normalizedSpecs = mutableListOf<AndroidEditorClipPlaybackSpec>()
+            for (spec in requestedClipSpecs) {
                 val inspection = AndroidDagSourceInspector().inspect(spec.sourcePath, context)
                 try {
                     if (!inspection.pass) {
@@ -169,7 +207,7 @@ class AndroidEditorSequentialPlaybackSession(
                         ))
                         return@post
                     }
-                    if (spec.sourceTrimEndUs > inspection.durationUs + TRIM_DURATION_TOLERANCE_US) {
+                    if (spec.sourceTrimEndUs > inspection.durationUs + TRIM_END_CLAMP_SLACK_US) {
                         dispose(null)
                         onResult(mapOf(
                             "pass" to false,
@@ -178,7 +216,33 @@ class AndroidEditorSequentialPlaybackSession(
                         ))
                         return@post
                     }
-                    Log.i(TAG, "$LOG_PREFIX clip_inspect_result index=${hasAudioByIndex.size} hasAudio=${inspection.hasAudio} durationUs=${inspection.durationUs}")
+                    // Requested trim end may still exceed the inspected source duration by up
+                    // to TRIM_END_CLAMP_SLACK_US (container/metadata slack) — clamp it down to
+                    // the real source duration so seeking/EOS/pts-mapping never target a PTS
+                    // the decoder can't reach, instead of failing the whole session outright.
+                    var normalizedSpec = spec
+                    if (spec.sourceTrimEndUs > inspection.durationUs) {
+                        val clampedTrimEndUs = inspection.durationUs
+                        if (clampedTrimEndUs <= spec.sourceTrimStartUs) {
+                            dispose(null)
+                            onResult(mapOf(
+                                "pass" to false,
+                                "raw" to "status=FAIL;reason=trim_clamp_collapsed_window;path=${spec.sourcePath};" +
+                                    "sourceTrimStartUs=${spec.sourceTrimStartUs};originalTrimEndUs=${spec.sourceTrimEndUs};" +
+                                    "clampedTrimEndUs=$clampedTrimEndUs;sourceDurationUs=${inspection.durationUs}",
+                            ))
+                            return@post
+                        }
+                        Log.i(TAG, "$LOG_PREFIX trim_end_clamped path=${spec.sourcePath} " +
+                            "originalTrimEndUs=${spec.sourceTrimEndUs} clampedTrimEndUs=$clampedTrimEndUs " +
+                            "sourceDurationUs=${inspection.durationUs} deltaUs=${spec.sourceTrimEndUs - inspection.durationUs}")
+                        normalizedSpec = spec.copy(
+                            sourceTrimEndUs = clampedTrimEndUs,
+                            timelineDurationUs = clampedTrimEndUs - spec.sourceTrimStartUs,
+                        )
+                    }
+                    Log.i(TAG, "$LOG_PREFIX clip_inspect_result index=${normalizedSpecs.size} hasAudio=${inspection.hasAudio} durationUs=${inspection.durationUs}")
+                    normalizedSpecs.add(normalizedSpec)
                     hasAudioByIndex.add(inspection.hasAudio)
                 } finally {
                     // Metadata-only probe: release immediately. The active clip's own
@@ -189,7 +253,17 @@ class AndroidEditorSequentialPlaybackSession(
             }
             clipHasAudio = hasAudioByIndex
 
-            totalDurationUs = clipSpecs.maxOf { it.timelineStartUs + it.timelineDurationUs }
+            // Recompute timelineStartUs/timelineDurationUs sequentially across the
+            // (possibly trim-clamped) specs so a clip shrunk by clamping never leaves a
+            // gap before the next clip's original, now-stale timelineStartUs.
+            var cursorUs = 0L
+            effectiveClipSpecs = normalizedSpecs.map { normalizedSpec ->
+                val positioned = normalizedSpec.copy(timelineStartUs = cursorUs)
+                cursorUs += positioned.timelineDurationUs
+                positioned
+            }
+
+            totalDurationUs = effectiveClipSpecs.maxOf { it.timelineStartUs + it.timelineDurationUs }
 
             val activateResult = activateClipBlocking(0, explicitSourceSeekUs = null, resumeAfterSeek = false)
             val pass = activateResult["pass"] as? Boolean ?: false
@@ -207,7 +281,7 @@ class AndroidEditorSequentialPlaybackSession(
                 "width" to width,
                 "height" to height,
                 "durationUs" to totalDurationUs,
-                "raw" to "status=OK;clipCount=${clipSpecs.size};totalDurationUs=$totalDurationUs",
+                "raw" to "status=OK;clipCount=${effectiveClipSpecs.size};totalDurationUs=$totalDurationUs",
             ))
         }
     }
@@ -273,14 +347,14 @@ class AndroidEditorSequentialPlaybackSession(
             return
         }
         h.post {
-            if (disposed.get() || clipSpecs.isEmpty()) {
+            if (disposed.get() || effectiveClipSpecs.isEmpty()) {
                 onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
                 return@post
             }
 
             val clampedUs = targetGlobalPtsUs.coerceIn(0L, (totalDurationUs - 1L).coerceAtLeast(0L))
             val targetIndex = resolveClipIndex(clampedUs)
-            val targetSpec = clipSpecs[targetIndex]
+            val targetSpec = effectiveClipSpecs[targetIndex]
             val sourceTargetUs = mapGlobalToSourcePts(clampedUs, targetSpec)
             isPlaying = resumeAfterSeek
 
@@ -313,8 +387,8 @@ class AndroidEditorSequentialPlaybackSession(
     /** Resolves [globalPtsUs] to the clip whose `[timelineStartUs, timelineStartUs + timelineDurationUs)` range contains it. */
     private fun resolveClipIndex(globalPtsUs: Long): Int {
         var idx = 0
-        for (i in clipSpecs.indices) {
-            if (clipSpecs[i].timelineStartUs <= globalPtsUs) idx = i else break
+        for (i in effectiveClipSpecs.indices) {
+            if (effectiveClipSpecs[i].timelineStartUs <= globalPtsUs) idx = i else break
         }
         return idx
     }
@@ -364,7 +438,7 @@ class AndroidEditorSequentialPlaybackSession(
      * its [TextureRegistry.SurfaceProducer.SurfaceCallback] registration —
      * before the replacement session touches the shared [surfaceProducer]),
      * then creates, prepares, and preroll-seeks the session for
-     * `clipSpecs[index]`. When [explicitSourceSeekUs] is null, activation
+     * `effectiveClipSpecs[index]`. When [explicitSourceSeekUs] is null, activation
      * preroll-seeks to the clip's own `sourceTrimStartUs` if non-zero (so a
      * default clip activation always lands on the trimmed-in frame); when
      * non-null (an explicit cross-clip seek target), that value is used
@@ -399,29 +473,38 @@ class AndroidEditorSequentialPlaybackSession(
         if (disposed.get()) {
             return mapOf("pass" to false, "raw" to "status=FAIL;reason=disposed")
         }
-        if (index !in clipSpecs.indices) {
+        if (index !in effectiveClipSpecs.indices) {
             return mapOf("pass" to false, "raw" to "status=FAIL;reason=clip_index_out_of_range;index=$index")
         }
 
         val mySessionToken = sessionToken.incrementAndGet()
-        val spec = clipSpecs[index]
+        val spec = effectiveClipSpecs[index]
 
         // Prepare (and preroll-seek) this clip's original-clip audio, if it has any, before
         // touching video — mirrors the video preroll below and keeps both media confined to
-        // their own dedicated threads. A clip with no audio track never gets a runtime at all;
-        // any MediaPlayer setup/seek failure disables the runtime internally without ever
-        // failing this activation (see AndroidEditorOriginalAudioPreviewRuntime).
+        // their own dedicated threads. A clip with no audio track never gets a runtime at all,
+        // and neither does a clip whose native original-audio policy is muted
+        // (spec.originalAudioGain <= 0, i.e. the app sent a derived role="original" sidecar
+        // track with volume*mixGain == 0): for runtime ownership it behaves exactly like
+        // hasAudio=false while the video preview proceeds untouched. A positive policy gain is
+        // handed to the runtime as its MediaPlayer volume. Any MediaPlayer setup/seek failure
+        // disables the runtime internally without ever failing this activation (see
+        // AndroidEditorOriginalAudioPreviewRuntime).
         val hasAudio = clipHasAudio.getOrNull(index) ?: false
-        val newAudio = if (hasAudio) AndroidEditorOriginalAudioPreviewRuntime(context) else null
+        val originalGain = spec.originalAudioGain
+        val audioRuntimeEnabled = hasAudio && originalGain > 0.0f
+        val newAudio = if (audioRuntimeEnabled) AndroidEditorOriginalAudioPreviewRuntime(context, originalGain) else null
         if (newAudio != null) {
             val initialAudioPtsUs = explicitSourceSeekUs ?: spec.sourceTrimStartUs
-            Log.i(TAG, "$LOG_PREFIX activate_clip_audio_decision index=$index hasAudio=true initialAudioPtsUs=$initialAudioPtsUs")
+            Log.i(TAG, "$LOG_PREFIX activate_clip_audio_decision index=$index clipId=${spec.clipId} hasAudio=true " +
+                "originalGain=$originalGain audioRuntimeEnabled=true initialAudioPtsUs=$initialAudioPtsUs")
             val audioPrepareLatch = CountDownLatch(1)
             newAudio.prepare(spec.sourcePath, initialAudioPtsUs) { audioPrepareLatch.countDown() }
             audioPrepareLatch.await()
             Log.i(TAG, "$LOG_PREFIX audio_prepare_done index=$index")
         } else {
-            Log.i(TAG, "$LOG_PREFIX activate_clip_audio_decision index=$index hasAudio=false")
+            Log.i(TAG, "$LOG_PREFIX activate_clip_audio_decision index=$index clipId=${spec.clipId} hasAudio=$hasAudio " +
+                "originalGain=$originalGain audioRuntimeEnabled=false")
         }
         activeAudioRuntime = newAudio
 
@@ -462,6 +545,17 @@ class AndroidEditorSequentialPlaybackSession(
                         Log.w(TAG, "onPlaybackInterrupted: pausing audio; reason=$reason")
                         isPlaying = false
                         activeAudioRuntime?.pause()
+                    }
+                }
+            },
+            // Phase 10-Autoplay-Fix: resume audio when video auto-resumes
+            // after a transient surface loss restore.
+            onPlaybackResumed = {
+                orchHandler?.post {
+                    if (sessionToken.get() == mySessionToken && !disposed.get()) {
+                        Log.i(TAG, "onPlaybackResumed: resuming audio after surface restoration")
+                        isPlaying = true
+                        activeAudioRuntime?.play()
                     }
                 }
             },
@@ -529,7 +623,7 @@ class AndroidEditorSequentialPlaybackSession(
     private fun handleClipEOS(finishedIndex: Int) {
         if (disposed.get()) return
 
-        if (finishedIndex >= clipSpecs.size - 1) {
+        if (finishedIndex >= effectiveClipSpecs.size - 1) {
             // Final clip EOS: preserve the completed session (holds last frame),
             // matching the single-clip route's Completed-state behavior.
             Log.i(TAG, "$LOG_PREFIX final_eos_pause_audio index=$finishedIndex")

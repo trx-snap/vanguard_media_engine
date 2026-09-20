@@ -1,7 +1,9 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 import kotlin.math.abs
 
@@ -23,9 +25,25 @@ import kotlin.math.abs
 // [remuxFn]/[mixFn]/[aacEncodeFn] are narrow diagnostic injection seams --
 // production always uses the bound defaults; no product/MethodChannel flag
 // selects an alternate implementation.
+//
+// Android reference-video export: [context] is an optional Context used ONLY
+// to open a sidecar track whose url is a `content://` URI (an original-sound
+// track over an Android gallery-reference clip) through the ContentResolver
+// -- in the direct-copy duration probe here, in
+// AndroidAudioDirectCopyValidator, and, via the bound defaults, in
+// AndroidAudioRemuxer / AndroidAudioMixdownEngine / AndroidAudioPcmDecoder.
+// The video/audio temps and the final output are always POSIX and never need
+// it. A `content://` track with a null Context fails closed through the
+// existing structured reasons (`remux:<reason>` / `mixdown:<reason>`); it
+// never throws out of [run]. Diagnostics/harness constructors keep working
+// unchanged via the defaults. Declared first so the bound defaults below can
+// capture it.
 class AndroidTimelineAudioPass2Muxer(
-    private val remuxFn: (String, String?, String) -> AndroidAudioRemuxResult = AndroidAudioRemuxer::remux,
-    private val mixFn: (List<AndroidAudioTrackSpec>) -> AndroidAudioMixdownResult = AndroidAudioMixdownEngine::mix,
+    private val context: Context? = null,
+    private val remuxFn: (String, String?, String) -> AndroidAudioRemuxResult =
+        { videoPath, audioPath, finalPath -> AndroidAudioRemuxer.remux(videoPath, audioPath, finalPath, context) },
+    private val mixFn: (List<AndroidAudioTrackSpec>) -> AndroidAudioMixdownResult =
+        { specs -> AndroidAudioMixdownEngine.mix(specs, context) },
     private val aacEncodeFn: (ShortArray, Int, Int, String) -> AndroidAacEncodeResult =
         AndroidAacEncoder::encodePcm16ToM4a,
 ) {
@@ -86,7 +104,7 @@ class AndroidTimelineAudioPass2Muxer(
     /// both the probed source audio duration and the pass-1 video duration
     /// within 50 ms. Any mismatch falls back to the mixdown path.
     private fun tryDirectCopy(specs: List<AndroidAudioTrackSpec>, videoTempPath: String): Boolean {
-        val verdict = AndroidAudioDirectCopyValidator.validate(specs)
+        val verdict = AndroidAudioDirectCopyValidator.validate(specs, context)
         if (!verdict.eligible) return false
 
         val track = specs.first()
@@ -104,7 +122,8 @@ class AndroidTimelineAudioPass2Muxer(
     private fun probeMediaDurationSeconds(path: String): Double? {
         val retriever = MediaMetadataRetriever()
         try {
-            retriever.setDataSource(path)
+            // POSIX temp or `content://` track url -- the helper picks the overload.
+            AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, path, context)
             val ms = retriever
                 .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: return null

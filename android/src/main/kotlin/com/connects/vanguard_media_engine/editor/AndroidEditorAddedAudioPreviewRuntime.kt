@@ -9,7 +9,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
-import java.io.File
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -66,8 +66,9 @@ data class AndroidEditorAddedAudioTrackConfig(
  * (`enabled = false`) and every subsequent call becomes a silent no-op — a corrupt/unsupported
  * added-audio source never blocks or fails the accompanying video preview.
  *
- * [context] is used only to request/abandon [AudioManager] playback focus; optional, and skipped
- * entirely when null.
+ * [context] is used to request/abandon [AudioManager] playback focus and to open `content://`
+ * sources via [AndroidUriDataSourceHelper]; optional — when null, focus is skipped and a
+ * `content://` source fails closed (disabled runtime, [prepare]'s `onDone` still fires).
  */
 class AndroidEditorAddedAudioPreviewRuntime(
     private val context: Context?,
@@ -146,8 +147,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
             }
             teardownPlayerLocked()
 
-            val file = File(config.sourcePath)
-            if (!file.exists() || !file.canRead()) {
+            if (!AndroidUriDataSourceHelper.isReadable(config.sourcePath, context)) {
                 Log.w(TAG, "$LOG_PREFIX prepare_failed reason=file_unreadable trackId=${config.trackId} role=${config.role}")
                 enabled = false
                 onDone()
@@ -198,7 +198,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                         finish()
                     }
                 }
-                mp.setDataSource(config.sourcePath)
+                AndroidUriDataSourceHelper.setMediaPlayerDataSource(mp, config.sourcePath, context)
                 mp.prepareAsync()
             } catch (t: Throwable) {
                 Log.w(TAG, "$LOG_PREFIX prepare_failed reason=setup_error trackId=${config.trackId} role=${config.role}", t)

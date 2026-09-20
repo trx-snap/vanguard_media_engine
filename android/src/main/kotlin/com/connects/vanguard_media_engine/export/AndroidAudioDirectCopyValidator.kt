@@ -1,7 +1,9 @@
 package com.connects.vanguard_media_engine.export
 
+import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 
 // ── AndroidAudioDirectCopyValidator (Export/Audio Unit B) ─────────────────────
@@ -33,7 +35,16 @@ object AndroidAudioDirectCopyValidator {
     private const val TOLERANCE = 0.001
     private const val AAC_MP4_MIME = "audio/mp4a-latm"
 
-    fun validate(activeTracks: List<AndroidAudioTrackSpec>): AndroidAudioDirectCopyVerdict {
+    /// [context] is an optional Context used ONLY when the track url is a
+    /// `content://` URI (AndroidUriDataSourceHelper) -- for the existence
+    /// preflight (g) and the AAC probe. POSIX urls keep the byte-identical
+    /// File.exists() preflight and setDataSource(String) probe. A
+    /// `content://` url with a null Context is an ineligible verdict
+    /// (`source_file_missing`), never a throw.
+    fun validate(
+        activeTracks: List<AndroidAudioTrackSpec>,
+        context: Context? = null,
+    ): AndroidAudioDirectCopyVerdict {
         if (activeTracks.size != 1) {
             return ineligible("active_track_count=${activeTracks.size}")
         }
@@ -57,16 +68,21 @@ object AndroidAudioDirectCopyValidator {
         if (track.hasVolumeKeyframes) {
             return ineligible("volume_keyframes_present")
         }
-        if (!File(track.url).exists()) {
+        val sourceMissing = if (AndroidUriDataSourceHelper.isContentUri(track.url)) {
+            !AndroidUriDataSourceHelper.isReadable(track.url, context)
+        } else {
+            !File(track.url).exists()
+        }
+        if (sourceMissing) {
             return ineligible("source_file_missing")
         }
-        return validateSourceAudioIsAac(track.url)
+        return validateSourceAudioIsAac(track.url, context)
     }
 
-    private fun validateSourceAudioIsAac(sourcePath: String): AndroidAudioDirectCopyVerdict {
+    private fun validateSourceAudioIsAac(sourcePath: String, context: Context?): AndroidAudioDirectCopyVerdict {
         val extractor = MediaExtractor()
         try {
-            extractor.setDataSource(sourcePath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, sourcePath, context)
             var audioFormat: MediaFormat? = null
             var audioMime = ""
             for (i in 0 until extractor.trackCount) {
