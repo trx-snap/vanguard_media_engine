@@ -53,11 +53,13 @@ class AndroidDuetPreviewRenderLoop(
     private val decoderProvider: () -> AndroidDuetSourceVideoDecoder?,
     /**
      * Optional callback invoked on the main thread each time [attachOutputSurface]
-     * succeeds and [compositor.cameraInputSurface] is non-null. The surface passed
-     * is compositor-owned (valid for the lifetime of this render loop). The
-     * coordinator uses this to start [AndroidDuetCameraSource] reliably without
-     * relying on an immediate post-attach synchronous read of [cameraInputSurface]
-     * (which would race the async render-thread bootstrap).
+     * succeeds and [compositor.cameraInputSurface] is non-null. The callback carries
+     * no Surface argument — the coordinator reads [cameraInputSurface] through the
+     * sink interface (backend-owned consumer endpoint), avoiding raw Surface transfer
+     * through the callback payload. The coordinator uses this to start
+     * [AndroidDuetCameraSource] reliably without relying on an immediate
+     * post-attach synchronous read of [cameraInputSurface] (which would race the
+     * async render-thread bootstrap).
      *
      * Fired on every successful [attachOutputSurface] where cameraInputSurface is
      * non-null (not just the first). The coordinator's [startCameraSourceIfNeeded]
@@ -66,7 +68,7 @@ class AndroidDuetPreviewRenderLoop(
      * transient CameraX failure nulled cameraSource. Never called if the
      * compositor bootstrap fails.
      */
-    private val cameraInputSurfaceReady: ((android.view.Surface) -> Unit)? = null,
+    private val cameraInputSurfaceReady: (() -> Unit)? = null,
     /**
      * Diagnostic-only backend selection, computed by
      * [AndroidDuetPreviewBackendFactory.selectForLayoutConfig] from the
@@ -123,8 +125,12 @@ class AndroidDuetPreviewRenderLoop(
     private var decoderBound = false
 
     /**
-     * The compositor's camera input surface — allocated inside [compositor]
-     * during the first [attachOutputSurface] call.
+     * Backend-owned BufferQueue consumer endpoint (SurfaceTexture for GLES,
+     * ImageReader/HardwareBuffer for Vulkan) exposed to CameraX through the
+     * [AndroidDuetForegroundSink] contract. Allocated inside [compositor] during
+     * the first [attachOutputSurface] call on the render thread. The render loop
+     * owns this surface; the foreground provider must NOT create, release, or
+     * transfer it — it reads it once in [AndroidDuetForegroundProvider.start].
      *
      * Prefer using the [cameraInputSurfaceReady] constructor callback rather
      * than polling this property, because the compositor bootstraps EGL
@@ -132,7 +138,7 @@ class AndroidDuetPreviewRenderLoop(
      * the first render-thread task for [attachOutputSurface] completes.
      * The callback is the only guaranteed delivery point.
      */
-    val cameraInputSurface: android.view.Surface? get() = compositor.cameraInputSurface
+    override val cameraInputSurface: android.view.Surface? get() = compositor.cameraInputSurface
 
     // -- Submission gating ------------------------------------------------------
 
@@ -225,6 +231,12 @@ class AndroidDuetPreviewRenderLoop(
             // thread. We must post back to mainHandler so the coordinator can start
             // CameraX (which requires the main thread).
             //
+            // The callback carries no Surface argument: the coordinator reads
+            // cameraInputSurface through the AndroidDuetForegroundSink interface
+            // (backend-owned BufferQueue consumer endpoint). This avoids passing raw
+            // Surface through the callback payload while keeping the render loop as
+            // the authoritative owner of the graphics consumer.
+            //
             // Fired on every successful attachOutputSurface where cameraInputSurface
             // is non-null — no once-only flag. The coordinator's startCameraSourceIfNeeded
             // is idempotent (session-identity, previewRenderLoop/previewProducer non-null,
@@ -235,7 +247,7 @@ class AndroidDuetPreviewRenderLoop(
             if (camSurface != null) {
                 val cb = cameraInputSurfaceReady
                 if (cb != null) {
-                    mainHandler.post { cb(camSurface) }
+                    mainHandler.post { cb() }
                 }
             }
             val input = compositor.decoderInputSurface ?: return@post

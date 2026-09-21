@@ -820,12 +820,14 @@ class AndroidDuetSessionCoordinator(
                 mainHandler     = mainHandler,
                 decoderHandler  = decoderHandler,
                 decoderProvider = { session.decoder },
-                // Defect 1 fix: receive the compositor's cameraInputSurface on the
-                // main thread once the render-thread EGL bootstrap completes, then
-                // call the centralized startCameraSourceIfNeeded — no synchronous
-                // post-attach read of cameraInputSurface.
-                cameraInputSurfaceReady = { camSurface ->
-                    startCameraSourceIfNeeded(session, sessionId, camSurface)
+                // Defect 1 fix: receive notification on the main thread once the
+                // render-thread EGL bootstrap completes, then call the centralized
+                // startCameraSourceIfNeeded — no synchronous post-attach read of
+                // cameraInputSurface. The callback carries no Surface argument:
+                // the coordinator reads cameraInputSurface through the render loop's
+                // AndroidDuetForegroundSink interface (backend-owned consumer endpoint).
+                cameraInputSurfaceReady = {
+                    startCameraSourceIfNeeded(session, sessionId)
                 },
                 backendSelection = backendSelection,
             )
@@ -934,6 +936,13 @@ class AndroidDuetSessionCoordinator(
      * Centralized, idempotent foreground-provider start helper called from the
      * render loop's [cameraInputSurfaceReady] callback (main thread).
      *
+     * The coordinator owns CameraX and segmentation lifecycle only; the backend
+     * compositor owns the graphics consumer endpoint (SurfaceTexture for GLES,
+     * ImageReader/HardwareBuffer for Vulkan). The camera input surface is read
+     * through [renderLoop] (which implements [AndroidDuetForegroundSink]) rather
+     * than being passed as a callback argument, keeping the raw Surface off the
+     * callback payload.
+     *
      * Session-level idempotent guards (all checked before delegating to the
      * provider):
      *   - [activeSession] is not this exact session object → no-op (session was
@@ -945,8 +954,9 @@ class AndroidDuetSessionCoordinator(
      *     before this callback ran; camera must not start against a dead loop).
      *   - [session.previewProducer] is null → no-op (producer was released; the
      *     output surface is gone and starting camera would be pointless).
-     *   - [surface.isValid] is false → no-op (compositor's cameraInputSurface was
-     *     already released during teardown before the posted callback ran).
+     *   - [renderLoop.cameraInputSurface] is null or invalid → no-op (compositor's
+     *     cameraInputSurface was already released during teardown before the posted
+     *     callback ran; provider.start will report the error internally).
      *
      * [AndroidDuetForegroundProvider.start] itself guards context-availability
      * and camera-already-started idempotency.
@@ -954,7 +964,6 @@ class AndroidDuetSessionCoordinator(
     private fun startCameraSourceIfNeeded(
         session: VGDuetAndroidSession,
         sessionId: String,
-        surface: android.view.Surface,
     ) {
         // Hard lifecycle guards — any of these failing means the session was torn
         // down between when cameraInputSurfaceReady was posted and when it ran.
@@ -962,14 +971,18 @@ class AndroidDuetSessionCoordinator(
         if (session.sessionId != sessionId) return
         val renderLoop = session.previewRenderLoop ?: return
         if (session.previewProducer == null) return
-        if (!surface.isValid) return
+        // Read the backend-owned surface through the sink interface.
+        // The compositor (backend) owns the BufferQueue consumer; we only
+        // check validity here as a fast-path guard — provider.start will
+        // perform the definitive null/isValid check and report onError if needed.
+        val surface = renderLoop.cameraInputSurface
+        if (surface == null || !surface.isValid) return
 
         val mode = session.layoutConfigMap["mode"] as? String ?: "pip"
         val provider = session.foregroundProvider
             ?: AndroidDuetCameraForegroundProvider(context, mainHandler).also { session.foregroundProvider = it }
 
         provider.start(
-            surface         = surface,
             sink            = renderLoop,
             layoutConfigMap = session.layoutConfigMap,
             callbacks       = object : AndroidDuetForegroundProviderCallbacks {

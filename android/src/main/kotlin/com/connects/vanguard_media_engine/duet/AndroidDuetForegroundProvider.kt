@@ -29,6 +29,18 @@ import java.util.concurrent.atomic.AtomicBoolean
  * slice — does not introduce new straight-alpha ingest.
  */
 interface AndroidDuetForegroundSink {
+    /**
+     * Backend-owned Android BufferQueue consumer endpoint exposed to CameraX.
+     * The graphics consumer (SurfaceTexture for GLES, ImageReader/HardwareBuffer
+     * for Vulkan) is allocated by the backend compositor and lives for the
+     * lifetime of the render loop. The provider does NOT own this surface and
+     * must NOT create, release, or transfer it. Read once in [start] to obtain
+     * the CameraX preview target; if null or invalid, [start] must report an
+     * error through [AndroidDuetForegroundProviderCallbacks.onError] and not
+     * create any CameraX state.
+     */
+    val cameraInputSurface: android.view.Surface?
+
     fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean)
     fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame)
     fun updateGreenScreenMaskHardwareBuffer(
@@ -55,22 +67,26 @@ interface AndroidDuetForegroundProviderCallbacks {
 }
 
 /**
- * Owns the Duet foreground (live camera + green-screen keying) source behind
- * a caller-owned compositor Surface and render sink.
+ * Owns the Duet foreground (live camera + green-screen keying) source.
+ * The provider owns the CameraX and segmentation lifecycle only; the
+ * backend compositor owns the graphics consumer endpoint (SurfaceTexture /
+ * ImageReader / HardwareBuffer acquisition).
  */
 interface AndroidDuetForegroundProvider {
     /** True once the current keying pass has delivered its first real mask. */
     val firstMaskReady: Boolean
 
     /**
-     * Starts the foreground source against [surface]. Idempotent — a second
-     * call while already started is a no-op. [layoutConfigMap] selects the
-     * initial mode ("greenScreen" binds the keying analyzer alongside camera
-     * preview from the first CameraX bind). Mask events are forwarded to
-     * [sink].
+     * Starts the foreground source. Reads the camera input surface from
+     * [sink.cameraInputSurface] — a backend-owned BufferQueue consumer
+     * endpoint. Idempotent — a second call while already started is a no-op.
+     * If [sink.cameraInputSurface] is null or invalid, reports an error via
+     * [callbacks.onError] and creates no CameraX state. [layoutConfigMap]
+     * selects the initial mode ("greenScreen" binds the keying analyzer
+     * alongside camera preview from the first CameraX bind). Mask events are
+     * forwarded to [sink].
      */
     fun start(
-        surface: Surface,
         sink: AndroidDuetForegroundSink,
         layoutConfigMap: Map<String, Any?>,
         callbacks: AndroidDuetForegroundProviderCallbacks,
@@ -162,7 +178,6 @@ class AndroidDuetCameraForegroundProvider(
     // ── Public API ─────────────────────────────────────────────────────────────
 
     override fun start(
-        surface: Surface,
         sink: AndroidDuetForegroundSink,
         layoutConfigMap: Map<String, Any?>,
         callbacks: AndroidDuetForegroundProviderCallbacks,
@@ -171,6 +186,16 @@ class AndroidDuetCameraForegroundProvider(
         // repeat call while already started correctly does nothing.
         if (cameraSource != null) return
         val ctx = context ?: return
+
+        // Read the camera input surface from the sink — the backend compositor
+        // owns this BufferQueue consumer endpoint; the provider must not allocate,
+        // release, or transfer it. If unavailable (backend not yet bootstrapped or
+        // already torn down), report a clean error and create no CameraX state.
+        val surface = sink.cameraInputSurface
+        if (surface == null || !surface.isValid) {
+            callbacks.onError(IllegalStateException("camera_input_surface_unavailable"))
+            return
+        }
 
         this.sink = sink
         this.callbacks = callbacks
