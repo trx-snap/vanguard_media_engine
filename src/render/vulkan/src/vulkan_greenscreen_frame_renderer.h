@@ -75,10 +75,14 @@
 //     image must therefore be a non-external-format sampled image (R8 CPU
 //     upload or RGBA8 GPU import); its .r channel is the matte.
 //   * VideoTransformFullPushConstants pushed verbatim from the caller
-//     (aspect-fill crop + colour matrix resolved by the placement helper);
-//     the fragment stage samples the mask at the same cropped UV as the
-//     camera texel (see the shader for the mask-orientation caveat). This is
-//     the camera's SENSOR/CONTENT rotation and is completely independent of
+//     (aspect-fill crop + colour matrix resolved by the placement helper) --
+//     that transformed camera UV feeds only the camera texel and the
+//     mask_mapped diagnostic (debugMode 2); normal-mode matte sampling
+//     instead uses the untransformed raw camera-rect UV with Y flipped
+//     (maskUv = vec2(inRawUv.x, 1.0 - inRawUv.y)), matching the GLES parity
+//     policy proven on-device (see the shader for the mask-orientation
+//     caveat). This aspect-fill/colour-matrix transform is the camera's
+//     SENSOR/CONTENT rotation and is completely independent of
 //     the foreground free-transform rotation above; both may be non-zero at
 //     once (e.g. a 90-degree front-camera sensor correction while the user
 //     free-rotates the foreground layer 37 degrees).

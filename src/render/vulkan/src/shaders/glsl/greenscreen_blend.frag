@@ -55,17 +55,27 @@
 //                  one-mask-pixel erosion taps in normal mode only,
 //   maskDebug.w  = reserved (0).
 //
-// Mask UV / matte policy (ANDROID-DUET-VULKAN-GREENSCREEN-MATTE): the mask
-// is produced from the same native camera frame `uCamera` samples, so normal
-// mode samples it with the TRANSFORMED camera UV (maskUv = clamp(inUv, 0.0,
-// 1.0)). The matte thus follows the same aspect-fill crop, 270-degree
-// rotation and front-camera mirror as the camera texel, then is eroded by
-// one mask texel (min of centre + 4 direct neighbours) and shaped with
-// smoothstep(0.52, 0.78). The former GLES parity policy (raw camera-rect UV
-// with Y flipped) is no longer valid for the corrected Vulkan-native camera
-// stream: physical RND on SM-A566B (cameraRot=270, cameraMirror=1) showed
-// the raw-UV matte rotated against the correctly placed camera. Raw-UV
-// sampling survives only in the mask_direct* diagnostics.
+// Mask UV / matte policy (ANDROID-DUET-VULKAN-GREENSCREEN-MATTE): restored to
+// the proven GLES parity policy (AndroidDuetPreviewCompositor.kt's green-screen
+// fragment program) after physical RND showed the TRANSFORMED-camera-UV policy
+// this shader briefly carried was wrong: normal mode samples the mask with the
+// UNTRANSFORMED raw camera-rect UV, Y flipped (maskUv = vec2(inRawUv.x, 1.0 -
+// inRawUv.y)), matching the GLES compositor's `vRawTexCoord` convention exactly
+// (see greenscreen_camera_mask.vert's orientation contract for why inRawUv is
+// already in that same bottom-left-origin convention, so no further flip of X
+// is needed here). GLES physical RND on-device established this is the only
+// sampling that places the matte correctly in the camera rect: mask_mapped
+// (the transformed-UV policy, still available as debugMode 2 below) produced a
+// side-stripe failure, and mask_direct (raw UV, no Y flip) produced a
+// top-heavy rectangle. The matte is then eroded by one mask texel (min of
+// centre + 4 direct neighbours) and shaped with smoothstep(0.52, 0.78). X is
+// intentionally NOT flipped: the mask buffer already carries the same X
+// orientation this raw-UV sampling expects, matching the GLES policy's own
+// note that an added X flip would cancel an upstream mirror correction and
+// reintroduce a wrong-side registration bug. Transformed-camera-UV sampling
+// (aspect-fill crop / rotation / mirror matched to the camera texel) survives
+// only in the mask_mapped diagnostic (debugMode 2); raw-UV sampling (no Y
+// flip) survives in mask_direct (debugMode 1).
 //
 // Debug modes 1..4 (RND diagnostic, selected by maskDebug.x) write the mask
 // as opaque grayscale instead of the camera: the pipeline's viewport /
@@ -142,10 +152,12 @@ void main() {
         1.0
     );
 
-    // Normal mode: transformed camera UV, so the matte follows the same
-    // aspect-fill crop / rotation / mirror as the camera texel (the UV
-    // mask_mapped visualises above).
-    vec2 maskUv = clamp(inUv, 0.0, 1.0);
+    // Normal mode: the proven GLES parity policy -- raw camera-rect UV, Y
+    // flipped (X is not flipped; see the header comment above). This is
+    // deliberately NOT the transformed camera UV mask_mapped (debugMode 2)
+    // visualises: physical RND showed that transformed-UV policy places the
+    // matte incorrectly (a side-stripe failure) on-device.
+    vec2 maskUv = vec2(inRawUv.x, 1.0 - inRawUv.y);
     float centerAlpha = texture(uMask, maskUv).r;
     // Conservative GPU-side matte refinement: take the minimum of the centre
     // tap and its four direct neighbours (one mask pixel away, clamped inside
