@@ -12,7 +12,7 @@
 //       * attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup
 //       * attach-time native layout rect for creatorOverlay was returned and matched expected geometry
 //       * startRecording activates render loop with preview compositor
-//       * green-screen preview remains active for bounded wait (5 s)
+//       * green-screen preview remains active for bounded wait (configured active seconds)
 //       * attach/update accepted a non-zero rotation transform and remained active (only when rotation proof is enabled)
 //       * layout update to safe-parity PiP rect works while active
 //       * PiP preview remains active for bounded wait (1.5 s)
@@ -83,6 +83,68 @@ final double kUpdateRotationDegrees = _parseRotationDegrees(
   _kUpdateRotationRaw,
   22.5,
 );
+
+const String _kDefaultSourceAsset = 'assets/manual_test_clips/clip_A.mov';
+const double _kDefaultTrimEndSeconds = 2.5;
+const double _kDefaultActiveSeconds = 5.0;
+const double kTrimStartSeconds = 0.0;
+
+const String _kSourceAssetRaw = String.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_SOURCE_ASSET',
+  defaultValue: _kDefaultSourceAsset,
+);
+
+const String _kTrimEndSecondsRaw = String.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_TRIM_END_SECONDS',
+  defaultValue: '2.5',
+);
+
+const String _kActiveSecondsRaw = String.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_ACTIVE_SECONDS',
+  defaultValue: '5.0',
+);
+
+String _parseSourceAsset(String raw, String defaultValue) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return defaultValue;
+  return trimmed;
+}
+
+double _parsePositiveSeconds(String raw, double defaultValue) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return defaultValue;
+  final parsed = double.tryParse(trimmed);
+  if (parsed == null || !parsed.isFinite || parsed <= 0.0) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
+String _assetFileName(String assetPath) {
+  final trimmed = assetPath.trim().replaceAll(r'\', '/');
+  final segments = trimmed.split('/').where((s) => s.isNotEmpty).toList();
+  if (segments.isEmpty) {
+    return 'clip_A.mov';
+  }
+  return segments.last;
+}
+
+final String kSourceAsset = _parseSourceAsset(
+  _kSourceAssetRaw,
+  _kDefaultSourceAsset,
+);
+
+final double kTrimEndSeconds = _parsePositiveSeconds(
+  _kTrimEndSecondsRaw,
+  _kDefaultTrimEndSeconds,
+);
+
+final double kGreenScreenPreviewActiveSeconds = _parsePositiveSeconds(
+  _kActiveSecondsRaw,
+  _kDefaultActiveSeconds,
+);
+
+final String kStagedSourceFileName = _assetFileName(kSourceAsset);
 
 VGDuetForegroundTransform _creatorOverlayWithRotation(double rotationDegrees) {
   final safeRotation = rotationDegrees.isFinite ? rotationDegrees : 0.0;
@@ -185,16 +247,14 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
     }
 
     try {
-      // Step 1: STAGE_FIXTURE — stage clip_A.mov from rootBundle into temp directory
+      // Step 1: STAGE_FIXTURE — stage source asset from rootBundle into temp directory
       final source = await runStep<VGDuetSource>(
         'STAGE_FIXTURE',
-        'Staging clip_A.mov into temp directory',
+        'Staging $kStagedSourceFileName into temp directory',
         () async {
           tempDir = await Directory.systemTemp.createTemp('duet_gs_smoke_');
-          final targetFile = File('${tempDir!.path}/clip_A.mov');
-          final byteData = await rootBundle.load(
-            'assets/manual_test_clips/clip_A.mov',
-          );
+          final targetFile = File('${tempDir!.path}/$kStagedSourceFileName');
+          final byteData = await rootBundle.load(kSourceAsset);
           await targetFile.writeAsBytes(
             byteData.buffer.asUint8List(
               byteData.offsetInBytes,
@@ -209,14 +269,14 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 2: INIT_SESSION — trim 0.0s to 2.5s
+      // Step 2: INIT_SESSION — trim ${kTrimStartSeconds}s to ${kTrimEndSeconds}s
       sessionId = await runStep<String>(
         'INIT_SESSION',
-        'Initializing Duet session (trim: 0.0s - 2.5s)',
+        'Initializing Duet session (trim: ${kTrimStartSeconds}s - ${kTrimEndSeconds}s)',
         () async {
           final trimWindow = VGDuetTrimWindow(
-            startSeconds: 0.0,
-            endSeconds: 2.5,
+            startSeconds: kTrimStartSeconds,
+            endSeconds: kTrimEndSeconds,
           );
           return await _withTimeout(
             _platform.initializeSession(source: source, trimWindow: trimWindow),
@@ -298,12 +358,16 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 5: GREENSCREEN_PREVIEW_ACTIVE — wait 5 seconds
+      // Step 5: GREENSCREEN_PREVIEW_ACTIVE — wait active seconds (${kGreenScreenPreviewActiveSeconds}s)
       await runStep<void>(
         'GREENSCREEN_PREVIEW_ACTIVE',
-        'Observing green-screen preview active (5.0s)',
+        'Observing green-screen preview active (${kGreenScreenPreviewActiveSeconds}s)',
         () async {
-          await Future<void>.delayed(const Duration(seconds: 5));
+          await Future<void>.delayed(
+            Duration(
+              milliseconds: (kGreenScreenPreviewActiveSeconds * 1000).round(),
+            ),
+          );
         },
       );
 
@@ -509,7 +573,7 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           'attach-time greenScreen layout accepts/preserves the creatorOverlay foregroundTransform route through platform setup',
           'attach-time native layout rect for creatorOverlay was returned and matched expected geometry',
           'startRecording activates render loop with preview compositor',
-          'green-screen preview remains active for bounded wait (5 s)',
+          'green-screen preview remains active for bounded wait ($kGreenScreenPreviewActiveSeconds s)',
           if (kRotationProofEnabled)
             'attach/update accepted a non-zero rotation transform and remained active',
           'layout update to safe-parity PiP rect works while active',
@@ -529,6 +593,11 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         ],
         'sessionId': sessionId,
         'textureId': textureId,
+        'sourceAsset': kSourceAsset,
+        'stagedSourceFileName': kStagedSourceFileName,
+        'trimStartSeconds': kTrimStartSeconds,
+        'trimEndSeconds': kTrimEndSeconds,
+        'greenScreenPreviewActiveSeconds': kGreenScreenPreviewActiveSeconds,
         'rotationProofEnabled': kRotationProofEnabled,
         'attachRotationDegrees': kAttachRotationDegrees,
         'updateRotationDegrees': kUpdateRotationDegrees,
