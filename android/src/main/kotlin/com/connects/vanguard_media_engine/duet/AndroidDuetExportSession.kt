@@ -341,6 +341,12 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
 
             // ── Build STICKER overlay descriptor ─────────────────────────────
             // Places the rect-sized PNG at fgRect.left/top with exact dimensions.
+            // Rotation carries the parsed foreground transform's rotationDegrees
+            // (already validated finite, default 0.0) so exported foreground
+            // rotation matches the live preview. This routes through the timeline
+            // overlay's own rotation handling and does not yet express non-center
+            // anchor-pivot parity with the preview compositor.
+            val fgRotationDegrees = params.foregroundTransform?.rotationDegrees ?: 0.0
             val overlayDescriptor = AndroidTimelineOverlayDescriptor(
                 overlayId        = "duet_synthetic_fg",
                 type             = AndroidTimelineOverlayDescriptor.Type.STICKER,
@@ -350,7 +356,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 translationY     = fgRect.top,
                 width            = fgRect.width,
                 height           = fgRect.height,
-                rotation         = 0.0,
+                rotation         = fgRotationDegrees,
                 scale            = 1.0,
                 opacity          = 1.0,
                 zIndex           = 1,
