@@ -399,18 +399,37 @@ class VGDuetForegroundTransform {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The type of background displayed beneath the green-screen camera layer.
+///
+/// **Export parity baseline:** [video] is the only background type supported
+/// for offline export on all platforms. [solidColor] and [image] are
+/// preview/R&D-only; both iOS and Android export sessions must reject them
+/// with `unsupported_export_feature` until cross-platform static/image export
+/// is explicitly implemented and documented.
 enum VGDuetGreenScreenBackgroundType {
   /// The source video as the background (default).
+  ///
+  /// This is the only type supported for cross-platform offline export.
   video,
 
   /// A solid ARGB color fill.
+  ///
+  /// **Preview/R&D-only.** Offline export must reject this type with
+  /// `unsupported_export_feature` on all platforms until solid-color export
+  /// is explicitly implemented and documented as supported.
   solidColor,
 
   /// A static image file from local storage.
+  ///
+  /// **Preview/R&D-only.** Offline export must reject this type with
+  /// `unsupported_export_feature` on all platforms until image-file export
+  /// is explicitly implemented and documented as supported.
   image,
 }
 
 /// Scaling mode for static green-screen backgrounds.
+///
+/// Only meaningful for [VGDuetGreenScreenBackgroundType.image] backgrounds,
+/// which are preview/R&D-only. Serialized for round-trip compatibility.
 enum VGDuetBackgroundScaleMode {
   /// Aspect fill: fills the entire rect, cropping overflow.
   aspectFill,
@@ -420,23 +439,48 @@ enum VGDuetBackgroundScaleMode {
 }
 
 /// Immutable specification of the background layer in green-screen layout mode.
+///
+/// **Cross-platform export baseline:** [VGDuetGreenScreenBackground.video] is
+/// the only variant that both iOS and Android export sessions support today.
+/// Sending [solidColor] or [imageFile] to an offline export session will
+/// cause a typed failure with code `unsupported_export_feature` on both
+/// platforms. These variants are accepted in preview/live sessions where the
+/// platform may provide its own diagnostic behavior, but callers must not
+/// rely on any specific preview-side handling for non-video backgrounds; it
+/// is not cross-platform.
+///
+/// Serialization keys and the public API are stable.
 class VGDuetGreenScreenBackground {
   final VGDuetGreenScreenBackgroundType type;
   final int? argbColor;
   final String? filePath;
   final VGDuetBackgroundScaleMode? scaleMode;
 
+  /// Background is the source video playing behind the keyed camera layer.
+  ///
+  /// This is the cross-platform export baseline and the default when no
+  /// explicit background is specified.
   const VGDuetGreenScreenBackground.video()
     : type = VGDuetGreenScreenBackgroundType.video,
       argbColor = null,
       filePath = null,
       scaleMode = null;
 
+  /// Background is a solid ARGB color fill.
+  ///
+  /// **Preview/R&D-only.** Offline export will reject this variant with
+  /// `unsupported_export_feature` on all platforms. Do not use for export
+  /// until cross-platform solid-color background support is documented.
   const VGDuetGreenScreenBackground.solidColor(int this.argbColor)
     : type = VGDuetGreenScreenBackgroundType.solidColor,
       filePath = null,
       scaleMode = null;
 
+  /// Background is a static image loaded from [filePath].
+  ///
+  /// **Preview/R&D-only.** Offline export will reject this variant with
+  /// `unsupported_export_feature` on all platforms. Do not use for export
+  /// until cross-platform image-file background support is documented.
   const VGDuetGreenScreenBackground.imageFile(
     String this.filePath, {
     VGDuetBackgroundScaleMode this.scaleMode =
@@ -510,7 +554,20 @@ enum VGDuetLayoutMode {
   /// Top/Bottom 50-50 vertical split.
   splitTopBottom,
 
-  /// Green Screen: source video as background; live camera subject keyed over it.
+  /// Green Screen layout preset: source video plays as the background;
+  /// live camera subject is keyed over it in the foreground.
+  ///
+  /// **Architectural note (legacy compatibility preset):** This value is a
+  /// Duet layout request, not a declaration of a reusable standalone
+  /// GreenScreen engine capability. The GreenScreen keying effect is an
+  /// upstream live-camera effect node owned outside of Duet; Duet
+  /// [greenScreen] mode wires that upstream output as the foreground layer
+  /// composited over the source video background. It is retained as a
+  /// first-class layout token for API and serialization compatibility.
+  ///
+  /// For the background sub-type, see [VGDuetGreenScreenBackground].
+  /// Offline export supports only the [VGDuetGreenScreenBackgroundType.video]
+  /// sub-type cross-platform.
   greenScreen,
 }
 

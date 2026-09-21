@@ -103,6 +103,21 @@ abstract class VGDuetPlatformInterface {
   ///
   /// Only one Duet export may be active at a time on Android.
   ///
+  /// **GreenScreen background export parity:** The cross-platform export
+  /// baseline for [VGDuetLayoutMode.greenScreen] is source-video background
+  /// only ([VGDuetGreenScreenBackground.video] or no explicit background).
+  /// If the [descriptor]'s layout config specifies a non-video green-screen
+  /// background ([VGDuetGreenScreenBackground.solidColor] or
+  /// [VGDuetGreenScreenBackground.imageFile]), the native export session on
+  /// both iOS and Android **must** reject the call with code
+  /// `unsupported_export_feature` before starting any encoding. This ensures
+  /// export failures are typed and visible rather than silently ignored.
+  ///
+  /// Duet preview sessions ([attachPreviewTexture]) may accept platform-specific
+  /// green-screen background diagnostics for R&D purposes, but callers must
+  /// not assume preview-side non-video background handling is cross-platform
+  /// or stable.
+  ///
   /// Parameters:
   /// - [descriptor]: full composition descriptor; must have a valid local
   ///   source file path reachable on disk.

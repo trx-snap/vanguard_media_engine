@@ -173,6 +173,29 @@ final class VGDuetExportSession {
             return
         }
 
+        // ── Reject non-video green-screen backgrounds before starting export ──
+        //
+        // Export parity with Android: if mode is greenScreen and an explicit
+        // greenScreenBackground is provided whose type is not "video", fail
+        // before marking busy or allocating any resources. solidColor and image
+        // backgrounds are preview/R&D-only; offline export requires the source
+        // video background on both platforms (unsupported_export_feature).
+        // Missing background, malformed background, or type "video" falls
+        // through and preserves existing behavior.
+
+        let layoutMode = layoutConfigMap["mode"] as? String
+        if layoutMode == "greenScreen" {
+            if let bgMap = layoutConfigMap["greenScreenBackground"] as? [String: Any],
+               let bgType = bgMap["type"] as? String,
+               bgType != "video" {
+                result(FlutterError(
+                    code:    "unsupported_export_feature",
+                    message: "exportDuetComposition: static/image green-screen backgrounds are preview-only; offline export requires source video background.",
+                    details: nil))
+                return
+            }
+        }
+
         // ── Mark busy and continue asynchronously ─────────────────────────────
 
         isBusy = true
