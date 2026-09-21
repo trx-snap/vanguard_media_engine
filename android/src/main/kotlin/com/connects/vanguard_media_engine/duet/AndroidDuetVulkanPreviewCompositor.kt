@@ -19,16 +19,22 @@ import kotlin.math.roundToInt
 class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     companion object {
         private const val TAG = "DuetVulkanComp"
-        // This CameraX Duet preview path uses a portrait 1080x1920 camera
-        // input surface to preserve the known-good preview/mask geometry
-        // the existing proof harness and downstream mask/layout math are
-        // built on. Do not optimize this down to landscape 720p inside this
-        // compositor: a prior attempt at that regressed live camera
-        // orientation and mask quality. Future performance work must
-        // introduce an explicit, tested camera-content geometry contract
-        // instead of hard-coding a different resolution here.
-        private const val CAMERA_DEFAULT_WIDTH = 1080
-        private const val CAMERA_DEFAULT_HEIGHT = 1920
+        // This CameraX Duet preview path uses the raw landscape 1920x1080
+        // camera input surface CameraX's Preview use-case actually negotiates
+        // on-device (matching the GLES path's CAMERA_ST_DEFAULT_WIDTH/HEIGHT
+        // contract in AndroidDuetPreviewCompositor). This is pre-rotation,
+        // sensor-orientation content: native's
+        // ResolveVulkanDuetLayoutLayerPlacement swaps width/height when
+        // cameraRotationDegrees is 90/270 before aspect-fill, which is what
+        // turns this landscape 1920x1080 buffer into the upright 9:16 aspect
+        // expected for the front camera. Do not optimize this down to a
+        // lower resolution inside this compositor: a prior attempt at that
+        // regressed live camera orientation and mask quality. Future
+        // performance work must introduce an explicit, tested camera-content
+        // geometry contract instead of hard-coding a different resolution
+        // here.
+        private const val CAMERA_DEFAULT_WIDTH = 1920
+        private const val CAMERA_DEFAULT_HEIGHT = 1080
         private const val DECODER_DEFAULT_WIDTH = 1080
         private const val DECODER_DEFAULT_HEIGHT = 1920
 
@@ -781,8 +787,8 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         // content size) rather than the requested content size, which would
         // distort the aspect-fill crop if used for geometry. The camera
         // content dimensions therefore come from the compositor's own
-        // requested reader size (CAMERA_DEFAULT_WIDTH/HEIGHT, portrait
-        // 1080x1920) instead of cameraImage.width/height. These are raw,
+        // requested reader size (CAMERA_DEFAULT_WIDTH/HEIGHT, landscape
+        // 1920x1080) instead of cameraImage.width/height. These are raw,
         // pre-rotation logical reader dimensions: native's
         // ResolveVulkanDuetLayoutLayerPlacement is responsible for swapping
         // width/height when cameraRotationDegrees is 90/270 before the

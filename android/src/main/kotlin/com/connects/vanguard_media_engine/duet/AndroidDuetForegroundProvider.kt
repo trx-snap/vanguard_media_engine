@@ -163,6 +163,9 @@ class AndroidDuetLegacyForegroundProvider(
         camSource.start(
             targetSurface = surface,
             analyzer = analyzerForBind,
+            onCameraFrameTransform = { rotationDegrees, mirrorHorizontal ->
+                this.renderLoop?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
+            },
             onStarted = {
                 if (mode == "greenScreen" && greenScreenAdapter != null) {
                     this.renderLoop?.setGreenScreenEnabled(true)

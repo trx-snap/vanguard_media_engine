@@ -26,6 +26,8 @@ package com.connects.vanguard_media_engine.duet
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -149,6 +151,12 @@ class AndroidDuetCameraSource(private val context: Context) {
      * [onStarted] fires on the main thread when CameraX accepts the surface.
      * [onError] fires on the main thread on any failure (including missing
      *   CAMERA permission, in which case a SecurityException is passed).
+     * [onCameraFrameTransform] fires once, on the main thread, immediately after
+     *   a successful CameraX bind, with the front camera's display rotation
+     *   (derived from CameraCharacteristics.SENSOR_ORIENTATION, same semantics
+     *   as the proven AndroidGreenScreenCamera2Source path) and mirrorHorizontal
+     *   always true (front camera only). Fails soft to (0, true) if the sensor
+     *   orientation lookup throws.
      *
      * Idempotent: if already running, logs and returns immediately.
      */
@@ -157,6 +165,7 @@ class AndroidDuetCameraSource(private val context: Context) {
         onStarted: () -> Unit = {},
         onError: (Exception) -> Unit = {},
         analyzer: ImageAnalysis.Analyzer? = null,
+        onCameraFrameTransform: (rotationDegrees: Int, mirrorHorizontal: Boolean) -> Unit = { _, _ -> },
     ) {
         if (_isRunning) {
             Log.w(TAG, "start() called while already running — ignored")
@@ -190,7 +199,14 @@ class AndroidDuetCameraSource(private val context: Context) {
                 }
 
                 cameraProvider = provider
-                bindPreview(provider, targetSurface, onStarted, onError, analyzer)
+                bindPreview(
+                    provider = provider,
+                    targetSurface = targetSurface,
+                    onStarted = onStarted,
+                    onError = onError,
+                    analyzer = analyzer,
+                    onCameraFrameTransform = onCameraFrameTransform,
+                )
             } catch (e: Exception) {
                 Log.e(TAG, "start(): ProcessCameraProvider failed: $e")
                 onError(e)
@@ -265,6 +281,7 @@ class AndroidDuetCameraSource(private val context: Context) {
         analyzer: ImageAnalysis.Analyzer? = null,
         /** Called synchronously with true after successful bindToLifecycle, false on catch. */
         onBindResult: (Boolean) -> Unit = {},
+        onCameraFrameTransform: (rotationDegrees: Int, mirrorHorizontal: Boolean) -> Unit = { _, _ -> },
     ) {
         try {
             provider.unbindAll()
@@ -334,11 +351,64 @@ class AndroidDuetCameraSource(private val context: Context) {
 
             provider.bindToLifecycle(lifecycleOwner, selector, *useCases)
             Log.d(TAG, "bindPreview() — front camera Preview use-case bound")
+            forwardCameraFrameTransform(onCameraFrameTransform)
             onBindResult(true)
         } catch (e: Exception) {
             Log.e(TAG, "bindPreview() threw: $e")
             onBindResult(false)
             onError(e)
+        }
+    }
+
+    // ── Private: front camera display transform ───────────────────────────────
+
+    /**
+     * Derives the front camera's display rotation from CameraCharacteristics.
+     * SENSOR_ORIENTATION — the same contract already proven on physical hardware
+     * (SM-A566B) by AndroidGreenScreenCamera2Source — and forwards it to
+     * [onCameraFrameTransform]. Fails soft to (0, true) on any lookup failure so
+     * a transform error never blocks camera start.
+     */
+    private fun forwardCameraFrameTransform(
+        onCameraFrameTransform: (rotationDegrees: Int, mirrorHorizontal: Boolean) -> Unit,
+    ) {
+        val sensorOrientation: Int
+        val cameraRotationDegrees: Int
+        try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            sensorOrientation = frontCameraSensorOrientation(cameraManager)
+            cameraRotationDegrees = normalizeCameraRotationDegrees(sensorOrientation)
+        } catch (t: Throwable) {
+            Log.w(TAG, "front camera transform lookup failed: " +
+                "${t.javaClass.simpleName}: ${t.message} — forwarding identity transform")
+            onCameraFrameTransform(0, true)
+            return
+        }
+        Log.i(TAG,
+            "ANDROID_DUET_CAMERA_SOURCE_TRANSFORM sensorOrientation=$sensorOrientation " +
+                "cameraRotationDegrees=$cameraRotationDegrees mirror=true")
+        onCameraFrameTransform(cameraRotationDegrees, true)
+    }
+
+    /** Same lookup contract as AndroidGreenScreenCamera2Source.frontCameraId(). */
+    private fun frontCameraSensorOrientation(cameraManager: CameraManager): Int {
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            if (chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT) {
+                return chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            }
+        }
+        throw IllegalStateException("No front-facing camera")
+    }
+
+    /** Same normalization contract as AndroidGreenScreenCamera2Source.normalizeCameraRotationDegrees(). */
+    private fun normalizeCameraRotationDegrees(degrees: Int): Int {
+        return when (((degrees % 360) + 360) % 360) {
+            0 -> 0
+            90 -> 90
+            180 -> 180
+            270 -> 270
+            else -> 0
         }
     }
 }
