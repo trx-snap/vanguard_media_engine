@@ -966,7 +966,7 @@ class AndroidDuetSessionCoordinator(
 
         val mode = session.layoutConfigMap["mode"] as? String ?: "pip"
         val provider = session.foregroundProvider
-            ?: AndroidDuetLegacyForegroundProvider(context, mainHandler).also { session.foregroundProvider = it }
+            ?: AndroidDuetCameraForegroundProvider(context, mainHandler).also { session.foregroundProvider = it }
 
         provider.start(
             surface         = surface,
@@ -1009,9 +1009,9 @@ class AndroidDuetSessionCoordinator(
         )
     }
 
-    // Adapter/camera building, debug backend policy, the segmentation ladder,
-    // and the ladder latch now live in AndroidDuetForegroundProvider — see
-    // AndroidDuetLegacyForegroundProvider.buildGreenScreenAdapter.
+    // Filter-node/camera building, debug backend policy, the segmentation
+    // ladder, and the ladder latch now live in AndroidDuetForegroundProvider —
+    // see AndroidDuetCameraForegroundProvider.buildGreenScreenFilterNode.
 
     /**
      * Handles a NON-terminal backend degradation (MediaPipe -> ML Kit): green

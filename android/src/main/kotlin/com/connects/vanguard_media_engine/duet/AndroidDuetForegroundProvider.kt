@@ -5,15 +5,20 @@ import android.os.Handler
 import android.util.Log
 import android.view.Surface
 import androidx.camera.core.ImageAnalysis
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenFilterNode
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenImageProxyBackendSelector
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenSegmentationBackend
 import java.util.concurrent.atomic.AtomicBoolean
 
 // -----------------------------------------------------------------------------
-// VG-DUET-PHASE-6B: Foreground-provider seam.
+// VG-DUET-PHASE-6B / VG-DUET-PHASE-7: Foreground-provider seam.
 // -----------------------------------------------------------------------------
 //
-// Intermediate legacy-compatibility boundary only. [AndroidDuetLegacyForegroundProvider]
-// wraps today's CameraX (AndroidDuetCameraSource) + ImageAnalysis green-screen
-// ladder (AndroidDuetGreenScreenAdapter) behind [AndroidDuetForegroundProvider]
+// [AndroidDuetCameraForegroundProvider] wraps today's CameraX
+// (AndroidDuetCameraSource) + ImageAnalysis green-screen keying, consuming the
+// neutral, GreenScreen-owned filter node/selector/backend types directly
+// (AndroidGreenScreenFilterNode, AndroidGreenScreenImageProxyBackendSelector,
+// AndroidGreenScreenSegmentationBackend) behind [AndroidDuetForegroundProvider]
 // so AndroidDuetSessionCoordinator no longer owns camera/segmentation lifecycle
 // directly. This is NOT the final straight-alpha/keyed-stream ingest contract.
 
@@ -79,20 +84,20 @@ interface AndroidDuetForegroundProvider {
 }
 
 /**
- * Legacy implementation: one [AndroidDuetCameraSource] plus one
- * [AndroidDuetGreenScreenAdapter] at a time, matching the behavior previously
- * inlined in AndroidDuetSessionCoordinator. Owns the segmentation backend
- * ladder debug policy (raw GPU delegate/model overrides, MediaPipe CPU model
- * override, backend latch) and forwards masks directly into the
+ * Duet's camera-backed foreground provider: one [AndroidDuetCameraSource] plus
+ * one [AndroidGreenScreenFilterNode] at a time, matching the behavior
+ * previously inlined in AndroidDuetSessionCoordinator. Owns the segmentation
+ * backend ladder debug policy (raw GPU delegate/model overrides, MediaPipe CPU
+ * model override, backend latch) and forwards masks directly into the
  * [AndroidDuetPreviewRenderLoop] supplied to [start].
  *
  * Main-thread only for start/setGreenScreenEnabled/stopKeying/stop, matching
- * AndroidDuetCameraSource and AndroidDuetGreenScreenAdapter's own threading
- * contracts. Mask/degrade/fallback callbacks from the adapter may arrive off
- * the analysis thread; this class hops them onto [mainHandler] before touching
- * any state or invoking [AndroidDuetForegroundProviderCallbacks].
+ * AndroidDuetCameraSource and AndroidGreenScreenFilterNode's own threading
+ * contracts. Mask/degrade/fallback callbacks from the filter node may arrive
+ * off the analysis thread; this class hops them onto [mainHandler] before
+ * touching any state or invoking [AndroidDuetForegroundProviderCallbacks].
  */
-class AndroidDuetLegacyForegroundProvider(
+class AndroidDuetCameraForegroundProvider(
     private val context: Context?,
     private val mainHandler: Handler,
 ) : AndroidDuetForegroundProvider {
@@ -115,7 +120,7 @@ class AndroidDuetLegacyForegroundProvider(
     }
 
     private var cameraSource: AndroidDuetCameraSource? = null
-    private var greenScreenAdapter: AndroidDuetGreenScreenAdapter? = null
+    private var greenScreenFilterNode: AndroidGreenScreenFilterNode? = null
 
     /**
      * One-way ladder latch. Set to the rung reached after a `green_screen_degraded`
@@ -157,7 +162,7 @@ class AndroidDuetLegacyForegroundProvider(
         // the adapter NOW — before the camera bind — so ImageAnalysis is part of
         // the first use-case set.
         val analyzerForBind: ImageAnalysis.Analyzer? = if (mode == "greenScreen") {
-            buildGreenScreenAdapter(layoutConfigMap)
+            buildGreenScreenFilterNode(layoutConfigMap)
         } else null
 
         camSource.start(
@@ -167,7 +172,7 @@ class AndroidDuetLegacyForegroundProvider(
                 this.renderLoop?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
             },
             onStarted = {
-                if (mode == "greenScreen" && greenScreenAdapter != null) {
+                if (mode == "greenScreen" && greenScreenFilterNode != null) {
                     this.renderLoop?.setGreenScreenEnabled(true)
                 }
                 callbacks.onStarted()
@@ -180,7 +185,7 @@ class AndroidDuetLegacyForegroundProvider(
                     cameraSource = null
                     // Always stop the adapter properly before clearing the ref,
                     // to avoid leaking the ML Kit Segmenter.
-                    stopGreenScreenAdapterInternal()
+                    stopGreenScreenFilterNodeInternal()
                 }
                 callbacks.onError(e)
             },
@@ -190,18 +195,18 @@ class AndroidDuetLegacyForegroundProvider(
     override fun setGreenScreenEnabled(enabled: Boolean, layoutConfigMap: Map<String, Any?>): Boolean {
         val loop = renderLoop
         if (enabled) {
-            if (greenScreenAdapter == null) {
-                val adapter = buildGreenScreenAdapter(layoutConfigMap)
-                if (adapter == null) {
-                    Log.w(TAG, "buildGreenScreenAdapter returned null — cannot enable green screen")
+            if (greenScreenFilterNode == null) {
+                val filterNode = buildGreenScreenFilterNode(layoutConfigMap)
+                if (filterNode == null) {
+                    Log.w(TAG, "buildGreenScreenFilterNode returned null — cannot enable green screen")
                     _lastEnableFailureReason = "adapter_creation_failed"
                     return false
                 }
                 // Hot-rebind: camera is already running, add ImageAnalysis.
-                val bound = cameraSource?.setAnalysisAnalyzer(adapter) ?: false
+                val bound = cameraSource?.setAnalysisAnalyzer(filterNode) ?: false
                 if (!bound) {
                     Log.w(TAG, "setAnalysisAnalyzer failed during greenScreen switch")
-                    stopGreenScreenAdapterInternal()
+                    stopGreenScreenFilterNodeInternal()
                     _lastEnableFailureReason = "bind_failed"
                     return false
                 }
@@ -210,9 +215,9 @@ class AndroidDuetLegacyForegroundProvider(
             return true
         }
         // Switching away from greenScreen: remove analysis use-case, stop
-        // adapter, disable compositor. Camera Preview continues.
+        // the filter node, disable compositor. Camera Preview continues.
         cameraSource?.setAnalysisAnalyzer(null)
-        stopGreenScreenAdapterInternal()
+        stopGreenScreenFilterNodeInternal()
         loop?.setGreenScreenEnabled(false)
         return true
     }
@@ -220,7 +225,7 @@ class AndroidDuetLegacyForegroundProvider(
     override fun lastEnableFailureReason(): String = _lastEnableFailureReason
 
     override fun stopKeying() {
-        stopGreenScreenAdapterInternal()
+        stopGreenScreenFilterNodeInternal()
     }
 
     override fun stop() {
@@ -230,39 +235,39 @@ class AndroidDuetLegacyForegroundProvider(
     }
 
     override fun reportedBackendId(): String =
-        greenScreenAdapter?.currentBackendId
+        greenScreenFilterNode?.currentBackendId
             ?: greenScreenLatchedBackendId
-            ?: AndroidDuetSegmentationBackendSelector(context).primaryBackendId()
+            ?: AndroidGreenScreenImageProxyBackendSelector(context).primaryBackendId()
 
-    // ── Adapter lifecycle ─────────────────────────────────────────────────────
+    // ── Filter node lifecycle ─────────────────────────────────────────────────
 
     /**
-     * Stops and nulls the adapter (idempotent). The adapter's stop() closes
-     * its active and any fallback backend.
+     * Stops and nulls the filter node (idempotent). Its stop() closes its
+     * active and any fallback backend.
      */
-    private fun stopGreenScreenAdapterInternal() {
-        val adapter = greenScreenAdapter ?: return
-        try { adapter.stop() } catch (_: Throwable) {}
-        greenScreenAdapter = null
-        // A rebuilt adapter must deliver a fresh first mask before a start may proceed.
+    private fun stopGreenScreenFilterNodeInternal() {
+        val filterNode = greenScreenFilterNode ?: return
+        try { filterNode.stop() } catch (_: Throwable) {}
+        greenScreenFilterNode = null
+        // A rebuilt filter node must deliver a fresh first mask before a start may proceed.
         _firstMaskReady = false
         Log.d(TAG, "Green-screen adapter stopped")
     }
 
     /**
-     * Creates, stores, and starts a new [AndroidDuetGreenScreenAdapter]. Returns
-     * the adapter (which also implements [ImageAnalysis.Analyzer]) so it can be
-     * passed directly to [AndroidDuetCameraSource.start]. No-ops and returns the
-     * existing adapter if one is already running; returns null if construction
-     * or start throws.
+     * Creates, stores, and starts a new [AndroidGreenScreenFilterNode]. Returns
+     * the filter node (which also implements [ImageAnalysis.Analyzer]) so it
+     * can be passed directly to [AndroidDuetCameraSource.start]. No-ops and
+     * returns the existing filter node if one is already running; returns null
+     * if construction or start throws.
      *
-     * Backend ladder: the adapter starts on the latched rung when a prior
+     * Backend ladder: the filter node starts on the latched rung when a prior
      * degradation happened, otherwise on the selector's primary (`mediapipe_cpu`
      * when the model asset is bundled, else `mlkit`). Backends open lazily on
      * the analysis thread, so start() here never loads a model on the main thread.
      */
-    private fun buildGreenScreenAdapter(layoutConfigMap: Map<String, Any?>): AndroidDuetGreenScreenAdapter? {
-        if (greenScreenAdapter != null) return greenScreenAdapter
+    private fun buildGreenScreenFilterNode(layoutConfigMap: Map<String, Any?>): AndroidGreenScreenFilterNode? {
+        if (greenScreenFilterNode != null) return greenScreenFilterNode
         val loop = renderLoop ?: return null
         return try {
             // Debug-only opt-in: a physical smoke harness can start this provider
@@ -276,7 +281,7 @@ class AndroidDuetLegacyForegroundProvider(
             // Read the raw GPU delegate mode only when the debug backend is raw_tflite_gpu.
             // Validate against the allowlist; fall back to default on invalid/missing values
             // without failing session start.
-            val rawGpuDelegateMode: String? = if (debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU) {
+            val rawGpuDelegateMode: String? = if (debugBackend == AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU) {
                 val rawMode = layoutConfigMap["debugRawTfliteGpuDelegateMode"] as? String
                 if (rawMode != null) {
                     if (rawMode in RAW_TFLITE_GPU_DELEGATE_MODE_ALLOWLIST) {
@@ -299,15 +304,15 @@ class AndroidDuetLegacyForegroundProvider(
             // Validate against the model allowlist; warn and fall back to the selector default
             // (selfie_multiclass_256x256.tflite) on invalid/missing values without failing
             // session start.
-            val rawGpuModelAssetPath: String? = if (debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU) {
+            val rawGpuModelAssetPath: String? = if (debugBackend == AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU) {
                 val rawModel = layoutConfigMap["debugRawTfliteGpuModelAssetPath"] as? String
                 if (rawModel != null) {
-                    if (rawModel in AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST) {
+                    if (rawModel in AndroidGreenScreenImageProxyBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST) {
                         rawModel
                     } else {
                         Log.w(TAG,
                             "debugRawTfliteGpuModelAssetPath='$rawModel' is not in allowlist " +
-                                "${AndroidDuetSegmentationBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST}; " +
+                                "${AndroidGreenScreenImageProxyBackendSelector.RAW_TFLITE_GPU_MODEL_ALLOWLIST}; " +
                                 "falling back to default model")
                         null
                     }
@@ -323,18 +328,18 @@ class AndroidDuetLegacyForegroundProvider(
             // production default.
             val mediaPipeCpuModelAssetPath: String? =
                 (layoutConfigMap["debugMediaPipeCpuModelAssetPath"] as? String)?.let { model ->
-                    if (model in AndroidDuetSegmentationBackendSelector.MEDIAPIPE_MODEL_ALLOWLIST) {
+                    if (model in AndroidGreenScreenImageProxyBackendSelector.MEDIAPIPE_MODEL_ALLOWLIST) {
                         model
                     } else {
                         Log.w(TAG,
                             "debugMediaPipeCpuModelAssetPath='$model' is not in allowlist " +
-                                "${AndroidDuetSegmentationBackendSelector.MEDIAPIPE_MODEL_ALLOWLIST}; " +
+                                "${AndroidGreenScreenImageProxyBackendSelector.MEDIAPIPE_MODEL_ALLOWLIST}; " +
                                 "using production default")
                         null
                     }
                 }
 
-            val selector = AndroidDuetSegmentationBackendSelector(
+            val selector = AndroidGreenScreenImageProxyBackendSelector(
                 context,
                 rawGpuDelegateMode,
                 rawGpuModelAssetPath,
@@ -344,18 +349,18 @@ class AndroidDuetLegacyForegroundProvider(
             val initialBackendId: String = when {
                 greenScreenLatchedBackendId != null ->
                     greenScreenLatchedBackendId!!
-                debugBackend == DuetSegmentationBackend.RAW_TFLITE_GPU &&
-                    selector.supports(DuetSegmentationBackend.RAW_TFLITE_GPU) -> {
+                debugBackend == AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU &&
+                    selector.supports(AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU) -> {
                     Log.d(TAG,
                         "debugSegmentationBackend=raw_tflite_gpu: starting adapter on raw_tflite_gpu " +
                             "(delegateMode=${rawGpuDelegateMode ?: "compat_best_or_default"}, " +
-                            "model=${rawGpuModelAssetPath ?: AndroidDuetSegmentationBackendSelector.TFLITE_GPU_MODEL_ASSET_PATH})")
-                    DuetSegmentationBackend.RAW_TFLITE_GPU
+                            "model=${rawGpuModelAssetPath ?: AndroidGreenScreenImageProxyBackendSelector.TFLITE_GPU_MODEL_ASSET_PATH})")
+                    AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU
                 }
                 else -> selector.primaryBackendId()
             }
 
-            var adapterRef: AndroidDuetGreenScreenAdapter? = null
+            var adapterRef: AndroidGreenScreenFilterNode? = null
             // Start barrier: hop the FIRST mask (CPU or GPU path) onto the main
             // thread exactly once per adapter. The per-frame mask upload itself
             // stays on the analysis thread; nothing else is posted per frame.
@@ -365,7 +370,7 @@ class AndroidDuetLegacyForegroundProvider(
                     mainHandler.post { handleFirstMask(adapterRef) }
                 }
             }
-            val adapter = AndroidDuetGreenScreenAdapter(
+            val adapter = AndroidGreenScreenFilterNode(
                 selector = selector,
                 initialBackendId = initialBackendId,
                 onMask = { frame ->
@@ -386,7 +391,7 @@ class AndroidDuetLegacyForegroundProvider(
                 },
             )
             adapterRef = adapter
-            greenScreenAdapter = adapter
+            greenScreenFilterNode = adapter
             adapter.start()
             Log.d(TAG,
                 "Green-screen adapter built and started " +
@@ -396,8 +401,8 @@ class AndroidDuetLegacyForegroundProvider(
             Log.w(TAG,
                 "[GreenScreen fallback] ${reportedBackendId()}->none (adapter_start_failed): ${t.message}")
             // Ensure no partial adapter reference is left.
-            try { greenScreenAdapter?.stop() } catch (_: Throwable) {}
-            greenScreenAdapter = null
+            try { greenScreenFilterNode?.stop() } catch (_: Throwable) {}
+            greenScreenFilterNode = null
             null
         }
     }
@@ -409,15 +414,15 @@ class AndroidDuetLegacyForegroundProvider(
      * this provider's live adapter — a mask from a stale (stopped/replaced)
      * adapter proves nothing about what the compositor is drawing now.
      */
-    private fun handleFirstMask(adapter: AndroidDuetGreenScreenAdapter?) {
-        if (adapter == null || greenScreenAdapter !== adapter) return
+    private fun handleFirstMask(adapter: AndroidGreenScreenFilterNode?) {
+        if (adapter == null || greenScreenFilterNode !== adapter) return
         if (_firstMaskReady) return
         _firstMaskReady = true
         callbacks?.onFirstMaskReady()
     }
 
     private fun handleDegraded(
-        adapter: AndroidDuetGreenScreenAdapter?,
+        adapter: AndroidGreenScreenFilterNode?,
         previousBackend: String,
         currentBackend: String,
         reason: String,
@@ -425,7 +430,7 @@ class AndroidDuetLegacyForegroundProvider(
     ) {
         // Latch regardless of adapter staleness: the degradation really happened.
         greenScreenLatchedBackendId = currentBackend
-        if (adapter == null || greenScreenAdapter !== adapter) {
+        if (adapter == null || greenScreenFilterNode !== adapter) {
             Log.d(TAG, "Green-screen degrade from a stale adapter latched ($currentBackend) without event")
             return
         }
@@ -438,12 +443,12 @@ class AndroidDuetLegacyForegroundProvider(
      * fallback over a current, healthy adapter/session state.
      */
     private fun handleFallback(
-        adapter: AndroidDuetGreenScreenAdapter?,
+        adapter: AndroidGreenScreenFilterNode?,
         previousBackend: String,
         reason: String,
         userMessage: String,
     ) {
-        if (adapter == null || greenScreenAdapter !== adapter) return
+        if (adapter == null || greenScreenFilterNode !== adapter) return
         callbacks?.onFallback(previousBackend, reason, userMessage)
     }
 }
