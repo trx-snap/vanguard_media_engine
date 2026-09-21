@@ -14,6 +14,7 @@
 //   - Slice 4B-B: owns the preview render loop lifecycle (create on attach, start/hold on
 //     record transitions, stop before texture + decoder teardown).  All decoder stepping
 //     for preview goes through the loop; the coordinator never draws or ticks itself.
+//   - Preview continuity telemetry: previewContinuityDiagnostics exposes loop diagnostics snapshot.
 
 import AVFoundation
 import Flutter
@@ -356,6 +357,40 @@ final class VGDuetNativeSessionCoordinator {
         // Idempotent if no attachment exists.
         releasePreviewTexture(for: session)
         reply(nil, nil)
+    }
+
+    // MARK: - previewContinuityDiagnostics
+
+    /// Read-only telemetry snapshot of the session's preview render loop.
+    /// Resolves active session via resolveActiveSession (returning session_not_found if missing).
+    /// If no loop exists, returns a fail-shaped map with pass: false / reason: no_preview_render_loop.
+    func previewContinuityDiagnostics(
+        sessionId: String,
+        reply: @escaping (Any?, FlutterError?) -> Void
+    ) {
+        assert(Thread.isMainThread)
+        guard let session = resolveActiveSession(sessionId: sessionId, reply: reply) else { return }
+        let stateStr = stateName(session.state)
+        let textureAttached = (session.previewTexture != nil)
+
+        guard let loop = session.previewRenderLoop else {
+            reply([
+                "pass": false,
+                "reason": "no_preview_render_loop",
+                "sessionId": session.sessionId,
+                "state": stateStr,
+                "textureAttached": textureAttached,
+            ], nil)
+            return
+        }
+
+        var snapshot = loop.diagnosticsSnapshot()
+        snapshot["pass"] = true
+        snapshot["reason"] = "ok"
+        snapshot["sessionId"] = session.sessionId
+        snapshot["state"] = stateStr
+        snapshot["textureAttached"] = textureAttached
+        reply(snapshot, nil)
     }
 
     // MARK: - Layout rect builder

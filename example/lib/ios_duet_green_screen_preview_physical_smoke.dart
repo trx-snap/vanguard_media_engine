@@ -13,6 +13,7 @@
 //       * attach-time native layout rect for creatorOverlay was returned and matched expected geometry
 //       * startRecording activates render loop with preview compositor
 //       * green-screen preview remains active for bounded wait (configured active seconds)
+//       * preview render loop source-continuity telemetry proves mechanical source advancement (pts span >= min span, distinct decoded pts >= min distinct, presented frames > 0, decoded frames > 0; when continuity proof is enabled)
 //       * attach/update accepted a non-zero rotation transform and remained active (only when rotation proof is enabled)
 //       * layout update to safe-parity PiP rect works while active
 //       * PiP preview remains active for bounded wait (1.5 s)
@@ -20,6 +21,7 @@
 //       * temp fixture cleanup completes
 //       * native IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST may evidence graph-backed straight-alpha source-over compositing
 //   - Non-claims:
+//       * no mechanical preview source-continuity telemetry proof when continuity proof is disabled (opt-in via VG_IOS_DUET_PREVIEW_CONTINUITY_PROOF)
 //       * no Dart frame counter
 //       * no rendered pixel / visual placement proof (rendered pixels not measured)
 //       * no matte quality proof; graph-backed provider faults are tolerated by fallback paths
@@ -43,6 +45,21 @@ const String kSmokeStartMarker =
 const String kSmokePassMarker = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_PASS';
 const String kSmokeFailMarker = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_FAIL';
 const String kSmokeJsonPrefix = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_JSON:';
+
+const bool kContinuityProofEnabled = bool.fromEnvironment(
+  'VG_IOS_DUET_PREVIEW_CONTINUITY_PROOF',
+  defaultValue: false,
+);
+
+const int kMinSourcePtsSpanMs = int.fromEnvironment(
+  'VG_IOS_DUET_PREVIEW_MIN_SOURCE_PTS_SPAN_MS',
+  defaultValue: 3000,
+);
+
+const int kMinDistinctSourcePts = int.fromEnvironment(
+  'VG_IOS_DUET_PREVIEW_MIN_DISTINCT_SOURCE_PTS',
+  defaultValue: 10,
+);
 
 const bool kRotationProofEnabled = bool.fromEnvironment(
   'VG_IOS_DUET_GREENSCREEN_PREVIEW_ROTATION_PROOF',
@@ -173,9 +190,11 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
     extends State<IOSDuetGreenScreenPreviewPhysicalSmokeApp> {
   final VGDuetPlatformInterface _platform = const MethodChannelVGDuetPlatform();
 
-  String _status = kRotationProofEnabled
-      ? 'Starting green-screen smoke harness (rotation proof enabled)...'
-      : 'Starting green-screen smoke harness...';
+  String _status = kContinuityProofEnabled
+      ? 'Starting green-screen smoke harness (continuity proof enabled)...'
+      : (kRotationProofEnabled
+            ? 'Starting green-screen smoke harness (rotation proof enabled)...'
+            : 'Starting green-screen smoke harness...');
   String _currentStep = 'INIT';
   String _layoutMode = kRotationProofEnabled
       ? 'greenScreen (attach rotation: $kAttachRotationDegrees°)'
@@ -215,6 +234,7 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
     int? textureId;
     Map<String, dynamic>? creatorOverlayCameraRect;
     Map<String, dynamic>? rotatedCameraRect;
+    Map<String, dynamic>? continuityDiagnostics;
     VGDuetCaptureResult? captureResult;
     Directory? tempDir;
     bool isDetached = false;
@@ -370,6 +390,68 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           );
         },
       );
+
+      if (kContinuityProofEnabled) {
+        // Step 5a/continuity: CONTINUITY_DIAGNOSTICS — mechanical proof of source advancement
+        continuityDiagnostics = await runStep<Map<String, dynamic>>(
+          'CONTINUITY_DIAGNOSTICS',
+          'Asserting preview render loop source continuity diagnostics',
+          () async {
+            const channel = MethodChannel('vanguard_media_engine');
+            final raw = await _withTimeout(
+              channel.invokeMethod<dynamic>(
+                'getIosDuetPreviewContinuityDiagnostics',
+                <String, dynamic>{'sessionId': sessionId!},
+              ),
+              'getIosDuetPreviewContinuityDiagnostics',
+            );
+            if (raw is! Map) {
+              throw StateError(
+                'Expected Map from getIosDuetPreviewContinuityDiagnostics, got: $raw',
+              );
+            }
+            final diag = raw.map(
+              (key, value) => MapEntry(key.toString(), value),
+            );
+            final passVal = diag['pass'] as bool? ?? false;
+            if (!passVal) {
+              throw StateError(
+                'Continuity diagnostics returned pass=false, reason: ${diag['reason']}',
+              );
+            }
+            final sourcePtsSpanMs =
+                (diag['sourcePtsSpanMs'] as num?)?.toInt() ?? -1;
+            final distinctDecodedSourcePtsCount =
+                (diag['distinctDecodedSourcePtsCount'] as num?)?.toInt() ?? 0;
+            final presentedFrameCount =
+                (diag['presentedFrameCount'] as num?)?.toInt() ?? 0;
+            final decodedFrameCount =
+                (diag['decodedFrameCount'] as num?)?.toInt() ?? 0;
+
+            if (sourcePtsSpanMs < kMinSourcePtsSpanMs) {
+              throw StateError(
+                'sourcePtsSpanMs ($sourcePtsSpanMs) < min span ($kMinSourcePtsSpanMs ms)',
+              );
+            }
+            if (distinctDecodedSourcePtsCount < kMinDistinctSourcePts) {
+              throw StateError(
+                'distinctDecodedSourcePtsCount ($distinctDecodedSourcePtsCount) < min distinct ($kMinDistinctSourcePts)',
+              );
+            }
+            if (presentedFrameCount <= 0) {
+              throw StateError(
+                'presentedFrameCount ($presentedFrameCount) must be > 0',
+              );
+            }
+            if (decodedFrameCount <= 0) {
+              throw StateError(
+                'decodedFrameCount ($decodedFrameCount) must be > 0',
+              );
+            }
+            return diag;
+          },
+        );
+      }
 
       if (kRotationProofEnabled) {
         // Step 5a: UPDATE_LAYOUT_ROTATION — update greenScreen creatorOverlay with update rotation degrees
@@ -574,6 +656,8 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           'attach-time native layout rect for creatorOverlay was returned and matched expected geometry',
           'startRecording activates render loop with preview compositor',
           'green-screen preview remains active for bounded wait ($kGreenScreenPreviewActiveSeconds s)',
+          if (kContinuityProofEnabled)
+            'preview render loop source-continuity telemetry proves mechanical source advancement (pts span >= $kMinSourcePtsSpanMs ms, distinct decoded pts >= $kMinDistinctSourcePts, presented frames > 0, decoded frames > 0)',
           if (kRotationProofEnabled)
             'attach/update accepted a non-zero rotation transform and remained active',
           'layout update to safe-parity PiP rect works while active',
@@ -583,6 +667,8 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           'native IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST may evidence graph-backed straight-alpha source-over compositing',
         ],
         'nonClaims': <String>[
+          if (!kContinuityProofEnabled)
+            'no mechanical preview source-continuity telemetry proof (opt-in via VG_IOS_DUET_PREVIEW_CONTINUITY_PROOF)',
           'no Dart frame counter',
           'no rendered pixel / visual placement proof (rendered pixels not measured)',
           'no matte quality proof; graph-backed provider faults are tolerated by fallback paths',
@@ -598,12 +684,16 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         'trimStartSeconds': kTrimStartSeconds,
         'trimEndSeconds': kTrimEndSeconds,
         'greenScreenPreviewActiveSeconds': kGreenScreenPreviewActiveSeconds,
+        'continuityProofEnabled': kContinuityProofEnabled,
+        'minSourcePtsSpanMs': kMinSourcePtsSpanMs,
+        'minDistinctSourcePts': kMinDistinctSourcePts,
         'rotationProofEnabled': kRotationProofEnabled,
         'attachRotationDegrees': kAttachRotationDegrees,
         'updateRotationDegrees': kUpdateRotationDegrees,
         'rotationHoldSeconds': kRotationHoldSeconds,
         'creatorOverlayCameraRect': ?creatorOverlayCameraRect,
         'rotatedCameraRect': ?rotatedCameraRect,
+        'continuityDiagnostics': ?continuityDiagnostics,
         'stepResults': stepResults,
         'failures': failures,
         if (captureResult != null)

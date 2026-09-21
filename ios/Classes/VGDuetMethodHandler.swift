@@ -1,7 +1,7 @@
 // VGDuetMethodHandler.swift
 // VG-DUET-SLICE-2/4A: Thin dispatch layer from VanguardMediaEnginePlugin to VGDuetNativeSessionCoordinator.
 //
-// Owns the 12 MethodChannel route names for Duet (10 original + 2 Slice 4A texture routes).
+// Owns the MethodChannel route names for Duet (session + texture + diagnostic routes).
 // Plugin is a thin router only — all session logic lives in VGDuetNativeSessionCoordinator.
 
 import AVFoundation
@@ -40,6 +40,8 @@ final class VGDuetMethodHandler {
         // VGDuetExportTransformPixelProofDiagnostics, never through generic
         // green-screen export production/diagnostic code.
         "assertIosDuetExportTransformPixelProofOutput",
+        // Diagnostic-only: live preview source-continuity telemetry snapshot.
+        "getIosDuetPreviewContinuityDiagnostics",
     ]
 
     static func ownsMethod(_ method: String) -> Bool {
@@ -175,6 +177,14 @@ final class VGDuetMethodHandler {
         // Flutter; always replies with a fail-shaped map on any internal failure.
         case "assertIosDuetExportTransformPixelProofOutput":
             exportTransformPixelProofDiagnostics.assertOutput(args: args, result: result)
+
+        // ── Diagnostic-only: live preview source-continuity telemetry snapshot ──
+        // Requires sessionId. Diagnostic-only; routes directly to coordinator.
+        case "getIosDuetPreviewContinuityDiagnostics":
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            coordinator.previewContinuityDiagnostics(sessionId: sid) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
 
         default:
             result(FlutterMethodNotImplemented)

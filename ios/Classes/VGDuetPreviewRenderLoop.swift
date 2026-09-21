@@ -173,6 +173,21 @@ final class VGDuetPreviewRenderLoop {
     /// Last clamped target handed to the decode path from a display tick.
     private var lastTickTargetPtsMs: Int?
 
+    // MARK: - Telemetry (main-thread confined)
+    private var displayTickCount: Int = 0
+    private var decodeRequestCount: Int = 0
+    private var decodedFrameCount: Int = 0
+    private var renderPassCount: Int = 0
+    private var presentedFrameCount: Int = 0
+    private var redrawRequestCount: Int = 0
+
+    private var firstDecodedSourcePtsMs: Int?
+    private var lastDecodedSourcePtsMs: Int?
+    private var minDecodedSourcePtsMs: Int?
+    private var maxDecodedSourcePtsMs: Int?
+    private var distinctDecodedSourcePtsCount: Int = 0
+    private var lastDistinctPtsMs: Int?
+
     // MARK: - Init
 
     init(compositor: VGDuetPreviewCompositor,
@@ -277,6 +292,41 @@ final class VGDuetPreviewRenderLoop {
         coveredRange    = nil
     }
 
+    /// Main-thread read-only telemetry snapshot.
+    func diagnosticsSnapshot() -> [String: Any] {
+        assert(Thread.isMainThread)
+        var snapshot: [String: Any] = [
+            "displayTickCount": displayTickCount,
+            "decodeRequestCount": decodeRequestCount,
+            "decodedFrameCount": decodedFrameCount,
+            "renderPassCount": renderPassCount,
+            "presentedFrameCount": presentedFrameCount,
+            "redrawRequestCount": redrawRequestCount,
+            "distinctDecodedSourcePtsCount": distinctDecodedSourcePtsCount,
+            "isActive": isActive,
+            "isStopped": isStopped,
+            "hasPresented": hasPresented,
+            "trimStartMs": trimStartMs,
+            "trimEndMs": trimEndMs,
+        ]
+        if let first = firstDecodedSourcePtsMs {
+            snapshot["firstDecodedSourcePtsMs"] = first
+        }
+        if let last = lastDecodedSourcePtsMs {
+            snapshot["lastDecodedSourcePtsMs"] = last
+        }
+        if let minPts = minDecodedSourcePtsMs {
+            snapshot["minDecodedSourcePtsMs"] = minPts
+        }
+        if let maxPts = maxDecodedSourcePtsMs {
+            snapshot["maxDecodedSourcePtsMs"] = maxPts
+        }
+        if let minPts = minDecodedSourcePtsMs, let maxPts = maxDecodedSourcePtsMs {
+            snapshot["sourcePtsSpanMs"] = maxPts - minPts
+        }
+        return snapshot
+    }
+
     // MARK: - Display link
 
     private func installDisplayLink() {
@@ -303,6 +353,7 @@ final class VGDuetPreviewRenderLoop {
 
     fileprivate func displayLinkFired(_ sender: CADisplayLink) {
         guard !isStopped, isActive else { return }
+        displayTickCount += 1
         let target = clamp(targetPtsProvider())
         guard target != lastTickTargetPtsMs else {
             // Source PTS target has not moved (e.g. the clock has clamped at
@@ -335,6 +386,7 @@ final class VGDuetPreviewRenderLoop {
     private func run(_ job: Job) {
         switch job {
         case .redraw:
+            redrawRequestCount += 1
             render(frame: heldSourceFrame)
 
         case .decode(let request, let forceRender):
@@ -349,6 +401,7 @@ final class VGDuetPreviewRenderLoop {
     }
 
     private func decode(_ request: VGDuetPreviewDecodeRequest, forceRender: Bool) {
+        decodeRequestCount += 1
         inFlight = true
         decodeHandler(request) { [weak self] decoded in
             DispatchQueue.main.async {
@@ -366,9 +419,29 @@ final class VGDuetPreviewRenderLoop {
         var changed = forceRender
 
         if let decoded = decoded, let buffer = decoded.pixelBuffer {
+            decodedFrameCount += 1
+            let pts = decoded.presentationTimeMs
+            if firstDecodedSourcePtsMs == nil {
+                firstDecodedSourcePtsMs = pts
+            }
+            lastDecodedSourcePtsMs = pts
+            if let currentMin = minDecodedSourcePtsMs {
+                minDecodedSourcePtsMs = min(currentMin, pts)
+            } else {
+                minDecodedSourcePtsMs = pts
+            }
+            if let currentMax = maxDecodedSourcePtsMs {
+                maxDecodedSourcePtsMs = max(currentMax, pts)
+            } else {
+                maxDecodedSourcePtsMs = pts
+            }
+            if lastDistinctPtsMs != pts {
+                distinctDecodedSourcePtsCount += 1
+                lastDistinctPtsMs = pts
+            }
+
             if buffer !== heldSourceFrame { changed = true }
             heldSourceFrame = buffer
-            let pts = decoded.presentationTimeMs
             coveredRange = min(target, pts)...max(target, pts)
         } else {
             // Decoder unavailable or produced nothing: keep whatever we hold and
@@ -384,6 +457,7 @@ final class VGDuetPreviewRenderLoop {
     }
 
     private func render(frame: CVPixelBuffer?) {
+        renderPassCount += 1
         inFlight = true
         let sRect       = sourceRect
         let cRect       = cameraRect
@@ -432,6 +506,7 @@ final class VGDuetPreviewRenderLoop {
     private func didRender(_ output: CVPixelBuffer?) {
         guard !isStopped else { return }
         if let output = output {
+            presentedFrameCount += 1
             presentHandler(output)
             hasPresented = true
         }
