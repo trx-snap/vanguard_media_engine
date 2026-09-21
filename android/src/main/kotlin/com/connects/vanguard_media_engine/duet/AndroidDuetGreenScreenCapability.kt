@@ -3,18 +3,19 @@ package com.connects.vanguard_media_engine.duet
 import android.content.Context
 import android.os.Build
 import android.os.PowerManager
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenSegmentationBackend
 
 // VG-DUET-GREEN-SCREEN: Capability probe + backend/quality enums.
 
-object DuetSegmentationBackend {
-    const val MEDIAPIPE_GPU  = "mediapipe_gpu"
-    const val MEDIAPIPE_GPU_GRAPH = "mediapipe_gpu_graph"
-    const val MEDIAPIPE_CPU  = "mediapipe_cpu"
-    const val MLKIT          = "mlkit"
-    const val NONE           = "none"
-    /** Standalone TensorFlow Lite GPU delegate backend — debug/smoke opt-in only; not default primary. */
-    const val RAW_TFLITE_GPU = "raw_tflite_gpu"
-}
+// GreenScreen backend-id constants are an independent, reusable capability
+// and must not be owned by the Duet multi-input compositor package. The real
+// definition now lives in
+// `com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenSegmentationBackend`
+// (AndroidGreenScreenSegmentationTypes.kt). This alias keeps every existing
+// Duet call site (`DuetSegmentationBackend.MEDIAPIPE_CPU`/`.MLKIT`/`.NONE`/
+// `.RAW_TFLITE_GPU`/`.MEDIAPIPE_GPU`/`.MEDIAPIPE_GPU_GRAPH`) source- and
+// binary-compatible without Duet owning the constants.
+typealias DuetSegmentationBackend = AndroidGreenScreenSegmentationBackend
 
 enum class DuetSegmentationQuality(val key: String) {
     QUALITY("quality"),
