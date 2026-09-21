@@ -68,13 +68,20 @@ abstract final class VGDuetLayoutMath {
   /// When [transform] is null, the camera rect is also full canvas (identity).
   ///
   /// When [transform] is non-null:
-  /// - scale is clamped to `[0.25, 1.0]`. If scale is non-finite or `<= 0.0`,
+  /// - scale is clamped to `[0.10, 4.0]`. If scale is non-finite or `<= 0.0`,
   ///   it degrades to identity (full canvas camera rect).
-  /// - offset is clamped to `[-1.0, 1.0]`. Non-finite offset components default to 0.0.
+  /// - offset is clamped to `[-2.0, 2.0]`. Non-finite offset components default to 0.0.
   /// - anchor is clamped to `[0.0, 1.0]`. Non-finite anchor components default to 0.5.
-  /// - If clamped scale >= 1.0 and offset is (0.0, 0.0), camera rect is full canvas.
-  /// - Otherwise, camera rect is scaled, positioned relative to canvas center + offset,
-  ///   and clamped fully inside the canvas bounds.
+  /// - The camera rect is scaled and positioned relative to canvas center +
+  ///   offset, anchored at [anchor] within the scaled rect. Unlike v1, the
+  ///   result is **not** clamped fully inside the canvas bounds: scale above
+  ///   1.0 or a large offset can legitimately place the rect partially or
+  ///   fully off-canvas (TikTok-style free placement). Scale exactly `1.0`
+  ///   with zero offset and centered anchor still yields the full-canvas
+  ///   identity rect.
+  /// - [transform.rotationDegrees] is not applied here: this method always
+  ///   returns the unrotated, axis-aligned camera rect. Rotation is
+  ///   serialized separately for native preview/export to apply.
   static List<VGDuetRect> computeGreenScreenRects({
     required VGDuetSize canvasSize,
     VGDuetForegroundTransform? transform,
@@ -96,19 +103,23 @@ abstract final class VGDuetLayoutMath {
       return [sourceRect, full];
     }
 
-    final scale = rawScale.clamp(0.25, 1.0);
+    final scale = rawScale.clamp(0.10, 4.0);
 
     final rawOffsetX = transform.offset.x;
     final rawOffsetY = transform.offset.y;
-    final offsetX = (rawOffsetX.isFinite ? rawOffsetX : 0.0).clamp(-1.0, 1.0);
-    final offsetY = (rawOffsetY.isFinite ? rawOffsetY : 0.0).clamp(-1.0, 1.0);
+    final offsetX = (rawOffsetX.isFinite ? rawOffsetX : 0.0).clamp(-2.0, 2.0);
+    final offsetY = (rawOffsetY.isFinite ? rawOffsetY : 0.0).clamp(-2.0, 2.0);
 
     final rawAnchorX = transform.anchor.x;
     final rawAnchorY = transform.anchor.y;
     final anchorX = (rawAnchorX.isFinite ? rawAnchorX : 0.5).clamp(0.0, 1.0);
     final anchorY = (rawAnchorY.isFinite ? rawAnchorY : 0.5).clamp(0.0, 1.0);
 
-    if (scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0) {
+    if (scale == 1.0 &&
+        offsetX == 0.0 &&
+        offsetY == 0.0 &&
+        anchorX == 0.5 &&
+        anchorY == 0.5) {
       return [sourceRect, full];
     }
 
@@ -120,13 +131,8 @@ abstract final class VGDuetLayoutMath {
     final targetX = cx + offsetX * cx;
     final targetY = cy + offsetY * cy;
 
-    var left = targetX - anchorX * scaledW;
-    var top = targetY - anchorY * scaledH;
-
-    final maxLeft = (canvasSize.width - scaledW).clamp(0.0, double.infinity);
-    final maxTop = (canvasSize.height - scaledH).clamp(0.0, double.infinity);
-    left = left.clamp(0.0, maxLeft);
-    top = top.clamp(0.0, maxTop);
+    final left = targetX - anchorX * scaledW;
+    final top = targetY - anchorY * scaledH;
 
     final cameraRect = VGDuetRect(
       left: left,

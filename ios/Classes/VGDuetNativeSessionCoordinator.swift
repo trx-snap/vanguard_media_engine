@@ -282,7 +282,7 @@ final class VGDuetNativeSessionCoordinator {
             canvasWidth:  CGFloat(width),
             canvasHeight: CGFloat(height)
         )
-        let layoutRects = typedRects.map { serializeLayoutRects($0) }
+        let layoutRects = typedRects.map { serializeLayoutRects((source: $0.source, camera: $0.camera)) }
 
         // Store original values so idempotent re-attach returns them verbatim.
         session.previewWidthPx    = width
@@ -366,17 +366,19 @@ final class VGDuetNativeSessionCoordinator {
         layoutConfigMap: [String: Any],
         canvasWidth: CGFloat,
         canvasHeight: CGFloat
-    ) -> (source: CGRect, camera: CGRect)? {
+    ) -> (source: CGRect, camera: CGRect, rotation: VGDuetForegroundRotation)? {
         let mode = layoutConfigMap["mode"] as? String ?? "pip"
         switch mode {
         case "splitLeftRight":
             let swapped = layoutConfigMap["isSideSwapped"] as? Bool ?? false
-            return VGDuetLayoutGeometry.splitLeftRight(
+            let rects = VGDuetLayoutGeometry.splitLeftRight(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight, isSwapped: swapped)
+            return (source: rects.source, camera: rects.camera, rotation: .identity)
         case "splitTopBottom":
             let swapped = layoutConfigMap["isTopBottomSwapped"] as? Bool ?? false
-            return VGDuetLayoutGeometry.splitTopBottom(
+            let rects = VGDuetLayoutGeometry.splitTopBottom(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight, isSwapped: swapped)
+            return (source: rects.source, camera: rects.camera, rotation: .identity)
         case "pip":
             let sourceRect = VGDuetLayoutGeometry.pipSourceRect(
                 canvasWidth: canvasWidth, canvasHeight: canvasHeight)
@@ -394,13 +396,15 @@ final class VGDuetNativeSessionCoordinator {
                     normalizedWidth:  CGFloat(nw),
                     normalizedHeight: CGFloat(nh))
             }
-            return (source: sourceRect, camera: cameraRect)
+            return (source: sourceRect, camera: cameraRect, rotation: .identity)
         case "greenScreen":
             let fgTransform = parseForegroundTransform(layoutConfigMap)
-            return VGDuetLayoutGeometry.greenScreen(
+            let rects = VGDuetLayoutGeometry.greenScreen(
                 canvasWidth:  canvasWidth,
                 canvasHeight: canvasHeight,
                 transform:    fgTransform)
+            let rotation = VGDuetLayoutGeometry.foregroundRotation(transform: fgTransform)
+            return (source: rects.source, camera: rects.camera, rotation: rotation)
         default:
             return nil
         }
@@ -416,13 +420,19 @@ final class VGDuetNativeSessionCoordinator {
     /// Parses a `NativeForegroundTransform` from a layout config map.
     ///
     /// Reads the nested `foregroundTransform` map with keys:
-    ///   `scale`, `offset` (`x`, `y`), `anchor` (`x`, `y`).
+    ///   `scale`, `offset` (`x`, `y`), `anchor` (`x`, `y`), `rotationDegrees`.
     ///
-    /// Returns nil when the map is absent, has invalid types, or has a
-    /// non-positive or non-finite scale — all degrade to the full-canvas identity.
+    /// Missing or wrong-type `scale` defaults to `1.0` (matching the Dart
+    /// `VGDuetForegroundTransform.fromMap` contract); the resulting scale must
+    /// still be finite and positive, or nil is returned (full-canvas identity).
+    /// Offset/anchor components default per-field (offset → 0.0, anchor → 0.5)
+    /// on missing, wrong-type, or non-finite values. `rotationDegrees` defaults
+    /// to `0.0` on missing, wrong-type, or non-finite values; it is carried on
+    /// the returned transform but does not affect the rect returned by
+    /// `VGDuetLayoutGeometry.greenScreen(canvasWidth:canvasHeight:transform:)`.
     private func parseForegroundTransform(_ layoutConfigMap: [String: Any]) -> NativeForegroundTransform? {
         guard let fgMap = layoutConfigMap["foregroundTransform"] as? [String: Any] else { return nil }
-        guard let rawScale = (fgMap["scale"] as? NSNumber)?.doubleValue else { return nil }
+        let rawScale = (fgMap["scale"] as? NSNumber)?.doubleValue ?? 1.0
         guard rawScale.isFinite && rawScale > 0.0 else { return nil }
         let offsetMap = fgMap["offset"] as? [String: Any]
         let anchorMap = fgMap["anchor"] as? [String: Any]
@@ -434,20 +444,24 @@ final class VGDuetNativeSessionCoordinator {
         let offsetY = rawOffsetY.isFinite ? rawOffsetY : 0.0
         let anchorX = rawAnchorX.isFinite ? rawAnchorX : 0.5
         let anchorY = rawAnchorY.isFinite ? rawAnchorY : 0.5
+        let rawRotation = (fgMap["rotationDegrees"] as? NSNumber)?.doubleValue ?? 0.0
+        let rotationDegrees = rawRotation.isFinite ? rawRotation : 0.0
         return NativeForegroundTransform(
-            scale:   CGFloat(rawScale),
-            offsetX: CGFloat(offsetX),
-            offsetY: CGFloat(offsetY),
-            anchorX: CGFloat(anchorX),
-            anchorY: CGFloat(anchorY)
+            scale:           CGFloat(rawScale),
+            offsetX:         CGFloat(offsetX),
+            offsetY:         CGFloat(offsetY),
+            anchorX:         CGFloat(anchorX),
+            anchorY:         CGFloat(anchorY),
+            rotationDegrees: CGFloat(rotationDegrees)
         )
     }
 
     /// Rects used by the render loop when the layout mode is unknown:
-    /// full-canvas source, no camera placeholder.
-    private static func fallbackPreviewRects(canvasWidth: Double, canvasHeight: Double) -> (source: CGRect, camera: CGRect) {
+    /// full-canvas source, no camera placeholder, identity rotation.
+    private static func fallbackPreviewRects(canvasWidth: Double, canvasHeight: Double) -> (source: CGRect, camera: CGRect, rotation: VGDuetForegroundRotation) {
         return (source: CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight),
-                camera: .zero)
+                camera: .zero,
+                rotation: .identity)
     }
 
     // MARK: - Preview render loop helpers (Slice 4B-B)
@@ -471,7 +485,7 @@ final class VGDuetNativeSessionCoordinator {
         registry:     FlutterTextureRegistry,
         canvasWidth:  Double,
         canvasHeight: Double,
-        rects:        (source: CGRect, camera: CGRect)
+        rects:        (source: CGRect, camera: CGRect, rotation: VGDuetForegroundRotation)
     ) -> VGDuetPreviewRenderLoop {
         let compositor   = VGDuetPreviewCompositor(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
         let clock        = session.previewClock
@@ -483,6 +497,9 @@ final class VGDuetNativeSessionCoordinator {
             trimEndMs:   session.trimEndMs,
             sourceRect:  rects.source,
             cameraRect:  rects.camera,
+            rotationDegrees: rects.rotation.rotationDegrees,
+            anchorX:     rects.rotation.anchorX,
+            anchorY:     rects.rotation.anchorY,
             targetPtsProvider: {
                 clock.currentSourcePtsMs()
             },
@@ -727,11 +744,14 @@ final class VGDuetNativeSessionCoordinator {
                 canvasWidth:  CGFloat(width),
                 canvasHeight: CGFloat(height)
             )
-            session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
+            session.previewLayoutRects = typedRects.map { serializeLayoutRects((source: $0.source, camera: $0.camera)) }
             let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
             session.previewRenderLoop?.updateLayout(
                 sourceRect:  rects.source,
                 cameraRect:  rects.camera,
+                rotationDegrees: rects.rotation.rotationDegrees,
+                anchorX:     rects.rotation.anchorX,
+                anchorY:     rects.rotation.anchorY,
                 targetPtsMs: session.previewClock.currentSourcePtsMs())
         }
         reply(nil, nil)
@@ -943,11 +963,14 @@ final class VGDuetNativeSessionCoordinator {
                 canvasWidth:  CGFloat(width),
                 canvasHeight: CGFloat(height)
             )
-            session.previewLayoutRects = typedRects.map { serializeLayoutRects($0) }
+            session.previewLayoutRects = typedRects.map { serializeLayoutRects((source: $0.source, camera: $0.camera)) }
             let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
             session.previewRenderLoop?.updateLayout(
                 sourceRect:  rects.source,
                 cameraRect:  rects.camera,
+                rotationDegrees: rects.rotation.rotationDegrees,
+                anchorX:     rects.rotation.anchorX,
+                anchorY:     rects.rotation.anchorY,
                 targetPtsMs: session.previewClock.currentSourcePtsMs())
         }
 

@@ -184,9 +184,11 @@ class AndroidLiveGreenScreenMethodHandler(
     }
 
     /**
-     * `{scale, offset: {x, y}?, anchor: {x, y}?}`. Absent → null (identity)
-     * when not [required]. Scale must be finite and positive; components, when
-     * present, must be finite numbers (offset defaults 0.0, anchor 0.5).
+     * `{scale, offset: {x, y}?, anchor: {x, y}?, rotationDegrees?}`. Absent →
+     * null (identity) when not [required]. Scale must be finite and positive;
+     * offset/anchor components, when present, must be finite numbers (offset
+     * defaults 0.0, anchor 0.5). `rotationDegrees` is best-effort: missing,
+     * wrong-type, or non-finite values default to 0.0 rather than throwing.
      */
     private fun parseForegroundTransform(raw: Any?, required: Boolean): AndroidGreenScreenForegroundTransform? {
         if (raw == null) {
@@ -198,12 +200,14 @@ class AndroidLiveGreenScreenMethodHandler(
         if (scale <= 0.0) throw IllegalArgumentException("'foregroundTransform.scale' must be > 0")
         val (offsetX, offsetY) = parsePoint(map["offset"], "foregroundTransform.offset", 0.0)
         val (anchorX, anchorY) = parsePoint(map["anchor"], "foregroundTransform.anchor", 0.5)
+        val rotationDegrees = parseRotationDegrees(map, "rotationDegrees")
         return AndroidGreenScreenForegroundTransform(
             scale = scale,
             offsetX = offsetX,
             offsetY = offsetY,
             anchorX = anchorX,
             anchorY = anchorY,
+            rotationDegrees = rotationDegrees,
         )
     }
 
@@ -253,6 +257,18 @@ class AndroidLiveGreenScreenMethodHandler(
             }
             else -> throw IllegalArgumentException("'$label' must be a number")
         }
+
+    /**
+     * Unlike [optionalFiniteDouble], missing, wrong-type, and non-finite
+     * `rotationDegrees` all silently default to `0.0` rather than throwing;
+     * rotation is contract data only and must never fail-closed the whole
+     * `foregroundTransform` parse.
+     */
+    private fun parseRotationDegrees(map: Map<*, *>, key: String): Double {
+        val value = map[key] as? Number ?: return 0.0
+        val d = value.toDouble()
+        return if (d.isFinite()) d else 0.0
+    }
 
     // ── Reply helpers ─────────────────────────────────────────────────────────
 

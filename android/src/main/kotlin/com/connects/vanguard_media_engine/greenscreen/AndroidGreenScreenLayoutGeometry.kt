@@ -37,6 +37,8 @@ data class AndroidGreenScreenLayoutRects(
  *
  * All fields are raw (pre-clamp) values from the layout config map;
  * clamping is performed inside [AndroidGreenScreenLayoutGeometry.greenScreen].
+ * [rotationDegrees] is contract data only in this slice: it defaults to `0.0`
+ * and is not applied to the axis-aligned rect returned by that function.
  */
 data class AndroidGreenScreenForegroundTransform(
     val scale:   Double,
@@ -44,6 +46,7 @@ data class AndroidGreenScreenForegroundTransform(
     val offsetY: Double,
     val anchorX: Double,
     val anchorY: Double,
+    val rotationDegrees: Double = 0.0,
 )
 
 /**
@@ -71,13 +74,16 @@ object AndroidGreenScreenLayoutGeometry {
      * full-canvas identity (backwards compatible with existing green-screen sessions
      * without a transform).
      *
-     * Transform semantics (v1 — shrink/reposition only):
-     * - scale is clamped to [0.25, 1.0] before rect math; malformed scale degrades
-     *   to the full-canvas identity.
+     * Transform semantics (v2 — free transform: scale, drag, rotate):
+     * - scale is clamped to [0.10, 4.0] before rect math; malformed scale degrades
+     *   to the full-canvas identity. Unlike v1, scale above 1.0 is not clamped
+     *   down to the full-canvas rect — the camera layer can be larger than the canvas.
      * - offset is a normalized canvas-center translation, defaulting non-finite
-     *   values to 0.0 before clamping to [-1.0, 1.0].
+     *   values to 0.0 before clamping to [-2.0, 2.0].
      * - anchor is the point within the scaled rect that maps to canvas-center + offset,
      *   defaulting non-finite values to 0.5 before clamping to [0.0, 1.0].
+     * - [AndroidGreenScreenForegroundTransform.rotationDegrees] is not applied here:
+     *   this function always returns the unrotated, axis-aligned camera rect.
      *
      * Rect math:
      *   scaledW = canvasWidth  * clampedScale
@@ -88,7 +94,11 @@ object AndroidGreenScreenLayoutGeometry {
      *   targetY  = canvasCy + clampedOffsetY * canvasCy
      *   left     = targetX - clampedAnchorX * scaledW
      *   top      = targetY - clampedAnchorY * scaledH
-     *   then clamp rect fully inside [0, canvasWidth] x [0, canvasHeight].
+     *
+     * Free placement (drag) is intentionally not clamped fully inside the canvas —
+     * the resulting rect may extend beyond canvas edges, matching TikTok-style Duet
+     * foreground placement. Scale exactly 1.0 with zero offset and centered anchor
+     * still yields the full-canvas identity rect.
      */
     fun greenScreen(
         canvasWidth:  Double,
@@ -108,19 +118,19 @@ object AndroidGreenScreenLayoutGeometry {
         }
 
         // Normalize and clamp inputs.
-        val scale = rawScale.coerceIn(0.25, 1.0)
+        val scale = rawScale.coerceIn(0.10, 4.0)
         val rawOffsetX = transform.offsetX
         val rawOffsetY = transform.offsetY
-        val offsetX = (if (rawOffsetX.isFinite()) rawOffsetX else 0.0).coerceIn(-1.0, 1.0)
-        val offsetY = (if (rawOffsetY.isFinite()) rawOffsetY else 0.0).coerceIn(-1.0, 1.0)
+        val offsetX = (if (rawOffsetX.isFinite()) rawOffsetX else 0.0).coerceIn(-2.0, 2.0)
+        val offsetY = (if (rawOffsetY.isFinite()) rawOffsetY else 0.0).coerceIn(-2.0, 2.0)
         val rawAnchorX = transform.anchorX
         val rawAnchorY = transform.anchorY
         val anchorX = (if (rawAnchorX.isFinite()) rawAnchorX else 0.5).coerceIn(0.0, 1.0)
         val anchorY = (if (rawAnchorY.isFinite()) rawAnchorY else 0.5).coerceIn(0.0, 1.0)
 
-        // Identity short-circuit: scale 1.0 with no offset returns full canvas
-        // without any rect math.
-        if (scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0) {
+        // Identity short-circuit: only exactly scale 1.0, zero offset, and
+        // centered anchor returns the full canvas without any rect math.
+        if (scale == 1.0 && offsetX == 0.0 && offsetY == 0.0 && anchorX == 0.5 && anchorY == 0.5) {
             return AndroidGreenScreenLayoutRects(source = source, camera = full)
         }
 
@@ -133,13 +143,12 @@ object AndroidGreenScreenLayoutGeometry {
         val targetX  = canvasCx + offsetX * canvasCx
         val targetY  = canvasCy + offsetY * canvasCy
 
-        // Unclamped rect with anchor mapping to target.
-        var left = targetX - anchorX * scaledW
-        var top  = targetY - anchorY * scaledH
-
-        // Clamp rect fully inside canvas; size is fixed by scale.
-        left = left.coerceIn(0.0, canvasWidth  - scaledW)
-        top  = top.coerceIn(0.0, canvasHeight - scaledH)
+        // Rect with anchor mapping to target. Free placement (drag) is
+        // intentionally not clamped fully inside the canvas — the resulting
+        // rect may extend beyond canvas edges, matching TikTok-style Duet
+        // foreground placement.
+        val left = targetX - anchorX * scaledW
+        val top  = targetY - anchorY * scaledH
 
         val camera = AndroidGreenScreenPixelRect(left, top, scaledW, scaledH)
         return AndroidGreenScreenLayoutRects(source = source, camera = camera)

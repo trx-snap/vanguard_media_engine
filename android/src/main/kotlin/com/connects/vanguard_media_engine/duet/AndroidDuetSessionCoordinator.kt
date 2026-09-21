@@ -1224,15 +1224,22 @@ class AndroidDuetSessionCoordinator(
      * Parses a [NativeForegroundTransform] from a layout config map.
      *
      * Reads the nested `foregroundTransform` map with keys:
-     *   `scale` (Double), `offset.x`, `offset.y`, `anchor.x`, `anchor.y`.
+     *   `scale` (Double), `offset.x`, `offset.y`, `anchor.x`, `anchor.y`,
+     *   `rotationDegrees`.
      *
-     * Returns null when the map is absent, has invalid types, or has a
-     * non-positive / non-finite scale — all degrade to full-canvas identity.
+     * Missing or wrong-type `scale` defaults to `1.0` (matching the Dart
+     * `VGDuetForegroundTransform.fromMap` contract); the resulting scale must
+     * still be finite and positive, or null is returned (full-canvas identity).
+     * Offset/anchor components default per-field (offset -> 0.0, anchor -> 0.5)
+     * on missing, wrong-type, or non-finite values. `rotationDegrees` defaults
+     * to `0.0` on missing, wrong-type, or non-finite values; it is carried on
+     * the returned transform but does not affect the rect returned by
+     * [AndroidGreenScreenLayoutGeometry.greenScreen].
      */
     private fun parseForegroundTransform(layoutConfigMap: Map<String, Any?>): NativeForegroundTransform? {
         @Suppress("UNCHECKED_CAST")
         val fgMap = layoutConfigMap["foregroundTransform"] as? Map<*, *> ?: return null
-        val scale = (fgMap["scale"] as? Number)?.toDouble() ?: return null
+        val scale = (fgMap["scale"] as? Number)?.toDouble() ?: 1.0
         if (!scale.isFinite() || scale <= 0.0) return null
         @Suppress("UNCHECKED_CAST")
         val offsetMap = fgMap["offset"] as? Map<*, *>
@@ -1246,12 +1253,15 @@ class AndroidDuetSessionCoordinator(
         val offsetY = if (rawOffsetY.isFinite()) rawOffsetY else 0.0
         val anchorX = if (rawAnchorX.isFinite()) rawAnchorX else 0.5
         val anchorY = if (rawAnchorY.isFinite()) rawAnchorY else 0.5
+        val rawRotation = (fgMap["rotationDegrees"] as? Number)?.toDouble() ?: 0.0
+        val rotationDegrees = if (rawRotation.isFinite()) rawRotation else 0.0
         return NativeForegroundTransform(
             scale   = scale,
             offsetX = offsetX,
             offsetY = offsetY,
             anchorX = anchorX,
             anchorY = anchorY,
+            rotationDegrees = rotationDegrees,
         )
     }
 

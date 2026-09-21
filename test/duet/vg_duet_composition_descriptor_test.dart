@@ -561,9 +561,224 @@ void main() {
         expect(ft!.scale, closeTo(0.62, 1e-10));
         expect(ft.offset, equals(const VGDuetPoint(0.0, 0.22)));
         expect(ft.anchor, equals(const VGDuetPoint(0.5, 0.5)));
+        // creatorOverlay is visually unchanged: rotation defaults to 0.0.
+        expect(ft.rotationDegrees, 0.0);
         expect(ft, equals(VGDuetForegroundTransform.creatorOverlay));
       },
     );
+
+    test('identity transform has rotationDegrees 0.0 by default', () {
+      expect(VGDuetForegroundTransform.identity.rotationDegrees, 0.0);
+    });
+
+    test('greenScreen descriptor with a non-zero rotationDegrees round-trips '
+        'preserving scale, offset, anchor, rotation, and equality', () {
+      const transform = VGDuetForegroundTransform(
+        scale: 0.8,
+        offset: VGDuetPoint(0.1, -0.2),
+        anchor: VGDuetPoint(0.3, 0.7),
+        rotationDegrees: 47.5,
+      );
+      final d = _makeDescriptor(
+        mode: VGDuetLayoutMode.greenScreen,
+        foregroundTransform: transform,
+      );
+      final map = d.toMap();
+      final restored = VGDuetCompositionDescriptor.fromMap(map);
+
+      expect(restored, equals(d));
+      final ft = restored.layoutConfig.foregroundTransform;
+      expect(ft, isNotNull);
+      expect(ft!.rotationDegrees, closeTo(47.5, 1e-10));
+      expect(ft, equals(transform));
+    });
+
+    test(
+      'rotationDegrees accepts arbitrary clockwise values including negative '
+      'and beyond-360 degrees, and toMap serializes the raw value',
+      () {
+        for (final degrees in [-450.0, -90.0, 0.0, 180.0, 359.9, 720.5]) {
+          final transform = VGDuetForegroundTransform(
+            scale: 1.0,
+            offset: VGDuetPoint.zero,
+            anchor: const VGDuetPoint(0.5, 0.5),
+            rotationDegrees: degrees,
+          );
+          expect(transform.toMap()['rotationDegrees'], degrees);
+          final restored = VGDuetForegroundTransform.fromMap(transform.toMap());
+          expect(restored.rotationDegrees, closeTo(degrees, 1e-10));
+        }
+      },
+    );
+
+    test('a payload without a rotationDegrees key (pre-rotation contract) '
+        'parses rotationDegrees as 0.0', () {
+      final map = <String, dynamic>{
+        'scale': 0.5,
+        'offset': {'x': 0.1, 'y': 0.2},
+        'anchor': {'x': 0.3, 'y': 0.4},
+        // no 'rotationDegrees' key
+      };
+      final ft = VGDuetForegroundTransform.fromMap(map);
+      expect(ft.rotationDegrees, 0.0);
+      expect(ft.scale, closeTo(0.5, 1e-10));
+    });
+
+    test('missing, malformed, or non-finite rotationDegrees in fromMap '
+        'degrades to 0.0 without throwing', () {
+      final malformedValues = <dynamic>[
+        null,
+        'not_a_number',
+        double.nan,
+        double.infinity,
+        double.negativeInfinity,
+      ];
+      for (final rawRotation in malformedValues) {
+        final map = <String, dynamic>{
+          'scale': 0.5,
+          'offset': {'x': 0.1, 'y': 0.2},
+          'anchor': {'x': 0.3, 'y': 0.4},
+          'rotationDegrees': rawRotation,
+        };
+        expect(() => VGDuetForegroundTransform.fromMap(map), returnsNormally);
+        final ft = VGDuetForegroundTransform.fromMap(map);
+        expect(
+          ft.rotationDegrees,
+          0.0,
+          reason: 'rotationDegrees $rawRotation should degrade to 0.0',
+        );
+      }
+    });
+
+    test('invalid scale degrading to identity also resets rotationDegrees to '
+        '0.0, ignoring any rotation present in the malformed payload', () {
+      final map = <String, dynamic>{
+        'scale': double.nan,
+        'rotationDegrees': 123.0,
+      };
+      final ft = VGDuetForegroundTransform.fromMap(map);
+      expect(ft, equals(VGDuetForegroundTransform.identity));
+      expect(ft.rotationDegrees, 0.0);
+    });
+
+    test('wrong-type scale (e.g. a String, bool, Map, or List) does not throw '
+        'and degrades to 1.0, matching the missing-scale contract', () {
+      final wrongTypeScales = <dynamic>[
+        'not_a_number',
+        true,
+        <String, dynamic>{},
+        <dynamic>[],
+      ];
+      for (final rawScale in wrongTypeScales) {
+        final map = <String, dynamic>{
+          'scale': rawScale,
+          'offset': {'x': 0.1, 'y': 0.2},
+          'anchor': {'x': 0.3, 'y': 0.4},
+        };
+        expect(
+          () => VGDuetForegroundTransform.fromMap(map),
+          returnsNormally,
+          reason: 'scale $rawScale should not throw',
+        );
+        final ft = VGDuetForegroundTransform.fromMap(map);
+        // Wrong-type scale falls back to 1.0, which is finite and
+        // positive, so it does not force full identity: offset/anchor
+        // still parse from the rest of the payload.
+        expect(ft.scale, 1.0, reason: 'scale $rawScale should default to 1.0');
+        expect(ft.offset, equals(const VGDuetPoint(0.1, 0.2)));
+        expect(ft.anchor, equals(const VGDuetPoint(0.3, 0.4)));
+      }
+    });
+
+    test('a missing scale key defaults to 1.0 (finite and positive), not '
+        'identity, when offset/anchor are otherwise present', () {
+      final map = <String, dynamic>{
+        'offset': {'x': 0.1, 'y': 0.2},
+        'anchor': {'x': 0.3, 'y': 0.4},
+      };
+      final ft = VGDuetForegroundTransform.fromMap(map);
+      expect(ft.scale, 1.0);
+      expect(ft.offset, equals(const VGDuetPoint(0.1, 0.2)));
+    });
+
+    test('wrong-type offset/anchor x or y coordinates do not throw and '
+        'degrade to the per-field default (offset -> 0.0, anchor -> 0.5)', () {
+      final wrongTypeCoordinates = <dynamic>[
+        'not_a_number',
+        true,
+        <String, dynamic>{},
+        <dynamic>[1, 2],
+        null,
+      ];
+      for (final rawCoord in wrongTypeCoordinates) {
+        final map = <String, dynamic>{
+          'scale': 0.75,
+          'offset': {'x': rawCoord, 'y': rawCoord},
+          'anchor': {'x': rawCoord, 'y': rawCoord},
+        };
+        expect(
+          () => VGDuetForegroundTransform.fromMap(map),
+          returnsNormally,
+          reason: 'coordinate $rawCoord should not throw',
+        );
+        final ft = VGDuetForegroundTransform.fromMap(map);
+        expect(ft.offset, equals(VGDuetPoint.zero));
+        expect(ft.anchor, equals(const VGDuetPoint(0.5, 0.5)));
+      }
+    });
+
+    test('equality, hashCode, and toString account for rotationDegrees', () {
+      const a = VGDuetForegroundTransform(
+        scale: 0.62,
+        offset: VGDuetPoint(0.0, 0.22),
+        anchor: VGDuetPoint(0.5, 0.5),
+        rotationDegrees: 10.0,
+      );
+      const bSameRotation = VGDuetForegroundTransform(
+        scale: 0.62,
+        offset: VGDuetPoint(0.0, 0.22),
+        anchor: VGDuetPoint(0.5, 0.5),
+        rotationDegrees: 10.0,
+      );
+      const cDifferentRotation = VGDuetForegroundTransform(
+        scale: 0.62,
+        offset: VGDuetPoint(0.0, 0.22),
+        anchor: VGDuetPoint(0.5, 0.5),
+        rotationDegrees: 20.0,
+      );
+
+      expect(a, equals(bSameRotation));
+      expect(a.hashCode, equals(bSameRotation.hashCode));
+      expect(a, isNot(equals(cDifferentRotation)));
+      expect(a.toString(), contains('rotationDegrees: 10.0'));
+      expect(cDifferentRotation.toString(), contains('rotationDegrees: 20.0'));
+    });
+
+    test('normalizedRotationDegrees canonicalizes to [0, 360)', () {
+      final cases = <double, double>{
+        0.0: 0.0,
+        90.0: 90.0,
+        359.0: 359.0,
+        360.0: 0.0,
+        720.0: 0.0,
+        -90.0: 270.0,
+        -360.0: 0.0,
+        450.0: 90.0,
+      };
+      cases.forEach((input, expected) {
+        final ft = VGDuetForegroundTransform(
+          scale: 1.0,
+          offset: VGDuetPoint.zero,
+          anchor: const VGDuetPoint(0.5, 0.5),
+          rotationDegrees: input,
+        );
+        expect(
+          ft.normalizedRotationDegrees,
+          closeTo(expected, 1e-9),
+          reason: 'input $input',
+        );
+      });
+    });
 
     test(
       'greenScreen layout with no foregroundTransform leaves it null after round-trip and does not serialize the key',

@@ -132,13 +132,31 @@ final class VGDuetPreviewCompositor {
     ///                      aspect-filled into cameraRect and source-over composited onto
     ///                      the composed canvas.  Default false composites `cameraFrame`
     ///                      as an opaque overlay instead.
+    ///   - cameraRotationDegrees, cameraAnchorX, cameraAnchorY:
+    ///                      Preview-only Duet foreground free-transform rotation (DEC_V2_123C).
+    ///                      The camera/foreground layer (live frame or placeholder) is rotated
+    ///                      `cameraRotationDegrees` clockwise (Dart/top-left visual convention)
+    ///                      around the normalized pivot `(cameraAnchorX, cameraAnchorY)` inside
+    ///                      cameraRect. Defaults (0.0, 0.5, 0.5) are a no-op identity rotation
+    ///                      so existing callers stay source-compatible. The source/background
+    ///                      layer is never rotated.
     /// - Returns: a pool-backed BGRA buffer, or nil when the pool is exhausted / unavailable.
     func composite(sourceFrame: CVPixelBuffer?,
                    sourceRect: CGRect,
                    cameraRect: CGRect,
                    cameraFrame: CVPixelBuffer? = nil,
-                   cameraFrameUsesStraightAlpha: Bool = false) -> CVPixelBuffer? {
+                   cameraFrameUsesStraightAlpha: Bool = false,
+                   cameraRotationDegrees: CGFloat = 0.0,
+                   cameraAnchorX: CGFloat = 0.5,
+                   cameraAnchorY: CGFloat = 0.5) -> CVPixelBuffer? {
         guard let pool = pool else { return nil }
+
+        // Final guard: sanitize non-finite rotation/anchor inputs regardless of
+        // caller (VGDuetLayoutGeometry.foregroundRotation already clamps these,
+        // but the compositor must not trust callers blindly).
+        let sanitizedRotationDegrees = cameraRotationDegrees.isFinite ? cameraRotationDegrees : 0.0
+        let sanitizedAnchorX = cameraAnchorX.isFinite ? cameraAnchorX : 0.5
+        let sanitizedAnchorY = cameraAnchorY.isFinite ? cameraAnchorY : 0.5
 
         var outBuffer: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
@@ -163,10 +181,16 @@ final class VGDuetPreviewCompositor {
                 //   The frame's bytes are STRAIGHT alpha (fg.rgb, a).  CoreImage treats a
                 //   BGRA pixel buffer as premultiplied, so premultiply first, giving
                 //   (fg.rgb*a, a), and do it BEFORE resampling so transparent texels never
-                //   bleed colour into edges; then aspect-fill and source-over onto the
-                //   canvas (C = C_fg*a + C_bg*(1-a)).
+                //   bleed colour into edges; then aspect-fill into the unrotated cameraRect,
+                //   rotate the resulting layer, then source-over onto the canvas
+                //   (C = C_fg*a + C_bg*(1-a)).
                 let camPremultiplied = CIImage(cvPixelBuffer: camFrame).premultiplyingAlpha()
-                image = aspectFill(camPremultiplied, into: ciCamera).composited(over: image)
+                let filled = aspectFill(camPremultiplied, into: ciCamera)
+                let rotated = rotateCameraLayer(filled, in: ciCamera,
+                                                rotationDegrees: sanitizedRotationDegrees,
+                                                anchorX: sanitizedAnchorX,
+                                                anchorY: sanitizedAnchorY)
+                image = rotated.composited(over: image)
                 // One-time diagnostic: first frame composited through the straight-alpha path.
                 // Grep marker: IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST
                 if !_hasLoggedFirstStraightAlphaComposite {
@@ -174,13 +198,23 @@ final class VGDuetPreviewCompositor {
                     NSLog("[VGDuetPreviewCompositor] IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST pre-keyed straight-alpha foreground premultiplied and source-over composited into cameraRect; no matte, no refinement")
                 }
             } else if let camFrame = cameraFrame {
-                // Opaque live camera frame: aspect-fill into the slot.
+                // Opaque live camera frame: aspect-fill into the unrotated slot, then rotate.
                 let camImage = CIImage(cvPixelBuffer: camFrame)
-                image = aspectFill(camImage, into: ciCamera).composited(over: image)
+                let filled = aspectFill(camImage, into: ciCamera)
+                let rotated = rotateCameraLayer(filled, in: ciCamera,
+                                                rotationDegrees: sanitizedRotationDegrees,
+                                                anchorX: sanitizedAnchorX,
+                                                anchorY: sanitizedAnchorY)
+                image = rotated.composited(over: image)
             } else {
-                // No live frame yet: show deterministic placeholder.
+                // No live frame yet: show deterministic placeholder, rotated to match.
                 let coversSource = !ciSource.isEmpty && ciCamera.contains(ciSource)
-                image = cameraPlaceholder(in: ciCamera, translucent: coversSource).composited(over: image)
+                let placeholder = cameraPlaceholder(in: ciCamera, translucent: coversSource)
+                let rotated = rotateCameraLayer(placeholder, in: ciCamera,
+                                                rotationDegrees: sanitizedRotationDegrees,
+                                                anchorX: sanitizedAnchorX,
+                                                anchorY: sanitizedAnchorY)
+                image = rotated.composited(over: image)
             }
         }
 
@@ -218,6 +252,38 @@ final class VGDuetPreviewCompositor {
         let ty = rect.minY + (rect.height - scaledH) / 2 - extent.minY * scale
         let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
         return image.transformed(by: transform).cropped(to: rect)
+    }
+
+    /// Rotates `image` (already aspect-filled/cropped into `rect`) around the
+    /// normalized pivot `(anchorX, anchorY)` by `rotationDegrees`.  Returns
+    /// `image` unchanged for zero, non-finite, or effectively-zero rotation.
+    ///
+    /// - `anchorX` is left-to-right inside `rect`: `rect.minX + anchorX * rect.width`.
+    /// - `anchorY` is Dart/top-left-normalized; it is flipped into CoreImage
+    ///   bottom-left space here: `rect.minY + (1.0 - anchorY) * rect.height`.
+    /// - `rotationDegrees` is the visual clockwise angle in Dart/top-left space;
+    ///   negating the radians before building the CoreImage affine rotation
+    ///   makes it rotate visually clockwise in CoreImage's bottom-left space too.
+    ///
+    /// The caller must not crop the result back to `rect`: the canvas-bounded
+    /// `ciContext.render` call is the only clip applied downstream, so rotated
+    /// corners extending past `rect` are preserved instead of cut off.
+    private func rotateCameraLayer(_ image: CIImage,
+                                   in rect: CGRect,
+                                   rotationDegrees: CGFloat,
+                                   anchorX: CGFloat,
+                                   anchorY: CGFloat) -> CIImage {
+        guard rotationDegrees.isFinite, abs(rotationDegrees) > 0.0001 else { return image }
+
+        let pivotX = rect.minX + anchorX * rect.width
+        let pivotY = rect.minY + (1.0 - anchorY) * rect.height
+        let radians = -rotationDegrees * CGFloat.pi / 180.0
+
+        let transform = CGAffineTransform(translationX: -pivotX, y: -pivotY)
+            .concatenating(CGAffineTransform(rotationAngle: radians))
+            .concatenating(CGAffineTransform(translationX: pivotX, y: pivotY))
+
+        return image.transformed(by: transform)
     }
 
     /// Deterministic camera placeholder: slate fill, 2 px lighter edge, soft

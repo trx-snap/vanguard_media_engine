@@ -196,34 +196,55 @@ class VGDuetInsets {
 
 /// Optional affine transform for the green-screen foreground camera layer.
 ///
-/// Semantics (v1 — shrink / reposition only):
-/// - [scale]: uniform scale of the camera rect in `(0, 1]`. Clamped to
-///   `[0.25, 1.0]` by native geometry before rect computation. A scale of 1.0
-///   produces the full-canvas identity.
+/// Semantics (v2 — free transform: scale, drag, rotate):
+/// - [scale]: uniform scale of the camera rect. Must be finite and positive;
+///   [VGDuetLayoutMath.computeGreenScreenRects] clamps it to `[0.10, 4.0]`
+///   before rect computation. A scale of 1.0 with zero offset and centered
+///   anchor produces the full-canvas identity. Unlike v1, scale above 1.0 is
+///   not clamped down to the full-canvas rect — the camera layer can be
+///   larger than the canvas.
 /// - [offset]: normalized canvas-center translation. `(0, 0)` keeps the rect
 ///   centered; `(1, 0)` shifts one full half-canvas width to the right.
-///   Clamped to `[-1.0, 1.0]` per axis.
+///   Clamped to `[-2.0, 2.0]` per axis by
+///   [VGDuetLayoutMath.computeGreenScreenRects].
 /// - [anchor]: the point within the scaled rect that maps to the canvas center
 ///   plus the offset translation. `(0.5, 0.5)` is the rect center. Clamped to
-///   `[0.0, 1.0]` per axis.
+///   `[0.0, 1.0]` per axis by [VGDuetLayoutMath.computeGreenScreenRects].
+/// - [rotationDegrees]: clockwise rotation of the camera layer about its
+///   anchor point, in degrees. Defaults to `0.0` (no rotation). This is
+///   serialized contract data consumed by native preview/export; it does not
+///   change the axis-aligned rect returned by
+///   [VGDuetLayoutMath.computeGreenScreenRects], which always reports the
+///   unrotated foreground rect.
+///
+/// Free placement (drag) is intentionally not clamped fully inside the
+/// canvas — the resulting rect may extend beyond canvas edges, matching
+/// TikTok-style Duet foreground placement.
 ///
 /// This class is only meaningful when the layout mode is
 /// [VGDuetLayoutMode.greenScreen]; it is harmlessly serialized for other modes
 /// when present.
 class VGDuetForegroundTransform {
   /// Uniform scale of the camera layer rect. Must be finite and positive.
-  /// Native geometry clamps to `[0.25, 1.0]`.
+  /// Clamped to `[0.10, 4.0]` by [VGDuetLayoutMath.computeGreenScreenRects].
   final double scale;
 
-  /// Normalized canvas-center translation. Clamped to `[-1.0, 1.0]` by native
-  /// geometry.
+  /// Normalized canvas-center translation. Clamped to `[-2.0, 2.0]` by
+  /// [VGDuetLayoutMath.computeGreenScreenRects].
   final VGDuetPoint offset;
 
   /// The point within the scaled rect that anchors to canvas-center + offset.
-  /// Clamped to `[0.0, 1.0]` by native geometry.
+  /// Clamped to `[0.0, 1.0]` by [VGDuetLayoutMath.computeGreenScreenRects].
   final VGDuetPoint anchor;
 
-  /// Identity transform: full-canvas rect, no offset, centered anchor.
+  /// Clockwise rotation of the camera layer about [anchor], in degrees.
+  /// Defaults to `0.0`. Arbitrary finite values (including negative and
+  /// values outside `[0, 360)`) are accepted and serialized as-is; use
+  /// [normalizedRotationDegrees] for a canonicalized `[0, 360)` value.
+  final double rotationDegrees;
+
+  /// Identity transform: full-canvas rect, no offset, centered anchor, no
+  /// rotation.
   static const VGDuetForegroundTransform identity = VGDuetForegroundTransform(
     scale: 1.0,
     offset: VGDuetPoint.zero,
@@ -246,21 +267,24 @@ class VGDuetForegroundTransform {
   /// Constructs a [VGDuetForegroundTransform].
   ///
   /// Only the [scale] positivity is checked at construction time (via assert).
-  /// Offset and anchor range clamping is deferred to native geometry to avoid
-  /// rejecting semantically reasonable inputs.
+  /// Offset, anchor, and rotation range clamping is deferred to layout
+  /// geometry to avoid rejecting semantically reasonable inputs.
   const VGDuetForegroundTransform({
     required this.scale,
     required this.offset,
     required this.anchor,
+    this.rotationDegrees = 0.0,
   }) : assert(scale > 0.0, 'scale must be positive');
 
   /// Constructs a [VGDuetForegroundTransform] with runtime validation.
   ///
-  /// Throws [ArgumentError] if [scale] is not finite or is not positive.
+  /// Throws [ArgumentError] if [scale] is not finite or is not positive, or
+  /// if [rotationDegrees] is not finite.
   factory VGDuetForegroundTransform.validated({
     required double scale,
     required VGDuetPoint offset,
     required VGDuetPoint anchor,
+    double rotationDegrees = 0.0,
   }) {
     if (!scale.isFinite) {
       throw ArgumentError.value(scale, 'scale', 'Must be finite.');
@@ -268,56 +292,87 @@ class VGDuetForegroundTransform {
     if (scale <= 0.0) {
       throw ArgumentError.value(scale, 'scale', 'Must be positive.');
     }
+    if (!rotationDegrees.isFinite) {
+      throw ArgumentError.value(
+        rotationDegrees,
+        'rotationDegrees',
+        'Must be finite.',
+      );
+    }
     return VGDuetForegroundTransform(
       scale: scale,
       offset: offset,
       anchor: anchor,
+      rotationDegrees: rotationDegrees,
     );
   }
+
+  /// [rotationDegrees] canonicalized to the `[0, 360)` range.
+  double get normalizedRotationDegrees =>
+      ((rotationDegrees % 360.0) + 360.0) % 360.0;
 
   Map<String, dynamic> toMap() => <String, dynamic>{
     'scale': scale,
     'offset': offset.toMap(),
     'anchor': anchor.toMap(),
+    'rotationDegrees': rotationDegrees,
   };
 
   /// Parses a [VGDuetForegroundTransform] from a map.
   ///
-  /// Invalid or missing values degrade to [identity] (for bad scale) or to
-  /// per-field defaults (offset → zero, anchor → center) rather than throwing.
-  /// No path through this factory throws for malformed foregroundTransform input.
+  /// Missing, wrong-type, or non-finite values degrade to [identity] (for
+  /// bad scale) or to per-field defaults (offset → zero, anchor → center,
+  /// rotationDegrees → 0.0) rather than throwing. Every numeric field is
+  /// type-checked with `is num` before use, so no path through this factory
+  /// throws for malformed foregroundTransform input — including a wrong
+  /// runtime type such as a `String` in place of a number. Payloads written
+  /// before rotation support was added (no `rotationDegrees` key) parse with
+  /// rotation 0.0.
   factory VGDuetForegroundTransform.fromMap(Map<String, dynamic> map) {
-    final rawScale = (map['scale'] as num?)?.toDouble() ?? 1.0;
+    // Parse scale defensively: missing or wrong-type → 1.0; non-finite or
+    // <= 0.0 (checked below) → identity.
+    final rawScaleValue = map['scale'];
+    final rawScale = rawScaleValue is num ? rawScaleValue.toDouble() : 1.0;
     if (!rawScale.isFinite || rawScale <= 0.0) {
       return VGDuetForegroundTransform.identity;
     }
 
-    // Parse offset x/y defensively: missing, non-numeric, or non-finite → 0.0.
+    // Parse offset x/y defensively: missing, wrong-type, or non-finite → 0.0.
     final offsetMap = map['offset'];
     double offsetX = 0.0;
     double offsetY = 0.0;
     if (offsetMap is Map) {
-      final rx = (offsetMap['x'] as num?)?.toDouble() ?? double.nan;
-      final ry = (offsetMap['y'] as num?)?.toDouble() ?? double.nan;
-      if (rx.isFinite) offsetX = rx;
-      if (ry.isFinite) offsetY = ry;
+      final rawX = offsetMap['x'];
+      final rawY = offsetMap['y'];
+      if (rawX is num && rawX.toDouble().isFinite) offsetX = rawX.toDouble();
+      if (rawY is num && rawY.toDouble().isFinite) offsetY = rawY.toDouble();
     }
 
-    // Parse anchor x/y defensively: missing, non-numeric, or non-finite → 0.5.
+    // Parse anchor x/y defensively: missing, wrong-type, or non-finite → 0.5.
     final anchorMap = map['anchor'];
     double anchorX = 0.5;
     double anchorY = 0.5;
     if (anchorMap is Map) {
-      final rx = (anchorMap['x'] as num?)?.toDouble() ?? double.nan;
-      final ry = (anchorMap['y'] as num?)?.toDouble() ?? double.nan;
-      if (rx.isFinite) anchorX = rx;
-      if (ry.isFinite) anchorY = ry;
+      final rawX = anchorMap['x'];
+      final rawY = anchorMap['y'];
+      if (rawX is num && rawX.toDouble().isFinite) anchorX = rawX.toDouble();
+      if (rawY is num && rawY.toDouble().isFinite) anchorY = rawY.toDouble();
+    }
+
+    // Parse rotationDegrees defensively: missing, non-numeric (wrong type),
+    // or non-finite → 0.0. Old payloads without this key parse the same way.
+    final rawRotationValue = map['rotationDegrees'];
+    double rotationDegrees = 0.0;
+    if (rawRotationValue is num) {
+      final rr = rawRotationValue.toDouble();
+      if (rr.isFinite) rotationDegrees = rr;
     }
 
     return VGDuetForegroundTransform(
       scale: rawScale,
       offset: VGDuetPoint(offsetX, offsetY),
       anchor: VGDuetPoint(anchorX, anchorY),
+      rotationDegrees: rotationDegrees,
     );
   }
 
@@ -327,14 +382,16 @@ class VGDuetForegroundTransform {
       other is VGDuetForegroundTransform &&
           scale == other.scale &&
           offset == other.offset &&
-          anchor == other.anchor;
+          anchor == other.anchor &&
+          rotationDegrees == other.rotationDegrees;
 
   @override
-  int get hashCode => Object.hash(scale, offset, anchor);
+  int get hashCode => Object.hash(scale, offset, anchor, rotationDegrees);
 
   @override
   String toString() =>
-      'VGDuetForegroundTransform(scale: $scale, offset: $offset, anchor: $anchor)';
+      'VGDuetForegroundTransform(scale: $scale, offset: $offset, '
+      'anchor: $anchor, rotationDegrees: $rotationDegrees)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

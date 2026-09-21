@@ -138,6 +138,12 @@ final class VGDuetPreviewRenderLoop {
 
     private var sourceRect: CGRect
     private var cameraRect: CGRect
+    /// Preview-only foreground rotation metadata (degrees + normalized pivot
+    /// anchor, Dart/top-left space). Updated alongside `cameraRect` in
+    /// `updateLayout`; passed to the compositor on every render.
+    private var rotationDegrees: CGFloat
+    private var anchorX: CGFloat
+    private var anchorY: CGFloat
 
     private var isStopped = false
     private var isActive  = false
@@ -164,6 +170,9 @@ final class VGDuetPreviewRenderLoop {
          trimEndMs: Int,
          sourceRect: CGRect,
          cameraRect: CGRect,
+         rotationDegrees: CGFloat = 0.0,
+         anchorX: CGFloat = 0.5,
+         anchorY: CGFloat = 0.5,
          targetPtsProvider: @escaping TargetPtsProvider,
          decodeHandler: @escaping DecodeHandler,
          presentHandler: @escaping PresentHandler,
@@ -173,6 +182,9 @@ final class VGDuetPreviewRenderLoop {
         self.trimEndMs                = max(trimStartMs, trimEndMs)
         self.sourceRect               = sourceRect
         self.cameraRect               = cameraRect
+        self.rotationDegrees          = rotationDegrees
+        self.anchorX                  = anchorX
+        self.anchorY                  = anchorY
         self.targetPtsProvider        = targetPtsProvider
         self.decodeHandler            = decodeHandler
         self.presentHandler           = presentHandler
@@ -222,14 +234,23 @@ final class VGDuetPreviewRenderLoop {
         submit(.decode(.seek(targetPtsMs: clamp(targetPtsMs)), forceRender: false))
     }
 
-    /// Applies new layout rects and redraws the held/current frame.  While
-    /// active, subsequent ticks pick up the new rects automatically.  Keying is
-    /// not a layout property here: it follows the provider's next sample.
-    func updateLayout(sourceRect: CGRect, cameraRect: CGRect, targetPtsMs: Int) {
+    /// Applies new layout rects (plus preview-only foreground rotation metadata)
+    /// and redraws the held/current frame.  While active, subsequent ticks pick
+    /// up the new rects/rotation automatically.  Keying is not a layout property
+    /// here: it follows the provider's next sample.
+    func updateLayout(sourceRect: CGRect,
+                      cameraRect: CGRect,
+                      rotationDegrees: CGFloat = 0.0,
+                      anchorX: CGFloat = 0.5,
+                      anchorY: CGFloat = 0.5,
+                      targetPtsMs: Int) {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
-        self.sourceRect = sourceRect
-        self.cameraRect = cameraRect
+        self.sourceRect      = sourceRect
+        self.cameraRect      = cameraRect
+        self.rotationDegrees = rotationDegrees
+        self.anchorX         = anchorX
+        self.anchorY         = anchorY
         submit(.decode(.step(targetPtsMs: clamp(targetPtsMs)), forceRender: true))
     }
 
@@ -345,6 +366,9 @@ final class VGDuetPreviewRenderLoop {
         inFlight = true
         let sRect       = sourceRect
         let cRect       = cameraRect
+        let rotationDeg = rotationDegrees
+        let anchorXVal  = anchorX
+        let anchorYVal  = anchorY
         let compositor  = self.compositor
         // Take ONE foreground sample *before* crossing the queue boundary.  Frame and
         // matte are each +1; the sample is released exactly once after compositing,
@@ -372,7 +396,10 @@ final class VGDuetPreviewRenderLoop {
                                               sourceRect: sRect,
                                               cameraRect: cRect,
                                               cameraFrame: cameraBuffer,
-                                              cameraFrameUsesStraightAlpha: usesStraightAlpha)
+                                              cameraFrameUsesStraightAlpha: usesStraightAlpha,
+                                              cameraRotationDegrees: rotationDeg,
+                                              cameraAnchorX: anchorXVal,
+                                              cameraAnchorY: anchorYVal)
             // Release the retained sample now that compositing is done (all modes).
             sample?.release()
             DispatchQueue.main.async {

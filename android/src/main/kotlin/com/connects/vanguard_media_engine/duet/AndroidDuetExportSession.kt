@@ -248,23 +248,40 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         )
     }
 
+    /**
+     * Parses a [NativeForegroundTransform] from `layoutConfig`'s
+     * `foregroundTransform` sub-map. Missing or wrong-type `scale` defaults
+     * to `1.0` (matching the Dart `VGDuetForegroundTransform.fromMap`
+     * contract); the resulting scale must still be finite and positive, or
+     * null is returned (full-canvas identity). Offset/anchor components
+     * default per-field (offset -> 0.0, anchor -> 0.5) on missing,
+     * wrong-type, or non-finite values. `rotationDegrees` defaults to `0.0`
+     * on missing, wrong-type, or non-finite values.
+     */
     @Suppress("UNCHECKED_CAST")
     private fun parseForegroundTransform(layoutMap: Map<*, *>?): NativeForegroundTransform? {
         val fgMap  = layoutMap?.get("foregroundTransform") as? Map<*, *> ?: return null
-        val scale  = (fgMap["scale"] as? Number)?.toDouble() ?: return null
+        val scale  = (fgMap["scale"] as? Number)?.toDouble() ?: 1.0
         if (!scale.isFinite() || scale <= 0.0) return null
-        val offsetMap = fgMap["offset"] as? Map<*, *>
-        val offsetX   = (offsetMap?.get("x") as? Number)?.toDouble() ?: 0.0
-        val offsetY   = (offsetMap?.get("y") as? Number)?.toDouble() ?: 0.0
-        val anchorMap = fgMap["anchor"] as? Map<*, *>
-        val anchorX   = (anchorMap?.get("x") as? Number)?.toDouble() ?: 0.5
-        val anchorY   = (anchorMap?.get("y") as? Number)?.toDouble() ?: 0.5
+        val offsetMap  = fgMap["offset"] as? Map<*, *>
+        val rawOffsetX = (offsetMap?.get("x") as? Number)?.toDouble() ?: Double.NaN
+        val rawOffsetY = (offsetMap?.get("y") as? Number)?.toDouble() ?: Double.NaN
+        val anchorMap  = fgMap["anchor"] as? Map<*, *>
+        val rawAnchorX = (anchorMap?.get("x") as? Number)?.toDouble() ?: Double.NaN
+        val rawAnchorY = (anchorMap?.get("y") as? Number)?.toDouble() ?: Double.NaN
+        val offsetX = if (rawOffsetX.isFinite()) rawOffsetX else 0.0
+        val offsetY = if (rawOffsetY.isFinite()) rawOffsetY else 0.0
+        val anchorX = if (rawAnchorX.isFinite()) rawAnchorX else 0.5
+        val anchorY = if (rawAnchorY.isFinite()) rawAnchorY else 0.5
+        val rawRotation = (fgMap["rotationDegrees"] as? Number)?.toDouble() ?: 0.0
+        val rotationDegrees = if (rawRotation.isFinite()) rawRotation else 0.0
         return NativeForegroundTransform(
             scale   = scale,
             offsetX = offsetX,
             offsetY = offsetY,
             anchorX = anchorX,
             anchorY = anchorY,
+            rotationDegrees = rotationDegrees,
         )
     }
 

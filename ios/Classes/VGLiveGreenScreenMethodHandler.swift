@@ -43,7 +43,9 @@
 //   start   → {canvasSize: {width, height}, background, foregroundTransform?}
 //           ← {sessionId, textureId, width, height}
 //   background → {type: "solidColor", argbColor} | {type: "image", filePath, scaleMode?}
-//   foregroundTransform → {scale, offset: {x, y}, anchor: {x, y}}
+//   foregroundTransform → {scale, offset: {x, y}, anchor: {x, y}, rotationDegrees?}
+//                          (rotationDegrees optional, default 0.0; contract data only —
+//                           not applied to the rect in this slice)
 //   diagnostics → {sessionId}
 //               ← {sessionId, textureId, isKeyed, maskMaxAgeSeconds, providerKind,
 //                  sampleCount, avgTotalMs, maxTotalMs, avgInferenceMs, …}
@@ -503,18 +505,21 @@ final class VGLiveGreenScreenMethodHandler {
 
     /// Returns nil when the transform is absent or not a map (→ full-canvas
     /// identity). Missing components default like the Dart model
-    /// (scale 1.0, offset 0.0, anchor 0.5); non-finite values are left for
-    /// VGDuetLayoutGeometry to degrade/clamp.
+    /// (scale 1.0, offset 0.0, anchor 0.5, rotationDegrees 0.0); non-finite
+    /// scale/offset/anchor values are left for VGDuetLayoutGeometry to
+    /// degrade/clamp, but `rotationDegrees` is finite-guarded here: missing,
+    /// wrong-type, NaN, or ±infinity all become 0.0.
     static func parseTransform(_ raw: Any?) -> NativeForegroundTransform? {
         guard let dict = raw as? [String: Any] else { return nil }
         let offset = dict["offset"] as? [String: Any]
         let anchor = dict["anchor"] as? [String: Any]
         return NativeForegroundTransform(
-            scale:   cgFloatValue(dict["scale"])  ?? 1.0,
-            offsetX: cgFloatValue(offset?["x"])   ?? 0.0,
-            offsetY: cgFloatValue(offset?["y"])   ?? 0.0,
-            anchorX: cgFloatValue(anchor?["x"])   ?? 0.5,
-            anchorY: cgFloatValue(anchor?["y"])   ?? 0.5)
+            scale:           cgFloatValue(dict["scale"])           ?? 1.0,
+            offsetX:         cgFloatValue(offset?["x"])             ?? 0.0,
+            offsetY:         cgFloatValue(offset?["y"])             ?? 0.0,
+            anchorX:         cgFloatValue(anchor?["x"])             ?? 0.5,
+            anchorY:         cgFloatValue(anchor?["y"])             ?? 0.5,
+            rotationDegrees: CGFloat(doubleValue(dict["rotationDegrees"]) ?? 0.0))
     }
 
     /// `{iosFastMetalPrecision: Bool, iosSegmentationBackend?: String,

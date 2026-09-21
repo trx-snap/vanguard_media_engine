@@ -105,23 +105,32 @@ enum VGDuetLayoutGeometry {
     /// full-canvas identity (backwards compatible with existing green-screen sessions
     /// without a transform).
     ///
-    /// Transform semantics (v1 — shrink/reposition only):
-    /// - `scale` is clamped to [0.25, 1.0] before rect math; malformed scale degrades
-    ///   to the full-canvas identity.
+    /// Transform semantics (v2 — free transform: scale, drag, rotate):
+    /// - `scale` is clamped to [0.10, 4.0] before rect math; malformed scale degrades
+    ///   to the full-canvas identity. Unlike v1, scale above 1.0 is not clamped down
+    ///   to the full-canvas rect — the camera layer can be larger than the canvas.
     /// - `offset` is a normalized canvas-center translation, defaulting non-finite
-    ///   values to 0.0 before clamping to [-1.0, 1.0].
+    ///   values to 0.0 before clamping to [-2.0, 2.0].
     /// - `anchor` maps a point within the scaled rect to canvas-center + offset,
     ///   defaulting non-finite values to 0.5 before clamping to [0.0, 1.0].
+    /// - `transform.rotationDegrees` is not applied here: this function always
+    ///   returns the unrotated, axis-aligned camera rect. Rotation is serialized
+    ///   separately for native preview/export to apply.
     ///
-    /// Rect math (mirrors AndroidDuetLayoutGeometry exactly):
+    /// Rect math (mirrors AndroidGreenScreenLayoutGeometry exactly):
     ///   scaledW  = canvasWidth  * clampedScale
     ///   scaledH  = canvasHeight * clampedScale
     ///   canvasCx = canvasWidth  / 2
     ///   canvasCy = canvasHeight / 2
     ///   targetX  = canvasCx + clampedOffsetX * canvasCx
     ///   targetY  = canvasCy + clampedOffsetY * canvasCy
-    ///   left     = targetX - clampedAnchorX * scaledW  (then clamp to canvas)
-    ///   top      = targetY - clampedAnchorY * scaledH  (then clamp to canvas)
+    ///   left     = targetX - clampedAnchorX * scaledW
+    ///   top      = targetY - clampedAnchorY * scaledH
+    ///
+    /// Free placement (drag) is intentionally not clamped fully inside the canvas —
+    /// the resulting rect may extend beyond canvas edges, matching TikTok-style Duet
+    /// foreground placement. Scale exactly 1.0 with zero offset and centered anchor
+    /// still yields the full-canvas identity rect.
     static func greenScreen(
         canvasWidth:  CGFloat,
         canvasHeight: CGFloat,
@@ -140,18 +149,19 @@ enum VGDuetLayoutGeometry {
         }
 
         // Normalize and clamp inputs.
-        let scale = min(max(rawScale, 0.25), 1.0)
+        let scale = min(max(rawScale, 0.10), 4.0)
         let rawOffsetX = t.offsetX
         let rawOffsetY = t.offsetY
-        let offsetX = min(max(rawOffsetX.isFinite ? rawOffsetX : 0.0, -1.0), 1.0)
-        let offsetY = min(max(rawOffsetY.isFinite ? rawOffsetY : 0.0, -1.0), 1.0)
+        let offsetX = min(max(rawOffsetX.isFinite ? rawOffsetX : 0.0, -2.0), 2.0)
+        let offsetY = min(max(rawOffsetY.isFinite ? rawOffsetY : 0.0, -2.0), 2.0)
         let rawAnchorX = t.anchorX
         let rawAnchorY = t.anchorY
         let anchorX = min(max(rawAnchorX.isFinite ? rawAnchorX : 0.5, 0.0), 1.0)
         let anchorY = min(max(rawAnchorY.isFinite ? rawAnchorY : 0.5, 0.0), 1.0)
 
-        // Identity short-circuit: scale 1.0 with no offset → full canvas.
-        if scale >= 1.0 && offsetX == 0.0 && offsetY == 0.0 {
+        // Identity short-circuit: only exactly scale 1.0, zero offset, and
+        // centered anchor returns the full canvas without any rect math.
+        if scale == 1.0 && offsetX == 0.0 && offsetY == 0.0 && anchorX == 0.5 && anchorY == 0.5 {
             return (source: source, camera: full)
         }
 
@@ -164,16 +174,44 @@ enum VGDuetLayoutGeometry {
         let targetX  = canvasCx + offsetX * canvasCx
         let targetY  = canvasCy + offsetY * canvasCy
 
-        // Unclamped rect with anchor mapping to target.
-        var left = targetX - anchorX * scaledW
-        var top  = targetY - anchorY * scaledH
-
-        // Clamp rect fully inside canvas; size is fixed by scale.
-        left = min(max(left, 0.0), canvasWidth  - scaledW)
-        top  = min(max(top,  0.0), canvasHeight - scaledH)
+        // Rect with anchor mapping to target. Free placement (drag) is
+        // intentionally not clamped fully inside the canvas — the resulting
+        // rect may extend beyond canvas edges, matching TikTok-style Duet
+        // foreground placement.
+        let left = targetX - anchorX * scaledW
+        let top  = targetY - anchorY * scaledH
 
         let camera = CGRect(x: left, y: top, width: scaledW, height: scaledH)
         return (source: source, camera: camera)
+    }
+
+    // MARK: - Foreground rotation (preview-only)
+
+    /// Derives preview-only rotation metadata from a foreground transform.
+    ///
+    /// Mirrors the same finiteness/clamping rules as
+    /// `greenScreen(canvasWidth:canvasHeight:transform:)`: a nil transform, or an
+    /// invalid (non-finite or non-positive) scale — which forces that function to
+    /// fall back to the full-canvas identity rect — also forces identity rotation
+    /// here (0 degrees, centered anchor). A valid transform's `rotationDegrees` and
+    /// anchor are carried through even when the unrotated rect happens to equal the
+    /// full canvas (scale 1.0, zero offset, centered anchor), since rotation can
+    /// still be visually meaningful in that case.
+    static func foregroundRotation(transform: NativeForegroundTransform?) -> VGDuetForegroundRotation {
+        guard let t = transform else { return .identity }
+
+        let rawScale = t.scale
+        guard rawScale.isFinite && rawScale > 0.0 else { return .identity }
+
+        let rawAnchorX = t.anchorX
+        let rawAnchorY = t.anchorY
+        let anchorX = min(max(rawAnchorX.isFinite ? rawAnchorX : 0.5, 0.0), 1.0)
+        let anchorY = min(max(rawAnchorY.isFinite ? rawAnchorY : 0.5, 0.0), 1.0)
+
+        let rawRotation = t.rotationDegrees
+        let rotationDegrees = rawRotation.isFinite ? rawRotation : 0.0
+
+        return VGDuetForegroundRotation(rotationDegrees: rotationDegrees, anchorX: anchorX, anchorY: anchorY)
     }
 
     // MARK: - Map serialization helpers
@@ -189,16 +227,52 @@ enum VGDuetLayoutGeometry {
     }
 }
 
+// MARK: - VGDuetForegroundRotation
+
+/// Preview-only rotation metadata for the green-screen foreground/camera layer.
+///
+/// Carries `rotationDegrees` plus the pivot anchor (normalized, Dart/top-left
+/// space) that `VGDuetPreviewCompositor` rotates the camera layer around. This
+/// is never serialized to Dart: `VGDuetLayoutGeometry.rectToMap` and
+/// `VGDuetNativeSessionCoordinator.serializeLayoutRects` continue to emit only
+/// source/camera rect maps.
+struct VGDuetForegroundRotation {
+    let rotationDegrees: CGFloat
+    let anchorX: CGFloat
+    let anchorY: CGFloat
+
+    static let identity = VGDuetForegroundRotation(rotationDegrees: 0.0, anchorX: 0.5, anchorY: 0.5)
+}
+
 // MARK: - NativeForegroundTransform
 
 /// Parsed foreground camera-layer transform for native geometry computation.
 ///
 /// All fields are raw (pre-clamp) values from the layout config map;
 /// clamping is performed inside `VGDuetLayoutGeometry.greenScreen(canvasWidth:canvasHeight:transform:)`.
+/// `rotationDegrees` is contract data only in this slice: it defaults to `0.0`
+/// and is not applied to the axis-aligned rect returned by that function.
 struct NativeForegroundTransform {
-    let scale:   CGFloat
-    let offsetX: CGFloat
-    let offsetY: CGFloat
-    let anchorX: CGFloat
-    let anchorY: CGFloat
+    let scale:           CGFloat
+    let offsetX:         CGFloat
+    let offsetY:         CGFloat
+    let anchorX:         CGFloat
+    let anchorY:         CGFloat
+    let rotationDegrees: CGFloat
+
+    init(
+        scale:           CGFloat,
+        offsetX:         CGFloat,
+        offsetY:         CGFloat,
+        anchorX:         CGFloat,
+        anchorY:         CGFloat,
+        rotationDegrees: CGFloat = 0.0
+    ) {
+        self.scale           = scale
+        self.offsetX         = offsetX
+        self.offsetY         = offsetY
+        self.anchorX         = anchorX
+        self.anchorY         = anchorY
+        self.rotationDegrees = rotationDegrees
+    }
 }

@@ -469,25 +469,37 @@ final class VGDuetExportSession {
     /// Parses a `NativeForegroundTransform` from `layoutConfig` map.
     ///
     /// Looks for `foregroundTransform` sub-map with keys `scale`, `offset.x`,
-    /// `offset.y`, `anchor.x`, `anchor.y` — matching the Dart serialization
-    /// of `VGDuetForegroundTransform.toMap()`.
+    /// `offset.y`, `anchor.x`, `anchor.y`, `rotationDegrees` — matching the
+    /// Dart serialization of `VGDuetForegroundTransform.toMap()`. Missing or
+    /// wrong-type values default per-field (scale → 1.0, offset → 0.0,
+    /// anchor → 0.5, rotationDegrees → 0.0, matching the Dart `fromMap`
+    /// contract); non-finite or non-positive scale is left for
+    /// `VGDuetLayoutGeometry.greenScreen(canvasWidth:canvasHeight:transform:)`
+    /// to degrade to the full-canvas identity.
     private func _parseForegroundTransform(_ layoutConfigMap: [String: Any]) -> NativeForegroundTransform? {
         guard let fgMap = layoutConfigMap["foregroundTransform"] as? [String: Any] else {
             return nil
         }
-        let scale     = (fgMap["scale"] as? NSNumber)?.doubleValue ?? 1.0
-        let offsetMap = fgMap["offset"] as? [String: Any] ?? [:]
-        let anchorMap = fgMap["anchor"] as? [String: Any] ?? [:]
-        let offsetX   = (offsetMap["x"] as? NSNumber)?.doubleValue ?? 0.0
-        let offsetY   = (offsetMap["y"] as? NSNumber)?.doubleValue ?? 0.0
-        let anchorX   = (anchorMap["x"] as? NSNumber)?.doubleValue ?? 0.5
-        let anchorY   = (anchorMap["y"] as? NSNumber)?.doubleValue ?? 0.5
+        let scale      = (fgMap["scale"] as? NSNumber)?.doubleValue ?? 1.0
+        let offsetMap  = fgMap["offset"] as? [String: Any]
+        let anchorMap  = fgMap["anchor"] as? [String: Any]
+        let rawOffsetX = (offsetMap?["x"] as? NSNumber)?.doubleValue ?? Double.nan
+        let rawOffsetY = (offsetMap?["y"] as? NSNumber)?.doubleValue ?? Double.nan
+        let rawAnchorX = (anchorMap?["x"] as? NSNumber)?.doubleValue ?? Double.nan
+        let rawAnchorY = (anchorMap?["y"] as? NSNumber)?.doubleValue ?? Double.nan
+        let offsetX = rawOffsetX.isFinite ? rawOffsetX : 0.0
+        let offsetY = rawOffsetY.isFinite ? rawOffsetY : 0.0
+        let anchorX = rawAnchorX.isFinite ? rawAnchorX : 0.5
+        let anchorY = rawAnchorY.isFinite ? rawAnchorY : 0.5
+        let rawRotation = (fgMap["rotationDegrees"] as? NSNumber)?.doubleValue ?? 0.0
+        let rotationDegrees = rawRotation.isFinite ? rawRotation : 0.0
         return NativeForegroundTransform(
-            scale:   CGFloat(scale),
-            offsetX: CGFloat(offsetX),
-            offsetY: CGFloat(offsetY),
-            anchorX: CGFloat(anchorX),
-            anchorY: CGFloat(anchorY)
+            scale:           CGFloat(scale),
+            offsetX:         CGFloat(offsetX),
+            offsetY:         CGFloat(offsetY),
+            anchorX:         CGFloat(anchorX),
+            anchorY:         CGFloat(anchorY),
+            rotationDegrees: CGFloat(rotationDegrees)
         )
     }
 

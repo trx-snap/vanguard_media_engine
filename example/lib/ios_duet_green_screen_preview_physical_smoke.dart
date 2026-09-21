@@ -13,6 +13,7 @@
 //       * attach-time native layout rect for creatorOverlay was returned and matched expected geometry
 //       * startRecording activates render loop with preview compositor
 //       * green-screen preview remains active for bounded wait (5 s)
+//       * attach/update accepted a non-zero rotation transform and remained active (only when rotation proof is enabled)
 //       * layout update to safe-parity PiP rect works while active
 //       * PiP preview remains active for bounded wait (1.5 s)
 //       * stop/detach/dispose cleanup routes complete
@@ -43,6 +44,56 @@ const String kSmokePassMarker = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_PASS';
 const String kSmokeFailMarker = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_FAIL';
 const String kSmokeJsonPrefix = 'IOS_DUET_GREENSCREEN_PREVIEW_PHYSICAL_JSON:';
 
+const bool kRotationProofEnabled = bool.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_ROTATION_PROOF',
+  defaultValue: false,
+);
+
+const String _kAttachRotationRaw = String.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_ATTACH_ROTATION_DEGREES',
+  defaultValue: '0.0',
+);
+
+const String _kUpdateRotationRaw = String.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_UPDATE_ROTATION_DEGREES',
+  defaultValue: '22.5',
+);
+
+const int kRotationHoldSeconds = int.fromEnvironment(
+  'VG_IOS_DUET_GREENSCREEN_PREVIEW_ROTATION_HOLD_SECONDS',
+  defaultValue: 3,
+);
+
+double _parseRotationDegrees(String raw, double defaultValue) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return defaultValue;
+  final parsed = double.tryParse(trimmed);
+  if (parsed == null || !parsed.isFinite) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
+final double kAttachRotationDegrees = _parseRotationDegrees(
+  _kAttachRotationRaw,
+  0.0,
+);
+
+final double kUpdateRotationDegrees = _parseRotationDegrees(
+  _kUpdateRotationRaw,
+  22.5,
+);
+
+VGDuetForegroundTransform _creatorOverlayWithRotation(double rotationDegrees) {
+  final safeRotation = rotationDegrees.isFinite ? rotationDegrees : 0.0;
+  return VGDuetForegroundTransform.validated(
+    scale: VGDuetForegroundTransform.creatorOverlay.scale,
+    offset: VGDuetForegroundTransform.creatorOverlay.offset,
+    anchor: VGDuetForegroundTransform.creatorOverlay.anchor,
+    rotationDegrees: safeRotation,
+  );
+}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const IOSDuetGreenScreenPreviewPhysicalSmokeApp());
@@ -60,9 +111,13 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
     extends State<IOSDuetGreenScreenPreviewPhysicalSmokeApp> {
   final VGDuetPlatformInterface _platform = const MethodChannelVGDuetPlatform();
 
-  String _status = 'Starting green-screen smoke harness...';
+  String _status = kRotationProofEnabled
+      ? 'Starting green-screen smoke harness (rotation proof enabled)...'
+      : 'Starting green-screen smoke harness...';
   String _currentStep = 'INIT';
-  String _layoutMode = 'greenScreen';
+  String _layoutMode = kRotationProofEnabled
+      ? 'greenScreen (attach rotation: $kAttachRotationDegrees°)'
+      : 'greenScreen';
   int? _textureId;
 
   @override
@@ -97,6 +152,7 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
     String? sessionId;
     int? textureId;
     Map<String, dynamic>? creatorOverlayCameraRect;
+    Map<String, dynamic>? rotatedCameraRect;
     VGDuetCaptureResult? captureResult;
     Directory? tempDir;
     bool isDetached = false;
@@ -172,7 +228,9 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
       // Step 3: ATTACH_PREVIEW_GREENSCREEN — canvas 1080x1920 with greenScreen creatorOverlay layout
       await runStep<VGDuetPreviewTexture>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen creatorOverlay)',
+        kRotationProofEnabled
+            ? 'Attaching preview texture (1080x1920, greenScreen creatorOverlay, attach rotation: $kAttachRotationDegrees°)'
+            : 'Attaching preview texture (1080x1920, greenScreen creatorOverlay)',
         () async {
           final preview = await _withTimeout(
             _platform.attachPreviewTexture(
@@ -180,7 +238,9 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
               canvasSize: const VGDuetSize(1080, 1920),
               layoutConfig: VGDuetLayoutConfig(
                 mode: VGDuetLayoutMode.greenScreen,
-                foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
+                foregroundTransform: kRotationProofEnabled
+                    ? _creatorOverlayWithRotation(kAttachRotationDegrees)
+                    : VGDuetForegroundTransform.creatorOverlay,
               ),
             ),
             'attachPreviewTexture (greenScreen)',
@@ -210,11 +270,16 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
             );
           }
           creatorOverlayCameraRect = cameraRect.toMap();
+          if (kRotationProofEnabled) {
+            rotatedCameraRect = creatorOverlayCameraRect;
+          }
           textureId = preview.textureId;
           if (mounted) {
             setState(() {
               _textureId = preview.textureId;
-              _layoutMode = 'greenScreen';
+              _layoutMode = kRotationProofEnabled
+                  ? 'greenScreen (attach rotation: $kAttachRotationDegrees°)'
+                  : 'greenScreen';
             });
           }
           return preview;
@@ -241,6 +306,44 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           await Future<void>.delayed(const Duration(seconds: 5));
         },
       );
+
+      if (kRotationProofEnabled) {
+        // Step 5a: UPDATE_LAYOUT_ROTATION — update greenScreen creatorOverlay with update rotation degrees
+        await runStep<void>(
+          'UPDATE_LAYOUT_ROTATION',
+          'Updating layout with rotation ($kUpdateRotationDegrees°)',
+          () async {
+            final rotatedConfig = VGDuetLayoutConfig(
+              mode: VGDuetLayoutMode.greenScreen,
+              foregroundTransform: _creatorOverlayWithRotation(
+                kUpdateRotationDegrees,
+              ),
+            );
+            await _withTimeout(
+              _platform.updateLayout(
+                sessionId: sessionId!,
+                layoutConfig: rotatedConfig,
+              ),
+              'updateLayout (greenScreen rotation)',
+            );
+            if (mounted) {
+              setState(() {
+                _layoutMode =
+                    'greenScreen (update rotation: $kUpdateRotationDegrees°)';
+              });
+            }
+          },
+        );
+
+        // Step 5b: GREENSCREEN_ROTATION_ACTIVE — wait rotation hold seconds
+        await runStep<void>(
+          'GREENSCREEN_ROTATION_ACTIVE',
+          'Observing green-screen preview with rotation active (${kRotationHoldSeconds}s)',
+          () async {
+            await Future<void>.delayed(Duration(seconds: kRotationHoldSeconds));
+          },
+        );
+      }
 
       // Step 6: UPDATE_LAYOUT_PIP — safe parity rect left 0.58, top 0.05, width 0.36, height 0.24
       await runStep<void>(
@@ -407,6 +510,8 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
           'attach-time native layout rect for creatorOverlay was returned and matched expected geometry',
           'startRecording activates render loop with preview compositor',
           'green-screen preview remains active for bounded wait (5 s)',
+          if (kRotationProofEnabled)
+            'attach/update accepted a non-zero rotation transform and remained active',
           'layout update to safe-parity PiP rect works while active',
           'PiP preview remains active for bounded wait (1.5 s)',
           'stop/detach/dispose cleanup routes complete',
@@ -424,7 +529,12 @@ class _IOSDuetGreenScreenPreviewPhysicalSmokeAppState
         ],
         'sessionId': sessionId,
         'textureId': textureId,
+        'rotationProofEnabled': kRotationProofEnabled,
+        'attachRotationDegrees': kAttachRotationDegrees,
+        'updateRotationDegrees': kUpdateRotationDegrees,
+        'rotationHoldSeconds': kRotationHoldSeconds,
         'creatorOverlayCameraRect': ?creatorOverlayCameraRect,
+        'rotatedCameraRect': ?rotatedCameraRect,
         'stepResults': stepResults,
         'failures': failures,
         if (captureResult != null)
