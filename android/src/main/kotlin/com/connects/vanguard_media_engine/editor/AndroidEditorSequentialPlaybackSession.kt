@@ -492,7 +492,7 @@ class AndroidEditorSequentialPlaybackSession(
         // AndroidEditorOriginalAudioPreviewRuntime).
         val hasAudio = clipHasAudio.getOrNull(index) ?: false
         val originalGain = spec.originalAudioGain
-        val audioRuntimeEnabled = hasAudio && originalGain > 0.0f
+        val audioRuntimeEnabled = hasAudio
         val newAudio = if (audioRuntimeEnabled) AndroidEditorOriginalAudioPreviewRuntime(context, originalGain) else null
         if (newAudio != null) {
             val initialAudioPtsUs = explicitSourceSeekUs ?: spec.sourceTrimStartUs
