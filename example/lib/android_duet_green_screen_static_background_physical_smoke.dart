@@ -231,10 +231,10 @@ class _AndroidDuetGreenScreenStaticBackgroundPhysicalSmokeAppState
         },
       );
 
-      // Step 2: Initialize Duet session with source file clip_A.mov and trim 0.0 to 9.0.
+      // Step 2: Initialize Duet session with source file clip_A.mov and trim 0.0 to 2.5.
       sessionId = await runStep<String>(
         'INIT_SESSION',
-        'Initializing Duet session (trim: 0.0s - 9.0s)',
+        'Initializing Duet session (trim: 0.0s - 2.5s)',
         () async {
           final result = await _withTimeout(
             _channel.invokeMethod<String>(
@@ -243,7 +243,7 @@ class _AndroidDuetGreenScreenStaticBackgroundPhysicalSmokeAppState
                 'source': VGDuetSource.localFile(clipFile.path).toMap(),
                 'trimWindow': VGDuetTrimWindow(
                   startSeconds: 0.0,
-                  endSeconds: 9.0,
+                  endSeconds: 2.5,
                 ).toMap(),
               },
             ),
