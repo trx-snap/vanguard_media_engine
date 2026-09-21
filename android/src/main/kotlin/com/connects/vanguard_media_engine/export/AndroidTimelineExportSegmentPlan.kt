@@ -91,31 +91,39 @@ internal object AndroidTimelineExportSegmentPlanner {
         for ((index, clip) in clips.withIndex()) {
             val incoming = incomingByClip[index]
             val outgoing = outgoingByClip[index]
-            val soloStart = clip.trimStartSeconds + (incoming?.durationSeconds ?: 0.0)
-            val soloEnd = clip.trimEndSeconds - (outgoing?.durationSeconds ?: 0.0)
+            val speed = if (clip.speed > 0.0) clip.speed else 1.0
+            val incomingSourceDuration = (incoming?.durationSeconds ?: 0.0) * speed
+            val outgoingSourceDuration = (outgoing?.durationSeconds ?: 0.0) * speed
+            val soloStart = clip.trimStartSeconds + incomingSourceDuration
+            val soloEnd = clip.trimEndSeconds - outgoingSourceDuration
             if (soloEnd < soloStart - OVERLAP_EPSILON_SECONDS) {
                 return fail("transition_overlap_exceeds_clip:clip=$index")
             }
-            if (soloEnd - soloStart >= minSoloWindowSeconds) {
+            if ((soloEnd - soloStart) / speed >= minSoloWindowSeconds) {
                 segments.add(AndroidTimelineExportSegment.Solo(clip, soloStart, soloEnd))
             }
             if (outgoing != null) {
                 val toClip = clips[outgoing.toClipIndex]
+                val toSpeed = if (toClip.speed > 0.0) toClip.speed else 1.0
+                val toTransitionSourceDuration = outgoing.durationSeconds * toSpeed
                 segments.add(
                     AndroidTimelineExportSegment.Overlap(
                         transition = outgoing,
                         fromClip = clip,
-                        fromWindowStartSeconds = clip.trimEndSeconds - outgoing.durationSeconds,
+                        fromWindowStartSeconds = clip.trimEndSeconds - outgoingSourceDuration,
                         fromWindowEndSeconds = clip.trimEndSeconds,
                         toClip = toClip,
                         toWindowStartSeconds = toClip.trimStartSeconds,
-                        toWindowEndSeconds = toClip.trimStartSeconds + outgoing.durationSeconds,
+                        toWindowEndSeconds = toClip.trimStartSeconds + toTransitionSourceDuration,
                     ),
                 )
             }
         }
         val timelineSeconds = AndroidTimelineTransitionDescriptor.timelineDurationSeconds(
-            clips.map { it.trimEndSeconds - it.trimStartSeconds },
+            clips.map {
+                val speed = if (it.speed > 0.0) it.speed else 1.0
+                (it.trimEndSeconds - it.trimStartSeconds) / speed
+            },
             nonHardCutTransitions,
         )
         val expected = ceil(timelineSeconds * fps).toInt().coerceAtLeast(1)

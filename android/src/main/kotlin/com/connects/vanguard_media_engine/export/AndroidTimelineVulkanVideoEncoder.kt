@@ -21,6 +21,7 @@ import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import kotlin.math.ceil
 import kotlin.math.min
 
 // ── AndroidTimelineVulkanVideoEncoder (Vulkan-first export, pass-1) ──────────
@@ -534,6 +535,19 @@ class AndroidTimelineVulkanVideoEncoder(
             dec.start()
             decoder = dec
 
+            val clipSpeed = if (clip.speed > 0.0) clip.speed else 1.0
+            val isUnitySpeed = Math.abs(clipSpeed - 1.0) < 0.0001
+            val expectedFramesInClip = ceil(((windowEndSeconds - windowStartSeconds) / clipSpeed) * fps).toInt().coerceAtLeast(1)
+            val sourceFps = if (trackFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                try { trackFormat.getInteger(MediaFormat.KEY_FRAME_RATE) } catch (_: Throwable) { 0 }
+            } else 0
+            val nominalSourceIntervalUs = if (sourceFps in 1..240) {
+                1_000_000L / sourceFps
+            } else {
+                1_000_000L / fps
+            }
+            var nextOutputFrameIndex = 0
+
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var renderedFramesInClip = 0
@@ -567,30 +581,73 @@ class AndroidTimelineVulkanVideoEncoder(
                         // Trim window is [trimStartUs, trimEndUs) — decoded pre-roll
                         // needed for the sync seek, and any frame at/after trimEnd,
                         // must be dropped rather than rendered.
-                        val inWindow = info.presentationTimeUs >= trimStartUs &&
-                            info.presentationTimeUs < trimEndUs
-                        if (inWindow) {
-                            dec.releaseOutputBuffer(outIdx, true)
-                            val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                                ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
-                            val frameFailure = renderImageIntoSession(
-                                image,
-                                clip.rotationDegrees,
-                                sourceWidth,
-                                sourceHeight,
-                                placement,
-                                clip.colorMatrix,
-                                clip.beautyIntensity,
-                            )
-                            if (frameFailure != null) return frameFailure
-                            renderedFramesInClip++
+                        if (isUnitySpeed) {
+                            val inWindow = info.presentationTimeUs >= trimStartUs &&
+                                info.presentationTimeUs < trimEndUs
+                            if (inWindow) {
+                                dec.releaseOutputBuffer(outIdx, true)
+                                val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                                    ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
+                                val frameFailure = renderImageIntoSession(
+                                    image,
+                                    clip.rotationDegrees,
+                                    sourceWidth,
+                                    sourceHeight,
+                                    placement,
+                                    clip.colorMatrix,
+                                    clip.beautyIntensity,
+                                )
+                                if (frameFailure != null) return frameFailure
+                                renderedFramesInClip++
+                            } else {
+                                dec.releaseOutputBuffer(outIdx, false)
+                            }
                         } else {
-                            dec.releaseOutputBuffer(outIdx, false)
+                            val inWindow = info.presentationTimeUs >= trimStartUs &&
+                                info.presentationTimeUs < trimEndUs
+                            if (inWindow) {
+                                val pts = info.presentationTimeUs
+                                var repeatCount = 0
+                                while (nextOutputFrameIndex + repeatCount < expectedFramesInClip) {
+                                    val targetUs = trimStartUs + ((nextOutputFrameIndex + repeatCount) * frameDurationUs * clipSpeed).toLong()
+                                    if (targetUs < pts + nominalSourceIntervalUs) {
+                                        repeatCount++
+                                    } else {
+                                        break
+                                    }
+                                }
+                                if ((isEos || inputDone) && nextOutputFrameIndex + repeatCount < expectedFramesInClip) {
+                                    repeatCount = expectedFramesInClip - nextOutputFrameIndex
+                                }
+
+                                if (repeatCount > 0) {
+                                    dec.releaseOutputBuffer(outIdx, true)
+                                    val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                                        ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
+                                    val frameFailure = renderImageIntoSession(
+                                        image,
+                                        clip.rotationDegrees,
+                                        sourceWidth,
+                                        sourceHeight,
+                                        placement,
+                                        clip.colorMatrix,
+                                        clip.beautyIntensity,
+                                        repeatCount,
+                                    )
+                                    if (frameFailure != null) return frameFailure
+                                    renderedFramesInClip += repeatCount
+                                    nextOutputFrameIndex += repeatCount
+                                } else {
+                                    dec.releaseOutputBuffer(outIdx, false)
+                                }
+                            } else {
+                                dec.releaseOutputBuffer(outIdx, false)
+                            }
                         }
                     } else {
                         dec.releaseOutputBuffer(outIdx, false)
                     }
-                    if (isEos) break
+                    if (isEos || (!isUnitySpeed && nextOutputFrameIndex >= expectedFramesInClip)) break
                 }
                 if (cancelRequested && inputDone && outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     // Cancellation requested and no more input pending — stop waiting for
@@ -662,6 +719,7 @@ class AndroidTimelineVulkanVideoEncoder(
         placement: LayerPlacement,
         colorMatrix: FloatArray?,
         beautyIntensity: Double?,
+        repeatCount: Int = 1,
     ): String? {
         var hwBuf: HardwareBuffer? = null
         try {
@@ -683,18 +741,23 @@ class AndroidTimelineVulkanVideoEncoder(
 
             // Read the crop rect before the image (and its buffer) is closed.
             val cropRect = image.cropRect
-            return renderSoloLayer(
-                hwBuf,
-                cropRect,
-                hwBuf.width,
-                hwBuf.height,
-                rotationDegrees,
-                expectedCropWidth,
-                expectedCropHeight,
-                placement,
-                colorMatrix,
-                beautyIntensity,
-            )
+            for (r in 0 until repeatCount) {
+                if (cancelRequested) break
+                val failure = renderSoloLayer(
+                    hwBuf,
+                    cropRect,
+                    hwBuf.width,
+                    hwBuf.height,
+                    rotationDegrees,
+                    expectedCropWidth,
+                    expectedCropHeight,
+                    placement,
+                    colorMatrix,
+                    beautyIntensity,
+                )
+                if (failure != null) return failure
+            }
+            return null
         } finally {
             try { hwBuf?.close() } catch (_: Throwable) {}
             try { image.close() } catch (_: Throwable) {}

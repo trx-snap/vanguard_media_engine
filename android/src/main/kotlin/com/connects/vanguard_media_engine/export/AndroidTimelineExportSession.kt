@@ -229,6 +229,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val trimStart: Double,
         val trimEnd: Double,
         val mediaKind: String,
+        val speed: Double = 1.0,
         val colorMatrix: FloatArray? = null,
         val beautyIntensity: Double? = null,
         // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: true when this clip must be
@@ -250,6 +251,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val decodedHeight: Int,
         val rotationDegrees: Int,
         val mediaKind: String,
+        val speed: Double = 1.0,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
         val colorMatrix: FloatArray? = null,
         val beautyIntensity: Double? = null,
@@ -480,8 +482,8 @@ class AndroidTimelineExportSession(private val context: Context) {
                 return
             }
             val speed = (map["speed"] as? Number)?.toDouble() ?: 1.0
-            if (speed != 1.0) {
-                onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.speed != 1.0 is not supported")
+            if (!speed.isFinite() || speed <= 0.0) {
+                onError("INVALID_ARG", "exportTimeline: clip.speed must be finite and > 0.0 (got $speed)")
                 return
             }
             // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips are accepted
@@ -644,6 +646,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     trimStart = trimStart,
                     trimEnd = trimEnd,
                     mediaKind = mediaKind,
+                    speed = speed,
                     colorMatrix = colorMatrix,
                     beautyIntensity = beautyIntensity,
                     isReversed = isReversed,
@@ -688,7 +691,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         if (anyReversed && rawTransitions.isEmpty()) {
             if (audioSpecs.isNotEmpty()) {
                 val reverseTimelineDurationSeconds = parsedClips
-                    .sumOf { it.trimEnd - it.trimStart }
+                    .sumOf { (it.trimEnd - it.trimStart) / it.speed }
                     .coerceAtLeast(0.0)
                 when (
                     val admission = AndroidTimelineAudioOverlapAdmission.validate(
@@ -717,7 +720,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     parsedClips.map { clip ->
                         AndroidTimelineTransitionDescriptor.ClipRef(
                             id = clip.id,
-                            durationSeconds = clip.trimEnd - clip.trimStart,
+                            durationSeconds = (clip.trimEnd - clip.trimStart) / clip.speed,
                         )
                     },
                 )
@@ -744,7 +747,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             // wrong output.
             if (audioSpecs.isNotEmpty()) {
                 val overlapAdjustedDurationSeconds = AndroidTimelineTransitionDescriptor.timelineDurationSeconds(
-                    parsedClips.map { it.trimEnd - it.trimStart },
+                    parsedClips.map { (it.trimEnd - it.trimStart) / it.speed },
                     transitions,
                 )
                 when (
@@ -780,6 +783,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                         decodedHeight = imageProbe.height,
                         rotationDegrees = 0,
                         mediaKind = clip.mediaKind,
+                        speed = clip.speed,
                         exifOrientation = imageProbe.exifOrientation,
                         colorMatrix = clip.colorMatrix,
                         beautyIntensity = clip.beautyIntensity,
@@ -827,6 +831,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     decodedHeight = probe.height,
                     rotationDegrees = normalizedRotation,
                     mediaKind = clip.mediaKind,
+                    speed = clip.speed,
                     colorMatrix = clip.colorMatrix,
                     beautyIntensity = clip.beautyIntensity,
                     isReversed = clip.isReversed,
@@ -960,7 +965,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         for (ctx in clipContexts) {
             var stillFrameCount = 0
             if (ctx.mediaKind == "image") {
-                val duration = ctx.trimEndSeconds - ctx.trimStartSeconds
+                val duration = (ctx.trimEndSeconds - ctx.trimStartSeconds) / ctx.speed
                 stillFrameCount = floor(duration * requestFps + 0.5).toInt().coerceAtLeast(1)
                 if (stillFrameCount > MAX_STILL_FRAME_COUNT) {
                     deleteOwnedTemps()
@@ -1026,6 +1031,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     decodedHeight = ctx.decodedHeight,
                     rotationDegrees = ctx.rotationDegrees,
                     mediaKind = ctx.mediaKind,
+                    speed = ctx.speed,
                     stillFrameCount = stillFrameCount,
                     exifOrientation = ctx.exifOrientation,
                     colorMatrix = ctx.colorMatrix,

@@ -116,6 +116,7 @@ class AndroidTimelineVideoEncoder(
         val rotationDegrees: Int,
         val mediaKind: String = "video",
         val stillFrameCount: Int = 0,
+        val speed: Double = 1.0,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
         val colorMatrix: FloatArray? = null,
         // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A, extended by
@@ -344,7 +345,8 @@ class AndroidTimelineVideoEncoder(
             if (clip.mediaKind == "image") {
                 clip.stillFrameCount
             } else {
-                ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps).toInt().coerceAtLeast(1)
+                val speed = if (clip.speed > 0.0) clip.speed else 1.0
+                ceil(((clip.trimEndSeconds - clip.trimStartSeconds) / speed) * fps).toInt().coerceAtLeast(1)
             }
         }
         var succeeded = false
@@ -743,6 +745,19 @@ class AndroidTimelineVideoEncoder(
             }
             val trimEndUs = (clip.trimEndSeconds * 1_000_000L).toLong()
 
+            val clipSpeed = if (clip.speed > 0.0) clip.speed else 1.0
+            val isUnitySpeed = Math.abs(clipSpeed - 1.0) < 0.0001
+            val expectedFramesInClip = ceil(((clip.trimEndSeconds - clip.trimStartSeconds) / clipSpeed) * fps).toInt().coerceAtLeast(1)
+            val sourceFps = if (trackFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                try { trackFormat.getInteger(MediaFormat.KEY_FRAME_RATE) } catch (_: Throwable) { 0 }
+            } else 0
+            val nominalSourceIntervalUs = if (sourceFps in 1..240) {
+                1_000_000L / sourceFps
+            } else {
+                1_000_000L / fps
+            }
+            var nextOutputFrameIndex = 0
+
             val mime = trackFormat.getString(MediaFormat.KEY_MIME)!!
             val dec = MediaCodec.createDecoderByType(mime)
             dec.configure(trackFormat, decodeInputSurface, null, 0)
@@ -785,34 +800,91 @@ class AndroidTimelineVideoEncoder(
                         // Trim window is [trimStartUs, trimEndUs) — decoded pre-roll
                         // needed for the sync seek, and any frame at/after trimEnd,
                         // must be dropped rather than rendered.
-                        val inWindow = info.presentationTimeUs >= trimStartUs &&
-                            info.presentationTimeUs < trimEndUs
-                        if (inWindow) {
-                            dec.releaseOutputBuffer(outIdx, true)
-                            if (!awaitNewImage(FRAME_WAIT_TIMEOUT_MS)) {
-                                // Real transfer failed to arrive — report honestly, never fake success.
-                                return "frame_transfer_timeout:${clip.sourcePath}"
-                            }
-                            val drawFailure = if (clip.beautyIntensity != null) {
-                                drawAndSubmitBeautyFrame(clip.beautyIntensity)
+                        if (isUnitySpeed) {
+                            val inWindow = info.presentationTimeUs >= trimStartUs &&
+                                info.presentationTimeUs < trimEndUs
+                            if (inWindow) {
+                                dec.releaseOutputBuffer(outIdx, true)
+                                if (!awaitNewImage(FRAME_WAIT_TIMEOUT_MS)) {
+                                    // Real transfer failed to arrive — report honestly, never fake success.
+                                    return "frame_transfer_timeout:${clip.sourcePath}"
+                                }
+                                val drawFailure = if (clip.beautyIntensity != null) {
+                                    drawAndSubmitBeautyFrame(clip.beautyIntensity)
+                                } else {
+                                    drawAndSubmitFrame(clip.colorMatrix)
+                                }
+                                if (drawFailure != null) return drawFailure
+                                drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+                                renderedFramesInClip++
                             } else {
-                                drawAndSubmitFrame(clip.colorMatrix)
+                                dec.releaseOutputBuffer(outIdx, false)
                             }
-                            if (drawFailure != null) return drawFailure
-                            drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
-                            renderedFramesInClip++
                         } else {
-                            dec.releaseOutputBuffer(outIdx, false)
+                            val inWindow = info.presentationTimeUs >= trimStartUs &&
+                                info.presentationTimeUs < trimEndUs
+                            if (inWindow) {
+                                val pts = info.presentationTimeUs
+                                var repeatCount = 0
+                                while (nextOutputFrameIndex + repeatCount < expectedFramesInClip) {
+                                    val targetUs = trimStartUs + ((nextOutputFrameIndex + repeatCount) * frameDurationUs * clipSpeed).toLong()
+                                    if (targetUs < pts + nominalSourceIntervalUs) {
+                                        repeatCount++
+                                    } else {
+                                        break
+                                    }
+                                }
+                                if ((isEos || inputDone) && nextOutputFrameIndex + repeatCount < expectedFramesInClip) {
+                                    repeatCount = expectedFramesInClip - nextOutputFrameIndex
+                                }
+
+                                if (repeatCount > 0) {
+                                    dec.releaseOutputBuffer(outIdx, true)
+                                    if (!awaitNewImage(FRAME_WAIT_TIMEOUT_MS)) {
+                                        return "frame_transfer_timeout:${clip.sourcePath}"
+                                    }
+                                    for (r in 0 until repeatCount) {
+                                        if (cancelRequested) break
+                                        val drawFailure = if (clip.beautyIntensity != null) {
+                                            drawAndSubmitBeautyFrame(clip.beautyIntensity)
+                                        } else {
+                                            drawAndSubmitFrame(clip.colorMatrix)
+                                        }
+                                        if (drawFailure != null) return drawFailure
+                                        drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+                                        renderedFramesInClip++
+                                        nextOutputFrameIndex++
+                                    }
+                                } else {
+                                    dec.releaseOutputBuffer(outIdx, false)
+                                }
+                            } else {
+                                dec.releaseOutputBuffer(outIdx, false)
+                            }
                         }
                     } else {
                         dec.releaseOutputBuffer(outIdx, false)
                     }
-                    if (isEos) break
+                    if (isEos || (!isUnitySpeed && nextOutputFrameIndex >= expectedFramesInClip)) break
                 }
                 if (cancelRequested && inputDone && outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     // Cancellation requested and no more input pending — stop waiting for
                     // a decoder drain that may never come from a codec we've EOS'd.
                     break
+                }
+            }
+
+            if (!isUnitySpeed && renderedFramesInClip > 0 && nextOutputFrameIndex < expectedFramesInClip && !cancelRequested) {
+                while (nextOutputFrameIndex < expectedFramesInClip && !cancelRequested) {
+                    val drawFailure = if (clip.beautyIntensity != null) {
+                        drawAndSubmitBeautyFrame(clip.beautyIntensity)
+                    } else {
+                        drawAndSubmitFrame(clip.colorMatrix)
+                    }
+                    if (drawFailure != null) return drawFailure
+                    drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+                    renderedFramesInClip++
+                    nextOutputFrameIndex++
                 }
             }
 
