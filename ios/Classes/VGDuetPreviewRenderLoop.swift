@@ -11,8 +11,14 @@
 //   - Decoded frames are composited on a private serial render queue and
 //     presented on the main thread through the injected present handler.
 //   - Held states (initial / paused / seeked) decode one frame and stay
-//     passive until asked again.  At trimEnd the target stops changing, so the
-//     loop naturally goes quiet; it never mutates session state.
+//     passive until asked again.  While actively recording, the loop never
+//     goes quiet: once the clamped source target stops changing (e.g. at
+//     trimEnd), each tick redraws the held source frame instead of
+//     re-decoding, so live foreground (camera / green-screen) samples keep
+//     presenting fresh over the held source -- matching Android's continued
+//     live-foreground-over-held-source behavior.  It never mutates session
+//     state and never loops, seeks, or re-decodes source video once the held
+//     frame already covers the target.
 //
 // Foreground seam (Phase 4A / 4B-A):
 //   - foregroundSampleProvider returns ONE retained VGDuetForegroundSample per render
@@ -132,7 +138,11 @@ final class VGDuetPreviewRenderLoop {
         /// Decode at the request target, then composite + present if the frame
         /// (or layout, when forceRender) changed.
         case decode(VGDuetPreviewDecodeRequest, forceRender: Bool)
-        /// Composite + present the held frame with the current layout rects.
+        /// Composite + present the held frame with the current layout rects,
+        /// never touching the decoder. Used both for layout-only redraws and
+        /// for active-recording ticks whose clamped target has not moved (see
+        /// displayLinkFired), so a fresh live foreground sample still reaches
+        /// the compositor every tick even while the source frame stays held.
         case redraw
     }
 
@@ -294,8 +304,19 @@ final class VGDuetPreviewRenderLoop {
     fileprivate func displayLinkFired(_ sender: CADisplayLink) {
         guard !isStopped, isActive else { return }
         let target = clamp(targetPtsProvider())
-        // Passive when the target has not moved (e.g. clock clamped at trimEnd).
-        guard target != lastTickTargetPtsMs else { return }
+        guard target != lastTickTargetPtsMs else {
+            // Source PTS target has not moved (e.g. the clock has clamped at
+            // trimEnd). The source/background frame stays held exactly as-is --
+            // this never decodes, seeks, or otherwise touches the decoder for an
+            // unchanged target -- but an active recording must keep presenting
+            // fresh live foreground (camera / green-screen) samples over that
+            // held frame every tick, matching Android's continued live rendering
+            // once its source hold begins. Submitting .redraw (never .decode)
+            // routes straight to render(frame:), which re-samples
+            // foregroundSampleProvider on every call.
+            submit(.redraw)
+            return
+        }
         lastTickTargetPtsMs = target
         submit(.decode(.step(targetPtsMs: target), forceRender: false))
     }

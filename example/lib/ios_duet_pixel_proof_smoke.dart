@@ -7,6 +7,9 @@
 // Proves that the existing VGDuetPreviewCompositor green-screen path
 // (CIBlendWithMask) blends a synthetic camera foreground over a synthetic
 // source/background through a single-channel mask, with pixel assertions.
+// Also proves deterministic Duet straight-alpha foreground free-transform
+// rotation/off-canvas pixel behavior via a real VGDuetPreviewCompositor
+// instance (DEC-V2-123C follow-up).
 //
 // Proof boundary:
 //   ios_duet_coreimage_pixel_proof_synthetic_mask_blend_only
@@ -44,6 +47,15 @@ const List<String> kExpectedGateKeys = <String>[
   'viewportExteriorOk',
   'cleanupOk',
   'canonical',
+  // DEC-V2-123C follow-up: Duet straight-alpha foreground free-transform
+  // rotation/off-canvas rendered pixel proof lane (VGDuetPreviewCompositor,
+  // not VGLiveGreenScreenCompositor). The harness fails unless these pass
+  // alongside the CIBlendWithMask gates above.
+  'straightAlphaRotation0Ok',
+  'straightAlphaRotation90Ok',
+  'straightAlphaRgbAlphaCoTransformOk',
+  'straightAlphaOffCanvasClipOk',
+  'rotationCanonicalOk',
 ];
 
 void main() {
@@ -175,7 +187,11 @@ class _IosDuetPixelProofSmokeAppState extends State<IosDuetPixelProofSmokeApp> {
 
     if (pass) {
       print(kSmokePassMarker);
-      _updateStatus('PASS', 'Deterministic iOS Duet pixel proof passed');
+      _updateStatus(
+        'PASS',
+        'Deterministic iOS Duet pixel proof passed '
+            '(mask blend + straight-alpha rotation/off-canvas)',
+      );
     } else {
       print(kSmokeFailMarker);
       _updateStatus('FAIL', errorMessage ?? 'Proof failed');
@@ -204,6 +220,10 @@ class _IosDuetPixelProofSmokeAppState extends State<IosDuetPixelProofSmokeApp> {
                     fontWeight: FontWeight.bold,
                     color: Colors.white,
                   ),
+                ),
+                const Text(
+                  'Mask blend + straight-alpha rotation/off-canvas',
+                  style: TextStyle(color: Colors.white70, fontSize: 11),
                 ),
                 const SizedBox(height: 8),
                 Text(

@@ -41,6 +41,16 @@
 // L8 mask with the expected linear-interpolation math, using only synthetic
 // CVPixelBuffers built in-process. Diagnostic only.
 //
+// DEC-V2-123C follow-up: this file also proves deterministic Duet straight-alpha
+// foreground free-transform rotation/off-canvas pixel behavior — a SEPARATE lane
+// appended near the end of runDeterministicPixelProof() that instantiates a real
+// VGDuetPreviewCompositor directly (not VGLiveGreenScreenCompositor) and exercises its
+// cameraFrameUsesStraightAlpha: true composite() path with cameraRotationDegrees /
+// cameraAnchorX / cameraAnchorY, using only synthetic CVPixelBuffers built in-process.
+// See that lane's own header comment for the exact test pattern, sample geometry, and
+// rotation-direction derivation. The proof boundary string, PASS/FAIL markers, and every
+// gate/sample point in the CIBlendWithMask lane above stay byte-for-byte unchanged.
+//
 // Non-claims: no real camera hardware or AVCaptureSession lifecycle, no Vision/ML
 // segmentation quality, no video decoder, no MP4 export, no audio, no ConnectsApp /
 // Universal Editor / upload wiring.
@@ -77,8 +87,12 @@ extension VGDuetPreviewCompositor {
     /// in `VGLiveGreenScreenCompositor.composite(...)`. Renders synthetic BGRA source/camera
     /// buffers and an L8 mask through a real `VGLiveGreenScreenCompositor(canvasWidth: 64,
     /// canvasHeight: 64)` instance and asserts pixel values in the resulting output buffer.
-    /// Never throws; every failure mode is captured in the returned map's
-    /// `failureReason`/`mismatches` instead.
+    /// Also runs a second, independent lane (DEC-V2-123C follow-up, appended near the end
+    /// of this function) proving `VGDuetPreviewCompositor`'s own straight-alpha foreground
+    /// free-transform rotation/off-canvas rendered pixel behavior via a real
+    /// `VGDuetPreviewCompositor(canvasWidth: 64, canvasHeight: 64)` instance. Never throws;
+    /// every failure mode is captured in the returned map's `failureReason`/`mismatches`
+    /// instead.
     /// Markers: IOS_DUET_PIXEL_PROOF_START / IOS_DUET_PIXEL_PROOF_PASS / IOS_DUET_PIXEL_PROOF_FAIL.
     static func runDeterministicPixelProof() -> [String: Any] {
         NSLog("[VGDuetPreviewCompositor] \(pixelProofStartMarker)")
@@ -92,6 +106,16 @@ extension VGDuetPreviewCompositor {
             "viewportExteriorOk":    false,
             "cleanupOk":             false,
             "canonical":             false,
+            // DEC-V2-123C follow-up: Duet straight-alpha foreground
+            // free-transform rotation / off-canvas rendered pixel proof (see
+            // the dedicated lane appended below), exercising a real
+            // VGDuetPreviewCompositor instance directly instead of
+            // VGLiveGreenScreenCompositor above.
+            "straightAlphaRotation0Ok":           false,
+            "straightAlphaRotation90Ok":           false,
+            "straightAlphaRgbAlphaCoTransformOk": false,
+            "straightAlphaOffCanvasClipOk":        false,
+            "rotationCanonicalOk":                 false,
         ]
         var failureReason = ""
         var mismatches: [String] = []
@@ -329,6 +353,262 @@ extension VGDuetPreviewCompositor {
             && gates["syntheticBuffersOk"] == true
             && viewportExteriorAllOk && boundaryKeyingAllOk && fractionalAllOk
 
+        // ─────────────────────────────────────────────────────────────────
+        // 5. DEC-V2-123C follow-up: Duet straight-alpha foreground
+        //    free-transform rotation / off-canvas rendered pixel proof.
+        //
+        //    Everything above proves VGLiveGreenScreenCompositor's
+        //    CIBlendWithMask green-screen path only (see this file's header)
+        //    and is completely untouched by this lane. This lane instead
+        //    instantiates a REAL VGDuetPreviewCompositor(canvasWidth: 64,
+        //    canvasHeight: 64) and drives its cameraFrameUsesStraightAlpha:
+        //    true composite() path directly, proving the RENDERED pixel
+        //    behavior of VGDuetPreviewCompositor.rotateCameraLayer -- which
+        //    example/lib/ios_duet_green_screen_preview_physical_smoke.dart's
+        //    VG_IOS_DUET_GREENSCREEN_PREVIEW_ROTATION_PROOF lane explicitly
+        //    does NOT claim (it proves the preview stays alive across a
+        //    rotation update, not any rendered pixel/visual-placement
+        //    outcome). Synthetic CVPixelBuffers only; never touches a real
+        //    camera, decoder, AVCaptureSession, or the GreenScreen
+        //    compositor/buffers above.
+        //
+        //    Test pattern (32x32 straight-alpha BGRA "two-arm" cross, local
+        //    coordinates, quarter = width/4 = height/4 = 8px):
+        //      "right arm"  x:[24,32) y:[8,24)  -> opaque foreground colour.
+        //      "lower arm"  x:[8,24)  y:[24,32) -> opaque foreground colour.
+        //      every other pixel (both corners, the top arm, the left arm,
+        //      the centre) -> fully transparent, RGB *and* alpha zeroed,
+        //      matching the straight-alpha "transparent means rgb=0 too"
+        //      convention VGGreenScreenFilterNode's production alpha output
+        //      already guarantees. Every block is >=8px so a sample point at
+        //      a block's centre is unaffected by bilinear-resampling
+        //      interpolation at its edges (large-block-samples requirement).
+        //
+        //    cameraRect = (16,16,32,32) on the 64x64 canvas (fully on-canvas,
+        //    so ciRect(fromTopLeft:) never clips it -- aspectFill's "cover"
+        //    scale is exactly 1.0 and local (lx,ly) maps to canvas
+        //    (16+lx,16+ly) with no recentring). Four fixed sample points,
+        //    each at a block centre:
+        //      "right sample" local (28,16) -> canvas (44,32) (right-arm centre)
+        //      "lower sample" local (16,28) -> canvas (32,44) (lower-arm centre)
+        //      "left sample"  local (4,16)  -> canvas (20,32) (left-arm-band centre, transparent)
+        //      "top sample"   local (16,4)  -> canvas (32,20) (top-arm-band centre, transparent)
+        //      "corner sample" local (4,4)  -> canvas (20,20) (corner, always transparent)
+        //
+        //    Rotation math independently re-derived from rotateCameraLayer's
+        //    own transform (radians = -rotationDegrees * pi/180, applied via
+        //    CGAffineTransform(rotationAngle:) in CoreImage's Y-up space,
+        //    where positive angles are counter-clockwise): for
+        //    cameraRotationDegrees: 90.0, a point to the right of the pivot
+        //    in CI space maps to a point below the pivot (CI-Y decreases,
+        //    i.e. toward the visual bottom of the canvas), and a point below
+        //    the pivot maps to a point left of the pivot -- exactly the
+        //    "right-side arm moves to lower sample; lower arm moves to left
+        //    sample" rendered behavior already confirmed by the physical
+        //    rotation smoke run referenced above. X is never flipped between
+        //    top-left and CI space (only Y is, by ciRect(fromTopLeft:)), so
+        //    this holds in the same top-left sample coordinates used
+        //    throughout this proof.
+        var straightAlphaRotation0AllOk = true
+        var straightAlphaRotation90AllOk = true
+        var straightAlphaRgbAlphaCoTransformAllOk = true
+        var straightAlphaOffCanvasClipAllOk = true
+
+        let saBackgroundColor: (r: Int, g: Int, b: Int) = (30, 90, 200)
+        let saForegroundColor: (r: Int, g: Int, b: Int) = (240, 180, 20)
+
+        // Shared mismatch/maxDelta/sampleCount accounting with the GreenScreen
+        // lane above (same finalize() reads them), reading from an explicit
+        // `buffer` parameter instead of `sample()`'s closure-captured
+        // GreenScreen `output` above -- this lane renders three *different*
+        // output buffers (rotation 0 / rotation 90 / off-canvas), never that one.
+        func sampleInBuffer(_ buffer: CVPixelBuffer, _ label: String, x: Int, y: Int,
+                            expected: (r: Int, g: Int, b: Int), group: String) {
+            guard let pixel = readBGRAPixel(buffer, x: x, y: y) else {
+                fail("straight_alpha_sample_read_failed_\(label)")
+                switch group {
+                case "straightAlphaRotation0": straightAlphaRotation0AllOk = false
+                case "straightAlphaRotation90": straightAlphaRotation90AllOk = false
+                case "straightAlphaRgbAlphaCoTransform": straightAlphaRgbAlphaCoTransformAllOk = false
+                case "straightAlphaOffCanvasClip": straightAlphaOffCanvasClipAllOk = false
+                default: break
+                }
+                return
+            }
+            let dR = abs(pixel.r - expected.r)
+            let dG = abs(pixel.g - expected.g)
+            let dB = abs(pixel.b - expected.b)
+            let delta = max(dR, max(dG, dB))
+            maxDelta = max(maxDelta, delta)
+            sampleCount += 1
+            if delta > pixelProofTolerance {
+                mismatches.append(
+                    "label=\(label) group=\(group) loc=(\(x),\(y)) " +
+                    "actual=(\(pixel.r),\(pixel.g),\(pixel.b)) " +
+                    "expected=(\(expected.r),\(expected.g),\(expected.b)) delta=\(delta)")
+                switch group {
+                case "straightAlphaRotation0": straightAlphaRotation0AllOk = false
+                case "straightAlphaRotation90": straightAlphaRotation90AllOk = false
+                case "straightAlphaRgbAlphaCoTransform": straightAlphaRgbAlphaCoTransformAllOk = false
+                case "straightAlphaOffCanvasClip": straightAlphaOffCanvasClipAllOk = false
+                default: break
+                }
+            }
+        }
+
+        guard let saSourceBuffer = makeConstantBGRABuffer(width: 64, height: 64,
+                                                           r: saBackgroundColor.r, g: saBackgroundColor.g, b: saBackgroundColor.b),
+              let saCameraBuffer = makeStraightAlphaArmPatternBuffer(width: 32, height: 32,
+                                                                      r: saForegroundColor.r, g: saForegroundColor.g, b: saForegroundColor.b)
+        else {
+            fail("straight_alpha_synthetic_buffer_creation_failed")
+            straightAlphaRotation0AllOk = false
+            straightAlphaRotation90AllOk = false
+            straightAlphaRgbAlphaCoTransformAllOk = false
+            straightAlphaOffCanvasClipAllOk = false
+            gates["straightAlphaRotation0Ok"] = false
+            gates["straightAlphaRotation90Ok"] = false
+            gates["straightAlphaRgbAlphaCoTransformOk"] = false
+            gates["straightAlphaOffCanvasClipOk"] = false
+            gates["rotationCanonicalOk"] = false
+            return finalize()
+        }
+
+        let saCompositor = VGDuetPreviewCompositor(canvasWidth: 64, canvasHeight: 64)
+        let saSourceRect = CGRect(x: 0, y: 0, width: 64, height: 64)
+        let saCameraRect = CGRect(x: 16, y: 16, width: 32, height: 32)
+
+        details["straightAlpha"] = [
+            "background": [saBackgroundColor.r, saBackgroundColor.g, saBackgroundColor.b],
+            "foreground": [saForegroundColor.r, saForegroundColor.g, saForegroundColor.b],
+            "cameraRect": ["x": 16, "y": 16, "width": 32, "height": 32],
+            "pattern": "32x32 straight-alpha two-arm cross: right arm x:[24,32) y:[8,24) + " +
+                       "lower arm x:[8,24) y:[24,32) opaque foreground; corners/top arm/left " +
+                       "arm/centre transparent (alpha 0, rgb 0)",
+        ]
+
+        // 5a. Rotation 0 (identity): right arm at the right sample, lower arm at the
+        //     lower sample, transparent regions reveal background.
+        if let out0 = saCompositor.composite(sourceFrame: saSourceBuffer,
+                                              sourceRect: saSourceRect,
+                                              cameraRect: saCameraRect,
+                                              cameraFrame: saCameraBuffer,
+                                              cameraFrameUsesStraightAlpha: true,
+                                              cameraRotationDegrees: 0.0,
+                                              cameraAnchorX: 0.5,
+                                              cameraAnchorY: 0.5) {
+            CVPixelBufferLockBaseAddress(out0, .readOnly)
+            sampleInBuffer(out0, "sa_rot0_right_arm", x: 44, y: 32,
+                           expected: saForegroundColor, group: "straightAlphaRotation0")
+            sampleInBuffer(out0, "sa_rot0_lower_arm", x: 32, y: 44,
+                           expected: saForegroundColor, group: "straightAlphaRotation0")
+            sampleInBuffer(out0, "sa_rot0_left_transparent", x: 20, y: 32,
+                           expected: saBackgroundColor, group: "straightAlphaRotation0")
+            sampleInBuffer(out0, "sa_rot0_top_transparent", x: 32, y: 20,
+                           expected: saBackgroundColor, group: "straightAlphaRotation0")
+            sampleInBuffer(out0, "sa_rot0_corner_transparent", x: 20, y: 20,
+                           expected: saBackgroundColor, group: "straightAlphaRotation0")
+            CVPixelBufferUnlockBaseAddress(out0, .readOnly)
+        } else {
+            straightAlphaRotation0AllOk = false
+            fail("straight_alpha_rotation0_composite_returned_nil")
+        }
+
+        // 5b/5c. Rotation 90 clockwise around the rect centre anchor: the right arm's
+        //     content moves to the lower sample and the lower arm's content moves to
+        //     the left sample; the (now vacated) right/top positions read back as pure
+        //     background. The two positions whose expected alpha state FLIPPED between
+        //     rotation 0 and rotation 90 (right: opaque->transparent; left:
+        //     transparent->opaque) are re-asserted as their own
+        //     straightAlphaRgbAlphaCoTransform group: a bug that rotated alpha without
+        //     RGB (or vice versa) would produce a wrong-hue partial pixel at one of
+        //     these two positions instead of an exact background/foreground match,
+        //     proving RGB and alpha moved together through the rotation.
+        if let out90 = saCompositor.composite(sourceFrame: saSourceBuffer,
+                                               sourceRect: saSourceRect,
+                                               cameraRect: saCameraRect,
+                                               cameraFrame: saCameraBuffer,
+                                               cameraFrameUsesStraightAlpha: true,
+                                               cameraRotationDegrees: 90.0,
+                                               cameraAnchorX: 0.5,
+                                               cameraAnchorY: 0.5) {
+            CVPixelBufferLockBaseAddress(out90, .readOnly)
+            sampleInBuffer(out90, "sa_rot90_right_now_transparent", x: 44, y: 32,
+                           expected: saBackgroundColor, group: "straightAlphaRotation90")
+            sampleInBuffer(out90, "sa_rot90_lower_now_colored", x: 32, y: 44,
+                           expected: saForegroundColor, group: "straightAlphaRotation90")
+            sampleInBuffer(out90, "sa_rot90_left_now_colored", x: 20, y: 32,
+                           expected: saForegroundColor, group: "straightAlphaRotation90")
+            sampleInBuffer(out90, "sa_rot90_top_now_transparent", x: 32, y: 20,
+                           expected: saBackgroundColor, group: "straightAlphaRotation90")
+            sampleInBuffer(out90, "sa_rot90_corner_still_transparent", x: 20, y: 20,
+                           expected: saBackgroundColor, group: "straightAlphaRotation90")
+
+            sampleInBuffer(out90, "sa_co_transform_right_pure_background", x: 44, y: 32,
+                           expected: saBackgroundColor, group: "straightAlphaRgbAlphaCoTransform")
+            sampleInBuffer(out90, "sa_co_transform_left_pure_foreground", x: 20, y: 32,
+                           expected: saForegroundColor, group: "straightAlphaRgbAlphaCoTransform")
+            CVPixelBufferUnlockBaseAddress(out90, .readOnly)
+        } else {
+            straightAlphaRotation90AllOk = false
+            straightAlphaRgbAlphaCoTransformAllOk = false
+            fail("straight_alpha_rotation90_composite_returned_nil")
+        }
+
+        // 5d. Off-canvas placement: cameraRect (48,16,32,32) extends 16px past the
+        //     right edge of the 64x64 canvas (only canvas x:48-64 is on-canvas; x:64-80
+        //     is clipped). Uses a SEPARATE, spatially-uniform fully-opaque straight-alpha
+        //     foreground buffer (not the arm pattern above) specifically so this
+        //     assertion is independent of exactly how aspectFill's "cover" scale
+        //     re-centres content once ciRect(fromTopLeft:) has already clipped the
+        //     destination rect -- with a uniform fill, any in-canvas point still
+        //     geometrically inside the rendered camera layer reads the same foreground
+        //     colour regardless of that recentring, so this proves the off-canvas
+        //     placement renders and clips safely without depending on sub-pixel
+        //     aspect-fill geometry this proof does not otherwise need to model.
+        let saOffCanvasRect = CGRect(x: 48, y: 16, width: 32, height: 32)
+        if let saOffCanvasCameraBuffer = makeConstantBGRABuffer(width: 32, height: 32,
+                                                                  r: saForegroundColor.r, g: saForegroundColor.g, b: saForegroundColor.b),
+           let outOffCanvas = saCompositor.composite(sourceFrame: saSourceBuffer,
+                                                       sourceRect: saSourceRect,
+                                                       cameraRect: saOffCanvasRect,
+                                                       cameraFrame: saOffCanvasCameraBuffer,
+                                                       cameraFrameUsesStraightAlpha: true,
+                                                       cameraRotationDegrees: 0.0,
+                                                       cameraAnchorX: 0.5,
+                                                       cameraAnchorY: 0.5) {
+            CVPixelBufferLockBaseAddress(outOffCanvas, .readOnly)
+            // Well inside both cameraRect and the canvas (canvas x:48-64 visible span).
+            sampleInBuffer(outOffCanvas, "sa_offcanvas_visible_foreground", x: 56, y: 32,
+                           expected: saForegroundColor, group: "straightAlphaOffCanvasClip")
+            // Well outside cameraRect (x:48-80) entirely: untouched pure background.
+            sampleInBuffer(outOffCanvas, "sa_offcanvas_untouched_background", x: 4, y: 4,
+                           expected: saBackgroundColor, group: "straightAlphaOffCanvasClip")
+            CVPixelBufferUnlockBaseAddress(outOffCanvas, .readOnly)
+            details["straightAlphaOffCanvas"] = [
+                "cameraRect": ["x": 48, "y": 16, "width": 32, "height": 32],
+                "canvasSize": ["width": 64, "height": 64],
+                "clippedPastRightEdgePx": 16,
+            ]
+        } else {
+            straightAlphaOffCanvasClipAllOk = false
+            fail("straight_alpha_offcanvas_buffer_or_composite_failed")
+        }
+
+        gates["straightAlphaRotation0Ok"] = straightAlphaRotation0AllOk
+        gates["straightAlphaRotation90Ok"] = straightAlphaRotation90AllOk
+        gates["straightAlphaRgbAlphaCoTransformOk"] = straightAlphaRgbAlphaCoTransformAllOk
+        gates["straightAlphaOffCanvasClipOk"] = straightAlphaOffCanvasClipAllOk
+        gates["rotationCanonicalOk"] = straightAlphaRotation0AllOk
+            && straightAlphaRotation90AllOk
+            && straightAlphaRgbAlphaCoTransformAllOk
+            && straightAlphaOffCanvasClipAllOk
+
+        if !straightAlphaRotation0AllOk { fail("straight_alpha_rotation0_mismatch") }
+        if !straightAlphaRotation90AllOk { fail("straight_alpha_rotation90_mismatch") }
+        if !straightAlphaRgbAlphaCoTransformAllOk { fail("straight_alpha_rgb_alpha_co_transform_mismatch") }
+        if !straightAlphaOffCanvasClipAllOk { fail("straight_alpha_offcanvas_clip_mismatch") }
+
         return finalize()
     }
 
@@ -383,6 +663,51 @@ extension VGDuetPreviewCompositor {
             for x in 0..<width {
                 let isLeft = x < halfW
                 row[x] = isTop ? (isLeft ? tl : tr) : (isLeft ? bl : br)
+            }
+        }
+        return buffer
+    }
+
+    /// DEC-V2-123C follow-up: synthetic `width` x `height` straight-alpha BGRA
+    /// "two-arm cross" test pattern for `VGDuetPreviewCompositor`'s straight-alpha
+    /// foreground path (`cameraFrameUsesStraightAlpha: true`): a "right arm" opaque
+    /// block spanning local `x:[3/4 width, width), y:[1/4 height, 3/4 height)` and a
+    /// "lower arm" opaque block spanning local `x:[1/4 width, 3/4 width), y:[3/4
+    /// height, height)`, both in `(r, g, b, 255)`; every other pixel (both corners,
+    /// the top arm, the left arm, the centre) is fully transparent with RGB also
+    /// zeroed (`(0, 0, 0, 0)`), matching the straight-alpha "transparent means rgb=0
+    /// too" convention `VGGreenScreenFilterNode`'s production alpha output already
+    /// guarantees. Every block is a `width/4` x `height/4` (or larger) uniform region,
+    /// so a sample point at a block's centre is never affected by bilinear-resampling
+    /// interpolation at its edges.
+    private static func makeStraightAlphaArmPatternBuffer(width: Int, height: Int,
+                                                            r: Int, g: Int, b: Int) -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                          kCVPixelFormatType_32BGRA, attributes as CFDictionary, &pixelBuffer)
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let byteR = UInt8(clamping: r), byteG = UInt8(clamping: g), byteB = UInt8(clamping: b)
+        let quarterW = width / 4
+        let quarterH = height / 4
+        for y in 0..<height {
+            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
+            let inRightArmBand = y >= quarterH && y < (3 * quarterH)
+            let inLowerArmBand = y >= (3 * quarterH)
+            for x in 0..<width {
+                let isRightArm = inRightArmBand && x >= (3 * quarterW)
+                let isLowerArm = inLowerArmBand && x >= quarterW && x < (3 * quarterW)
+                let opaque = isRightArm || isLowerArm
+                row[x * 4 + 0] = opaque ? byteB : 0
+                row[x * 4 + 1] = opaque ? byteG : 0
+                row[x * 4 + 2] = opaque ? byteR : 0
+                row[x * 4 + 3] = opaque ? 255 : 0
             }
         }
         return buffer
