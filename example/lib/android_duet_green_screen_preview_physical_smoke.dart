@@ -82,6 +82,68 @@ const String kSmokeJsonPrefix =
 /// this harness goes through the typed [VGDuetPlatformInterface] as before.
 const MethodChannel _rawDuetChannel = MethodChannel('vanguard_media_engine');
 
+const String _kDefaultSourceAsset = 'assets/manual_test_clips/clip_A.mov';
+const double _kDefaultTrimEndSeconds = 2.5;
+const double _kDefaultActiveSeconds = 5.0;
+const double kTrimStartSeconds = 0.0;
+
+const String _kSourceAssetRaw = String.fromEnvironment(
+  'VG_ANDROID_DUET_GREENSCREEN_PREVIEW_SOURCE_ASSET',
+  defaultValue: _kDefaultSourceAsset,
+);
+
+const String _kTrimEndSecondsRaw = String.fromEnvironment(
+  'VG_ANDROID_DUET_GREENSCREEN_PREVIEW_TRIM_END_SECONDS',
+  defaultValue: '2.5',
+);
+
+const String _kActiveSecondsRaw = String.fromEnvironment(
+  'VG_ANDROID_DUET_GREENSCREEN_PREVIEW_ACTIVE_SECONDS',
+  defaultValue: '5.0',
+);
+
+String _parseSourceAsset(String raw, String defaultValue) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return defaultValue;
+  return trimmed;
+}
+
+double _parsePositiveSeconds(String raw, double defaultValue) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return defaultValue;
+  final parsed = double.tryParse(trimmed);
+  if (parsed == null || !parsed.isFinite || parsed <= 0.0) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
+String _assetFileName(String assetPath) {
+  final trimmed = assetPath.trim().replaceAll(r'\', '/');
+  final segments = trimmed.split('/').where((s) => s.isNotEmpty).toList();
+  if (segments.isEmpty) {
+    return 'clip_A.mov';
+  }
+  return segments.last;
+}
+
+final String kSourceAsset = _parseSourceAsset(
+  _kSourceAssetRaw,
+  _kDefaultSourceAsset,
+);
+
+final double kTrimEndSeconds = _parsePositiveSeconds(
+  _kTrimEndSecondsRaw,
+  _kDefaultTrimEndSeconds,
+);
+
+final double kGreenScreenPreviewActiveSeconds = _parsePositiveSeconds(
+  _kActiveSecondsRaw,
+  _kDefaultActiveSeconds,
+);
+
+final String kStagedSourceFileName = _assetFileName(kSourceAsset);
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const AndroidDuetGreenScreenPreviewPhysicalSmokeApp());
@@ -99,7 +161,8 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
     extends State<AndroidDuetGreenScreenPreviewPhysicalSmokeApp> {
   final VGDuetPlatformInterface _platform = const MethodChannelVGDuetPlatform();
 
-  String _status = 'Starting green-screen smoke harness...';
+  String _status =
+      'Starting green-screen smoke harness ($kStagedSourceFileName)...';
   String _currentStep = 'INIT';
   String _layoutMode = 'greenScreen';
   int? _textureId;
@@ -170,18 +233,16 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
     }
 
     try {
-      // Step 1: Stage clip_A.mov fixture from rootBundle into temp directory
+      // Step 1: Stage $kStagedSourceFileName fixture from rootBundle into temp directory
       final source = await runStep<VGDuetSource>(
         'STAGE_FIXTURE',
-        'Staging clip_A.mov into temp directory',
+        'Staging $kStagedSourceFileName into temp directory',
         () async {
           tempDir = await Directory.systemTemp.createTemp(
             'duet_greenscreen_smoke_',
           );
-          final targetFile = File('${tempDir!.path}/clip_A.mov');
-          final byteData = await rootBundle.load(
-            'assets/manual_test_clips/clip_A.mov',
-          );
+          final targetFile = File('${tempDir!.path}/$kStagedSourceFileName');
+          final byteData = await rootBundle.load(kSourceAsset);
           await targetFile.writeAsBytes(
             byteData.buffer.asUint8List(
               byteData.offsetInBytes,
@@ -196,14 +257,14 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 2: Initialize Duet session with trim window 0.0 to 2.5 seconds
+      // Step 2: Initialize Duet session with trim window ${kTrimStartSeconds}s to ${kTrimEndSeconds}s
       sessionId = await runStep<String>(
         'INIT_SESSION',
-        'Initializing Duet session (trim: 0.0s - 2.5s)',
+        'Initializing Duet session (trim: ${kTrimStartSeconds}s - ${kTrimEndSeconds}s)',
         () async {
           final trimWindow = VGDuetTrimWindow(
-            startSeconds: 0.0,
-            endSeconds: 2.5,
+            startSeconds: kTrimStartSeconds,
+            endSeconds: kTrimEndSeconds,
           );
           return await _withTimeout(
             _platform.initializeSession(source: source, trimWindow: trimWindow),
@@ -294,12 +355,16 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         },
       );
 
-      // Step 5: Wait 5.0 seconds with greenScreen preview active
+      // Step 5: Wait ${kGreenScreenPreviewActiveSeconds}s with greenScreen preview active
       await runStep<void>(
         'GREENSCREEN_PREVIEW_ACTIVE',
-        'Observing greenScreen preview active (5.0s)',
+        'Observing greenScreen preview active (${kGreenScreenPreviewActiveSeconds}s)',
         () async {
-          await Future<void>.delayed(const Duration(seconds: 5));
+          await Future<void>.delayed(
+            Duration(
+              milliseconds: (kGreenScreenPreviewActiveSeconds * 1000).round(),
+            ),
+          );
         },
       );
 
@@ -361,7 +426,9 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
             ),
             'updateLayout(splitTopBottom)',
           );
-          print('ANDROID_DUET_VULKAN_LAYOUT_SMOKE_SWITCHED mode=splitTopBottom');
+          print(
+            'ANDROID_DUET_VULKAN_LAYOUT_SMOKE_SWITCHED mode=splitTopBottom',
+          );
           if (mounted) {
             setState(() {
               _layoutMode = 'splitTopBottom (vulkan diagnostic)';
@@ -532,9 +599,18 @@ class _AndroidDuetGreenScreenPreviewPhysicalSmokeAppState
         ],
         'sessionId': sessionId,
         'textureId': textureId,
+        'sourceAsset': kSourceAsset,
+        'stagedSourceFileName': kStagedSourceFileName,
+        'trimStartSeconds': kTrimStartSeconds,
+        'trimEndSeconds': kTrimEndSeconds,
+        'greenScreenPreviewActiveSeconds': kGreenScreenPreviewActiveSeconds,
         'creatorOverlayCameraRect': ?creatorOverlayCameraRect,
         'vulkanLayoutRoute': <String, Object?>{
-          'layoutSwitchSequence': <String>['greenScreen', 'pip', 'splitTopBottom'],
+          'layoutSwitchSequence': <String>[
+            'greenScreen',
+            'pip',
+            'splitTopBottom',
+          ],
           'pipSwitchStep': stepResults['UPDATE_LAYOUT_PIP_VULKAN'],
           'pipActiveStep': stepResults['PIP_VULKAN_LAYOUT_ACTIVE'],
           'splitTopBottomSwitchStep':
