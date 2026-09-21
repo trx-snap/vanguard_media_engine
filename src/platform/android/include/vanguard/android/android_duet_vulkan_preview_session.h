@@ -120,6 +120,14 @@ public:
     // consumer/allocator allocation instead of the requested content size.
     // Pass 0 for a pair to fall back to the descriptor's own dimensions,
     // which remain fallback/diagnostic only.
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: foregroundRotationDegrees/
+    // foregroundAnchorX/foregroundAnchorY are the Duet-only user foreground
+    // free-rotation for the green-screen camera layer -- entirely independent
+    // from cameraRotationDegrees above (camera sensor/content rotation; both
+    // may be non-zero at once). Only meaningful when greenScreenEnabled is
+    // true; ignored on the opaque layout (PiP/split) path. Identity default
+    // (0.0, 0.5, 0.5) keeps this call byte-for-byte identical to before this
+    // parameter existed.
     bool RenderFrame(void* decoderBuffer,
                      void* cameraBuffer,
                      bool greenScreenEnabled,
@@ -132,7 +140,10 @@ public:
                      uint32_t sourceContentWidth = 0,
                      uint32_t sourceContentHeight = 0,
                      uint32_t cameraContentWidth = 0,
-                     uint32_t cameraContentHeight = 0);
+                     uint32_t cameraContentHeight = 0,
+                     float foregroundRotationDegrees = 0.0f,
+                     float foregroundAnchorX = 0.5f,
+                     float foregroundAnchorY = 0.5f);
 
     // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
     // only): camera-only green-screen frame over a static background. Imports
@@ -155,6 +166,8 @@ public:
     // importing anything when no surface is attached or cameraRect has a
     // non-positive size. Never retains cameraBuffer beyond this call.
     // RenderFrame above is unchanged.
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: same foreground
+    // free-rotation contract as RenderFrame above.
     bool RenderStaticBackgroundFrame(void* cameraBuffer,
                                      const AndroidDuetVulkanPreviewLayoutRect& cameraRect,
                                      uint32_t cameraRotationDegrees,
@@ -162,7 +175,10 @@ public:
                                      int32_t debugMode,
                                      int32_t backgroundMode,
                                      uint32_t cameraContentWidth = 0,
-                                     uint32_t cameraContentHeight = 0);
+                                     uint32_t cameraContentHeight = 0,
+                                     float foregroundRotationDegrees = 0.0f,
+                                     float foregroundAnchorX = 0.5f,
+                                     float foregroundAnchorY = 0.5f);
 
 private:
     struct Impl;

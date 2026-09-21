@@ -83,6 +83,37 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
             return NativeLayoutRect(clampedLeft, clampedTop, width, height)
         }
 
+        /**
+         * ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: converts a
+         * canvas-pixel [rect] (Double, top-left origin) into the integer rect
+         * handed to native for the Duet green-screen FOREGROUND camera layer,
+         * WITHOUT clamping its position to the canvas -- unlike
+         * [toNativeLayoutRect], which the PiP/split layout path still uses.
+         * The Dart free-transform contract (VGDuetLayoutMath.computeGreenScreenRects)
+         * intentionally allows the foreground rect to extend beyond or start
+         * before the canvas; native (ResolveVulkanDuetLayoutLayerPlacement)
+         * is responsible for clipping the scissor to the canvas and failing
+         * closed if nothing of the rect remains on-canvas. Still fails closed
+         * (null) when any component is non-finite or the size is not
+         * strictly positive after rounding.
+         */
+        internal fun toNativeForegroundRect(rect: VGDuetPixelRect): NativeLayoutRect? {
+            if (!rect.left.isFinite() || !rect.top.isFinite() ||
+                !rect.width.isFinite() || !rect.height.isFinite()
+            ) {
+                return null
+            }
+            if (rect.width <= 0.0 || rect.height <= 0.0) return null
+            val left = rect.left.roundToInt()
+            val top = rect.top.roundToInt()
+            val right = (rect.left + rect.width).roundToInt()
+            val bottom = (rect.top + rect.height).roundToInt()
+            val width = right - left
+            val height = bottom - top
+            if (width <= 0 || height <= 0) return null
+            return NativeLayoutRect(left, top, width, height)
+        }
+
         /** Normalizes any integer degrees to a cardinal 0/90/180/270 value; anything else maps to 0. */
         private fun normalizeRotationDegrees(degrees: Int): Int {
             return when (((degrees % 360) + 360) % 360) {
@@ -167,6 +198,17 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
     private var sourceVideoRotationDegrees = 0
     private var cameraRotationDegrees = 0
     private var cameraMirrorHorizontal = false
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: Duet-only preview
+    // foreground free-rotation metadata (mirrors AndroidDuetPreviewCompositor's
+    // GLES fields of the same name): [setForegroundRotation]'s visual-clockwise
+    // angle (Dart/top-left space) and normalized pivot anchor within the
+    // camera rect. Render-thread only. Identity default (0.0, 0.5, 0.5)
+    // applies no rotation, so callers that never invoke [setForegroundRotation]
+    // see unchanged behavior.
+    private var foregroundRotationDegrees = 0.0
+    private var foregroundAnchorX = 0.5
+    private var foregroundAnchorY = 0.5
 
     // One-shot diagnostic logs, emitted only after the corresponding native
     // call reports success for the first time (never on a false/failed call).
@@ -400,6 +442,23 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         }
         cameraRotationDegrees = normalizeRotationDegrees(rotationDegrees)
         cameraMirrorHorizontal = mirrorHorizontal
+    }
+
+    /**
+     * Duet-only preview seam: stores the green-screen foreground/camera
+     * layer's free-rotation angle and pivot anchor for the next [drawFrame].
+     * Sanitizes non-finite input to identity and clamps the anchor to
+     * `[0.0, 1.0]`, matching [AndroidDuetPreviewCompositor]'s GLES
+     * implementation of the same method exactly.
+     */
+    override fun setForegroundRotation(rotationDegrees: Double, anchorX: Double, anchorY: Double) {
+        fallbackDelegate?.let {
+            it.setForegroundRotation(rotationDegrees, anchorX, anchorY)
+            return
+        }
+        foregroundRotationDegrees = if (rotationDegrees.isFinite()) rotationDegrees else 0.0
+        foregroundAnchorX = (if (anchorX.isFinite()) anchorX else 0.5).coerceIn(0.0, 1.0)
+        foregroundAnchorY = (if (anchorY.isFinite()) anchorY else 0.5).coerceIn(0.0, 1.0)
     }
 
     override fun setGreenScreenEnabled(enabled: Boolean) {
@@ -737,7 +796,11 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         if (nativeGreenScreen) {
             val fullCanvas = NativeLayoutRect(0, 0, canvasWidth, canvasHeight)
             nativeSourceRect = sourceRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) } ?: fullCanvas
-            nativeCameraRect = cameraRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) } ?: fullCanvas
+            // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: the foreground
+            // camera rect is intentionally NOT clamped to the canvas here --
+            // see toNativeForegroundRect. Native clips the scissor to the
+            // canvas and fails closed if nothing remains on-canvas.
+            nativeCameraRect = cameraRect?.let { toNativeForegroundRect(it) } ?: fullCanvas
         } else {
             val source = sourceRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) }
             val camera = cameraRect?.let { toNativeLayoutRect(it, canvasWidth, canvasHeight) }
@@ -815,6 +878,7 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                 sourceVideoRotationDegrees, cameraRotationDegrees, cameraMirrorHorizontal,
                 decoderContentWidth, decoderContentHeight, cameraContentWidth, cameraContentHeight,
                 debugMode,
+                foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY,
             )
             if (success && greenScreen && previewFrameLoggedOnce.compareAndSet(false, true)) {
                 Log.i(
@@ -878,6 +942,7 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
                 cameraContentWidth, cameraContentHeight,
                 debugMode,
                 NATIVE_GREEN_SCREEN_STATIC_BACKGROUND_SOLID_TEAL,
+                foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY,
             )
             if (success && staticBackgroundFrameLoggedOnce.compareAndSet(false, true)) {
                 Log.i(

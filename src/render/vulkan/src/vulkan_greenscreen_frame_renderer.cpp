@@ -14,6 +14,7 @@
 
 #if defined(__ANDROID__)
 
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -48,21 +49,34 @@ void SetErr(std::string* outError, const char* reason) {
     if (outError) *outError = reason;
 }
 
-// Private 128-byte push-constant block pushed for the camera-mask draw: the
-// shared 112-byte VideoTransformFullPushConstants (vertex UV transform +
-// fragment colour matrix) plus a trailing fragment-only vec4 maskDebug
-// (debugMode, 1/maskWidth, 1/maskHeight, reserved), matching the GLSL
-// `Transform` block in glsl/greenscreen_blend.frag /
-// glsl/greenscreen_camera_mask.vert exactly.
+// Private 160-byte push-constant block pushed for the camera-mask draw: the
+// original 128-byte block -- the shared 112-byte VideoTransformFullPushConstants
+// (vertex UV transform + fragment colour matrix) plus a trailing fragment-only
+// vec4 maskDebug (debugMode, 1/maskWidth, 1/maskHeight, useRotatedQuad) -- is
+// byte-for-byte unchanged from the pre-rotation layout, with 32 trailing
+// vertex-only bytes (rotatedQuad0/rotatedQuad1: the 4 rotated NDC corners,
+// meaningful only when maskDebug[3] != 0) appended after it. Matches the GLSL
+// `Transform` block in glsl/greenscreen_camera_mask.vert exactly (the
+// fragment shader, glsl/greenscreen_blend.frag, only declares/reads the
+// original 128-byte block and is otherwise untouched).
 struct alignas(16) VulkanGreenScreenCameraMaskPushConstants {
     VideoTransformFullPushConstants transform;
     float maskDebug[4];
+    float rotatedQuad0[4];
+    float rotatedQuad1[4];
 };
 
-static_assert(sizeof(VulkanGreenScreenCameraMaskPushConstants) == 128,
-              "VulkanGreenScreenCameraMaskPushConstants must be exactly 128 bytes");
+static_assert(sizeof(VulkanGreenScreenCameraMaskPushConstants) == 160,
+              "VulkanGreenScreenCameraMaskPushConstants must be exactly 160 bytes");
 static_assert(alignof(VulkanGreenScreenCameraMaskPushConstants) == 16,
               "VulkanGreenScreenCameraMaskPushConstants must be 16-byte aligned");
+
+// ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: below this magnitude, a
+// foreground rotation is treated as identity so the unrotated fast path
+// (original fullscreen-triangle draw, byte-for-byte unchanged output) is
+// used instead of the rotated-quad path. Mirrors the GLES compositor's
+// ROTATION_EPSILON_DEGREES (AndroidDuetPreviewCompositor.kt).
+constexpr float kForegroundRotationEpsilonDegrees = 1e-4f;
 
 // Non-dispatchable Vulkan handles are exactly 8 bytes on every ABI Vulkan
 // supports (a pointer on LP64/64-bit targets, a plain uint64_t otherwise),
@@ -228,6 +242,12 @@ struct VulkanGreenScreenFrameRenderer::Impl {
 
         const VkDescriptorSetLayout setLayouts[2] = {cameraSetLayout, maskSetLayout};
 
+        // Range size covers the full 160-byte block (including the trailing
+        // vertex-only rotatedQuad0/1 bytes) even though the identity draw
+        // only pushes/uses the first 128 -- vkCmdPushConstants always pushes
+        // the whole struct below, and the vertex shader's push_constant
+        // block declares all 160 bytes, so the pipeline layout's range must
+        // cover them for both stages.
         VkPushConstantRange pushRange{};
         pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pushRange.offset     = 0;
@@ -479,18 +499,98 @@ bool VulkanGreenScreenFrameRenderer::recordCameraDraw(
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->pipeline);
 
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: identity/near-zero
+    // foreground rotation (including non-finite, treated as identity rather
+    // than failing closed) keeps the exact pre-rotation viewport / scissor /
+    // draw below, byte-for-byte. A non-identity rotation switches to a
+    // rotated 2-triangle quad: the viewport/scissor become the full canvas
+    // (the rotated quad's own geometry bounds what is rasterized instead),
+    // and the 4 camera-rect corners are rotated around the anchor pivot in
+    // canvas-pixel space, then converted to NDC. Vulkan clip space is
+    // already Y-down / top-left, matching the canvas convention used
+    // throughout this codebase, so -- unlike the GLES compositor's parity
+    // implementation -- no Y-flip is needed in this conversion.
+    const bool foregroundRotationFinite = std::isfinite(draw.foregroundRotationDegrees);
+    const bool useRotatedQuad = foregroundRotationFinite &&
+        std::fabs(draw.foregroundRotationDegrees) >= kForegroundRotationEpsilonDegrees;
+
+    float rotatedQuad0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float rotatedQuad1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (useRotatedQuad) {
+        const float rawAnchorX = draw.foregroundAnchorX;
+        const float rawAnchorY = draw.foregroundAnchorY;
+        const float anchorX = std::isfinite(rawAnchorX) ? rawAnchorX : 0.5f;
+        const float anchorY = std::isfinite(rawAnchorY) ? rawAnchorY : 0.5f;
+        const float clampedAnchorX = anchorX < 0.0f ? 0.0f : (anchorX > 1.0f ? 1.0f : anchorX);
+        const float clampedAnchorY = anchorY < 0.0f ? 0.0f : (anchorY > 1.0f ? 1.0f : anchorY);
+
+        const float rectLeft = static_cast<float>(draw.viewportX);
+        const float rectTop = static_cast<float>(draw.viewportY);
+        const float rectWidth = static_cast<float>(draw.viewportWidth);
+        const float rectHeight = static_cast<float>(draw.viewportHeight);
+        const float rectRight = rectLeft + rectWidth;
+        const float rectBottom = rectTop + rectHeight;
+
+        const float pivotX = rectLeft + clampedAnchorX * rectWidth;
+        const float pivotY = rectTop + clampedAnchorY * rectHeight;
+
+        constexpr double kPi = 3.14159265358979323846;
+        const double radians = static_cast<double>(draw.foregroundRotationDegrees) * (kPi / 180.0);
+        const float cosT = static_cast<float>(std::cos(radians));
+        const float sinT = static_cast<float>(std::sin(radians));
+
+        // Corner order matches the shader's kQuadUvBase and the identity
+        // path's fullscreen-triangle-implied logical quad corners exactly:
+        // 0 = top-left (NDC(-1,-1)), 1 = top-right (NDC(1,-1)), 2 =
+        // bottom-left (NDC(-1,1)), 3 = bottom-right (NDC(1,1)).
+        const float cornersX[4] = {rectLeft, rectRight, rectLeft, rectRight};
+        const float cornersY[4] = {rectTop, rectTop, rectBottom, rectBottom};
+
+        float ndcX[4];
+        float ndcY[4];
+        for (int i = 0; i < 4; ++i) {
+            const float dx = cornersX[i] - pivotX;
+            const float dy = cornersY[i] - pivotY;
+            const float rx = pivotX + dx * cosT - dy * sinT;
+            const float ry = pivotY + dx * sinT + dy * cosT;
+            ndcX[i] = (rx / static_cast<float>(canvasWidth)) * 2.0f - 1.0f;
+            ndcY[i] = (ry / static_cast<float>(canvasHeight)) * 2.0f - 1.0f;
+        }
+        rotatedQuad0[0] = ndcX[0];
+        rotatedQuad0[1] = ndcY[0];
+        rotatedQuad0[2] = ndcX[1];
+        rotatedQuad0[3] = ndcY[1];
+        rotatedQuad1[0] = ndcX[2];
+        rotatedQuad1[1] = ndcY[2];
+        rotatedQuad1[2] = ndcX[3];
+        rotatedQuad1[3] = ndcY[3];
+    }
+
     VkViewport viewport{};
-    viewport.x        = static_cast<float>(draw.viewportX);
-    viewport.y        = static_cast<float>(draw.viewportY);
-    viewport.width    = static_cast<float>(draw.viewportWidth);
-    viewport.height   = static_cast<float>(draw.viewportHeight);
+    if (useRotatedQuad) {
+        viewport.x      = 0.0f;
+        viewport.y      = 0.0f;
+        viewport.width  = static_cast<float>(canvasWidth);
+        viewport.height = static_cast<float>(canvasHeight);
+    } else {
+        viewport.x      = static_cast<float>(draw.viewportX);
+        viewport.y      = static_cast<float>(draw.viewportY);
+        viewport.width  = static_cast<float>(draw.viewportWidth);
+        viewport.height = static_cast<float>(draw.viewportHeight);
+    }
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 
     VkRect2D scissor{};
-    scissor.offset = {draw.scissorX, draw.scissorY};
-    scissor.extent = {draw.scissorWidth, draw.scissorHeight};
+    if (useRotatedQuad) {
+        scissor.offset = {0, 0};
+        scissor.extent = {canvasWidth, canvasHeight};
+    } else {
+        scissor.offset = {draw.scissorX, draw.scissorY};
+        scissor.extent = {draw.scissorWidth, draw.scissorHeight};
+    }
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
     const VkDescriptorSet sets[2] = {cameraSet, maskSet};
@@ -502,13 +602,15 @@ bool VulkanGreenScreenFrameRenderer::recordCameraDraw(
     pushConstants.maskDebug[0] = static_cast<float>(draw.debugMode);
     pushConstants.maskDebug[1] = 1.0f / static_cast<float>(draw.maskWidth);
     pushConstants.maskDebug[2] = 1.0f / static_cast<float>(draw.maskHeight);
-    pushConstants.maskDebug[3] = 0.0f;
+    pushConstants.maskDebug[3] = useRotatedQuad ? 1.0f : 0.0f;
+    std::memcpy(pushConstants.rotatedQuad0, rotatedQuad0, sizeof(rotatedQuad0));
+    std::memcpy(pushConstants.rotatedQuad1, rotatedQuad1, sizeof(rotatedQuad1));
 
     vkCmdPushConstants(commandBuffer, impl_->pipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, static_cast<uint32_t>(sizeof(pushConstants)), &pushConstants);
 
-    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    vkCmdDraw(commandBuffer, useRotatedQuad ? 6 : 3, 1, 0, 0);
 
     return true;
 }

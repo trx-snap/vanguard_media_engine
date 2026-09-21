@@ -178,7 +178,10 @@ bool AndroidDuetVulkanPreviewSession::RenderFrame(
     uint32_t sourceContentWidth,
     uint32_t sourceContentHeight,
     uint32_t cameraContentWidth,
-    uint32_t cameraContentHeight) {
+    uint32_t cameraContentHeight,
+    float foregroundRotationDegrees,
+    float foregroundAnchorX,
+    float foregroundAnchorY) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (!impl_->backend || !impl_->hasSurface || !decoderBuffer || !cameraBuffer) {
         return false;
@@ -254,7 +257,8 @@ bool AndroidDuetVulkanPreviewSession::RenderFrame(
             impl_->maskHandle,
             impl_->gpuMaskHandle, impl_->gpuMaskWidth, impl_->gpuMaskHeight,
             sourceRotationDegrees, /*sourceMirrorHorizontal=*/false,
-            cameraRotationDegrees, cameraMirrorHorizontal, debugMode);
+            cameraRotationDegrees, cameraMirrorHorizontal, debugMode,
+            foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY);
     } else {
         renderResult = impl_->backend->renderDuetLayoutFrame(
             decoderHandle, cameraHandle,
@@ -285,7 +289,10 @@ bool AndroidDuetVulkanPreviewSession::RenderStaticBackgroundFrame(
     int32_t debugMode,
     int32_t backgroundMode,
     uint32_t cameraContentWidth,
-    uint32_t cameraContentHeight) {
+    uint32_t cameraContentHeight,
+    float foregroundRotationDegrees,
+    float foregroundAnchorX,
+    float foregroundAnchorY) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (!impl_->backend || !impl_->hasSurface || !cameraBuffer) {
         return false;
@@ -338,7 +345,8 @@ bool AndroidDuetVulkanPreviewSession::RenderStaticBackgroundFrame(
             effectiveCameraWidth, effectiveCameraHeight,
             impl_->maskHandle,
             impl_->gpuMaskHandle, impl_->gpuMaskWidth, impl_->gpuMaskHeight,
-            cameraRotationDegrees, cameraMirrorHorizontal, debugMode, mode);
+            cameraRotationDegrees, cameraMirrorHorizontal, debugMode, mode,
+            foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY);
 
     int cameraReleaseFenceFd = -1;
     impl_->backend->releaseHardwareBuffer(cameraHandle, &cameraReleaseFenceFd);

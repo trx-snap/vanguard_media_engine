@@ -193,6 +193,17 @@ public:
     // VulkanFrameRenderer::VulkanGreenScreenMaskInfo::debugMode (0 = normal,
     // 1 = mask_direct, 2 = mask_mapped, 3 = mask_direct_mirror_x,
     // 4 = mask_direct_flip_y).
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: foregroundRotationDegrees/
+    // foregroundAnchorX/foregroundAnchorY are the Duet-only user foreground
+    // free-rotation for the camera layer -- entirely independent from
+    // cameraRotationDegrees above (camera sensor/content rotation; both may
+    // be non-zero at once). foregroundRotationDegrees is visual clockwise in
+    // canvas-pixel space, any finite value; identity default (0.0) keeps
+    // this call byte-for-byte identical to before this parameter existed.
+    // foregroundAnchorX/foregroundAnchorY are the normalized [0,1] pivot
+    // within cameraRect the rotation is applied around (default 0.5, 0.5 --
+    // centre). Forwarded verbatim to
+    // VulkanFrameRenderer::VulkanGreenScreenForegroundRotation.
     RenderFrameResult renderDuetGreenScreenFrame(HardwareBufferHandle sourceHandle,
                                                  HardwareBufferHandle cameraHandle,
                                                  const RenderDestinationRect& sourceRect,
@@ -209,7 +220,10 @@ public:
                                                  bool sourceMirrorHorizontal,
                                                  uint32_t cameraRotationDegrees,
                                                  bool cameraMirrorHorizontal,
-                                                 int32_t debugMode = 0);
+                                                 int32_t debugMode = 0,
+                                                 float foregroundRotationDegrees = 0.0f,
+                                                 float foregroundAnchorX = 0.5f,
+                                                 float foregroundAnchorY = 0.5f);
 
     // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
     // only): camera-only Duet green-screen frame over a static background.
@@ -228,6 +242,8 @@ public:
     // backgroundMode or invalid geometry fails closed with kVulkanFailure
     // before the swapchain is touched. Production renderDuetGreenScreenFrame /
     // renderDuetLayoutFrame behaviour is unchanged.
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: same foreground
+    // free-rotation contract as renderDuetGreenScreenFrame above.
     RenderFrameResult renderDuetGreenScreenStaticBackgroundFrame(
         HardwareBufferHandle cameraHandle,
         const RenderDestinationRect& cameraRect,
@@ -240,7 +256,10 @@ public:
         uint32_t cameraRotationDegrees,
         bool cameraMirrorHorizontal,
         int32_t debugMode,
-        DuetGreenScreenStaticBackgroundMode backgroundMode);
+        DuetGreenScreenStaticBackgroundMode backgroundMode,
+        float foregroundRotationDegrees = 0.0f,
+        float foregroundAnchorX = 0.5f,
+        float foregroundAnchorY = 0.5f);
 
     // ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame (PiP /
     // split, and the green-screen terminal fallback to safe PiP). The

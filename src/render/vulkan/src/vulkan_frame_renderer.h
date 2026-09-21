@@ -31,6 +31,34 @@ struct VulkanCoreShaderModules;
 // solely from the .cpp translation unit.
 struct VulkanOverlayFrameDraw;
 
+// ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: Duet-only foreground
+// free-rotation for the green-screen camera layer preview -- entirely
+// independent from VulkanFrameRenderer::DuetLayoutLayer::rotationDegrees
+// (camera sensor/content rotation, which stays in the aspect-fill UV
+// transform; both may be non-zero at once). [degrees] is visual clockwise in
+// canvas-pixel space (Dart/top-left convention), any finite value including
+// negative or beyond +-360; identity (default 0.0, or any non-finite value,
+// or any magnitude below VulkanGreenScreenFrameRenderer::recordCameraDraw's
+// small epsilon) keeps the pre-rotation axis-aligned draw exactly.
+// [anchorX]/[anchorY] are the normalized [0,1] pivot within the camera rect
+// the rotation is applied around (default 0.5, 0.5 -- rect centre);
+// out-of-range or non-finite values are clamped/defaulted defensively, never
+// fail closed.
+//
+// Deliberately declared at namespace scope rather than nested inside
+// VulkanFrameRenderer: a nested class's default member initializers cannot
+// be used to default-construct a default ARGUMENT of another member function
+// of that same enclosing class (Clang rejects this as "default member
+// initializer ... needed within definition of enclosing class ... outside of
+// member functions"), matching how VideoBeautyV2RenderParams -- used the
+// same way as a defaulted reference parameter below -- is also a namespace-
+// scope struct rather than a nested one.
+struct VulkanGreenScreenForegroundRotation {
+    float degrees = 0.0f;
+    float anchorX = 0.5f;
+    float anchorY = 0.5f;
+};
+
 class VulkanFrameRenderer {
 public:
     static constexpr uint32_t kDefaultFramesInFlight = 2;
@@ -283,6 +311,8 @@ public:
     // described on VulkanGreenScreenMaskInfo. Invalid geometry fails closed
     // with kVulkanFailure before the swapchain is touched; any later failure
     // fails closed with no partial present.
+    // [foregroundRotation] defaults to identity, so an existing caller that
+    // does not pass it observes byte-for-byte identical behavior.
     RenderFrameResult renderDuetGreenScreenFrame(
         void* queueHandle,
         VulkanSurfaceSwapchain& swapchain,
@@ -290,7 +320,9 @@ public:
         VulkanCoreShaderModules& coreShaders,
         const DuetLayoutLayer& source,
         const DuetLayoutLayer& camera,
-        const VulkanGreenScreenMaskInfo& maskInfo);
+        const VulkanGreenScreenMaskInfo& maskInfo,
+        const VulkanGreenScreenForegroundRotation& foregroundRotation =
+            VulkanGreenScreenForegroundRotation{});
 
     // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
     // only): the static, non-video background of a camera-only green-screen
@@ -326,13 +358,18 @@ public:
     // later failure fails closed with no partial present. Production
     // renderDuetGreenScreenFrame / renderDuetLayoutFrame behaviour is
     // unchanged.
+    // [foregroundRotation] defaults to identity, so an existing caller that
+    // does not pass it observes byte-for-byte identical behavior. Same
+    // contract as renderDuetGreenScreenFrame's [foregroundRotation] above.
     RenderFrameResult renderDuetGreenScreenStaticBackgroundFrame(
         void* queueHandle,
         VulkanSurfaceSwapchain& swapchain,
         VulkanHardwareBufferImports& ahbImports,
         const DuetLayoutLayer& camera,
         const VulkanGreenScreenMaskInfo& maskInfo,
-        const DuetStaticBackground& background);
+        const DuetStaticBackground& background,
+        const VulkanGreenScreenForegroundRotation& foregroundRotation =
+            VulkanGreenScreenForegroundRotation{});
 
     // ANDROID-DUET-VULKAN-LAYOUT: two-layer opaque Duet layout frame (PiP /
     // split, and the green-screen terminal fallback to safe PiP): [source]

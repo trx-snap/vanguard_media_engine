@@ -1273,6 +1273,18 @@ class VanguardNativeBridge(
         // (0 = normal, 1 = mask_direct, 2 = mask_mapped,
         // 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y); ignored on the
         // opaque layout path.
+        // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: foregroundRotationDegrees/
+        // foregroundAnchorX/foregroundAnchorY are the Duet-only user
+        // foreground free-rotation for the green-screen camera layer --
+        // entirely independent from cameraRotationDegrees above (camera
+        // sensor/content rotation; both may be non-zero at once). Only
+        // meaningful when greenScreenEnabled is true; ignored on the opaque
+        // layout path. foregroundRotationDegrees is visual clockwise in
+        // canvas-pixel space (Dart/top-left convention), any finite value;
+        // identity default (0.0) matches pre-rotation behavior.
+        // foregroundAnchorX/foregroundAnchorY are the normalized [0,1] pivot
+        // within the camera rect the rotation is applied around (default
+        // 0.5, 0.5 -- centre).
         // Returns false (with the session left intact for retry) when no
         // surface is attached, either buffer fails to import, or the render
         // itself fails; never retains either HardwareBuffer beyond the call.
@@ -1297,6 +1309,9 @@ class VanguardNativeBridge(
             cameraContentWidth: Int = 0,
             cameraContentHeight: Int = 0,
             debugMode: Int = 0,
+            foregroundRotationDegrees: Double = 0.0,
+            foregroundAnchorX: Double = 0.5,
+            foregroundAnchorY: Double = 0.5,
         ): Boolean
 
         // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic
@@ -1315,6 +1330,10 @@ class VanguardNativeBridge(
         // green-screen path selects it. The camera rect, rotation, mirror,
         // content dimensions and debugMode follow
         // renderAndroidDuetVulkanPreviewFrame's camera contract verbatim.
+        // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: foregroundRotationDegrees/
+        // foregroundAnchorX/foregroundAnchorY follow
+        // renderAndroidDuetVulkanPreviewFrame's foreground free-rotation
+        // contract verbatim.
         // Returns false (session left intact for retry) when no surface is
         // attached, the camera rect size is non-positive, the camera buffer
         // fails to import, or the render itself fails; never retains
@@ -1333,6 +1352,9 @@ class VanguardNativeBridge(
             cameraContentHeight: Int,
             debugMode: Int,
             backgroundMode: Int,
+            foregroundRotationDegrees: Double = 0.0,
+            foregroundAnchorX: Double = 0.5,
+            foregroundAnchorY: Double = 0.5,
         ): Boolean
 
         // ── P5-ANDROID-DUET-GPU-TEXTURE-BRIDGE (lifecycle skeleton) ──

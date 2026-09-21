@@ -258,7 +258,10 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(
     bool /*sourceMirrorHorizontal*/,
     uint32_t /*cameraRotationDegrees*/,
     bool /*cameraMirrorHorizontal*/,
-    int32_t /*debugMode*/) {
+    int32_t /*debugMode*/,
+    float /*foregroundRotationDegrees*/,
+    float /*foregroundAnchorX*/,
+    float /*foregroundAnchorY*/) {
     return RenderFrameResult::kUnavailable;
 }
 
@@ -279,7 +282,10 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenStaticBackgroundFrame(
     uint32_t /*cameraRotationDegrees*/,
     bool /*cameraMirrorHorizontal*/,
     int32_t /*debugMode*/,
-    DuetGreenScreenStaticBackgroundMode /*backgroundMode*/) {
+    DuetGreenScreenStaticBackgroundMode /*backgroundMode*/,
+    float /*foregroundRotationDegrees*/,
+    float /*foregroundAnchorX*/,
+    float /*foregroundAnchorY*/) {
     return RenderFrameResult::kUnavailable;
 }
 
@@ -1369,7 +1375,10 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle
                                                             bool sourceMirrorHorizontal,
                                                             uint32_t cameraRotationDegrees,
                                                             bool cameraMirrorHorizontal,
-                                                            int32_t debugMode) {
+                                                            int32_t debugMode,
+                                                            float foregroundRotationDegrees,
+                                                            float foregroundAnchorX,
+                                                            float foregroundAnchorY) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -1436,6 +1445,11 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle
     camera.rotationDegrees = cameraRotationDegrees;
     camera.mirrorHorizontal = cameraMirrorHorizontal;
 
+    VulkanGreenScreenForegroundRotation foregroundRotation;
+    foregroundRotation.degrees = foregroundRotationDegrees;
+    foregroundRotation.anchorX = foregroundAnchorX;
+    foregroundRotation.anchorY = foregroundAnchorY;
+
     return s.frameRenderer->renderDuetGreenScreenFrame(
         static_cast<void*>(s.queue),
         *s.surfaceSwapchain,
@@ -1443,7 +1457,8 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenFrame(HardwareBufferHandle
         *s.coreShaders,
         source,
         camera,
-        maskInfo);
+        maskInfo,
+        foregroundRotation);
 }
 
 // ANDROID-DUET-VULKAN-GREENSCREEN-STATIC-BACKGROUND (RND diagnostic only):
@@ -1465,7 +1480,10 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenStaticBackgroundFrame(
     uint32_t cameraRotationDegrees,
     bool cameraMirrorHorizontal,
     int32_t debugMode,
-    DuetGreenScreenStaticBackgroundMode backgroundMode) {
+    DuetGreenScreenStaticBackgroundMode backgroundMode,
+    float foregroundRotationDegrees,
+    float foregroundAnchorX,
+    float foregroundAnchorY) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -1532,13 +1550,19 @@ RenderFrameResult VulkanBackend::renderDuetGreenScreenStaticBackgroundFrame(
     camera.rotationDegrees = cameraRotationDegrees;
     camera.mirrorHorizontal = cameraMirrorHorizontal;
 
+    VulkanGreenScreenForegroundRotation foregroundRotation;
+    foregroundRotation.degrees = foregroundRotationDegrees;
+    foregroundRotation.anchorX = foregroundAnchorX;
+    foregroundRotation.anchorY = foregroundAnchorY;
+
     return s.frameRenderer->renderDuetGreenScreenStaticBackgroundFrame(
         static_cast<void*>(s.queue),
         *s.surfaceSwapchain,
         *s.ahbImports,
         camera,
         maskInfo,
-        background);
+        background,
+        foregroundRotation);
 }
 
 // ---------------------------------------------------------------------------

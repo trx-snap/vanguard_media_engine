@@ -34,12 +34,25 @@
 //     with -DVANGUARD_DUET_CAMERA_MASK=1). The vertex shader emits both the
 //     transformed camera UV (location 0) and the raw camera-rect UV
 //     (location 1) the fragment stage samples the mask with.
-//   * Fullscreen triangle, no vertex input. Dynamic viewport = the camera
-//     rect (may start before / extend beyond the canvas), dynamic scissor =
-//     the rect clipped to the canvas -- the same viewport / scissor / UV
-//     crop contract AppendVulkanDuetLayoutLayer records for the layout
-//     path's camera layer, so the caller resolves both through
-//     ResolveVulkanDuetLayoutLayerPlacement (single source of truth).
+//   * Identity / near-identity foreground rotation (the default; see
+//     VulkanGreenScreenCameraDraw::foregroundRotationDegrees): fullscreen
+//     triangle, no vertex input, byte-for-byte the pre-rotation draw.
+//     Dynamic viewport = the camera rect (may start before / extend beyond
+//     the canvas), dynamic scissor = the rect clipped to the canvas -- the
+//     same viewport / scissor / UV crop contract AppendVulkanDuetLayoutLayer
+//     records for the layout path's camera layer, so the caller resolves
+//     both through ResolveVulkanDuetLayoutLayerPlacement (single source of
+//     truth).
+//   * ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: non-identity foreground
+//     rotation switches to a 2-triangle (6-vertex) quad built from 4 NDC
+//     corners this helper computes by rotating the camera rect's corners in
+//     canvas-pixel space around (foregroundAnchorX, foregroundAnchorY)'s
+//     pivot, converting each to NDC (Vulkan clip space is already Y-down /
+//     top-left, matching the canvas convention -- no Y-flip, unlike GLES).
+//     Dynamic viewport / scissor become the FULL canvas in this case (like
+//     the GLES rotated path's glViewport(0,0,w,h) + scissor disabled): the
+//     rotated quad's own geometry -- not the viewport/scissor rect -- bounds
+//     what is rasterized, since a rotated rect is not axis-aligned.
 //   * Pipeline layout:
 //       set 0: the camera import's OWN descriptor set layout (binding 0,
 //              COMBINED_IMAGE_SAMPLER, the import's immutable external-format
@@ -47,11 +60,13 @@
 //              never created or destroyed here;
 //       set 1: this helper's mask set layout (binding 0,
 //              COMBINED_IMAGE_SAMPLER, fragment stage, mutable sampler);
-//       one VERTEX|FRAGMENT push-constant range of 128 bytes: the shared
-//       112-byte VideoTransformFullPushConstants block (matching the shared
-//       import pipeline layouts; see vulkan_descriptor_resources.h) plus a
-//       trailing fragment-only vec4 maskDebug (debugMode, 1/maskWidth,
-//       1/maskHeight, reserved).
+//       one VERTEX|FRAGMENT push-constant range of 160 bytes: the original
+//       128-byte block (112-byte VideoTransformFullPushConstants, matching
+//       the shared import pipeline layouts, plus the fragment-only vec4
+//       maskDebug: debugMode, 1/maskWidth, 1/maskHeight, useRotatedQuad) is
+//       byte-for-byte unchanged, with a trailing 32 vertex-only bytes
+//       (rotatedQuad0/rotatedQuad1, the 4 rotated NDC corners) appended after
+//       it, always pushed but meaningful only on the rotated-quad path.
 //   * Straight-alpha blend over the destination: colour SRC_ALPHA /
 //     ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA, RGBA write mask.
 //   * The mask is bound with this helper's own LINEAR / CLAMP_TO_EDGE sampler
@@ -62,8 +77,13 @@
 //   * VideoTransformFullPushConstants pushed verbatim from the caller
 //     (aspect-fill crop + colour matrix resolved by the placement helper);
 //     the fragment stage samples the mask at the same cropped UV as the
-//     camera texel (see the shader for the mask-orientation caveat).
-//   * vkCmdDraw(3, 1, 0, 0).
+//     camera texel (see the shader for the mask-orientation caveat). This is
+//     the camera's SENSOR/CONTENT rotation and is completely independent of
+//     the foreground free-transform rotation above; both may be non-zero at
+//     once (e.g. a 90-degree front-camera sensor correction while the user
+//     free-rotates the foreground layer 37 degrees).
+//   * vkCmdDraw(3, 1, 0, 0) on the identity path; vkCmdDraw(6, 1, 0, 0) on
+//     the rotated-quad path.
 //
 // Caching / lifecycle:
 //   * Cached until shutdown(): shader modules, mask descriptor set layout,
@@ -151,6 +171,26 @@ struct VulkanGreenScreenCameraDraw {
 
     // Aspect-fill crop UV mapping + colour matrix, pushed verbatim.
     VideoTransformFullPushConstants pushConstants{};
+
+    // ANDROID-DUET-VULKAN-GREENSCREEN-FREE-TRANSFORM: Duet-only user
+    // foreground free-rotation for the green-screen camera layer preview --
+    // entirely independent from any camera sensor/content rotation baked
+    // into [pushConstants]'s UV transform (see DuetLayoutLayer::rotationDegrees
+    // in vulkan_frame_renderer.h). [foregroundRotationDegrees] is visual
+    // clockwise in canvas-pixel space (Dart/top-left convention), any finite
+    // value including negative or beyond +-360; identity (default 0.0, or
+    // any value whose magnitude is below recordCameraDraw's small epsilon)
+    // keeps the pre-existing axis-aligned fullscreen-triangle draw exactly,
+    // byte-for-byte. [foregroundAnchorX]/[foregroundAnchorY] are the
+    // normalized [0,1] pivot within the camera rect (viewportX/Y/Width/Height
+    // above, BEFORE any aspect-fill inflation -- Vulkan's aspect-fill crop is
+    // UV-only, so the rect above already is the true un-inflated camera
+    // rect) the rotation is applied around; default (0.5, 0.5) is the rect
+    // centre. Out-of-range or non-finite anchor values are clamped/defaulted
+    // defensively inside recordCameraDraw, never fail closed.
+    float foregroundRotationDegrees = 0.0f;
+    float foregroundAnchorX = 0.5f;
+    float foregroundAnchorY = 0.5f;
 };
 
 class VulkanGreenScreenFrameRenderer {

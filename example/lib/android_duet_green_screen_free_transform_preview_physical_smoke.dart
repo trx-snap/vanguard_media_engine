@@ -2,7 +2,7 @@
 // android_duet_green_screen_free_transform_preview_physical_smoke.dart
 //
 // Standalone physical smoke harness for Android Duet green-screen live preview
-// free-transform contract verification.
+// free-transform contract verification on the opt-in Vulkan diagnostic backend route.
 //
 // Proof boundary:
 //   - Device requirement: Android physical device with camera permission available.
@@ -11,24 +11,31 @@
 //       flutter run -d <deviceId> -t lib/android_duet_green_screen_free_transform_preview_physical_smoke.dart
 //   - Claims allowed:
 //       * local source session init from staged clip_A.mov fixture
-//       * attach-time greenScreen layout accepts and preserves the v2 free foregroundTransform
-//         (scale > 1.0, non-zero offset, centered anchor, non-zero rotationDegrees, partial off-canvas)
+//       * the harness requests Vulkan diagnostic backend while exercising Duet greenScreen
+//         v2 foregroundTransform rotation/off-canvas placement
+//         (first transform: scale 1.35, offset -0.65/0.25, anchor 0.5/0.5, rotationDegrees 90.0;
+//          second transform: scale 0.55, offset 0.85/-0.35, anchor 0.25/0.75, rotationDegrees -35.0)
 //       * native attach-time layout rect for camera matches VGDuetLayoutMath.computeGreenScreenRects
 //         geometry within 0.5px tolerance
 //       * preview texture attach success with 1080x1920 canvas
-//       * diagnostic keys debugGreenScreenBackgroundMode=solid_teal and
-//         debugGreenScreenView=camera_passthrough passed to stabilize visual observation
+//       * diagnostic keys debugGreenScreenBackgroundMode=solid_teal,
+//         debugGreenScreenView=camera_passthrough, and debugPreviewBackend=vulkan passed to
+//         stabilize visual observation and request Vulkan diagnostic preview backend
 //       * startRecording activates preview render loop and camera
 //       * bounded initial free-transform observation window (~2s) executes cleanly
-//       * mid-session updateLayout accepts second free transform (scale < 1.0, non-zero offset,
-//         off-center anchor, negative rotationDegrees)
+//       * mid-session updateLayout accepts second free transform with debugPreviewBackend=vulkan
 //       * bounded updated free-transform observation window (~2s) executes cleanly
 //       * stop recording, detach preview, dispose session, and temp directory cleanup complete
 //   - Non-claims:
+//       * Dart alone does not prove native backend selection; actual Vulkan selection must be
+//         verified from device/native logs such as backend-selected/Vulkan-first-frame markers
+//         during the physical run (e.g. ANDROID_DUET_PREVIEW_BACKEND_SELECTED,
+//         ANDROID_DUET_VULKAN_PREVIEW_FRAME_FIRST). If the native Vulkan capability probe fails,
+//         fallback to GLES is expected behavior, not a harness defect.
 //       * no automated pixel rotation verification (actual GPU-rendered rotated camera
 //         pixels are not measured or read back; visual confirmation on physical display)
 //       * no matte quality or segmentation boundary accuracy proof
-//       * no MediaPipe GPU delegate or promotion proof (production GLES pipeline exercised)
+//       * no MediaPipe GPU delegate or promotion proof
 //       * no offline export or audio mixing proof
 //       * no low-end / multi-device performance proof
 
@@ -54,8 +61,8 @@ const String kObserveTickMarker =
     'ANDROID_DUET_GREENSCREEN_FREE_TRANSFORM_OBSERVE_TICK';
 
 /// Raw channel used for attach and updateLayout so layoutConfig can carry
-/// diagnostic keys (`debugGreenScreenBackgroundMode`, `debugGreenScreenView`)
-/// not exposed on the typed [VGDuetLayoutConfig] model.
+/// diagnostic keys (`debugGreenScreenBackgroundMode`, `debugGreenScreenView`,
+/// `debugPreviewBackend`) not exposed on the typed [VGDuetLayoutConfig] model.
 const MethodChannel _rawDuetChannel = MethodChannel('vanguard_media_engine');
 
 /// Canvas size for preview attachment (standard 9:16 vertical video).
@@ -244,10 +251,10 @@ class _AndroidDuetGreenScreenFreeTransformPreviewPhysicalSmokeAppState
       );
 
       // Step 3: Attach preview texture with canvas 1080x1920, greenScreen layout,
-      // first free foregroundTransform, and diagnostic keys (solid_teal, camera_passthrough).
+      // first free foregroundTransform, and diagnostic keys (solid_teal, camera_passthrough, debugPreviewBackend=vulkan).
       await runStep<VGDuetPreviewTexture>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen, freeTransform v2, solid_teal, camera_passthrough)',
+        'Attaching preview texture (1080x1920, greenScreen, freeTransform v2, solid_teal, camera_passthrough, debugPreviewBackend=vulkan)',
         () async {
           final rawResult = await _withTimeout(
             _rawDuetChannel.invokeMethod<Map>(
@@ -266,6 +273,7 @@ class _AndroidDuetGreenScreenFreeTransformPreviewPhysicalSmokeAppState
                       ).toMap(),
                   'debugGreenScreenBackgroundMode': 'solid_teal',
                   'debugGreenScreenView': 'camera_passthrough',
+                  'debugPreviewBackend': 'vulkan',
                 },
               },
             ),
@@ -374,10 +382,10 @@ class _AndroidDuetGreenScreenFreeTransformPreviewPhysicalSmokeAppState
       );
 
       // Step 6: Update layout to second free transform:
-      // scale 0.55, offset {x:0.85, y:-0.35}, anchor {x:0.25, y:0.75}, rotationDegrees -35.0
+      // scale 0.55, offset {x:0.85, y:-0.35}, anchor {x:0.25, y:0.75}, rotationDegrees -35.0, debugPreviewBackend: vulkan
       await runStep<void>(
         'UPDATE_LAYOUT_SECOND_TRANSFORM',
-        'Updating layout to second free transform (scale=0.55, offset=(0.85,-0.35), anchor=(0.25,0.75), rot=-35°)',
+        'Updating layout to second free transform (scale=0.55, offset=(0.85,-0.35), anchor=(0.25,0.75), rot=-35°, debugPreviewBackend=vulkan)',
         () async {
           await _withTimeout(
             _rawDuetChannel.invokeMethod<void>(
@@ -395,6 +403,7 @@ class _AndroidDuetGreenScreenFreeTransformPreviewPhysicalSmokeAppState
                       ).toMap(),
                   'debugGreenScreenBackgroundMode': 'solid_teal',
                   'debugGreenScreenView': 'camera_passthrough',
+                  'debugPreviewBackend': 'vulkan',
                 },
               },
             ),
@@ -587,6 +596,7 @@ class _AndroidDuetGreenScreenFreeTransformPreviewPhysicalSmokeAppState
         'cleanupOk': cleanupOk,
         'claimsAllowed': <String>[
           'local source session init from staged clip_A.mov fixture in temp directory',
+          'the harness requests Vulkan diagnostic backend while exercising Duet greenScreen v2 foregroundTransform rotation/off-canvas placement',
           'attach-time greenScreen layout accepts and preserves v2 free foregroundTransform '
               '(scale 1.35 > 1.0, non-zero offset {-0.65, 0.25}, centered anchor {0.5, 0.5}, '
               'rotationDegrees 90.0, partial off-canvas placement)',
@@ -594,20 +604,23 @@ class _AndroidDuetGreenScreenFreeTransformPreviewPhysicalSmokeAppState
               'geometry within 0.5px tolerance',
           'preview texture attach success (1080x1920 canvas)',
           'diagnostic layoutConfig keys (debugGreenScreenBackgroundMode=solid_teal, '
-              'debugGreenScreenView=camera_passthrough) accepted and forwarded to preview render loop',
+              'debugGreenScreenView=camera_passthrough, debugPreviewBackend=vulkan) accepted and forwarded to preview render loop',
           'startRecording activates preview render loop and camera',
           'bounded initial free-transform observation window (~2s) executes cleanly',
           'mid-session updateLayout accepts second free transform (scale 0.55 < 1.0, '
-              'offset {0.85, -0.35}, off-center anchor {0.25, 0.75}, rotationDegrees -35.0)',
+              'offset {0.85, -0.35}, off-center anchor {0.25, 0.75}, rotationDegrees -35.0) '
+              'with debugPreviewBackend=vulkan',
           'bounded updated free-transform observation window (~2s) executes cleanly',
           'clean stopRecording, detachPreviewTexture, disposeSession, and temp directory cleanup',
         ],
         'nonClaims': <String>[
+          'Dart alone does not prove native backend selection; actual Vulkan selection must be verified '
+              'from device/native logs such as backend-selected/Vulkan-first-frame markers during the physical run',
           'no automated pixel rotation verification: actual on-screen or GPU-rendered pixel rotation '
               'is not read back or numerically measured by this harness; requires visual confirmation '
               'on physical device display',
           'no matte quality or edge accuracy proof: live segmentation mask quality is not measured',
-          'no MediaPipe GPU delegate proof: default production GLES compositor path is exercised',
+          'no MediaPipe GPU delegate proof',
           'no offline export or audio mixing proof',
           'no low-end or multi-device performance proof',
         ],

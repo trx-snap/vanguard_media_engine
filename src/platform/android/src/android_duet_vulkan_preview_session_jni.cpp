@@ -124,7 +124,8 @@ namespace {
         jint sourceRotationDegrees, jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
         jint sourceContentWidth, jint sourceContentHeight,
         jint cameraContentWidth, jint cameraContentHeight,
-        jint debugMode) {
+        jint debugMode,
+        jdouble foregroundRotationDegrees, jdouble foregroundAnchorX, jdouble foregroundAnchorY) {
         if (!decoderHardwareBuffer || !cameraHardwareBuffer) {
             return JNI_FALSE;
         }
@@ -174,7 +175,9 @@ namespace {
             static_cast<uint32_t>(sourceRotationDegrees), static_cast<uint32_t>(cameraRotationDegrees),
             cameraMirrorHorizontal == JNI_TRUE, static_cast<int32_t>(debugMode),
             safeSourceContentWidth, safeSourceContentHeight,
-            safeCameraContentWidth, safeCameraContentHeight);
+            safeCameraContentWidth, safeCameraContentHeight,
+            static_cast<float>(foregroundRotationDegrees), static_cast<float>(foregroundAnchorX),
+            static_cast<float>(foregroundAnchorY));
         return ok ? JNI_TRUE : JNI_FALSE;
     }
 
@@ -190,7 +193,8 @@ namespace {
         jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
         jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
         jint cameraContentWidth, jint cameraContentHeight,
-        jint debugMode, jint backgroundMode) {
+        jint debugMode, jint backgroundMode,
+        jdouble foregroundRotationDegrees, jdouble foregroundAnchorX, jdouble foregroundAnchorY) {
         if (!cameraHardwareBuffer || cameraWidth <= 0 || cameraHeight <= 0) {
             return JNI_FALSE;
         }
@@ -221,7 +225,9 @@ namespace {
             static_cast<uint32_t>(cameraRotationDegrees),
             cameraMirrorHorizontal == JNI_TRUE,
             static_cast<int32_t>(debugMode), static_cast<int32_t>(backgroundMode),
-            safeCameraContentWidth, safeCameraContentHeight);
+            safeCameraContentWidth, safeCameraContentHeight,
+            static_cast<float>(foregroundRotationDegrees), static_cast<float>(foregroundAnchorX),
+            static_cast<float>(foregroundAnchorY));
         return ok ? JNI_TRUE : JNI_FALSE;
     }
 
@@ -329,7 +335,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     jint sourceRotationDegrees, jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
     jint sourceContentWidth, jint sourceContentHeight,
     jint cameraContentWidth, jint cameraContentHeight,
-    jint debugMode) {
+    jint debugMode,
+    jdouble foregroundRotationDegrees, jdouble foregroundAnchorX, jdouble foregroundAnchorY) {
     return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer,
                            greenScreenEnabled,
                            sourceX, sourceY, sourceWidth, sourceHeight,
@@ -337,7 +344,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
                            sourceRotationDegrees, cameraRotationDegrees, cameraMirrorHorizontal,
                            sourceContentWidth, sourceContentHeight,
                            cameraContentWidth, cameraContentHeight,
-                           debugMode);
+                           debugMode,
+                           foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -346,12 +354,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
     jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
     jint cameraContentWidth, jint cameraContentHeight,
-    jint debugMode, jint backgroundMode) {
+    jint debugMode, jint backgroundMode,
+    jdouble foregroundRotationDegrees, jdouble foregroundAnchorX, jdouble foregroundAnchorY) {
     return RenderStaticBackgroundFrameImpl(env, handle, cameraHardwareBuffer,
                                            cameraX, cameraY, cameraWidth, cameraHeight,
                                            cameraRotationDegrees, cameraMirrorHorizontal,
                                            cameraContentWidth, cameraContentHeight,
-                                           debugMode, backgroundMode);
+                                           debugMode, backgroundMode,
+                                           foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +413,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint sourceRotationDegrees, jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
     jint sourceContentWidth, jint sourceContentHeight,
     jint cameraContentWidth, jint cameraContentHeight,
-    jint debugMode) {
+    jint debugMode,
+    jdouble foregroundRotationDegrees, jdouble foregroundAnchorX, jdouble foregroundAnchorY) {
     return RenderFrameImpl(env, handle, decoderHardwareBuffer, cameraHardwareBuffer,
                            greenScreenEnabled,
                            sourceX, sourceY, sourceWidth, sourceHeight,
@@ -411,7 +422,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
                            sourceRotationDegrees, cameraRotationDegrees, cameraMirrorHorizontal,
                            sourceContentWidth, sourceContentHeight,
                            cameraContentWidth, cameraContentHeight,
-                           debugMode);
+                           debugMode,
+                           foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -420,10 +432,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint cameraX, jint cameraY, jint cameraWidth, jint cameraHeight,
     jint cameraRotationDegrees, jboolean cameraMirrorHorizontal,
     jint cameraContentWidth, jint cameraContentHeight,
-    jint debugMode, jint backgroundMode) {
+    jint debugMode, jint backgroundMode,
+    jdouble foregroundRotationDegrees, jdouble foregroundAnchorX, jdouble foregroundAnchorY) {
     return RenderStaticBackgroundFrameImpl(env, handle, cameraHardwareBuffer,
                                            cameraX, cameraY, cameraWidth, cameraHeight,
                                            cameraRotationDegrees, cameraMirrorHorizontal,
                                            cameraContentWidth, cameraContentHeight,
-                                           debugMode, backgroundMode);
+                                           debugMode, backgroundMode,
+                                           foregroundRotationDegrees, foregroundAnchorX, foregroundAnchorY);
 }

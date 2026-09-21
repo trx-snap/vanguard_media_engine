@@ -3021,7 +3021,8 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     VulkanCoreShaderModules& coreShaders,
     const DuetLayoutLayer& source,
     const DuetLayoutLayer& camera,
-    const VulkanGreenScreenMaskInfo& maskInfo) {
+    const VulkanGreenScreenMaskInfo& maskInfo,
+    const VulkanGreenScreenForegroundRotation& foregroundRotation) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -3256,6 +3257,9 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     cameraDraw.scissorWidth = cameraPlacement.scissor.width();
     cameraDraw.scissorHeight = cameraPlacement.scissor.height();
     cameraDraw.pushConstants = cameraPlacement.pushConstants;
+    cameraDraw.foregroundRotationDegrees = foregroundRotation.degrees;
+    cameraDraw.foregroundAnchorX = foregroundRotation.anchorX;
+    cameraDraw.foregroundAnchorY = foregroundRotation.anchorY;
     std::string failureReason;
     if (!s.greenScreenRenderer->recordCameraDraw(
             s.device, frame->commandBuffer, renderPassHandle,
@@ -3474,7 +3478,8 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenStaticBackgroundFram
     VulkanHardwareBufferImports& ahbImports,
     const DuetLayoutLayer& camera,
     const VulkanGreenScreenMaskInfo& maskInfo,
-    const DuetStaticBackground& background) {
+    const DuetStaticBackground& background,
+    const VulkanGreenScreenForegroundRotation& foregroundRotation) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -3668,6 +3673,9 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenStaticBackgroundFram
     cameraDraw.scissorWidth = cameraPlacement.scissor.width();
     cameraDraw.scissorHeight = cameraPlacement.scissor.height();
     cameraDraw.pushConstants = cameraPlacement.pushConstants;
+    cameraDraw.foregroundRotationDegrees = foregroundRotation.degrees;
+    cameraDraw.foregroundAnchorX = foregroundRotation.anchorX;
+    cameraDraw.foregroundAnchorY = foregroundRotation.anchorY;
     std::string failureReason;
     if (!s.greenScreenRenderer->recordCameraDraw(
             s.device, frame->commandBuffer, renderPassHandle,
@@ -4357,7 +4365,8 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenFrame(
     VulkanCoreShaderModules& /*coreShaders*/,
     const DuetLayoutLayer& source,
     const DuetLayoutLayer& camera,
-    const VulkanGreenScreenMaskInfo& maskInfo) {
+    const VulkanGreenScreenMaskInfo& maskInfo,
+    const VulkanGreenScreenForegroundRotation& /*foregroundRotation*/) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -4384,7 +4393,8 @@ RenderFrameResult VulkanFrameRenderer::renderDuetGreenScreenStaticBackgroundFram
     VulkanHardwareBufferImports& ahbImports,
     const DuetLayoutLayer& camera,
     const VulkanGreenScreenMaskInfo& maskInfo,
-    const DuetStaticBackground& background) {
+    const DuetStaticBackground& background,
+    const VulkanGreenScreenForegroundRotation& /*foregroundRotation*/) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
