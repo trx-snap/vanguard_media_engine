@@ -69,8 +69,10 @@ data class AndroidEditorAddedAudioTrackConfig(
  */
 class AndroidEditorAddedAudioPreviewRuntime(
     private val context: Context?,
-    private val config: AndroidEditorAddedAudioTrackConfig,
+    private var config: AndroidEditorAddedAudioTrackConfig,
 ) {
+    val trackId: String get() = config.trackId
+
     companion object {
         private const val TAG = "EditorAddedAudioPreview"
         private const val LOG_PREFIX = "VG_EDITOR_ADDED_AUDIO_PREVIEW"
@@ -471,6 +473,23 @@ class AndroidEditorAddedAudioPreviewRuntime(
             Log.i(TAG, "$LOG_PREFIX release_done trackId=${config.trackId} role=${config.role}")
             onDone?.invoke()
             try { audioThread.quitSafely() } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Updates the mix gain for this added-audio track live.
+     *
+     * [gain] is clamped to `[0.0, 1.0]`. The updated mix gain is stored in [config]
+     * and immediately applied to the active [MediaPlayer] via [applyVolumeLocked].
+     */
+    fun setMixGain(gain: Float) {
+        val clamped = gain.coerceIn(0.0f, 1.0f)
+        audioHandler.post {
+            config = config.copy(mixGain = clamped)
+            val mp = player
+            if (mp != null && enabled) {
+                applyVolumeLocked(mp, currentTimelinePtsUs)
+            }
         }
     }
 

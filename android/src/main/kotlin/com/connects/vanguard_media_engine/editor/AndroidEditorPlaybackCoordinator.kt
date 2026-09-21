@@ -66,6 +66,7 @@ class AndroidEditorPlaybackCoordinator(
             "timelinePause",
             "timelineSeek",
             "disposeTimeline",
+            "timeline_setAudioMixGain",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -112,6 +113,7 @@ class AndroidEditorPlaybackCoordinator(
             "timelinePause" -> timelinePause(result)
             "timelineSeek" -> timelineSeek(args, result)
             "disposeTimeline" -> disposeTimeline(result)
+            "timeline_setAudioMixGain" -> timelineSetAudioMixGain(args, result)
             else -> return false
         }
         return true
@@ -928,6 +930,61 @@ class AndroidEditorPlaybackCoordinator(
     /** Best-effort idempotent cleanup for plugin detach. */
     fun disposeAll() {
         disposeActiveSession {}
+    }
+
+    // ── timeline_setAudioMixGain ──────────────────────────────────────────
+
+    private fun timelineSetAudioMixGain(args: Map<*, *>?, result: MethodChannel.Result) {
+        val rawTextureId = args?.get("textureId")
+        if (rawTextureId == null) {
+            result.error("INVALID_ARG", "timeline_setAudioMixGain: missing textureId", null)
+            return
+        }
+        val requestedTextureId = (rawTextureId as? Number)?.toLong()
+        if (requestedTextureId == null || requestedTextureId < 0L) {
+            result.error("INVALID_ARG", "timeline_setAudioMixGain: textureId must be non-negative integer", null)
+            return
+        }
+
+        val trackId = args["trackId"] as? String
+        if (trackId.isNullOrEmpty()) {
+            result.error("INVALID_ARG", "timeline_setAudioMixGain: missing or empty trackId", null)
+            return
+        }
+
+        val gainNum = args["gain"] as? Number
+        if (gainNum == null) {
+            result.error("INVALID_ARG", "timeline_setAudioMixGain: gain must be a number", null)
+            return
+        }
+        val gain = gainNum.toDouble().coerceIn(0.0, 1.0).toFloat()
+
+        synchronized(lock) {
+            val currentActive = active
+            if (currentActive == null || currentActive.textureId != requestedTextureId) {
+                result.error(
+                    "STALE_TIMELINE",
+                    "timeline_setAudioMixGain: textureId $requestedTextureId is not an active timeline session",
+                    null,
+                )
+                return
+            }
+
+            if (trackId.startsWith("original-")) {
+                val clipId = trackId.removePrefix("original-")
+                currentActive.session.setOriginalTrackGain(clipId, gain)
+            } else if (trackId == "original") {
+                currentActive.session.setAllOriginalTracksGain(gain)
+            } else {
+                val matchingRuntime = currentActive.addedAudioRuntimes.firstOrNull { it.trackId == trackId }
+                if (matchingRuntime != null) {
+                    matchingRuntime.setMixGain(gain)
+                } else {
+                    Log.w(TAG, "timeline_setAudioMixGain: trackId $trackId not found in addedAudioRuntimes")
+                }
+            }
+        }
+        result.success(null)
     }
 
     // ── Phase 10-C-3N: read-only accessor for AndroidTimelineLiveControlCoordinator ──

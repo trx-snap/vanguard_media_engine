@@ -57,7 +57,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
     }
 
     /** Clamped preview volume applied to the [MediaPlayer] on prepare (see [gain] doc above). */
-    private val volumeGain: Float = if (gain.isFinite()) gain.coerceIn(0.0f, 1.0f) else 1.0f
+    private var volumeGain: Float = if (gain.isFinite()) gain.coerceIn(0.0f, 1.0f) else 1.0f
 
     private val audioThread = HandlerThread("EditorOrigAudioPreview").also { it.start() }
     private val audioHandler = Handler(audioThread.looper)
@@ -263,6 +263,28 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                 Log.w(TAG, "seek: MediaPlayer.seekTo failed", t)
                 disableLocked(mp, "seek_error")
                 finish()
+            }
+        }
+    }
+
+    // ── volume ────────────────────────────────────────────────────────────
+
+    /**
+     * Updates preview volume gain live. Clamped to [0.0, 1.0].
+     */
+    fun setVolumeGain(gain: Float) {
+        val clamped = if (gain.isFinite()) gain.coerceIn(0.0f, 1.0f) else 1.0f
+        audioHandler.post {
+            if (released.get()) return@post
+            volumeGain = clamped
+            val mp = player
+            if (mp != null && enabled) {
+                try {
+                    mp.setVolume(clamped, clamped)
+                    Log.i(TAG, "$LOG_PREFIX set_volume_success gain=$clamped")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "$LOG_PREFIX set_volume_error gain=$clamped", t)
+                }
             }
         }
     }

@@ -642,6 +642,39 @@ class AndroidEditorSequentialPlaybackSession(
         }
     }
 
+    /**
+     * Updates original audio gain for [clipId] live.
+     *
+     * [gain] is clamped to `[0.0, 1.0]`. Updates [effectiveClipSpecs] so subsequent
+     * clip activations retain the updated gain, and immediately updates the active
+     * [AndroidEditorOriginalAudioPreviewRuntime] if [clipId] is currently active.
+     */
+    fun setOriginalTrackGain(clipId: String, gain: Float) {
+        val clamped = gain.coerceIn(0.0f, 1.0f)
+        orchHandler?.post {
+            effectiveClipSpecs = effectiveClipSpecs.map { spec ->
+                if (spec.clipId == clipId) spec.copy(originalAudioGain = clamped) else spec
+            }
+            val activeIndex = activeClipIndex
+            if (activeIndex in effectiveClipSpecs.indices && effectiveClipSpecs[activeIndex].clipId == clipId) {
+                activeAudioRuntime?.setVolumeGain(clamped)
+            }
+        }
+    }
+
+    /**
+     * Updates original audio gain across all clips live.
+     */
+    fun setAllOriginalTracksGain(gain: Float) {
+        val clamped = gain.coerceIn(0.0f, 1.0f)
+        orchHandler?.post {
+            effectiveClipSpecs = effectiveClipSpecs.map { spec ->
+                spec.copy(originalAudioGain = clamped)
+            }
+            activeAudioRuntime?.setVolumeGain(clamped)
+        }
+    }
+
     // ── dispose ────────────────────────────────────────────────────────────
 
     /**
