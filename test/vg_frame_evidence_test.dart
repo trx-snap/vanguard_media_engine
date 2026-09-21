@@ -401,4 +401,63 @@ void _runFaceScanEvidenceTests() {
           reason: 'FC8: channel must NOT be called for a missing file');
     },
   );
+
+  // ── FC9 — Android MediaPipe FaceDetector payload passes through intact ────
+  test(
+    'FC9 — Android MediaPipe FaceDetector response is forwarded and schema-valid',
+    () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        return <Object?, Object?>{
+          'frameWidth':           1080,
+          'frameHeight':          1920,
+          'method':               'MediaPipeTasksVisionFaceDetector',
+          'frameExtractionMethod':'MediaMetadataRetriever',
+          'visionOrientation':    'up',
+          'coordinateSpace':      'displayTopLeftNormalizedAndPixels',
+          'faceCount':            1,
+          'faces': [
+            {
+              'index':            0,
+              'visionX':          0.30,
+              'visionY':          0.20,
+              'visionWidth':      0.40,
+              'visionHeight':     0.35,
+              'normalizedX':      0.30,
+              'normalizedY':      0.20,
+              'normalizedWidth':  0.40,
+              'normalizedHeight': 0.35,
+              'pixelX':           324.0,
+              'pixelY':           384.0,
+              'pixelWidth':       432.0,
+              'pixelHeight':      672.0,
+              'clamped':          false,
+              'confidence':       0.92,
+            }
+          ],
+          'requestedTimeSeconds': 0.0,
+          'actualTimeSeconds':    0.0,
+        };
+      });
+
+      final tmp = await _createTempVideo();
+      try {
+        final result =
+            await VanguardMediaPreparer.extractImportedFaceScanEvidence(
+          videoPath: tmp,
+        );
+        expect(result, isNotNull, reason: 'FC9: Android native map is returned');
+        expect(result!['method'], equals('MediaPipeTasksVisionFaceDetector'));
+        expect(result['frameExtractionMethod'], equals('MediaMetadataRetriever'));
+        expect(result['faceCount'], equals(1));
+        final faces = result['faces'] as List?;
+        expect(faces?.length, equals(1));
+        final face = faces![0] as Map;
+        expect(face['confidence'], equals(0.92));
+      } finally {
+        await _deleteTempVideo(tmp);
+      }
+    },
+  );
 }
+

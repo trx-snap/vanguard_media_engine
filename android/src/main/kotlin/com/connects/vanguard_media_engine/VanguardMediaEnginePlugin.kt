@@ -2557,15 +2557,22 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 }.start()
             }
 
-            // ROI-5C.1 Android stub — blocked until ROI-5B Android smoke passes.
-            // Android face detection is NOT implemented in this slice.
-            // Returns UNSUPPORTED_PLATFORM so Dart can handle it gracefully.
+            // ROI-5C.1 Android face scan evidence via MediaPipe Tasks Vision FaceDetector.
             "extractImportedFaceScanEvidence" -> {
-                result.error(
-                    "UNSUPPORTED_PLATFORM",
-                    "ROI-5C Android face scan evidence is blocked until " +
-                        "ROI-5B Android smoke passes",
-                    null,
+                val videoPath = args?.get("videoPath") as? String
+                if (videoPath.isNullOrEmpty()) {
+                    result.error(
+                        "INVALID_ARG",
+                        "extractImportedFaceScanEvidence: videoPath required",
+                        null,
+                    )
+                    return
+                }
+                com.connects.vanguard_media_engine.roi.AndroidFaceScanEvidenceExtractor.extract(
+                    context = context,
+                    videoPath = videoPath,
+                    mainHandler = mainHandler,
+                    result = result,
                 )
             }
 
@@ -4010,6 +4017,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: shutdown background executor.
         greenScreenExportApiPixelProofSmokeCoordinator?.disposeAll()
         greenScreenExportApiPixelProofSmokeCoordinator = null
+        // Android Face Scan Evidence Extractor: release persistent warm MediaPipe FaceDetector
+        com.connects.vanguard_media_engine.roi.AndroidFaceScanEvidenceExtractor.release()
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

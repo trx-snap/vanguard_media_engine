@@ -380,6 +380,61 @@ void main() {
       expect(report.diagnostics['hasAudioSidecarPlan'], isTrue);
     });
 
+    test('draft with unmodified original audio sidecar plan is eligible', () {
+      final clip = makePlainVideoClip(id: 'clip-1', sourcePath: '/data/source.mp4');
+      final draft = makeDraft(
+        singleClip: clip,
+        audioSidecarPlan: VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'original-clip-1',
+              url: '/data/source.mp4',
+              startTime: 0.0,
+              duration: 10.0,
+              sourceTrimStartSeconds: 0.0,
+              role: 'original',
+              volume: 1.0,
+              fadeInSeconds: 0.0,
+              fadeOutSeconds: 0.0,
+            ),
+          ],
+        ),
+      );
+      final report = evaluator.evaluate(draft: draft);
+
+      expect(report.decision, VGPassthroughRemuxDecision.eligible);
+      expect(report.issues, isEmpty);
+      expect(report.diagnostics['hasAudioSidecarPlan'], isTrue);
+    });
+
+    test('draft with modified original audio volume is ineligible', () {
+      final clip = makePlainVideoClip(id: 'clip-1', sourcePath: '/data/source.mp4');
+      final draft = makeDraft(
+        singleClip: clip,
+        audioSidecarPlan: VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'original-clip-1',
+              url: '/data/source.mp4',
+              startTime: 0.0,
+              duration: 10.0,
+              role: 'original',
+              volume: 0.5, // modified volume requires re-encode/mix
+            ),
+          ],
+        ),
+      );
+      final report = evaluator.evaluate(draft: draft);
+
+      expect(report.decision, VGPassthroughRemuxDecision.ineligible);
+      expect(
+        report.issues.any(
+          (i) => i.code == VGPassthroughRemuxIssueCode.audioSidecarPlanPresent,
+        ),
+        isTrue,
+      );
+    });
+
     test('non-video media kind is ineligible', () {
       final imageClip = makePlainVideoClip(
         id: 'img-1',

@@ -463,30 +463,26 @@ class VanguardMediaPreparer {
 
   // ── extractImportedFaceScanEvidence ───────────────────────────────────────
 
-  /// ROI-5C.1 — Diagnostic method for imported face scan evidence (iOS only).
+  /// ROI-5C.1 — Diagnostic method for imported face scan evidence.
   ///
-  /// Extracts one display-oriented frame from [videoPath] using
-  /// [AVAssetImageGenerator] with `appliesPreferredTrackTransform = true`
-  /// (same path as [extractDisplayOrientedFrameEvidence]) and then runs
-  /// Apple Vision [VNDetectFaceRectanglesRequest] on that display-oriented
-  /// frame with orientation `.up`.
+  /// Extracts one display-oriented frame from [videoPath] (via AVAssetImageGenerator
+  /// with `appliesPreferredTrackTransform = true` on iOS, or MediaMetadataRetriever
+  /// with rotation normalization on Android) and then runs face detection
+  /// (Apple Vision VNDetectFaceRectanglesRequest on iOS, Google MediaPipe Tasks Vision
+  /// FaceDetector with blaze_face_short_range.tflite on Android).
   ///
   /// Returns face bounding boxes in three coordinate spaces per face:
-  /// - Vision raw (bottom-left normalized origin, Vision convention)
-  /// - Top-left normalized: `normalizedY = 1.0 - visionY - visionHeight`
+  /// - Vision / detector raw coordinates
+  /// - Top-left normalized: `[0.0, 1.0]` matching display orientation
   /// - Display pixel: `normalizedX * frameWidth`, `normalizedY * frameHeight`
   ///
   /// **This method is diagnostic only.** It does not generate ROI sidecars,
   /// write files, perform landmarks, or alter any export/capture path.
-  ///
-  /// **Android is not supported** for this slice — Android ROI-5C is blocked
-  /// until Android ROI-5B frame-extraction physical smoke passes. On Android,
-  /// the native side returns a [PlatformException] with code
-  /// `UNSUPPORTED_PLATFORM`, which is caught here and returned as null.
+  /// Downstream builders (e.g. `VGImportedROISidecarBuilder`) consume this evidence.
   ///
   /// Returns null if:
   /// - The file does not exist or is empty.
-  /// - Native frame extraction or Vision detection fails.
+  /// - Native frame extraction or face detection fails.
   ///
   /// Expected returned map keys:
   /// - `frameWidth` (int): display-oriented frame pixel width
