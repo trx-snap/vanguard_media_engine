@@ -239,19 +239,10 @@ class AndroidEditorPlaybackCoordinator(
             }
 
             // Timing/trim fields are unconditionally present in VGClipDescriptor.toMap()
-            // (see vg_clip_descriptor.dart:604-614). speed != 1.0 is rejected here because
-            // speed audio/video parity is not part of this slice.
+            // (see vg_clip_descriptor.dart:604-614). speed must be finite and positive.
             val speed = (clip["speed"] as? Number)?.toDouble()
-            if (speed == null || !speed.isFinite()) {
-                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a missing or non-finite speed", null)
-                return
-            }
-            if (speed != 1.0) {
-                result.error(
-                    "UNSUPPORTED_TIMELINE_FEATURE",
-                    "clip \"${clip["id"]}\" uses speed=$speed, which is not supported in this slice",
-                    null,
-                )
+            if (speed == null || !speed.isFinite() || speed <= 0.0) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a missing, non-finite, or non-positive speed", null)
                 return
             }
 
@@ -295,9 +286,14 @@ class AndroidEditorPlaybackCoordinator(
 
             val sourceTrimStartUs = (trimStartSeconds * 1_000_000.0).toLong()
             val sourceTrimEndUs = (trimEndSeconds * 1_000_000.0).toLong()
-            val timelineDurationUs = sourceTrimEndUs - sourceTrimStartUs
-            if (timelineDurationUs <= 0L) {
+            val sourceTrimDurationUs = sourceTrimEndUs - sourceTrimStartUs
+            if (sourceTrimDurationUs <= 0L) {
                 result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a non-positive trim duration", null)
+                return
+            }
+            val timelineDurationUs = (sourceTrimDurationUs / speed).toLong()
+            if (timelineDurationUs <= 0L) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a non-positive timeline duration", null)
                 return
             }
 
@@ -323,6 +319,7 @@ class AndroidEditorPlaybackCoordinator(
                     sourceTrimStartUs = sourceTrimStartUs,
                     sourceTrimEndUs = sourceTrimEndUs,
                     timelineDurationUs = timelineDurationUs,
+                    speed = speed,
                 ),
             )
             cursorUs += timelineDurationUs

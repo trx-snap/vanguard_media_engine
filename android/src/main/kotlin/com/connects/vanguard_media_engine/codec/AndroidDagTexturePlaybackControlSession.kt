@@ -63,6 +63,7 @@ class AndroidDagTexturePlaybackControlSession(
      * [prepare] (source inspection reports `content_uri_requires_context`).
      */
     private val context: Context? = null,
+    private val playbackSpeed: Double = 1.0,
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
@@ -209,8 +210,8 @@ class AndroidDagTexturePlaybackControlSession(
     private var choreographer: Choreographer? = null
     private var activeFrameCallback: Choreographer.FrameCallback? = null
 
-    /** Paces rendered frames by media PTS at 1.0x instead of one source frame per vsync. */
-    private val timelineClock = AndroidDagTimelineClock()
+    /** Paces rendered frames by media PTS at [playbackSpeed] instead of one source frame per vsync. */
+    private val timelineClock = AndroidDagTimelineClock(initialPlaybackSpeed = playbackSpeed)
     private var pendingPlayCallback: ((Map<String, Any?>) -> Unit)? = null
     private var targetFrameCount: Int? = null
 

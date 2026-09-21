@@ -39,6 +39,7 @@ data class AndroidEditorClipPlaybackSpec(
     val sourceTrimEndUs: Long,
     val timelineDurationUs: Long,
     val originalAudioGain: Float = 1.0f,
+    val speed: Double = 1.0,
 )
 
 /**
@@ -236,9 +237,10 @@ class AndroidEditorSequentialPlaybackSession(
                         Log.i(TAG, "$LOG_PREFIX trim_end_clamped path=${spec.sourcePath} " +
                             "originalTrimEndUs=${spec.sourceTrimEndUs} clampedTrimEndUs=$clampedTrimEndUs " +
                             "sourceDurationUs=${inspection.durationUs} deltaUs=${spec.sourceTrimEndUs - inspection.durationUs}")
+                        val effectiveSpeed = if (spec.speed > 0.0) spec.speed else 1.0
                         normalizedSpec = spec.copy(
                             sourceTrimEndUs = clampedTrimEndUs,
-                            timelineDurationUs = clampedTrimEndUs - spec.sourceTrimStartUs,
+                            timelineDurationUs = ((clampedTrimEndUs - spec.sourceTrimStartUs) / effectiveSpeed).toLong(),
                         )
                     }
                     Log.i(TAG, "$LOG_PREFIX clip_inspect_result index=${normalizedSpecs.size} hasAudio=${inspection.hasAudio} durationUs=${inspection.durationUs}")
@@ -400,7 +402,9 @@ class AndroidEditorSequentialPlaybackSession(
      * past this clip's trim end.
      */
     private fun mapGlobalToSourcePts(globalPtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long {
-        val sourcePtsUs = spec.sourceTrimStartUs + (globalPtsUs - spec.timelineStartUs)
+        val speed = if (spec.speed > 0.0) spec.speed else 1.0
+        val sourceOffsetUs = ((globalPtsUs - spec.timelineStartUs) * speed).toLong()
+        val sourcePtsUs = spec.sourceTrimStartUs + sourceOffsetUs
         val maxSourceUs = (spec.sourceTrimEndUs - 1L).coerceAtLeast(spec.sourceTrimStartUs)
         return sourcePtsUs.coerceIn(spec.sourceTrimStartUs, maxSourceUs)
     }
@@ -409,8 +413,11 @@ class AndroidEditorSequentialPlaybackSession(
      * Maps a source-local PTS back to the global timeline PTS for [spec], unclamped — used only
      * for translating diagnostic seek-result fields, not for gating what is ever rendered.
      */
-    private fun sourceToGlobalPtsRaw(sourcePtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long =
-        spec.timelineStartUs + (sourcePtsUs - spec.sourceTrimStartUs)
+    private fun sourceToGlobalPtsRaw(sourcePtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long {
+        val speed = if (spec.speed > 0.0) spec.speed else 1.0
+        val timelineOffsetUs = ((sourcePtsUs - spec.sourceTrimStartUs) / speed).toLong()
+        return spec.timelineStartUs + timelineOffsetUs
+    }
 
     /**
      * Maps a source-local PTS back to the global timeline PTS for [spec], clamped into this
@@ -493,7 +500,7 @@ class AndroidEditorSequentialPlaybackSession(
         val hasAudio = clipHasAudio.getOrNull(index) ?: false
         val originalGain = spec.originalAudioGain
         val audioRuntimeEnabled = hasAudio
-        val newAudio = if (audioRuntimeEnabled) AndroidEditorOriginalAudioPreviewRuntime(context, originalGain) else null
+        val newAudio = if (audioRuntimeEnabled) AndroidEditorOriginalAudioPreviewRuntime(context, originalGain, spec.speed.toFloat()) else null
         if (newAudio != null) {
             val initialAudioPtsUs = explicitSourceSeekUs ?: spec.sourceTrimStartUs
             Log.i(TAG, "$LOG_PREFIX activate_clip_audio_decision index=$index clipId=${spec.clipId} hasAudio=true " +
@@ -549,6 +556,7 @@ class AndroidEditorSequentialPlaybackSession(
                 }
             },
             context = context,
+            playbackSpeed = spec.speed,
         )
 
         activeSession = newSession

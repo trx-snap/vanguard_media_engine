@@ -2,6 +2,7 @@ package com.connects.vanguard_media_engine.editor
 
 import android.content.Context
 import android.media.MediaPlayer
+import android.media.PlaybackParams
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -50,6 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class AndroidEditorOriginalAudioPreviewRuntime(
     private val context: Context?,
     gain: Float = 1.0f,
+    speed: Float = 1.0f,
 ) {
     companion object {
         private const val TAG = "EditorOrigAudioPreview"
@@ -58,6 +60,9 @@ class AndroidEditorOriginalAudioPreviewRuntime(
 
     /** Clamped preview volume applied to the [MediaPlayer] on prepare (see [gain] doc above). */
     private var volumeGain: Float = if (gain.isFinite()) gain.coerceIn(0.0f, 1.0f) else 1.0f
+
+    /** Playback speed applied to [MediaPlayer.playbackParams]. Defaults to 1.0x. */
+    private var playbackSpeed: Float = if (speed.isFinite() && speed > 0.0f) speed else 1.0f
 
     private val audioThread = HandlerThread("EditorOrigAudioPreview").also { it.start() }
     private val audioHandler = Handler(audioThread.looper)
@@ -135,6 +140,11 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                     } catch (t: Throwable) {
                         Log.w(TAG, "$LOG_PREFIX prepared_set_volume_error gain=$volumeGain", t)
                     }
+                    applyPlaybackSpeedLocked(mp)
+                    if (playbackSpeed != 1.0f) {
+                        // setPlaybackParams on a prepared player can start playback; keep paused until play()
+                        try { mp.pause() } catch (_: Throwable) {}
+                    }
                     val targetMs = (initialSourcePtsUs / 1000L)
                         .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
                     Log.i(TAG, "$LOG_PREFIX prepared durationMs=${mp.duration} targetMs=$targetMs gain=$volumeGain enabled=$enabled")
@@ -182,8 +192,9 @@ class AndroidEditorOriginalAudioPreviewRuntime(
             requestFocusLocked()
             Log.i(TAG, "$LOG_PREFIX play_start hasFocusBefore=$hasFocusBefore hasFocusAfter=$hasFocus")
             try {
+                applyPlaybackSpeedLocked(mp)
                 mp.start()
-                Log.i(TAG, "$LOG_PREFIX play_started isPlaying=${mp.isPlaying} currentPositionMs=${mp.currentPosition}")
+                Log.i(TAG, "$LOG_PREFIX play_started isPlaying=${mp.isPlaying} currentPositionMs=${mp.currentPosition} speed=$playbackSpeed")
             } catch (t: Throwable) {
                 Log.w(TAG, "$LOG_PREFIX play_start_error", t)
                 disableLocked(mp, "play_start_error")
@@ -249,8 +260,9 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                     if (resumeAfterSeek) {
                         requestFocusLocked()
                         try {
+                            applyPlaybackSpeedLocked(mp)
                             mp.start()
-                            Log.i(TAG, "$LOG_PREFIX seek_resume_started")
+                            Log.i(TAG, "$LOG_PREFIX seek_resume_started speed=$playbackSpeed")
                         } catch (t: Throwable) {
                             Log.w(TAG, "$LOG_PREFIX seek_resume_error", t)
                             disableLocked(mp, "seek_resume_error")
@@ -267,7 +279,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
         }
     }
 
-    // ── volume ────────────────────────────────────────────────────────────
+    // ── volume & speed ───────────────────────────────────────────────────
 
     /**
      * Updates preview volume gain live. Clamped to [0.0, 1.0].
@@ -285,6 +297,34 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                 } catch (t: Throwable) {
                     Log.w(TAG, "$LOG_PREFIX set_volume_error gain=$clamped", t)
                 }
+            }
+        }
+    }
+
+    /**
+     * Updates preview playback speed live. Must be finite and positive.
+     */
+    fun setSpeed(speed: Float) {
+        val validSpeed = if (speed.isFinite() && speed > 0.0f) speed else 1.0f
+        audioHandler.post {
+            if (released.get()) return@post
+            playbackSpeed = validSpeed
+            val mp = player
+            if (mp != null && enabled) {
+                applyPlaybackSpeedLocked(mp)
+            }
+        }
+    }
+
+    private fun applyPlaybackSpeedLocked(mp: MediaPlayer) {
+        if (playbackSpeed != 1.0f) {
+            try {
+                val params = mp.playbackParams
+                params.speed = playbackSpeed
+                mp.playbackParams = params
+                Log.i(TAG, "$LOG_PREFIX applied_playback_speed speed=$playbackSpeed")
+            } catch (t: Throwable) {
+                Log.w(TAG, "$LOG_PREFIX apply_playback_speed_error speed=$playbackSpeed", t)
             }
         }
     }
