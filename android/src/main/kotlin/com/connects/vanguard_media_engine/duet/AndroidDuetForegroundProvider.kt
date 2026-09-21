@@ -23,6 +23,26 @@ import java.util.concurrent.atomic.AtomicBoolean
 // directly. This is NOT the final straight-alpha/keyed-stream ingest contract.
 
 /**
+ * Narrow sink interface covering exactly the methods the foreground provider
+ * calls on the render loop. Decouples [AndroidDuetCameraForegroundProvider]
+ * from the concrete [AndroidDuetPreviewRenderLoop]. Phase 7 provider-boundary
+ * slice — does not introduce new straight-alpha ingest.
+ */
+interface AndroidDuetForegroundSink {
+    fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean)
+    fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame)
+    fun updateGreenScreenMaskHardwareBuffer(
+        hardwareBuffer: android.hardware.HardwareBuffer,
+        widthPx: Int,
+        heightPx: Int,
+        timestampUs: Long,
+        onReleased: ((android.hardware.HardwareBuffer) -> Unit)? = null,
+        acquireFenceFd: Int = -1,
+    )
+    fun setGreenScreenEnabled(enabled: Boolean)
+}
+
+/**
  * Callbacks the provider uses to report lifecycle and segmentation-ladder
  * events back to the session coordinator. Always invoked on the main thread.
  */
@@ -36,7 +56,7 @@ interface AndroidDuetForegroundProviderCallbacks {
 
 /**
  * Owns the Duet foreground (live camera + green-screen keying) source behind
- * a caller-owned compositor Surface and render loop.
+ * a caller-owned compositor Surface and render sink.
  */
 interface AndroidDuetForegroundProvider {
     /** True once the current keying pass has delivered its first real mask. */
@@ -46,11 +66,12 @@ interface AndroidDuetForegroundProvider {
      * Starts the foreground source against [surface]. Idempotent — a second
      * call while already started is a no-op. [layoutConfigMap] selects the
      * initial mode ("greenScreen" binds the keying analyzer alongside camera
-     * preview from the first CameraX bind).
+     * preview from the first CameraX bind). Mask events are forwarded to
+     * [sink].
      */
     fun start(
         surface: Surface,
-        renderLoop: AndroidDuetPreviewRenderLoop,
+        sink: AndroidDuetForegroundSink,
         layoutConfigMap: Map<String, Any?>,
         callbacks: AndroidDuetForegroundProviderCallbacks,
     )
@@ -89,7 +110,7 @@ interface AndroidDuetForegroundProvider {
  * previously inlined in AndroidDuetSessionCoordinator. Owns the segmentation
  * backend ladder debug policy (raw GPU delegate/model overrides, MediaPipe CPU
  * model override, backend latch) and forwards masks directly into the
- * [AndroidDuetPreviewRenderLoop] supplied to [start].
+ * [AndroidDuetForegroundSink] supplied to [start].
  *
  * Main-thread only for start/setGreenScreenEnabled/stopKeying/stop, matching
  * AndroidDuetCameraSource and AndroidGreenScreenFilterNode's own threading
@@ -135,14 +156,14 @@ class AndroidDuetCameraForegroundProvider(
     /** Set by [setGreenScreenEnabled] immediately before each `false` return. */
     private var _lastEnableFailureReason: String = "bind_failed"
 
-    private var renderLoop: AndroidDuetPreviewRenderLoop? = null
+    private var sink: AndroidDuetForegroundSink? = null
     private var callbacks: AndroidDuetForegroundProviderCallbacks? = null
 
     // ── Public API ─────────────────────────────────────────────────────────────
 
     override fun start(
         surface: Surface,
-        renderLoop: AndroidDuetPreviewRenderLoop,
+        sink: AndroidDuetForegroundSink,
         layoutConfigMap: Map<String, Any?>,
         callbacks: AndroidDuetForegroundProviderCallbacks,
     ) {
@@ -151,7 +172,7 @@ class AndroidDuetCameraForegroundProvider(
         if (cameraSource != null) return
         val ctx = context ?: return
 
-        this.renderLoop = renderLoop
+        this.sink = sink
         this.callbacks = callbacks
 
         val mode = layoutConfigMap["mode"] as? String ?: "pip"
@@ -169,11 +190,11 @@ class AndroidDuetCameraForegroundProvider(
             targetSurface = surface,
             analyzer = analyzerForBind,
             onCameraFrameTransform = { rotationDegrees, mirrorHorizontal ->
-                this.renderLoop?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
+                this.sink?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
             },
             onStarted = {
                 if (mode == "greenScreen" && greenScreenFilterNode != null) {
-                    this.renderLoop?.setGreenScreenEnabled(true)
+                    this.sink?.setGreenScreenEnabled(true)
                 }
                 callbacks.onStarted()
             },
@@ -193,7 +214,7 @@ class AndroidDuetCameraForegroundProvider(
     }
 
     override fun setGreenScreenEnabled(enabled: Boolean, layoutConfigMap: Map<String, Any?>): Boolean {
-        val loop = renderLoop
+        val currentSink = sink
         if (enabled) {
             if (greenScreenFilterNode == null) {
                 val filterNode = buildGreenScreenFilterNode(layoutConfigMap)
@@ -211,14 +232,14 @@ class AndroidDuetCameraForegroundProvider(
                     return false
                 }
             }
-            loop?.setGreenScreenEnabled(true)
+            currentSink?.setGreenScreenEnabled(true)
             return true
         }
         // Switching away from greenScreen: remove analysis use-case, stop
         // the filter node, disable compositor. Camera Preview continues.
         cameraSource?.setAnalysisAnalyzer(null)
         stopGreenScreenFilterNodeInternal()
-        loop?.setGreenScreenEnabled(false)
+        currentSink?.setGreenScreenEnabled(false)
         return true
     }
 
@@ -268,7 +289,7 @@ class AndroidDuetCameraForegroundProvider(
      */
     private fun buildGreenScreenFilterNode(layoutConfigMap: Map<String, Any?>): AndroidGreenScreenFilterNode? {
         if (greenScreenFilterNode != null) return greenScreenFilterNode
-        val loop = renderLoop ?: return null
+        val currentSink = sink ?: return null
         return try {
             // Debug-only opt-in: a physical smoke harness can start this provider
             // on a GPU rung by setting layoutConfigMap["debugSegmentationBackend"] =
@@ -374,11 +395,11 @@ class AndroidDuetCameraForegroundProvider(
                 selector = selector,
                 initialBackendId = initialBackendId,
                 onMask = { frame ->
-                    loop.updateGreenScreenMask(frame)
+                    currentSink.updateGreenScreenMask(frame)
                     signalFirstMask()
                 },
                 onGpuMask = { hardwareBuffer, widthPx, heightPx, timestampUs ->
-                    loop.updateGreenScreenMaskHardwareBuffer(hardwareBuffer, widthPx, heightPx, timestampUs)
+                    currentSink.updateGreenScreenMaskHardwareBuffer(hardwareBuffer, widthPx, heightPx, timestampUs)
                     signalFirstMask()
                 },
                 onDegraded = { prev, next, reason, userMessage ->

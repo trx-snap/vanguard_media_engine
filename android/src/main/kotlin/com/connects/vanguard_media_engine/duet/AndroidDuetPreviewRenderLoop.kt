@@ -73,7 +73,7 @@ class AndroidDuetPreviewRenderLoop(
      * attach-time layoutConfigMap. Defaults to the production GLES selection.
      */
     private val backendSelection: AndroidDuetPreviewBackendSelection = AndroidDuetPreviewBackendFactory.selectDefault(),
-) {
+) : AndroidDuetForegroundSink {
 
     companion object {
         private const val TAG = "DuetPreviewRenderLoop"
@@ -360,7 +360,7 @@ class AndroidDuetPreviewRenderLoop(
      * the render thread so the compositor's render-thread-only state is always
      * mutated on the correct thread. No ML inside the loop.
      */
-    fun setGreenScreenEnabled(enabled: Boolean) {
+    override fun setGreenScreenEnabled(enabled: Boolean) {
         if (isStopped.get()) return
         renderHandler.post {
             if (isStopped.get()) return@post
@@ -375,7 +375,7 @@ class AndroidDuetPreviewRenderLoop(
      * posting style so the compositor's render-thread-only state is always
      * mutated on the correct thread.
      */
-    fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean) {
+    override fun setCameraFrameTransform(rotationDegrees: Int, mirrorHorizontal: Boolean) {
         if (isStopped.get()) return
         renderHandler.post {
             if (isStopped.get()) return@post
@@ -389,7 +389,7 @@ class AndroidDuetPreviewRenderLoop(
      * any thread-safety concern between this post and the next drawFrame.
      * No ML runs inside the render loop.
      */
-    fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
+    override fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame) {
         if (isStopped.get()) return
         renderHandler.post {
             if (isStopped.get()) return@post
@@ -471,13 +471,13 @@ class AndroidDuetPreviewRenderLoop(
      * the loop is stopped, or the post fails because the render looper has
      * already quit, [hardwareBuffer] is closed here so it is never leaked.
      */
-    fun updateGreenScreenMaskHardwareBuffer(
+    override fun updateGreenScreenMaskHardwareBuffer(
         hardwareBuffer: android.hardware.HardwareBuffer,
         widthPx: Int,
         heightPx: Int,
         timestampUs: Long,
-        onReleased: ((android.hardware.HardwareBuffer) -> Unit)? = null,
-        acquireFenceFd: Int = -1,
+        onReleased: ((android.hardware.HardwareBuffer) -> Unit)?,
+        acquireFenceFd: Int,
     ) {
         if (isStopped.get()) {
             closeFenceFdQuietly(acquireFenceFd)

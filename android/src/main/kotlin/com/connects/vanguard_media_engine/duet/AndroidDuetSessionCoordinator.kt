@@ -970,7 +970,7 @@ class AndroidDuetSessionCoordinator(
 
         provider.start(
             surface         = surface,
-            renderLoop      = renderLoop,
+            sink            = renderLoop,
             layoutConfigMap = session.layoutConfigMap,
             callbacks       = object : AndroidDuetForegroundProviderCallbacks {
                 override fun onStarted() {
