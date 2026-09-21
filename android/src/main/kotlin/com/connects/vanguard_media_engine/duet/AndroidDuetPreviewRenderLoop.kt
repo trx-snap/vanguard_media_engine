@@ -202,6 +202,7 @@ class AndroidDuetPreviewRenderLoop(
         sourceRect: VGDuetPixelRect,
         cameraRect: VGDuetPixelRect,
         targetPtsMs: Long,
+        foregroundRotation: VGDuetForegroundRotation = VGDuetForegroundRotation.IDENTITY,
     ) {
         if (isStopped.get()) return
         val generation = surfaceGeneration.incrementAndGet()
@@ -211,6 +212,9 @@ class AndroidDuetPreviewRenderLoop(
             if (generation != surfaceGeneration.get()) return@post
             if (!compositor.attachOutputSurface(surface, widthPx, heightPx)) return@post
             compositor.setLayout(sourceRect, cameraRect)
+            compositor.setForegroundRotation(
+                foregroundRotation.rotationDegrees, foregroundRotation.anchorX, foregroundRotation.anchorY,
+            )
             canSubmit.set(true)
             // Ensure camera idle pump is running so camera frames are presented
             // even before the decoder binds or active recording starts.
@@ -326,12 +330,20 @@ class AndroidDuetPreviewRenderLoop(
      * latched frame; while holding (not active) it additionally steps to
      * [targetPtsMs] so the held frame matches the caller's timeline position.
      */
-    fun updateLayout(sourceRect: VGDuetPixelRect, cameraRect: VGDuetPixelRect, targetPtsMs: Long) {
+    fun updateLayout(
+        sourceRect: VGDuetPixelRect,
+        cameraRect: VGDuetPixelRect,
+        targetPtsMs: Long,
+        foregroundRotation: VGDuetForegroundRotation = VGDuetForegroundRotation.IDENTITY,
+    ) {
         if (isStopped.get()) return
         val generation = surfaceGeneration.get()
         renderHandler.post {
             if (isStopped.get()) return@post
             compositor.setLayout(sourceRect, cameraRect)
+            compositor.setForegroundRotation(
+                foregroundRotation.rotationDegrees, foregroundRotation.anchorX, foregroundRotation.anchorY,
+            )
             if (generation == surfaceGeneration.get() && canSubmit.get()) {
                 compositor.drawFrame()
             }

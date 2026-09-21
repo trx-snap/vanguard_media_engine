@@ -79,6 +79,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         // sourceVideoWidthPx/HeightPx of its own.
         private const val CAMERA_UPRIGHT_ASPECT =
             CAMERA_ST_DEFAULT_HEIGHT.toDouble() / CAMERA_ST_DEFAULT_WIDTH.toDouble()
+
+        // Below this magnitude, [setForegroundRotation]'s angle is treated as
+        // identity so the unrotated fast path (existing viewport/scissor crop,
+        // unchanged pixel output) is used instead of the rotated-quad path.
+        private const val ROTATION_EPSILON_DEGREES = 1e-4
     }
 
     // -- EGL core (created lazily on first attach, destroyed only in release) --
@@ -192,6 +197,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     /** GL texture ID for the single-channel mask (LUMINANCE). 0 = not yet allocated. */
     private var maskTextureId = 0
 
+    /**
+     * Duet-only preview foreground free-rotation metadata: [setForegroundRotation]'s
+     * visual-clockwise angle (Dart/top-left space) and normalized pivot anchor
+     * within the camera rect. Render-thread only. Identity default (0.0, 0.5,
+     * 0.5) applies no rotation, so callers that never invoke [setForegroundRotation]
+     * see unchanged behavior.
+     */
+    private var foregroundRotationDegrees = 0.0
+    private var foregroundAnchorX = 0.5
+    private var foregroundAnchorY = 0.5
+
     /** GLES program: OES camera + 2D mask → alpha-blended draw. 0 = not yet compiled. */
     private var greenScreenProgram = 0
     private var gsAPositionLoc = -1
@@ -263,6 +279,15 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         0f, 1f,
         1f, 1f,
     )
+
+    /**
+     * Scratch vertex-position buffer for the non-zero-rotation green-screen
+     * camera draw ([drawCameraGreenScreenRotated]), reused every frame instead
+     * of allocating. Holds 4 NDC (x, y) corners in the same order as
+     * [quadPositions]; texture coordinates are unaffected by rotation and
+     * continue to use [quadTexCoords].
+     */
+    private val rotatedQuadPositions: FloatBuffer = floatBufferOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
 
     // -- Attach / detach -------------------------------------------------------
 
@@ -404,6 +429,19 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      */
     override fun setGreenScreenBackground(background: AndroidDuetGreenScreenBackground) {
         greenScreenBackground = background
+    }
+
+    /**
+     * Duet-only preview seam: stores the green-screen foreground/camera layer's
+     * free-rotation angle and pivot anchor for the next [drawFrame]. Sanitizes
+     * non-finite input to identity, matching the finiteness contract
+     * [AndroidDuetLayoutGeometry.foregroundRotation] already enforces upstream.
+     * Must be called on the render thread (mirrors [setLayout]).
+     */
+    override fun setForegroundRotation(rotationDegrees: Double, anchorX: Double, anchorY: Double) {
+        foregroundRotationDegrees = if (rotationDegrees.isFinite()) rotationDegrees else 0.0
+        foregroundAnchorX = (if (anchorX.isFinite()) anchorX else 0.5).coerceIn(0.0, 1.0)
+        foregroundAnchorY = (if (anchorY.isFinite()) anchorY else 0.5).coerceIn(0.0, 1.0)
     }
 
 
@@ -1017,7 +1055,25 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     /**
      * Draws the camera OES frame alpha-blended into [rect] using the current
-     * mask texture. GL_BLEND is enabled around this draw only; source video
+     * mask texture. Dispatches on [foregroundRotationDegrees]: identity/near-zero
+     * rotation keeps the exact axis-aligned fast path
+     * ([drawCameraGreenScreenAxisAligned], unchanged pixel output); a non-zero
+     * user rotation switches to [drawCameraGreenScreenRotated], which rotates
+     * the quad geometry around the configured pivot instead of only cropping
+     * to [rect].
+     */
+    private fun drawCameraGreenScreen(rect: VGDuetPixelRect) {
+        val rotationDeg = foregroundRotationDegrees
+        if (kotlin.math.abs(rotationDeg) < ROTATION_EPSILON_DEGREES) {
+            drawCameraGreenScreenAxisAligned(rect)
+        } else {
+            drawCameraGreenScreenRotated(rect, rotationDeg)
+        }
+    }
+
+    /**
+     * Identity/near-zero-rotation path: unchanged from the pre-rotation
+     * behavior. GL_BLEND is enabled around this draw only; source video
      * underneath shows through where mask alpha is low (background).
      *
      * Like [drawCameraRect], the viewport is aspect-filled (via
@@ -1025,7 +1081,7 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * [rect]; camera passthrough and green-screen share the same aspect-fill
      * geometry so the two draws stay visually consistent.
      */
-    private fun drawCameraGreenScreen(rect: VGDuetPixelRect) {
+    private fun drawCameraGreenScreenAxisAligned(rect: VGDuetPixelRect) {
         val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
         if (scissor.width <= 0 || scissor.height <= 0) return
         val viewport = cameraAspectFillViewport(rect)
@@ -1078,6 +1134,115 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         quadPositions.position(0)
         GLES20.glEnableVertexAttribArray(gsAPositionLoc)
         GLES20.glVertexAttribPointer(gsAPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
+        quadTexCoords.position(0)
+        GLES20.glEnableVertexAttribArray(gsATexCoordLoc)
+        GLES20.glVertexAttribPointer(gsATexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(gsAPositionLoc)
+        GLES20.glDisableVertexAttribArray(gsATexCoordLoc)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    /**
+     * Non-zero-rotation path: rotates the aspect-filled camera quad's four
+     * corners around `pivot = (rect.left + foregroundAnchorX * rect.width,
+     * rect.top + foregroundAnchorY * rect.height)` by [rotationDegrees]
+     * (visual clockwise, Dart/top-left space) in canvas-pixel space, then maps
+     * each rotated corner independently to NDC for the full output surface.
+     *
+     * Deliberately does not use [toGlRect]'s scissor/viewport cropping to
+     * [rect]: a rotated quad's corners can land outside that axis-aligned box,
+     * and clipping to it would cut off the rotated corners. Instead the
+     * viewport covers the whole output surface with scissor disabled, and the
+     * quad's own triangle-strip geometry — not a scissor rect — bounds what
+     * gets rasterized, so nothing outside the rotated quad is drawn.
+     *
+     * Texture coordinates ([quadTexCoords]) and the camera's sensor transform
+     * ([cameraStMatrix]) are untouched: only the on-screen vertex positions
+     * rotate, so CameraX orientation/mirror correction stays exclusively in
+     * [cameraStMatrix] as before.
+     */
+    private fun drawCameraGreenScreenRotated(rect: VGDuetPixelRect, rotationDegrees: Double) {
+        if (outputWidthPx <= 0 || outputHeightPx <= 0) return
+        val aspectRect = cameraAspectFillCanvasRect(rect)
+        if (aspectRect.width <= 0.0 || aspectRect.height <= 0.0) return
+
+        ensureGreenScreenProgram()
+        if (greenScreenProgram == 0) return  // compilation failed; skip silently
+
+        val pivotX = rect.left + foregroundAnchorX * rect.width
+        val pivotY = rect.top + foregroundAnchorY * rect.height
+        val radians = Math.toRadians(rotationDegrees)
+        val cosT = Math.cos(radians)
+        val sinT = Math.sin(radians)
+
+        // Canvas-space corners in the same vertex order as [quadPositions]
+        // ((-1,-1),(1,-1),(-1,1),(1,1)): via toGlRect's y-flip those NDC
+        // corners map to GL-viewport bottom-left/bottom-right/top-left/
+        // top-right, i.e. canvas bottom-left/bottom-right/top-left/top-right.
+        val left = aspectRect.left
+        val top = aspectRect.top
+        val right = aspectRect.left + aspectRect.width
+        val bottom = aspectRect.top + aspectRect.height
+        val cornersX = doubleArrayOf(left, right, left, right)
+        val cornersY = doubleArrayOf(bottom, bottom, top, top)
+
+        val ndc = FloatArray(8)
+        for (i in 0 until 4) {
+            val dx = cornersX[i] - pivotX
+            val dy = cornersY[i] - pivotY
+            val rx = pivotX + dx * cosT - dy * sinT
+            val ry = pivotY + dx * sinT + dy * cosT
+            ndc[i * 2] = ((rx / outputWidthPx) * 2.0 - 1.0).toFloat()
+            ndc[i * 2 + 1] = (1.0 - (ry / outputHeightPx) * 2.0).toFloat()
+        }
+        rotatedQuadPositions.position(0)
+        rotatedQuadPositions.put(ndc)
+        rotatedQuadPositions.position(0)
+
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glViewport(0, 0, outputWidthPx, outputHeightPx)
+
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+        GLES20.glUseProgram(greenScreenProgram)
+
+        val debugViewCode = when (greenScreenDebugView) {
+            "mask_direct" -> 1
+            "mask_mapped" -> 2
+            "mask_direct_mirror_x" -> 3
+            "mask_direct_flip_y" -> 4
+            "camera_passthrough" -> 5
+            else -> 0
+        }
+        GLES20.glUniform1i(gsUDebugViewLoc, debugViewCode)
+
+        val maskTexelW = if (latestMaskWidth > 0) 1f / latestMaskWidth else 1f
+        val maskTexelH = if (latestMaskHeight > 0) 1f / latestMaskHeight else 1f
+        GLES20.glUniform2f(gsUMaskTexelSizeLoc, maskTexelW, maskTexelH)
+
+        // Texture unit 0: camera OES
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
+        GLES20.glUniform1i(gsSCameraLoc, 0)
+        GLES20.glUniformMatrix4fv(gsUSTMatrixLoc, 1, false, cameraStMatrix, 0)
+
+        // Texture unit 1: mask (2D LUMINANCE)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
+        GLES20.glUniform1i(gsUMaskLoc, 1)
+
+        rotatedQuadPositions.position(0)
+        GLES20.glEnableVertexAttribArray(gsAPositionLoc)
+        GLES20.glVertexAttribPointer(gsAPositionLoc, 2, GLES20.GL_FLOAT, false, 0, rotatedQuadPositions)
         quadTexCoords.position(0)
         GLES20.glEnableVertexAttribArray(gsATexCoordLoc)
         GLES20.glVertexAttribPointer(gsATexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
@@ -1498,10 +1663,23 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * [sourceVideoWidthPx]/[sourceVideoHeightPx] are for the decoder.
      */
     private fun cameraAspectFillViewport(rect: VGDuetPixelRect): GlRect {
+        val aspectRect = cameraAspectFillCanvasRect(rect)
+        return toGlRect(aspectRect.left, aspectRect.top, aspectRect.width, aspectRect.height)
+    }
+
+    /**
+     * Canvas-space (top-left origin, pre-[toGlRect]) counterpart of
+     * [cameraAspectFillViewport]: same centred-inflate aspect-fill math, but
+     * returned before the GL-viewport y-flip conversion so
+     * [drawCameraGreenScreenRotated] can rotate the quad's corners directly in
+     * canvas-pixel space (matching [VGDuetForegroundRotation]'s Dart/top-left
+     * convention) before converting each rotated corner to NDC individually.
+     */
+    private fun cameraAspectFillCanvasRect(rect: VGDuetPixelRect): VGDuetPixelRect {
         val rectW = rect.width
         val rectH = rect.height
         if (rectW <= 0.0 || rectH <= 0.0) {
-            return toGlRect(rect.left, rect.top, rectW, rectH)
+            return rect
         }
         val cameraAspect = CAMERA_UPRIGHT_ASPECT
         val rectAspect = rectW / rectH
@@ -1514,11 +1692,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             drawnW = rectW
             drawnH = rectW / cameraAspect
         }
-        return toGlRect(
-            rect.left - (drawnW - rectW) / 2.0,
-            rect.top - (drawnH - rectH) / 2.0,
-            drawnW,
-            drawnH,
+        return VGDuetPixelRect(
+            left   = rect.left - (drawnW - rectW) / 2.0,
+            top    = rect.top - (drawnH - rectH) / 2.0,
+            width  = drawnW,
+            height = drawnH,
         )
     }
 

@@ -27,6 +27,24 @@ typealias VGDuetLayoutRects = AndroidGreenScreenLayoutRects
 typealias NativeForegroundTransform = AndroidGreenScreenForegroundTransform
 
 /**
+ * Duet-only preview rotation metadata for the green-screen foreground/camera
+ * layer: the free-rotation angle (visual clockwise degrees, Dart/top-left
+ * space) plus the normalized pivot anchor within the camera rect that
+ * [AndroidDuetPreviewCompositor] rotates the camera quad around. Never
+ * serialized to Dart — [AndroidDuetLayoutGeometry.greenScreen] and the
+ * MethodChannel layout-rect reply continue to carry only source/camera rects.
+ */
+data class VGDuetForegroundRotation(
+    val rotationDegrees: Double,
+    val anchorX: Double,
+    val anchorY: Double,
+) {
+    companion object {
+        val IDENTITY = VGDuetForegroundRotation(rotationDegrees = 0.0, anchorX = 0.5, anchorY = 0.5)
+    }
+}
+
+/**
  * Pure static helpers for Duet spatial layout geometry.
  *
  * Matches the semantics of `VGDuetLayoutMath` in Dart.
@@ -122,4 +140,34 @@ object AndroidDuetLayoutGeometry {
         transform:    NativeForegroundTransform?,
     ): VGDuetLayoutRects =
         AndroidGreenScreenLayoutGeometry.greenScreen(canvasWidth, canvasHeight, transform)
+
+    // ── Foreground rotation (preview-only, Duet-owned) ─────────────────────────
+
+    /**
+     * Derives preview-only rotation metadata from a foreground transform.
+     *
+     * Mirrors the same finiteness rules [AndroidGreenScreenLayoutGeometry.greenScreen]
+     * uses for the rect: a null [transform], or a non-finite/non-positive scale
+     * (which forces that function to the full-canvas identity rect), also forces
+     * identity rotation here (0 degrees, centered anchor). A valid transform's
+     * rotationDegrees and anchor are carried through even when the unrotated rect
+     * happens to equal the full canvas (scale 1.0, zero offset, centered anchor),
+     * since rotation can still be visually meaningful in that case.
+     */
+    fun foregroundRotation(transform: NativeForegroundTransform?): VGDuetForegroundRotation {
+        if (transform == null) return VGDuetForegroundRotation.IDENTITY
+
+        val rawScale = transform.scale
+        if (!rawScale.isFinite() || rawScale <= 0.0) return VGDuetForegroundRotation.IDENTITY
+
+        val rawAnchorX = transform.anchorX
+        val rawAnchorY = transform.anchorY
+        val anchorX = (if (rawAnchorX.isFinite()) rawAnchorX else 0.5).coerceIn(0.0, 1.0)
+        val anchorY = (if (rawAnchorY.isFinite()) rawAnchorY else 0.5).coerceIn(0.0, 1.0)
+
+        val rawRotation = transform.rotationDegrees
+        val rotationDegrees = if (rawRotation.isFinite()) rawRotation else 0.0
+
+        return VGDuetForegroundRotation(rotationDegrees = rotationDegrees, anchorX = anchorX, anchorY = anchorY)
+    }
 }

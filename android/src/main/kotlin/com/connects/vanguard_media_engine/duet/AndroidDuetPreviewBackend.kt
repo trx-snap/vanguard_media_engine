@@ -53,6 +53,18 @@ interface AndroidDuetPreviewBackend {
     fun updateGreenScreenMask(frame: AndroidDuetSegmentationFrame)
 
     /**
+     * Duet-only preview seam: sets the green-screen foreground/camera layer's
+     * free-rotation metadata — [rotationDegrees] (visual clockwise, Dart/top-left
+     * space, arbitrary finite value) and the normalized pivot [anchorX]/[anchorY]
+     * within the camera rect the rotation is applied around. Identity is
+     * `(0.0, 0.5, 0.5)`. Only meaningful while green-screen compositing is
+     * enabled; harmless to call otherwise. Backends that do not support
+     * foreground rotation (the default here) no-op, so production behavior for
+     * callers that never invoke this is unaffected.
+     */
+    fun setForegroundRotation(rotationDegrees: Double, anchorX: Double, anchorY: Double) {}
+
+    /**
      * Debug-only (RND diagnostic): selects a raw segmentation mask
      * visualization mode so a physical smoke can capture what the mask
      * texture actually contains, independent of the production alpha-blend

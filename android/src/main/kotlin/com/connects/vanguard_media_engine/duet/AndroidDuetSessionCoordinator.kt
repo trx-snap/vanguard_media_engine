@@ -90,6 +90,10 @@ class VGDuetAndroidSession(
     // Typed twin of previewLayoutRects, fed to the render loop on (re)attach.
     // Recomputed by updateLayout while a preview is attached.
     var previewTypedLayoutRects: VGDuetLayoutRects? = null
+    // Duet-only preview rotation metadata paired with previewTypedLayoutRects,
+    // fed to the render loop alongside it on (re)attach and updateLayout.
+    // Identity outside greenScreen mode; never sent over the MethodChannel.
+    var previewForegroundRotation: VGDuetForegroundRotation = VGDuetForegroundRotation.IDENTITY
     // startDuetRecording reply parked behind the barrier. Non-null only while
     // state == INITIALIZED and a start is pending; cleared by completion/cancel.
     var pendingStartReply: ((Any?, String?) -> Unit)? = null
@@ -489,7 +493,9 @@ class AndroidDuetSessionCoordinator(
         val heightPx = session.previewHeightPx
         if (widthPx != null && heightPx != null) {
             val typedRects = buildTypedLayoutRects(layoutConfigMap, widthPx.toDouble(), heightPx.toDouble())
+            val foregroundRotation = buildForegroundRotation(layoutConfigMap)
             session.previewTypedLayoutRects = typedRects
+            session.previewForegroundRotation = foregroundRotation
             session.previewLayoutRects = typedRects?.let {
                 mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
             }
@@ -498,6 +504,7 @@ class AndroidDuetSessionCoordinator(
                     typedRects.source,
                     typedRects.camera,
                     session.previewClock.currentSourcePtsMs().toLong(),
+                    foregroundRotation,
                 )
             }
             // Enable/disable green-screen compositing based on the new mode.
@@ -849,6 +856,7 @@ class AndroidDuetSessionCoordinator(
             session.layoutConfigMap = layoutConfigMap
         }
         val typedRects = buildTypedLayoutRects(effectiveLayoutMap, widthPx.toDouble(), heightPx.toDouble())
+        val foregroundRotation = buildForegroundRotation(effectiveLayoutMap)
         val layoutRects = typedRects?.let {
             mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
         }
@@ -858,6 +866,7 @@ class AndroidDuetSessionCoordinator(
         session.previewHeightPx   = heightPx
         session.previewLayoutRects = layoutRects
         session.previewTypedLayoutRects = typedRects
+        session.previewForegroundRotation = foregroundRotation
 
         // The eager probe in the producer's init never fires the availability
         // hook, so bootstrap the render loop here when the surface already exists.
@@ -870,6 +879,7 @@ class AndroidDuetSessionCoordinator(
                     surface, widthPx, heightPx,
                     typedRects.source, typedRects.camera,
                     session.previewClock.currentSourcePtsMs().toLong(),
+                    foregroundRotation,
                 )
             }
         }
@@ -905,6 +915,7 @@ class AndroidDuetSessionCoordinator(
             surface, widthPx, heightPx,
             typedRects.source, typedRects.camera,
             session.previewClock.currentSourcePtsMs().toLong(),
+            session.previewForegroundRotation,
         )
     }
 
@@ -1082,6 +1093,10 @@ class AndroidDuetSessionCoordinator(
         if (widthPx != null && heightPx != null) {
             val typedRects = buildTypedLayoutRects(fallbackLayout, widthPx.toDouble(), heightPx.toDouble())
             session.previewTypedLayoutRects = typedRects
+            // PiP fallback leaves greenScreen mode: rotation is Duet-only
+            // metadata scoped to the green-screen camera layer, so it resets
+            // to identity here rather than carrying over a stale angle.
+            session.previewForegroundRotation = VGDuetForegroundRotation.IDENTITY
             session.previewLayoutRects = typedRects?.let {
                 mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
             }
@@ -1090,6 +1105,7 @@ class AndroidDuetSessionCoordinator(
                     typedRects.source,
                     typedRects.camera,
                     session.previewClock.currentSourcePtsMs().toLong(),
+                    VGDuetForegroundRotation.IDENTITY,
                 )
             }
         }
@@ -1176,6 +1192,7 @@ class AndroidDuetSessionCoordinator(
         session.previewHeightPx    = null
         session.previewLayoutRects = null
         session.previewTypedLayoutRects = null
+        session.previewForegroundRotation = VGDuetForegroundRotation.IDENTITY
     }
 
     // ── Layout rect builder ───────────────────────────────────────────────────
@@ -1218,6 +1235,17 @@ class AndroidDuetSessionCoordinator(
             }
             else -> null
         }
+    }
+
+    /**
+     * Duet-only preview rotation metadata paired with [buildTypedLayoutRects]:
+     * identity for every mode except greenScreen, where it mirrors the same
+     * parsed foreground transform used for the camera rect.
+     */
+    private fun buildForegroundRotation(layoutConfigMap: Map<String, Any?>): VGDuetForegroundRotation {
+        val mode = layoutConfigMap["mode"] as? String ?: "pip"
+        if (mode != "greenScreen") return VGDuetForegroundRotation.IDENTITY
+        return AndroidDuetLayoutGeometry.foregroundRotation(parseForegroundTransform(layoutConfigMap))
     }
 
     /**
