@@ -316,6 +316,18 @@ final class VGDuetExportSession {
 
         // ── Build overlay descriptor dictionary ───────────────────────────────
 
+        // VGOverlayDescriptor.rotation is RADIANS, clockwise-positive at the
+        // descriptor level; VGOverlayNode negates it internally to correct
+        // for CoreImage's counter-clockwise-positive convention, so a
+        // positive value here already renders visually clockwise -- matching
+        // NativeForegroundTransform.rotationDegrees' Dart/top-left
+        // visual-clockwise contract with no extra sign flip needed. nil (no
+        // foregroundTransform) or a non-finite/malformed rotationDegrees was
+        // already sanitized to 0.0 inside _parseForegroundTransform, so this
+        // conversion never needs its own nil/finite handling beyond the `?? 0.0`
+        // for a nil nativeTransform.
+        let overlayRotationRadians = Double(nativeTransform?.rotationDegrees ?? 0.0) * .pi / 180.0
+
         let overlayDict: [String: Any] = [
             "id":               "duet_synthetic_fg",
             "type":             "sticker",
@@ -325,7 +337,7 @@ final class VGDuetExportSession {
             "translationY":     Double(overlayRect.origin.y),
             "width":            Double(overlayRect.width),
             "height":           Double(overlayRect.height),
-            "rotation":         0.0,
+            "rotation":         overlayRotationRadians,
             "scale":            1.0,
             "opacity":          1.0,
             "zIndex":           1,
