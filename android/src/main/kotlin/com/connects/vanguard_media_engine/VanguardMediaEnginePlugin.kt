@@ -2506,16 +2506,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 val videoPath = args?.get("videoPath") as? String
                 val count     = (args?.get("count")    as? Number)?.toInt()    ?: 8
                 val duration  = (args?.get("duration") as? Number)?.toDouble() ?: 0.0
-                val maxWidth  = (args?.get("maxWidth") as? Number)?.toInt()
-                val maxHeight = (args?.get("maxHeight") as? Number)?.toInt()
-                val jpegQuality = (args?.get("jpegQuality") as? Number)?.toDouble()
+                val maxWidth  = (args?.get("maxWidth") as? Number)?.toInt() ?: 120
+                val maxHeight = (args?.get("maxHeight") as? Number)?.toInt() ?: 214
+                val jpegQuality = (args?.get("jpegQuality") as? Number)?.toDouble() ?: 0.6
                 if (videoPath == null) {
                     result.error("INVALID_ARG", "generateThumbnails: videoPath required", null)
                     return
                 }
                 Thread {
                     val frames = VanguardThumbnailExtractor.extract(
-                        videoPath, count, duration, maxWidth, maxHeight, jpegQuality
+                        videoPath, count, duration, maxWidth, maxHeight, jpegQuality, context
                     )
                     mainHandler.post { result.success(frames) }
                 }.start()
