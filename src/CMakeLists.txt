@@ -3,7 +3,7 @@
 # the plugin to fail to compile for some customers of the plugin.
 cmake_minimum_required(VERSION 3.10)
 
-project(vanguard_media_engine_library VERSION 0.0.1 LANGUAGES CXX)
+project(vanguard_media_engine_library VERSION 0.0.1 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -62,6 +62,40 @@ add_library(vanguard_sources STATIC
 target_include_directories(vanguard_sources PUBLIC "sources/include")
 target_link_libraries(vanguard_sources PRIVATE vanguard_graph vanguard_core)
 
+add_library(vanguard_helix_aac STATIC
+    "audio/third_party/helix_aac/aacdec.c"
+    "audio/third_party/helix_aac/aactabs.c"
+    "audio/third_party/helix_aac/bitstream.c"
+    "audio/third_party/helix_aac/buffers.c"
+    "audio/third_party/helix_aac/dct4.c"
+    "audio/third_party/helix_aac/decelmnt.c"
+    "audio/third_party/helix_aac/dequant.c"
+    "audio/third_party/helix_aac/fft.c"
+    "audio/third_party/helix_aac/filefmt.c"
+    "audio/third_party/helix_aac/huffman.c"
+    "audio/third_party/helix_aac/hufftabs.c"
+    "audio/third_party/helix_aac/imdct.c"
+    "audio/third_party/helix_aac/noiseless.c"
+    "audio/third_party/helix_aac/pns.c"
+    "audio/third_party/helix_aac/sbr.c"
+    "audio/third_party/helix_aac/sbrfft.c"
+    "audio/third_party/helix_aac/sbrfreq.c"
+    "audio/third_party/helix_aac/sbrhfadj.c"
+    "audio/third_party/helix_aac/sbrhfgen.c"
+    "audio/third_party/helix_aac/sbrhuff.c"
+    "audio/third_party/helix_aac/sbrimdct.c"
+    "audio/third_party/helix_aac/sbrmath.c"
+    "audio/third_party/helix_aac/sbrqmf.c"
+    "audio/third_party/helix_aac/sbrside.c"
+    "audio/third_party/helix_aac/sbrtabs.c"
+    "audio/third_party/helix_aac/stproc.c"
+    "audio/third_party/helix_aac/tns.c"
+    "audio/third_party/helix_aac/trigtabs.c"
+)
+target_include_directories(vanguard_helix_aac PUBLIC "audio/third_party/helix_aac")
+set_target_properties(vanguard_helix_aac PROPERTIES LINKER_LANGUAGE CXX)
+target_compile_options(vanguard_helix_aac PRIVATE -O3)
+
 add_library(vanguard_audio STATIC
     "audio/src/decoded_audio_pcm_source_node.cpp"
     "audio/src/audio_gain_envelope.cpp"
@@ -72,9 +106,14 @@ add_library(vanguard_audio STATIC
     "audio/src/audio_clock.cpp"
     "audio/src/clocked_audio_transport_coordinator.cpp"
     "audio/src/audio_decoder_ring_writer.cpp"
+    "audio/src/vg_native_waveform_extractor.cpp"
 )
-target_include_directories(vanguard_audio PUBLIC "audio/include")
-target_link_libraries(vanguard_audio PRIVATE vanguard_graph vanguard_core)
+target_include_directories(vanguard_audio PUBLIC "audio/include" "audio/third_party/dr_mp3" "audio/third_party/helix_aac")
+target_link_libraries(vanguard_audio PRIVATE vanguard_graph vanguard_core vanguard_helix_aac)
+target_compile_options(vanguard_audio PRIVATE -O3)
+if (ANDROID)
+    target_link_libraries(vanguard_audio PRIVATE mediandk)
+endif()
 
 add_library(vanguard_compositors STATIC
     "compositors/src/multi_cam_compositor_node.cpp"
@@ -215,6 +254,7 @@ target_compile_definitions(vanguard_media_engine PUBLIC DART_SHARED_LIB)
 if (ANDROID)
   target_sources(vanguard_media_engine PRIVATE
     "platform/android/src/jni_bridge.cpp"
+    "platform/android/src/android_waveform_extractor_jni.cpp"
     "platform/android/src/android_backend_probe.cpp"
     "platform/android/src/android_phase4a_decoder_smoke_jni.cpp"
     "platform/android/src/android_phase4b1_texture_playback_jni.cpp"

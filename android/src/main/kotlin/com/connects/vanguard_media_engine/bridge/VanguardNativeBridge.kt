@@ -19,6 +19,19 @@ class VanguardNativeBridge(
             System.loadLibrary("vanguard_media_engine")
         }
 
+        // ── Fast-Path In-Process C++ NDK Waveform Extraction (Route 2) ───────────
+        // In-process AMediaExtractor + software audio decoders (dr_mp3 for MP3,
+        // Helix for AAC) + streaming RMS accumulation in CPU cache.
+        // Returns FloatArray of RMS points and writes duration into outDuration[0].
+        // Returns null on unsupported codecs, missing audio tracks, or decode errors,
+        // allowing clean fallback to MediaCodec.
+        external fun nativeExtractWaveform(
+            path: String,
+            samplesPerSecond: Int,
+            maxDurationSeconds: Double,
+            outDuration: DoubleArray,
+        ): FloatArray?
+
         // ── P4 True-DAG V4.3 sub-slice G1: audio decoder ring ingest diagnostic session core ─
         // Native JNI session seam for the future real MediaCodec-to-
         // AudioDecoderRingWriter ingest proof. Kotlin will remain the sole
