@@ -95,6 +95,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScre
 import com.connects.vanguard_media_engine.diagnostics.AndroidDuetVulkanGreenScreenExportExternalYcbcrPixelProofSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenProductionExportSmokeHarness
 import com.connects.vanguard_media_engine.diagnostics.AndroidGreenScreenExportApiPixelProofSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidDuetExportTransformPixelProofSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -605,6 +606,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator ──
     private var greenScreenExportApiPixelProofSmokeCoordinator: AndroidGreenScreenExportApiPixelProofSmokeCoordinator? = null
+    // ── VG-DUET-EXPORT-TRANSFORM-PIXEL-PROOF: diagnostic coordinator ──────────
+    private var duetExportTransformPixelProofSmokeCoordinator: AndroidDuetExportTransformPixelProofSmokeCoordinator? = null
 
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
@@ -990,6 +993,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: diagnostic fixture & assert coordinator
         greenScreenExportApiPixelProofSmokeCoordinator = AndroidGreenScreenExportApiPixelProofSmokeCoordinator(mainHandler)
+        // VG-DUET-EXPORT-TRANSFORM-PIXEL-PROOF: diagnostic coordinator
+        duetExportTransformPixelProofSmokeCoordinator = AndroidDuetExportTransformPixelProofSmokeCoordinator(mainHandler)
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -1037,6 +1042,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android green screen export API pixel proof coordinator unavailable", null)
+            }
+            return
+        }
+
+        // ── VG-DUET-EXPORT-TRANSFORM-PIXEL-PROOF: diagnostic dispatch ──────────
+        if (AndroidDuetExportTransformPixelProofSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = duetExportTransformPixelProofSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android Duet export transform pixel proof coordinator unavailable", null)
             }
             return
         }
@@ -4023,6 +4039,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // VG-GREENSCREEN-EXPORT-API-PIXEL-PROOF: shutdown background executor.
         greenScreenExportApiPixelProofSmokeCoordinator?.disposeAll()
         greenScreenExportApiPixelProofSmokeCoordinator = null
+        // VG-DUET-EXPORT-TRANSFORM-PIXEL-PROOF: shutdown background executor.
+        duetExportTransformPixelProofSmokeCoordinator?.disposeAll()
+        duetExportTransformPixelProofSmokeCoordinator = null
         // Android Face Scan Evidence Extractor: release persistent warm MediaPipe FaceDetector
         com.connects.vanguard_media_engine.roi.AndroidFaceScanEvidenceExtractor.release()
     }
