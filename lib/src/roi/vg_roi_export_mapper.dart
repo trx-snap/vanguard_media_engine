@@ -130,18 +130,33 @@ class VGROISidecarExportMapper {
 
     final List<VGROISample> exportSamples = [];
 
-    for (final sample in captureSidecar.samples) {
-      // Drop samples outside the trim window.
-      if (sample.recordingRelativeMs < trimStartMs) continue;
-      if (trimEndMs != null && sample.recordingRelativeMs > trimEndMs) continue;
+    final bool isSingleSample = captureSidecar.samples.length == 1;
 
-      // Shift timestamps by trimStartMs.
-      final int shiftedTimestampMs =
-          (sample.timestampMs - trimStartMs).clamp(0, _kMaxMs);
-      final int shiftedFramePtsMs =
-          (sample.framePtsMs - trimStartMs).clamp(0, _kMaxMs);
-      final int shiftedRecordingRelativeMs =
-          (sample.recordingRelativeMs - trimStartMs).clamp(0, _kMaxMs);
+    for (final sample in captureSidecar.samples) {
+      final int shiftedTimestampMs;
+      final int shiftedFramePtsMs;
+      final int shiftedRecordingRelativeMs;
+
+      if (isSingleSample && sample.recordingRelativeMs < trimStartMs) {
+        // Re-anchor the single keyframe sample to the start of the trimmed clip (t=0)
+        // rather than dropping the only face representation for this video.
+        if (trimEndMs != null && trimStartMs > trimEndMs) continue;
+        shiftedTimestampMs = 0;
+        shiftedFramePtsMs = 0;
+        shiftedRecordingRelativeMs = 0;
+      } else {
+        // Multi-sample or in-window: drop samples outside the trim window.
+        if (sample.recordingRelativeMs < trimStartMs) continue;
+        if (trimEndMs != null && sample.recordingRelativeMs > trimEndMs) continue;
+
+        // Shift timestamps by trimStartMs.
+        shiftedTimestampMs =
+            (sample.timestampMs - trimStartMs).clamp(0, _kMaxMs);
+        shiftedFramePtsMs =
+            (sample.framePtsMs - trimStartMs).clamp(0, _kMaxMs);
+        shiftedRecordingRelativeMs =
+            (sample.recordingRelativeMs - trimStartMs).clamp(0, _kMaxMs);
+      }
 
       // Map box coordinates.
       VGROIBox? exportBox;

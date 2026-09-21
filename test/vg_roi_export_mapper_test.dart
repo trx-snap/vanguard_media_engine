@@ -1165,5 +1165,79 @@ void main() {
       expect(s.box, isNotNull);
       expectBoxCloseTo(s.box, box);
     });
+
+    test('imported single-keyframe sidecar re-anchors to t=0 when trimmed', () {
+      final box = VGROIBox(x: 0.25, y: 0.30, w: 0.40, h: 0.35);
+      final sidecar = makeImportedSidecar(
+        displayWidth: 1080,
+        displayHeight: 1920,
+        durationMs: 10000,
+        samples: [
+          _makeSample(
+            timestampMs: 0,
+            framePtsMs: 0,
+            recordingRelativeMs: 0,
+            box: box,
+            quality: 'detected',
+            confidence: 0.95,
+          ),
+        ],
+      );
+
+      // Trim from t=2.5s to t=7.5s (sample at t=0 must NOT be dropped)
+      final exportSidecar = VGROISidecarExportMapper.mapSidecar(
+        captureSidecar: sidecar,
+        sourceWidth: 1080,
+        sourceHeight: 1920,
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        trimStartSeconds: 2.5,
+        trimEndSeconds: 7.5,
+      );
+
+      expect(exportSidecar.samples.length, equals(1));
+      final s = exportSidecar.samples.single;
+      expect(s.timestampMs, equals(0));
+      expect(s.framePtsMs, equals(0));
+      expect(s.recordingRelativeMs, equals(0));
+      expect(s.quality, equals('detected'));
+      expect(s.box, isNotNull);
+      expectBoxCloseTo(s.box, box);
+      expect(exportSidecar.videoIdentity.durationMs, equals(5000));
+    });
+
+    test('imported empty sidecar (quality missing, box null) preserves empty sample on trim', () {
+      final sidecar = makeImportedSidecar(
+        displayWidth: 1080,
+        displayHeight: 1920,
+        durationMs: 10000,
+        samples: [
+          _makeSample(
+            timestampMs: 0,
+            framePtsMs: 0,
+            recordingRelativeMs: 0,
+            box: null,
+            quality: 'missing',
+          ),
+        ],
+      );
+
+      final exportSidecar = VGROISidecarExportMapper.mapSidecar(
+        captureSidecar: sidecar,
+        sourceWidth: 1080,
+        sourceHeight: 1920,
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        trimStartSeconds: 1.0,
+        trimEndSeconds: 4.0,
+      );
+
+      expect(exportSidecar.samples.length, equals(1));
+      final s = exportSidecar.samples.single;
+      expect(s.timestampMs, equals(0));
+      expect(s.quality, equals('missing'));
+      expect(s.box, isNull);
+      expect(exportSidecar.videoIdentity.durationMs, equals(3000));
+    });
   });
 }

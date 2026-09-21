@@ -276,6 +276,8 @@ export 'src/roi/vg_roi_export_mapper.dart';
 export 'src/roi/vg_imported_roi_sidecar_builder.dart';
 // P5-ANIM-ROI: Pure-Dart animated / keyframed ROI sidecar builder
 export 'src/roi/vg_roi_keyframe_sidecar_builder.dart';
+// Phase 5-Unit N/O: Export-space ROI sidecar post-processor (single-clip and multi-clip timeline)
+export 'src/roi/vg_roi_export_sidecar_post_processor.dart';
 // Audio Track Interaction S-P1: timeline-scoped live filter-chain control.
 export 'vg_timeline_live_controls.dart';
 // V-B1/V-B2: per-track live mix-gain control (no updateDraft call).

@@ -6,6 +6,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -95,8 +96,7 @@ class AndroidNormalizeVideoSession(private val context: Context) {
             .coerceIn(0L, MAX_DIAGNOSTIC_HOLD_MS)
 
         // -- 2. Source readability ---------------------------------------
-        val inputFile = File(inputPath)
-        if (!inputFile.exists() || !inputFile.canRead()) {
+        if (!AndroidUriDataSourceHelper.isReadable(inputPath, context)) {
             onError("FILE_UNREADABLE", "normalizeVideo: cannot read source: $inputPath")
             return
         }
@@ -233,7 +233,7 @@ class AndroidNormalizeVideoSession(private val context: Context) {
     private fun probeSource(inputPath: String): SourceProbe? {
         val extractor = MediaExtractor()
         try {
-            extractor.setDataSource(inputPath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, inputPath, context)
             var hasVideoTrack = false
             var rotationDegrees = 0
             var hasAudioTrack = false
@@ -291,7 +291,7 @@ class AndroidNormalizeVideoSession(private val context: Context) {
         var failureReason: String? = null
 
         try {
-            extractor.setDataSource(inputPath)
+            AndroidUriDataSourceHelper.setExtractorDataSource(extractor, inputPath, context)
 
             var videoTrackIndex = -1
             var audioTrackIndex = -1

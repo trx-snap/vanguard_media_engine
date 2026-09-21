@@ -2428,7 +2428,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                             // Build result map. Existing keys are preserved unchanged.
                             val resultMap = mutableMapOf<String, Any?>(
                                 "kind"                 to kind,
-                                "container"            to container,
+                                "container"            to if (container.isNotEmpty()) container else when (mimeType) {
+                                    "video/mp4", "application/mp4" -> "mp4"
+                                    "video/quicktime" -> "mov"
+                                    "video/x-matroska" -> "mkv"
+                                    "video/webm" -> "webm"
+                                    else -> ""
+                                },
                                 "videoCodec"           to videoCodec,
                                 "audioCodec"           to audioCodec,
                                 "width"                to w,
