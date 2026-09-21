@@ -7,27 +7,32 @@
 // CRITICAL WARNING / MOTIVATION:
 // The existing long harness (android_duet_green_screen_sustained_baseline_physical_smoke.dart)
 // has a default observation window of 45 seconds. However, the clip_A.mov fixture is
-// only ~9.83s long (measured via ffprobe), and trimEnd is set to 9.0s. Because
-// AndroidDuetPreviewClock clamps playback to trimEndMs, the decoded source video
-// intentionally freezes on its last frame after 9.0s, leaving the remaining ~36s
-// of the 45s run frozen. That long harness is strictly for degradation/endurance
+// only ~5.928s long (measured via ffprobe/physical run), and trimEnd is set to 5.0s.
+// Because AndroidDuetPreviewClock clamps playback to trimEndMs, the decoded source
+// video intentionally freezes on its last frame after 5.0s, leaving the remaining
+// ~40s of the 45s run frozen. That long harness is strictly for degradation/endurance
 // detection (monitoring green_screen_degraded / green_screen_fallback events
 // against the live camera feed), NOT for visual moving-background proof.
 //
 // THIS HARNESS EXISTS SPECIFICALLY TO AVOID TREATING THE 45S SUSTAINED HARNESS AS
 // VISUAL MOVING-VIDEO PROOF.
 //
-// By establishing a bounded 8.0-second observation window (default, override with
-// --dart-define=BOUNDED_SECONDS=<n>) with trimEnd remaining at 9.0 seconds, the
-// entire observation window executes strictly within the moving-video playback
-// range of the ~9.83s clip_A.mov fixture, providing definitive visual proof that
-// the decoded source video background moves continuously behind the live camera
-// segmentation mask without freezing.
+// By establishing a bounded 4.0-second observation window (default, override with
+// --dart-define=ANDROID_DUET_VIDEO_BACKGROUND_HOLD_SECONDS=<n>, or the legacy
+// --dart-define=BOUNDED_SECONDS=<n> / --dart-define=SUSTAINED_SECONDS=<n>) with
+// trimEnd remaining at 5.0 seconds, the entire observation window executes strictly
+// within the moving-video playback range of the ~5.928s clip_A.mov fixture, providing
+// definitive visual proof that the decoded source video background moves continuously
+// behind the live camera segmentation mask without freezing. Any provided override is
+// clamped to stay within this safe window: values <= 0 fall back to the 4s default,
+// and values above the safe window are clamped down to 4s so this harness never claims
+// moving background beyond the 5.0s trim.
 //
 // Physical evidence from Android SM A566B:
-// Short run with SUSTAINED_SECONDS=8 passed on Android SM A566B:
-// first mask ready before recording begin, duetEvents=0,
-// summary count=242 masks=242 skipped=0 failures=0 avgMs=14 maxMs=44.
+// Short run with SUSTAINED_SECONDS=8 previously failed before preview because
+// initializeDuetSession rejected trimEnd=9.0 against the current ~5.928s clip_A.mov
+// fixture (source duration was 5928ms). This harness now targets the current fixture
+// duration so a bounded moving-video run can complete against the live device.
 //
 // Production ladder only:
 // Attaches with the production ladder only (mediapipe_cpu -> mlkit):
@@ -44,7 +49,7 @@
 //       cd packages/vanguard_media_engine/example &&
 //       flutter run -d <deviceId> \
 //         -t lib/android_duet_green_screen_video_background_bounded_physical_smoke.dart \
-//         --dart-define=BOUNDED_SECONDS=8
+//         --dart-define=ANDROID_DUET_VIDEO_BACKGROUND_HOLD_SECONDS=4
 //   - Claims allowed:
 //       * local source session init
 //       * attach-time greenScreen layout accepted on the production ladder
@@ -54,10 +59,11 @@
 //       * preview texture attach success
 //       * startRecording activates render loop and camera
 //       * bounded production-ladder segmentation window (mediapipe_cpu -> mlkit) runs
-//         continuously against the live camera feed for the full 8s observation duration
+//         continuously against the live camera feed for the full observation duration
+//         (default 4s, clamped to a safe maximum of 4s)
 //       * decoded source video plays as genuine moving video background (moving picture,
-//         not a frozen frame) for the bounded in-trim observation window (0.0s -> 8.0s,
-//         safely within the 9.0s trim window of the ~9.83s clip_A.mov fixture)
+//         not a frozen frame) for the bounded in-trim observation window (0.0s -> 4.0s,
+//         safely within the 5.0s trim window of the ~5.928s clip_A.mov fixture)
 //       * zero matching Duet degrade/fallback events during window (green_screen_degraded /
 //         green_screen_fallback for this session, observed via VGDuetEvents.stream)
 //       * native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS /
@@ -66,7 +72,7 @@
 //       * stop/detach/dispose/temp cleanup complete
 //   - Non-claims:
 //       * moving decoded source video is claimed ONLY for the bounded in-trim window
-//         (0.0s -> 8.0s <= 9.0s trimEnd < 9.83s clip duration); no claim of full-duration
+//         (0.0s -> 4.0s <= 5.0s trimEnd < ~5.928s clip duration); no claim of full-duration
 //         looping or playback past trimEnd
 //       * no automated pixel or matte-quality proof
 //       * no export or audio proof
@@ -97,25 +103,43 @@ const String kObserveTickMarker =
     'ANDROID_DUET_GREENSCREEN_VIDEO_BACKGROUND_BOUNDED_OBSERVE_TICK';
 
 /// Length of the bounded live-preview observation window, in seconds.
-/// Override with `--dart-define=BOUNDED_SECONDS=<n>` or `--dart-define=SUSTAINED_SECONDS=<n>`.
-/// Default is 8 seconds to guarantee the observation finishes before the 9.0s trim end.
-const int _rawBoundedSeconds = int.fromEnvironment(
-  'BOUNDED_SECONDS',
-  defaultValue: int.fromEnvironment('SUSTAINED_SECONDS', defaultValue: 8),
+/// Preferred override: `--dart-define=ANDROID_DUET_VIDEO_BACKGROUND_HOLD_SECONDS=<n>`.
+/// Legacy overrides `--dart-define=BOUNDED_SECONDS=<n>` and
+/// `--dart-define=SUSTAINED_SECONDS=<n>` remain supported as fallbacks.
+/// Default is 4 seconds to guarantee the observation finishes before the 5.0s trim end.
+const int _rawObservationSeconds = int.fromEnvironment(
+  'ANDROID_DUET_VIDEO_BACKGROUND_HOLD_SECONDS',
+  defaultValue: int.fromEnvironment(
+    'BOUNDED_SECONDS',
+    defaultValue: int.fromEnvironment('SUSTAINED_SECONDS', defaultValue: 4),
+  ),
 );
-const int kBoundedObservationSeconds = _rawBoundedSeconds > 0
-    ? _rawBoundedSeconds
-    : 8;
+
+/// Safe upper bound for the observation window: the entire window must stay
+/// within the moving-video playback range of the ~5.928s clip_A.mov fixture
+/// (trimEnd = 5.0s), so an observation window here never claims moving
+/// background beyond the trim.
+const int kMaxSafeObservationSeconds = 4;
+
+/// Non-positive overrides fall back to the 4s default; overrides above the
+/// safe window are clamped down so the harness never claims moving
+/// background beyond [kTrimEndSeconds].
+const int kBoundedObservationSeconds = _rawObservationSeconds <= 0
+    ? 4
+    : (_rawObservationSeconds > kMaxSafeObservationSeconds
+          ? kMaxSafeObservationSeconds
+          : _rawObservationSeconds);
 
 /// How often an observe tick (and eventCount snapshot) is printed.
 const int kObserveTickIntervalSeconds = 2;
 
 /// Trim end (seconds) for the staged source clip. clip_A.mov duration is
-/// ~9.83s (measured via ffprobe). With kTrimEndSeconds = 9.0s and the default
-/// [kBoundedObservationSeconds] = 8s, the entire 8-second observation window
-/// is safely bounded within the source video's moving-picture playback window,
-/// providing genuine visual proof of moving video background.
-const double kTrimEndSeconds = 9.0;
+/// ~5.928s (measured via ffprobe/physical run). With kTrimEndSeconds = 5.0s
+/// and the default [kBoundedObservationSeconds] = 4s, the entire 4-second
+/// observation window is safely bounded within the source video's
+/// moving-picture playback window, providing genuine visual proof of moving
+/// video background.
+const double kTrimEndSeconds = 5.0;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -248,9 +272,9 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
       );
 
       // Step 2: Initialize Duet session (trim: 0.0s - kTrimEndSeconds).
-      // With kTrimEndSeconds = 9.0s and kBoundedObservationSeconds = 8.0s,
+      // With kTrimEndSeconds = 5.0s and kBoundedObservationSeconds = 4.0s,
       // the observation window is completely within the active moving-picture
-      // portion of clip_A.mov (~9.83s fixture).
+      // portion of clip_A.mov (~5.928s fixture).
       sessionId = await runStep<String>(
         'INIT_SESSION',
         'Initializing Duet session (trim: 0.0s - ${kTrimEndSeconds}s)',
@@ -530,7 +554,7 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
               'mediapipe_cpu -> mlkit) runs continuously against the live camera feed',
           'decoded source video plays as genuine moving video background (not frozen) '
               'for the bounded observation window (0.0s -> ${kBoundedObservationSeconds}s, '
-              'safely within the ${kTrimEndSeconds}s trim window of the ~9.83s clip_A.mov fixture)',
+              'safely within the ${kTrimEndSeconds}s trim window of the ~5.928s clip_A.mov fixture)',
           'zero matching Duet degrade/fallback events (green_screen_degraded / '
               'green_screen_fallback) for this session during the bounded observation window',
           'native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS / '
@@ -541,7 +565,7 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
         'nonClaims': <String>[
           'no moving video proof beyond the bounded trim window: moving decoded source '
               'video is claimed only for the bounded in-trim window (${kBoundedObservationSeconds}s '
-              'observation <= ${kTrimEndSeconds}s trimEnd < ~9.83s clip duration); no claim of '
+              'observation <= ${kTrimEndSeconds}s trimEnd < ~5.928s clip duration); no claim of '
               'full-duration looping or playback past trimEnd',
           'no automated pixel or matte-quality proof',
           'no export or audio proof',

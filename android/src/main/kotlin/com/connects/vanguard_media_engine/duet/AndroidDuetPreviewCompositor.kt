@@ -84,6 +84,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         // identity so the unrotated fast path (existing viewport/scissor crop,
         // unchanged pixel output) is used instead of the rotated-quad path.
         private const val ROTATION_EPSILON_DEGREES = 1e-4
+
+        /** Normalizes any integer degrees to a cardinal 0/90/180/270 value; anything else maps to 0. */
+        private fun normalizeRotationDegrees(degrees: Int): Int {
+            return when (((degrees % 360) + 360) % 360) {
+                0 -> 0
+                90 -> 90
+                180 -> 180
+                270 -> 270
+                else -> 0
+            }
+        }
     }
 
     // -- EGL core (created lazily on first attach, destroyed only in release) --
@@ -167,9 +178,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private var sourceRect: VGDuetPixelRect? = null
     private var cameraRect: VGDuetPixelRect? = null
 
-    /** Source video dimensions used for aspect-fill; 0 means unknown (stretch). */
+    /** Raw decoded source video dimensions used for aspect-fill; 0 means unknown (stretch). */
     private var sourceVideoWidthPx = 0
     private var sourceVideoHeightPx = 0
+
+    /**
+     * Source video's normalized (0/90/180/270) display rotation, as reported
+     * by the decoder. [aspectFillViewport] swaps [sourceVideoWidthPx]/
+     * [sourceVideoHeightPx] for 90/270 so the background aspect matches the
+     * upright display orientation instead of the raw decoded buffer's shape.
+     */
+    private var sourceVideoRotationDegrees = 0
 
     private val isReleased = AtomicBoolean(false)
 
@@ -365,10 +384,28 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * Source video dimensions used for aspect-fill inside the source rect.
      * Read off the decoder (on the decoder thread) by the render loop and
      * forwarded here. Unknown (<= 0) falls back to a plain stretch fill.
+     * Resets the stored rotation to 0 (identity); callers that also know the
+     * source's display rotation should use [setSourceVideoMetadata] instead.
      */
     override fun setSourceVideoSize(widthPx: Int, heightPx: Int) {
+        applySourceVideoMetadata(widthPx, heightPx, rotationDegrees = 0)
+    }
+
+    /**
+     * Backwards-safe superset of [setSourceVideoSize]: also carries the source
+     * video's display rotation, normalized to 0/90/180/270 (any other value
+     * degrades to 0), so [aspectFillViewport] can swap width/height for a
+     * 90/270 source instead of aspect-filling with the raw decoded buffer's
+     * (sideways) shape.
+     */
+    override fun setSourceVideoMetadata(widthPx: Int, heightPx: Int, rotationDegrees: Int) {
+        applySourceVideoMetadata(widthPx, heightPx, rotationDegrees)
+    }
+
+    private fun applySourceVideoMetadata(widthPx: Int, heightPx: Int, rotationDegrees: Int) {
         sourceVideoWidthPx = widthPx
         sourceVideoHeightPx = heightPx
+        sourceVideoRotationDegrees = normalizeRotationDegrees(rotationDegrees)
     }
 
     // -- Green-screen controls (render-thread only for enabled; AtomicRef for mask) --
@@ -1626,8 +1663,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     /**
      * Viewport for an aspect-fill of the source video into [rect]: same centre,
-     * inflated along one axis to the video's aspect ratio. Unknown video size
-     * degrades to the rect itself (stretch).
+     * inflated along one axis to the video's display aspect ratio. Unknown
+     * video size degrades to the rect itself (stretch). For a 90/270-degree
+     * [sourceVideoRotationDegrees], the raw decoded width/height are swapped
+     * first so the aspect used here matches the upright display orientation
+     * rather than the sideways decode buffer.
      */
     private fun aspectFillViewport(rect: VGDuetPixelRect): GlRect {
         val rectW = rect.width
@@ -1635,7 +1675,16 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         if (sourceVideoWidthPx <= 0 || sourceVideoHeightPx <= 0 || rectW <= 0.0 || rectH <= 0.0) {
             return toGlRect(rect.left, rect.top, rectW, rectH)
         }
-        val videoAspect = sourceVideoWidthPx.toDouble() / sourceVideoHeightPx.toDouble()
+        val displayWidthPx: Int
+        val displayHeightPx: Int
+        if (sourceVideoRotationDegrees == 90 || sourceVideoRotationDegrees == 270) {
+            displayWidthPx = sourceVideoHeightPx
+            displayHeightPx = sourceVideoWidthPx
+        } else {
+            displayWidthPx = sourceVideoWidthPx
+            displayHeightPx = sourceVideoHeightPx
+        }
+        val videoAspect = displayWidthPx.toDouble() / displayHeightPx.toDouble()
         val rectAspect = rectW / rectH
         val drawnW: Double
         val drawnH: Double
