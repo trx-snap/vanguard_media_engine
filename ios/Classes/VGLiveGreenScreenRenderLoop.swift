@@ -83,6 +83,13 @@ final class VGLiveGreenScreenRenderLoop {
     /// Invoked on main, only while not stopped, with a composited output buffer.
     typealias PresentHandler = (CVPixelBuffer) -> Void
 
+    /// Optional live-video background frame provider. When non-nil, called on
+    /// every render *before* the composite to get the latest decoded video frame.
+    /// The closure is stored and released on the main thread only. Returns nil
+    /// when no frame is available yet; the stored static background is used as
+    /// the fallback so the render is never dropped.
+    typealias BackgroundFrameProvider = () -> CVPixelBuffer?
+
     private let compositor: VGLiveGreenScreenCompositor
     private let cameraFrameProvider: CameraFrameProvider
     private let maskProvider: MaskProvider
@@ -93,8 +100,12 @@ final class VGLiveGreenScreenRenderLoop {
 
     // MARK: Main-thread state
 
-    /// Static background presented as the full-canvas source layer.
+    /// Static background presented as the full-canvas source layer (also the
+    /// fallback when the video provider returns nil).
     private var background: CVPixelBuffer
+    /// Optional live-video background provider. When non-nil it is called on
+    /// every render to supply the latest decoded video frame.
+    private var backgroundFrameProvider: BackgroundFrameProvider?
     /// Full-canvas rect for the background layer (top-left origin).
     private let fullCanvasRect: CGRect
     /// Current foreground (keyed camera) rect (top-left origin).
@@ -121,16 +132,18 @@ final class VGLiveGreenScreenRenderLoop {
          foregroundRect: CGRect,
          cameraFrameProvider: @escaping CameraFrameProvider,
          maskProvider: @escaping MaskProvider,
-         presentHandler: @escaping PresentHandler) {
-        self.compositor          = compositor
-        self.background          = background
-        self.fullCanvasRect      = CGRect(x: 0, y: 0,
-                                          width: compositor.canvasWidth,
-                                          height: compositor.canvasHeight)
-        self.foregroundRect      = foregroundRect
-        self.cameraFrameProvider = cameraFrameProvider
-        self.maskProvider        = maskProvider
-        self.presentHandler      = presentHandler
+         presentHandler: @escaping PresentHandler,
+         backgroundFrameProvider: BackgroundFrameProvider? = nil) {
+        self.compositor               = compositor
+        self.background               = background
+        self.fullCanvasRect           = CGRect(x: 0, y: 0,
+                                               width: compositor.canvasWidth,
+                                               height: compositor.canvasHeight)
+        self.foregroundRect           = foregroundRect
+        self.cameraFrameProvider      = cameraFrameProvider
+        self.maskProvider             = maskProvider
+        self.presentHandler           = presentHandler
+        self.backgroundFrameProvider  = backgroundFrameProvider
     }
 
     deinit {
@@ -165,6 +178,18 @@ final class VGLiveGreenScreenRenderLoop {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
         background = buffer
+        requestRender()
+    }
+
+    /// Replaces (or clears) the live-video background provider. When set to a
+    /// non-nil closure the loop calls it on every render to obtain the latest
+    /// decoded video frame; the stored static buffer remains the fallback.
+    /// Clears the provider when `nil` is passed (switches back to the static
+    /// background). Forces the next render so the change is visible immediately.
+    func updateVideoBackgroundProvider(_ provider: BackgroundFrameProvider?) {
+        assert(Thread.isMainThread)
+        guard !isStopped else { return }
+        backgroundFrameProvider = provider
         requestRender()
     }
 
@@ -232,7 +257,16 @@ final class VGLiveGreenScreenRenderLoop {
         inFlight      = true
         renderPending = false
 
-        let sourceFrame = background
+        // Obtain the current background frame. When a live-video provider is
+        // wired, call it on the main thread (non-blocking: it just returns the
+        // last decoded frame held by the player) and fall back to the static
+        // buffer if it returns nil (first frame not yet decoded, or EOF).
+        let sourceFrame: CVPixelBuffer
+        if let videoFrame = backgroundFrameProvider?() {
+            sourceFrame = videoFrame
+        } else {
+            sourceFrame = background
+        }
         let sourceRect  = fullCanvasRect
         let cameraRect  = foregroundRect
         let keyed       = isKeyingEnabled

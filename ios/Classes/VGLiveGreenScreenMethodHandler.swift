@@ -203,13 +203,15 @@ final class VGLiveGreenScreenMethodHandler {
         case "updateLiveGreenScreenBackground":
             guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
             let spec: VGLiveGreenScreenBackgroundSpec
+            let videoSpec: VGLiveGreenScreenVideoSpec?
             do {
-                spec = try VGLiveGreenScreenMethodHandler.parseBackground(args?["background"])
+                (spec, videoSpec) = try VGLiveGreenScreenMethodHandler.parseBackground(args?["background"])
             } catch {
                 result(VGLiveGreenScreenMethodHandler.invalidArg(method: method, error: error))
                 return
             }
-            coordinator.updateBackground(sessionId: sid, background: spec) { val, err in
+            coordinator.updateBackground(sessionId: sid, background: spec,
+                                         videoBackground: videoSpec) { val, err in
                 self.reply(result: result, value: val, error: err)
             }
 
@@ -448,17 +450,31 @@ final class VGLiveGreenScreenMethodHandler {
               width > 0, height > 0 else {
             throw ParseError(message: "canvasSize.width and canvasSize.height must be numbers > 0")
         }
-        let background = try parseBackground(args["background"])
+        let (background, videoBackground) = try parseBackground(args["background"])
         let transform  = parseTransform(args["foregroundTransform"])
         return VGLiveGreenScreenStartRequest(canvasWidth: width,
                                              canvasHeight: height,
                                              background: background,
+                                             videoBackground: videoBackground,
                                              foregroundTransform: transform)
     }
 
-    /// Accepts `solidColor` and `image` only. Video (and any unknown type) is
-    /// rejected: video backgrounds are not supported by the live session.
-    static func parseBackground(_ raw: Any?) throws -> VGLiveGreenScreenBackgroundSpec {
+    /// Accepts `solidColor`, `image`, `video`, and `videoFile`.
+    ///
+    /// Returns a tuple of:
+    ///   - `VGLiveGreenScreenBackgroundSpec`: the static background spec.
+    ///     For video backgrounds this is `.solidColor(argb: 0)` (opaque black)
+    ///     used only while the first video frame decodes.
+    ///   - `VGLiveGreenScreenVideoSpec?`: non-nil for video backgrounds, nil
+    ///     for solidColor and image.
+    ///
+    /// Failure modes:
+    ///   - Missing or non-map `background`: throws with INVALID_ARG.
+    ///   - Missing or non-string `type`: throws with INVALID_ARG.
+    ///   - Video type with missing/blank `filePath`: throws with INVALID_ARG.
+    ///   - Invalid `scaleMode` for any background type: throws with INVALID_ARG.
+    ///   - Unknown `type`: throws with INVALID_ARG.
+    static func parseBackground(_ raw: Any?) throws -> (VGLiveGreenScreenBackgroundSpec, VGLiveGreenScreenVideoSpec?) {
         guard let dict = raw as? [String: Any] else {
             throw ParseError(message: "missing required argument 'background'")
         }
@@ -470,7 +486,7 @@ final class VGLiveGreenScreenMethodHandler {
             guard let color = int64Value(dict["argbColor"]) else {
                 throw ParseError(message: "background.argbColor must be a number")
             }
-            return .solidColor(argb: Int32(truncatingIfNeeded: color))
+            return (.solidColor(argb: Int32(truncatingIfNeeded: color)), nil)
 
         case "image":
             guard let path = dict["filePath"] as? String,
@@ -478,13 +494,28 @@ final class VGLiveGreenScreenMethodHandler {
                 throw ParseError(message: "background.filePath must be a non-blank string")
             }
             let scaleMode = try parseScaleMode(dict["scaleMode"])
-            return .image(filePath: path, scaleMode: scaleMode)
+            return (.image(filePath: path, scaleMode: scaleMode), nil)
 
         case "video", "videoFile":
-            throw ParseError(message: "video backgrounds are not supported by the live green-screen session; use solidColor or image")
+            // Required: non-empty local file path.
+            guard let path = dict["filePath"] as? String,
+                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ParseError(message: "background.filePath must be a non-blank string for video background")
+            }
+            let scaleMode = try parseScaleMode(dict["scaleMode"])
+            // Video backgrounds are composited via aspectFill only (the render
+            // compositor always aspect-fills the source frame). aspectFit would
+            // have no effect and is rejected so callers are not silently misled.
+            guard scaleMode == .aspectFill else {
+                throw ParseError(message: "video backgrounds only support scaleMode aspectFill; aspectFit is not implemented for video (use aspectFill or omit scaleMode)")
+            }
+            // Placeholder background used until the first video frame decodes.
+            let placeholderSpec = VGLiveGreenScreenBackgroundSpec.solidColor(argb: 0)
+            let videoSpec = VGLiveGreenScreenVideoSpec(filePath: path, scaleMode: scaleMode)
+            return (placeholderSpec, videoSpec)
 
         default:
-            throw ParseError(message: "background.type must be one of solidColor, image (got '\(type)')")
+            throw ParseError(message: "background.type must be one of solidColor, image, video (got '\(type)')")
         }
     }
 

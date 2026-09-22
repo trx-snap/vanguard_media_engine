@@ -140,14 +140,30 @@ import CoreMedia
 import CoreVideo
 import Flutter
 import Foundation
+import os.lock
 
 // MARK: - Start request
+
+/// Validated video background arguments for a live GreenScreen session.
+/// Parsed and validated by `VGLiveGreenScreenMethodHandler.parseBackground`
+/// when `background.type` is "video" or "videoFile".
+struct VGLiveGreenScreenVideoSpec {
+    /// Absolute local file path. Guaranteed non-empty by the method handler.
+    let filePath: String
+    /// Scale mode (aspectFill default; aspectFit when explicitly requested).
+    let scaleMode: VGLiveGreenScreenBackgroundScaleMode
+}
 
 /// Validated `startLiveGreenScreenSession` arguments (built by the handler).
 struct VGLiveGreenScreenStartRequest {
     let canvasWidth: Int
     let canvasHeight: Int
+    /// Solid-color or still-image background. For video backgrounds this is a
+    /// solid-black placeholder used only while the first video frame decodes;
+    /// the actual content is supplied by `videoBackground`.
     let background: VGLiveGreenScreenBackgroundSpec
+    /// Non-nil when the caller requested a video background.
+    let videoBackground: VGLiveGreenScreenVideoSpec?
     /// nil → full-canvas identity (foregroundTransform omitted or malformed).
     let foregroundTransform: NativeForegroundTransform?
 }
@@ -197,6 +213,272 @@ struct VGLiveGreenScreenDiagnosticsOptions {
             "iosSegmentationBackend": iosSegmentationBackend,
             "iosLiveMatteRefinement": iosLiveMatteRefinement,
         ]
+    }
+}
+
+// MARK: - Video background player errors
+
+private enum VGVideoBackgroundError: Error, LocalizedError {
+    case noVideoTrack
+    case zeroDuration
+    case readerInitFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noVideoTrack:
+            return "Video file contains no video track."
+        case .zeroDuration:
+            return "Video file has zero or indeterminate duration."
+        case .readerInitFailed(let msg):
+            return "Video reader initialisation failed: \(msg)"
+        }
+    }
+}
+
+// MARK: - Video background player
+
+/// Decodes a looping local video file and vends the latest BGRA frame for the
+/// live GreenScreen render loop to poll non-blocking on the main thread.
+///
+/// Lifecycle:
+///   1. Call `validateAndGetDuration()` synchronously (safe on the main thread
+///      for local files). Throws on missing track, zero duration, or reader
+///      setup failure. Returns video duration in seconds.
+///   2. Call `start()` to begin the decode loop on `decodeQueue`.
+///   3. Call `latestFrame()` on any thread at any time (non-blocking).
+///   4. Call `release()` to stop. Idempotent; safe from any thread.
+///
+/// Real-time pacing: the decode loop records `loopStartTime = CACurrentMediaTime()`
+/// before each pass, then for every decoded frame sleeps until
+/// `loopStartTime + framePTSSeconds` before vending the buffer. At EOF
+/// `loopStartTime` advances by `videoDuration` so the next loop begins
+/// seamlessly. The last decoded frame is retained across the brief reset
+/// so the render loop never sees nil mid-loop.
+private final class VGLiveGreenScreenVideoBackgroundPlayer {
+
+    private let url: URL
+    /// Duration in seconds, set by validateAndGetDuration(). Used by the
+    /// decode loop to advance loopStartTime at EOF.
+    private(set) var videoDuration: Double = 0
+
+    private let decodeQueue = DispatchQueue(
+        label: "com.connects.vanguard.livegreenscreen.videobg.decode",
+        qos: .userInteractive)
+
+    // os_unfair_lock protecting _latestFrame and _isReleased.
+    private var _lock = os_unfair_lock_s()
+    private var _latestFrame: CVPixelBuffer?
+    private var _isReleased = false
+
+    // Retained after validateAndGetDuration() for reuse in the decode loop.
+    private var preparedAsset: AVURLAsset?
+    private var preparedTrack: AVAssetTrack?
+
+    // Decode-queue state; nil while not reading.
+    private var assetReader: AVAssetReader?
+    private var trackOutput: AVAssetReaderVideoCompositionOutput?
+
+    // MARK: Init
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    // MARK: Public
+
+    /// Synchronous pre-flight validation. Must be called on the main thread
+    /// before `start()`. For local files the AVAsset track load and a brief
+    /// startReading probe are fast (< ~10 ms). Throws `VGVideoBackgroundError`
+    /// on failure so the caller can fail closed before allocating any session
+    /// resources.
+    ///
+    /// - Returns: video duration in seconds (also stored in `videoDuration`).
+    @discardableResult
+    func validateAndGetDuration() throws -> Double {
+        let asset = AVURLAsset(url: url,
+                               options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            throw VGVideoBackgroundError.noVideoTrack
+        }
+        let dur = CMTimeGetSeconds(asset.duration)
+        guard dur.isFinite, dur > 0 else {
+            throw VGVideoBackgroundError.zeroDuration
+        }
+        // Probe: verify AVAssetReader can be initialised and started.
+        let probeSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        let probeComposition = AVMutableVideoComposition(propertiesOf: asset)
+        let probeOutput = AVAssetReaderVideoCompositionOutput(videoTracks: [track],
+                                                              videoSettings: probeSettings)
+        probeOutput.videoComposition    = probeComposition
+        probeOutput.alwaysCopiesSampleData = false
+        let probeReader: AVAssetReader
+        do {
+            probeReader = try AVAssetReader(asset: asset)
+        } catch {
+            throw VGVideoBackgroundError.readerInitFailed(error.localizedDescription)
+        }
+        guard probeReader.canAdd(probeOutput) else {
+            throw VGVideoBackgroundError.readerInitFailed("Cannot add output to probe AVAssetReader")
+        }
+        probeReader.add(probeOutput)
+        probeReader.timeRange = CMTimeRange(
+            start: .zero,
+            duration: CMTime(seconds: 0.1, preferredTimescale: 600))
+        guard probeReader.startReading() else {
+            throw VGVideoBackgroundError.readerInitFailed(
+                probeReader.error?.localizedDescription ?? "startReading failed on probe reader")
+        }
+        probeReader.cancelReading()
+
+        self.videoDuration   = dur
+        self.preparedAsset   = asset
+        self.preparedTrack   = track
+        return dur
+    }
+
+    /// Begins the real-time decode loop on `decodeQueue`.
+    /// Must only be called after a successful `validateAndGetDuration()`.
+    func start() {
+        decodeQueue.async { [weak self] in
+            self?.runDecodeLoop()
+        }
+    }
+
+    /// Returns the most recently decoded video frame, or nil before the first
+    /// frame is ready or after `release()`. Non-blocking; safe on any thread.
+    func latestFrame() -> CVPixelBuffer? {
+        os_unfair_lock_lock(&_lock)
+        let frame = _latestFrame
+        os_unfair_lock_unlock(&_lock)
+        return frame
+    }
+
+    /// Idempotent terminal teardown. After this call `latestFrame()` returns nil.
+    /// Safe to call from any thread.
+    func release() {
+        os_unfair_lock_lock(&_lock)
+        _isReleased  = true
+        _latestFrame = nil
+        os_unfair_lock_unlock(&_lock)
+        // Cancel the reader on the decode queue so copyNextSampleBuffer()
+        // unblocks promptly rather than waiting for the next frame interval.
+        decodeQueue.async { [weak self] in self?.cancelReader() }
+    }
+
+    // MARK: Private – real-time decode loop (runs entirely on decodeQueue)
+
+    private func runDecodeLoop() {
+        os_unfair_lock_lock(&_lock)
+        let released = _isReleased
+        os_unfair_lock_unlock(&_lock)
+        guard !released else { return }
+
+        guard let asset = preparedAsset, let track = preparedTrack else { return }
+        let duration = videoDuration
+
+        // Wall-clock reference: video t=0 maps to this host time.
+        // Advances by `duration` at each EOF for seamless looping.
+        var loopStartTime = CACurrentMediaTime()
+
+        outerLoop: while true {
+            os_unfair_lock_lock(&_lock)
+            let stop = _isReleased
+            os_unfair_lock_unlock(&_lock)
+            guard !stop else { break }
+
+            guard setupReader(asset: asset, track: track) else { break }
+
+            guard let output = trackOutput, let reader = assetReader else { break }
+
+            while reader.status == .reading {
+                os_unfair_lock_lock(&_lock)
+                let stop = _isReleased
+                os_unfair_lock_unlock(&_lock)
+                if stop { cancelReader(); break outerLoop }
+
+                guard let sampleBuffer = output.copyNextSampleBuffer() else {
+                    // EOF: advance loop reference time and start next pass.
+                    break
+                }
+
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                let ptsSeconds = CMTimeGetSeconds(pts)
+                guard ptsSeconds.isFinite else { continue }
+
+                // Pace to real-time: sleep until the frame's wall-clock moment.
+                let targetWallTime = loopStartTime + ptsSeconds
+                let sleepSeconds   = targetWallTime - CACurrentMediaTime()
+                if sleepSeconds > 0.001 {
+                    Thread.sleep(forTimeInterval: min(sleepSeconds, 0.5))
+                }
+
+                if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                    os_unfair_lock_lock(&_lock)
+                    if !_isReleased { _latestFrame = imageBuffer }
+                    os_unfair_lock_unlock(&_lock)
+                }
+            }
+
+            // EOF (or reader failed). Advance the loop start reference by the
+            // video duration so the next loop begins at exactly the right
+            // wall-clock offset for seamless playback. Resync to wall clock
+            // if duration drifted past current time.
+            let now = CACurrentMediaTime()
+            if now >= loopStartTime + duration {
+                loopStartTime = now
+            } else {
+                loopStartTime += duration
+            }
+        }
+
+        cancelReader()
+        preparedAsset = nil
+        preparedTrack = nil
+    }
+
+    private func setupReader(asset: AVURLAsset, track: AVAssetTrack) -> Bool {
+        cancelReader()
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        ]
+        let videoComposition = AVMutableVideoComposition(propertiesOf: asset)
+        let output = AVAssetReaderVideoCompositionOutput(videoTracks: [track],
+                                                         videoSettings: outputSettings)
+        output.videoComposition    = videoComposition
+        output.alwaysCopiesSampleData = false
+
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            NSLog("[VGLiveGreenScreenVideoBackgroundPlayer] AVAssetReader init failed for %@",
+                  url.lastPathComponent)
+            return false
+        }
+        guard reader.canAdd(output) else {
+            NSLog("[VGLiveGreenScreenVideoBackgroundPlayer] Cannot add output for %@",
+                  url.lastPathComponent)
+            return false
+        }
+        reader.add(output)
+        reader.timeRange = CMTimeRange(start: .zero, duration: .positiveInfinity)
+        guard reader.startReading() else {
+            NSLog("[VGLiveGreenScreenVideoBackgroundPlayer] startReading failed: %@",
+                  reader.error?.localizedDescription ?? "unknown")
+            return false
+        }
+        assetReader = reader
+        trackOutput = output
+        return true
+    }
+
+    private func cancelReader() {
+        if let r = assetReader, r.status == .reading { r.cancelReading() }
+        assetReader = nil
+        trackOutput = nil
     }
 }
 
@@ -303,6 +585,12 @@ final class VGLiveGreenScreenSessionCoordinator {
         /// verbatim when a fallback pipeline starts mid-session.
         var background: CVPixelBuffer
         var foregroundRect: CGRect
+        /// Active video background player. Non-nil only when the current
+        /// background is a video; nil for solidColor and image backgrounds.
+        var videoPlayer: VGLiveGreenScreenVideoBackgroundPlayer?
+        /// Spec of the most-recently accepted video background (kept so
+        /// describe() can name it in log markers).
+        var videoFilePath: String?
 
         // Adapter path components (nil while the ARKit engine drives the session).
         var cameraSource: VGLiveGreenScreenCameraSource?
@@ -400,6 +688,25 @@ final class VGLiveGreenScreenSessionCoordinator {
             return
         }
 
+        // Validate video decodability before allocating any session resources
+        // (texture, camera, ARKit engine) so a missing track or corrupt file
+        // fails with nothing to unwind. validateAndGetDuration() is synchronous
+        // and fast for local files (< ~10 ms AVAsset track probe + brief read).
+        if let videoSpec = request.videoBackground {
+            let probePlayer = VGLiveGreenScreenVideoBackgroundPlayer(
+                url: URL(fileURLWithPath: videoSpec.filePath))
+            do {
+                try probePlayer.validateAndGetDuration()
+            } catch {
+                let desc = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "startLiveGreenScreenSession: background video is not decodable: \(desc)",
+                    details: nil))
+                return
+            }
+        }
+
         // Build the static background before allocating the texture or camera
         // so a rejected image path fails with nothing to unwind.
         let background: CVPixelBuffer
@@ -450,13 +757,38 @@ final class VGLiveGreenScreenSessionCoordinator {
         // (always asynchronous on main) resolves against `activeSession`.
         activeSession = session
 
+        // Create and validate the video player. validateAndGetDuration() was
+        // already run above as a probe; running it a second time on the real
+        // player object captures the prepared asset and track for the decode loop.
+        if let videoSpec = request.videoBackground {
+            let player = VGLiveGreenScreenVideoBackgroundPlayer(
+                url: URL(fileURLWithPath: videoSpec.filePath))
+            do {
+                try player.validateAndGetDuration()
+            } catch {
+                // Should not happen (probe passed above), but fail closed.
+                // release() unregisters the texture and nils activeSession.
+                release(session)
+                let desc = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "startLiveGreenScreenSession: background video validation failed unexpectedly: \(desc)",
+                    details: nil))
+                return
+            }
+            session.videoPlayer   = player
+            session.videoFilePath = videoSpec.filePath
+            player.start()
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_VIDEO_BG_STARTED sessionId=\(sessionId) filePath=\(videoSpec.filePath) duration=\(player.videoDuration)s")
+        }
+
         // Backend resolution. Exactly one engine is created: the ARKit engine
         // owns the camera through its ARSession and no VGLiveGreenScreenCameraSource
         // exists while it runs; the adapter path owns the camera through
         // VGLiveGreenScreenCameraSource and no ARSession exists.
         let requestedBackend = diagnosticsOptions.iosSegmentationBackend
         let wantsARKit =
-            requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
+            (requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto && request.videoBackground == nil)
             || requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit
         var arkitFailureReason: String?
         if wantsARKit {
@@ -473,10 +805,24 @@ final class VGLiveGreenScreenSessionCoordinator {
         }
 
         if wantsARKit, arkitFailureReason == nil {
+            // ARKit engine started successfully.
             session.effectiveSegmentationBackend = VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit
             session.segmentationBackendSelection =
                 requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto
                 ? "arkit_default" : "arkit_explicit"
+
+            // Video backgrounds require the adapter render loop's frame provider;
+            // the ARKit engine does not support dynamic per-frame background updates.
+            // Fail closed: release the session and return INVALID_ARG.
+            if request.videoBackground != nil {
+                NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_VIDEO_BG_ARKIT_REJECTED sessionId=\(sessionId) reason=arkit_engine_does_not_support_video_background")
+                release(session)  // tears down ARKit engine, video player, texture, and clears activeSession
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "startLiveGreenScreenSession: video backgrounds are not supported when the ARKit segmentation engine is active; use a solidColor or image background, or force the Vision backend via diagnosticsOptions.iosSegmentationBackend.",
+                    details: nil))
+                return
+            }
         } else if requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendARKit {
             // Explicit ARKit could not start: no Vision fallback by design (an
             // A/B run never reports numbers from another provider). The
@@ -499,12 +845,17 @@ final class VGLiveGreenScreenSessionCoordinator {
             let backend: String
             if requestedBackend == VGLiveGreenScreenSessionCoordinator.segmentationBackendAuto {
                 backend = VGLiveGreenScreenSegmentationBackendVisionFast
-                let reason = arkitFailureReason ?? "unknown"
-                let unsupported = reason == "face_tracking_unsupported" || reason == "face_person_segmentation_unsupported"
-                session.segmentationBackendSelection = unsupported
-                    ? "vision_default_arkit_unsupported(\(reason))"
-                    : "vision_fallback_after_arkit_start_failure(\(reason))"
-                NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_UNAVAILABLE_VISION_DEFAULT sessionId=\(sessionId) reason=\(reason) segmentationBackend=\(backend)")
+                if request.videoBackground != nil {
+                    session.segmentationBackendSelection = "vision_default_video_background"
+                    NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_VIDEO_BG_VISION_SELECTION sessionId=\(sessionId) segmentationBackend=\(backend)")
+                } else {
+                    let reason = arkitFailureReason ?? "unknown"
+                    let unsupported = reason == "face_tracking_unsupported" || reason == "face_person_segmentation_unsupported"
+                    session.segmentationBackendSelection = unsupported
+                        ? "vision_default_arkit_unsupported(\(reason))"
+                        : "vision_fallback_after_arkit_start_failure(\(reason))"
+                    NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_ARKIT_UNAVAILABLE_VISION_DEFAULT sessionId=\(sessionId) reason=\(reason) segmentationBackend=\(backend)")
+                }
             } else {
                 backend = requestedBackend
                 session.segmentationBackendSelection = "explicit"
@@ -534,20 +885,76 @@ final class VGLiveGreenScreenSessionCoordinator {
 
     func updateBackground(sessionId: String,
                           background spec: VGLiveGreenScreenBackgroundSpec,
+                          videoBackground videoSpec: VGLiveGreenScreenVideoSpec?,
                           reply: @escaping (Any?, FlutterError?) -> Void) {
         assert(Thread.isMainThread)
         guard let session = resolveActiveSession(sessionId: sessionId,
                                                  route: "updateLiveGreenScreenBackground",
                                                  reply: reply) else { return }
+
+        // ── Video background ─────────────────────────────────────────────────
+        if let videoSpec = videoSpec {
+            // Video backgrounds require the adapter render loop's frame provider.
+            // The ARKit engine does not support dynamic per-frame background updates;
+            // fail closed without touching the active background.
+            if session.arkitEngine != nil {
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "updateLiveGreenScreenBackground: video backgrounds are not supported when the ARKit segmentation engine is active; use a solidColor or image background.",
+                    details: nil))
+                return
+            }
+            // Validate the new video before touching anything on the session
+            // so a missing track or corrupt file leaves the previous background
+            // fully alive (fail-open on update, fail-closed on start).
+            let newPlayer = VGLiveGreenScreenVideoBackgroundPlayer(
+                url: URL(fileURLWithPath: videoSpec.filePath))
+            do {
+                try newPlayer.validateAndGetDuration()
+            } catch {
+                let desc = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "updateLiveGreenScreenBackground: background video is not decodable: \(desc)",
+                    details: nil))
+                return
+            }
+            // Validation passed: hand over atomically.
+            // Release the old player BEFORE starting the new one so only one
+            // decode queue is running at a time.
+            session.videoPlayer?.release()
+            session.videoPlayer   = newPlayer
+            session.videoFilePath = videoSpec.filePath
+            newPlayer.start()
+            let provider: VGLiveGreenScreenRenderLoop.BackgroundFrameProvider = { [weak newPlayer] in
+                newPlayer?.latestFrame()
+            }
+            session.renderLoop?.updateVideoBackgroundProvider(provider)
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_BACKGROUND_UPDATED sessionId=\(sessionId) type=video filePath=\(videoSpec.filePath) duration=\(newPlayer.videoDuration)s")
+            reply(nil, nil)
+            return
+        }
+
+        // ── Static background (solidColor or image) ───────────────────────────
         let buffer: CVPixelBuffer
         do {
             buffer = try backgroundRenderer.build(spec: spec,
                                                   canvasWidth: session.canvasWidth,
                                                   canvasHeight: session.canvasHeight)
         } catch {
+            // Leave the session's existing background fully alive on error.
             reply(nil, VGLiveGreenScreenSessionCoordinator.flutterError(
                 from: error, route: "updateLiveGreenScreenBackground"))
             return
+        }
+        // Tear down any active video player when switching away from video.
+        if session.videoPlayer != nil {
+            session.videoPlayer?.release()
+            session.videoPlayer   = nil
+            session.videoFilePath = nil
+            // Clear the provider on the render loop so it reverts to the
+            // static background buffer.
+            session.renderLoop?.updateVideoBackgroundProvider(nil)
         }
         // Atomic swap on the live engine; camera / segmenter / texture untouched.
         // The session keeps the current buffer so a mid-session fallback
@@ -738,6 +1145,13 @@ final class VGLiveGreenScreenSessionCoordinator {
     private func release(_ session: LiveSession) {
         assert(Thread.isMainThread)
 
+        // Clear the video provider before stopping the render loop so the
+        // loop cannot call into a player that is being torn down.
+        session.renderLoop?.updateVideoBackgroundProvider(nil)
+        session.videoPlayer?.release()
+        session.videoPlayer   = nil
+        session.videoFilePath = nil
+
         session.renderLoop?.stop()
         session.renderLoop = nil
 
@@ -862,6 +1276,15 @@ final class VGLiveGreenScreenSessionCoordinator {
         // the session weakly so the loop never keeps a released session alive.
         let texture   = session.texture
         let textureId = session.textureId
+        // When the session has a live video player, wire its frame provider so
+        // the render loop polls it on every render tick (non-blocking).
+        let videoProvider: VGLiveGreenScreenRenderLoop.BackgroundFrameProvider?
+        if let player = session.videoPlayer {
+            videoProvider = { [weak player] in player?.latestFrame() }
+        } else {
+            videoProvider = nil
+        }
+
         let loop = VGLiveGreenScreenRenderLoop(
             compositor:     compositor,
             background:     session.background,
@@ -899,7 +1322,8 @@ final class VGLiveGreenScreenSessionCoordinator {
             presentHandler: { pixelBuffer in
                 texture.update(pixelBuffer: pixelBuffer)
                 registry.textureFrameAvailable(textureId)
-            })
+            },
+            backgroundFrameProvider: videoProvider)
         session.renderLoop = loop
         loop.start()
     }

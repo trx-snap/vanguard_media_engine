@@ -173,9 +173,9 @@ class VGLiveGreenScreenForegroundTransform {
 
 /// Everything needed to start one live green-screen session.
 ///
-/// [background] must be a [VGGreenScreenSolidColorBackground] or a
-/// [VGGreenScreenImageFileBackground]; a [VGGreenScreenVideoFileBackground]
-/// is rejected with [ArgumentError] (video backgrounds are deferred).
+/// [background] must be a [VGGreenScreenSolidColorBackground], a
+/// [VGGreenScreenImageFileBackground], or a [VGGreenScreenVideoFileBackground]
+/// with a non-blank path.
 class VGLiveGreenScreenConfig {
   /// Pixel size of the composited output texture.
   final VGGreenScreenSize canvasSize;
@@ -197,8 +197,8 @@ class VGLiveGreenScreenConfig {
     validateBackground(background);
   }
 
-  /// Throws [ArgumentError] unless [background] is a solid color or an image
-  /// file with a non-blank path.
+  /// Throws [ArgumentError] unless [background] is a solid color, an image
+  /// file with a non-blank path, or a video file with a non-blank path.
   static void validateBackground(VGGreenScreenBackgroundSource background) {
     switch (background) {
       case VGGreenScreenSolidColorBackground():
@@ -212,20 +212,21 @@ class VGLiveGreenScreenConfig {
           );
         }
         return;
-      case VGGreenScreenVideoFileBackground():
-        throw ArgumentError.value(
-          background,
-          'background',
-          'video backgrounds are not supported by the live green-screen '
-              'session; use solidColor or imageFile',
-        );
+      case VGGreenScreenVideoFileBackground(:final path):
+        if (path.trim().isEmpty) {
+          throw ArgumentError.value(
+            path,
+            'background.path',
+            'must not be blank',
+          );
+        }
+        return;
     }
   }
 
   /// Converts a generic background to the native live-session wire map:
-  /// `{type: solidColor, argbColor}` or `{type: image, filePath, scaleMode}`.
-  ///
-  /// Throws [ArgumentError] for a video background.
+  /// `{type: solidColor, argbColor}`, `{type: image, filePath, scaleMode}`,
+  /// or `{type: video, filePath, scaleMode}`.
   static Map<String, dynamic> backgroundToNativeMap(
     VGGreenScreenBackgroundSource background,
   ) {
@@ -239,9 +240,12 @@ class VGLiveGreenScreenConfig {
           'filePath': path,
           'scaleMode': scaleMode.name,
         };
-      case VGGreenScreenVideoFileBackground():
-        // Unreachable: validateBackground threw above.
-        throw ArgumentError.value(background, 'background', 'unsupported');
+      case VGGreenScreenVideoFileBackground(:final path):
+        return <String, dynamic>{
+          'type': 'video',
+          'filePath': path,
+          'scaleMode': 'aspectFill',
+        };
     }
   }
 
