@@ -3,6 +3,7 @@ package com.connects.vanguard_media_engine.sidecar
 import android.content.Context
 import android.os.Handler
 import android.util.Log
+import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -28,7 +29,7 @@ import kotlin.math.roundToInt
  *   - trim window <= [MAX_DURATION_SECONDS]
  *   - output frame count <= [MAX_FRAMES] (derived from
  *     [AndroidReverseSidecarTranscoder.OUTPUT_FPS])
- *   - target canvas <= [MAX_WIDTH]x[MAX_HEIGHT]
+ *   - target canvas major axis <= [MAX_MAJOR_AXIS], minor axis <= [MAX_MINOR_AXIS]
  *
  * Generation guard: [generation] is captured once per [prepareReverseSidecars]
  * call. [cleanupReverseSidecars]/[disposeAll] bump it. A transcode that
@@ -51,10 +52,11 @@ class AndroidReverseSidecarCoordinator(
         private const val FINAL_SUFFIX = ".mp4"
         private const val MAX_ID_LENGTH = 128
 
-        private const val MAX_DURATION_SECONDS = 5.0
-        private const val MAX_FRAMES = 150
-        private const val MAX_WIDTH = 1920
-        private const val MAX_HEIGHT = 1080
+        private const val MAX_DURATION_SECONDS = 10.05
+        private const val MAX_FRAMES = 305
+        private const val MAX_MAJOR_AXIS = 3840
+        private const val MAX_MINOR_AXIS = 2160
+        private const val PREVIEW_MAX_MAJOR_AXIS = 1920
 
         private const val STATE_PREPARING = "preparing"
         private const val STATE_READY = "ready"
@@ -224,27 +226,41 @@ class AndroidReverseSidecarCoordinator(
             return AdmitOutcome.Resolved(failedStatusMap(clipId, CODE_INVALID_TRIM_RANGE))
         }
 
-        val sourceFile = File(sourcePath)
-        if (!sourceFile.exists() || !sourceFile.canRead()) {
+        if (!AndroidUriDataSourceHelper.isReadable(sourcePath, context)) {
+            Log.w(TAG, "validateAndAdmitClip: clipId=$clipId unreadable sourcePath=$sourcePath")
             storeFailedRecord(clipId, sourceHash, CODE_MISSING_SOURCE_FILE)
             return AdmitOutcome.Resolved(failedStatusMap(clipId, CODE_MISSING_SOURCE_FILE))
         }
 
         val windowSeconds = trimEnd - trimStart
-        val targetWidth = (targetWidthRaw ?: 0.0).roundToInt()
-        val targetHeight = (targetHeightRaw ?: 0.0).roundToInt()
+        var targetWidth = (targetWidthRaw ?: 0.0).roundToInt()
+        var targetHeight = (targetHeightRaw ?: 0.0).roundToInt()
         val frameCount = ceil(windowSeconds * AndroidReverseSidecarTranscoder.OUTPUT_FPS).toInt()
+
+        val majorAxis = maxOf(targetWidth, targetHeight)
+        val minorAxis = minOf(targetWidth, targetHeight)
 
         val outOfBounds = windowSeconds <= 0.0 ||
             windowSeconds > MAX_DURATION_SECONDS ||
             frameCount <= 0 ||
             frameCount > MAX_FRAMES ||
             targetWidth <= 0 || targetHeight <= 0 ||
-            targetWidth > MAX_WIDTH || targetHeight > MAX_HEIGHT
+            majorAxis > MAX_MAJOR_AXIS || minorAxis > MAX_MINOR_AXIS
         if (outOfBounds) {
+            Log.w(TAG, "validateAndAdmitClip: clipId=$clipId outOfBounds: windowSeconds=$windowSeconds frameCount=$frameCount targetWidth=$targetWidth targetHeight=$targetHeight")
             storeFailedRecord(clipId, sourceHash, CODE_TRIM_WINDOW_TOO_LONG)
             return AdmitOutcome.Resolved(failedStatusMap(clipId, CODE_TRIM_WINDOW_TOO_LONG))
         }
+
+        // Clamp transcode dimensions for preview so major axis does not exceed PREVIEW_MAX_MAJOR_AXIS,
+        // and ensure both dimensions are even for MediaCodec AVC.
+        if (majorAxis > PREVIEW_MAX_MAJOR_AXIS) {
+            val scale = PREVIEW_MAX_MAJOR_AXIS.toDouble() / majorAxis
+            targetWidth = (targetWidth * scale).roundToInt()
+            targetHeight = (targetHeight * scale).roundToInt()
+        }
+        targetWidth = (maxOf(targetWidth, 2) / 2) * 2
+        targetHeight = (maxOf(targetHeight, 2) / 2) * 2
 
         val cacheDir = File(context.cacheDir, CACHE_DIR_NAME)
         try { cacheDir.mkdirs() } catch (_: Throwable) {}
@@ -315,6 +331,7 @@ class AndroidReverseSidecarCoordinator(
                     frameCount = job.frameCount,
                     targetWidth = job.targetWidth,
                     targetHeight = job.targetHeight,
+                    context = context,
                     // Cooperative cancellation: a concurrent cleanup/dispose bumps
                     // [generation], and this poll lets the transcoder bail out of
                     // its own in-flight work boundedly instead of racing to
@@ -336,6 +353,7 @@ class AndroidReverseSidecarCoordinator(
         }
 
         if (failureCode != null) {
+            Log.w(TAG, "runTranscodeJob: clipId=${job.clipId} failed with code=$failureCode")
             deleteIfContained(cacheDir, tempFile)
             val stillCurrent = synchronized(lock) { generation == capturedGeneration }
             // A cancellation only ever fires once generation has moved on, so
@@ -383,6 +401,7 @@ class AndroidReverseSidecarCoordinator(
             return invalidatedStatusMap(job.clipId)
         }
 
+        Log.i(TAG, "runTranscodeJob: clipId=${job.clipId} ready at ${finalFile.absolutePath}")
         return mapOf(
             "clipId" to job.clipId,
             "state" to STATE_READY,
@@ -474,6 +493,24 @@ class AndroidReverseSidecarCoordinator(
             "errorMessage" to record.errorMessage,
             "progress" to record.progress,
         ))
+    }
+
+    /**
+     * Returns the absolute path of the ready reverse sidecar MP4 for [clipId] if
+     * it exists and is non-empty, or null if no sidecar is ready.
+     * Thread-safe; read-only.
+     */
+    fun getReadySidecarPath(clipId: String): String? {
+        val record = synchronized(lock) { records[clipId] } ?: return null
+        if (record.state != STATE_READY) return null
+        val path = record.finalPath ?: return null
+        val stillReady = try {
+            val f = File(path)
+            f.exists() && f.length() > 0L
+        } catch (_: Throwable) {
+            false
+        }
+        return if (stillReady) path else null
     }
 
     // ── cleanupReverseSidecars ──────────────────────────────────────────────────

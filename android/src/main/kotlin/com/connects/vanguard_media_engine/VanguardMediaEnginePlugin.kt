@@ -695,10 +695,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         editorPlaybackCoordinator = AndroidEditorPlaybackCoordinator(
-            textureRegistry = binding.textureRegistry,
-            channel         = channel,
-            mainHandler     = mainHandler,
-            context         = binding.applicationContext,
+            textureRegistry            = binding.textureRegistry,
+            channel                    = channel,
+            mainHandler                = mainHandler,
+            context                    = binding.applicationContext,
+            reverseSidecarPathProvider = { clipId -> reverseSidecarCoordinator?.getReadySidecarPath(clipId) },
         )
         timelineLiveControlCoordinator = AndroidTimelineLiveControlCoordinator(
             activeTextureIdProvider = { editorPlaybackCoordinator?.activeTimelineTextureId() },
@@ -925,9 +926,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         editorExportCoordinator = AndroidEditorExportCoordinator(
-            context     = binding.applicationContext,
-            channel     = channel,
-            mainHandler = mainHandler,
+            context                    = binding.applicationContext,
+            channel                    = channel,
+            mainHandler                = mainHandler,
+            reverseSidecarPathProvider = { clipId -> reverseSidecarCoordinator?.getReadySidecarPath(clipId) },
         )
         glesTextureSmokeCoordinator = AndroidGlesTextureSmokeCoordinator(
             textureRegistry = binding.textureRegistry,

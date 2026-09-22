@@ -239,6 +239,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Whether [dispose] has been called.
   bool _disposed = false;
 
+  /// Whether this controller has been disposed.
+  bool get isDisposed => _disposed;
+
   // ── Teardown — exact-once dispatch (Phase 10-C Slice D teardown fix) ────────
   //
   // _rawTeardownFuture is the bare MethodChannel future for `disposeTimeline`,
@@ -1093,22 +1096,23 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // without affecting the busy-lock state.
     final newDraft = value.draft.reverseClip(clipId: clipId);
 
+    final toggled = newDraft.clips.firstWhere(
+      (c) => c.id == clipId,
+      orElse: () => newDraft.clips.first,
+    );
+
+    // If toggling to reversed, prepare the reverse sidecar for the new draft
+    // first so that the native playback session (e.g. Android sequential playback)
+    // has the ready sidecar path available when updateDraft commits the new timeline.
+    if (toggled.isReversed) {
+      await prepareReverseSidecars(newDraft)
+          .catchError((_) => <VGReverseSidecarStatus>[]);
+    }
+
+    if (_disposed) return;
+
     // Push to native via updateDraft (handles busy-lock, pause, and state).
     await updateDraft(newDraft);
-
-    // Phase 7.20D: if the clip is now reversed, kick off background sidecar
-    // preparation (fire-and-forget). The native compositor (Phase 7.20C)
-    // picks up the ready sidecar on the next compositor pull cycle.
-    // Does not block reverseClip completion and is safe to ignore on failure.
-    if (!_disposed) {
-      final toggled = value.draft.clips.firstWhere(
-        (c) => c.id == clipId,
-        orElse: () => value.draft.clips.first,
-      );
-      if (toggled.isReversed) {
-        prepareReverseSidecars().catchError((_) => <VGReverseSidecarStatus>[]);
-      }
-    }
   }
 
   // ── Frame cache stats (Phase 7.18B2 / DEC-152) ────────────────────────────
@@ -1187,9 +1191,12 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// an empty list is returned (best-effort).
   ///
   /// Throws [StateError] if [dispose] has been called.
-  Future<List<VGReverseSidecarStatus>> prepareReverseSidecars() async {
+  Future<List<VGReverseSidecarStatus>> prepareReverseSidecars([
+    VGEditorDraft? targetDraft,
+  ]) async {
     _assertNotDisposed();
-    final reversedClips = value.draft.clips.where((c) => c.isReversed).toList();
+    final draft = targetDraft ?? value.draft;
+    final reversedClips = draft.clips.where((c) => c.isReversed).toList();
     if (reversedClips.isEmpty) return const [];
 
     final clips = reversedClips.map((c) {
@@ -1198,9 +1205,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         'sourcePath': c.sourcePath,
         'trimStart': c.trimStartSeconds,
         'trimEnd': c.trimEndSeconds,
-        'targetWidth': value.draft.canvasWidth.toDouble(),
-        'targetHeight': value.draft.canvasHeight.toDouble(),
-        'sourceHash': _sidecarSourceHash(c),
+        'targetWidth': draft.canvasWidth.toDouble(),
+        'targetHeight': draft.canvasHeight.toDouble(),
+        'sourceHash': _sidecarSourceHash(c, draft),
       };
     }).toList();
 
@@ -1704,11 +1711,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Encodes (sourcePath + trimStart + trimEnd + canvasWidth + canvasHeight)
   /// as a pipe-delimited string. Matches the sourceHash contract documented
   /// in VGReverseSidecarManager.h § Sidecar identity (sourceHash).
-  String _sidecarSourceHash(VGClipDescriptor clip) =>
-      '${clip.sourcePath}'
-      '|${clip.trimStartSeconds}'
-      '|${clip.trimEndSeconds}'
-      '|${value.draft.canvasWidth}x${value.draft.canvasHeight}';
+  String _sidecarSourceHash(VGClipDescriptor clip, [VGEditorDraft? draft]) {
+    final d = draft ?? value.draft;
+    return '${clip.sourcePath}'
+        '|${clip.trimStartSeconds}'
+        '|${clip.trimEndSeconds}'
+        '|${d.canvasWidth}x${d.canvasHeight}';
+  }
 
   // ── Audio Recording — Slice M ──────────────────────────────────────────────
 

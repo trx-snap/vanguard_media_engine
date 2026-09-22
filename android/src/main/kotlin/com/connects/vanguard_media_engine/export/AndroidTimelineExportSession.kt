@@ -171,7 +171,10 @@ import kotlin.math.max
 //   - Anything outside this scope is rejected with UNSUPPORTED_EXPORT_FEATURE
 //     rather than silently ignored -- a minimal exporter that ignores a
 //     feature would silently produce wrong output, which this Unit must not do.
-class AndroidTimelineExportSession(private val context: Context) {
+class AndroidTimelineExportSession(
+    private val context: Context,
+    private val reverseSidecarPathProvider: ((clipId: String) -> String?)? = null,
+) {
 
     @Volatile private var cancelRequested = false
     @Volatile private var activeEncoder: AndroidTimelineVideoPassEncoder? = null
@@ -496,7 +499,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             // known at this point in per-clip parsing and are enforced
             // further below, once every clip has been parsed (and, for
             // rotation, probed).
-            val isReversed = map["isReversed"] as? Boolean ?: false
+            var isReversed = map["isReversed"] as? Boolean ?: false
             if (isReversed && mediaKind != "video") {
                 onError(
                     "INVALID_ARG",
@@ -504,6 +507,19 @@ class AndroidTimelineExportSession(private val context: Context) {
                         "(mediaKind '$mediaKind' with isReversed=true)",
                 )
                 return
+            }
+            var effectiveSourcePath = sourcePath
+            var effectiveTrimStart = trimStart
+            var effectiveTrimEnd = trimEnd
+            val clipId = (map["id"] as? String)?.trim()
+            if (isReversed && clipId != null) {
+                val sidecarPath = reverseSidecarPathProvider?.invoke(clipId)
+                if (sidecarPath != null && AndroidUriDataSourceHelper.isReadable(sidecarPath, context)) {
+                    effectiveSourcePath = sidecarPath
+                    isReversed = false
+                    effectiveTrimStart = 0.0
+                    effectiveTrimEnd = trimEnd - trimStart
+                }
             }
             for (unsupportedKey in UNSUPPORTED_CLIP_KEYS) {
                 if (map[unsupportedKey] != null) {
@@ -622,29 +638,29 @@ class AndroidTimelineExportSession(private val context: Context) {
             // decode/probe path is File-based and is not part of this route.
             // Plain POSIX paths keep the byte-identical File.exists/canRead
             // preflight via the helper's non-content branch.
-            val isContentUriSource = AndroidUriDataSourceHelper.isContentUri(sourcePath)
+            val isContentUriSource = AndroidUriDataSourceHelper.isContentUri(effectiveSourcePath)
             if (isContentUriSource && mediaKind != "video") {
                 onError(
                     "UNSUPPORTED_EXPORT_FEATURE",
                     "exportTimeline: content:// clip sources are only supported for video clips " +
-                        "(mediaKind '$mediaKind'): $sourcePath",
+                        "(mediaKind '$mediaKind'): $effectiveSourcePath",
                 )
                 return
             }
-            if (!isContentUriSource && !sourcePath.startsWith("/")) {
+            if (!isContentUriSource && !effectiveSourcePath.startsWith("/")) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: non-local clip sources are not supported")
                 return
             }
-            if (!AndroidUriDataSourceHelper.isReadable(sourcePath, context)) {
-                onError("FILE_UNREADABLE", "exportTimeline: cannot read clip source: $sourcePath")
+            if (!AndroidUriDataSourceHelper.isReadable(effectiveSourcePath, context)) {
+                onError("FILE_UNREADABLE", "exportTimeline: cannot read clip source: $effectiveSourcePath")
                 return
             }
             parsedClips.add(
                 ParsedClip(
-                    id = (map["id"] as? String)?.trim(),
-                    sourcePath = sourcePath,
-                    trimStart = trimStart,
-                    trimEnd = trimEnd,
+                    id = clipId,
+                    sourcePath = effectiveSourcePath,
+                    trimStart = effectiveTrimStart,
+                    trimEnd = effectiveTrimEnd,
                     mediaKind = mediaKind,
                     speed = speed,
                     colorMatrix = colorMatrix,

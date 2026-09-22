@@ -43,6 +43,7 @@ class AndroidEditorExportCoordinator(
     private val context: Context,
     private val channel: MethodChannel,
     private val mainHandler: Handler,
+    private val reverseSidecarPathProvider: ((clipId: String) -> String?)? = null,
 ) {
     @Volatile private var activeTimelineSession: AndroidTimelineExportSession? = null
     @Volatile private var activePassthroughSession: AndroidPassthroughRemuxSession? = null
@@ -110,7 +111,10 @@ class AndroidEditorExportCoordinator(
                 replyError("EXPORT_IN_PROGRESS", "exportTimeline: an export is already in progress")
                 return
             }
-            val session = AndroidTimelineExportSession(context)
+            val session = AndroidTimelineExportSession(
+                context = context,
+                reverseSidecarPathProvider = reverseSidecarPathProvider,
+            )
             activeTimelineSession = session
             activeTimelineProgressGate = progressOpen
             session.start(

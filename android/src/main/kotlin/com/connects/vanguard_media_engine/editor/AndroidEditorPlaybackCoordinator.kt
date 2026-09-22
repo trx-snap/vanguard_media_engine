@@ -40,6 +40,7 @@ class AndroidEditorPlaybackCoordinator(
      * session is allocated.
      */
     private val context: Context? = null,
+    private val reverseSidecarPathProvider: ((clipId: String) -> String?)? = null,
 ) {
     companion object {
         private const val TAG = "EditorPlaybackCoord"
@@ -201,7 +202,6 @@ class AndroidEditorPlaybackCoordinator(
                 clip["fitMode"] != null ||
                 clip["cropRect"] != null ||
                 clip["freezePTS"] != null ||
-                clip["isReversed"] != null ||
                 clip["dualCamera"] != null ||
                 clip["timeRemap"] != null ||
                 clip["transformTrack"] != null ||
@@ -229,12 +229,29 @@ class AndroidEditorPlaybackCoordinator(
                 result.error("FILE_UNREADABLE", "sourcePath is missing or blank", null)
                 return
             }
+
+            val isReversed = clip["isReversed"] as? Boolean ?: false
+            var effectiveSourcePath = sourcePath
+            if (isReversed) {
+                val sidecarPath = reverseSidecarPathProvider?.invoke(clipId)
+                if (sidecarPath != null) {
+                    effectiveSourcePath = sidecarPath
+                } else {
+                    result.error(
+                        "UNSUPPORTED_TIMELINE_FEATURE",
+                        "clip \"$clipId\" is reversed but reverse sidecar is not ready",
+                        null,
+                    )
+                    return
+                }
+            }
+
             // POSIX paths keep the File.exists()/canRead() check; `content://` URIs are probed
             // via ContentResolver and fail closed (false) when the context is null or the
             // provider refuses. No texture/session has been allocated yet, so the caller can
             // retry with a valid path/URI after a FILE_UNREADABLE error.
-            if (!AndroidUriDataSourceHelper.isReadable(sourcePath, context)) {
-                result.error("FILE_UNREADABLE", "sourcePath is not readable: $sourcePath", null)
+            if (!AndroidUriDataSourceHelper.isReadable(effectiveSourcePath, context)) {
+                result.error("FILE_UNREADABLE", "sourcePath is not readable: $effectiveSourcePath", null)
                 return
             }
 
@@ -284,8 +301,11 @@ class AndroidEditorPlaybackCoordinator(
                 return
             }
 
-            val sourceTrimStartUs = (trimStartSeconds * 1_000_000.0).toLong()
-            val sourceTrimEndUs = (trimEndSeconds * 1_000_000.0).toLong()
+            val effectiveTrimStartSeconds = if (isReversed) 0.0 else trimStartSeconds
+            val effectiveTrimEndSeconds = if (isReversed) (trimEndSeconds - trimStartSeconds) else trimEndSeconds
+
+            val sourceTrimStartUs = (effectiveTrimStartSeconds * 1_000_000.0).toLong()
+            val sourceTrimEndUs = (effectiveTrimEndSeconds * 1_000_000.0).toLong()
             val sourceTrimDurationUs = sourceTrimEndUs - sourceTrimStartUs
             if (sourceTrimDurationUs <= 0L) {
                 result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a non-positive trim duration", null)
@@ -314,7 +334,7 @@ class AndroidEditorPlaybackCoordinator(
             clipSpecs.add(
                 AndroidEditorClipPlaybackSpec(
                     clipId = clipId,
-                    sourcePath = sourcePath,
+                    sourcePath = effectiveSourcePath,
                     timelineStartUs = cursorUs,
                     sourceTrimStartUs = sourceTrimStartUs,
                     sourceTrimEndUs = sourceTrimEndUs,

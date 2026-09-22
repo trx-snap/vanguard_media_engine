@@ -207,4 +207,29 @@ final class VanguardTimelineExporter {
   }) async {
     await channel.invokeMethod('cancelExport');
   }
+
+  /// Returns the absolute path of the ready reverse sidecar MP4 for [clipId],
+  /// or null if the sidecar is not ready or does not exist.
+  /// Safe to call at any time; never throws.
+  static Future<String?> getReadyReverseSidecarPath(
+    String clipId, {
+    MethodChannel channel = _defaultChannel,
+  }) async {
+    if (clipId.trim().isEmpty) return null;
+    try {
+      final result = await channel.invokeMapMethod<String, dynamic>(
+        'getSidecarStatus',
+        <String, Object?>{'clipId': clipId.trim()},
+      );
+      if (result == null) return null;
+      final state = result['state'] as String?;
+      final path = result['sidecarPath'] as String?;
+      if (state == 'ready' && path != null && path.isNotEmpty) {
+        return path;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
 }
