@@ -51,4 +51,12 @@ interface AndroidGreenScreenPreviewBackend {
 
     fun drawFrame(): Boolean
     fun release()
+
+    /**
+     * Read-only, render-thread-only diagnostics snapshot for regression
+     * tooling. Default is empty; backends that carry meaningful telemetry
+     * (such as [AndroidGreenScreenGpuResidentPreviewBackend]) override this.
+     * Must never mutate state.
+     */
+    fun diagnosticsSnapshot(): Map<String, Any?> = emptyMap()
 }

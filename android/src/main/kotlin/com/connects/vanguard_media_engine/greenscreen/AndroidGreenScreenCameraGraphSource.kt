@@ -184,6 +184,7 @@ class AndroidGreenScreenCameraGraphSource(
         snapshot["usingFallbackBackend"] = usingFallbackBackend
         snapshot["cameraSourceMode"] = cameraSourceMode
         snapshot["camera"] = cameraSource?.diagnosticsSnapshot()
+        snapshot["renderLoop"] = renderLoop?.diagnosticsSnapshot()
         return snapshot
     }
 

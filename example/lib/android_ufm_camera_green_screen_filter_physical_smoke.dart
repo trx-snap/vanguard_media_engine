@@ -294,6 +294,109 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         _extractSteadyMaskFrameCount(gsDiag) > 0;
   }
 
+  /// Reads greenScreenDiagnostics.renderLoop.backendDiagnostics: the bounded,
+  /// render-thread-safe snapshot exposed by
+  /// AndroidGreenScreenPreviewRenderLoop.diagnosticsSnapshot(), which in turn
+  /// carries AndroidGreenScreenGpuResidentPreviewBackend's own structural
+  /// telemetry when that backend is active.
+  static Map<String, dynamic>? _extractBackendDiagnostics(
+    Map<String, dynamic>? gsDiag,
+  ) {
+    if (gsDiag == null) return null;
+    final renderLoop = gsDiag['renderLoop'];
+    if (renderLoop is! Map) return null;
+    final backend = renderLoop['backendDiagnostics'];
+    if (backend is! Map) return null;
+    return backend.map((k, v) => MapEntry(k.toString(), v));
+  }
+
+  static Map<String, dynamic>? _extractNativeStats(
+    Map<String, dynamic>? gsDiag,
+  ) {
+    final backend = _extractBackendDiagnostics(gsDiag);
+    if (backend == null) return null;
+    final nativeStats = backend['nativeStats'];
+    if (nativeStats is! Map) return null;
+    return nativeStats.map((k, v) => MapEntry(k.toString(), v));
+  }
+
+  static Map<String, dynamic>? _extractNativeStatsDimension(
+    Map<String, dynamic>? gsDiag,
+    String key,
+  ) {
+    final nativeStats = _extractNativeStats(gsDiag);
+    if (nativeStats == null) return null;
+    final dim = nativeStats[key];
+    if (dim is! Map) return null;
+    return dim.map((k, v) => MapEntry(k.toString(), v));
+  }
+
+  static bool _intEquals(dynamic value, int expected) {
+    return value is num && value.toInt() == expected;
+  }
+
+  /// Quant-lab structural proof (route A only): the GPU-resident backend's
+  /// own diagnostics — not just the route-selection flags checked by
+  /// [_gpuResidentRouteSatisfied] — confirm the production path is still
+  /// running the RND-class GPU-resident pipeline: an active GPU delegate,
+  /// inferences flowing with zero failures, the expected 256x256 model/mask
+  /// dimensions, the expected 720x1280 alpha output, and non-zero inference
+  /// timing. This is a structural/regression proof only — it makes no
+  /// pixel-quality or visual-fidelity claim about the live matte.
+  static bool _quantLabDiagnosticsSatisfied(Map<String, dynamic>? gsDiag) {
+    final backend = _extractBackendDiagnostics(gsDiag);
+    if (backend == null) return false;
+    if (backend['backend'] != 'gpu_resident') return false;
+
+    final delegate = backend['delegate'];
+    if (delegate is! String || !delegate.startsWith('gpu:')) return false;
+
+    final inferences = backend['inferences'];
+    if (inferences is! num || inferences <= 0) return false;
+    final inferenceFailures = backend['inferenceFailures'];
+    if (inferenceFailures is! num || inferenceFailures != 0) return false;
+    if (backend['inferenceDisabled'] != false) return false;
+    if (backend['hasMask'] != true) return false;
+
+    if (!_intEquals(backend['modelInputWidth'], 256)) return false;
+    if (!_intEquals(backend['modelInputHeight'], 256)) return false;
+    if (!_intEquals(backend['maskWidth'], 256)) return false;
+    if (!_intEquals(backend['maskHeight'], 256)) return false;
+
+    final alpha = _extractNativeStatsDimension(gsDiag, 'alpha');
+    if (alpha == null ||
+        !_intEquals(alpha['width'], 720) ||
+        !_intEquals(alpha['height'], 1280)) {
+      return false;
+    }
+    final coarseMask = _extractNativeStatsDimension(gsDiag, 'coarseMask');
+    if (coarseMask == null ||
+        !_intEquals(coarseMask['width'], 256) ||
+        !_intEquals(coarseMask['height'], 256)) {
+      return false;
+    }
+
+    final avgInferenceMs = backend['avgInferenceMs'];
+    final maxInferenceMs = backend['maxInferenceMs'];
+    if (avgInferenceMs is! num || avgInferenceMs <= 0) return false;
+    if (maxInferenceMs is! num || maxInferenceMs <= 0) return false;
+
+    return true;
+  }
+
+  /// Honest regression guard derived from current hardware timing, not a
+  /// TikTok-quality claim: flags whether the GPU-resident backend's own
+  /// inference timing stayed within a bound wide enough to absorb normal
+  /// device variance while still catching a real performance regression.
+  static bool _quantLabPerfSatisfied(Map<String, dynamic>? gsDiag) {
+    final backend = _extractBackendDiagnostics(gsDiag);
+    if (backend == null) return false;
+    final avgInferenceMs = backend['avgInferenceMs'];
+    final maxInferenceMs = backend['maxInferenceMs'];
+    if (avgInferenceMs is! num || maxInferenceMs is! num) return false;
+    return avgInferenceMs <= 20.0 && maxInferenceMs <= 35.0;
+  }
+
   static double? _extractMaxLatency(
     Map<String, dynamic>? fcDiag,
     Map<String, dynamic>? gsDiag,
@@ -319,6 +422,8 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
     int? textureId;
     Map<String, dynamic>? lastGsDiag;
     Map<String, dynamic>? lastFcDiag;
+    var quantLabProven = false;
+    var quantLabPerfOk = false;
 
     try {
       // 1. print start
@@ -393,10 +498,16 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
               break;
             }
           } else {
-            // Route A (GPU-resident, no CPU pipeline/frame counts to wait on)
-            // or route B (CPU-compositor fallback frame counters).
-            if (_gpuResidentRouteSatisfied(gs) ||
-                _cpuFallbackRouteSatisfied(gs, fc)) {
+            // Route A (GPU-resident): extended beyond route selection to
+            // also require the backend's own structural quant-lab
+            // diagnostics (route B is unchanged / not weakened).
+            if (_gpuResidentRouteSatisfied(gs) &&
+                _quantLabDiagnosticsSatisfied(gs)) {
+              diagSatisfied = true;
+              quantLabProven = true;
+              break;
+            }
+            if (_cpuFallbackRouteSatisfied(gs, fc)) {
               diagSatisfied = true;
               break;
             }
@@ -426,6 +537,9 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
       if (alphaDiagSatisfied) {
         print('ANDROID_UFM_GREENSCREEN_ALPHA_DIAGNOSTICS_PASS');
       }
+      if (quantLabProven) {
+        print('ANDROID_UFM_GREENSCREEN_QUANT_LAB_DIAGNOSTICS_PASS');
+      }
 
       // 6. Hold visual for hold seconds while periodically refreshing diagnostics.
       _updatePhase('HOLD_VISUAL');
@@ -437,6 +551,13 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         if (fc != null) lastFcDiag = fc;
         _updateDiagnostics(lastGsDiag, lastFcDiag);
         await Future<void>.delayed(const Duration(milliseconds: 500));
+      }
+
+      // Recompute the honest performance gate from the freshest diagnostics
+      // gathered across the hold period (steadier averages than the first
+      // poll that satisfied the structural proof above).
+      if (quantLabProven) {
+        quantLabPerfOk = _quantLabPerfSatisfied(lastGsDiag);
       }
 
       // 7. Clear filters with setCameraFilterChain([]).
@@ -506,6 +627,10 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         'holdSeconds': kHoldSeconds,
         if (!kIsAlphaMode) 'gpuResidentRouteProven': gpuRouteProven,
         if (!kIsAlphaMode) 'cpuFallbackRouteProven': cpuFallbackProven,
+        if (!kIsAlphaMode) 'quantLabProven': quantLabProven,
+        if (!kIsAlphaMode) 'quantLabPerfOk': quantLabPerfOk,
+        if (!kIsAlphaMode)
+          'backendDiagnostics': _extractBackendDiagnostics(lastGsDiag),
         'claimsAllowed': kIsAlphaMode
             ? <String>[
                 'public UFM capture profile selected Android green-screen graph path',
@@ -528,6 +653,12 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
                       'cameraSourceMode==camera2_preview_only, '
                       'camera.analysisEnabled==false, '
                       'camera.source==camera2_front_preview_only, cameraStarted==true',
+                if (quantLabProven)
+                  'structured GPU-resident quant-lab diagnostics proved the production '
+                      'path is still the RND-class GPU-resident pipeline: active gpu: '
+                      'delegate, inferences flowing with zero failures, 256x256 model '
+                      'input/mask dimensions, 720x1280 alpha output, non-zero '
+                      'avgInferenceMs/maxInferenceMs (quantLabPerfOk=$quantLabPerfOk)',
                 if (cpuFallbackProven)
                   'native diagnostics proved mask frames via the CPU-compositor '
                       'fallback route (graphFrameCount/maskFrameCount/'
@@ -555,6 +686,10 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
                 if (cpuFallbackProven && !gpuRouteProven)
                   'no GPU-resident backend proof: this run used the CPU-compositor '
                       'fallback route',
+                if (quantLabProven)
+                  'quant-lab diagnostics are structural/performance telemetry only: '
+                      'no automated pixel-quality or visual-fidelity proof of the '
+                      'live camera matte',
               ],
         'greenScreenDiagnostics': ?lastGsDiag,
         'filterChainDiagnostics': ?lastFcDiag,

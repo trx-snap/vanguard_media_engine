@@ -113,6 +113,9 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         private const val GUIDED_FILTER_ENABLED = true
         private const val TEMPORAL_STABILIZER_ENABLED = false
         private const val DESPILL_ENABLED = true
+
+        /** Matches nativeStatsSummary dimension tokens like "720x1280". */
+        private val DIMENSION_PATTERN = Regex("^(\\d+)x(\\d+)$")
     }
 
     /** Interpreter + delegate + direct tensor buffers, created on the render thread. */
@@ -416,6 +419,87 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         )
 
         teardownCoreQuietly()
+    }
+
+    // -- Diagnostics (render-thread-only; read-only, never mutates state) ------
+
+    override fun diagnosticsSnapshot(): Map<String, Any?> {
+        val snapshot = LinkedHashMap<String, Any?>()
+        snapshot["backend"] = "gpu_resident"
+        snapshot["coreReady"] = coreReady
+        snapshot["outputAttached"] = outputAttached
+        snapshot["outputWidthPx"] = outputWidthPx
+        snapshot["outputHeightPx"] = outputHeightPx
+        snapshot["greenScreenEnabled"] = greenScreenEnabled
+        snapshot["hasMask"] = hasMask
+        snapshot["inferenceDisabled"] = inferenceDisabled
+        snapshot["frames"] = frameCount
+        snapshot["swappedFrames"] = swappedFrameCount
+        snapshot["inferences"] = inferenceCount
+        snapshot["inferenceFailures"] = inferenceFailureCount
+        snapshot["avgInferenceMs"] =
+            if (inferenceCount > 0) totalInferenceNs / inferenceCount / 1_000_000.0 else 0.0
+        snapshot["maxInferenceMs"] = maxInferenceNs / 1_000_000.0
+        val session = model
+        snapshot["delegate"] = session?.delegateLabel ?: "none"
+        snapshot["modelInputWidth"] = session?.inputWidth
+        snapshot["modelInputHeight"] = session?.inputHeight
+        snapshot["maskWidth"] = session?.maskWidth
+        snapshot["maskHeight"] = session?.maskHeight
+        snapshot["cameraUprightAspect"] = cameraUprightAspect
+        val handle = nativeHandle
+        val nativeStatsRaw = if (handle != 0L) {
+            try { bridge.nativeStatsSummary(handle) } catch (_: Throwable) { null }
+        } else {
+            null
+        }
+        snapshot["nativeStatsRaw"] = nativeStatsRaw
+        snapshot["nativeStats"] = nativeStatsRaw?.let { parseNativeStats(it) }
+        return snapshot
+    }
+
+    /**
+     * Parses a [nativeStatsSummary]-style "key=value key=value ..." string
+     * into a primitive map for diagnostics consumers. Never throws: any
+     * unparsable token is dropped rather than aborting the whole snapshot.
+     * Integral values become [Long], other numeric values become [Double],
+     * dimension values like "720x1280" become a nested map with
+     * width/height ints plus the original raw string, and anything else is
+     * kept as its original string.
+     */
+    private fun parseNativeStats(raw: String): Map<String, Any?> {
+        val result = LinkedHashMap<String, Any?>()
+        try {
+            for (token in raw.trim().split(Regex("\\s+"))) {
+                if (token.isEmpty()) continue
+                val eq = token.indexOf('=')
+                if (eq <= 0) continue
+                val key = token.substring(0, eq)
+                val value = token.substring(eq + 1)
+                result[key] = parseNativeStatValue(value)
+            }
+        } catch (_: Throwable) {
+            // Best-effort: return whatever was parsed before the failure.
+        }
+        return result
+    }
+
+    private fun parseNativeStatValue(value: String): Any {
+        val dimension = DIMENSION_PATTERN.matchEntire(value)
+        if (dimension != null) {
+            val width = dimension.groupValues[1].toIntOrNull()
+            val height = dimension.groupValues[2].toIntOrNull()
+            if (width != null && height != null) {
+                val dims = LinkedHashMap<String, Any?>()
+                dims["width"] = width
+                dims["height"] = height
+                dims["raw"] = value
+                return dims
+            }
+        }
+        value.toLongOrNull()?.let { return it }
+        value.toDoubleOrNull()?.let { return it }
+        return value
     }
 
     // -- Core bootstrap ------------------------------------------------------

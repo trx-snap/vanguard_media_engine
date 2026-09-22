@@ -393,6 +393,74 @@ class AndroidGreenScreenPreviewRenderLoop(
         }
     }
 
+    // -- Diagnostics (bounded, render-thread-safe, never mutates state) --------
+
+    /**
+     * Bounded diagnostics snapshot for regression tooling. Executes directly
+     * when already called from the render thread; otherwise posts to it and
+     * blocks the caller for at most [timeoutMs] so main/plugin-thread callers
+     * can never stall indefinitely. On post failure, timeout, or an
+     * exception inside the capture, returns a best-effort map carrying a
+     * `diagnosticsUnavailable` reason instead of throwing. Never mutates
+     * compositor or render-loop state.
+     */
+    fun diagnosticsSnapshot(timeoutMs: Long = 250L): Map<String, Any?> {
+        if (Looper.myLooper() == renderHandler.looper) {
+            return try {
+                captureDiagnosticsSnapshot()
+            } catch (t: Throwable) {
+                Log.w(TAG, "diagnosticsSnapshot capture threw: ${t.message}")
+                fallbackDiagnosticsSnapshot("capture_exception")
+            }
+        }
+
+        val captured = arrayOfNulls<Map<String, Any?>>(1)
+        val latch = CountDownLatch(1)
+        val posted = try {
+            renderHandler.post {
+                try {
+                    captured[0] = captureDiagnosticsSnapshot()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "diagnosticsSnapshot capture threw: ${t.message}")
+                } finally {
+                    latch.countDown()
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "diagnosticsSnapshot post threw: ${t.message}")
+            false
+        }
+        if (!posted) return fallbackDiagnosticsSnapshot("post_failed")
+
+        val completed = awaitQuietly(latch, timeoutMs)
+        if (!completed) return fallbackDiagnosticsSnapshot("timeout")
+        return captured[0] ?: fallbackDiagnosticsSnapshot("capture_failed")
+    }
+
+    /** Render-thread-only: reads compositor + render-loop state, mutates nothing. */
+    private fun captureDiagnosticsSnapshot(): Map<String, Any?> {
+        val snapshot = LinkedHashMap<String, Any?>()
+        snapshot["usingFallbackBackend"] = usingFallbackBackend
+        snapshot["hasAttachedOnce"] = hasAttachedOnce
+        snapshot["canSubmit"] = canSubmit.get()
+        snapshot["stopped"] = isStopped.get()
+        snapshot["backendDiagnostics"] = try {
+            compositor.diagnosticsSnapshot()
+        } catch (t: Throwable) {
+            Log.w(TAG, "compositor diagnosticsSnapshot threw: ${t.message}")
+            null
+        }
+        return snapshot
+    }
+
+    private fun fallbackDiagnosticsSnapshot(reason: String): Map<String, Any?> {
+        val snapshot = LinkedHashMap<String, Any?>()
+        snapshot["diagnosticsUnavailable"] = reason
+        snapshot["usingFallbackBackend"] = usingFallbackBackend
+        snapshot["stopped"] = isStopped.get()
+        return snapshot
+    }
+
     // -- Camera redraw pump ------------------------------------------------------
 
     /**
@@ -420,11 +488,12 @@ class AndroidGreenScreenPreviewRenderLoop(
 
     // -- Helpers ----------------------------------------------------------------
 
-    private fun awaitQuietly(latch: CountDownLatch, timeoutMs: Long) {
-        try {
+    private fun awaitQuietly(latch: CountDownLatch, timeoutMs: Long): Boolean {
+        return try {
             latch.await(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+            false
         }
     }
 }
