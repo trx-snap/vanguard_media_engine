@@ -233,9 +233,21 @@ add_library(vanguard_render_gles STATIC
     # helper (blur_h, blur_v, composite; fused highpass, adaptive smoothing
     # gate, tone compression, midtone lift, detail add-back, state restore).
     "render/gles/src/gles_beauty_v2_compositor.cpp"
+    # ANDROID-GREENSCREEN-GPU-RESIDENT: private GPU-resident live GreenScreen
+    # preview renderer (ES 3.1 compute downscale / guided filter / optional
+    # temporal + composite over an already-latched camera OES texture;
+    # NEON float packing; no camera / AHardwareBuffer ownership). Driven by
+    # AndroidGreenScreenGpuResidentPreviewBackend.kt through
+    # android_greenscreen_gpu_resident_jni.cpp. TFLite stays in Kotlin.
+    "render/gles/src/gles_green_screen_gpu_resident_renderer.cpp"
 )
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
+# The GPU-resident renderer's per-frame CPU work (RGBA8 -> float RGB model
+# input, float mask -> R8) is NEON/scalar hot-loop code; keep it optimized in
+# every build type like the audio hot paths above.
+set_source_files_properties("render/gles/src/gles_green_screen_gpu_resident_renderer.cpp"
+    PROPERTIES COMPILE_FLAGS "-O3")
 
 
 
@@ -576,6 +588,12 @@ if (ANDROID)
     # camera beauty filter (3-pass bilateral blur via GlesBeautyV2Compositor).
     # Called from AndroidCameraBeautySurfaceProcessor on its GPU HandlerThread.
     "platform/android/src/android_live_camera_beauty_jni.cpp"
+    # ANDROID-GREENSCREEN-GPU-RESIDENT: production JNI surface for
+    # AndroidGreenScreenGpuResidentNativeBridge.kt (handle registry over
+    # GlesGreenScreenGpuResidentRenderer; borrowed output Surface ->
+    # ANativeWindow, direct-buffer model input / mask exchange). Called from
+    # AndroidGreenScreenGpuResidentPreviewBackend on the GreenScreen render thread.
+    "platform/android/src/android_greenscreen_gpu_resident_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

@@ -19,6 +19,8 @@ import android.util.Size
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import java.util.LinkedHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -34,8 +36,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * native StackOverflowError), which runs the same production segmentation ladder as Duet
  * (mediapipe_cpu -> mlkit) and delivers CPU mask frames via [onMask]. This path never opens the
  * MediaPipe GPU graph or its untracked binary graph / JNI library.
+ *
+ * [analysisEnabled] (default true, preserving every behavior above) selects whether the CPU
+ * analysis target exists at all. With `false` (used when the preview backend performs its own
+ * segmentation, e.g. AndroidGreenScreenGpuResidentPreviewBackend) the capture session has the
+ * preview Surface as its only target: no ImageReader is created, no
+ * [AndroidGreenScreenCleanSegmentationPipeline] is opened, and `onMask` is never invoked.
  */
-class AndroidGreenScreenCamera2Source(private val context: Context) {
+class AndroidGreenScreenCamera2Source(
+    private val context: Context,
+    private val analysisEnabled: Boolean = true,
+) {
 
     companion object {
         private const val TAG = "GreenScreenCam2Source"
@@ -54,6 +65,16 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
 
         /** Tolerance (relative) around the 16:9 ratio used to classify a Size as "16:9 family". */
         private const val SIXTEEN_BY_NINE_RATIO_TOLERANCE = 0.08
+
+        /**
+         * Bounded wait, per close callback, for Camera2's async session/device onClosed dispatch
+         * to drain on the handler thread before stop() quits/joins that thread. Camera2 posts
+         * these close callbacks (e.g. CameraDeviceImpl$ClientStateCallback.onClosed) to the same
+         * Handler passed to openCamera()/createCaptureSession(); quitting that thread's Looper
+         * before they run makes the late post crash with "Handler sending message to a Handler on
+         * a dead thread". Kept short so stop() stays bounded, not indefinite.
+         */
+        private const val CLOSE_DRAIN_TIMEOUT_MS = 300L
     }
 
     private val running = AtomicBoolean(false)
@@ -64,6 +85,10 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    // Counted down by the corresponding StateCallback.onClosed(), which Camera2 dispatches
+    // asynchronously on the handler thread; stop() awaits these (bounded) before quitting it.
+    @Volatile private var cameraCloseLatch: CountDownLatch? = null
+    @Volatile private var sessionCloseLatch: CountDownLatch? = null
     @Volatile private var pipeline: AndroidGreenScreenCleanSegmentationPipeline? = null
     @Volatile private var cameraRotationDegrees: Int = 0
     @Volatile private var acquiredFrameCount: Long = 0
@@ -142,47 +167,57 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         )
         onCameraFrameTransform(cameraRotationDegrees, true)
 
-        val analysisSize = try {
-            chooseAnalysisSize(cameraManager, cameraId)
-        } catch (t: Throwable) {
-            Log.w(TAG, "chooseAnalysisSize failed; falling back to $TARGET_ANALYSIS_SIZE", t)
-            TARGET_ANALYSIS_SIZE
-        }
-
         val ht = HandlerThread("vg.greenscreen.cam2")
         ht.start()
         val h = Handler(ht.looper)
         thread = ht
         handler = h
 
-        val reader = try {
-            ImageReader.newInstance(
-                analysisSize.width,
-                analysisSize.height,
-                ImageFormat.YUV_420_888,
-                MAX_IMAGES,
+        // CPU analysis target (ImageReader + clean segmentation pipeline) only
+        // when analysis is enabled. Preview-only mode (analysisEnabled=false)
+        // creates neither and never calls onMask.
+        var analysisSurface: Surface? = null
+        if (analysisEnabled) {
+            val analysisSize = try {
+                chooseAnalysisSize(cameraManager, cameraId)
+            } catch (t: Throwable) {
+                Log.w(TAG, "chooseAnalysisSize failed; falling back to $TARGET_ANALYSIS_SIZE", t)
+                TARGET_ANALYSIS_SIZE
+            }
+
+            val reader = try {
+                ImageReader.newInstance(
+                    analysisSize.width,
+                    analysisSize.height,
+                    ImageFormat.YUV_420_888,
+                    MAX_IMAGES,
+                )
+            } catch (t: Throwable) {
+                failStart(onError, IllegalStateException("ImageReader target creation failed", t))
+                return
+            }
+            imageReader = reader
+
+            val pipe = AndroidGreenScreenCleanSegmentationPipeline(
+                context = context.applicationContext ?: context,
+                onMask = onMask,
             )
-        } catch (t: Throwable) {
-            failStart(onError, IllegalStateException("ImageReader target creation failed", t))
-            return
-        }
-        imageReader = reader
+            if (!pipe.open()) {
+                failStart(onError, IllegalStateException("Green screen segmentation pipeline failed to open"))
+                return
+            }
+            pipeline = pipe
 
-        val pipe = AndroidGreenScreenCleanSegmentationPipeline(
-            context = context.applicationContext ?: context,
-            onMask = onMask,
-        )
-        if (!pipe.open()) {
-            failStart(onError, IllegalStateException("Green screen segmentation pipeline failed to open"))
-            return
+            reader.setOnImageAvailableListener({ availableReader ->
+                drainLatestImage(availableReader)
+            }, h)
+            analysisSurface = reader.surface
+        } else {
+            Log.i(TAG, "ANDROID_GREENSCREEN_CAMERA2_SOURCE_PREVIEW_ONLY analysisEnabled=false")
         }
-        pipeline = pipe
-
-        reader.setOnImageAvailableListener({ availableReader ->
-            drainLatestImage(availableReader)
-        }, h)
 
         try {
+            cameraCloseLatch = CountDownLatch(1)
             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (stopped.get()) {
@@ -190,7 +225,7 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
                         return
                     }
                     cameraDevice = camera
-                    configureSession(camera, targetSurface, reader.surface, h, onStarted, onError)
+                    configureSession(camera, targetSurface, analysisSurface, h, onStarted, onError)
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
@@ -203,6 +238,10 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
                     Log.w(TAG, "Camera2 green screen source error=$error")
                     camera.close()
                     if (!stopped.get()) onError(IllegalStateException("Camera2 green screen source error=$error"))
+                }
+
+                override fun onClosed(camera: CameraDevice) {
+                    cameraCloseLatch?.countDown()
                 }
             }, h)
         } catch (e: Exception) {
@@ -218,12 +257,19 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         try { captureSession?.abortCaptures() } catch (_: Throwable) {}
         try { captureSession?.close() } catch (_: Throwable) {}
         try { cameraDevice?.close() } catch (_: Throwable) {}
+        // Camera2 dispatches the corresponding onClosed() callbacks asynchronously on the
+        // handler thread below; drain them here (bounded) before quitting/joining that thread,
+        // or the late dispatch posts to a dead Handler and crashes.
+        try { sessionCloseLatch?.await(CLOSE_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
+        try { cameraCloseLatch?.await(CLOSE_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
         try { imageReader?.close() } catch (_: Throwable) {}
         try { pipeline?.close() } catch (_: Throwable) {}
         captureSession = null
         cameraDevice = null
         imageReader = null
         pipeline = null
+        cameraCloseLatch = null
+        sessionCloseLatch = null
         val ht = thread
         thread = null
         handler = null
@@ -251,7 +297,8 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
     fun diagnosticsSnapshot(): Map<String, Any?> {
         val snapshot = LinkedHashMap<String, Any?>()
         snapshot["proofLevel"] = "android_green_screen_camera2_clean_segmentation_source_v1"
-        snapshot["source"] = "camera2_front_clean_segmentation_cpu"
+        snapshot["source"] = if (analysisEnabled) "camera2_front_clean_segmentation_cpu" else "camera2_front_preview_only"
+        snapshot["analysisEnabled"] = analysisEnabled
         snapshot["running"] = running.get()
         snapshot["stopped"] = stopped.get()
         snapshot["acquiredFrameCount"] = acquiredFrameCount
@@ -265,17 +312,19 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
         return snapshot
     }
 
+    /** [analysisSurface] is null in preview-only mode (analysisEnabled=false): the preview Surface is the sole target. */
     private fun configureSession(
         camera: CameraDevice,
         previewSurface: Surface,
-        analysisSurface: Surface,
+        analysisSurface: Surface?,
         handler: Handler,
         onStarted: () -> Unit,
         onError: (Exception) -> Unit,
     ) {
         try {
+            sessionCloseLatch = CountDownLatch(1)
             camera.createCaptureSession(
-                listOf(previewSurface, analysisSurface),
+                listOfNotNull(previewSurface, analysisSurface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
                         if (stopped.get()) {
@@ -286,7 +335,7 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
                         try {
                             val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                                 addTarget(previewSurface)
-                                addTarget(analysisSurface)
+                                if (analysisSurface != null) addTarget(analysisSurface)
                                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                             }.build()
                             session.setRepeatingRequest(request, null, handler)
@@ -299,6 +348,10 @@ class AndroidGreenScreenCamera2Source(private val context: Context) {
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         onError(IllegalStateException("Camera2 green screen source session configure failed"))
+                    }
+
+                    override fun onClosed(session: CameraCaptureSession) {
+                        sessionCloseLatch?.countDown()
                     }
                 },
                 handler,

@@ -26,7 +26,8 @@ import java.util.concurrent.atomic.AtomicInteger
 // never calls startActive(), so that pump was always the sole frame source).
 //
 // Owns exactly one thing: the "vg.greenscreen.render" HandlerThread plus the
-// AndroidGreenScreenPreviewCompositor confined to it. It is a pure pump
+// AndroidGreenScreenPreviewBackend confined to it (built by [backendFactory];
+// AndroidGreenScreenPreviewCompositor by default). It is a pure pump
 // between two loopers it does not own:
 //   - mainHandler:   the ONLY place [cameraInputSurfaceReady] is invoked, so
 //                    the coordinator can start Camera2 (which requires the
@@ -39,6 +40,18 @@ import java.util.concurrent.atomic.AtomicInteger
 // and bumps the surface generation synchronously on the calling thread, so
 // swap acceptance is blocked immediately; the EGL-side detach then happens
 // asynchronously on the render thread.
+//
+// Backend selection: [backendFactory] builds the primary backend; when its
+// very first attach fails because its bootstrap never produced a camera
+// input surface (e.g. the GPU-resident backend's EGL/ES 3.1/TFLite bootstrap
+// or model validation) and a [fallbackBackendFactory] is supplied, the
+// primary is released and the fallback takes over on the render thread
+// BEFORE [cameraInputSurfaceReady] ever fires, so the camera is only ever
+// bound to the backend that actually survived bootstrap. State delivered
+// before that swap (enabled flag, background, camera transform) is replayed
+// onto the fallback. A failed attach whose bootstrap DID produce a camera
+// surface (transient window-surface failure) keeps the primary for the next
+// attach, and a later re-attach failure never swaps backends.
 
 class AndroidGreenScreenPreviewRenderLoop(
     private val mainHandler: Handler,
@@ -57,6 +70,19 @@ class AndroidGreenScreenPreviewRenderLoop(
      * Never called if the compositor bootstrap fails.
      */
     private val cameraInputSurfaceReady: ((Surface) -> Unit)? = null,
+    /**
+     * Builds the render-thread-confined preview backend. Invoked once, on the
+     * constructing thread; the product must defer every GL/EGL/model step to
+     * its own [AndroidGreenScreenPreviewBackend.attachOutputSurface].
+     * Default preserves the historical hardcoded CPU-mask compositor.
+     */
+    backendFactory: () -> AndroidGreenScreenPreviewBackend = { AndroidGreenScreenPreviewCompositor() },
+    /**
+     * Optional backend used when the primary backend's FIRST attach fails.
+     * Invoked on the render thread at most once. Null = no fallback (attach
+     * failure leaves the loop idle exactly as before this seam existed).
+     */
+    private val fallbackBackendFactory: (() -> AndroidGreenScreenPreviewBackend)? = null,
 ) {
 
     companion object {
@@ -71,8 +97,33 @@ class AndroidGreenScreenPreviewRenderLoop(
     private val renderThread = HandlerThread("vg.greenscreen.render").apply { start() }
     private val renderHandler = Handler(renderThread.looper)
 
-    /** Render-thread-only; every touch happens via [renderHandler]. */
-    private val compositor: AndroidGreenScreenPreviewBackend = AndroidGreenScreenPreviewCompositor()
+    /**
+     * Render-thread-only; every touch happens via [renderHandler]. Volatile
+     * only so the main-thread [cameraInputSurface] read observes a fallback
+     * swap (which always precedes the first [cameraInputSurfaceReady] post).
+     */
+    @Volatile
+    private var compositor: AndroidGreenScreenPreviewBackend = backendFactory()
+
+    /**
+     * True once the primary backend was replaced by [fallbackBackendFactory]'s
+     * product. Set on the render thread before [cameraInputSurfaceReady] fires,
+     * so the coordinator can read it from that callback to pick the matching
+     * camera-source configuration.
+     */
+    @Volatile
+    var usingFallbackBackend: Boolean = false
+        private set
+
+    /** Render-thread-only: fallback is allowed only before the first successful attach. */
+    private var hasAttachedOnce = false
+
+    // Latest backend state received before/around attach, replayed onto a
+    // fallback backend so it starts from the same configuration the primary
+    // would have had. Render-thread-only.
+    private var latestGreenScreenEnabled: Boolean? = null
+    private var latestBackground: AndroidGreenScreenBackground? = null
+    private var latestCameraTransform: Pair<Int, Boolean>? = null
 
     /**
      * The compositor's camera input surface — allocated inside [compositor]
@@ -120,7 +171,8 @@ class AndroidGreenScreenPreviewRenderLoop(
             if (isStopped.get()) return@post
             // A newer attach/loss superseded this one before it ran.
             if (generation != surfaceGeneration.get()) return@post
-            if (!compositor.attachOutputSurface(surface, widthPx, heightPx)) return@post
+            if (!attachWithFallback(surface, widthPx, heightPx)) return@post
+            hasAttachedOnce = true
             compositor.setLayout(sourceRect, cameraRect)
             canSubmit.set(true)
             // Ensure the redraw pump is running so camera frames are presented
@@ -139,6 +191,50 @@ class AndroidGreenScreenPreviewRenderLoop(
                 }
             }
         }
+    }
+
+    /**
+     * Render-thread only. Attaches on the current backend; when that is the
+     * primary's first-ever attach, it fails, and the primary's bootstrap left
+     * no camera input surface behind (core failure, not a transient window
+     * failure), releases the primary, swaps in the fallback (replaying the
+     * latest enabled/background/transform state) and retries once. Returns
+     * the final attach result.
+     */
+    private fun attachWithFallback(surface: Surface, widthPx: Int, heightPx: Int): Boolean {
+        val primary = compositor
+        if (primary.attachOutputSurface(surface, widthPx, heightPx)) return true
+        if (hasAttachedOnce || usingFallbackBackend) return false
+        // Bootstrap survived (camera surface exists): only the window attach
+        // failed, which the next attach may recover on this same backend.
+        if (primary.cameraInputSurface != null) return false
+        val factory = fallbackBackendFactory ?: return false
+
+        Log.w(
+            TAG,
+            "ANDROID_GREENSCREEN_GPU_RESIDENT_FALLBACK primary=${primary.javaClass.simpleName} " +
+                "reason=first_attach_bootstrap_failed -> fallback backend",
+        )
+        try { primary.release() } catch (t: Throwable) {
+            Log.w(TAG, "primary backend release after failed attach threw: ${t.message}")
+        }
+        val fallback = try {
+            factory()
+        } catch (t: Throwable) {
+            Log.w(TAG, "fallback backend factory threw: ${t.message}")
+            return false
+        }
+        compositor = fallback
+        usingFallbackBackend = true
+        latestGreenScreenEnabled?.let { fallback.setGreenScreenEnabled(it) }
+        latestBackground?.let { fallback.setGreenScreenBackground(it) }
+        latestCameraTransform?.let { (rotation, mirror) -> fallback.setCameraFrameTransform(rotation, mirror) }
+        val attached = fallback.attachOutputSurface(surface, widthPx, heightPx)
+        Log.i(
+            TAG,
+            "ANDROID_GREENSCREEN_GPU_RESIDENT_FALLBACK_RESULT backend=${fallback.javaClass.simpleName} attached=$attached",
+        )
+        return attached
     }
 
     /**
@@ -180,6 +276,7 @@ class AndroidGreenScreenPreviewRenderLoop(
         if (isStopped.get()) return
         renderHandler.post {
             if (isStopped.get()) return@post
+            latestGreenScreenEnabled = enabled
             compositor.setGreenScreenEnabled(enabled)
         }
     }
@@ -197,6 +294,7 @@ class AndroidGreenScreenPreviewRenderLoop(
         if (isStopped.get()) return
         renderHandler.post {
             if (isStopped.get()) return@post
+            latestCameraTransform = rotationDegrees to mirrorHorizontal
             compositor.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
         }
     }
@@ -205,7 +303,8 @@ class AndroidGreenScreenPreviewRenderLoop(
      * Delivers a new CPU segmentation mask to the compositor for the next draw.
      * Posts to the render thread; the compositor's AtomicReference absorbs
      * any thread-safety concern between this post and the next drawFrame.
-     * No ML runs inside the render loop.
+     * No ML runs inside the render loop itself; a self-contained backend
+     * (AndroidGreenScreenGpuResidentPreviewBackend) ignores these frames.
      */
     fun updateGreenScreenMask(frame: AndroidGreenScreenSegmentationFrame) {
         if (isStopped.get()) return
@@ -220,6 +319,7 @@ class AndroidGreenScreenPreviewRenderLoop(
         if (isStopped.get()) return
         renderHandler.post {
             if (isStopped.get()) return@post
+            latestBackground = background
             compositor.setGreenScreenBackground(background)
         }
     }

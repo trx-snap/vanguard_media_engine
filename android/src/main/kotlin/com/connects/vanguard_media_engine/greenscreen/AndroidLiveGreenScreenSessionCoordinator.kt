@@ -27,13 +27,26 @@ import java.util.concurrent.atomic.AtomicBoolean
 // Reuses the production GL preview stack as-is (no diagnostics Canvas code):
 //   - AndroidPreviewSurfaceProducer      → Flutter texture / output Surface
 //   - AndroidGreenScreenPreviewRenderLoop → independent single-camera render
-//                                          thread + GLES compositor: no
+//                                          thread + preview backend: no
 //                                          decoderProvider, no source-video
 //                                          clock, no Duet layout modes — the
 //                                          camera redraw pump presents every
 //                                          camera frame directly.
+//     Backend selection (render loop factory seam): the GPU-resident backend
+//     (AndroidGreenScreenGpuResidentPreviewBackend: self-contained TFLite
+//     GpuDelegate segmentation + native ES 3.1 guided-filter composite, one
+//     frame transaction per camera frame) is the default. If its first
+//     attach fails (EGL/ES 3.1/model validation), the loop falls back to
+//     AndroidGreenScreenPreviewCompositor BEFORE the camera starts; the
+//     coordinator reads `usingFallbackBackend` inside cameraInputSurfaceReady
+//     to configure the camera source to match.
 //   - AndroidGreenScreenCamera2Source    → independent front-camera Camera2
-//                                          source feeding the production
+//                                          source. With the GPU-resident
+//                                          backend it runs preview-only
+//                                          (analysisEnabled=false: no
+//                                          ImageReader, no CPU segmentation
+//                                          pipeline, no onMask). On fallback
+//                                          it feeds the production
 //                                          segmentation ladder (mediapipe_cpu
 //                                          -> mlkit -> none) directly against
 //                                          a Camera2 Image (see its class doc
@@ -45,8 +58,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 //                                          coordinator only sees `onMask`,
 //                                          `onCameraFrameTransform`,
 //                                          `onStarted`, and `onError`, so it
-//                                          reports a coarse mediapipe_cpu/none
-//                                          backend rather than the live rung.
+//                                          reports a coarse raw_tflite_gpu /
+//                                          mediapipe_cpu / none backend rather
+//                                          than the live rung.
 //   - AndroidGreenScreenBackground   → static background spec (from the
 //                                          very first frame; never VIDEO here).
 //   - AndroidGreenScreenLayoutGeometry.greenScreen(canvas, transform) → source rect =
@@ -126,6 +140,12 @@ class AndroidLiveGreenScreenSessionCoordinator(
         var cameraSource: AndroidGreenScreenCamera2Source? = null
         /** True between an output-surface loss and its re-availability. */
         var suspended: Boolean = false
+        /**
+         * Coarse segmentation backend label reported in events/logs while the
+         * camera source runs: raw_tflite_gpu for the GPU-resident backend,
+         * mediapipe_cpu for the CPU compositor fallback. Set at camera start.
+         */
+        var segmentationBackend: String = AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -205,6 +225,12 @@ class AndroidLiveGreenScreenSessionCoordinator(
                 cameraInputSurfaceReady = { camSurface ->
                     startCameraSourceIfNeeded(session, camSurface)
                 },
+                // Primary: GPU-resident self-contained segmentation backend.
+                // Its EGL/ES 3.1/TFLite bootstrap runs inside its first attach
+                // on the render thread; if that fails the loop swaps in the
+                // proven CPU-mask compositor before any camera start.
+                backendFactory = { AndroidGreenScreenGpuResidentPreviewBackend(ctx) },
+                fallbackBackendFactory = { AndroidGreenScreenPreviewCompositor() },
             )
         } catch (t: Throwable) {
             producer.release()
@@ -336,23 +362,39 @@ class AndroidLiveGreenScreenSessionCoordinator(
      * Idempotent camera start. No-ops when the session was torn down between
      * the render-thread post and this main-thread run, when the compositor
      * surface is already dead, or when the camera is already running (it
-     * survives output loss). [AndroidGreenScreenCamera2Source] owns its own
-     * segmentation ladder (mediapipe_cpu -> mlkit -> none) internally and only
-     * ever calls back here with `onCameraFrameTransform` (forwarded to the
-     * render loop so the compositor corrects for sensor orientation/mirroring),
-     * `onMask` (forwarded to the render loop), `onStarted`, and `onError`. On
-     * failure the source is stopped and nulled so a later re-attach can retry,
-     * and an `error` event is emitted; the session stays alive for the caller
-     * to stop.
+     * survives output loss).
+     *
+     * Backend-matched camera configuration: the render loop has already
+     * settled its backend (primary GPU-resident, or CPU fallback) before this
+     * callback was posted. With the GPU-resident backend the camera source
+     * runs preview-only (`analysisEnabled = false`): segmentation happens
+     * inside the backend's own frame transaction, so no ImageReader, no CPU
+     * segmentation pipeline and no `onMask` ever exist. On fallback,
+     * [AndroidGreenScreenCamera2Source] owns its own segmentation ladder
+     * (mediapipe_cpu -> mlkit -> none) internally exactly as before and
+     * forwards `onMask` to the render loop. In both cases it calls back with
+     * `onCameraFrameTransform` (forwarded to the render loop), `onStarted`,
+     * and `onError`. On failure the source is stopped and nulled so a later
+     * re-attach can retry, and an `error` event is emitted; the session stays
+     * alive for the caller to stop.
      */
     private fun startCameraSourceIfNeeded(session: LiveSession, surface: Surface) {
         if (activeSession !== session) return
-        if (session.renderLoop == null || session.producer == null) return
+        val renderLoop = session.renderLoop ?: return
+        if (session.producer == null) return
         if (!surface.isValid) return
         val ctx = context ?: return
         if (session.cameraSource != null) return
 
-        val camSource = AndroidGreenScreenCamera2Source(ctx)
+        val gpuResident = !renderLoop.usingFallbackBackend
+        session.segmentationBackend = if (gpuResident) {
+            AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU
+        } else {
+            AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU
+        }
+        val backendLabel = session.segmentationBackend
+
+        val camSource = AndroidGreenScreenCamera2Source(ctx, analysisEnabled = !gpuResident)
         session.cameraSource = camSource
 
         camSource.start(
@@ -363,14 +405,15 @@ class AndroidLiveGreenScreenSessionCoordinator(
             onMask = { frame -> session.renderLoop?.updateGreenScreenMask(frame) },
             onStarted = {
                 Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_CAMERA_STARTED session=${session.sessionId} " +
-                    "source=camera2_clean_segmentation backend=${AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU}")
+                    "source=${if (gpuResident) "camera2_preview_only" else "camera2_clean_segmentation"} " +
+                    "backend=$backendLabel gpuResident=$gpuResident")
             },
             onError = { e ->
                 Log.w(TAG, "Camera source failed for live session ${session.sessionId}: ${e.message}")
                 camSource.stop()
                 if (activeSession === session && session.cameraSource === camSource) {
                     session.cameraSource = null
-                    emit(session, EVENT_ERROR, AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU, AndroidGreenScreenSegmentationBackend.NONE,
+                    emit(session, EVENT_ERROR, backendLabel, AndroidGreenScreenSegmentationBackend.NONE,
                         "camera_start_failed",
                         "The camera could not be started: ${e.message ?: e.javaClass.simpleName}")
                 }
@@ -381,11 +424,13 @@ class AndroidLiveGreenScreenSessionCoordinator(
     /**
      * Coarse backend label for `suspended`/`resumed`/`error` events: the
      * independent Camera2 source's internal ladder (mediapipe_cpu -> mlkit ->
-     * none) is not observable from here, so this reports `mediapipe_cpu`
-     * while the camera source is running and `none` once it is gone.
+     * none) is not observable from here, so this reports the session's
+     * settled backend (`raw_tflite_gpu` for the GPU-resident backend,
+     * `mediapipe_cpu` on fallback) while the camera source is running and
+     * `none` once it is gone.
      */
     private fun reportedBackend(session: LiveSession): String =
-        if (session.cameraSource != null) AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU else AndroidGreenScreenSegmentationBackend.NONE
+        if (session.cameraSource != null) session.segmentationBackend else AndroidGreenScreenSegmentationBackend.NONE
 
     // ── Release ───────────────────────────────────────────────────────────────
 

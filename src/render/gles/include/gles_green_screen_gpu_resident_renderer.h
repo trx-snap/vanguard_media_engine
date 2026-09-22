@@ -1,0 +1,297 @@
+// gles_green_screen_gpu_resident_renderer.h
+// ANDROID-GREENSCREEN-GPU-RESIDENT: private helper - GlesGreenScreenGpuResidentRenderer.
+//
+// Native half of the Android live GreenScreen GPU-resident preview backend
+// (AndroidGreenScreenGpuResidentPreviewBackend.kt). Adapted from the RND
+// gpuzero `gl_renderer.cpp` GPU-resident loop with every camera-owner concern
+// removed: no AHardwareBuffer / EGLImage import, no CameraStreamReader,
+// no AImage. The renderer samples an already-latched GL_TEXTURE_EXTERNAL_OES
+// texture that Kotlin drives through a SurfaceTexture (updateTexImage on the
+// render thread), and every camera sample in every pass goes through the
+// SurfaceTexture transform matrix supplied via SetCameraTransform.
+//
+// Owns:
+//   - its own EGLDisplay / ES 3.1 EGLContext / 1x1 pbuffer (context stays
+//     current on the render thread while no output is attached),
+//   - an optional EGL window surface over a borrowed ANativeWindow (attached /
+//     detached independently of the camera input, which survives output loss),
+//   - the camera OES texture name (created here, handed to Kotlin for
+//     SurfaceTexture construction),
+//   - model-input RGBA8 texture + FBO, coarse R8 mask texture, R32F alpha
+//     ping/pong/history textures, optional background image texture, the
+//     compute / composite programs and the full-screen quad.
+//
+// Does NOT own: the TFLite interpreter (Kotlin), the SurfaceTexture / camera
+// Surface (Kotlin), the output Surface (Flutter SurfaceProducer; only the EGL
+// window surface wrapping it is created/destroyed here).
+//
+// One frame transaction (all on the render thread, context current):
+//   DownscaleCameraToModelInput -> [Kotlin: Interpreter.run] ->
+//   UploadCoarseMask -> RenderFrame (guided filter -> optional temporal ->
+//   composite -> eglSwapBuffers).
+//
+// Threading: single render thread only. No internal locking.
+//
+// Private header: EGL/GLES/Android headers never appear here; the .cpp
+// confines them behind #if defined(__ANDROID__) and compiles to a failing
+// stub elsewhere.
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace vanguard {
+namespace render {
+
+/** Canvas-pixel rect, top-left origin (mirrors AndroidGreenScreenPixelRect). */
+struct GlesGreenScreenGpuResidentRect {
+    float left = 0.0f;
+    float top = 0.0f;
+    float width = 0.0f;
+    float height = 0.0f;
+};
+
+/** Cumulative per-session counters for the release-time summary log. */
+struct GlesGreenScreenGpuResidentStats {
+    uint64_t framesRendered = 0;
+    uint64_t framesSwapped = 0;
+    uint64_t downscales = 0;
+    uint64_t maskUploads = 0;
+    uint64_t refinePasses = 0;
+    double totalDownscaleMs = 0.0;
+    double totalRefineMs = 0.0;
+    double totalCompositeMs = 0.0;
+    float lastDownscaleMs = 0.0f;
+    float lastRefineMs = 0.0f;
+    float lastCompositeMs = 0.0f;
+};
+
+class GlesGreenScreenGpuResidentRenderer {
+public:
+    enum class BackgroundMode : int32_t {
+        kBlack = 0,
+        kSolidColor = 1,
+        kImage = 2,
+    };
+
+    enum class CameraMode : int32_t {
+        kNone = 0,         // camera layer not drawn (background stays visible)
+        kPlaceholder = 1,  // fixed placeholder fill of the camera rect
+        kPassthrough = 2,  // latched camera frame, unmasked
+        kMasked = 3,       // latched camera frame keyed by the refined alpha
+    };
+
+    GlesGreenScreenGpuResidentRenderer();
+    ~GlesGreenScreenGpuResidentRenderer();
+
+    GlesGreenScreenGpuResidentRenderer(const GlesGreenScreenGpuResidentRenderer&) = delete;
+    GlesGreenScreenGpuResidentRenderer& operator=(const GlesGreenScreenGpuResidentRenderer&) = delete;
+
+    // -- Lifecycle ----------------------------------------------------------
+
+    /**
+     * Creates the EGL display / ES 3.1 context / pbuffer, compiles every
+     * program and allocates the static GL objects (camera OES texture, quad).
+     * Leaves the context current on the calling thread. On failure every
+     * partial resource is destroyed and *error describes the first failure.
+     */
+    bool Initialize(std::string* error);
+
+    /** Terminal teardown (idempotent, never throws). Destroys the window
+     *  surface, every GL object, the pbuffer, the context and the display. */
+    void Destroy();
+
+    bool IsInitialized() const { return initialized_; }
+
+    /** Makes the context current on the calling thread (window surface if
+     *  attached, else the pbuffer). */
+    bool MakeCurrent();
+
+    /** GL_TEXTURE_EXTERNAL_OES texture name for the Kotlin SurfaceTexture. */
+    uint32_t CameraTextureId() const { return cameraTexture_; }
+
+    /** Allocates the model-input RGBA8 texture + FBO for the interpreter's
+     *  input tensor size. Requires a current context. */
+    bool ConfigureModelInput(int width, int height, std::string* error);
+
+    // -- Output window -------------------------------------------------------
+
+    /**
+     * Wraps a borrowed ANativeWindow* (acquired here; released on detach) in
+     * an EGL window surface and makes it current. Re-attaching destroys the
+     * previous window surface first. Never releases the Android Surface.
+     */
+    bool AttachOutputWindow(void* nativeWindow, int widthPx, int heightPx, std::string* error);
+
+    /** Destroys ONLY the EGL window surface (and drops the window ref); the
+     *  context, camera texture and every other GL object survive. */
+    void DetachOutputWindow();
+
+    bool HasOutputWindow() const { return eglWindowSurface_ != nullptr; }
+
+    // -- State ---------------------------------------------------------------
+
+    void SetLayout(const GlesGreenScreenGpuResidentRect& sourceRect,
+                   const GlesGreenScreenGpuResidentRect& cameraRect);
+
+    /**
+     * Latches the SurfaceTexture transform matrix (column-major 4x4, as
+     * returned by getTransformMatrix) plus the upright camera aspect
+     * (width / height after that transform) used for the aspect-fill
+     * viewport and the alpha resolution.
+     */
+    void SetCameraTransform(const float stMatrixColumnMajor[16], float cameraUprightAspect);
+
+    void SetBackgroundBlack();
+    void SetBackgroundSolidColor(uint32_t argb);
+    /** Uploads tightly packed RGBA8 pixels (row 0 = top). Requires a current context. */
+    bool SetBackgroundImage(const uint8_t* rgba, int width, int height, bool aspectFill, std::string* error);
+    void SetBackgroundImageScaleMode(bool aspectFill);
+    void ClearBackgroundImage();
+
+    void SetFilterToggles(bool guidedFilter, bool temporalStabilizer, bool despill);
+
+    // -- Frame transaction ---------------------------------------------------
+
+    /**
+     * GPU-downscales the latched camera frame into the model input texture,
+     * reads it back and packs it as normalized float RGB (NHWC, row 0 = top)
+     * into outRgbFloats (must hold width*height*3 floats). Requires a
+     * current context and ConfigureModelInput.
+     */
+    bool DownscaleCameraToModelInput(float* outRgbFloats, size_t outFloatCount, std::string* error);
+
+    /**
+     * Converts a float32 single-channel mask (row 0 = top, width*height
+     * floats, values clamped to [0,1]) to R8 and uploads it as the coarse
+     * alpha texture. Requires a current context.
+     */
+    bool UploadCoarseMask(const float* mask, size_t floatCount, int width, int height, std::string* error);
+
+    /**
+     * Guided filter (+ optional temporal) over the coarse mask when
+     * refineMask is set (or when no refined alpha exists yet), then the
+     * composite into the window surface and eglSwapBuffers. Returns the swap
+     * result; false without an attached window.
+     */
+    bool RenderFrame(CameraMode cameraMode, bool refineMask, std::string* error);
+
+    const GlesGreenScreenGpuResidentStats& stats() const { return stats_; }
+    std::string StatsSummary() const;
+
+private:
+    struct GlRect {
+        float x = 0.0f;
+        float y = 0.0f;
+        float w = 0.0f;
+        float h = 0.0f;
+    };
+
+    bool CreateEglCore(std::string* error);
+    bool CreatePrograms(std::string* error);
+    bool CreateStaticObjects(std::string* error);
+    bool EnsureAlphaTextures(int width, int height, std::string* error);
+    bool EnsureCoarseAlphaTexture(int width, int height, std::string* error);
+    void DestroyGlObjects();
+    void DestroyWindowSurfaceQuietly();
+    void MakePbufferCurrentQuietly();
+
+    GlRect ToGl(const GlesGreenScreenGpuResidentRect& rect) const;
+    GlRect CameraAspectFillViewport(const GlesGreenScreenGpuResidentRect& rect) const;
+    GlRect BackgroundImageRect(const GlesGreenScreenGpuResidentRect& rect) const;
+    void DeriveAlphaResolution(int* width, int* height) const;
+
+    bool RunGuidedFilter(std::string* error);
+    bool RunTemporalStabilizer(std::string* error);
+    bool RunComposite(CameraMode cameraMode, std::string* error);
+
+    // EGL (void* aliases of EGLDisplay / EGLConfig / EGLContext / EGLSurface).
+    void* eglDisplay_ = nullptr;
+    void* eglConfig_ = nullptr;
+    void* eglContext_ = nullptr;
+    void* eglPbufferSurface_ = nullptr;
+    void* eglWindowSurface_ = nullptr;
+    void* nativeWindow_ = nullptr;  // ANativeWindow*, acquired on attach
+    bool initialized_ = false;
+
+    int outputWidth_ = 0;
+    int outputHeight_ = 0;
+
+    int modelInputWidth_ = 0;
+    int modelInputHeight_ = 0;
+
+    // GL objects.
+    uint32_t cameraTexture_ = 0;
+    uint32_t modelInputTexture_ = 0;
+    uint32_t modelInputFbo_ = 0;
+    uint32_t coarseAlphaTexture_ = 0;
+    uint32_t alphaPingTexture_ = 0;
+    uint32_t alphaPongTexture_ = 0;
+    uint32_t alphaHistoryTexture_ = 0;
+    uint32_t backgroundImageTexture_ = 0;
+    uint32_t quadVao_ = 0;
+    uint32_t quadVbo_ = 0;
+
+    uint32_t downscaleProgram_ = 0;
+    uint32_t guidedProgram_ = 0;
+    uint32_t temporalProgram_ = 0;
+    uint32_t compositeProgram_ = 0;
+
+    // Uniform locations.
+    int32_t downscaleModelSizeLoc_ = -1;
+    int32_t downscaleStMatrixLoc_ = -1;
+    int32_t guidedAlphaResolutionLoc_ = -1;
+    int32_t guidedStMatrixLoc_ = -1;
+    int32_t guidedFilterEnabledLoc_ = -1;
+    int32_t temporalAlphaResolutionLoc_ = -1;
+    int32_t compositeCameraTextureLoc_ = -1;
+    int32_t compositeAlphaTextureLoc_ = -1;
+    int32_t compositeBackgroundImageLoc_ = -1;
+    int32_t compositeAlphaResolutionLoc_ = -1;
+    int32_t compositeStMatrixLoc_ = -1;
+    int32_t compositeSourceRectLoc_ = -1;
+    int32_t compositeCameraScissorLoc_ = -1;
+    int32_t compositeCameraViewportLoc_ = -1;
+    int32_t compositeBackgroundImageRectLoc_ = -1;
+    int32_t compositeBackgroundColorLoc_ = -1;
+    int32_t compositePlaceholderColorLoc_ = -1;
+    int32_t compositeBackgroundModeLoc_ = -1;
+    int32_t compositeCameraModeLoc_ = -1;
+    int32_t compositeDespillEnabledLoc_ = -1;
+
+    int coarseAlphaWidth_ = 0;
+    int coarseAlphaHeight_ = 0;
+    int alphaWidth_ = 0;
+    int alphaHeight_ = 0;
+    uint32_t activeAlphaTexture_ = 0;
+    bool hasCoarseMask_ = false;
+    bool hasRefinedAlpha_ = false;
+
+    GlesGreenScreenGpuResidentRect sourceRect_;
+    GlesGreenScreenGpuResidentRect cameraRect_;
+    bool hasLayout_ = false;
+
+    float cameraStMatrix_[16];
+    float cameraUprightAspect_ = 1080.0f / 1920.0f;
+
+    BackgroundMode backgroundMode_ = BackgroundMode::kBlack;
+    float backgroundColor_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    int backgroundImageWidth_ = 0;
+    int backgroundImageHeight_ = 0;
+    bool backgroundImageAspectFill_ = true;
+
+    bool guidedFilterEnabled_ = true;
+    bool temporalEnabled_ = false;
+    bool despillEnabled_ = true;
+
+    std::vector<uint8_t> modelInputRgba_;
+    std::vector<uint8_t> coarseAlphaBytes_;
+
+    GlesGreenScreenGpuResidentStats stats_;
+};
+
+}  // namespace render
+}  // namespace vanguard
