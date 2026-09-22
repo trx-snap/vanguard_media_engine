@@ -5,10 +5,12 @@ import android.media.MediaExtractor
 import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.StatFs
 import android.util.Log
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.view.TextureRegistry
 import java.io.File
+import java.util.TreeMap
 import java.util.UUID
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,6 +30,14 @@ import java.util.UUID
 //   - Slice 4B-C: wires AndroidDuetPreviewRenderLoop behind the preview texture
 //     lifecycle (attach / surface available / surface lost / detach) and the
 //     recording transport (start/pause/resume/deleteLastSegment/updateLayout).
+//   - Slice 1A (live take persistence): every RECORDING span is one
+//     AndroidDuetSegmentRecorder take written to
+//     <cacheDir>/vanguard_duet_segments/<sessionId>/take_<n>.mp4 from the
+//     compositor's already-latched camera frame (encoder surface attached
+//     through the render loop), and the source clip's own audio is previewed
+//     through AndroidDuetPreviewAudioPlayer at the clock's cursor/speed.
+//     pause/stop reply only after the take file is durable; stop returns the
+//     real per-segment asset paths (index-aligned with the clock's segments).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State machine
@@ -100,12 +110,41 @@ class VGDuetAndroidSession(
     // Bounded fallback that starts anyway if the first mask never arrives.
     var pendingStartTimeoutRunnable: Runnable? = null
 
+    // ── Slice 1A: live take persistence + source-audio preview ────────────────
+    // Per-session temp directory holding one MP4 per take; created lazily on
+    // the first take, deleted on dispose (never on stop: the returned assets
+    // belong to the caller from then on).
+    var segmentDir: File? = null
+    // Monotonic file-name counter so a rolled-back take never reuses the name
+    // of a file whose async deletion may still be pending.
+    var takeFileCounter: Int = 0
+    // Recorder of the RECORDING take and the clock segment index it commits as.
+    var currentRecorder: AndroidDuetSegmentRecorder? = null
+    var currentTakeIndex: Int = -1
+    // A take whose encoder-surface attach is still in flight on the render
+    // thread (state is still INITIALIZED/PAUSED). Guards double starts; the
+    // parked reply is failed with [pendingTakeFailureCode] if the preview goes away.
+    var pendingTakeRecorder: AndroidDuetSegmentRecorder? = null
+    var pendingTakeReply: ((Any?, String?) -> Unit)? = null
+    var pendingTakeFailureCode: String = "recording_start_failed"
+    // Durable take files keyed by clock segment index (ordered).
+    val segmentAssetPathsByIndex: TreeMap<Int, String> = TreeMap()
+    // Takes whose recorder is still finalizing, keyed by segment index.
+    val finalizingRecorders: MutableMap<Int, AndroidDuetSegmentRecorder> = mutableMapOf()
+    // Segment indices rolled back (deleteLastSegment) while their take was still finalizing.
+    val discardedTakeIndices: MutableSet<Int> = mutableSetOf()
+    // Continuation parked by stopRecording until every finalizing take has landed.
+    var onAllTakesFinalized: (() -> Unit)? = null
+    // Source-clip audio preview; null when the source has no audio track.
+    var previewAudioPlayer: AndroidDuetPreviewAudioPlayer? = null
+
     fun startSegment() {
         previewClock.startSegment()
     }
 
-    fun commitSegment() {
-        previewClock.commitSegment()
+    /** Commits the active clock segment; null when the clock was not recording. */
+    fun commitSegment(): VGDuetAndroidSegmentRecord? {
+        return previewClock.commitSegment()
     }
 
     fun deleteLastSegment(): Boolean {
@@ -128,11 +167,14 @@ class VGDuetAndroidSession(
             "sourceAudioMuted" to (sourceGain < 0.0001),
             "micAudioMuted"    to (micGain < 0.0001),
         )
+        // Slice 1A: real per-take files, ordered by clock segment index. A take
+        // that failed to finalize has already rolled its clock segment back, so
+        // this list stays index-aligned with `segments`.
         return mapOf(
             "compositionDescriptor" to descriptor,
             "totalDurationMs"       to maxOf(1, totalDurationMs()),
             "segmentCount"          to maxOf(1, segmentCount()),
-            "segmentAssets"         to emptyList<String>(),
+            "segmentAssets"         to segmentAssetPathsByIndex.values.toList(),
             "proofOutputPath"       to null,
         )
     }
@@ -180,8 +222,22 @@ class AndroidDuetSessionCoordinator(
          */
         private const val GREEN_SCREEN_FIRST_MASK_START_TIMEOUT_MS = 4000L
 
+        /** Slice 1A: free storage required in the cache volume before a take may start. */
+        private const val MIN_FREE_DISK_BYTES = 200L * 1024L * 1024L
+        private const val SEGMENT_DIR_ROOT = "vanguard_duet_segments"
+
         fun isValidSpeed(speed: Double): Boolean =
             VALID_SPEEDS.any { Math.abs(it - speed) < SPEED_EPSILON }
+
+        /** Plain filesystem path for a `file://` URI or path (same rule as [probeSource]). */
+        fun resolveSourcePath(filePath: String): String {
+            if (!filePath.startsWith("file://")) return filePath
+            return try {
+                java.net.URI(filePath).path ?: filePath
+            } catch (_: Exception) {
+                filePath
+            }
+        }
 
         fun validatePipRect(rectMap: Map<*, *>): String? {
             val left   = (rectMap["left"]   as? Number)?.toDouble() ?: return "PiP rect missing 'left'."
@@ -450,6 +506,18 @@ class AndroidDuetSessionCoordinator(
                         decoder             = decoder,
                     )
                     session.probeResult = probVal
+                    // Slice 1A: source-audio preview only when the clip has an
+                    // audio track; prepared asynchronously and primed at trimStart
+                    // so the first take's play() is immediate. Failure to prepare
+                    // is logged inside the player and never blocks the session.
+                    if (probVal.hasAudioTrack) {
+                        val player = AndroidDuetPreviewAudioPlayer(resolveSourcePath(filePath), mainHandler)
+                        player.prepare(trimStartMs)
+                        session.previewAudioPlayer = player
+                    } else {
+                        Log.i("DuetCoordinator",
+                            "ANDROID_DUET_PREVIEW_AUDIO_SKIPPED session=$sessionId reason=source_has_no_audio_track")
+                    }
                     activeSession = session
                     reply(sessionId, null)
                 }
@@ -553,6 +621,11 @@ class AndroidDuetSessionCoordinator(
         }
         session.speedMultiplier = speed
         session.previewClock.setSpeed(speed)
+        // Slice 1A: the clock applies a speed change at the NEXT segment start
+        // (activeSpeedMultiplier is captured by startSegment), so the audio
+        // preview and the take's PTS policy pick it up at the next take too;
+        // changing the live player mid-take would desync it from the source
+        // video preview, which follows the clock.
         reply(null, null)
     }
 
@@ -571,6 +644,10 @@ class AndroidDuetSessionCoordinator(
         }
         session.sourceGain = sourceGain
         session.micGain    = micGain
+        // Slice 1A: source gain drives the live audio preview immediately.
+        // micGain stays descriptor metadata (applied at export); the take
+        // recorder captures unity-gain mic audio so it is never baked in twice.
+        session.previewAudioPlayer?.setVolume(sourceGain)
         reply(null, null)
     }
 
@@ -585,6 +662,10 @@ class AndroidDuetSessionCoordinator(
             // A start is already parked behind the green-screen first-mask barrier:
             // never start twice and never overwrite the parked reply.
             reply(null, invalidState("startDuetRecording", "INITIALIZED (start pending)", expected = "INITIALIZED")); return
+        }
+        if (session.pendingTakeRecorder != null) {
+            // Slice 1A: a take's encoder-surface attach is in flight; never start twice.
+            reply(null, invalidState("startDuetRecording", "INITIALIZED (take start pending)", expected = "INITIALIZED")); return
         }
         val immediateReason = immediateStartReason(session)
         if (immediateReason != null) {
@@ -618,8 +699,10 @@ class AndroidDuetSessionCoordinator(
     }
 
     /**
-     * Performs the actual INITIALIZED -> RECORDING transition: state, segment
-     * open, active render-loop playback, success reply. Main thread only — the
+     * Performs the actual INITIALIZED -> RECORDING transition through the
+     * Slice 1A take pipeline ([beginTake]): recorder + encoder-surface attach
+     * first, then state, segment open, source-audio preview, active
+     * render-loop playback and the success reply. Main thread only — the
      * preview clock, the loop's PTS provider, and the (possibly parked)
      * MethodChannel reply all live there.
      */
@@ -628,16 +711,7 @@ class AndroidDuetSessionCoordinator(
         reply: (Any?, String?) -> Unit,
         reason: String,
     ) {
-        session.state = VGDuetSessionState.RECORDING
-        session.startSegment()
-        // Slice 4B-C: active playback. The provider runs on the main thread only,
-        // so reading the preview clock here is safe.
-        session.previewRenderLoop?.startActive {
-            session.previewClock.currentSourcePtsMs().toLong()
-        }
-        Log.i("DuetCoordinator",
-            "ANDROID_DUET_RECORDING_BEGIN session=${session.sessionId} reason=$reason")
-        reply(null, null)
+        beginTake(session, reply, isResume = false, reason = reason)
     }
 
     /**
@@ -719,11 +793,26 @@ class AndroidDuetSessionCoordinator(
         if (session.state != VGDuetSessionState.RECORDING) {
             reply(null, invalidState("pauseDuetRecording", session.state.name, expected = "RECORDING")); return
         }
-        session.commitSegment()
+        val committed = session.commitSegment()
         session.state = if (session.previewClock.isAutoStopped) VGDuetSessionState.COMPLETED else VGDuetSessionState.PAUSED
+        // Slice 1A: silence the source preview before the held frame lands.
+        session.previewAudioPlayer?.pause()
         val targetPts = session.previewClock.currentSourcePtsMs().toLong()
         session.previewRenderLoop?.pauseAndHold(targetPts)
-        reply(null, null)
+        if (committed == null) {
+            // Pre-existing quirk preserved: deleteLastSegment during RECORDING
+            // stops the clock (and, since Slice 1A, discards the active take)
+            // without leaving RECORDING; a following pause then has no segment
+            // to commit, so any stray recorder has nothing to pair with.
+            discardActiveTake(session, "pause_without_committed_segment")
+            reply(null, null)
+            return
+        }
+        // Slice 1A: the reply completes only once the take file is durable (or
+        // the take has been rolled back), so callers can trust segmentAssets.
+        finalizeActiveTake(session, committed.index) { err ->
+            reply(null, err)
+        }
     }
 
     // ── resumeRecording ───────────────────────────────────────────────────────
@@ -733,12 +822,17 @@ class AndroidDuetSessionCoordinator(
         if (session.state != VGDuetSessionState.PAUSED) {
             reply(null, invalidState("resumeDuetRecording", session.state.name, expected = "PAUSED")); return
         }
-        session.state = VGDuetSessionState.RECORDING
-        session.startSegment()
-        session.previewRenderLoop?.startActive {
-            session.previewClock.currentSourcePtsMs().toLong()
+        if (session.pendingTakeRecorder != null) {
+            reply(null, invalidState("resumeDuetRecording", "PAUSED (take start pending)", expected = "PAUSED")); return
         }
-        reply(null, null)
+        if (session.finalizingRecorders.isNotEmpty()) {
+            // Slice 1A: the previous take's file is not durable yet (its pause
+            // reply is still pending). Starting a new clock segment now would
+            // let a failed finalize orphan a non-last segment; keep the
+            // segment/asset lists index-aligned by refusing until it lands.
+            reply(null, invalidState("resumeDuetRecording", "PAUSED (previous take still finalizing)", expected = "PAUSED")); return
+        }
+        beginTake(session, reply, isResume = true, reason = "resume")
     }
 
     // ── deleteLastSegment ─────────────────────────────────────────────────────
@@ -748,13 +842,325 @@ class AndroidDuetSessionCoordinator(
         if (session.state == VGDuetSessionState.STOPPED) {
             reply(null, invalidState("deleteLastDuetSegment", "STOPPED")); return
         }
-        session.deleteLastSegment()
+        // Slice 1A: the clock discards its active segment when deleting while
+        // RECORDING, so the active take (if any) is discarded with it; the
+        // last committed segment's take file goes with that segment.
+        if (session.state == VGDuetSessionState.RECORDING) {
+            discardActiveTake(session, "delete_last_segment_while_recording")
+            session.previewAudioPlayer?.pause()
+        }
+        val removedIndex = session.previewClock.segments.lastOrNull()?.index
+        val removed = session.deleteLastSegment()
+        if (removed && removedIndex != null) {
+            discardTakeFile(session, removedIndex)
+        }
         if (session.state == VGDuetSessionState.COMPLETED) {
             session.state = VGDuetSessionState.PAUSED
         }
         val targetPts = session.previewClock.currentSourcePtsMs().toLong()
         session.previewRenderLoop?.seekAndHold(targetPts)
+        session.previewAudioPlayer?.seekTo(targetPts.toInt())
         reply(null, null)
+    }
+
+    // ── Slice 1A: live take lifecycle ─────────────────────────────────────────
+
+    /**
+     * Opens one take: preconditions (context, preview/render loop, segment
+     * directory, free storage), recorder start (bounded inline codec/muxer
+     * setup), then the asynchronous encoder-surface attach on the render
+     * thread. Only when the attach succeeds does the session transition to
+     * RECORDING (state, clock segment, source-audio preview, active render
+     * loop) and reply success; every failure leaves the session in its
+     * previous retryable state with the recorder canceled and no file behind.
+     * Main thread only.
+     */
+    private fun beginTake(
+        session: VGDuetAndroidSession,
+        reply: (Any?, String?) -> Unit,
+        isResume: Boolean,
+        reason: String,
+    ) {
+        val code = if (isResume) "recording_resume_failed" else "recording_start_failed"
+        val route = if (isResume) "resumeDuetRecording" else "startDuetRecording"
+        val ctx = context
+        if (ctx == null) {
+            reply(null, errorMsg(code, "$route: application context unavailable; cannot persist the take."))
+            return
+        }
+        val loop = session.previewRenderLoop
+        if (loop == null) {
+            reply(null, errorMsg(code, "$route: no preview is attached, so live camera frames are unavailable for the take."))
+            return
+        }
+        val dir = ensureSegmentDir(session, ctx)
+        if (dir == null) {
+            reply(null, errorMsg(code, "$route: cannot create the take directory in the app cache."))
+            return
+        }
+        val diskErr = freeDiskError(dir)
+        if (diskErr != null) {
+            reply(null, errorMsg("disk_full", "$route: $diskErr"))
+            return
+        }
+        val file = File(dir, "take_${session.takeFileCounter++}.mp4")
+        val recorder = AndroidDuetSegmentRecorder(
+            context = ctx,
+            outputFile = file,
+            speedMultiplier = session.previewClock.speedMultiplier,
+            micGain = session.micGain,
+        )
+        if (!recorder.start()) {
+            recorder.cancel()
+            reply(null, errorMsg(code, "$route: the take encoder/muxer could not be started."))
+            return
+        }
+        session.pendingTakeRecorder = recorder
+        session.pendingTakeReply = reply
+        session.pendingTakeFailureCode = code
+        loop.attachSegmentRecorder(recorder) { attached ->
+            if (activeSession !== session || session.pendingTakeRecorder !== recorder) {
+                // Canceled underneath (preview released / disposed / stopped):
+                // cancelPendingTake already failed the parked reply.
+                recorder.cancel()
+                return@attachSegmentRecorder
+            }
+            session.pendingTakeRecorder = null
+            session.pendingTakeReply = null
+            if (!attached) {
+                recorder.cancel()
+                Log.w("DuetCoordinator",
+                    "ANDROID_DUET_TAKE_ATTACH_FAILED session=${session.sessionId} route=$route file=${file.name}")
+                reply(null, errorMsg(code, "$route: could not attach the take encoder surface to the preview compositor."))
+                return@attachSegmentRecorder
+            }
+            val activeLoop = session.previewRenderLoop ?: loop
+            session.state = VGDuetSessionState.RECORDING
+            session.currentRecorder = recorder
+            session.currentTakeIndex = session.previewClock.segmentCount()
+            // The clock captures its speed at startSegment; the recorder's PTS
+            // policy must use exactly that value (a setRecordingSpeed may have
+            // landed during the async attach gap).
+            recorder.setSpeedMultiplier(session.previewClock.speedMultiplier)
+            session.startSegment()
+            session.previewAudioPlayer?.play(
+                session.previewClock.sourceCursorMs,
+                session.previewClock.speedMultiplier,
+                session.sourceGain,
+            )
+            // Slice 4B-C: active playback. The provider runs on the main thread only,
+            // so reading the preview clock here is safe.
+            activeLoop.startActive {
+                session.previewClock.currentSourcePtsMs().toLong()
+            }
+            Log.i("DuetCoordinator",
+                "ANDROID_DUET_RECORDING_BEGIN session=${session.sessionId} reason=$reason " +
+                    "takeIndex=${session.currentTakeIndex} file=${file.name} " +
+                    "speed=${session.previewClock.speedMultiplier} sourceGain=${session.sourceGain} " +
+                    "audioPreview=${session.previewAudioPlayer != null}")
+            reply(null, null)
+        }
+    }
+
+    /**
+     * Detaches the RECORDING take's encoder surface from the render loop (so
+     * no render-thread work can touch it), then finalizes the recorder
+     * asynchronously. [onDone] lands on the main thread with null on success
+     * (file registered under [takeIndex]) or the error string to reply with.
+     * A take that cannot be finalized rolls its clock segment back so the
+     * segment/asset lists stay aligned (see [onTakeFinalized]).
+     */
+    private fun finalizeActiveTake(
+        session: VGDuetAndroidSession,
+        takeIndex: Int,
+        onDone: (String?) -> Unit,
+    ) {
+        val recorder = session.currentRecorder
+        session.currentRecorder = null
+        session.currentTakeIndex = -1
+        if (recorder == null) {
+            // The clock committed a segment but no recorder ever ran for it
+            // (should not happen: RECORDING is only entered with a recorder).
+            rollbackFailedTake(session, takeIndex, "no_recorder")
+            onDone(errorMsg("stop_recording_failed",
+                "The take could not be persisted (no recorder was active); the segment was rolled back."))
+            return
+        }
+        session.finalizingRecorders[takeIndex] = recorder
+        val proceed = {
+            recorder.finishAsync { result ->
+                mainHandler.post { onTakeFinalized(session, takeIndex, result, onDone) }
+            }
+        }
+        val loop = session.previewRenderLoop
+        if (loop != null) loop.detachSegmentRecorder { proceed() } else proceed()
+    }
+
+    /** Main-thread landing of a take's finalize result. */
+    private fun onTakeFinalized(
+        session: VGDuetAndroidSession,
+        takeIndex: Int,
+        result: Result<File>,
+        onDone: (String?) -> Unit,
+    ) {
+        session.finalizingRecorders.remove(takeIndex)
+        val discarded = session.discardedTakeIndices.remove(takeIndex)
+        val sessionLive = activeSession === session
+        val file = result.getOrNull()
+        val durable = file != null && file.exists() && file.length() > 0L
+        var err: String? = null
+        if (durable) {
+            if (discarded || !sessionLive) {
+                deleteFileAsync(file!!)
+                if (!sessionLive) {
+                    err = errorMsg("invalid_state",
+                        "The session was disposed while its take was finalizing; the take was discarded.")
+                }
+            } else {
+                session.segmentAssetPathsByIndex[takeIndex] = file!!.absolutePath
+                Log.i("DuetCoordinator",
+                    "ANDROID_DUET_TAKE_PERSISTED session=${session.sessionId} takeIndex=$takeIndex " +
+                        "path=${file.absolutePath} bytes=${file.length()}")
+            }
+        } else {
+            val reason = result.exceptionOrNull()?.message ?: "unknown"
+            if (!sessionLive) {
+                err = errorMsg("invalid_state",
+                    "The session was disposed while its take was finalizing ($reason).")
+            } else if (!discarded) {
+                rollbackFailedTake(session, takeIndex, reason)
+                err = errorMsg("stop_recording_failed",
+                    "The take could not be persisted ($reason); the segment was rolled back.")
+            }
+        }
+        onDone(err)
+        val continuation = session.onAllTakesFinalized
+        if (continuation != null && session.finalizingRecorders.isEmpty()) {
+            session.onAllTakesFinalized = null
+            continuation()
+        }
+    }
+
+    /**
+     * Rolls the clock segment [takeIndex] back after its take failed, but only
+     * while it is still the last segment (it always is: resume refuses to open
+     * a new segment while a take is finalizing). Re-holds preview and audio at
+     * the rolled-back cursor and leaves the session PAUSED and retryable.
+     */
+    private fun rollbackFailedTake(session: VGDuetAndroidSession, takeIndex: Int, reason: String) {
+        val last = session.previewClock.segments.lastOrNull()
+        if (last == null || last.index != takeIndex) {
+            Log.w("DuetCoordinator",
+                "ANDROID_DUET_TAKE_FAILED session=${session.sessionId} takeIndex=$takeIndex reason=$reason " +
+                    "rollback=skipped lastSegmentIndex=${last?.index}")
+            return
+        }
+        session.previewClock.deleteLastSegment()
+        session.segmentAssetPathsByIndex.remove(takeIndex)
+        if (session.state == VGDuetSessionState.COMPLETED) {
+            session.state = VGDuetSessionState.PAUSED
+        }
+        val targetPts = session.previewClock.currentSourcePtsMs().toLong()
+        if (session.state != VGDuetSessionState.STOPPED) {
+            session.previewRenderLoop?.seekAndHold(targetPts)
+            session.previewAudioPlayer?.seekTo(targetPts.toInt())
+        }
+        Log.w("DuetCoordinator",
+            "ANDROID_DUET_TAKE_FAILED session=${session.sessionId} takeIndex=$takeIndex reason=$reason " +
+                "rollback=applied state=${session.state.name} cursorMs=$targetPts")
+    }
+
+    /** Discards the RECORDING take without keeping any file (detach first, then cancel). */
+    private fun discardActiveTake(session: VGDuetAndroidSession, reason: String) {
+        val recorder = session.currentRecorder ?: return
+        session.currentRecorder = null
+        session.currentTakeIndex = -1
+        Log.i("DuetCoordinator", "ANDROID_DUET_TAKE_DISCARDED session=${session.sessionId} reason=$reason")
+        val loop = session.previewRenderLoop
+        if (loop != null) loop.detachSegmentRecorder { recorder.cancel() } else recorder.cancel()
+    }
+
+    /** Drops the durable file (or marks a still-finalizing take) for clock segment [index]. */
+    private fun discardTakeFile(session: VGDuetAndroidSession, index: Int) {
+        val path = session.segmentAssetPathsByIndex.remove(index)
+        if (path != null) deleteFileAsync(File(path))
+        if (session.finalizingRecorders.containsKey(index)) {
+            session.discardedTakeIndices.add(index)
+        }
+    }
+
+    /** Fails a take whose encoder-surface attach is still in flight (preview released / stop / dispose). */
+    private fun cancelPendingTake(session: VGDuetAndroidSession, reason: String) {
+        val recorder = session.pendingTakeRecorder ?: return
+        val reply = session.pendingTakeReply
+        val code = session.pendingTakeFailureCode
+        session.pendingTakeRecorder = null
+        session.pendingTakeReply = null
+        recorder.cancel()
+        Log.w("DuetCoordinator", "ANDROID_DUET_TAKE_START_CANCELED session=${session.sessionId} reason=$reason")
+        reply?.invoke(null, errorMsg(code, "The take could not be started ($reason)."))
+    }
+
+    /** Cancels every recorder the session still owns (active, pending, finalizing). Idempotent. */
+    private fun cancelAllTakes(session: VGDuetAndroidSession, reason: String) {
+        cancelPendingTake(session, reason)
+        discardActiveTake(session, reason)
+        for (recorder in session.finalizingRecorders.values.toList()) {
+            recorder.cancel()
+        }
+        // Their completions still land in onTakeFinalized (sessionLive == false there).
+    }
+
+    /** Runs [action] now, or once every finalizing take has landed. */
+    private fun whenAllTakesFinalized(session: VGDuetAndroidSession, action: () -> Unit) {
+        if (session.finalizingRecorders.isEmpty()) {
+            action()
+        } else {
+            session.onAllTakesFinalized = action
+        }
+    }
+
+    private fun ensureSegmentDir(session: VGDuetAndroidSession, ctx: Context): File? {
+        val existing = session.segmentDir
+        if (existing != null && (existing.isDirectory || existing.mkdirs())) return existing
+        val dir = File(File(ctx.cacheDir, SEGMENT_DIR_ROOT), session.sessionId)
+        val ok = try { dir.isDirectory || dir.mkdirs() || dir.isDirectory } catch (_: Throwable) { false }
+        if (!ok) return null
+        session.segmentDir = dir
+        return dir
+    }
+
+    /** Null when at least [MIN_FREE_DISK_BYTES] are free on [dir]'s volume (or the check itself fails). */
+    private fun freeDiskError(dir: File): String? {
+        val available = try {
+            StatFs(dir.absolutePath).availableBytes
+        } catch (t: Throwable) {
+            Log.w("DuetCoordinator", "StatFs failed for ${dir.absolutePath}: ${t.message}")
+            return null
+        }
+        if (available >= MIN_FREE_DISK_BYTES) return null
+        return "Insufficient free storage for a Duet take (${available / (1024L * 1024L)} MB available, " +
+            "${MIN_FREE_DISK_BYTES / (1024L * 1024L)} MB required)."
+    }
+
+    private fun deleteFileAsync(file: File) {
+        val posted = probeHandler.post {
+            try { if (file.exists()) file.delete() } catch (_: Throwable) {}
+        }
+        if (!posted) {
+            try { if (file.exists()) file.delete() } catch (_: Throwable) {}
+        }
+    }
+
+    /** Deletes the session's take directory (best effort, off the main thread when possible). */
+    private fun deleteSegmentDirAsync(session: VGDuetAndroidSession) {
+        val dir = session.segmentDir ?: return
+        session.segmentDir = null
+        session.segmentAssetPathsByIndex.clear()
+        val task = Runnable {
+            try { dir.deleteRecursively() } catch (_: Throwable) {}
+        }
+        if (!probeHandler.post(task)) task.run()
     }
 
     // ── attachPreviewTexture (Slice 4A) ───────────────────────────────────────
@@ -840,6 +1246,16 @@ class AndroidDuetSessionCoordinator(
 
         session.previewProducer   = producer
         session.previewRenderLoop = renderLoop
+        // Slice 1A: a take that is still RECORDING across a detach/re-attach
+        // keeps recording from the new compositor (best effort; frames are
+        // simply absent while no preview existed).
+        val liveRecorder = session.currentRecorder
+        if (liveRecorder != null) {
+            renderLoop.attachSegmentRecorder(liveRecorder) { ok ->
+                Log.i("DuetCoordinator",
+                    "ANDROID_DUET_TAKE_REATTACHED session=$sessionId ok=$ok")
+            }
+        }
         // Debug-only (RND diagnostic): forward the raw mask visualization
         // opt-in at attach time too, so a physical smoke can request it from
         // the very first attach without waiting for a later updateLayout.
@@ -1183,6 +1599,11 @@ class AndroidDuetSessionCoordinator(
         // satisfied once the preview (and its keying) is gone — fail it now so
         // neither the MethodChannel reply nor the timeout runnable leaks.
         cancelPendingStart(session, "preview_released")
+        // Phase 0b (Slice 1A): a take whose encoder surface is still being
+        // attached to this compositor can never receive frames — fail it too.
+        // A take already RECORDING keeps its recorder: the compositor's
+        // release() (phase 4) drops only the EGL wrapper of its surface.
+        cancelPendingTake(session, "preview_released")
         // Phase 1: stop new producer submissions.
         producer?.beginRelease()
         // Phase 2: halt render-thread ticking and camera-idle redraw, and block
@@ -1310,23 +1731,91 @@ class AndroidDuetSessionCoordinator(
 
     fun stopRecording(sessionId: String, reply: (Any?, String?) -> Unit) {
         val session = resolveSession(sessionId, "stopDuetRecording", reply) ?: return
+        var committed: VGDuetAndroidSegmentRecord? = null
+        val wasRecording: Boolean
         when (session.state) {
-            VGDuetSessionState.RECORDING -> session.commitSegment()
-            VGDuetSessionState.PAUSED, VGDuetSessionState.COMPLETED -> { /* already committed */ }
+            VGDuetSessionState.RECORDING -> {
+                committed = session.commitSegment()
+                wasRecording = true
+            }
+            VGDuetSessionState.PAUSED, VGDuetSessionState.COMPLETED -> wasRecording = false
             else -> {
                 reply(null, invalidState("stopDuetRecording", session.state.name, expected = "RECORDING, PAUSED, or COMPLETED"))
                 return
             }
         }
         session.state = VGDuetSessionState.STOPPED
-        // Slice 4B-C: stop the render loop while the decoder is still reachable,
-        // so its final unbind lands on a live decoder before release is queued.
-        releasePreviewProducer(session)
-        val dec = session.decoder
-        session.decoder = null
-        activeSession = null
-        decoderHandler.post { dec?.release() }
-        releaseCameraAdmission(session.sessionId)
+        // Slice 1A: a resume whose encoder attach is still in flight can no
+        // longer start; the source preview stops now. Then the active take (if
+        // any) is committed + finalized, and the reply waits for every take
+        // file to be durable before the session is torn down.
+        cancelPendingTake(session, "stop")
+        session.previewAudioPlayer?.pause()
+        // Fail-closed: a last take that cannot be persisted (its segment is
+        // rolled back by onTakeFinalized) must fail the stop itself after the
+        // full teardown, never surface as a success with a shorter asset list.
+        var stopTakeError: String? = null
+        val afterTakes = { completeStop(session, stopTakeError, reply) }
+        if (wasRecording && committed != null) {
+            finalizeActiveTake(session, committed.index) { err ->
+                if (err != null) {
+                    Log.w("DuetCoordinator",
+                        "ANDROID_DUET_STOP_LAST_TAKE_FAILED session=${session.sessionId} error=$err")
+                    stopTakeError = err
+                }
+                whenAllTakesFinalized(session, afterTakes)
+            }
+        } else {
+            // No committed segment to pair a recorder with (see pauseRecording's
+            // preserved quirk): discard rather than persist an orphan take.
+            discardActiveTake(session, "stop_without_committed_segment")
+            whenAllTakesFinalized(session, afterTakes)
+        }
+    }
+
+    /**
+     * Second half of [stopRecording], run once every take file is durable:
+     * tears the preview/decoder/admission down (unless a dispose already did)
+     * and replies with the stop result carrying the real segment assets.
+     * Fails closed, after that teardown, with [stopTakeError] (the last take's
+     * finalize error; its segment was already rolled back) or with
+     * `stop_recording_failed` when no take file was persisted at all, so a
+     * success reply always carries at least one real asset.
+     */
+    private fun completeStop(
+        session: VGDuetAndroidSession,
+        stopTakeError: String?,
+        reply: (Any?, String?) -> Unit,
+    ) {
+        if (activeSession === session) {
+            // Slice 4B-C: stop the render loop while the decoder is still reachable,
+            // so its final unbind lands on a live decoder before release is queued.
+            releasePreviewProducer(session)
+            val dec = session.decoder
+            session.decoder = null
+            activeSession = null
+            decoderHandler.post { dec?.release() }
+            releaseCameraAdmission(session.sessionId)
+        }
+        session.previewAudioPlayer?.release()
+        session.previewAudioPlayer = null
+        val segmentCount = session.previewClock.segmentCount()
+        val assetCount = session.segmentAssetPathsByIndex.size
+        Log.i("DuetCoordinator",
+            "ANDROID_DUET_STOP_RESULT session=${session.sessionId} segments=$segmentCount assets=$assetCount " +
+                "totalDurationMs=${session.totalDurationMs()}")
+        if (stopTakeError != null || assetCount == 0) {
+            Log.w("DuetCoordinator",
+                "ANDROID_DUET_STOP_FAILED_CLOSED session=${session.sessionId} segments=$segmentCount " +
+                    "assets=$assetCount lastTakeFailed=${stopTakeError != null}")
+            reply(null, stopTakeError ?: errorMsg("stop_recording_failed",
+                "stopDuetRecording: no take could be persisted for the recorded segments."))
+            return
+        }
+        if (assetCount != segmentCount) {
+            Log.w("DuetCoordinator",
+                "ANDROID_DUET_STOP_ASSET_MISMATCH session=${session.sessionId} segments=$segmentCount assets=$assetCount")
+        }
         reply(session.buildStopResult(), null)
     }
 
@@ -1343,6 +1832,13 @@ class AndroidDuetSessionCoordinator(
         val current = activeSession
         if (current != null && current.sessionId == sessionId) {
             canceledProbeIds += sessionId
+            // Slice 1A: discard every take (active / pending / finalizing) and
+            // the source-audio preview before the preview stack goes away; the
+            // take directory is deleted last (a disposed session's takes never
+            // reach a caller).
+            cancelAllTakes(current, "dispose")
+            current.previewAudioPlayer?.release()
+            current.previewAudioPlayer = null
             // Slice 4B-C: render loop stops while decoder is still non-null.
             releasePreviewProducer(current)
             val dec = current.decoder
@@ -1350,6 +1846,7 @@ class AndroidDuetSessionCoordinator(
             activeSession = null
             decoderHandler.post { dec?.release() }
             releaseCameraAdmission(sessionId)
+            deleteSegmentDirAsync(current)
         }
         reply(null, null)
     }
@@ -1366,6 +1863,11 @@ class AndroidDuetSessionCoordinator(
         val current = activeSession
         if (current != null) {
             canceledProbeIds += current.sessionId
+            // Slice 1A: see disposeSession. The directory delete is posted to
+            // probeHandler before quitSafely below, so it still runs.
+            cancelAllTakes(current, "dispose_all")
+            current.previewAudioPlayer?.release()
+            current.previewAudioPlayer = null
             // Slice 4B-C: stopBlocking inside completes the render-loop unbind
             // (decoder still non-null) before the decoder thread is quit below.
             releasePreviewProducer(current)
@@ -1373,6 +1875,7 @@ class AndroidDuetSessionCoordinator(
             current.decoder = null
             decoderHandler.post { dec?.release() }
             releaseCameraAdmission(current.sessionId)
+            deleteSegmentDirAsync(current)
         }
         activeSession = null
         try {

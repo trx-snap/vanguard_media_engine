@@ -273,6 +273,22 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     private val cameraStMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
+    // -- Live take recorder target (ANDROID-DUET-SLICE-1A; render-thread only) --
+
+    /**
+     * Attached encoder target ([setSegmentRecorderTarget]) and the EGL window
+     * surface wrapping its MediaCodec input Surface. The window surface is
+     * created against this compositor's own [eglConfig]/[eglContext] so the
+     * already-latched [cameraOesTextureId] can be drawn into it directly (zero
+     * copy). Independent of the preview output surface: it survives output
+     * loss and is destroyed by [setSegmentRecorderTarget] (null) or [release].
+     */
+    private var recorderTarget: AndroidDuetSegmentRecorderSurfaceTarget? = null
+    private var eglRecorderSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var recorderFramesSubmitted = 0L
+    private var recorderFramesSkipped = 0L
+    private var recorderSwapFailureLogged = false
+
 
     // -- Output / layout state -------------------------------------------------
 
@@ -693,6 +709,178 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         foregroundAnchorY = (if (anchorY.isFinite()) anchorY else 0.5).coerceIn(0.0, 1.0)
     }
 
+    // -- Live take recorder surface (ANDROID-DUET-SLICE-1A) ---------------------
+
+    /**
+     * Attaches or detaches the live take recorder's encoder surface (see
+     * [AndroidDuetPreviewBackend.setSegmentRecorderTarget]). Any previously
+     * attached encoder surface is destroyed first, so this is idempotent and
+     * a replace is a detach + attach. Attaching bootstraps the EGL core if the
+     * preview has not attached yet (the camera ingest is allocated with it),
+     * wraps the target's Surface in an EGL window surface on this compositor's
+     * config/context, verifies it can be made current, then restores the
+     * preview (window or pbuffer) as the current surface. Returns false, with
+     * nothing attached, on any failure so the coordinator can fail the take
+     * start cleanly. Must run on the render thread.
+     */
+    override fun setSegmentRecorderTarget(target: AndroidDuetSegmentRecorderSurfaceTarget?): Boolean {
+        destroyRecorderSurfaceQuietly()
+        if (target == null) return true
+        if (isReleased.get()) return false
+        if (!ensureCore()) return false
+        val surface = target.inputSurface
+        if (surface == null || !surface.isValid || target.widthPx <= 0 || target.heightPx <= 0) {
+            Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_SURFACE_REJECTED valid=${surface?.isValid} " +
+                "size=${target.widthPx}x${target.heightPx}")
+            return false
+        }
+        try {
+            val eglSurf = EGL14.eglCreateWindowSurface(
+                eglDisplay, eglConfig, surface, intArrayOf(EGL14.EGL_NONE), 0,
+            )
+            if (eglSurf == null || eglSurf == EGL14.EGL_NO_SURFACE) {
+                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_SURFACE_FAILED stage=eglCreateWindowSurface " +
+                    "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                restorePreviewCurrentQuietly()
+                return false
+            }
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)) {
+                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_SURFACE_FAILED stage=eglMakeCurrent " +
+                    "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                restorePreviewCurrentQuietly()
+                try { EGL14.eglDestroySurface(eglDisplay, eglSurf) } catch (_: Throwable) {}
+                return false
+            }
+            restorePreviewCurrentQuietly()
+            eglRecorderSurface = eglSurf
+            recorderTarget = target
+            recorderFramesSubmitted = 0L
+            recorderFramesSkipped = 0L
+            recorderSwapFailureLogged = false
+            Log.i(
+                TAG,
+                "ANDROID_DUET_SEGMENT_RECORDER_SURFACE_ATTACHED size=${target.widthPx}x${target.heightPx} " +
+                    "cameraLatched=$hasCameraTexImage gles=$glesMajor.$glesMinor",
+            )
+            return true
+        } catch (t: Throwable) {
+            Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_SURFACE_FAILED stage=exception ${t.javaClass.simpleName}: ${t.message}")
+            restorePreviewCurrentQuietly()
+            return false
+        }
+    }
+
+    /**
+     * Draws the camera frame latched by the enclosing [drawFrame] into the
+     * attached encoder surface: full encoder frame, camera aspect-filled and
+     * oriented exactly as the preview draws it ([cameraStMatrix] + the shared
+     * [drawCameraOesQuad]), stamped with the target's presentation time, then
+     * swapped. Runs after the preview swap so preview latency is untouched,
+     * and restores the preview surface as current before returning. Every
+     * EGL/GL failure is logged (first swap failure once) and never thrown.
+     * Frames the target declines (negative PTS: recorder finishing/canceled)
+     * are skipped without touching the encoder surface.
+     */
+    private fun encodeRecorderFrame() {
+        val target = recorderTarget ?: return
+        val eglSurf = eglRecorderSurface
+        if (eglSurf == EGL14.EGL_NO_SURFACE || !hasCameraTexImage || cameraOesTextureId == 0) return
+        val ptsNs = target.nextFramePresentationTimeNs()
+        if (ptsNs < 0L) {
+            recorderFramesSkipped++
+            return
+        }
+        try {
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)) {
+                if (!recorderSwapFailureLogged) {
+                    recorderSwapFailureLogged = true
+                    Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_FRAME_FAILED stage=eglMakeCurrent " +
+                        "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                }
+                return
+            }
+            val frameW = target.widthPx
+            val frameH = target.heightPx
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            GLES20.glViewport(0, 0, frameW, frameH)
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            val viewport = recorderCameraAspectFillViewport(frameW, frameH)
+            GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
+            drawCameraOesQuad()
+            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurf, ptsNs)
+            if (EGL14.eglSwapBuffers(eglDisplay, eglSurf)) {
+                recorderFramesSubmitted++
+                target.onFrameSubmitted(ptsNs)
+                if (recorderFramesSubmitted == 1L) {
+                    Log.i(TAG, "ANDROID_DUET_SEGMENT_RECORDER_FIRST_FRAME ptsNs=$ptsNs " +
+                        "viewport=${viewport.x},${viewport.y},${viewport.width}x${viewport.height} " +
+                        "frame=${frameW}x$frameH")
+                }
+            } else if (!recorderSwapFailureLogged) {
+                recorderSwapFailureLogged = true
+                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_FRAME_FAILED stage=eglSwapBuffers " +
+                    "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+            }
+        } catch (t: Throwable) {
+            if (!recorderSwapFailureLogged) {
+                recorderSwapFailureLogged = true
+                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_FRAME_FAILED stage=exception ${t.javaClass.simpleName}: ${t.message}")
+            }
+        } finally {
+            restorePreviewCurrentQuietly()
+        }
+    }
+
+    /**
+     * Viewport for an aspect-fill of the upright camera image into the whole
+     * encoder frame: the same centred-inflate math as
+     * [cameraAspectFillCanvasRect], converted to a bottom-left-origin GL rect
+     * using the encoder frame height (not [outputHeightPx], which belongs to
+     * the preview surface). For the 9:16 default take size and the 9:16
+     * upright camera aspect this is the identity full-frame viewport.
+     */
+    private fun recorderCameraAspectFillViewport(frameW: Int, frameH: Int): GlRect {
+        val aspectRect = cameraAspectFillCanvasRect(
+            VGDuetPixelRect(0.0, 0.0, frameW.toDouble(), frameH.toDouble()),
+        )
+        val w = aspectRect.width.roundToInt()
+        val h = aspectRect.height.roundToInt()
+        return GlRect(
+            x = aspectRect.left.roundToInt(),
+            y = frameH - (aspectRect.top.roundToInt() + h),
+            width = w,
+            height = h,
+        )
+    }
+
+    /** Makes the preview window surface current again when attached, else the bootstrap pbuffer. */
+    private fun restorePreviewCurrentQuietly() {
+        val window = eglWindowSurface
+        makeCurrentQuietly(if (window != EGL14.EGL_NO_SURFACE) window else eglPbufferSurface)
+    }
+
+    /**
+     * Destroys only the encoder EGL window surface (never the recorder-owned
+     * Surface behind it) after switching the preview/pbuffer back to current,
+     * and forgets the target. Idempotent; tolerates a recorder Surface that is
+     * already dead (recorder canceled first).
+     */
+    private fun destroyRecorderSurfaceQuietly() {
+        val surf = eglRecorderSurface
+        val target = recorderTarget
+        eglRecorderSurface = EGL14.EGL_NO_SURFACE
+        recorderTarget = null
+        if (surf == EGL14.EGL_NO_SURFACE || eglDisplay == EGL14.EGL_NO_DISPLAY) return
+        restorePreviewCurrentQuietly()
+        try { EGL14.eglDestroySurface(eglDisplay, surf) } catch (_: Throwable) {}
+        if (target != null) {
+            Log.i(TAG, "ANDROID_DUET_SEGMENT_RECORDER_SURFACE_DETACHED " +
+                "framesSubmitted=$recorderFramesSubmitted framesSkipped=$recorderFramesSkipped")
+        }
+    }
+
 
     /**
      * Composites one frame into the attached output surface:
@@ -801,7 +989,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             }
 
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-            return EGL14.eglSwapBuffers(display, window)
+            val presented = EGL14.eglSwapBuffers(display, window)
+
+            // ANDROID-DUET-SLICE-1A: after the preview swap, feed the SAME
+            // latched camera frame to the attached take recorder (once per
+            // new camera frame, so the encoder never sees duplicates). The
+            // preview output above is unchanged by this; encodeRecorderFrame
+            // restores the preview surface as current before returning.
+            if (latchedNewCameraFrame && recorderTarget != null) {
+                encodeRecorderFrame()
+            }
+            return presented
         } catch (t: Throwable) {
             Log.w(TAG, "drawFrame failed: ${t.message}")
             return false
@@ -823,6 +1021,8 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         try { surfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
         try { cameraSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
 
+        // Encoder surface first (it may be current), then the preview window.
+        destroyRecorderSurfaceQuietly()
         destroyWindowSurfaceQuietly()
         outputSurface = null
 
@@ -2538,6 +2738,18 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
         GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
 
+        drawCameraOesQuad()
+
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    /**
+     * The camera OES quad draw shared by [drawCameraRect] (preview) and
+     * [encodeRecorderFrame] (live take): [oesProgram] sampling
+     * [cameraOesTextureId] through [cameraStMatrix] over the full current
+     * viewport. Callers own viewport/scissor state; this touches neither.
+     */
+    private fun drawCameraOesQuad() {
         GLES20.glUseProgram(oesProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
@@ -2556,7 +2768,6 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
-        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
     // -- Geometry --------------------------------------------------------------
@@ -2702,9 +2913,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     /** Partial-bootstrap cleanup for a failed [ensureCore]; a later attach may retry. */
     private fun teardownCoreQuietly() {
-        // The segmenter is only ever created after coreReady, so this is a
-        // no-op here in practice; kept so no ordering change can leak it.
+        // The segmenter and the recorder surface are only ever created after
+        // coreReady, so these are no-ops here in practice; kept so no ordering
+        // change can leak them.
         if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {
+            destroyRecorderSurfaceQuietly()
             makeCurrentQuietly(eglPbufferSurface)
             teardownGpuSegmenterQuietly()
         }

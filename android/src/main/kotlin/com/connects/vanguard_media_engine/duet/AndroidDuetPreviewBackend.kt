@@ -5,6 +5,34 @@ import android.os.ParcelFileDescriptor
 import android.view.Surface
 
 /**
+ * ANDROID-DUET-SLICE-1A: encoder-surface seam between a live take recorder
+ * ([AndroidDuetSegmentRecorder]) and a preview backend. The backend draws the
+ * upright live camera frame it has already latched for the preview into
+ * [inputSurface] on its own render thread; the target only supplies the
+ * surface, its pixel size and the presentation timestamp policy. No pixel
+ * data ever crosses this seam (no readback, no Bitmap, no ImageAnalysis).
+ *
+ * Threading: [nextFramePresentationTimeNs] and [onFrameSubmitted] are called
+ * on the backend's render thread only; the properties may be read there too.
+ */
+interface AndroidDuetSegmentRecorderSurfaceTarget {
+    /** Encoder input surface; null once the recorder has released it. */
+    val inputSurface: Surface?
+    val widthPx: Int
+    val heightPx: Int
+
+    /**
+     * Presentation time (nanoseconds, take-relative, starting at 0) for the
+     * camera frame the backend is about to draw and swap into [inputSurface],
+     * or a negative value to skip the frame (recorder finishing / canceled).
+     */
+    fun nextFramePresentationTimeNs(): Long
+
+    /** The backend swapped one frame stamped [presentationTimeNs] into [inputSurface]. */
+    fun onFrameSubmitted(presentationTimeNs: Long)
+}
+
+/**
  * Backend interface for Duet preview compositing and presentation.
  *
  * Defines the contract consumed by [AndroidDuetPreviewRenderLoop], abstracting
@@ -144,6 +172,21 @@ interface AndroidDuetPreviewBackend {
             ParcelFileDescriptor.adoptFd(fd).close()
         } catch (_: Throwable) {}
     }
+
+    /**
+     * ANDROID-DUET-SLICE-1A: attaches (non-null) or detaches (null) the live
+     * take recorder's encoder surface. While attached, the backend draws the
+     * upright camera frame it latches for each preview [drawFrame] into
+     * [AndroidDuetSegmentRecorderSurfaceTarget.inputSurface] as well, with
+     * the same camera orientation/aspect-fill policy the preview uses, and
+     * stamps [AndroidDuetSegmentRecorderSurfaceTarget.nextFramePresentationTimeNs]
+     * on it. Attaching replaces any previously attached target. Returns true
+     * when the surface is ready to receive frames (always true for null);
+     * false when the backend cannot host an encoder surface — the default
+     * here, so backends without a recording path make a take start fail
+     * cleanly instead of silently recording nothing. Render thread only.
+     */
+    fun setSegmentRecorderTarget(target: AndroidDuetSegmentRecorderSurfaceTarget?): Boolean = target == null
 
     fun drawFrame(): Boolean
     fun release()

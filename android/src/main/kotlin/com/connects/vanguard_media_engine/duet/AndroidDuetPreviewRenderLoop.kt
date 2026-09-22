@@ -530,6 +530,72 @@ class AndroidDuetPreviewRenderLoop(
         }
     }
 
+    // -- Live take recorder surface (ANDROID-DUET-SLICE-1A) ---------------------
+
+    /**
+     * Attaches [target] (a live take recorder's encoder input surface) to the
+     * compositor on the render thread. [onResult] lands on [mainHandler] with
+     * true once the compositor accepted the surface — from that point every
+     * new camera frame the preview latches is also drawn into it — or false
+     * when the loop is stopped, the render looper is gone, or the compositor
+     * rejected / failed EGL setup (nothing attached). Safe from any thread.
+     */
+    fun attachSegmentRecorder(
+        target: AndroidDuetSegmentRecorderSurfaceTarget,
+        onResult: (Boolean) -> Unit,
+    ) {
+        if (isStopped.get()) {
+            mainHandler.post { onResult(false) }
+            return
+        }
+        val posted = renderHandler.post {
+            val ok = if (isStopped.get()) {
+                false
+            } else {
+                try {
+                    compositor.setSegmentRecorderTarget(target)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "setSegmentRecorderTarget threw: ${t.message}")
+                    false
+                }
+            }
+            mainHandler.post { onResult(ok) }
+        }
+        if (!posted) {
+            mainHandler.post { onResult(false) }
+        }
+    }
+
+    /**
+     * Detaches the attached take recorder surface (if any) on the render
+     * thread; the compositor destroys only its EGL wrapper, never the
+     * recorder-owned Surface. [onDetached] lands on [mainHandler] once no
+     * render-thread work can touch the encoder surface any more, so the
+     * caller may then finish/release the recorder. After [stopBlocking] the
+     * compositor's release has already dropped the surface, so the callback
+     * fires immediately. Idempotent; safe from any thread.
+     */
+    fun detachSegmentRecorder(onDetached: (() -> Unit)? = null) {
+        val done = {
+            if (onDetached != null) mainHandler.post { onDetached() }
+        }
+        if (isStopped.get()) {
+            done()
+            return
+        }
+        val posted = renderHandler.post {
+            if (!isStopped.get()) {
+                try {
+                    compositor.setSegmentRecorderTarget(null)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "setSegmentRecorderTarget(null) threw: ${t.message}")
+                }
+            }
+            done()
+        }
+        if (!posted) done()
+    }
+
     /**
      * Terminal teardown, bounded by [timeoutMs] per stage and best-effort
      * throughout (never throws, even on timeout):
