@@ -20,7 +20,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Routes owned:
  *  - [METHOD_ASSERT]: decodes exported MP4s via MediaMetadataRetriever and
  *    asserts expected pixel values at sampled points (center, rightArm, lowerArm, farCorner)
- *    to differentiate 0-degree vs 90-degree foreground rotation.
+ *    to differentiate 0-degree vs 90-degree foreground rotation, and (via the optional
+ *    third `anchorRotation90Path`) asserts anchor-pivot placement parity for a non-center
+ *    anchor combined with 90-degree rotation.
  *
  * Diagnostic only: not wired into production export, Duet, or product UI.
  */
@@ -71,11 +73,15 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
         }
         val rotation0Path = args?.get("rotation0Path") as? String
         val rotation90Path = args?.get("rotation90Path") as? String
-        if (rotation0Path.isNullOrBlank() || rotation90Path.isNullOrBlank()) {
+        val anchorRotation90Path = args?.get("anchorRotation90Path") as? String
+        if (rotation0Path.isNullOrBlank() || rotation90Path.isNullOrBlank() ||
+            anchorRotation90Path.isNullOrBlank()
+        ) {
             result.success(
                 mapOf(
                     "pass" to false,
-                    "reason" to "invalid_arguments: rotation0Path and rotation90Path required",
+                    "reason" to "invalid_arguments: rotation0Path, rotation90Path, and " +
+                        "anchorRotation90Path required",
                 ),
             )
             return
@@ -91,6 +97,7 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
                 val outcome = decodeAndAssert(
                     rotation0Path = rotation0Path,
                     rotation90Path = rotation90Path,
+                    anchorRotation90Path = anchorRotation90Path,
                     width = width,
                     height = height,
                     fps = fps,
@@ -108,9 +115,21 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
         }
     }
 
+    private fun decodeAndAssertFailure(reason: String): Map<String, Any?> = mapOf(
+        "pass" to false,
+        "reason" to reason,
+        "decodeOk" to false,
+        "centerOverlayOk" to false,
+        "rightArmRotationDifferentiatesOk" to false,
+        "lowerArmRotationDifferentiatesOk" to false,
+        "farCornerBackgroundOk" to false,
+        "anchorPivotShiftOk" to false,
+    )
+
     private fun decodeAndAssert(
         rotation0Path: String,
         rotation90Path: String,
+        anchorRotation90Path: String,
         width: Int,
         height: Int,
         fps: Int,
@@ -118,54 +137,32 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
     ): Map<String, Any?> {
         val rot0File = File(rotation0Path)
         val rot90File = File(rotation90Path)
+        val anchorRot90File = File(anchorRotation90Path)
 
         if (!rot0File.exists() || rot0File.length() == 0L) {
-            return mapOf(
-                "pass" to false,
-                "reason" to "rotation0_file_missing_or_empty:$rotation0Path",
-                "decodeOk" to false,
-                "centerOverlayOk" to false,
-                "rightArmRotationDifferentiatesOk" to false,
-                "lowerArmRotationDifferentiatesOk" to false,
-                "farCornerBackgroundOk" to false,
-            )
+            return decodeAndAssertFailure("rotation0_file_missing_or_empty:$rotation0Path")
         }
         if (!rot90File.exists() || rot90File.length() == 0L) {
-            return mapOf(
-                "pass" to false,
-                "reason" to "rotation90_file_missing_or_empty:$rotation90Path",
-                "decodeOk" to false,
-                "centerOverlayOk" to false,
-                "rightArmRotationDifferentiatesOk" to false,
-                "lowerArmRotationDifferentiatesOk" to false,
-                "farCornerBackgroundOk" to false,
+            return decodeAndAssertFailure("rotation90_file_missing_or_empty:$rotation90Path")
+        }
+        if (!anchorRot90File.exists() || anchorRot90File.length() == 0L) {
+            return decodeAndAssertFailure(
+                "anchor_rotation90_file_missing_or_empty:$anchorRotation90Path",
             )
         }
 
         val rot0Bitmap = decodeMidFrame(rotation0Path, fps)
         val rot90Bitmap = decodeMidFrame(rotation90Path, fps)
+        val anchorRot90Bitmap = decodeMidFrame(anchorRotation90Path, fps)
 
         if (rot0Bitmap == null) {
-            return mapOf(
-                "pass" to false,
-                "reason" to "rotation0_decode_failed_null_bitmap",
-                "decodeOk" to false,
-                "centerOverlayOk" to false,
-                "rightArmRotationDifferentiatesOk" to false,
-                "lowerArmRotationDifferentiatesOk" to false,
-                "farCornerBackgroundOk" to false,
-            )
+            return decodeAndAssertFailure("rotation0_decode_failed_null_bitmap")
         }
         if (rot90Bitmap == null) {
-            return mapOf(
-                "pass" to false,
-                "reason" to "rotation90_decode_failed_null_bitmap",
-                "decodeOk" to false,
-                "centerOverlayOk" to false,
-                "rightArmRotationDifferentiatesOk" to false,
-                "lowerArmRotationDifferentiatesOk" to false,
-                "farCornerBackgroundOk" to false,
-            )
+            return decodeAndAssertFailure("rotation90_decode_failed_null_bitmap")
+        }
+        if (anchorRot90Bitmap == null) {
+            return decodeAndAssertFailure("anchor_rotation90_decode_failed_null_bitmap")
         }
 
         val center0 = sampleAndClassify("center", 180, 320, rot0Bitmap, width, height, expectedMagenta = true, tolerance = tolerance)
@@ -178,17 +175,32 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
         val lowerArm90 = sampleAndClassify("lowerArm", 180, 430, rot90Bitmap, width, height, expectedMagenta = false, tolerance = tolerance)
         val farCorner90 = sampleAndClassify("farCorner", 20, 20, rot90Bitmap, width, height, expectedMagenta = false, tolerance = tolerance)
 
+        // Anchor-pivot proof: scale=0.4, offset=(0,0), anchor=(0.25,0.25), rotationDegrees=90
+        // on a 360x640 canvas. fgRect = left=144, top=256, width=144, height=256; pivot =
+        // (180,320); shifted center = (116,356); fixed overlay left/top = (44,228). The
+        // rotated bounding box is approximately x=[-12,244], y=[284,428].
+        //   shiftedOnly (20,356): only magenta with the anchor-pivot fix applied.
+        //   oldCenterOnly (300,356): only magenta under the old (unfixed) center placement.
+        //   shiftedCenter (116,356): magenta under both, a positive control that the
+        //     overlay itself still renders.
+        val shiftedOnly = sampleAndClassify("shiftedOnly", 20, 356, anchorRot90Bitmap, width, height, expectedMagenta = true, tolerance = tolerance)
+        val oldCenterOnly = sampleAndClassify("oldCenterOnly", 300, 356, anchorRot90Bitmap, width, height, expectedMagenta = false, tolerance = tolerance)
+        val shiftedCenter = sampleAndClassify("shiftedCenter", 116, 356, anchorRot90Bitmap, width, height, expectedMagenta = true, tolerance = tolerance)
+
         val centerOverlayOk = (center0["pass"] == true) && (center90["pass"] == true)
         val rightArmRotationDifferentiatesOk = (rightArm0["pass"] == true) && (rightArm90["pass"] == true)
         val lowerArmRotationDifferentiatesOk = (lowerArm0["pass"] == true) && (lowerArm90["pass"] == true)
         val farCornerBackgroundOk = (farCorner0["pass"] == true) && (farCorner90["pass"] == true)
+        val anchorPivotShiftOk = (shiftedOnly["pass"] == true) && (oldCenterOnly["pass"] == true) && (shiftedCenter["pass"] == true)
 
-        val allPass = centerOverlayOk && rightArmRotationDifferentiatesOk && lowerArmRotationDifferentiatesOk && farCornerBackgroundOk
+        val allPass = centerOverlayOk && rightArmRotationDifferentiatesOk &&
+            lowerArmRotationDifferentiatesOk && farCornerBackgroundOk && anchorPivotShiftOk
         val failureReasons = mutableListOf<String>()
         if (!centerOverlayOk) failureReasons.add("center_overlay_failed:rot0=${center0["isMagenta"]},rot90=${center90["isMagenta"]}")
         if (!rightArmRotationDifferentiatesOk) failureReasons.add("right_arm_differentiation_failed:rot0=${rightArm0["isMagenta"]},rot90=${rightArm90["isMagenta"]}")
         if (!lowerArmRotationDifferentiatesOk) failureReasons.add("lower_arm_differentiation_failed:rot0=${lowerArm0["isMagenta"]},rot90=${lowerArm90["isMagenta"]}")
         if (!farCornerBackgroundOk) failureReasons.add("far_corner_background_failed:rot0=${farCorner0["isMagenta"]},rot90=${farCorner90["isMagenta"]}")
+        if (!anchorPivotShiftOk) failureReasons.add("anchor_pivot_shift_failed:shiftedOnly=${shiftedOnly["isMagenta"]},oldCenterOnly=${oldCenterOnly["isMagenta"]},shiftedCenter=${shiftedCenter["isMagenta"]}")
         val reason = if (allPass) "pass" else failureReasons.joinToString(";")
 
         return mapOf(
@@ -199,6 +211,7 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
             "rightArmRotationDifferentiatesOk" to rightArmRotationDifferentiatesOk,
             "lowerArmRotationDifferentiatesOk" to lowerArmRotationDifferentiatesOk,
             "farCornerBackgroundOk" to farCornerBackgroundOk,
+            "anchorPivotShiftOk" to anchorPivotShiftOk,
             "tolerance" to tolerance,
             "rotation0" to mapOf(
                 "center" to center0,
@@ -211,6 +224,11 @@ class AndroidDuetExportTransformPixelProofSmokeCoordinator(
                 "rightArm" to rightArm90,
                 "lowerArm" to lowerArm90,
                 "farCorner" to farCorner90,
+            ),
+            "anchorRotation90" to mapOf(
+                "shiftedOnly" to shiftedOnly,
+                "oldCenterOnly" to oldCenterOnly,
+                "shiftedCenter" to shiftedCenter,
             ),
         )
     }

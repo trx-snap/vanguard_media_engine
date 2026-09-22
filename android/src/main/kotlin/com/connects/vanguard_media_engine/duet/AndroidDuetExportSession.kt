@@ -340,20 +340,35 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             )
 
             // ── Build STICKER overlay descriptor ─────────────────────────────
-            // Places the rect-sized PNG at fgRect.left/top with exact dimensions.
-            // Rotation carries the parsed foreground transform's rotationDegrees
-            // (already validated finite, default 0.0) so exported foreground
-            // rotation matches the live preview. This routes through the timeline
-            // overlay's own rotation handling and does not yet express non-center
-            // anchor-pivot parity with the preview compositor.
+            // Places the rect-sized PNG with exact dimensions, sized fgRect.width
+            // x fgRect.height. Rotation carries the parsed foreground transform's
+            // rotationDegrees (already validated finite, default 0.0) so exported
+            // foreground rotation matches the live preview. The timeline overlay
+            // renderer rotates a sticker around its own bounding-box center, but
+            // the preview compositor rotates the foreground around
+            // foregroundTransform.anchor. To keep anchor-pivot parity for this
+            // synthetic export path, the overlay's placement (translationX/Y) is
+            // compensated below: fgRect's own center is rotated around the anchor
+            // pivot by rotationDegrees, and the overlay is placed so its
+            // (unrotated) bounding-box center lands on that rotated point. For a
+            // center anchor or zero rotation this reduces exactly to
+            // fgRect.left/top.
             val fgRotationDegrees = params.foregroundTransform?.rotationDegrees ?: 0.0
+            val fgAnchorX = params.foregroundTransform?.anchorX ?: 0.5
+            val fgAnchorY = params.foregroundTransform?.anchorY ?: 0.5
+            val overlayOrigin = computeAnchorPivotOverlayOrigin(
+                fgRect          = fgRect,
+                anchorX         = fgAnchorX,
+                anchorY         = fgAnchorY,
+                rotationDegrees = fgRotationDegrees,
+            )
             val overlayDescriptor = AndroidTimelineOverlayDescriptor(
                 overlayId        = "duet_synthetic_fg",
                 type             = AndroidTimelineOverlayDescriptor.Type.STICKER,
                 startTimeSeconds = 0.0,
                 durationSeconds  = trimDurationSec,
-                translationX     = fgRect.left,
-                translationY     = fgRect.top,
+                translationX     = overlayOrigin.first,
+                translationY     = overlayOrigin.second,
                 width            = fgRect.width,
                 height           = fgRect.height,
                 rotation         = fgRotationDegrees,
@@ -506,6 +521,35 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 VGDuetLayoutRects(source = full, camera = full)
             }
         }
+    }
+
+    /**
+     * Computes the overlay placement (left, top) whose unrotated bounding-box
+     * center, after rotating [fgRect]'s own center by [rotationDegrees]
+     * (clockwise-positive, matching the existing center-anchor rotation
+     * proof) around the anchor pivot within [fgRect], lands on the rotated
+     * point. The anchor pivot is `(fgRect.left + anchorX * fgRect.width,
+     * fgRect.top + anchorY * fgRect.height)`. For anchor (0.5, 0.5) or
+     * rotationDegrees == 0.0 this reduces exactly to (fgRect.left, fgRect.top).
+     */
+    private fun computeAnchorPivotOverlayOrigin(
+        fgRect: VGDuetPixelRect,
+        anchorX: Double,
+        anchorY: Double,
+        rotationDegrees: Double,
+    ): Pair<Double, Double> {
+        val centerX = fgRect.left + fgRect.width / 2.0
+        val centerY = fgRect.top + fgRect.height / 2.0
+        val pivotX  = fgRect.left + anchorX * fgRect.width
+        val pivotY  = fgRect.top + anchorY * fgRect.height
+        val theta = Math.toRadians(rotationDegrees)
+        val cosT = Math.cos(theta)
+        val sinT = Math.sin(theta)
+        val dx = centerX - pivotX
+        val dy = centerY - pivotY
+        val shiftedCenterX = pivotX + dx * cosT - dy * sinT
+        val shiftedCenterY = pivotY + dx * sinT + dy * cosT
+        return Pair(shiftedCenterX - fgRect.width / 2.0, shiftedCenterY - fgRect.height / 2.0)
     }
 
     // ── Internal: metadata probe ──────────────────────────────────────────────

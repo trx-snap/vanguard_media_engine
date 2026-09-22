@@ -16,10 +16,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-const String _startMarker =
-    'ANDROID_DUET_EXPORT_TRANSFORM_PIXEL_PROOF_START';
-const String _jsonPrefix =
-    'ANDROID_DUET_EXPORT_TRANSFORM_PIXEL_PROOF_JSON:';
+const String _startMarker = 'ANDROID_DUET_EXPORT_TRANSFORM_PIXEL_PROOF_START';
+const String _jsonPrefix = 'ANDROID_DUET_EXPORT_TRANSFORM_PIXEL_PROOF_JSON:';
 const String _passMarker =
     'ANDROID_DUET_EXPORT_TRANSFORM_PIXEL_PROOF_PHYSICAL_PASS';
 const String _failMarker =
@@ -69,23 +67,27 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
     var fixtureOk = false;
     var exportRotation0Ok = false;
     var exportRotation90Ok = false;
+    var exportAnchorRotation90Ok = false;
     var outputFilesOk = false;
     var decodeOk = false;
     var centerOverlayOk = false;
     var rightArmRotationDifferentiatesOk = false;
     var lowerArmRotationDifferentiatesOk = false;
     var farCornerBackgroundOk = false;
+    var anchorPivotShiftOk = false;
     var cleanupOk = false;
     var canonical = false;
 
     Map<String, dynamic>? fixtureResult;
     Map<String, dynamic>? export0Result;
     Map<String, dynamic>? export90Result;
+    Map<String, dynamic>? exportAnchorRotation90Result;
     Map<String, dynamic>? nativeAssertResult;
     final failureReasons = <String>[];
 
     final rotation0Path = '${tempDir.path}/duet_export_rot0.mp4';
     final rotation90Path = '${tempDir.path}/duet_export_rot90.mp4';
+    final anchorRotation90Path = '${tempDir.path}/duet_export_anchor_rot90.mp4';
 
     try {
       // Step 1: Prepare deterministic native fixtures (deterministic solid red MP4)
@@ -102,7 +104,8 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
       );
 
       final redVideoPath = fixtureResult?['foregroundVideoPath'] as String?;
-      fixtureOk = fixtureResult?['pass'] == true &&
+      fixtureOk =
+          fixtureResult?['pass'] == true &&
           redVideoPath != null &&
           File(redVideoPath).existsSync() &&
           File(redVideoPath).lengthSync() > 0;
@@ -114,9 +117,7 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
       } else {
         // Step 2: Export Duet composition A (greenScreen, rotationDegrees: 0)
         final descriptorRot0 = <String, dynamic>{
-          'source': <String, dynamic>{
-            'filePath': redVideoPath,
-          },
+          'source': <String, dynamic>{'filePath': redVideoPath},
           'trimWindow': <String, dynamic>{
             'startSeconds': 0.0,
             'endSeconds': 0.2,
@@ -157,9 +158,7 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
 
         // Step 3: Export Duet composition B (greenScreen, rotationDegrees: 90)
         final descriptorRot90 = <String, dynamic>{
-          'source': <String, dynamic>{
-            'filePath': redVideoPath,
-          },
+          'source': <String, dynamic>{'filePath': redVideoPath},
           'trimWindow': <String, dynamic>{
             'startSeconds': 0.0,
             'endSeconds': 0.2,
@@ -199,13 +198,66 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
           failureReasons.add('export_rotation90_failed:$e');
         }
 
+        // Step 3.5: Export Duet composition C (greenScreen, non-center anchor
+        // (0.25, 0.25) + rotationDegrees: 90) to prove anchor-pivot placement
+        // parity, not just in-place rotation.
+        final descriptorAnchorRot90 = <String, dynamic>{
+          'source': <String, dynamic>{'filePath': redVideoPath},
+          'trimWindow': <String, dynamic>{
+            'startSeconds': 0.0,
+            'endSeconds': 0.2,
+          },
+          'layoutConfig': <String, dynamic>{
+            'mode': 'greenScreen',
+            'foregroundTransform': <String, dynamic>{
+              'scale': 0.4,
+              'offset': <String, dynamic>{'x': 0.0, 'y': 0.0},
+              'anchor': <String, dynamic>{'x': 0.25, 'y': 0.25},
+              'rotationDegrees': 90.0,
+            },
+          },
+        };
+
+        try {
+          exportAnchorRotation90Result = await _channel
+              .invokeMapMethod<String, dynamic>(
+                'exportDuetComposition',
+                <String, dynamic>{
+                  'descriptor': descriptorAnchorRot90,
+                  'outputPath': anchorRotation90Path,
+                  'targetSize': <String, dynamic>{
+                    'width': _width,
+                    'height': _height,
+                  },
+                  'videoBitRate': _videoBitRate,
+                },
+              );
+          final outAnchorRot90Path =
+              exportAnchorRotation90Result?['outputPath'] as String?;
+          final sizeAnchorRot90 =
+              (exportAnchorRotation90Result?['fileSizeBytes'] as num?)
+                  ?.toInt() ??
+              0;
+          exportAnchorRotation90Ok =
+              outAnchorRot90Path != null && sizeAnchorRot90 > 0;
+          if (!exportAnchorRotation90Ok) {
+            failureReasons.add('export_anchor_rotation90_invalid_result');
+          }
+        } catch (e) {
+          failureReasons.add('export_anchor_rotation90_failed:$e');
+        }
+
         // Verify output files exist and are non-empty
         final f0 = File(rotation0Path);
         final f90 = File(rotation90Path);
-        outputFilesOk = f0.existsSync() &&
+        final fAnchorRot90 = File(anchorRotation90Path);
+        outputFilesOk =
+            f0.existsSync() &&
             f0.lengthSync() > 0 &&
             f90.existsSync() &&
-            f90.lengthSync() > 0;
+            f90.lengthSync() > 0 &&
+            fAnchorRot90.existsSync() &&
+            fAnchorRot90.lengthSync() > 0;
         if (!outputFilesOk) {
           failureReasons.add('output_files_missing_or_empty');
         }
@@ -213,17 +265,19 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
         if (outputFilesOk) {
           // Step 4: Validate decoded pixels via native assertion helper
           try {
-            nativeAssertResult = await _channel.invokeMapMethod<String, dynamic>(
-              'assertAndroidDuetExportTransformPixelProofOutput',
-              <String, dynamic>{
-                'rotation0Path': rotation0Path,
-                'rotation90Path': rotation90Path,
-                'width': _width,
-                'height': _height,
-                'fps': _fps,
-                'tolerance': _pixelTolerance,
-              },
-            );
+            nativeAssertResult = await _channel
+                .invokeMapMethod<String, dynamic>(
+                  'assertAndroidDuetExportTransformPixelProofOutput',
+                  <String, dynamic>{
+                    'rotation0Path': rotation0Path,
+                    'rotation90Path': rotation90Path,
+                    'anchorRotation90Path': anchorRotation90Path,
+                    'width': _width,
+                    'height': _height,
+                    'fps': _fps,
+                    'tolerance': _pixelTolerance,
+                  },
+                );
 
             decodeOk = nativeAssertResult?['decodeOk'] == true;
             centerOverlayOk = nativeAssertResult?['centerOverlayOk'] == true;
@@ -233,6 +287,8 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
                 nativeAssertResult?['lowerArmRotationDifferentiatesOk'] == true;
             farCornerBackgroundOk =
                 nativeAssertResult?['farCornerBackgroundOk'] == true;
+            anchorPivotShiftOk =
+                nativeAssertResult?['anchorPivotShiftOk'] == true;
 
             if (nativeAssertResult?['pass'] != true) {
               failureReasons.add(
@@ -258,15 +314,18 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
         failureReasons.add('cleanup_failed:$e');
       }
 
-      canonical = fixtureOk &&
+      canonical =
+          fixtureOk &&
           exportRotation0Ok &&
           exportRotation90Ok &&
+          exportAnchorRotation90Ok &&
           outputFilesOk &&
           decodeOk &&
           centerOverlayOk &&
           rightArmRotationDifferentiatesOk &&
           lowerArmRotationDifferentiatesOk &&
           farCornerBackgroundOk &&
+          anchorPivotShiftOk &&
           cleanupOk;
 
       final pass = canonical;
@@ -280,12 +339,14 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
           'fixtureOk': fixtureOk,
           'exportRotation0Ok': exportRotation0Ok,
           'exportRotation90Ok': exportRotation90Ok,
+          'exportAnchorRotation90Ok': exportAnchorRotation90Ok,
           'outputFilesOk': outputFilesOk,
           'decodeOk': decodeOk,
           'centerOverlayOk': centerOverlayOk,
           'rightArmRotationDifferentiatesOk': rightArmRotationDifferentiatesOk,
           'lowerArmRotationDifferentiatesOk': lowerArmRotationDifferentiatesOk,
           'farCornerBackgroundOk': farCornerBackgroundOk,
+          'anchorPivotShiftOk': anchorPivotShiftOk,
           'cleanupOk': cleanupOk,
           'canonical': canonical,
         },
@@ -299,13 +360,17 @@ class _AndroidDuetExportTransformPixelProofSmokeAppState
         'exports': <String, dynamic>{
           'rotation0': export0Result,
           'rotation90': export90Result,
+          'anchorRotation90': exportAnchorRotation90Result,
         },
         'nonClaims': <String>[
           'no_live_camera',
           'no_ml_matte_quality',
           'no_ios',
           'no_connectsapp_ui_upload',
-          'no_arbitrary_anchor_pivot_parity_beyond_center_anchor_90_degree_proof',
+          'proves_synthetic_export_anchor_pivot_parity_only_for_sampled_'
+              'anchor_0_25_0_25_and_90_degree_rotation_not_arbitrary_anchor_'
+              'rotation_combinations',
+          'no_real_live_camera_mask_audio_export_anchor_pivot_proof',
           'no_low_end_android_proof',
         ],
       };
