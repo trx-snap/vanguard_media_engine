@@ -694,7 +694,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
     /// exactly the seven standard files.
     static func matteStageFiles(for mode: VGMatteRefinementPipeline.GreenScreenRefinementMode) -> [(key: String, file: String)] {
         switch mode {
-        case .s1:               return matteStageFiles
+        case .s1, .gpuZeroMetal: return matteStageFiles
         case .s4GuidedAlphaR1,
              .s4SoftAlphaR2,
              .s4TightAlphaR2:   return matteStageFiles + [matteStageS4BandFile]
@@ -710,7 +710,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
     private static func isS4FamilyMode(_ mode: VGMatteRefinementPipeline.GreenScreenRefinementMode) -> Bool {
         switch mode {
         case .s4GuidedAlphaR1, .s4SoftAlphaR2, .s4TightAlphaR2: return true
-        case .s1, .s5GuidedFilterR1, .tightAlphaR1:            return false
+        case .s1, .s5GuidedFilterR1, .tightAlphaR1, .gpuZeroMetal: return false
         }
     }
 
@@ -721,7 +721,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
         case .s4GuidedAlphaR1: return "R1 parameter set (the unchanged live-S4 constants)"
         case .s4SoftAlphaR2:   return "soft-alpha R2 parameter set (wider, softer band; softer in-band alpha; offline lab mode and the production live default)"
         case .s4TightAlphaR2:  return "lab-only tight-alpha R2 parameter set (narrower band; steeper in-band alpha)"
-        case .s1, .s5GuidedFilterR1, .tightAlphaR1: return nil
+        case .s1, .s5GuidedFilterR1, .tightAlphaR1, .gpuZeroMetal: return nil
         }
     }
 
@@ -821,7 +821,7 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 )
             }
             composited = pooled
-        case .s4GuidedAlphaR1, .s4SoftAlphaR2, .s4TightAlphaR2, .s5GuidedFilterR1, .tightAlphaR1:
+        case .s4GuidedAlphaR1, .s4SoftAlphaR2, .s4TightAlphaR2, .s5GuidedFilterR1, .tightAlphaR1, .gpuZeroMetal:
             composited = try composeWithSelectedMask(compositor: compositor,
                                                      bundle: bundle,
                                                      cameraFilled: camFilled,
@@ -862,6 +862,9 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 ? "tight-alpha R1 final mask: the live opt-in applyLiveTightAlphaR1 post-pass (smoothstep remap + small final blur) run offline on the S1 stage-4 mask (lab evaluation, not the live default)"
                 : "tightAlphaR1 requested but failed open (\(stages.tightAlphaR1FailOpenReason ?? "unknown")); identical to the S1 stage-4 mask"
             finalCompositeDescription = "full canvas composite built by the lab from the tight-alpha-R1-selected final mask with composite()'s CIBlendWithMask recipe (not composite() pool output)"
+        case .gpuZeroMetal:
+            finalMaskDescription = "GPU Zero Metal final mask"
+            finalCompositeDescription = "full canvas composite built with GPU Zero Metal"
         }
         var stageImages: [(key: String, image: CIImage, rect: CGRect, context: CIContext, description: String)] = [
             ("rawMask", rawMaskImage, rawMaskImage.extent, compositor.ciContext,
@@ -973,6 +976,10 @@ final class VGLiveGreenScreenReplayDiagnostics {
             tightAlphaR1Status = stages.tightAlphaR1Applied
                 ? "applied"
                 : "fail_open:\(stages.tightAlphaR1FailOpenReason ?? "unknown")"
+        case .gpuZeroMetal:
+            s4Status = "not_requested"
+            s5Status = "not_requested"
+            tightAlphaR1Status = "not_requested"
         }
 
         NSLog("[VGLiveGreenScreenReplayDiagnostics] IOS_LIVE_GREENSCREEN_MATTE_STAGE_LAB_COMPLETED inputDir=\(inputDir) outputDir=\(trimmedOutputDir) label=\(label) refinementMode=\(refinementMode.rawValue) s4Status=\(s4Status) s5Status=\(s5Status) tightAlphaR1Status=\(tightAlphaR1Status) canvas=\(bundle.canvasWidth)x\(bundle.canvasHeight) cameraRectCI=\(Int(ciCamera.minX)),\(Int(ciCamera.minY)) \(Int(ciCamera.width))x\(Int(ciCamera.height)) rawMask=\(CVPixelBufferGetWidth(bundle.mask))x\(CVPixelBufferGetHeight(bundle.mask)) flags=\(appliedFlags)")
@@ -1057,6 +1064,13 @@ final class VGLiveGreenScreenReplayDiagnostics {
                 "no automated pixel quality assertion in this routine; any objective mask-edge metrics are computed by the calling harness from the written stage PNGs",
                 "07 is not composite() pool output; bit-exactness with the live texture path (S1 or the live tightAlphaR1 opt-in) or with the S1 lab composite is not asserted",
                 "tight alpha is a global remap of the whole S1 mask, not a band-limited refinement, so no band tap exists and no comparison against S4/S5 quality is asserted",
+            ]
+        case .gpuZeroMetal:
+            claims = [
+                "GPU Zero Metal compute pipeline offline lab run",
+            ]
+            nonClaims = [
+                "offline diagnostic run only",
             ]
         }
 

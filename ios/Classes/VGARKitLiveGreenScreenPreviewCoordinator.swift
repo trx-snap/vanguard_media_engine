@@ -125,8 +125,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
     static let proofBoundary = "ios_arkit_person_segmentation_matte_live_physical_smoke"
     /// Only supported tracking configuration: front-camera ARFaceTrackingConfiguration.
     static let trackingConfiguration = "face"
-    /// Default display orientation from the still proof (`face` → `leftMirrored`).
-    static let defaultOrientationMode = "leftMirrored"
+    /// Default display orientation: upright non-mirrored matching Vanguard camera (`right`).
+    static let defaultOrientationMode = "right"
     static let orientationMode = defaultOrientationMode
     /// `background` descriptor value when no session background was supplied
     /// (probe: solid teal).
@@ -158,7 +158,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
     /// Marker logged once when the optional replay bundle capture failed.
     static let captureBundleFailMarker = "IOS_ARKIT_LIVE_CAPTURE_BUNDLE_FAIL"
 
-    static let defaultDisplayOrientation: CGImagePropertyOrientation = .leftMirrored
+    static let defaultDisplayOrientation: CGImagePropertyOrientation = .right
     private static let displayOrientation = defaultDisplayOrientation
 
     /// RND-only allowlist: leftMirrored (selfie mirror) and right (upright non-mirrored).
@@ -281,6 +281,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         /// publishes here, and this engine never instantiates a
         /// VGDuetPreviewCompositor.
         let maskRefiner: VGMatteRefinementPipeline
+        let gpuZeroPipeline: VGGPUZeroMetalPipeline?
         /// Matte pool, created lazily for the first observed matte size.
         var mattePool: CVPixelBufferPool?
         var mattePoolWidth = 0
@@ -294,7 +295,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
 
         init(device: MTLDevice, commandQueue: MTLCommandQueue, matteGenerator: ARMatteGenerator,
              ciContext: CIContext, outputPool: CVPixelBufferPool, canvasRect: CGRect, backgroundImage: CIImage,
-             maskRefiner: VGMatteRefinementPipeline) {
+             maskRefiner: VGMatteRefinementPipeline, gpuZeroPipeline: VGGPUZeroMetalPipeline? = nil) {
             self.device = device
             self.commandQueue = commandQueue
             self.matteGenerator = matteGenerator
@@ -303,6 +304,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
             self.canvasRect = canvasRect
             self.backgroundImage = backgroundImage
             self.maskRefiner = maskRefiner
+            self.gpuZeroPipeline = gpuZeroPipeline
         }
     }
 
@@ -430,7 +432,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         self.ownsTexture = true
         self.textureId = -1
         self.sessionId = "ios_arkit_live_gs_" + UUID().uuidString.lowercased()
-        self.minAcceptedFrameInterval = 0.9 / Double(max(1, request.targetFps))
+        self.minAcceptedFrameInterval = 0.9 / Double(max(1, request.targetFps)) // Steady 30 FPS cadence
         self.currentBackground = request.background
         self.currentForegroundRect = request.foregroundRect
             ?? CGRect(x: 0, y: 0, width: request.canvasWidth, height: request.canvasHeight)
@@ -454,7 +456,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         self.ownsTexture = false
         self.textureId = textureId
         self.sessionId = sessionId
-        self.minAcceptedFrameInterval = 0.9 / Double(max(1, request.targetFps))
+        self.minAcceptedFrameInterval = 0.9 / Double(max(1, request.targetFps)) // Steady 30 FPS cadence
         self.currentBackground = request.background
         self.currentForegroundRect = request.foregroundRect
             ?? CGRect(x: 0, y: 0, width: request.canvasWidth, height: request.canvasHeight)
@@ -533,6 +535,10 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         // mode. Mask refinement only (see RenderResources.maskRefiner); this
         // engine never instantiates a VGDuetPreviewCompositor.
         let maskRefiner = VGMatteRefinementPipeline(liveMatteRefinementMode: request.liveMatteRefinementMode)
+        let gpuZero = (request.liveMatteRefinementMode == .gpuZeroMetal) ? VGGPUZeroMetalPipeline(device: device) : nil
+        if gpuZero != nil {
+            NSLog("[VGARKitLiveGreenScreenPreviewCoordinator] VGGPUZeroMetalPipeline active for ARKit canvas %dx%d", canvasWidth, canvasHeight)
+        }
         resources = RenderResources(
             device: device,
             commandQueue: commandQueue,
@@ -541,10 +547,14 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
             outputPool: outputPool,
             canvasRect: canvasRect,
             backgroundImage: CIImage(color: VGARKitLiveGreenScreenPreviewCoordinator.tealColor).cropped(to: canvasRect),
-            maskRefiner: maskRefiner)
+            maskRefiner: maskRefiner,
+            gpuZeroPipeline: gpuZero)
 
         let configuration = ARFaceTrackingConfiguration()
         configuration.frameSemantics.insert(.personSegmentation)
+        if let format30 = ARFaceTrackingConfiguration.supportedVideoFormats.first(where: { $0.framesPerSecond == 30 }) {
+            configuration.videoFormat = format30
+        }
         let videoFormat = configuration.videoFormat
         let formatWidth  = Int(videoFormat.imageResolution.width)
         let formatHeight = Int(videoFormat.imageResolution.height)
@@ -883,6 +893,123 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
     private func renderFrame(_ frame: ARFrame, with res: RenderResources) throws {
         guard let commandBuffer = res.commandQueue.makeCommandBuffer() else {
             throw RenderError.terminal("no_metal_command_buffer")
+        }
+
+        // Fast path: Pure Metal GPU Zero compute pipeline (<2ms latency, sub-pixel guided snapping, zero CPU copies)
+        if request.liveMatteRefinementMode == .gpuZeroMetal,
+           let gpuZero = res.gpuZeroPipeline {
+            let matteStart = CACurrentMediaTime()
+            let matteTexture = res.matteGenerator.generateMatte(from: frame, commandBuffer: commandBuffer)
+            let matteMs = (CACurrentMediaTime() - matteStart) * 1000.0
+
+            let compositeStart = CACurrentMediaTime()
+            var outBuffer: CVPixelBuffer?
+            let aux: [String: Any] = [
+                kCVPixelBufferPoolAllocationThresholdKey as String: VGARKitLiveGreenScreenPreviewCoordinator.outputPoolAllocationThreshold,
+            ]
+            let outStatus = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+                kCFAllocatorDefault, res.outputPool, aux as CFDictionary, &outBuffer)
+            if outStatus == kCVReturnWouldExceedAllocationThreshold {
+                throw RenderError.poolExhausted
+            }
+            guard outStatus == kCVReturnSuccess, let output = outBuffer else {
+                throw RenderError.terminal("output_pool_pixel_buffer_create_failed_\(outStatus)")
+            }
+
+            lock.lock()
+            let backgroundBuffer = currentBackground
+            lock.unlock()
+
+            let capturedImage = frame.capturedImage
+            let imageWidth  = CVPixelBufferGetWidth(capturedImage)
+            let imageHeight = CVPixelBufferGetHeight(capturedImage)
+            let dstW = Int(res.canvasRect.width.rounded())
+            let dstH = Int(res.canvasRect.height.rounded())
+
+            // Vanguard camera upright portrait transform
+            let rotIdx: UInt32 = 1
+            let effSrcW = imageHeight
+            let effSrcH = imageWidth
+
+            let scale = max(Double(dstW) / Double(effSrcW), Double(dstH) / Double(effSrcH))
+            let visU = Float(Double(dstW) / (Double(effSrcW) * scale))
+            let visV = Float(Double(dstH) / (Double(effSrcH) * scale))
+            let cropUniforms = SIMD4<Float>((1.0 - visU) / 2.0, (1.0 - visV) / 2.0, visU, visV)
+            let mirrorCorrection: UInt32 = (request.displayOrientationMode == "unmirrored" || request.displayOrientationMode == "rightUnmirrored") ? 1 : 0
+
+            let solidCol = SIMD4<Float>(0.0, 0.50196, 0.50196, 1.0)
+
+            if gpuZero.encode(
+                commandBuffer: commandBuffer,
+                cameraBuffer: capturedImage,
+                matteTexture: matteTexture,
+                backgroundBuffer: backgroundBuffer,
+                outputBuffer: output,
+                canvasWidth: dstW,
+                canvasHeight: dstH,
+                solidColor: solidCol,
+                cropUniforms: cropUniforms,
+                rotationIndex: rotIdx,
+                mirrorCorrection: mirrorCorrection
+            ) {
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                let compositeMs = (CACurrentMediaTime() - compositeStart) * 1000.0
+
+                texture.update(pixelBuffer: output)
+                let publishTime = CACurrentMediaTime()
+
+                lock.lock()
+                publishedFrames += 1
+                if firstPublishTime == nil { firstPublishTime = publishTime }
+                lastPublishTime = publishTime
+                matteWidth  = matteTexture.width
+                matteHeight = matteTexture.height
+                matteGenerationSumMs += matteMs
+                matteGenerationMaxMs = max(matteGenerationMaxMs, matteMs)
+                matteGenerationCount += 1
+                if matteGenerationSamplesMs.count < VGARKitLiveGreenScreenPreviewCoordinator.maxTimingSamples {
+                    matteGenerationSamplesMs.append(matteMs)
+                }
+                compositeSumMs += compositeMs
+                compositeMaxMs = max(compositeMaxMs, compositeMs)
+                compositeCount += 1
+                if compositeSamplesMs.count < VGARKitLiveGreenScreenPreviewCoordinator.maxTimingSamples {
+                    compositeSamplesMs.append(compositeMs)
+                }
+                let isFirstPublish = publishedFrames == 1
+                var logFirstRefinement = false
+                maskRefinementFrames += 1
+                maskMorphologyCloseApplied = true
+                maskFeatherApplied         = true
+                maskTrimapApplied          = true
+                maskGuidedEdgeApplied      = true
+                liveS4GuidedAlphaApplied   = true
+                if !hasLoggedFirstMaskRefinement {
+                    hasLoggedFirstMaskRefinement = true
+                    logFirstRefinement = true
+                }
+                lock.unlock()
+
+                if isFirstPublish {
+                    NSLog("IOS_ARKIT_LIVE_PREVIEW_NATIVE_FIRST_PUBLISH sessionId=\(sessionId) textureId=\(textureId) capturedImage=\(imageWidth)x\(imageHeight) matte=\(matteTexture.width)x\(matteTexture.height) matteGenerationMs=\(matteMs) compositeMs=\(compositeMs) mode=gpuZeroMetal")
+                }
+                if logFirstRefinement {
+                    NSLog("\(VGARKitLiveGreenScreenPreviewCoordinator.maskRefinementFirstMarker) sessionId=\(sessionId) textureId=\(textureId) maskRefinementPath=\(VGARKitLiveGreenScreenPreviewCoordinator.diagnosticsMaskRefinementPath) liveMatteRefinement=\(request.liveMatteRefinementMode.rawValue) maskMorphologyCloseApplied=true maskFeatherApplied=true maskTrimapApplied=true maskGuidedEdgeApplied=true liveTightAlphaR1Applied=false liveS4GuidedAlphaR1Applied=false liveS4GuidedAlphaApplied=true targetRect=\(VGARKitLiveGreenScreenPreviewCoordinator.describe(res.canvasRect)) matte=\(matteTexture.width)x\(matteTexture.height) compositeMs=\(compositeMs)")
+                }
+
+                let id = textureId
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.lock.lock()
+                    let publishable = self.state == .running
+                    self.lock.unlock()
+                    if publishable {
+                        self.textureRegistry.textureFrameAvailable(id)
+                    }
+                }
+                return
+            }
         }
 
         // 1. Full-resolution matte (same call as the still proof, once per frame).

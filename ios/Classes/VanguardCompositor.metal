@@ -234,3 +234,374 @@ fragment float4 vanguard_blit_rotated_ex(
 
     return float4(color, sampled.a);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MARK: - GPU Zero Green Screen Metal Compute Pipelines (< 12.5ms & Sub-Pixel Parity)
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct GreenScreenDownscaleUniforms {
+    uint mirror;
+    float cropScale;
+};
+
+struct GreenScreenGuidedUniforms {
+    float2 resolution;      // canvas resolution (e.g. 720, 1280)
+    float eps;             // 1e-4
+    uint filterEnabled;    // 1
+    float4 cropUniforms;   // (offsetU, offsetV, scaleU, scaleV)
+    uint rotationIndex;    // 0=identity, 1=+90 CW, 2=-90 CCW, 3=180
+    uint mirrorCorrection; // 0=off, 1=flip
+    uint isBiPlanar;       // 0=BGRA, 1=YCbCr biplanar
+    uint _pad;
+};
+
+struct GreenScreenTemporalUniforms {
+    float2 resolution;
+    uint stabilizerEnabled;
+    uint _pad;
+};
+
+struct GreenScreenCompositeUniforms {
+    float2 resolution;
+    float4 solidColor;
+    uint outputMode;       // 0: straight-alpha, 1: solid color, 2: texture, 5: raw cam, 6: mask inspect
+    uint despillEnabled;
+    float4 cropUniforms;   // (offsetU, offsetV, scaleU, scaleV)
+    uint rotationIndex;    // 0=identity, 1=+90 CW, 2=-90 CCW, 3=180
+    uint mirrorCorrection; // 0=off, 1=flip
+    uint isBiPlanar;       // 0=BGRA, 1=YCbCr biplanar
+    uint _pad;
+};
+
+inline float getGreenScreenLuma(float3 rgb) {
+    return dot(rgb, float3(0.299, 0.587, 0.114));
+}
+
+// Maps canvas UV [0, 1]^2 to camera UV [0, 1]^2 with aspect-fill crop, rotation, and mirror correction.
+inline float2 getGreenScreenCameraUv(float2 uv, float4 cropUniforms, uint rotationIndex, uint mirrorCorrection) {
+    float2 cropOffset = float2(cropUniforms.x, cropUniforms.y);
+    float2 cropScale  = float2(cropUniforms.z, cropUniforms.w);
+    float2 normUv = cropOffset + uv * cropScale;
+
+    if (rotationIndex == 0) {
+        // Landscape / pass-through
+        float effX = (mirrorCorrection != 0) ? (1.0 - normUv.x) : normUv.x;
+        return float2(effX, normUv.y);
+    } else {
+        // Portrait front camera (sensor 1920x1440):
+        // Upright vertical: canvas top (v=0) maps to sensor top (camX=cropOffset.y).
+        // Canvas bottom (v=1) maps to sensor bottom (camX=cropOffset.y + cropScale.y).
+        float camX = normUv.y;
+        // Horizontal:
+        // By default (mirrorCorrection == 0), selfie-mirrored matching Vanguard front camera:
+        // Canvas left (u=0) maps to sensor right, canvas right (u=1) maps to sensor left.
+        // Raising user's right hand raises right hand on screen.
+        // When mirrorCorrection != 0, spectator unmirrored (raising user's right hand shows on screen left).
+        float camY = (mirrorCorrection != 0) ? normUv.x : (1.0 - normUv.x);
+        return float2(camX, camY);
+    }
+}
+
+// ── 1. Downscale Compute Kernel (Camera 1080p -> 256x256 RGB input) ─────────
+kernel void kernel_greenscreen_downscale(
+    texture2d<float, access::sample> uCameraTexture  [[texture(0)]],
+    texture2d<float, access::write>  uDownscaledImage [[texture(1)]],
+    constant GreenScreenDownscaleUniforms& u          [[buffer(0)]],
+    uint2 coord                                      [[thread_position_in_grid]]
+) {
+    if (coord.x >= 256 || coord.y >= 256) return;
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float2 uv = (float2(coord) + 0.5) / 256.0;
+    float effX = (u.mirror != 0) ? (1.0 - uv.x) : uv.x;
+    float2 camUv = float2(0.5 + (effX - 0.5) * u.cropScale, uv.y);
+    float4 color = uCameraTexture.sample(s, camUv);
+    uDownscaledImage.write(float4(color.rgb, 1.0), coord);
+}
+
+// ── 2. 25-Point Isotropic Guided Filter (Sub-Pixel Edge Snapping) ───────────
+constant float2 kGreenScreenGuidedOffsets[25] = {
+    float2( 0.0,  0.0),
+    // Ring 1 (radius 1.5)
+    float2( 1.5,  0.0), float2(-1.5,  0.0), float2( 0.0,  1.5), float2( 0.0, -1.5),
+    float2( 1.1,  1.1), float2(-1.1,  1.1), float2( 1.1, -1.1), float2(-1.1, -1.1),
+    // Ring 2 (radius 3.0)
+    float2( 3.0,  0.0), float2(-3.0,  0.0), float2( 0.0,  3.0), float2( 0.0, -3.0),
+    float2( 2.1,  2.1), float2(-2.1,  2.1), float2( 2.1, -2.1), float2(-2.1, -2.1),
+    // Ring 3 (radius 5.0)
+    float2( 5.0,  0.0), float2(-5.0,  0.0), float2( 0.0,  5.0), float2( 0.0, -5.0),
+    float2( 3.5,  3.5), float2(-3.5,  3.5), float2( 3.5, -3.5), float2(-3.5, -3.5)
+};
+
+kernel void kernel_greenscreen_guided_filter(
+    texture2d<float, access::sample> uCameraTexture      [[texture(0)]], // Camera Y (or BGRA)
+    texture2d<float, access::sample> uCoarseAlphaTexture [[texture(1)]], // ARKit raw matte (.r8Unorm)
+    texture2d<float, access::write>  uRefinedAlphaImage  [[texture(2)]], // Refined alpha at canvas resolution
+    constant GreenScreenGuidedUniforms& u                [[buffer(0)]],
+    uint2 coord                                          [[thread_position_in_grid]]
+) {
+    if (coord.x >= uint(u.resolution.x) || coord.y >= uint(u.resolution.y)) return;
+
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float2 uv = (float2(coord) + 0.5) / u.resolution;
+    float2 centerCamUv = getGreenScreenCameraUv(uv, u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+
+    // Sample coarse alpha from ARKit matte at camera UV
+    float rawAlpha = uCoarseAlphaTexture.sample(s, centerCamUv).r;
+
+    // High-resolution input bypass: Apple ARMatteGenerator (1920x1440) already performs
+    // high-resolution guided refinement. Re-filtering over high-res matte adds ISO noise and motion grain.
+    if (u.filterEnabled == 0 || uCoarseAlphaTexture.get_width() > 512) {
+        uRefinedAlphaImage.write(float4(rawAlpha, 0.0, 0.0, 1.0), coord);
+        return;
+    }
+
+    // Fast path: solid foreground interior (>0.96) or deep background (<0.03)
+    if (rawAlpha < 0.03) {
+        uRefinedAlphaImage.write(float4(0.0, 0.0, 0.0, 1.0), coord);
+        return;
+    }
+    if (rawAlpha > 0.96) {
+        uRefinedAlphaImage.write(float4(1.0, 0.0, 0.0, 1.0), coord);
+        return;
+    }
+
+    float centerI = (u.isBiPlanar != 0) ? uCameraTexture.sample(s, centerCamUv).r
+                                        : getGreenScreenLuma(uCameraTexture.sample(s, centerCamUv).rgb);
+
+    // 25-point isotropic circular guided filter
+    float2 step = 2.0 / u.resolution;
+    float sumI  = 0.0;
+    float sumP  = 0.0;
+    float sumII = 0.0;
+    float sumIp = 0.0;
+
+    for (int i = 0; i < 25; i++) {
+        float2 offsetUv = uv + kGreenScreenGuidedOffsets[i] * step;
+        float2 offsetCamUv = getGreenScreenCameraUv(offsetUv, u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+
+        float I = (u.isBiPlanar != 0) ? uCameraTexture.sample(s, offsetCamUv).r
+                                      : getGreenScreenLuma(uCameraTexture.sample(s, offsetCamUv).rgb);
+        float p = uCoarseAlphaTexture.sample(s, offsetCamUv).r;
+
+        sumI  += I;
+        sumP  += p;
+        sumII += I * I;
+        sumIp += I * p;
+    }
+
+    float meanI = sumI * 0.04;
+    float meanP = sumP * 0.04;
+    float varI  = max(0.0, (sumII * 0.04) - (meanI * meanI));
+    float covIp = (sumIp * 0.04) - (meanI * meanP);
+
+    float a = covIp / (varI + u.eps);
+    float b = meanP - a * meanI;
+
+    float refinedAlpha = clamp(a * centerI + b, 0.0, 1.0);
+
+    float edgeFactor = smoothstep(0.03, 0.14, rawAlpha) * smoothstep(0.96, 0.85, rawAlpha);
+    float finalAlpha = mix(rawAlpha, refinedAlpha, edgeFactor);
+
+    uRefinedAlphaImage.write(float4(finalAlpha, 0.0, 0.0, 1.0), coord);
+}
+
+// ── 3. Temporal Stability Compute Kernel (Strict Zero-Lag Motion Snap) ────────
+kernel void kernel_greenscreen_temporal_stabilize(
+    texture2d<float, access::sample> uCurrAlpha       [[texture(0)]],
+    texture2d<float, access::sample> uPrevAlpha       [[texture(1)]],
+    texture2d<float, access::write>  uStabilizedAlpha [[texture(2)]],
+    constant GreenScreenTemporalUniforms& u           [[buffer(0)]],
+    uint2 coord                                       [[thread_position_in_grid]]
+) {
+    if (coord.x >= uint(u.resolution.x) || coord.y >= uint(u.resolution.y)) return;
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float2 uv = (float2(coord) + 0.5) / u.resolution;
+
+    float currA = uCurrAlpha.sample(s, uv).r;
+    float prevA = uPrevAlpha.sample(s, uv).r;
+
+    if (u.stabilizerEnabled == 0) {
+        uStabilizedAlpha.write(float4(currA, 0.0, 0.0, 1.0), coord);
+        return;
+    }
+
+    float diffAlpha = abs(currA - prevA);
+    // Strict zero-lag motion snap: snap 100% to current frame on movement (glued to face).
+    // Blend only when completely static to eliminate camera sensor grain.
+    float blendRate = (diffAlpha > 0.012) ? 1.0 : mix(0.35, 1.0, diffAlpha / 0.012);
+    float finalAlpha = mix(prevA, currA, blendRate);
+
+    uStabilizedAlpha.write(float4(finalAlpha, 0.0, 0.0, 1.0), coord);
+}
+
+// ── 4. Hermite Antialiased Composite & Despill Kernel ─────────────────────────
+inline float sampleGreenScreenHermiteAlpha(texture2d<float, access::sample> tex, sampler s, float2 uv, float2 res) {
+    float2 pos = uv * res - 0.5;
+    float2 f = fract(pos);
+    float2 p = (floor(pos) + 0.5) / res;
+    float2 d = 1.0 / res;
+    float2 st = f * f * (3.0 - 2.0 * f);
+    float a00 = tex.sample(s, p).r;
+    float a10 = tex.sample(s, p + float2(d.x, 0.0)).r;
+    float a01 = tex.sample(s, p + float2(0.0, d.y)).r;
+    float a11 = tex.sample(s, p + d).r;
+    return mix(mix(a00, a10, st.x), mix(a01, a11, st.x), st.y);
+}
+
+inline float3 sampleCameraColor(
+    texture2d<float, access::sample> uCameraY,
+    texture2d<float, access::sample> uCameraCbCr,
+    sampler s,
+    float2 camUv,
+    uint isBiPlanar
+) {
+    if (isBiPlanar != 0) {
+        float y = uCameraY.sample(s, camUv).r;
+        float2 cbcr = uCameraCbCr.sample(s, camUv).rg;
+        return ycbcrToRgb(y, cbcr.r, cbcr.g);
+    } else {
+        return uCameraY.sample(s, camUv).rgb;
+    }
+}
+
+kernel void kernel_greenscreen_composite_despill(
+    texture2d<float, access::sample> uCameraY         [[texture(0)]], // Camera Y (or BGRA)
+    texture2d<float, access::sample> uCameraCbCr      [[texture(1)]], // Camera CbCr (or dummy)
+    texture2d<float, access::sample> uAlphaTexture    [[texture(2)]], // Stabilized alpha (canvas res)
+    texture2d<float, access::sample> uBgTexture       [[texture(3)]], // Background (canvas res)
+    texture2d<float, access::write>  uOutputImage     [[texture(4)]], // Output image (canvas res)
+    constant GreenScreenCompositeUniforms& u          [[buffer(0)]],
+    uint2 coord                                       [[thread_position_in_grid]]
+) {
+    if (coord.x >= uint(u.resolution.x) || coord.y >= uint(u.resolution.y)) return;
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float2 uv = (float2(coord) + 0.5) / u.resolution;
+    float2 camUv = getGreenScreenCameraUv(uv, u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+
+    float3 cameraColor = sampleCameraColor(uCameraY, uCameraCbCr, s, camUv, u.isBiPlanar);
+
+    // Studio "Virtual Key Light" & Face Warmth Recovery:
+    // In flat/cloudy indoor daylight, recover natural facial warmth, midtone exposure, and healthy skin tones:
+    float rawCamLuma = getGreenScreenLuma(cameraColor);
+    float3 litColor = pow(max(cameraColor, float3(0.0)), float3(0.94));
+    litColor.r = min(1.0, litColor.r * 1.025);
+    litColor.b = min(1.0, litColor.b * 0.985);
+    litColor = mix(float3(rawCamLuma), litColor, 1.06);
+    cameraColor = clamp(litColor, 0.0, 1.0);
+
+    float alpha = sampleGreenScreenHermiteAlpha(uAlphaTexture, s, uv, u.resolution);
+
+    // Isotropic Cardinal Analysis for Despill Normal Gradient
+    float2 px = float2(1.5 / u.resolution.x, 1.5 / u.resolution.y);
+    float aN = sampleGreenScreenHermiteAlpha(uAlphaTexture, s, uv + float2(0.0, px.y), u.resolution);
+    float aS = sampleGreenScreenHermiteAlpha(uAlphaTexture, s, uv - float2(0.0, px.y), u.resolution);
+    float aE = sampleGreenScreenHermiteAlpha(uAlphaTexture, s, uv + float2(px.x, 0.0), u.resolution);
+    float aW = sampleGreenScreenHermiteAlpha(uAlphaTexture, s, uv - float2(px.x, 0.0), u.resolution);
+
+    // 1. High-Frequency Hair Edge Detail Transfer:
+    // Boost fine hair strand contrast in the transition zone using the local Laplacian.
+    // Gated to alpha in [0.20, 0.80] with a noise deadzone to eliminate floating specks in the background.
+    float refinedA = alpha;
+    if (alpha > 0.20 && alpha < 0.80) {
+        float laplacianA = alpha - 0.25 * (aN + aS + aE + aW);
+        if (abs(laplacianA) > 0.02) {
+            float hairBoost = clamp(laplacianA * 0.25, -0.08, 0.08) * smoothstep(0.20, 0.45, alpha) * smoothstep(0.80, 0.55, alpha);
+            refinedA = clamp(alpha + hairBoost, 0.0, 1.0);
+        }
+    }
+
+    // Continuous sub-pixel Hermite edge transition with subtle interior choke:
+    // Choking the outer edge from 0.12 removes residual room-light fringe while keeping sub-pixel hair strands smooth.
+    float compAlpha = smoothstep(0.12, 0.92, refinedA);
+
+    // 2. Low-Light Boundary Cross-Bilateral De-Noiser:
+    // In dim/cloudy light, sensor ISO gain causes high-frequency buzzing along the boundary.
+    // Cross-bilateral smoothing along the edge eliminates sensor grain while preserving sharp hair edges:
+    if (compAlpha > 0.05 && compAlpha < 0.92) {
+        float2 camUvN = getGreenScreenCameraUv(uv + float2(0.0, px.y), u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+        float2 camUvS = getGreenScreenCameraUv(uv - float2(0.0, px.y), u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+        float2 camUvE = getGreenScreenCameraUv(uv + float2(px.x, 0.0), u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+        float2 camUvW = getGreenScreenCameraUv(uv - float2(px.x, 0.0), u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+
+        float3 colN = sampleCameraColor(uCameraY, uCameraCbCr, s, camUvN, u.isBiPlanar);
+        float3 colS = sampleCameraColor(uCameraY, uCameraCbCr, s, camUvS, u.isBiPlanar);
+        float3 colE = sampleCameraColor(uCameraY, uCameraCbCr, s, camUvE, u.isBiPlanar);
+        float3 colW = sampleCameraColor(uCameraY, uCameraCbCr, s, camUvW, u.isBiPlanar);
+
+        float wN = exp(-distance(cameraColor, colN) * 10.0);
+        float wS = exp(-distance(cameraColor, colS) * 10.0);
+        float wE = exp(-distance(cameraColor, colE) * 10.0);
+        float wW = exp(-distance(cameraColor, colW) * 10.0);
+        float totalW = 1.0 + wN + wS + wE + wW;
+        cameraColor = (cameraColor + colN * wN + colS * wS + colE * wE + colW * wW) / totalW;
+    }
+
+    // 3. Optical Chromatic Green Spill Neutralization:
+    // Neutralize ugly green bounce on skin, ears, and hair edges
+    if (u.despillEnabled != 0 && compAlpha > 0.02) {
+        float maxRB = max(cameraColor.r, cameraColor.b);
+        if (cameraColor.g > maxRB) {
+            float excessG = cameraColor.g - maxRB;
+            float despillFactor = smoothstep(0.98, 0.35, compAlpha);
+            cameraColor.g -= excessG * despillFactor;
+            // Restore lost luminance into warm natural skin tones
+            cameraColor.rb += float2(excessG * 0.25 * despillFactor);
+        }
+    }
+
+    // 4. Ambient Wall Light Decontamination (Despill) using Inward Normal
+    if (u.despillEnabled != 0 && compAlpha > 0.02 && compAlpha < 0.90) {
+        float2 grad = float2(aE - aW, aN - aS);
+        float gradLen = length(grad);
+        if (gradLen > 0.001) {
+            float2 inDir = (grad / gradLen) * 3.5 * px;
+            float inAlpha = sampleGreenScreenHermiteAlpha(uAlphaTexture, s, uv + inDir, u.resolution);
+            if (inAlpha > 0.65) {
+                float2 inCamUv = getGreenScreenCameraUv(uv + inDir, u.cropUniforms, u.rotationIndex, u.mirrorCorrection);
+                float3 inCol = sampleCameraColor(uCameraY, uCameraCbCr, s, inCamUv, u.isBiPlanar);
+                float inLuma = getGreenScreenLuma(inCol);
+                float curLuma = getGreenScreenLuma(cameraColor);
+                if (curLuma > inLuma * 1.05) {
+                    cameraColor = mix(cameraColor, inCol, (1.0 - compAlpha) * 0.75);
+                }
+            }
+        }
+    }
+
+    // 5. Background color, Exposure Harmonization & Subtle Light Wrap:
+    float3 bgCol = (u.outputMode == 1) ? u.solidColor.rgb : uBgTexture.sample(s, uv).rgb;
+    if (u.outputMode != 0) {
+        // Exposure Harmonization: bridge contrast gap when subject is in cloudy/dim light over bright background
+        float bgLuma = getGreenScreenLuma(bgCol);
+        float curLuma = getGreenScreenLuma(cameraColor);
+        if (bgLuma > 0.55 && curLuma < 0.50) {
+            float exposureGap = (bgLuma - curLuma) * 0.16;
+            cameraColor = min(float3(1.0), cameraColor * (1.0 + exposureGap));
+        }
+
+        // Naturally soften outer silhouette edge into background without washing out dark hair
+        if (compAlpha > 0.15 && compAlpha < 0.85) {
+            float lumaWeight = clamp(curLuma * 0.8 + 0.2, 0.2, 1.0);
+            float wrapWeight = smoothstep(0.85, 0.45, compAlpha) * smoothstep(0.15, 0.45, compAlpha) * 0.08 * lumaWeight;
+            cameraColor = mix(cameraColor, bgCol, wrapWeight);
+        }
+    }
+
+    float4 finalPixel;
+    if (u.outputMode == 0) {
+        // Straight-alpha output (for Duet / graph compositor)
+        finalPixel = (compAlpha > 0.0) ? float4(cameraColor, compAlpha) : float4(0.0);
+    } else if (u.outputMode == 5) {
+        // Raw camera feed pass
+        finalPixel = float4(cameraColor, 1.0);
+    } else if (u.outputMode == 6) {
+        // Mask inspection pass
+        finalPixel = float4(float3(compAlpha), 1.0);
+    } else {
+        // Background composite (solid color or texture)
+        finalPixel = float4(mix(bgCol, cameraColor, compAlpha), 1.0);
+    }
+
+    uOutputImage.write(finalPixel, coord);
+}
+
