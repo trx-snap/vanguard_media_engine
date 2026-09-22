@@ -1,11 +1,10 @@
 // Copyright 2026, Connects. All rights reserved.
 // android_duet_green_screen_sustained_baseline_physical_smoke.dart
 //
-// Dedicated physical smoke harness for a *sustained* production-ladder live
-// preview window on the Android Duet green-screen backend. Unlike
-// android_duet_raw_tflite_gpu_sustained_preview_physical_smoke.dart, this
-// harness attaches with the production ladder only (mediapipe_cpu -> mlkit):
-// no debugSegmentationBackend, no debugRawTfliteGpuDelegateMode, and no
+// Dedicated physical smoke harness for a *sustained* production live preview
+// window on the Android Duet green-screen backend. This harness attaches with
+// production defaults (production Duet GPU GreenScreen path): no
+// debugSegmentationBackend, no debugRawTfliteGpuDelegateMode, and no
 // debugRawTfliteGpuModelAssetPath are passed. It establishes a sustained
 // baseline observation window (default 45s, override with
 // --dart-define=SUSTAINED_SECONDS=<n>) and fails if any Duet green-screen
@@ -20,37 +19,25 @@
 //         --dart-define=SUSTAINED_SECONDS=45
 //   - Claims allowed:
 //       * local source session init
-//       * attach-time greenScreen layout accepted on the production ladder
-//         (no debugSegmentationBackend / debugRawTfliteGpuDelegateMode /
-//         debugRawTfliteGpuModelAssetPath keys sent)
+//       * attach-time greenScreen layout accepted on production defaults while
+//         omitting legacy/debug segmentation keys
+//       * production Duet GPU GreenScreen path selected by engine defaults when
+//         paired with native logcat markers
 //       * preview texture attach success
 //       * startRecording activates render loop and camera
-//       * sustained production-ladder segmentation window (mediapipe_cpu -> mlkit) runs
-//         continuously against the live camera feed for the full observation duration,
-//         independent of the decoded source video's own playback position
-//       * the decoded source video plays (moving picture, not a frozen frame) for its
-//         trim window (0.0s -> kTrimEndSeconds, a known-safe ~9.0s window within the
-//         ~9.83s clip_A.mov fixture); AndroidDuetPreviewClock clamps it to a frozen
-//         last frame for the remainder of the observation window when
-//         kSustainedObservationSeconds exceeds kTrimEndSeconds (true at the 45s default)
-//       * zero matching Duet degrade/fallback events during window (green_screen_degraded /
-//         green_screen_fallback for this session, observed via VGDuetEvents.stream)
-//       * native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS /
-//         ANDROID_DUET_GREENSCREEN_SEGMENTATION_SUMMARY) may prove backend-neutral
-//         segmentation completion stats
-//       * stop/detach/dispose/temp cleanup complete
+//       * sustained 45s segmentation window runs with zero Duet degrade/fallback
+//         events via VGDuetEvents.stream
+//       * decoded source video is moving for the default 45s in-trim observation
+//         window using the new 60s fixture
+//       * cleanup completion
 //   - Non-claims:
-//       * no full-duration moving-video proof: clip_A.mov is only ~9.83s long, so a
-//         default 45s kSustainedObservationSeconds window cannot show ~35s of it as
-//         moving video no matter how the trim window is set; only the first
-//         kTrimEndSeconds (~9.0s) of the observation shows genuine source video motion,
-//         the rest is a frozen last frame. This does not affect the degrade/fallback
-//         event proof above, which is measured against the live camera feed, not the
-//         decoded source video.
 //       * no automated pixel/matte-quality proof
 //       * no export/audio proof
 //       * no all-device/low-end proof
-//       * no GPU promotion (raw_tflite_gpu / mediapipe_gpu are not exercised by this harness)
+//       * no standalone logcat assertion inside Dart because GPU route proof
+//         requires pairing with native logcat markers
+//       * no claim beyond the fixture/trim window if someone overrides
+//         SUSTAINED_SECONDS above 45
 
 // ignore_for_file: avoid_print
 
@@ -93,20 +80,11 @@ const String kMediaPipeCpuModelAsset = String.fromEnvironment(
 const int kObserveTickIntervalSeconds = 5;
 
 /// ANDROID-DUET-VISUAL-REGISTRATION: trim end (seconds) for the staged source
-/// clip. clip_A.mov is only ~9.83s long (measured via ffprobe), far shorter
-/// than the default kSustainedObservationSeconds (45s). AndroidDuetPreviewClock
-/// clamps source playback to trimEndMs, so regardless of trim end the decoded
-/// source video cannot show moving picture for anywhere near the full default
-/// observation window — the previous fixed 2.5s trim end made this worse than
-/// necessary by freezing after only 2.5s. This value is a known-safe window
-/// within the fixture (leaving an ~0.8s margin below the measured duration)
-/// so the moving-video portion of the observation is maximized without
-/// requesting a decode past the physical end of the clip. This harness's
-/// actual purpose — detecting green_screen_degraded/green_screen_fallback
-/// events — is unaffected by the source video freezing, since segmentation
-/// runs continuously against the live camera feed for the entire window,
-/// independent of the (separate) decoded source video's playback position.
-const double kTrimEndSeconds = 9.0;
+/// clip. Uses the generated 60.0s portrait moving fixture
+/// (assets/manual_test_clips/duet_sustained_motion_60s_720x1280.mp4).
+/// Setting trim end to 45.0s ensures the default 45s observation window is
+/// entirely inside a moving-video window, with the 60s fixture providing margin.
+const double kTrimEndSeconds = 45.0;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -209,17 +187,20 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
     }
 
     try {
-      // Step 1: Stage clip_A.mov fixture from rootBundle into temp directory.
+      // Step 1: Stage duet_sustained_motion_60s_720x1280.mp4 fixture from
+      // rootBundle into temp directory.
       final sourcePath = await runStep<String>(
         'STAGE_FIXTURE',
-        'Staging clip_A.mov into temp directory',
+        'Staging duet_sustained_motion_60s_720x1280.mp4 into temp directory',
         () async {
           tempDir = await Directory.systemTemp.createTemp(
             'duet_greenscreen_sustained_baseline_smoke_',
           );
-          final targetFile = File('${tempDir!.path}/clip_A.mov');
+          final targetFile = File(
+            '${tempDir!.path}/duet_sustained_motion_60s_720x1280.mp4',
+          );
           final byteData = await rootBundle.load(
-            'assets/manual_test_clips/clip_A.mov',
+            'assets/manual_test_clips/duet_sustained_motion_60s_720x1280.mp4',
           );
           await targetFile.writeAsBytes(
             byteData.buffer.asUint8List(
@@ -235,10 +216,9 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
         },
       );
 
-      // Step 2: Initialize Duet session (trim: 0.0s - kTrimEndSeconds). See
-      // kTrimEndSeconds' doc comment: this is a known-safe window within the
-      // ~9.83s clip_A.mov fixture, not a claim that the full sustained window
-      // shows moving video.
+      // Step 2: Initialize Duet session (trim: 0.0s - kTrimEndSeconds). The
+      // staged 60s fixture provides full motion throughout the default 45s
+      // observation window with margin.
       sessionId = await runStep<String>(
         'INIT_SESSION',
         'Initializing Duet session (trim: 0.0s - ${kTrimEndSeconds}s)',
@@ -281,11 +261,11 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
         }
       });
 
-      // Step 3: Attach preview texture with greenScreen layout on the
-      // production ladder only. Deliberately omits debugSegmentationBackend,
+      // Step 3: Attach preview texture with greenScreen layout on production
+      // defaults. Deliberately omits debugSegmentationBackend,
       // debugRawTfliteGpuDelegateMode, and debugRawTfliteGpuModelAssetPath so
-      // the session starts on the selector's normal primary
-      // (mediapipe_cpu -> mlkit), exactly as a production session would.
+      // the session selects the production Duet GPU GreenScreen path by engine
+      // defaults, exactly as a production session would.
       final layoutConfig = <String, dynamic>{
         'mode': 'greenScreen',
         'isSideSwapped': false,
@@ -295,7 +275,7 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
       };
       await runStep<void>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen, production ladder)',
+        'Attaching preview texture (1080x1920, greenScreen, production GPU path)',
         () async {
           final result = await _withTimeout(
             _channel.invokeMethod<Map>(
@@ -343,10 +323,12 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
 
       // Step 5: Observe the sustained live preview window. Prints a
       // kObserveTickMarker line every kObserveTickIntervalSeconds with the
-      // running Duet event count for this session. Native logcat may show
-      // periodic ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS markers during
-      // this window. Fails if any green_screen_degraded / green_screen_fallback
-      // event for this session arrived during the window.
+      // running Duet event count for this session. When paired with native
+      // logcat markers (e.g. ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED,
+      // ANDROID_DUET_GPU_GREENSCREEN_FIRST_MASK_READY, release summary),
+      // this confirms the production Duet GPU GreenScreen path is active.
+      // Fails if any green_screen_degraded / green_screen_fallback event for
+      // this session arrived during the window.
       await runStep<void>(
         'GREENSCREEN_SUSTAINED_BASELINE_PREVIEW_ACTIVE',
         'Observing greenScreen sustained baseline preview (${kSustainedObservationSeconds}s)',
@@ -508,34 +490,26 @@ class _AndroidDuetGreenScreenSustainedBaselinePhysicalSmokeAppState
         'observationSeconds': kSustainedObservationSeconds,
         'claimsAllowed': <String>[
           'local source session init',
-          'attach-time greenScreen layout accepted on the production ladder '
-              '(no debugSegmentationBackend / debugRawTfliteGpuDelegateMode / '
-              'debugRawTfliteGpuModelAssetPath keys sent)',
+          'attach-time greenScreen layout accepted on production defaults while '
+              'omitting legacy/debug segmentation keys',
+          'production Duet GPU GreenScreen path selected by engine defaults when '
+              'paired with native logcat markers',
           'preview texture attach success',
           'startRecording activates render loop and camera',
-          'sustained production-ladder segmentation window (~${kSustainedObservationSeconds}s, '
-              'mediapipe_cpu -> mlkit) runs continuously against the live camera feed for the '
-              'full observation duration, independent of the decoded source video playback position',
-          'decoded source video plays as moving picture (not a frozen frame) for its trim window '
-              '(0.0s -> ${kTrimEndSeconds}s, a known-safe window within the ~9.83s clip_A.mov fixture)',
-          'zero matching Duet degrade/fallback events (green_screen_degraded / '
-              'green_screen_fallback) for this session during the sustained observation window',
-          'native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS / '
-              'ANDROID_DUET_GREENSCREEN_SEGMENTATION_SUMMARY) may prove backend-neutral '
-              'segmentation completion stats',
-          'stop/detach/dispose/temp cleanup complete',
+          'sustained 45s segmentation window runs with zero Duet degrade/fallback '
+              'events via VGDuetEvents.stream',
+          'decoded source video is moving for the default 45s in-trim observation '
+              'window using the new 60s fixture',
+          'cleanup completion',
         ],
         'nonClaims': <String>[
-          'no full-duration moving-video proof: clip_A.mov is only ~9.83s long, so the default '
-              '${kSustainedObservationSeconds}s observation window cannot show the full duration as '
-              'moving video; only the first ${kTrimEndSeconds}s show genuine source video motion, '
-              'the remainder is a frozen last frame (AndroidDuetPreviewClock trim-clamp) — this does '
-              'not affect the degrade/fallback event proof above, which is measured independently '
-              'against the live camera feed',
           'no automated pixel/matte-quality proof',
           'no export/audio proof',
           'no all-device/low-end proof',
-          'no GPU promotion (raw_tflite_gpu / mediapipe_gpu are not exercised by this harness)',
+          'no standalone logcat assertion inside Dart because GPU route proof '
+              'requires pairing with native logcat markers',
+          'no claim beyond the fixture/trim window if someone overrides '
+              'SUSTAINED_SECONDS above 45',
         ],
         'sessionId': sessionId,
         'textureId': textureId,
