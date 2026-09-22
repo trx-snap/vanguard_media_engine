@@ -68,8 +68,21 @@ import kotlin.math.max
 //
 // Backgrounds: SOLID_COLOR renders the requested ARGB; IMAGE decodes on the
 // render thread (bounded to 2048px) and uploads through native, honoring
-// aspectFill / aspectFit; VIDEO degrades to black exactly like the CPU
-// compositor. [updateGreenScreenMask] is ignored (segmentation is internal).
+// aspectFill / aspectFit; VIDEO plays a looping local video file through a
+// second native-owned GL_TEXTURE_EXTERNAL_OES lane (Slice 2), mirroring the
+// camera ingest ownership split: native creates/owns the GL texture id
+// (EnsureBackgroundVideoTexture), Kotlin wraps it in a SurfaceTexture/Surface
+// and drives decoding via a private AndroidGreenScreenVideoBackgroundDecoder
+// instance (independent of Duet, one per active video background). The
+// decoder frame is latched on this render thread every drawFrame (exactly
+// like the camera latch) and its ST matrix/dimensions/rotation/scale mode
+// are pushed to native via nativeSetBackgroundVideoFrame, which also
+// switches the native background mode to video; nativeClearBackgroundVideo
+// releases the native texture and reverts to black when leaving video.
+// Until the first frame decodes, whatever the background showed before the
+// switch (an intentionally softer transition than IMAGE/SOLID_COLOR's
+// harder cut) or black at session start stays visible. [updateGreenScreenMask]
+// is ignored (segmentation is internal).
 //
 // Threading: render-thread-only, except the SurfaceTexture frame-available
 // callback (any looper; only sets [cameraFramePending]) and the volatile
@@ -183,6 +196,22 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
     private var backgroundDirty = true
     private var backgroundImageLoadedPath: String? = null
     private var backgroundImageDecodeFailed = false
+
+    // -- Background video (Slice 2; render-thread only except the frame-
+    // available listener, which only sets backgroundVideoFramePending) -------
+
+    private var backgroundVideoSurfaceTexture: SurfaceTexture? = null
+    private var backgroundVideoSurface: Surface? = null
+    private val backgroundVideoStMatrix = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
+    private val backgroundVideoFramePending = AtomicBoolean(false)
+    private var backgroundVideoDecoder: AndroidGreenScreenVideoBackgroundDecoder? = null
+    private var backgroundVideoLoadedPath: String? = null
+    private var backgroundVideoDecodeFailed = false
+
+    /** Written only from the decoder's own thread, read only from this render thread. */
+    @Volatile private var backgroundVideoWidthPx = 0
+    @Volatile private var backgroundVideoHeightPx = 0
+    @Volatile private var backgroundVideoRotationDegrees = 0
 
     // -- Telemetry (render-thread only) ----------------------------------------
 
@@ -303,6 +332,37 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
                             "uprightAspect=$cameraUprightAspect stMatrix=[" +
                             cameraStMatrix.joinToString(",") { "%.3f".format(it) } + "]",
                     )
+                }
+            }
+
+            // 1b. Latch a new background video frame if one arrived since
+            // last draw, and push it to native. Unconditional (like the
+            // camera latch above) so the decoder's bounded SurfaceTexture
+            // BufferQueue never backs up; a stale reference here (background
+            // already switched away) is impossible because
+            // releaseBackgroundVideoState always clears this field first.
+            val bgVideoSt = backgroundVideoSurfaceTexture
+            if (bgVideoSt != null && backgroundVideoFramePending.compareAndSet(true, false)) {
+                try {
+                    bgVideoSt.updateTexImage()
+                    bgVideoSt.getTransformMatrix(backgroundVideoStMatrix)
+                    val aspectFill = background.scaleMode != AndroidGreenScreenBackgroundScaleMode.ASPECT_FIT
+                    bridge.nativeSetBackgroundVideoFrame(
+                        handle, backgroundVideoStMatrix, backgroundVideoWidthPx, backgroundVideoHeightPx,
+                        backgroundVideoRotationDegrees, aspectFill,
+                    )
+                    // The first video frame is now latched and visible in
+                    // native: safe to release any image background this
+                    // session was still holding onto during the transition
+                    // (ensureBackgroundUploaded's VIDEO branch deliberately
+                    // does not release it up front, so the old image stays
+                    // visible instead of flashing black while the decoder
+                    // starts up).
+                    if (backgroundImageLoadedPath != null) {
+                        releaseBackgroundImageState(handle)
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "background video updateTexImage failed: ${t.message}")
                 }
             }
 
@@ -775,14 +835,21 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         val bg = background
         when (bg.type) {
             AndroidGreenScreenBackgroundType.VIDEO -> {
-                releaseBackgroundImageState(handle)
-                bridge.nativeSetBackgroundBlack(handle)
+                // Deliberately does NOT release the image background here:
+                // switching to video must keep whatever was previously
+                // visible (image, solid color, or a prior video's last
+                // frame) on screen until the first decoded video frame is
+                // actually latched and pushed (see drawFrame's step 1b),
+                // rather than clearing to black up front.
+                ensureBackgroundVideoProvider(handle, bg)
             }
             AndroidGreenScreenBackgroundType.SOLID_COLOR -> {
                 releaseBackgroundImageState(handle)
+                releaseBackgroundVideoState(handle)
                 bridge.nativeSetBackgroundSolidColor(handle, bg.argbColor)
             }
             AndroidGreenScreenBackgroundType.IMAGE -> {
+                releaseBackgroundVideoState(handle)
                 val aspectFill = bg.scaleMode != AndroidGreenScreenBackgroundScaleMode.ASPECT_FIT
                 if (backgroundImageLoadedPath != null && backgroundImageLoadedPath == bg.filePath &&
                     !backgroundImageDecodeFailed
@@ -804,6 +871,123 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
                 }
             }
         }
+    }
+
+    /**
+     * Lazily (re)starts a looping [AndroidGreenScreenVideoBackgroundDecoder]
+     * for [bg]'s file path against a native-owned OES texture. No-ops once a
+     * decoder matching [bg]'s filePath is already active, or once setup has
+     * already failed for that path (never retries every frame). Releases the
+     * previous video provider first when the path actually changes. Must run
+     * on the render thread with the native context current. Non-blocking:
+     * decoding itself always happens on the decoder's own thread.
+     */
+    private fun ensureBackgroundVideoProvider(handle: Long, bg: AndroidGreenScreenBackground) {
+        if (backgroundVideoLoadedPath == bg.filePath &&
+            (backgroundVideoDecoder != null || backgroundVideoDecodeFailed)
+        ) {
+            return
+        }
+        releaseBackgroundVideoState(handle)
+        backgroundVideoLoadedPath = bg.filePath
+
+        val path = bg.filePath
+        if (path == null) {
+            backgroundVideoDecodeFailed = true
+            Log.w(TAG, "ANDROID_GREENSCREEN_GPU_RESIDENT_BACKGROUND_VIDEO_FALLBACK reason=missing_path path=")
+            return
+        }
+
+        val texId = try {
+            bridge.nativeGetBackgroundVideoTextureId(handle)
+        } catch (t: Throwable) {
+            0
+        }
+        if (texId == 0) {
+            backgroundVideoDecodeFailed = true
+            Log.w(
+                TAG,
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_BACKGROUND_VIDEO_FALLBACK reason=native_texture_failed " +
+                    "path=$path ${bridge.nativeLastError(handle)}",
+            )
+            return
+        }
+
+        val texture = try {
+            SurfaceTexture(texId).apply {
+                setOnFrameAvailableListener { backgroundVideoFramePending.set(true) }
+            }
+        } catch (t: Throwable) {
+            // texId was already allocated natively; a stranded native
+            // texture must not survive this failed attempt.
+            try { bridge.nativeClearBackgroundVideo(handle) } catch (_: Throwable) {}
+            backgroundVideoDecodeFailed = true
+            Log.w(
+                TAG,
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_BACKGROUND_VIDEO_FALLBACK reason=surface_texture_failed " +
+                    "path=$path error=${t.message}",
+            )
+            return
+        }
+        val surface = try {
+            Surface(texture)
+        } catch (t: Throwable) {
+            try { texture.release() } catch (_: Throwable) {}
+            // Same as above: texId was already allocated natively.
+            try { bridge.nativeClearBackgroundVideo(handle) } catch (_: Throwable) {}
+            backgroundVideoDecodeFailed = true
+            Log.w(
+                TAG,
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_BACKGROUND_VIDEO_FALLBACK reason=surface_failed " +
+                    "path=$path error=${t.message}",
+            )
+            return
+        }
+        backgroundVideoSurfaceTexture = texture
+        backgroundVideoSurface = surface
+
+        backgroundVideoDecoder = AndroidGreenScreenVideoBackgroundDecoder(
+            filePath = path,
+            outputSurface = surface,
+            outputSurfaceTexture = texture,
+            onFormatKnown = { w, h, rotation ->
+                backgroundVideoWidthPx = w
+                backgroundVideoHeightPx = h
+                backgroundVideoRotationDegrees = rotation
+            },
+            onFatalError = { message ->
+                Log.w(TAG, "ANDROID_GREENSCREEN_GPU_RESIDENT_BACKGROUND_VIDEO_DECODE_FAILED path=$path error=$message")
+            },
+        ).also { it.start() }
+    }
+
+    /**
+     * Releases the current background video decoder/native texture
+     * (idempotent, non-blocking). Drops the SurfaceTexture/Surface
+     * references immediately but does not release those two objects itself —
+     * the decoder ([AndroidGreenScreenVideoBackgroundDecoder.release]) owns
+     * and releases them asynchronously, on its own thread, once its codec
+     * has guaranteed no further writes; deleting the native GL texture name
+     * here does not require that to have already happened (see
+     * AndroidGreenScreenVideoBackgroundDecoder's class doc). This is what
+     * keeps a mid-session background switch from ever blocking render loop
+     * pacing.
+     */
+    private fun releaseBackgroundVideoState(handle: Long) {
+        backgroundVideoFramePending.set(false)
+        try { backgroundVideoDecoder?.release() } catch (_: Throwable) {}
+        backgroundVideoDecoder = null
+        try { backgroundVideoSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+        backgroundVideoSurface = null
+        backgroundVideoSurfaceTexture = null
+        if (backgroundVideoLoadedPath != null) {
+            try { bridge.nativeClearBackgroundVideo(handle) } catch (_: Throwable) {}
+        }
+        backgroundVideoLoadedPath = null
+        backgroundVideoDecodeFailed = false
+        backgroundVideoWidthPx = 0
+        backgroundVideoHeightPx = 0
+        backgroundVideoRotationDegrees = 0
     }
 
     private fun releaseBackgroundImageState(handle: Long) {
@@ -892,6 +1076,17 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         try { cameraSurfaceTexture?.release() } catch (_: Throwable) {}
         cameraSurfaceTexture = null
 
+        // Background video: stop the decoder and drop the SurfaceTexture/
+        // Surface references (the decoder releases those two asynchronously,
+        // on its own thread). The native OES texture is torn down for free
+        // below by nativeDestroy's own DestroyGlObjects, so no explicit
+        // nativeClearBackgroundVideo call is needed here.
+        try { backgroundVideoDecoder?.release() } catch (_: Throwable) {}
+        backgroundVideoDecoder = null
+        try { backgroundVideoSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+        backgroundVideoSurface = null
+        backgroundVideoSurfaceTexture = null
+
         if (handle != 0L) {
             try { bridge.nativeDestroy(handle) } catch (_: Throwable) {}
         }
@@ -902,6 +1097,11 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         hasMask = false
         backgroundImageLoadedPath = null
         backgroundImageDecodeFailed = false
+        backgroundVideoLoadedPath = null
+        backgroundVideoDecodeFailed = false
+        backgroundVideoWidthPx = 0
+        backgroundVideoHeightPx = 0
+        backgroundVideoRotationDegrees = 0
         backgroundDirty = true
     }
 }

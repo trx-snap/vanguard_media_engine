@@ -75,6 +75,7 @@ public:
         kBlack = 0,
         kSolidColor = 1,
         kImage = 2,
+        kVideo = 3,
     };
 
     enum class CameraMode : int32_t {
@@ -152,6 +153,35 @@ public:
     void SetBackgroundImageScaleMode(bool aspectFill);
     void ClearBackgroundImage();
 
+    /**
+     * Allocates (if not already) the GL_TEXTURE_EXTERNAL_OES texture a Kotlin
+     * SurfaceTexture is constructed around for MediaCodec background-video
+     * output, mirroring CameraTextureId()/cameraTexture_'s ownership split:
+     * native creates and owns the GL texture name, Kotlin owns the
+     * SurfaceTexture/Surface/decoder wrapping it. Idempotent while a texture
+     * is already allocated (call ClearBackgroundVideo first to force a fresh
+     * one for a new video source). Requires a current context. 0 on failure.
+     */
+    uint32_t EnsureBackgroundVideoTexture(std::string* error);
+
+    /**
+     * Latches the background video's SurfaceTexture transform matrix (as
+     * returned by getTransformMatrix), its decoded dimensions, its
+     * 0/90/180/270 source rotation and its scale mode, and switches the
+     * background to video. Call once per decoded frame (after
+     * EnsureBackgroundVideoTexture), mirroring SetCameraTransform's per-frame
+     * latch for the camera layer.
+     */
+    void SetBackgroundVideoFrame(const float stMatrixColumnMajor[16], int videoWidth, int videoHeight,
+                                  int rotationDegrees, bool aspectFill);
+
+    /**
+     * Releases the background-video OES texture (if any) and reverts the
+     * background to black if it was showing video. Idempotent, never throws.
+     * Mirrors ClearBackgroundImage.
+     */
+    void ClearBackgroundVideo();
+
     void SetFilterToggles(bool guidedFilter, bool temporalStabilizer, bool despill);
 
     // -- Frame transaction ---------------------------------------------------
@@ -202,6 +232,7 @@ private:
     GlRect ToGl(const GlesGreenScreenGpuResidentRect& rect) const;
     GlRect CameraAspectFillViewport(const GlesGreenScreenGpuResidentRect& rect) const;
     GlRect BackgroundImageRect(const GlesGreenScreenGpuResidentRect& rect) const;
+    GlRect BackgroundVideoRect(const GlesGreenScreenGpuResidentRect& rect) const;
     void DeriveAlphaResolution(int* width, int* height) const;
 
     bool RunGuidedFilter(std::string* error);
@@ -232,6 +263,7 @@ private:
     uint32_t alphaPongTexture_ = 0;
     uint32_t alphaHistoryTexture_ = 0;
     uint32_t backgroundImageTexture_ = 0;
+    uint32_t backgroundVideoTexture_ = 0;
     uint32_t quadVao_ = 0;
     uint32_t quadVbo_ = 0;
 
@@ -256,6 +288,9 @@ private:
     int32_t compositeCameraScissorLoc_ = -1;
     int32_t compositeCameraViewportLoc_ = -1;
     int32_t compositeBackgroundImageRectLoc_ = -1;
+    int32_t compositeBackgroundVideoTextureLoc_ = -1;
+    int32_t compositeBackgroundVideoStMatrixLoc_ = -1;
+    int32_t compositeBackgroundVideoRectLoc_ = -1;
     int32_t compositeBackgroundColorLoc_ = -1;
     int32_t compositePlaceholderColorLoc_ = -1;
     int32_t compositeBackgroundModeLoc_ = -1;
@@ -282,6 +317,12 @@ private:
     int backgroundImageWidth_ = 0;
     int backgroundImageHeight_ = 0;
     bool backgroundImageAspectFill_ = true;
+
+    float backgroundVideoStMatrix_[16];
+    int backgroundVideoWidth_ = 0;
+    int backgroundVideoHeight_ = 0;
+    int backgroundVideoRotationDegrees_ = 0;
+    bool backgroundVideoAspectFill_ = true;
 
     bool guidedFilterEnabled_ = true;
     bool temporalEnabled_ = false;

@@ -271,6 +271,7 @@ void FloatToU8Clamped(const float* in, uint8_t* out, size_t count) {
 
 GlesGreenScreenGpuResidentRenderer::GlesGreenScreenGpuResidentRenderer() {
     for (int i = 0; i < 16; ++i) cameraStMatrix_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    for (int i = 0; i < 16; ++i) backgroundVideoStMatrix_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
 }
 
 GlesGreenScreenGpuResidentRenderer::~GlesGreenScreenGpuResidentRenderer() {
@@ -422,6 +423,9 @@ bool GlesGreenScreenGpuResidentRenderer::CreatePrograms(std::string* error) {
     compositeCameraScissorLoc_ = glGetUniformLocation(compositeProgram_, "uCameraScissor");
     compositeCameraViewportLoc_ = glGetUniformLocation(compositeProgram_, "uCameraViewport");
     compositeBackgroundImageRectLoc_ = glGetUniformLocation(compositeProgram_, "uBackgroundImageRect");
+    compositeBackgroundVideoTextureLoc_ = glGetUniformLocation(compositeProgram_, "uBackgroundVideoTexture");
+    compositeBackgroundVideoStMatrixLoc_ = glGetUniformLocation(compositeProgram_, "uBackgroundVideoStMatrix");
+    compositeBackgroundVideoRectLoc_ = glGetUniformLocation(compositeProgram_, "uBackgroundVideoRect");
     compositeBackgroundColorLoc_ = glGetUniformLocation(compositeProgram_, "uBackgroundColor");
     compositePlaceholderColorLoc_ = glGetUniformLocation(compositeProgram_, "uPlaceholderColor");
     compositeBackgroundModeLoc_ = glGetUniformLocation(compositeProgram_, "uBackgroundMode");
@@ -575,6 +579,7 @@ void GlesGreenScreenGpuResidentRenderer::DestroyGlObjects() {
     DeleteTextureQuietly(&alphaPongTexture_);
     DeleteTextureQuietly(&alphaHistoryTexture_);
     DeleteTextureQuietly(&backgroundImageTexture_);
+    DeleteTextureQuietly(&backgroundVideoTexture_);
     DeleteTextureQuietly(&cameraTexture_);
     if (quadVbo_ != 0) {
         GLuint vbo = quadVbo_;
@@ -597,6 +602,8 @@ void GlesGreenScreenGpuResidentRenderer::DestroyGlObjects() {
     hasRefinedAlpha_ = false;
     backgroundImageWidth_ = 0;
     backgroundImageHeight_ = 0;
+    backgroundVideoWidth_ = 0;
+    backgroundVideoHeight_ = 0;
 }
 
 bool GlesGreenScreenGpuResidentRenderer::MakeCurrent() {
@@ -778,6 +785,56 @@ void GlesGreenScreenGpuResidentRenderer::ClearBackgroundImage() {
     if (backgroundMode_ == BackgroundMode::kImage) backgroundMode_ = BackgroundMode::kBlack;
 }
 
+uint32_t GlesGreenScreenGpuResidentRenderer::EnsureBackgroundVideoTexture(std::string* error) {
+    if (!initialized_) {
+        SetError(error, "EnsureBackgroundVideoTexture before Initialize");
+        return 0;
+    }
+    if (backgroundVideoTexture_ != 0) return backgroundVideoTexture_;
+    if (!MakeCurrent()) {
+        SetError(error, EglErrorString("eglMakeCurrent(background video texture)"));
+        return 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (tex == 0) {
+        SetError(error, GlErrorString("glGenTextures(background video OES)"));
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    backgroundVideoTexture_ = tex;
+    return backgroundVideoTexture_;
+}
+
+void GlesGreenScreenGpuResidentRenderer::SetBackgroundVideoFrame(const float stMatrixColumnMajor[16],
+                                                                  int videoWidth, int videoHeight,
+                                                                  int rotationDegrees, bool aspectFill) {
+    std::memcpy(backgroundVideoStMatrix_, stMatrixColumnMajor, sizeof(backgroundVideoStMatrix_));
+    if (videoWidth > 0 && videoHeight > 0) {
+        backgroundVideoWidth_ = videoWidth;
+        backgroundVideoHeight_ = videoHeight;
+    }
+    backgroundVideoRotationDegrees_ = rotationDegrees;
+    backgroundVideoAspectFill_ = aspectFill;
+    backgroundMode_ = BackgroundMode::kVideo;
+}
+
+void GlesGreenScreenGpuResidentRenderer::ClearBackgroundVideo() {
+    if (eglContext_ != nullptr && MakeCurrent()) {
+        DeleteTextureQuietly(&backgroundVideoTexture_);
+    }
+    backgroundVideoTexture_ = 0;
+    backgroundVideoWidth_ = 0;
+    backgroundVideoHeight_ = 0;
+    backgroundVideoRotationDegrees_ = 0;
+    if (backgroundMode_ == BackgroundMode::kVideo) backgroundMode_ = BackgroundMode::kBlack;
+}
+
 void GlesGreenScreenGpuResidentRenderer::SetFilterToggles(bool guidedFilter, bool temporalStabilizer, bool despill) {
     guidedFilterEnabled_ = guidedFilter;
     temporalEnabled_ = temporalStabilizer;
@@ -838,6 +895,42 @@ GlesGreenScreenGpuResidentRenderer::GlRect GlesGreenScreenGpuResidentRenderer::B
     } else {
         drawnW = rect.width;
         drawnH = rect.width / imageAspect;
+    }
+    GlesGreenScreenGpuResidentRect drawn;
+    drawn.left = rect.left - (drawnW - rect.width) / 2.0f;
+    drawn.top = rect.top - (drawnH - rect.height) / 2.0f;
+    drawn.width = drawnW;
+    drawn.height = drawnH;
+    return ToGl(drawn);
+}
+
+GlesGreenScreenGpuResidentRenderer::GlRect GlesGreenScreenGpuResidentRenderer::BackgroundVideoRect(
+    const GlesGreenScreenGpuResidentRect& rect) const {
+    if (backgroundVideoWidth_ <= 0 || backgroundVideoHeight_ <= 0 || rect.width <= 0.0f || rect.height <= 0.0f) {
+        return ToGl(rect);
+    }
+    // For a 90/270-degree source rotation the raw decoded width/height are
+    // swapped first so the aspect used here matches the upright display
+    // orientation rather than the sideways decode buffer, mirroring the CPU
+    // fallback compositor's backgroundVideoAspectViewport.
+    int displayWidth = backgroundVideoWidth_;
+    int displayHeight = backgroundVideoHeight_;
+    if (backgroundVideoRotationDegrees_ == 90 || backgroundVideoRotationDegrees_ == 270) {
+        displayWidth = backgroundVideoHeight_;
+        displayHeight = backgroundVideoWidth_;
+    }
+    const float videoAspect = static_cast<float>(displayWidth) / static_cast<float>(displayHeight);
+    const float rectAspect = rect.width / rect.height;
+    const bool cover = backgroundVideoAspectFill_;
+    const bool matchHeightBasis = cover ? (videoAspect > rectAspect) : (videoAspect <= rectAspect);
+    float drawnW;
+    float drawnH;
+    if (matchHeightBasis) {
+        drawnH = rect.height;
+        drawnW = rect.height * videoAspect;
+    } else {
+        drawnW = rect.width;
+        drawnH = rect.width / videoAspect;
     }
     GlesGreenScreenGpuResidentRect drawn;
     drawn.left = rect.left - (drawnW - rect.width) / 2.0f;
@@ -1085,6 +1178,7 @@ bool GlesGreenScreenGpuResidentRenderer::RunComposite(CameraMode cameraMode, std
     const GlRect cameraScissorGl = ToGl(cameraRect);
     const GlRect cameraViewportGl = CameraAspectFillViewport(cameraRect);
     const GlRect backgroundImageGl = BackgroundImageRect(sourceRect);
+    const GlRect backgroundVideoGl = BackgroundVideoRect(sourceRect);
 
     int cameraModeValue = static_cast<int>(cameraMode);
     if (cameraModeValue != static_cast<int>(CameraMode::kNone) &&
@@ -1094,6 +1188,9 @@ bool GlesGreenScreenGpuResidentRenderer::RunComposite(CameraMode cameraMode, std
     }
     int backgroundModeValue = static_cast<int>(backgroundMode_);
     if (backgroundModeValue == static_cast<int>(BackgroundMode::kImage) && backgroundImageTexture_ == 0) {
+        backgroundModeValue = static_cast<int>(BackgroundMode::kBlack);
+    }
+    if (backgroundModeValue == static_cast<int>(BackgroundMode::kVideo) && backgroundVideoTexture_ == 0) {
         backgroundModeValue = static_cast<int>(BackgroundMode::kBlack);
     }
 
@@ -1117,6 +1214,9 @@ bool GlesGreenScreenGpuResidentRenderer::RunComposite(CameraMode cameraMode, std
     glUniform4f(compositeCameraScissorLoc_, cameraScissorGl.x, cameraScissorGl.y, cameraScissorGl.w, cameraScissorGl.h);
     glUniform4f(compositeCameraViewportLoc_, cameraViewportGl.x, cameraViewportGl.y, cameraViewportGl.w, cameraViewportGl.h);
     glUniform4f(compositeBackgroundImageRectLoc_, backgroundImageGl.x, backgroundImageGl.y, backgroundImageGl.w, backgroundImageGl.h);
+    glUniform1i(compositeBackgroundVideoTextureLoc_, 3);
+    glUniformMatrix4fv(compositeBackgroundVideoStMatrixLoc_, 1, GL_FALSE, backgroundVideoStMatrix_);
+    glUniform4f(compositeBackgroundVideoRectLoc_, backgroundVideoGl.x, backgroundVideoGl.y, backgroundVideoGl.w, backgroundVideoGl.h);
     glUniform4fv(compositeBackgroundColorLoc_, 1, backgroundColor_);
     glUniform4f(compositePlaceholderColorLoc_, kPlaceholderR, kPlaceholderG, kPlaceholderB, 1.0f);
     glUniform1i(compositeBackgroundModeLoc_, backgroundModeValue);
@@ -1129,11 +1229,15 @@ bool GlesGreenScreenGpuResidentRenderer::RunComposite(CameraMode cameraMode, std
     glBindTexture(GL_TEXTURE_2D, activeAlphaTexture_ != 0 ? activeAlphaTexture_ : alphaPingTexture_);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, backgroundImageTexture_);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, backgroundVideoTexture_);
 
     glBindVertexArray(quadVao_);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -1238,6 +1342,7 @@ void SetUnavailable(std::string* error) {
 
 GlesGreenScreenGpuResidentRenderer::GlesGreenScreenGpuResidentRenderer() {
     for (int i = 0; i < 16; ++i) cameraStMatrix_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    for (int i = 0; i < 16; ++i) backgroundVideoStMatrix_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
 }
 GlesGreenScreenGpuResidentRenderer::~GlesGreenScreenGpuResidentRenderer() {}
 bool GlesGreenScreenGpuResidentRenderer::Initialize(std::string* error) { SetUnavailable(error); return false; }
@@ -1253,6 +1358,9 @@ void GlesGreenScreenGpuResidentRenderer::SetBackgroundSolidColor(uint32_t) {}
 bool GlesGreenScreenGpuResidentRenderer::SetBackgroundImage(const uint8_t*, int, int, bool, std::string* error) { SetUnavailable(error); return false; }
 void GlesGreenScreenGpuResidentRenderer::SetBackgroundImageScaleMode(bool) {}
 void GlesGreenScreenGpuResidentRenderer::ClearBackgroundImage() {}
+uint32_t GlesGreenScreenGpuResidentRenderer::EnsureBackgroundVideoTexture(std::string* error) { SetUnavailable(error); return 0; }
+void GlesGreenScreenGpuResidentRenderer::SetBackgroundVideoFrame(const float[16], int, int, int, bool) {}
+void GlesGreenScreenGpuResidentRenderer::ClearBackgroundVideo() {}
 void GlesGreenScreenGpuResidentRenderer::SetFilterToggles(bool, bool, bool) {}
 bool GlesGreenScreenGpuResidentRenderer::DownscaleCameraToModelInput(float*, size_t, std::string* error) { SetUnavailable(error); return false; }
 bool GlesGreenScreenGpuResidentRenderer::UploadCoarseMask(const float*, size_t, int, int, std::string* error) { SetUnavailable(error); return false; }

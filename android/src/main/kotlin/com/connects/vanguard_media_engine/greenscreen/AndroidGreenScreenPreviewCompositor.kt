@@ -221,6 +221,42 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
     private var bgImageATexCoordLoc = -1
     private var bgImageSTextureLoc = -1
 
+    // -- Green-screen static background: VIDEO GL state (Slice 2) --------------
+    //
+    // Mirrors the camera ingest shape (OES texture + SurfaceTexture +
+    // frame-pending flag, latched in drawFrame) rather than the IMAGE state
+    // above, because a video background is itself a continuous producer, not
+    // a one-shot decode. Draws reuse the existing plain [oesProgram] (camera
+    // passthrough shader) since both are "OES texture + ST matrix" draws.
+
+    private var backgroundVideoOesTextureId = 0
+    private var backgroundVideoSurfaceTexture: SurfaceTexture? = null
+    private var backgroundVideoSurface: Surface? = null
+    private val backgroundVideoStMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val backgroundVideoFramePending = AtomicBoolean(false)
+
+    /** True once [backgroundVideoSurfaceTexture] has latched at least one real decoded frame. */
+    private var hasBackgroundVideoTexImage = false
+
+    /** The decoder exclusively owning [backgroundVideoSurface]/[backgroundVideoSurfaceTexture]; null when no video background is active. */
+    private var backgroundVideoDecoder: AndroidGreenScreenVideoBackgroundDecoder? = null
+
+    /** File path the currently-loaded [backgroundVideoDecoder] was started for, if any. */
+    private var backgroundVideoLoadedPath: String? = null
+
+    /** True once video ingest setup has failed for [backgroundVideoLoadedPath]; stops retrying every frame. */
+    private var backgroundVideoDecodeFailed = false
+
+    /**
+     * Reported by [backgroundVideoDecoder] once its format is known. Written
+     * only from the decoder's own thread, read only from the render thread
+     * inside [backgroundVideoAspectViewport]; volatile for cross-thread
+     * visibility (single writer, single reader — no read-modify-write race).
+     */
+    @Volatile private var backgroundVideoWidthPx = 0
+    @Volatile private var backgroundVideoHeightPx = 0
+    @Volatile private var backgroundVideoRotationDegrees = 0
+
     private val quadPositions: FloatBuffer = floatBufferOf(
         -1f, -1f,
          1f, -1f,
@@ -376,6 +412,21 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
                 hasCameraTexImage = true
             }
 
+            // Latch a new background video frame if one arrived since last
+            // draw. Unconditional (like the camera latch above) so the
+            // decoder's bounded SurfaceTexture BufferQueue never backs up
+            // while green-screen compositing happens to be disabled.
+            val bgVideoSt = backgroundVideoSurfaceTexture
+            if (bgVideoSt != null && backgroundVideoFramePending.compareAndSet(true, false)) {
+                try {
+                    bgVideoSt.updateTexImage()
+                    bgVideoSt.getTransformMatrix(backgroundVideoStMatrix)
+                    hasBackgroundVideoTexImage = true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "background video updateTexImage failed: ${t.message}")
+                }
+            }
+
             // Upload latest mask texture when green-screen is active.
             if (greenScreenEnabled) {
                 val maskFrame = pendingMaskRef.getAndSet(null)
@@ -459,6 +510,10 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
             try {
                 if (backgroundImageTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(backgroundImageTextureId), 0)
             } catch (_: Throwable) {}
+            // Background video teardown needs the EGL context current (GL
+            // texture delete); the decoder's own Surface/SurfaceTexture
+            // release happens asynchronously on its own thread regardless.
+            releaseBackgroundVideoQuietly()
         }
         oesProgram = 0
         cameraOesTextureId = 0
@@ -932,24 +987,37 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
 
     /**
      * Draws the background layer beneath the masked camera in green-screen
-     * mode, dispatching on [greenScreenBackground]'s type. [VIDEO] is not
-     * supported by this single-camera compositor (there is no source-video
-     * decoder here at all): it degrades to leaving the prior black clear in
-     * place, exactly matching the observable behavior GreenScreen already had
-     * on the Duet render loop (the decoder was never bound there either, so
-     * the video draw call never ran). [SOLID_COLOR] and [IMAGE] are the only
-     * backgrounds the GreenScreen coordinators ever actually produce.
+     * mode, dispatching on [greenScreenBackground]'s type. [VIDEO] plays a
+     * looping local video file via [AndroidGreenScreenVideoBackgroundDecoder]
+     * (Slice 2); [SOLID_COLOR] and [IMAGE] are unchanged from before.
+     * Switching away from a type always releases that type's resources so
+     * nothing leaks or keeps decoding in the background unobserved.
      */
     private fun drawGreenScreenBackground(rect: AndroidGreenScreenPixelRect) {
         when (greenScreenBackground.type) {
             AndroidGreenScreenBackgroundType.VIDEO -> {
                 releaseBackgroundImageTextureQuietly()
+                ensureBackgroundVideoProvider(greenScreenBackground)
+                if (hasBackgroundVideoTexImage) {
+                    drawVideoBackground(rect)
+                } else {
+                    // No frame decoded yet (startup latency) or setup/decode
+                    // failed: opaque black fallback, matching the IMAGE
+                    // precedent. A previously-showing background is only ever
+                    // torn down once a NEW background spec is accepted (see
+                    // ensureBackgroundVideoProvider / releaseBackgroundVideoQuietly),
+                    // so this path is never reached while a prior background
+                    // was already on screen for the *same* spec.
+                    drawSolidColorBackground(rect, AndroidGreenScreenBackground.VIDEO.argbColor)
+                }
             }
             AndroidGreenScreenBackgroundType.SOLID_COLOR -> {
                 releaseBackgroundImageTextureQuietly()
+                releaseBackgroundVideoQuietly()
                 drawSolidColorBackground(rect, greenScreenBackground.argbColor)
             }
             AndroidGreenScreenBackgroundType.IMAGE -> {
+                releaseBackgroundVideoQuietly()
                 ensureBackgroundImageTexture(greenScreenBackground)
                 if (backgroundImageTextureId != 0) {
                     drawImageBackground(rect)
@@ -1118,6 +1186,229 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
         } else {
             drawnW = rectW
             drawnH = rectW / imageAspect
+        }
+        return toGlRect(
+            rect.left - (drawnW - rectW) / 2.0,
+            rect.top - (drawnH - rectH) / 2.0,
+            drawnW,
+            drawnH,
+        )
+    }
+
+    // -- Green-screen static background: VIDEO draws (Slice 2) -----------------
+
+    /**
+     * Lazily (re)starts a looping [AndroidGreenScreenVideoBackgroundDecoder]
+     * for [bg]'s file path. No-ops once a decoder matching [bg]'s filePath is
+     * already active, or once setup has already failed for that path (never
+     * retries every frame). Releases the previous video provider first when
+     * the path actually changes. Must run on the render thread with the EGL
+     * context current (GL texture allocation). Non-blocking: decoding itself
+     * always happens on the decoder's own thread.
+     */
+    private fun ensureBackgroundVideoProvider(bg: AndroidGreenScreenBackground) {
+        if (backgroundVideoLoadedPath == bg.filePath &&
+            (backgroundVideoDecoder != null || backgroundVideoDecodeFailed)
+        ) {
+            return
+        }
+        releaseBackgroundVideoQuietly()
+        backgroundVideoLoadedPath = bg.filePath
+
+        val path = bg.filePath
+        if (path == null) {
+            backgroundVideoDecodeFailed = true
+            Log.w(TAG, "ANDROID_GREENSCREEN_PREVIEW_BACKGROUND_VIDEO_FALLBACK reason=missing_path path=")
+            return
+        }
+
+        try {
+            setupBackgroundVideoIngest()
+        } catch (t: Throwable) {
+            backgroundVideoDecodeFailed = true
+            Log.w(TAG, "ANDROID_GREENSCREEN_PREVIEW_BACKGROUND_VIDEO_FALLBACK reason=texture_setup_failed path=$path error=${t.message}")
+            return
+        }
+        val surface = backgroundVideoSurface
+        val texture = backgroundVideoSurfaceTexture
+        if (surface == null || texture == null) {
+            backgroundVideoDecodeFailed = true
+            return
+        }
+
+        backgroundVideoDecoder = AndroidGreenScreenVideoBackgroundDecoder(
+            filePath = path,
+            outputSurface = surface,
+            outputSurfaceTexture = texture,
+            onFormatKnown = { w, h, rotation ->
+                backgroundVideoWidthPx = w
+                backgroundVideoHeightPx = h
+                backgroundVideoRotationDegrees = rotation
+            },
+            onFatalError = { message ->
+                Log.w(TAG, "ANDROID_GREENSCREEN_PREVIEW_BACKGROUND_VIDEO_DECODE_FAILED path=$path error=$message")
+            },
+        ).also { it.start() }
+    }
+
+    /**
+     * Allocates a fresh OES texture + SurfaceTexture + Surface for the
+     * background video decoder's exclusive use. Unlike [setupCameraIngest],
+     * no default buffer size is set: MediaCodec negotiates the ANativeWindow
+     * buffer geometry itself from the decoder's own output format once
+     * configured. Must run on the render thread with the EGL context current.
+     *
+     * Exception-safe: builds the GL texture / SurfaceTexture / Surface as
+     * locals and only publishes them to the
+     * [backgroundVideoOesTextureId]/[backgroundVideoSurfaceTexture]/[backgroundVideoSurface]
+     * fields once all three succeed together. If any step throws (most
+     * notably [Surface]'s constructor, after the GL texture and
+     * SurfaceTexture already exist), every local created so far is released
+     * immediately before rethrowing — no decoder has been constructed yet at
+     * that point, so nothing else will ever own/release them, unlike the
+     * normal [releaseBackgroundVideoQuietly] teardown model this must not
+     * disturb. Cleanup here is synchronous GL/SurfaceTexture/Surface teardown
+     * only — no thread posts, no blocking waits.
+     */
+    private fun setupBackgroundVideoIngest() {
+        var texId = 0
+        var texture: SurfaceTexture? = null
+        var surface: Surface? = null
+        try {
+            val textures = IntArray(1)
+            GLES20.glGenTextures(1, textures, 0)
+            texId = textures[0]
+            if (texId == 0) throw IllegalStateException("glGenTextures failed for background video OES texture")
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+            texture = SurfaceTexture(texId)
+            texture.setOnFrameAvailableListener { backgroundVideoFramePending.set(true) }
+            surface = Surface(texture)
+
+            backgroundVideoOesTextureId = texId
+            backgroundVideoSurfaceTexture = texture
+            backgroundVideoSurface = surface
+        } catch (t: Throwable) {
+            try { surface?.release() } catch (_: Throwable) {}
+            try { texture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+            try { texture?.release() } catch (_: Throwable) {}
+            if (texId != 0) {
+                try { GLES20.glDeleteTextures(1, intArrayOf(texId), 0) } catch (_: Throwable) {}
+            }
+            throw t
+        }
+    }
+
+    /**
+     * Releases the current background video decoder/texture (idempotent,
+     * non-blocking). Deletes the GL texture id immediately (render-thread,
+     * EGL context must be current) and drops the Surface/SurfaceTexture
+     * references, but does not release those two objects itself — the
+     * decoder ([AndroidGreenScreenVideoBackgroundDecoder.release]) owns and
+     * releases them asynchronously, on its own thread, once its codec has
+     * guaranteed no further writes. This is what keeps a mid-session
+     * background switch from ever blocking render loop pacing.
+     */
+    private fun releaseBackgroundVideoQuietly() {
+        hasBackgroundVideoTexImage = false
+        backgroundVideoFramePending.set(false)
+        try { backgroundVideoDecoder?.release() } catch (_: Throwable) {}
+        backgroundVideoDecoder = null
+        try { backgroundVideoSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+        if (backgroundVideoOesTextureId != 0) {
+            try { GLES20.glDeleteTextures(1, intArrayOf(backgroundVideoOesTextureId), 0) } catch (_: Throwable) {}
+        }
+        backgroundVideoOesTextureId = 0
+        backgroundVideoSurface = null
+        backgroundVideoSurfaceTexture = null
+        backgroundVideoLoadedPath = null
+        backgroundVideoDecodeFailed = false
+        backgroundVideoWidthPx = 0
+        backgroundVideoHeightPx = 0
+        backgroundVideoRotationDegrees = 0
+    }
+
+    /**
+     * Draws the latched background video OES frame into [rect] using
+     * [backgroundVideoAspectViewport] for placement and the plain OES
+     * program/[backgroundVideoStMatrix] for sampling — the same shader
+     * [drawCameraRect] uses for the camera layer, just a different texture/ST
+     * matrix. Letterbox/pillarbox area (aspectFit) is cleared to black first,
+     * matching [drawImageBackground].
+     */
+    private fun drawVideoBackground(rect: AndroidGreenScreenPixelRect) {
+        val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
+        if (scissor.width <= 0 || scissor.height <= 0) return
+
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        val viewport = backgroundVideoAspectViewport(rect)
+        GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
+
+        GLES20.glUseProgram(oesProgram)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, backgroundVideoOesTextureId)
+        GLES20.glUniform1i(sTextureLoc, 0)
+        GLES20.glUniformMatrix4fv(uSTMatrixLoc, 1, false, backgroundVideoStMatrix, 0)
+
+        quadPositions.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionLoc)
+        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
+        quadTexCoords.position(0)
+        GLES20.glEnableVertexAttribArray(aTexCoordLoc)
+        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(aPositionLoc)
+        GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    /**
+     * Viewport for the background video inside [rect], per
+     * [greenScreenBackground]'s scale mode: aspectFill (cover) or aspectFit
+     * (contain) — identical policy to [backgroundImageAspectViewport]. For a
+     * 90/270-degree [backgroundVideoRotationDegrees] the raw decoded
+     * width/height are swapped first so the aspect used here matches the
+     * upright display orientation rather than the sideways decode buffer,
+     * mirroring duet/AndroidDuetPreviewCompositor's aspectFillViewport.
+     * Unknown video size degrades to the rect itself (stretch).
+     */
+    private fun backgroundVideoAspectViewport(rect: AndroidGreenScreenPixelRect): GlRect {
+        val rectW = rect.width
+        val rectH = rect.height
+        if (backgroundVideoWidthPx <= 0 || backgroundVideoHeightPx <= 0 || rectW <= 0.0 || rectH <= 0.0) {
+            return toGlRect(rect.left, rect.top, rectW, rectH)
+        }
+        val displayWidthPx: Int
+        val displayHeightPx: Int
+        if (backgroundVideoRotationDegrees == 90 || backgroundVideoRotationDegrees == 270) {
+            displayWidthPx = backgroundVideoHeightPx
+            displayHeightPx = backgroundVideoWidthPx
+        } else {
+            displayWidthPx = backgroundVideoWidthPx
+            displayHeightPx = backgroundVideoHeightPx
+        }
+        val videoAspect = displayWidthPx.toDouble() / displayHeightPx.toDouble()
+        val rectAspect = rectW / rectH
+        val cover = greenScreenBackground.scaleMode != AndroidGreenScreenBackgroundScaleMode.ASPECT_FIT
+        val matchHeightBasis = if (cover) videoAspect > rectAspect else videoAspect <= rectAspect
+        val drawnW: Double
+        val drawnH: Double
+        if (matchHeightBasis) {
+            drawnH = rectH
+            drawnW = rectH * videoAspect
+        } else {
+            drawnW = rectW
+            drawnH = rectW / videoAspect
         }
         return toGlRect(
             rect.left - (drawnW - rectW) / 2.0,

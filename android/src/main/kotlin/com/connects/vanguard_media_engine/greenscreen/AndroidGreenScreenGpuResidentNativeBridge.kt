@@ -63,6 +63,22 @@ object AndroidGreenScreenGpuResidentNativeBridge {
     external fun nativeSetBackgroundImageScaleMode(handle: Long, aspectFill: Boolean)
     external fun nativeClearBackgroundImage(handle: Long)
 
+    /** Allocates (if needed) the GL_TEXTURE_EXTERNAL_OES texture for a Kotlin-owned background-video SurfaceTexture. 0 on failure. */
+    external fun nativeGetBackgroundVideoTextureId(handle: Long): Int
+
+    /** Latches the background video's SurfaceTexture transform matrix (16 floats), decoded size, source rotation and scale mode; switches the background to video. */
+    external fun nativeSetBackgroundVideoFrame(
+        handle: Long,
+        stMatrix: FloatArray,
+        videoWidth: Int,
+        videoHeight: Int,
+        rotationDegrees: Int,
+        aspectFill: Boolean,
+    )
+
+    /** Releases the background-video OES texture (if any) and reverts the background to black if it was showing video. */
+    external fun nativeClearBackgroundVideo(handle: Long)
+
     external fun nativeSetFilterToggles(handle: Long, guidedFilter: Boolean, temporalStabilizer: Boolean, despill: Boolean)
 
     /** GPU-downscales the latched camera frame and packs normalized float RGB (NHWC) into [modelInput]. */

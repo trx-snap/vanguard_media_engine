@@ -222,16 +222,19 @@ out vec4 fragColor;
 uniform samplerExternalOES uCameraTexture;
 uniform sampler2D uAlphaTexture;
 uniform sampler2D uBackgroundImage;
+uniform samplerExternalOES uBackgroundVideoTexture;
 
 uniform vec2 uAlphaResolution;
 uniform mat4 uCameraStMatrix;
+uniform mat4 uBackgroundVideoStMatrix;
 uniform vec4 uSourceRect;
 uniform vec4 uCameraScissor;
 uniform vec4 uCameraViewport;
 uniform vec4 uBackgroundImageRect;
+uniform vec4 uBackgroundVideoRect;
 uniform vec4 uBackgroundColor;
 uniform vec4 uPlaceholderColor;
-uniform int uBackgroundMode;  // 0 black, 1 solid color, 2 image
+uniform int uBackgroundMode;  // 0 black, 1 solid color, 2 image, 3 video
 uniform int uCameraMode;      // 0 none, 1 placeholder, 2 passthrough, 3 masked
 uniform bool uDespillEnabled;
 
@@ -323,6 +326,13 @@ void main() {
             vec2 iuv = (p - uBackgroundImageRect.xy) / uBackgroundImageRect.zw;
             // Image row 0 is the top row; GL v=0 is the bottom.
             col = texture(uBackgroundImage, vec2(iuv.x, 1.0 - iuv.y)).rgb;
+        } else if (uBackgroundMode == 3 && inRect(p, uBackgroundVideoRect)) {
+            // Unlike the image path above, no manual row flip: the decoder's
+            // SurfaceTexture transform matrix already delivers a
+            // display-correct sample, exactly like uCameraStMatrix does for
+            // the camera layer.
+            vec2 vuv = (p - uBackgroundVideoRect.xy) / uBackgroundVideoRect.zw;
+            col = texture(uBackgroundVideoTexture, (uBackgroundVideoStMatrix * vec4(vuv, 0.0, 1.0)).xy).rgb;
         }
     }
 

@@ -1,6 +1,8 @@
 package com.connects.vanguard_media_engine.greenscreen
 
 import android.content.Context
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.os.Handler
 import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import io.flutter.plugin.common.MethodChannel
@@ -137,9 +139,11 @@ class AndroidLiveGreenScreenMethodHandler(
     }
 
     /**
-     * Static backgrounds only (v1): `{type: solidColor, argbColor}` or
-     * `{type: image, filePath, scaleMode?}`. The image file must exist so a
-     * missing background fails closed here instead of silently drawing black.
+     * `{type: solidColor, argbColor}`, `{type: image, filePath, scaleMode?}`,
+     * or `{type: video|videoFile, filePath, scaleMode?}`. The image/video file
+     * must exist, and a video file must contain a decodable video track, so a
+     * missing or unusable background fails closed here instead of silently
+     * drawing black or freezing the render loop mid-session.
      */
     private fun parseBackground(raw: Any?): AndroidGreenScreenBackground {
         val map = raw as? Map<*, *> ?: throw IllegalArgumentException("'background' map required")
@@ -155,20 +159,8 @@ class AndroidLiveGreenScreenMethodHandler(
                 )
             }
             "image" -> {
-                val path = (map["filePath"] as? String)?.trim()
-                if (path.isNullOrEmpty()) {
-                    throw IllegalArgumentException("'background.filePath' must be a non-blank string")
-                }
-                if (!File(path).isFile) {
-                    throw IllegalArgumentException("'background.filePath' does not exist: $path")
-                }
-                val scaleMode = when (val rawMode = map["scaleMode"]) {
-                    null, "aspectFill" -> AndroidGreenScreenBackgroundScaleMode.ASPECT_FILL
-                    "aspectFit" -> AndroidGreenScreenBackgroundScaleMode.ASPECT_FIT
-                    else -> throw IllegalArgumentException(
-                        "'background.scaleMode' must be aspectFill or aspectFit (got $rawMode)",
-                    )
-                }
+                val path = requireExistingFilePath(map)
+                val scaleMode = requireScaleMode(map)
                 AndroidGreenScreenBackground(
                     type = AndroidGreenScreenBackgroundType.IMAGE,
                     argbColor = AndroidGreenScreenBackground.VIDEO.argbColor,
@@ -176,10 +168,70 @@ class AndroidLiveGreenScreenMethodHandler(
                     scaleMode = scaleMode,
                 )
             }
+            "video", "videoFile" -> {
+                val path = requireExistingFilePath(map)
+                if (!hasDecodableVideoTrack(path)) {
+                    throw IllegalArgumentException(
+                        "'background.filePath' has no decodable video track: $path",
+                    )
+                }
+                val scaleMode = requireScaleMode(map)
+                AndroidGreenScreenBackground(
+                    type = AndroidGreenScreenBackgroundType.VIDEO,
+                    argbColor = AndroidGreenScreenBackground.VIDEO.argbColor,
+                    filePath = path,
+                    scaleMode = scaleMode,
+                )
+            }
             else -> throw IllegalArgumentException(
-                "'background.type' must be solidColor or image (got ${type ?: "null"}); " +
-                    "video backgrounds are not supported by the live session",
+                "'background.type' must be solidColor, image, video, or videoFile (got ${type ?: "null"})",
             )
+        }
+    }
+
+    private fun requireExistingFilePath(map: Map<*, *>): String {
+        val path = (map["filePath"] as? String)?.trim()
+        if (path.isNullOrEmpty()) {
+            throw IllegalArgumentException("'background.filePath' must be a non-blank string")
+        }
+        if (!File(path).isFile) {
+            throw IllegalArgumentException("'background.filePath' does not exist: $path")
+        }
+        return path
+    }
+
+    private fun requireScaleMode(map: Map<*, *>): AndroidGreenScreenBackgroundScaleMode =
+        when (val rawMode = map["scaleMode"]) {
+            null, "aspectFill" -> AndroidGreenScreenBackgroundScaleMode.ASPECT_FILL
+            "aspectFit" -> AndroidGreenScreenBackgroundScaleMode.ASPECT_FIT
+            else -> throw IllegalArgumentException(
+                "'background.scaleMode' must be aspectFill or aspectFit (got $rawMode)",
+            )
+        }
+
+    /**
+     * Lightweight, synchronous container-header probe (no frame decode): opens
+     * [path] with a throwaway [MediaExtractor] and checks for at least one
+     * track whose MIME type starts with "video/". Mirrors the cost class of
+     * the image path's existing
+     * synchronous [File.isFile] / [android.graphics.BitmapFactory] checks, so
+     * running it here on the calling (platform) thread does not newly violate
+     * the "must not block render loop pacing" requirement, which concerns
+     * steady-state per-frame decode, not one-time argument validation. Always
+     * releases the extractor.
+     */
+    private fun hasDecodableVideoTrack(path: String): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(path)
+            (0 until extractor.trackCount).any { i ->
+                val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
+                mime?.startsWith("video/") == true
+            }
+        } catch (_: Throwable) {
+            false
+        } finally {
+            try { extractor.release() } catch (_: Throwable) {}
         }
     }
 

@@ -218,6 +218,32 @@ VG_GS_GPU_RESIDENT_JNI(void, nativeClearBackgroundImage)(JNIEnv* /*env*/, jobjec
     entry->renderer->ClearBackgroundImage();
 }
 
+VG_GS_GPU_RESIDENT_JNI(jint, nativeGetBackgroundVideoTextureId)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = Lookup(handle);
+    if (!entry) return 0;
+    std::string error;
+    const uint32_t texId = entry->renderer->EnsureBackgroundVideoTexture(&error);
+    RecordError(entry, error);
+    return static_cast<jint>(texId);
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeSetBackgroundVideoFrame)(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jfloatArray stMatrix, jint videoWidth, jint videoHeight,
+    jint rotationDegrees, jboolean aspectFill) {
+    auto entry = Lookup(handle);
+    if (!entry || stMatrix == nullptr) return;
+    if (env->GetArrayLength(stMatrix) < 16) return;
+    float matrix[16];
+    env->GetFloatArrayRegion(stMatrix, 0, 16, matrix);
+    entry->renderer->SetBackgroundVideoFrame(matrix, videoWidth, videoHeight, rotationDegrees, aspectFill == JNI_TRUE);
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeClearBackgroundVideo)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = Lookup(handle);
+    if (!entry) return;
+    entry->renderer->ClearBackgroundVideo();
+}
+
 VG_GS_GPU_RESIDENT_JNI(void, nativeSetFilterToggles)(
     JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jboolean guidedFilter, jboolean temporalStabilizer,
     jboolean despill) {
