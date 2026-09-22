@@ -94,6 +94,12 @@ final class VGDuetNativeSession {
     // camera source or green-screen adapter directly.
     var foregroundProvider: VGDuetForegroundProvider?
 
+    // Slice 1: segment recording, audio preview, and mic capture
+    var segmentAssetPaths: [String] = []
+    var currentRecorder: VGDuetSegmentRecorder?
+    var audioPlayer: VGDuetPreviewAudioPlayer?
+    var micCapture: VGDuetMicrophoneCapture?
+
     init(sessionId: String,
          sourceMap: [String: Any],
          trimWindowMap: [String: Any],
@@ -130,6 +136,34 @@ final class VGDuetNativeSession {
         return previewClock.deleteLastSegment()
     }
 
+    /// Aborts the clock's active (uncommitted) recording segment, if any,
+    /// WITHOUT removing any already-committed segment or its asset.
+    ///
+    /// VGDuetPreviewClock has no direct "abort active only" API:
+    /// deleteLastSegment() clears the active-recording flag AND additionally
+    /// removes the last COMMITTED segment whenever one exists -- it is
+    /// designed for the user-facing "delete last segment" rollback, which
+    /// intentionally rewinds past a completed take. Calling it directly
+    /// after a FAILED (never-committed) segment's asset write would
+    /// therefore silently discard the previous GOOD take's segment instead
+    /// of only the failed one (e.g. a second take's recorder-finish failure
+    /// wrongly erasing the first take).
+    ///
+    /// Achieves a true "abort active only" using only VGDuetPreviewClock's
+    /// existing public API: commitSegment() first transitions the clock out
+    /// of "recording" and provisionally appends the active segment as the
+    /// new last segment; deleteLastSegment() is then called immediately,
+    /// which removes exactly that just-committed record (it is now the
+    /// clock's last segment) and rewinds sourceCursorMs/outputCursorMs and
+    /// isAutoStopped back to their state before this segment started --
+    /// leaving every earlier committed segment and its asset path untouched.
+    /// No-op if the clock has no active recording segment.
+    func abortActiveSegment() {
+        guard previewClock.isRecordingActive else { return }
+        previewClock.commitSegment()
+        previewClock.deleteLastSegment()
+    }
+
     func totalDurationMs() -> Int { previewClock.totalDurationMs() }
     func segmentCount() -> Int { previewClock.segmentCount() }
 
@@ -148,9 +182,9 @@ final class VGDuetNativeSession {
         ]
         return [
             "compositionDescriptor": descriptor,
-            "totalDurationMs":       max(1, totalDurationMs()),
-            "segmentCount":          max(1, segmentCount()),
-            "segmentAssets":         [String](),
+            "totalDurationMs":       totalDurationMs(),
+            "segmentCount":          segmentCount(),
+            "segmentAssets":         segmentAssetPaths,
             "proofOutputPath":       NSNull(),
         ]
     }
@@ -333,6 +367,7 @@ final class VGDuetNativeSessionCoordinator {
         )
         session.previewRenderLoop = loop
         loop.renderInitialFrame()
+        session.audioPlayer?.seek(toMilliseconds: session.trimStartMs)
         if session.state == .recording {
             loop.startActive()
         }
@@ -572,7 +607,14 @@ final class VGDuetNativeSessionCoordinator {
                 // Called on main or renderQueue; nil when no camera frame yet or
                 // after the provider was stopped.  The provider decides whether
                 // the sample carries a matte (keyed) or not.
-                session?.foregroundProvider?.sampleRetained()
+                guard let sample = session?.foregroundProvider?.sampleRetained() else { return nil }
+                if let session = session, session.state == .recording, let recorder = session.currentRecorder {
+                    let pixelBuffer = sample.frame.takeUnretainedValue()
+                    let currentPtsMs = session.previewClock.currentOutputPtsMs() - session.previewClock.outputCursorMs
+                    let pts = CMTimeMake(value: Int64(max(0, currentPtsMs)), timescale: 1000)
+                    recorder.appendVideoPixelBuffer(pixelBuffer, presentationTime: pts)
+                }
+                return sample
             }
         )
     }
@@ -632,6 +674,12 @@ final class VGDuetNativeSessionCoordinator {
         }
         guard micGain >= 0.0 && micGain <= 1.0 else {
             reply(nil, FlutterError(code: "source_invalid", message: "initializeDuetSession: micGain must be in [0.0, 1.0].", details: nil))
+            return
+        }
+
+        let freeBytes = Self.availableDiskSpaceBytes()
+        guard freeBytes >= 200 * 1024 * 1024 else {
+            reply(nil, FlutterError(code: "disk_full", message: "Insufficient disk space for recording (minimum 200MB required)", details: nil))
             return
         }
 
@@ -737,6 +785,12 @@ final class VGDuetNativeSessionCoordinator {
                             decoder:         decoder
                         )
                         session.probeResult = probe
+
+                        // Slice 1: attach preview audio player for source video
+                        let player = VGDuetPreviewAudioPlayer(sourceURL: url)
+                        player.setVolume(Float(sourceGain))
+                        session.audioPlayer = player
+
                         self.activeSession = session
                         reply(sessionId, nil)
                     }
@@ -812,6 +866,8 @@ final class VGDuetNativeSessionCoordinator {
         }
         session.speedMultiplier = speed
         session.previewClock.setSpeed(speed)
+        session.audioPlayer?.setRate(speed)
+        session.micCapture?.setSpeedMultiplier(speed)
         reply(nil, nil)
     }
 
@@ -833,6 +889,7 @@ final class VGDuetNativeSessionCoordinator {
         }
         session.sourceGain = sourceGain
         session.micGain    = micGain
+        session.audioPlayer?.setVolume(Float(sourceGain))
         reply(nil, nil)
     }
 
@@ -844,9 +901,46 @@ final class VGDuetNativeSessionCoordinator {
         guard session.state == .initialized else {
             reply(nil, invalidState("startDuetRecording", current: stateName(session.state), expected: "initialized")); return
         }
+        guard session.previewRenderLoop != nil, session.foregroundProvider != nil else {
+            reply(nil, FlutterError(code: "preview_not_attached",
+                                     message: "Cannot start recording: preview texture or camera foreground provider is not attached",
+                                     details: nil))
+            return
+        }
+
+        let freeBytes = Self.availableDiskSpaceBytes()
+        guard freeBytes >= 200 * 1024 * 1024 else {
+            reply(nil, FlutterError(code: "disk_full", message: "Insufficient disk space for recording", details: nil))
+            return
+        }
+
+        let segIdx = session.segmentCount()
+        let segURL = Self.segmentFileURL(sessionId: sessionId, index: segIdx)
+        let width = session.previewWidthPx ?? 1080
+        let height = session.previewHeightPx ?? 1920
+        do {
+            let recorder = try VGDuetSegmentRecorder(outputURL: segURL, videoSize: CGSize(width: width, height: height))
+            session.currentRecorder = recorder
+        } catch {
+            reply(nil, FlutterError(code: "recording_start_failed", message: "Failed to initialize segment recorder: \(error.localizedDescription)", details: nil))
+            return
+        }
+
+        let mic = VGDuetMicrophoneCapture(speedMultiplier: session.speedMultiplier) { [weak session] sampleBuffer in
+            session?.currentRecorder?.appendAudioSampleBuffer(sampleBuffer)
+        }
+        session.micCapture = mic
+        mic.start()
+
         session.state = .recording
         session.startSegment()
         session.previewRenderLoop?.startActive()   // Slice 4B-B
+
+        session.audioPlayer?.seek(toMilliseconds: session.trimStartMs) { [weak session] in
+            guard let session = session, session.state == .recording else { return }
+            session.audioPlayer?.play(atRate: session.speedMultiplier)
+        }
+
         reply(nil, nil)
     }
 
@@ -858,11 +952,43 @@ final class VGDuetNativeSessionCoordinator {
         guard session.state == .recording else {
             reply(nil, invalidState("pauseDuetRecording", current: stateName(session.state), expected: "recording")); return
         }
-        session.commitSegment()
-        session.state = session.previewClock.isAutoStopped ? .completed : .paused
+        session.audioPlayer?.pause()
+        session.micCapture?.stop()
+        session.micCapture = nil
+
+        let recorder = session.currentRecorder
+        session.currentRecorder = nil
+
         // Slice 4B-B: the render loop owns decoder stepping; hold the committed cursor frame.
         session.previewRenderLoop?.pauseAndHold(targetPtsMs: session.previewClock.currentSourcePtsMs())
-        reply(nil, nil)
+
+        if let recorder = recorder {
+            recorder.finishWriting { [weak session] result in
+                guard let session = session else {
+                    reply(nil, FlutterError(code: "session_deallocated", message: "Session deallocated during pause", details: nil))
+                    return
+                }
+                switch result {
+                case .success(let url):
+                    session.segmentAssetPaths.append(url.path)
+                    session.commitSegment()
+                    session.state = session.previewClock.isAutoStopped ? .completed : .paused
+                    reply(nil, nil)
+                case .failure(let err):
+                    NSLog("[VGDuetNativeSessionCoordinator] Segment write finish failed: %@", err.localizedDescription)
+                    session.abortActiveSegment()
+                    try? FileManager.default.removeItem(at: recorder.outputURL)
+                    session.state = .paused
+                    reply(nil, FlutterError(code: "segment_write_failed",
+                                             message: "Failed to persist segment asset: \(err.localizedDescription)",
+                                             details: nil))
+                }
+            }
+        } else {
+            session.commitSegment()
+            session.state = session.previewClock.isAutoStopped ? .completed : .paused
+            reply(nil, nil)
+        }
     }
 
     // MARK: - resumeRecording
@@ -873,9 +999,47 @@ final class VGDuetNativeSessionCoordinator {
         guard session.state == .paused else {
             reply(nil, invalidState("resumeDuetRecording", current: stateName(session.state), expected: "paused")); return
         }
+        guard session.previewRenderLoop != nil, session.foregroundProvider != nil else {
+            reply(nil, FlutterError(code: "preview_not_attached",
+                                     message: "Cannot resume recording: preview texture or camera foreground provider is not attached",
+                                     details: nil))
+            return
+        }
+
+        let freeBytes = Self.availableDiskSpaceBytes()
+        guard freeBytes >= 100 * 1024 * 1024 else {
+            reply(nil, FlutterError(code: "disk_full", message: "Insufficient disk space for recording", details: nil))
+            return
+        }
+
+        let segIdx = session.segmentCount()
+        let segURL = Self.segmentFileURL(sessionId: sessionId, index: segIdx)
+        let width = session.previewWidthPx ?? 1080
+        let height = session.previewHeightPx ?? 1920
+        do {
+            let recorder = try VGDuetSegmentRecorder(outputURL: segURL, videoSize: CGSize(width: width, height: height))
+            session.currentRecorder = recorder
+        } catch {
+            reply(nil, FlutterError(code: "recording_resume_failed", message: "Failed to initialize segment recorder: \(error.localizedDescription)", details: nil))
+            return
+        }
+
+        let mic = VGDuetMicrophoneCapture(speedMultiplier: session.speedMultiplier) { [weak session] sampleBuffer in
+            session?.currentRecorder?.appendAudioSampleBuffer(sampleBuffer)
+        }
+        session.micCapture = mic
+        mic.start()
+
         session.state = .recording
         session.startSegment()
         session.previewRenderLoop?.startActive()   // Slice 4B-B
+
+        let cursorMs = session.previewClock.currentSourcePtsMs()
+        session.audioPlayer?.seek(toMilliseconds: cursorMs) { [weak session] in
+            guard let session = session, session.state == .recording else { return }
+            session.audioPlayer?.play(atRate: session.speedMultiplier)
+        }
+
         reply(nil, nil)
     }
 
@@ -893,8 +1057,18 @@ final class VGDuetNativeSessionCoordinator {
         if session.state == .completed {
             session.state = .paused
         }
+
+        if !session.segmentAssetPaths.isEmpty {
+            let removedPath = session.segmentAssetPaths.removeLast()
+            DispatchQueue.global(qos: .utility).async {
+                try? FileManager.default.removeItem(atPath: removedPath)
+            }
+        }
+
+        let cursorMs = session.previewClock.currentSourcePtsMs()
+        session.audioPlayer?.seek(toMilliseconds: cursorMs)
         // Slice 4B-B: the render loop owns decoder seeking; hold the rolled-back cursor frame.
-        session.previewRenderLoop?.seekAndHold(targetPtsMs: session.previewClock.currentSourcePtsMs())
+        session.previewRenderLoop?.seekAndHold(targetPtsMs: cursorMs)
         reply(nil, nil)
     }
 
@@ -904,22 +1078,63 @@ final class VGDuetNativeSessionCoordinator {
         assert(Thread.isMainThread)
         guard let session = resolveActiveSession(sessionId: sessionId, reply: reply) else { return }
         switch session.state {
-        case .recording:
-            session.commitSegment()
-        case .paused, .completed:
+        case .recording, .paused, .completed:
             break
         default:
             reply(nil, invalidState("stopDuetRecording", current: stateName(session.state), expected: "recording, paused, or completed")); return
         }
+
         session.state = .stopped
+        session.audioPlayer?.stop()
+        session.audioPlayer = nil
+        session.micCapture?.stop()
+        session.micCapture = nil
+
+        let recorder = session.currentRecorder
+        session.currentRecorder = nil
+
         stopPreviewRenderLoop(for: session)   // Slice 4B-B: loop first, then texture, then decoder
         let dec = session.decoder
         session.decoder = nil
         releasePreviewTexture(for: session)   // Slice 4A: detach before drop
         activeSession = nil
         decoderQueue.async { dec?.release() }
-        let resultMap = session.buildStopResult()
-        reply(resultMap, nil)
+
+        let finalizeResult = { (session: VGDuetNativeSession, stopTakeError: Error?) in
+            if let err = stopTakeError {
+                reply(nil, FlutterError(code: "recording_failed",
+                                         message: "Failed to persist final segment asset: \(err.localizedDescription)",
+                                         details: nil))
+                return
+            }
+            guard session.segmentCount() > 0 && !session.segmentAssetPaths.isEmpty else {
+                reply(nil, FlutterError(code: "recording_failed",
+                                         message: "Cannot stop recording: no valid segment assets were recorded or persisted",
+                                         details: nil))
+                return
+            }
+            let resultMap = session.buildStopResult()
+            reply(resultMap, nil)
+        }
+
+        if let recorder = recorder {
+            recorder.finishWriting { result in
+                var stopTakeError: Error? = nil
+                switch result {
+                case .success(let url):
+                    session.segmentAssetPaths.append(url.path)
+                    session.commitSegment()
+                case .failure(let err):
+                    NSLog("[VGDuetNativeSessionCoordinator] Final segment write failed: %@", err.localizedDescription)
+                    session.abortActiveSegment()
+                    try? FileManager.default.removeItem(at: recorder.outputURL)
+                    stopTakeError = err
+                }
+                finalizeResult(session, stopTakeError)
+            }
+        } else {
+            finalizeResult(session, nil)
+        }
     }
 
     // MARK: - disposeSession (idempotent)
@@ -932,6 +1147,22 @@ final class VGDuetNativeSessionCoordinator {
         }
         if let session = activeSession, session.sessionId == sessionId {
             canceledProbeIds.insert(sessionId)
+            session.audioPlayer?.stop()
+            session.audioPlayer = nil
+            session.micCapture?.stop()
+            session.micCapture = nil
+            session.currentRecorder?.cancel()
+            session.currentRecorder = nil
+            let pathsToDelete = session.segmentAssetPaths
+            session.segmentAssetPaths.removeAll()
+            let sessionDir = Self.sessionDirectory(sessionId: session.sessionId)
+            DispatchQueue.global(qos: .utility).async {
+                for p in pathsToDelete {
+                    try? FileManager.default.removeItem(atPath: p)
+                }
+                try? FileManager.default.removeItem(at: sessionDir)
+            }
+
             stopPreviewRenderLoop(for: session)   // Slice 4B-B: loop first, then texture, then decoder
             let dec = session.decoder
             session.decoder = nil
@@ -951,6 +1182,22 @@ final class VGDuetNativeSessionCoordinator {
         }
         if let session = activeSession {
             canceledProbeIds.insert(session.sessionId)
+            session.audioPlayer?.stop()
+            session.audioPlayer = nil
+            session.micCapture?.stop()
+            session.micCapture = nil
+            session.currentRecorder?.cancel()
+            session.currentRecorder = nil
+            let pathsToDelete = session.segmentAssetPaths
+            session.segmentAssetPaths.removeAll()
+            let sessionDir = Self.sessionDirectory(sessionId: session.sessionId)
+            DispatchQueue.global(qos: .utility).async {
+                for p in pathsToDelete {
+                    try? FileManager.default.removeItem(atPath: p)
+                }
+                try? FileManager.default.removeItem(at: sessionDir)
+            }
+
             stopPreviewRenderLoop(for: session)   // Slice 4B-B: loop first, then texture, then decoder
             let dec = session.decoder
             session.decoder = nil
@@ -1140,5 +1387,482 @@ final class VGDuetNativeSessionCoordinator {
             return "PiP rect exceeds canvas bounds (right=\(left + width), bottom=\(top + height))."
         }
         return nil
+    }
+
+    // MARK: - Slice 1 Helpers
+
+    static func sessionDirectory(sessionId: String) -> URL {
+        return URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("vanguard_duet_segments", isDirectory: true)
+            .appendingPathComponent(sessionId, isDirectory: true)
+    }
+
+    static func segmentFileURL(sessionId: String, index: Int) -> URL {
+        return sessionDirectory(sessionId: sessionId)
+            .appendingPathComponent("take_\(index).mp4", isDirectory: false)
+    }
+
+    static func availableDiskSpaceBytes() -> Int64 {
+        let tempPath = NSTemporaryDirectory()
+        let attrs = try? FileManager.default.attributesOfFileSystem(forPath: tempPath)
+        return (attrs?[.systemFreeSize] as? NSNumber)?.int64Value ?? Int64.max
+    }
+}
+
+// MARK: - Slice 1: Preview Audio Player
+
+final class VGDuetPreviewAudioPlayer {
+
+    private var player: AVPlayer?
+    private var playerItem: AVPlayerItem?
+    private var endObserver: Any?
+    private var currentSpeed: Double = 1.0
+    private var currentVolume: Float = 1.0
+    private var isPlaying: Bool = false
+
+    init(sourceURL: URL) {
+        assert(Thread.isMainThread)
+        let asset = AVURLAsset(url: sourceURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let item = AVPlayerItem(asset: asset)
+        item.audioTimePitchAlgorithm = .timeDomain
+        let pl = AVPlayer(playerItem: item)
+        pl.actionAtItemEnd = .pause
+        self.player = pl
+        self.playerItem = item
+
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.isPlaying = false
+        }
+    }
+
+    deinit {
+        stop()
+    }
+
+    func play(atRate rate: Double) {
+        assert(Thread.isMainThread)
+        guard let player = player else { return }
+        currentSpeed = rate
+        player.volume = currentVolume
+        player.rate = Float(rate)
+        isPlaying = true
+    }
+
+    func pause() {
+        assert(Thread.isMainThread)
+        guard let player = player else { return }
+        player.pause()
+        isPlaying = false
+    }
+
+    func seek(toMilliseconds ms: Int, completion: (() -> Void)? = nil) {
+        assert(Thread.isMainThread)
+        guard let player = player else {
+            completion?()
+            return
+        }
+        let time = CMTimeMake(value: Int64(ms), timescale: 1000)
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            DispatchQueue.main.async {
+                completion?()
+            }
+        }
+    }
+
+    func setRate(_ rate: Double) {
+        assert(Thread.isMainThread)
+        currentSpeed = rate
+        if isPlaying, let player = player {
+            player.rate = Float(rate)
+        }
+    }
+
+    func setVolume(_ volume: Float) {
+        assert(Thread.isMainThread)
+        let clamped = max(0.0, min(1.0, volume))
+        currentVolume = clamped < 0.0001 ? 0.0 : clamped
+        player?.volume = currentVolume
+    }
+
+    func stop() {
+        assert(Thread.isMainThread)
+        if let observer = endObserver {
+            NotificationCenter.default.removeObserver(observer)
+            endObserver = nil
+        }
+        if let player = player {
+            player.pause()
+            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+            player.replaceCurrentItem(with: nil)
+            self.player = nil
+            self.playerItem = nil
+        }
+        isPlaying = false
+    }
+}
+
+// MARK: - Slice 1: Segment Recorder
+
+final class VGDuetSegmentRecorder {
+
+    let outputURL: URL
+    private let videoSize: CGSize
+    private let averageBitRate: Int
+    private let writerQueue = DispatchQueue(label: "com.connects.vanguard.duet.segment.writer",
+                                            qos: .userInitiated)
+
+    private var assetWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var audioInput: AVAssetWriterInput?
+
+    private var isSessionStarted: Bool = false
+    private var isFinished: Bool = false
+    private var isCancelled: Bool = false
+
+    private var lastVideoPTS: CMTime = .invalid
+    private var firstPTS: CMTime?
+
+    init(outputURL: URL, videoSize: CGSize = CGSize(width: 1080, height: 1920), averageBitRate: Int = 10_000_000) throws {
+        self.outputURL = outputURL
+        self.videoSize = videoSize
+        self.averageBitRate = averageBitRate
+
+        let parentDir = outputURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: parentDir.path) {
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true, attributes: nil)
+        }
+
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(videoSize.width),
+            AVVideoHeightKey: Int(videoSize.height),
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: averageBitRate,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoExpectedSourceFrameRateKey: 30,
+                AVVideoAllowFrameReorderingKey: false,
+            ]
+        ]
+
+        let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        vInput.expectsMediaDataInRealTime = true
+
+        let pbAttrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferWidthKey as String: Int(videoSize.width),
+            kCVPixelBufferHeightKey as String: Int(videoSize.height),
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: vInput,
+            sourcePixelBufferAttributes: nil
+        )
+
+        guard writer.canAdd(vInput) else {
+            throw NSError(domain: "VGDuetSegmentRecorder", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Cannot add video input to AVAssetWriter"])
+        }
+        writer.add(vInput)
+
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 128_000,
+        ]
+        let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        aInput.expectsMediaDataInRealTime = true
+
+        if writer.canAdd(aInput) {
+            writer.add(aInput)
+            self.audioInput = aInput
+        }
+
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "VGDuetSegmentRecorder", code: 2,
+                                          userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter startWriting failed"])
+        }
+
+        self.assetWriter = writer
+        self.videoInput = vInput
+        self.pixelBufferAdaptor = adaptor
+    }
+
+    func appendVideoPixelBuffer(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        writerQueue.async { [self] in
+            guard let writer = self.assetWriter,
+                  let adaptor = self.pixelBufferAdaptor,
+                  let input = self.videoInput,
+                  !self.isFinished,
+                  !self.isCancelled,
+                  writer.status == .writing else { return }
+
+            if !self.isSessionStarted {
+                writer.startSession(atSourceTime: .zero)
+                self.isSessionStarted = true
+            }
+
+            guard presentationTime >= .zero else { return }
+
+            if self.lastVideoPTS.isValid && presentationTime <= self.lastVideoPTS {
+                return
+            }
+
+            if input.isReadyForMoreMediaData {
+                if adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
+                    self.lastVideoPTS = presentationTime
+                } else {
+                    NSLog("[VGDuetSegmentRecorder] appendVideo failed: status=%ld, error=%@",
+                          writer.status.rawValue, String(describing: writer.error))
+                }
+            }
+        }
+    }
+
+    func appendAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        writerQueue.async { [self] in
+            guard let writer = self.assetWriter,
+                  let aInput = self.audioInput,
+                  self.isSessionStarted,
+                  !self.isFinished,
+                  !self.isCancelled,
+                  writer.status == .writing else { return }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            guard pts >= .zero else { return }
+
+            if aInput.isReadyForMoreMediaData {
+                if !aInput.append(sampleBuffer) {
+                    NSLog("[VGDuetSegmentRecorder] appendAudio failed: status=%ld, error=%@",
+                          writer.status.rawValue, String(describing: writer.error))
+                }
+            }
+        }
+    }
+
+    func finishWriting(completion: @escaping (Result<URL, Error>) -> Void) {
+        writerQueue.async { [self] in
+            guard !self.isFinished, !self.isCancelled, let writer = self.assetWriter else {
+                DispatchQueue.main.async {
+                    completion(.failure(NSError(domain: "VGDuetSegmentRecorder", code: 3,
+                                                userInfo: [NSLocalizedDescriptionKey: "Recorder not active or already finished"])))
+                }
+                return
+            }
+
+            self.isFinished = true
+
+            // If the writer never started or failed, do NOT call writer.finishWriting because
+            // AVAssetWriter will hang or drop the completion callback!
+            guard self.isSessionStarted, writer.status == .writing else {
+                let status = writer.status.rawValue
+                let err = writer.error ?? NSError(domain: "VGDuetSegmentRecorder", code: 5,
+                                                  userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter status is \(status) (not writing), sessionStarted=\(self.isSessionStarted)"])
+                NSLog("[VGDuetSegmentRecorder] Cannot finishWriting: status=%ld, error=%@", status, String(describing: writer.error))
+                if writer.status == .writing {
+                    writer.cancelWriting()
+                }
+                DispatchQueue.main.async {
+                    completion(.failure(err))
+                }
+                return
+            }
+
+            self.videoInput?.markAsFinished()
+            self.audioInput?.markAsFinished()
+
+            let url = self.outputURL
+            writer.finishWriting {
+                if writer.status == .completed {
+                    let fileAttrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+                    let size = (fileAttrs?[.size] as? NSNumber)?.int64Value ?? 0
+                    if size > 0 {
+                        DispatchQueue.main.async {
+                            completion(.success(url))
+                        }
+                    } else {
+                        DispatchQueue.main.async {
+                            completion(.failure(NSError(domain: "VGDuetSegmentRecorder", code: 4,
+                                                        userInfo: [NSLocalizedDescriptionKey: "Output segment file is empty: \(url.path)"])))
+                        }
+                    }
+                } else {
+                    let err = writer.error ?? NSError(domain: "VGDuetSegmentRecorder", code: 5,
+                                                      userInfo: [NSLocalizedDescriptionKey: "finishWriting failed with status \(writer.status.rawValue), error: \(String(describing: writer.error))"])
+                    DispatchQueue.main.async {
+                        completion(.failure(err))
+                    }
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        let writer = self.assetWriter
+        let outputURL = self.outputURL
+        self.isCancelled = true
+        self.assetWriter = nil
+        self.videoInput = nil
+        self.pixelBufferAdaptor = nil
+        self.audioInput = nil
+
+        writerQueue.async {
+            if writer?.status == .writing {
+                writer?.cancelWriting()
+            }
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+    }
+}
+
+// MARK: - Slice 1: Microphone Capture
+
+final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+
+    typealias AudioBufferHandler = (CMSampleBuffer) -> Void
+
+    private let captureQueue = DispatchQueue(label: "com.connects.vanguard.duet.mic.capture",
+                                             qos: .userInitiated)
+    private var captureSession: AVCaptureSession?
+    private var audioOutput: AVCaptureAudioDataOutput?
+
+    private var onAudioBuffer: AudioBufferHandler?
+    private var speedMultiplier: Double = 1.0
+
+    private var firstPTS: CMTime?
+    private var isCapturing: Bool = false
+
+    init(speedMultiplier: Double = 1.0, onAudioBuffer: @escaping AudioBufferHandler) {
+        self.speedMultiplier = speedMultiplier
+        self.onAudioBuffer = onAudioBuffer
+        super.init()
+    }
+
+    deinit {
+        let session = self.captureSession
+        let output = self.audioOutput
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        if let s = session, s.isRunning {
+            captureQueue.async {
+                s.stopRunning()
+            }
+        }
+    }
+
+    func start() {
+        captureQueue.async { [weak self] in
+            guard let self = self, !self.isCapturing else { return }
+            self.firstPTS = nil
+
+            let session = AVCaptureSession()
+            guard let mic = AVCaptureDevice.default(for: .audio),
+                  let input = try? AVCaptureDeviceInput(device: mic) else {
+                NSLog("[VGDuetMicrophoneCapture] Microphone device unavailable")
+                return
+            }
+
+            if session.canAddInput(input) {
+                session.addInput(input)
+            }
+
+            let output = AVCaptureAudioDataOutput()
+            output.setSampleBufferDelegate(self, queue: self.captureQueue)
+            if session.canAddOutput(output) {
+                session.addOutput(output)
+            }
+
+            session.startRunning()
+            self.captureSession = session
+            self.audioOutput = output
+            self.isCapturing = true
+        }
+    }
+
+    func stop() {
+        isCapturing = false
+        onAudioBuffer = nil
+        let session = self.captureSession
+        let output = self.audioOutput
+        self.captureSession = nil
+        self.audioOutput = nil
+        self.firstPTS = nil
+
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        if let s = session, s.isRunning {
+            captureQueue.async {
+                s.stopRunning()
+            }
+        }
+    }
+
+    func setSpeedMultiplier(_ speed: Double) {
+        captureQueue.async { [weak self] in
+            self?.speedMultiplier = speed
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard isCapturing, let handler = onAudioBuffer else { return }
+
+        let rawPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if firstPTS == nil {
+            firstPTS = rawPTS
+        }
+
+        guard let startPTS = firstPTS else { return }
+
+        if abs(speedMultiplier - 1.0) < 0.001 {
+            let elapsed = CMTimeSubtract(rawPTS, startPTS)
+            if let timedBuffer = Self.retimedSampleBuffer(sampleBuffer, newPTS: elapsed) {
+                handler(timedBuffer)
+            } else {
+                handler(sampleBuffer)
+            }
+        } else {
+            let elapsedSec = CMTimeGetSeconds(CMTimeSubtract(rawPTS, startPTS))
+            let scaledSec = max(0.0, elapsedSec * speedMultiplier)
+            let scaledPTS = CMTimeMakeWithSeconds(scaledSec, preferredTimescale: 44100)
+
+            if let timedBuffer = Self.retimedSampleBuffer(sampleBuffer, newPTS: scaledPTS) {
+                handler(timedBuffer)
+            }
+        }
+    }
+
+    private static func retimedSampleBuffer(_ buffer: CMSampleBuffer, newPTS: CMTime) -> CMSampleBuffer? {
+        var count: CMItemCount = 0
+        CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count)
+        guard count > 0 else { return nil }
+
+        var timingArray = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: count, arrayToFill: &timingArray, entriesNeededOut: &count)
+
+        for i in 0..<count {
+            timingArray[i].presentationTimeStamp = newPTS
+        }
+
+        var retimedBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: buffer,
+            sampleTimingEntryCount: count,
+            sampleTimingArray: timingArray,
+            sampleBufferOut: &retimedBuffer
+        )
+
+        return (status == noErr) ? retimedBuffer : nil
     }
 }
