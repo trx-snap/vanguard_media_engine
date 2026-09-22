@@ -80,4 +80,53 @@ object AndroidGreenScreenGpuResidentNativeBridge {
 
     external fun nativeStatsSummary(handle: Long): String
     external fun nativeLastError(handle: Long): String
+
+    // -------------------------------------------------------------------------
+    // Embeddable segmenter (GlesGreenScreenGpuSegmenter): the same downscale ->
+    // [Interpreter.run] -> coarse mask upload -> guided/temporal refinement
+    // core, but with NO EGL/window/swap/background ownership, for a host
+    // compositor that runs it inside its OWN current ES 3.1 context on its own
+    // render thread and then samples the refined alpha texture from its own
+    // draw (AndroidDuetPreviewCompositor greenScreen mode). Every call must be
+    // made on that thread with that context current; the camera OES texture is
+    // passed per call and stays owned by the host. Native fails closed
+    // (0 / false / no-op) for unknown or destroyed handles.
+    // -------------------------------------------------------------------------
+
+    /** Verifies the CURRENT context is ES 3.1 + external_essl3 and compiles the compute programs. 0 on failure. */
+    external fun nativeSegmenterCreate(): Long
+
+    /** Deletes every GL object the segmenter owns; the host's context must still be current. Idempotent. */
+    external fun nativeSegmenterDestroy(handle: Long)
+
+    /** Allocates the model-input texture/FBO for the interpreter's NHWC input size. */
+    external fun nativeSegmenterConfigureModelInput(handle: Long, width: Int, height: Int): Boolean
+
+    /** Latches the camera SurfaceTexture transform (column-major, 16 floats) and upright aspect (w/h). */
+    external fun nativeSegmenterSetCameraTransform(handle: Long, stMatrix: FloatArray, cameraUprightAspect: Float)
+
+    /** Host output size the refined alpha resolution is derived from (long side clamped to [64,1280]). */
+    external fun nativeSegmenterSetAlphaTargetSize(handle: Long, outputWidthPx: Int, outputHeightPx: Int)
+
+    external fun nativeSegmenterSetFilterToggles(handle: Long, guidedFilter: Boolean, temporalStabilizer: Boolean)
+
+    /** GPU-downscales the latched frame of [cameraOesTexture] and packs normalized float RGB (NHWC) into [modelInput]. */
+    external fun nativeSegmenterDownscaleCameraToModelInput(handle: Long, cameraOesTexture: Int, modelInput: ByteBuffer): Boolean
+
+    /** Uploads a float32 single-channel mask (row 0 = top) as the coarse alpha texture. */
+    external fun nativeSegmenterUploadCoarseMask(handle: Long, mask: ByteBuffer, width: Int, height: Int): Boolean
+
+    /** Guided filter (+ optional temporal) of the coarse mask against [cameraOesTexture] luminance. */
+    external fun nativeSegmenterRefineAlpha(handle: Long, cameraOesTexture: Int): Boolean
+
+    /** R32F GL_NEAREST texture (quad space) holding the latest refined alpha; 0 until the first refine. */
+    external fun nativeSegmenterRefinedAlphaTextureId(handle: Long): Int
+    external fun nativeSegmenterAlphaWidth(handle: Long): Int
+    external fun nativeSegmenterAlphaHeight(handle: Long): Int
+
+    /** Forgets the current coarse mask / refined alpha / temporal history (textures are kept). */
+    external fun nativeSegmenterResetMaskState(handle: Long)
+
+    external fun nativeSegmenterStatsSummary(handle: Long): String
+    external fun nativeSegmenterLastError(handle: Long): String
 }

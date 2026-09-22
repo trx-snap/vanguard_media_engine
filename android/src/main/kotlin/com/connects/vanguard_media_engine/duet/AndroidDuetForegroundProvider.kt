@@ -15,12 +15,26 @@ import java.util.concurrent.atomic.AtomicBoolean
 // -----------------------------------------------------------------------------
 //
 // [AndroidDuetCameraForegroundProvider] wraps today's CameraX
-// (AndroidDuetCameraSource) + ImageAnalysis green-screen keying, consuming the
-// neutral, GreenScreen-owned filter node/selector/backend types directly
-// (AndroidGreenScreenFilterNode, AndroidGreenScreenImageProxyBackendSelector,
-// AndroidGreenScreenSegmentationBackend) behind [AndroidDuetForegroundProvider]
-// so AndroidDuetSessionCoordinator no longer owns camera/segmentation lifecycle
+// (AndroidDuetCameraSource) behind [AndroidDuetForegroundProvider] so
+// AndroidDuetSessionCoordinator no longer owns camera/segmentation lifecycle
 // directly. This is NOT the final straight-alpha/keyed-stream ingest contract.
+//
+// ANDROID-DUET-GPU-GREENSCREEN-SEGMENTER: the production greenScreen path is
+// GPU-resident. The camera is bound PREVIEW-ONLY into the backend-owned
+// camera surface (no ImageAnalysis use-case, no analyzer thread, no
+// AndroidGreenScreenFilterNode), and keying happens inside the GLES
+// compositor's own render pass (AndroidDuetPreviewCompositor +
+// GlesGreenScreenGpuSegmenter). This provider's job for that path is to
+// publish the application Context / model asset / event listener through
+// [AndroidDuetGpuGreenScreenSegmenterBinding] BEFORE asking the sink to enable
+// keying, and to translate the compositor's render-thread events into the
+// coordinator-facing readiness ([firstMaskReady] / onFirstMaskReady) and
+// terminal fallback (onFallback -> safe PiP) callbacks it already understands.
+//
+// The previous CameraX ImageAnalysis mask ladder (AndroidGreenScreenFilterNode
+// over AndroidGreenScreenImageProxyBackendSelector: mediapipe_cpu -> mlkit,
+// raw_tflite_gpu opt-in) is retained ONLY as an explicit debug lane
+// ([usesLegacyImageAnalysisPath]); it is never selected without a debug key.
 
 /**
  * Narrow sink interface covering exactly the methods the foreground provider
@@ -121,17 +135,20 @@ interface AndroidDuetForegroundProvider {
 }
 
 /**
- * Duet's camera-backed foreground provider: one [AndroidDuetCameraSource] plus
- * one [AndroidGreenScreenFilterNode] at a time, matching the behavior
- * previously inlined in AndroidDuetSessionCoordinator. Owns the segmentation
- * backend ladder debug policy (raw GPU delegate/model overrides, MediaPipe CPU
- * model override, backend latch) and forwards masks directly into the
+ * Duet's camera-backed foreground provider: one [AndroidDuetCameraSource]
+ * (preview-only by default) plus, for the production greenScreen path, one
+ * installed [AndroidDuetGpuGreenScreenSegmenterBinding.Config] whose listener
+ * feeds this provider's readiness/fallback state. The legacy debug lane keeps
+ * one [AndroidGreenScreenFilterNode] at a time with the segmentation backend
+ * ladder debug policy (raw GPU delegate/model overrides, MediaPipe CPU model
+ * override, backend latch) and forwards CPU masks into the
  * [AndroidDuetForegroundSink] supplied to [start].
  *
  * Main-thread only for start/setGreenScreenEnabled/stopKeying/stop, matching
  * AndroidDuetCameraSource and AndroidGreenScreenFilterNode's own threading
- * contracts. Mask/degrade/fallback callbacks from the filter node may arrive
- * off the analysis thread; this class hops them onto [mainHandler] before
+ * contracts. Events from the compositor's render thread (GPU path) and
+ * mask/degrade/fallback callbacks from the filter node (legacy lane) may
+ * arrive off the main thread; this class hops them onto [mainHandler] before
  * touching any state or invoking [AndroidDuetForegroundProviderCallbacks].
  */
 class AndroidDuetCameraForegroundProvider(
@@ -141,6 +158,22 @@ class AndroidDuetCameraForegroundProvider(
 
     companion object {
         private const val TAG = "DuetForegroundProvider"
+
+        /** Backend id reported for the production GPU-resident segmenter path. */
+        const val GPU_SEGMENTER_BACKEND_ID = "gpu_resident_tflite"
+
+        /**
+         * Explicit debug key selecting the legacy CameraX ImageAnalysis mask
+         * lane: `layoutConfigMap["debugGreenScreenMaskPath"] == "image_analysis"`.
+         * Any explicit `debugSegmentationBackend` (an ImageAnalysis ladder rung)
+         * or `debugPreviewBackend` (the Vulkan compositor, which only consumes
+         * CPU/HardwareBuffer masks) opt-in also selects that lane.
+         */
+        const val DEBUG_MASK_PATH_KEY = "debugGreenScreenMaskPath"
+        const val DEBUG_MASK_PATH_IMAGE_ANALYSIS = "image_analysis"
+
+        /** [AndroidDuetForegroundProvider.lastEnableFailureReason] token for a latched GPU segmenter failure. */
+        const val ENABLE_FAILURE_GPU_SEGMENTER_UNAVAILABLE = "gpu_segmenter_unavailable"
 
         /**
          * Allowlist for `layoutConfigMap["debugRawTfliteGpuDelegateMode"]`. Kept in
@@ -154,10 +187,41 @@ class AndroidDuetCameraForegroundProvider(
             "force_opencl",
             "force_opengl",
         )
+
+        /**
+         * True when [layoutConfigMap] explicitly opts into the legacy CameraX
+         * ImageAnalysis mask lane. Without any debug key the production
+         * GPU-resident segmenter path is used.
+         */
+        internal fun usesLegacyImageAnalysisPath(layoutConfigMap: Map<String, Any?>): Boolean {
+            if (layoutConfigMap[DEBUG_MASK_PATH_KEY] == DEBUG_MASK_PATH_IMAGE_ANALYSIS) return true
+            if ((layoutConfigMap["debugSegmentationBackend"] as? String) != null) return true
+            if ((layoutConfigMap["debugPreviewBackend"] as? String) != null) return true
+            return false
+        }
     }
 
     private var cameraSource: AndroidDuetCameraSource? = null
     private var greenScreenFilterNode: AndroidGreenScreenFilterNode? = null
+
+    // -- GPU-resident segmenter path state (main thread) ------------------------
+
+    /** Listener currently installed in [AndroidDuetGpuGreenScreenSegmenterBinding]; null when the GPU path is not enabled. */
+    private var gpuSegmenterListener: GpuSegmenterListener? = null
+
+    /**
+     * Latched for this provider's lifetime once the compositor reported the
+     * GPU segmenter unavailable (ES 3.1 missing, native/model bootstrap
+     * failure, inference disabled). A later enable on the GPU path then fails
+     * synchronously with [ENABLE_FAILURE_GPU_SEGMENTER_UNAVAILABLE] instead of
+     * re-triggering the same async fallback.
+     */
+    private var gpuSegmenterUnavailableReason: String? = null
+
+    /** Whether the most recent keying enable selected the GPU path (for [reportedBackendId]). */
+    private var lastMaskPathWasGpu = false
+
+    @Volatile private var gpuDelegateLabel: String? = null
 
     /**
      * One-way ladder latch. Set to the rung reached after a `green_screen_degraded`
@@ -204,12 +268,24 @@ class AndroidDuetCameraForegroundProvider(
         val camSource = AndroidDuetCameraSource(ctx)
         cameraSource = camSource
 
-        // When the initial/effective layout mode is greenScreen, create and start
-        // the adapter NOW — before the camera bind — so ImageAnalysis is part of
-        // the first use-case set.
-        val analyzerForBind: ImageAnalysis.Analyzer? = if (mode == "greenScreen") {
+        val legacyLane = mode == "greenScreen" && usesLegacyImageAnalysisPath(layoutConfigMap)
+        val gpuLane = mode == "greenScreen" && !legacyLane
+        if (mode == "greenScreen") {
+            Log.i(
+                TAG,
+                "ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED " +
+                    "path=${if (gpuLane) "gpu_segmenter" else "image_analysis"} stage=start",
+            )
+        }
+
+        // Legacy debug lane only: create and start the ImageAnalysis adapter
+        // NOW — before the camera bind — so ImageAnalysis is part of the first
+        // use-case set. The production GPU lane binds preview-only and installs
+        // the compositor binding instead (no analyzer, no analysis thread).
+        val analyzerForBind: ImageAnalysis.Analyzer? = if (legacyLane) {
             buildGreenScreenFilterNode(layoutConfigMap)
         } else null
+        if (gpuLane) installGpuSegmenterBinding(ctx)
 
         camSource.start(
             targetSurface = surface,
@@ -218,7 +294,7 @@ class AndroidDuetCameraForegroundProvider(
                 this.sink?.setCameraFrameTransform(rotationDegrees, mirrorHorizontal)
             },
             onStarted = {
-                if (mode == "greenScreen" && greenScreenFilterNode != null) {
+                if (mode == "greenScreen" && (greenScreenFilterNode != null || gpuSegmenterListener != null)) {
                     this.sink?.setGreenScreenEnabled(true)
                 }
                 callbacks.onStarted()
@@ -230,8 +306,10 @@ class AndroidDuetCameraForegroundProvider(
                 if (cameraSource === camSource) {
                     cameraSource = null
                     // Always stop the adapter properly before clearing the ref,
-                    // to avoid leaking the ML Kit Segmenter.
+                    // to avoid leaking the ML Kit Segmenter; and drop the GPU
+                    // binding so the compositor cannot report into a dead start.
                     stopGreenScreenFilterNodeInternal()
+                    uninstallGpuSegmenterBinding()
                 }
                 callbacks.onError(e)
             },
@@ -241,29 +319,67 @@ class AndroidDuetCameraForegroundProvider(
     override fun setGreenScreenEnabled(enabled: Boolean, layoutConfigMap: Map<String, Any?>): Boolean {
         val currentSink = sink
         if (enabled) {
-            if (greenScreenFilterNode == null) {
-                val filterNode = buildGreenScreenFilterNode(layoutConfigMap)
-                if (filterNode == null) {
-                    Log.w(TAG, "buildGreenScreenFilterNode returned null — cannot enable green screen")
-                    _lastEnableFailureReason = "adapter_creation_failed"
-                    return false
+            if (usesLegacyImageAnalysisPath(layoutConfigMap)) {
+                Log.i(TAG, "ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED path=image_analysis stage=enable")
+                // Switching lanes: a GPU binding from a previous enable must not
+                // stay installed while the CPU mask lane drives the compositor.
+                uninstallGpuSegmenterBinding()
+                lastMaskPathWasGpu = false
+                if (greenScreenFilterNode == null) {
+                    val filterNode = buildGreenScreenFilterNode(layoutConfigMap)
+                    if (filterNode == null) {
+                        Log.w(TAG, "buildGreenScreenFilterNode returned null — cannot enable green screen")
+                        _lastEnableFailureReason = "adapter_creation_failed"
+                        return false
+                    }
+                    // Hot-rebind: camera is already running, add ImageAnalysis.
+                    val bound = cameraSource?.setAnalysisAnalyzer(filterNode) ?: false
+                    if (!bound) {
+                        Log.w(TAG, "setAnalysisAnalyzer failed during greenScreen switch")
+                        stopGreenScreenFilterNodeInternal()
+                        _lastEnableFailureReason = "bind_failed"
+                        return false
+                    }
                 }
-                // Hot-rebind: camera is already running, add ImageAnalysis.
-                val bound = cameraSource?.setAnalysisAnalyzer(filterNode) ?: false
-                if (!bound) {
-                    Log.w(TAG, "setAnalysisAnalyzer failed during greenScreen switch")
-                    stopGreenScreenFilterNodeInternal()
-                    _lastEnableFailureReason = "bind_failed"
-                    return false
-                }
+                currentSink?.setGreenScreenEnabled(true)
+                return true
             }
+
+            // Production GPU-resident lane.
+            Log.i(TAG, "ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED path=gpu_segmenter stage=enable")
+            val unavailable = gpuSegmenterUnavailableReason
+            if (unavailable != null) {
+                Log.w(TAG, "GPU green-screen segmenter latched unavailable ($unavailable) — cannot enable green screen")
+                _lastEnableFailureReason = ENABLE_FAILURE_GPU_SEGMENTER_UNAVAILABLE
+                return false
+            }
+            val ctx = context
+            if (ctx == null || cameraSource == null) {
+                // Mirrors the legacy "no camera source yet" bind failure so the
+                // coordinator applies the same safe-PiP fallback.
+                Log.w(TAG, "GPU green-screen enable without context/camera source — bind_failed")
+                _lastEnableFailureReason = "bind_failed"
+                return false
+            }
+            // Switching lanes: retire a legacy adapter from a previous debug
+            // enable (its ImageAnalysis use-case goes with it; the preview-only
+            // camera continues).
+            if (greenScreenFilterNode != null) {
+                cameraSource?.setAnalysisAnalyzer(null)
+                stopGreenScreenFilterNodeInternal()
+            }
+            installGpuSegmenterBinding(ctx)
             currentSink?.setGreenScreenEnabled(true)
             return true
         }
-        // Switching away from greenScreen: remove analysis use-case, stop
-        // the filter node, disable compositor. Camera Preview continues.
-        cameraSource?.setAnalysisAnalyzer(null)
-        stopGreenScreenFilterNodeInternal()
+        // Switching away from greenScreen: remove the analysis use-case only
+        // when one was bound (legacy lane), stop the filter node, drop the GPU
+        // binding, disable compositor. Camera Preview continues untouched.
+        if (greenScreenFilterNode != null) {
+            cameraSource?.setAnalysisAnalyzer(null)
+            stopGreenScreenFilterNodeInternal()
+        }
+        uninstallGpuSegmenterBinding()
         currentSink?.setGreenScreenEnabled(false)
         return true
     }
@@ -272,9 +388,11 @@ class AndroidDuetCameraForegroundProvider(
 
     override fun stopKeying() {
         stopGreenScreenFilterNodeInternal()
+        uninstallGpuSegmenterBinding()
     }
 
     override fun stop() {
+        uninstallGpuSegmenterBinding()
         val camSource = cameraSource ?: return
         camSource.stop()
         cameraSource = null
@@ -282,8 +400,114 @@ class AndroidDuetCameraForegroundProvider(
 
     override fun reportedBackendId(): String =
         greenScreenFilterNode?.currentBackendId
+            ?: (if (gpuSegmenterListener != null || lastMaskPathWasGpu) GPU_SEGMENTER_BACKEND_ID else null)
             ?: greenScreenLatchedBackendId
             ?: AndroidGreenScreenImageProxyBackendSelector(context).primaryBackendId()
+
+    // ── GPU-resident segmenter binding ─────────────────────────────────────────
+
+    /**
+     * Publishes (or refreshes) this provider's configuration for the
+     * compositor's GPU segmenter. Idempotent while a live listener exists;
+     * otherwise installs a fresh listener so events from any previous enable
+     * (already closed) are ignored. Must precede the sink enable.
+     */
+    private fun installGpuSegmenterBinding(ctx: Context) {
+        lastMaskPathWasGpu = true
+        val existing = gpuSegmenterListener
+        if (existing != null && !existing.closed) {
+            val current = AndroidDuetGpuGreenScreenSegmenterBinding.config
+            if (current == null || current.listener !== existing) {
+                AndroidDuetGpuGreenScreenSegmenterBinding.config = AndroidDuetGpuGreenScreenSegmenterBinding.Config(
+                    context = ctx,
+                    modelAssetPath = AndroidDuetGpuGreenScreenSegmenterBinding.DEFAULT_MODEL_ASSET,
+                    listener = existing,
+                )
+            }
+            return
+        }
+        val listener = GpuSegmenterListener()
+        gpuSegmenterListener = listener
+        _firstMaskReady = false
+        AndroidDuetGpuGreenScreenSegmenterBinding.config = AndroidDuetGpuGreenScreenSegmenterBinding.Config(
+            context = ctx,
+            modelAssetPath = AndroidDuetGpuGreenScreenSegmenterBinding.DEFAULT_MODEL_ASSET,
+            listener = listener,
+        )
+        Log.d(TAG, "GPU green-screen segmenter binding installed (model=${AndroidDuetGpuGreenScreenSegmenterBinding.DEFAULT_MODEL_ASSET})")
+    }
+
+    /**
+     * Closes the live listener (late render-thread events become no-ops) and
+     * clears the process-wide config only if it is still ours. Idempotent.
+     * Resets [firstMaskReady] so a rebuilt keying pass must deliver a fresh
+     * first mask, exactly like [stopGreenScreenFilterNodeInternal].
+     */
+    private fun uninstallGpuSegmenterBinding() {
+        val listener = gpuSegmenterListener ?: return
+        listener.closed = true
+        gpuSegmenterListener = null
+        val current = AndroidDuetGpuGreenScreenSegmenterBinding.config
+        if (current != null && current.listener === listener) {
+            AndroidDuetGpuGreenScreenSegmenterBinding.config = null
+        }
+        _firstMaskReady = false
+        Log.d(TAG, "GPU green-screen segmenter binding uninstalled")
+    }
+
+    /**
+     * Render-thread events from the compositor, hopped onto [mainHandler].
+     * [closed] is flipped by [uninstallGpuSegmenterBinding]; every landing
+     * re-checks it and that this listener is still the provider's live one.
+     */
+    private inner class GpuSegmenterListener : AndroidDuetGpuGreenScreenSegmenterBinding.Listener {
+        @Volatile var closed = false
+
+        override fun onSegmenterReady(delegateLabel: String) {
+            if (closed) return
+            gpuDelegateLabel = delegateLabel
+        }
+
+        override fun onFirstMask() {
+            if (closed) return
+            mainHandler.post { handleGpuFirstMask(this) }
+        }
+
+        override fun onSegmenterUnavailable(reason: String) {
+            if (closed) return
+            mainHandler.post { handleGpuSegmenterUnavailable(this, reason) }
+        }
+    }
+
+    /** Same staleness gating as [handleFirstMask]: only the live listener may release a parked start. */
+    private fun handleGpuFirstMask(listener: GpuSegmenterListener) {
+        if (listener.closed || gpuSegmenterListener !== listener) return
+        if (_firstMaskReady) return
+        _firstMaskReady = true
+        Log.i(TAG, "ANDROID_DUET_GPU_GREENSCREEN_FIRST_MASK_READY delegate=${gpuDelegateLabel ?: "unknown"}")
+        callbacks?.onFirstMaskReady()
+    }
+
+    /**
+     * Terminal for this provider: latches the reason (a later GPU enable fails
+     * synchronously) and, when the listener is still live, reports the same
+     * terminal fallback the legacy ladder reports when it is exhausted, so the
+     * coordinator applies its existing safe-PiP fallback. The compositor has
+     * already stopped drawing the camera layer (source stays visible).
+     */
+    private fun handleGpuSegmenterUnavailable(listener: GpuSegmenterListener, reason: String) {
+        gpuSegmenterUnavailableReason = reason
+        if (listener.closed || gpuSegmenterListener !== listener) {
+            Log.d(TAG, "GPU green-screen segmenter unavailable from a stale listener latched ($reason) without event")
+            return
+        }
+        Log.w(TAG, "[GreenScreen fallback] $GPU_SEGMENTER_BACKEND_ID->none ($reason)")
+        callbacks?.onFallback(
+            GPU_SEGMENTER_BACKEND_ID,
+            reason,
+            "Green screen unavailable. Switched to Picture-in-Picture",
+        )
+    }
 
     // ── Filter node lifecycle ─────────────────────────────────────────────────
 

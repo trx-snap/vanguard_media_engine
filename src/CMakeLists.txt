@@ -240,6 +240,14 @@ add_library(vanguard_render_gles STATIC
     # AndroidGreenScreenGpuResidentPreviewBackend.kt through
     # android_greenscreen_gpu_resident_jni.cpp. TFLite stays in Kotlin.
     "render/gles/src/gles_green_screen_gpu_resident_renderer.cpp"
+    # ANDROID-GREENSCREEN-GPU-SEGMENTER: caller-agnostic segmentation core
+    # (model-input downscale, coarse mask upload, guided/optional temporal
+    # refinement into an R32F alpha texture) extracted from the renderer above
+    # for host compositors that own their own EGL context, camera OES texture
+    # and final draw (AndroidDuetPreviewCompositor's greenScreen mode). Owns no
+    # EGL/window/swap/background state; reuses the shared compute shader
+    # sources. Driven through android_greenscreen_gpu_resident_jni.cpp.
+    "render/gles/src/gles_green_screen_gpu_segmenter.cpp"
 )
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
@@ -247,6 +255,9 @@ target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vangua
 # input, float mask -> R8) is NEON/scalar hot-loop code; keep it optimized in
 # every build type like the audio hot paths above.
 set_source_files_properties("render/gles/src/gles_green_screen_gpu_resident_renderer.cpp"
+    PROPERTIES COMPILE_FLAGS "-O3")
+# Same NEON/scalar packing hot loops in the embeddable segmenter.
+set_source_files_properties("render/gles/src/gles_green_screen_gpu_segmenter.cpp"
     PROPERTIES COMPILE_FLAGS "-O3")
 
 
@@ -593,6 +604,10 @@ if (ANDROID)
     # GlesGreenScreenGpuResidentRenderer; borrowed output Surface ->
     # ANativeWindow, direct-buffer model input / mask exchange). Called from
     # AndroidGreenScreenGpuResidentPreviewBackend on the GreenScreen render thread.
+    # ANDROID-GREENSCREEN-GPU-SEGMENTER: the same translation unit also exports
+    # the nativeSegmenter* surface over GlesGreenScreenGpuSegmenter (separate
+    # handle registry, no EGL ownership) used by AndroidDuetPreviewCompositor
+    # inside its own ES 3.1 context on the Duet render thread.
     "platform/android/src/android_greenscreen_gpu_resident_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")

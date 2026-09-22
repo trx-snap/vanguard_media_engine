@@ -1,16 +1,25 @@
 package com.connects.vanguard_media_engine.duet
 
+import android.content.Context
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
+import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.Matrix
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.greenscreen.AndroidGreenScreenGpuResidentNativeBridge
+import org.tensorflow.lite.DataType
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.gpu.GpuDelegateFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -48,6 +57,78 @@ import kotlin.math.roundToInt
 // cross-thread touch points are the SurfaceTexture frame-available callback
 // (which may fire on any looper and therefore only sets [framePending]) and
 // the decoder writing into [decoderInputSurface] on the decoder thread.
+//
+// ANDROID-DUET-GPU-GREENSCREEN-SEGMENTER: greenScreen mode no longer depends
+// on a CameraX ImageAnalysis mask stream by default. When the foreground
+// provider installs an [AndroidDuetGpuGreenScreenSegmenterBinding.Config]
+// before enabling keying, this compositor runs the committed GPU-resident
+// segmentation core (GlesGreenScreenGpuSegmenter, reached through
+// AndroidGreenScreenGpuResidentNativeBridge.nativeSegmenter*) INSIDE its own
+// render pass, on this render thread, in this EGL context (upgraded to ES 3.1
+// when the device supports it), sampling the already-latched
+// [cameraOesTextureId] through [cameraStMatrix]:
+//   latch camera frame N -> native downscale -> Interpreter.run (GpuDelegate)
+//   -> native coarse mask upload -> native guided-filter refine
+//   -> (existing) source-video / static background draw
+//   -> (existing) axis-aligned / free-rotated camera quad, keyed by the
+//      refined R32F alpha texture instead of a CPU-uploaded LUMINANCE mask.
+// Nothing about the source-video decoder ingest, PiP/split drawing, output
+// surface lifecycle or the free-transform geometry changes. Without an
+// installed config (explicit debug opt-in only) the legacy CPU-mask path
+// through [updateGreenScreenMask] keeps working unchanged.
+//
+// Fail-closed policy: if the context is not ES 3.1, the native segmenter or
+// the TFLite session cannot be created, or inference fails repeatedly, the
+// camera layer is simply not drawn (source video stays visible, exactly the
+// pre-existing "no mask => background only" invariant) and the installed
+// listener is told once so the provider can drive the existing PiP fallback.
+
+/**
+ * Process-wide hand-off between the main-thread foreground provider (which
+ * owns the application Context, the model asset policy and the
+ * coordinator-facing readiness / fallback callbacks) and the render-thread
+ * [AndroidDuetPreviewCompositor] (which owns the GPU segmenter, the TFLite
+ * session and the frame transaction). The compositor is constructed by
+ * [AndroidDuetPreviewBackendFactory] without a Context and is only reachable
+ * through the [AndroidDuetPreviewBackend] contract, so the provider publishes
+ * its configuration here BEFORE it asks the sink to enable keying; the
+ * compositor latches the current [config] on the render thread inside
+ * [AndroidDuetPreviewCompositor.setGreenScreenEnabled] (`true`). Only the
+ * application Context is ever stored (never an Activity). A `null` config at
+ * enable time selects the legacy CPU-mask path.
+ *
+ * Listener calls are made on the compositor's render thread; implementations
+ * must hop to their own thread and must tolerate late calls after they have
+ * been uninstalled.
+ */
+object AndroidDuetGpuGreenScreenSegmenterBinding {
+
+    /** RND-proven single-channel selfie segmenter (float32 NHWC [1,256,256,3] -> [1,256,256,1]). */
+    const val DEFAULT_MODEL_ASSET = "selfie_segmenter_gpu.tflite"
+
+    interface Listener {
+        /** Native segmenter + TFLite session are live; [delegateLabel] is "gpu:*" or "cpu_xnnpack". */
+        fun onSegmenterReady(delegateLabel: String)
+
+        /** First refined alpha of the current enable is available to the draw. */
+        fun onFirstMask()
+
+        /** Terminal for the current enable: no alpha will be produced; [reason] is a stable token. */
+        fun onSegmenterUnavailable(reason: String)
+    }
+
+    class Config(
+        context: Context,
+        val modelAssetPath: String,
+        val listener: Listener,
+    ) {
+        /** Always the application Context (never an Activity), so holding it process-wide leaks nothing. */
+        val applicationContext: Context = context.applicationContext ?: context
+    }
+
+    @Volatile
+    var config: Config? = null
+}
 
 class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
@@ -85,6 +166,19 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         // unchanged pixel output) is used instead of the rotated-quad path.
         private const val ROTATION_EPSILON_DEGREES = 1e-4
 
+        // -- GPU green-screen segmenter policy (same RND defaults as
+        //    AndroidGreenScreenGpuResidentPreviewBackend) ------------------------
+
+        /** RND defaults (gl_renderer.h): guided filter on, temporal off, despill on. */
+        private const val GPU_GUIDED_FILTER_ENABLED = true
+        private const val GPU_TEMPORAL_STABILIZER_ENABLED = false
+        private const val GPU_DESPILL_ENABLED = true
+
+        /** After this many consecutive segmentation failures the GPU path stops for this enable. */
+        private const val GPU_MAX_CONSECUTIVE_INFERENCE_FAILURES = 3
+
+        private const val GPU_CPU_FALLBACK_THREADS = 4
+
         /** Normalizes any integer degrees to a cardinal 0/90/180/270 value; anything else maps to 0. */
         private fun normalizeRotationDegrees(degrees: Int): Int {
             return when (((degrees % 360) + 360) % 360) {
@@ -110,6 +204,17 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private var eglWindowSurface: EGLSurface = EGL14.EGL_NO_SURFACE
 
     private var coreReady = false
+
+    /**
+     * OpenGL ES version the bootstrapped context actually reports (parsed
+     * from GL_VERSION). [ensureCore] asks for ES 3.1 first (needed by the GPU
+     * segmenter's compute passes), then plain ES 3, then the historical ES 2
+     * request; every existing ES 2 shader/draw in this file runs unchanged on
+     * any of them. [computeCapable] is true only for 3.1+.
+     */
+    private var glesMajor = 0
+    private var glesMinor = 0
+    private var computeCapable = false
 
     // -- Decoder ingest (survives output loss, dies only in release) ----------
 
@@ -264,6 +369,82 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private var latestMaskWidth = 0
     private var latestMaskHeight = 0
 
+    // -- GPU green-screen segmenter state (render-thread only) ----------------
+
+    /** Interpreter + delegate + direct tensor buffers, created on the render thread. */
+    private class GpuModelSession(
+        val interpreter: Interpreter,
+        val gpuDelegate: GpuDelegate?,
+        val inputBuffer: ByteBuffer,
+        val outputBuffer: ByteBuffer,
+        val inputWidth: Int,
+        val inputHeight: Int,
+        val maskWidth: Int,
+        val maskHeight: Int,
+        val delegateLabel: String,
+        val inputShape: String,
+        val outputShape: String,
+    ) {
+        fun closeQuietly() {
+            try { interpreter.close() } catch (_: Throwable) {}
+            try { gpuDelegate?.close() } catch (_: Throwable) {}
+        }
+    }
+
+    private val gpuBridge = AndroidGreenScreenGpuResidentNativeBridge
+
+    /**
+     * Provider-installed configuration latched by [setGreenScreenEnabled]
+     * (`true`) from [AndroidDuetGpuGreenScreenSegmenterBinding.config]. Non-null
+     * means "this enable uses the GPU segmenter"; null means the legacy
+     * CPU-mask path ([updateGreenScreenMask] -> [maskTextureId]).
+     */
+    private var gpuConfig: AndroidDuetGpuGreenScreenSegmenterBinding.Config? = null
+
+    /** Native GlesGreenScreenGpuSegmenter handle living in THIS EGL context. 0 = not created. */
+    private var gpuSegmenterHandle = 0L
+    private var gpuModel: GpuModelSession? = null
+    private var gpuSegmenterReady = false
+
+    /** Latched for the compositor's lifetime once bootstrap fails (no per-frame retry storm). */
+    private var gpuSegmenterFailed = false
+    private var gpuSegmenterFailureReason: String? = null
+
+    /** Per-enable one-shot latches for the listener notifications. */
+    private var gpuUnavailableNotified = false
+    private var gpuFirstMaskSignaled = false
+
+    /** True once the current enable has a refined alpha texture the draw may use. */
+    private var gpuHasRefinedAlpha = false
+    private var gpuAlphaTextureId = 0
+    private var gpuAlphaWidth = 0
+    private var gpuAlphaHeight = 0
+
+    private var gpuInferenceDisabled = false
+    private var gpuConsecutiveInferenceFailures = 0
+
+    /** GLES 3.00 program: OES camera keyed by the refined R32F alpha (port of the GPU-resident composite). */
+    private var gpuMaskedProgram = 0
+    private var gpuAPositionLoc = -1
+    private var gpuATexCoordLoc = -1
+    private var gpuUSTMatrixLoc = -1
+    private var gpuSCameraLoc = -1
+    private var gpuUAlphaLoc = -1
+    private var gpuUAlphaResolutionLoc = -1
+    private var gpuUDespillLoc = -1
+    private var gpuUDebugViewLoc = -1
+    private var gpuMaskedProgramFailed = false
+
+    // GPU segmenter telemetry (render-thread only).
+    private var gpuFrameCount = 0L
+    private var gpuInferenceCount = 0L
+    private var gpuInferenceFailureCount = 0L
+    private var gpuTotalInferenceNs = 0L
+    private var gpuMaxInferenceNs = 0L
+    private var gpuFirstInferenceLogged = false
+    private var gpuSessionStartMs = 0L
+    private var loggedMaskPath = false
+
     // -- Green-screen static background GL state -------------------------------
 
     /** Current background spec. Render-thread only; default preserves prior behavior. */
@@ -350,6 +531,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             outputSurface = surface
             outputWidthPx = widthPx
             outputHeightPx = heightPx
+            // The refined alpha resolution derives from the output size; keep
+            // the (possibly already created) segmenter in step on re-attach.
+            if (gpuSegmenterHandle != 0L) {
+                try { gpuBridge.nativeSegmenterSetAlphaTargetSize(gpuSegmenterHandle, widthPx, heightPx) } catch (_: Throwable) {}
+            }
             return true
         } catch (t: Throwable) {
             Log.w(TAG, "attachOutputSurface threw: ${t.message}")
@@ -413,6 +599,14 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     /**
      * Enable or disable green-screen compositing. Must be called on the render thread.
      * When disabled, the camera rect reverts to normal PiP/split drawing behaviour.
+     *
+     * Enabling latches the provider-installed
+     * [AndroidDuetGpuGreenScreenSegmenterBinding.config] for this enable: a
+     * non-null config selects the GPU segmenter path (bootstrapped lazily on
+     * the next [drawFrame]); null keeps the legacy CPU-mask path. Disabling
+     * forgets every mask (legacy texture flag and GPU refined alpha / temporal
+     * history) so a later re-enable never composites a stale matte, but keeps
+     * the segmenter, model session and GL objects alive for a cheap re-enable.
      */
     override fun setGreenScreenEnabled(enabled: Boolean) {
         greenScreenEnabled = enabled
@@ -424,7 +618,25 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             lastUploadedMaskBackend = null
             latestMaskWidth = 0
             latestMaskHeight = 0
+            // GPU path: forget the matte for this enable; resources survive.
+            gpuHasRefinedAlpha = false
+            gpuAlphaTextureId = 0
+            if (gpuSegmenterHandle != 0L) {
+                try { gpuBridge.nativeSegmenterResetMaskState(gpuSegmenterHandle) } catch (_: Throwable) {}
+            }
+            gpuConfig = null
+            return
         }
+        gpuConfig = AndroidDuetGpuGreenScreenSegmenterBinding.config
+        gpuUnavailableNotified = false
+        gpuFirstMaskSignaled = false
+        gpuHasRefinedAlpha = false
+        gpuAlphaTextureId = 0
+        // A fresh enable gets a fresh failure budget; a bootstrap failure
+        // ([gpuSegmenterFailed]) stays latched because it cannot recover.
+        gpuInferenceDisabled = false
+        gpuConsecutiveInferenceFailures = 0
+        loggedMaskPath = false
     }
 
     /**
@@ -513,18 +725,37 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             }
 
             // Latch camera frame if one arrived since last draw.
+            var latchedNewCameraFrame = false
             val camSt = cameraSurfaceTexture
             if (camSt != null && cameraFramePending.compareAndSet(true, false)) {
                 camSt.updateTexImage()
                 camSt.getTransformMatrix(cameraStMatrix)
                 hasCameraTexImage = true
+                latchedNewCameraFrame = true
             }
 
-            // Upload latest mask texture when green-screen is active.
+            // Green-screen mask production for this frame:
+            //  - GPU segmenter path (provider-installed config): one same-frame
+            //    transaction over exactly the camera frame latched above
+            //    (downscale -> Interpreter.run -> coarse upload -> refine), all
+            //    in this context on this thread, BEFORE any draw of the frame.
+            //  - Legacy path (no config, explicit debug opt-in): upload the
+            //    latest CPU mask delivered through updateGreenScreenMask.
             if (greenScreenEnabled) {
-                val maskFrame = pendingMaskRef.getAndSet(null)
-                if (maskFrame != null) {
-                    uploadMaskTexture(maskFrame)
+                if (gpuConfig != null) {
+                    logMaskPathOnce("gpu_segmenter")
+                    if (ensureGpuSegmenter()) {
+                        gpuFrameCount++
+                        if (latchedNewCameraFrame && !gpuInferenceDisabled) {
+                            runGpuSegmentationOnLatchedFrame()
+                        }
+                    }
+                } else {
+                    logMaskPathOnce("image_analysis")
+                    val maskFrame = pendingMaskRef.getAndSet(null)
+                    if (maskFrame != null) {
+                        uploadMaskTexture(maskFrame)
+                    }
                 }
             }
 
@@ -551,9 +782,12 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             val cr = cameraRect
             if (cr != null) {
                 if (greenScreenEnabled) {
-                    // Green-screen: only draw when both camera OES and mask are ready.
-                    // Source remains visible underneath (drawn above); no opaque fill.
-                    if (hasCameraTexImage && hasMaskTexture) {
+                    // Green-screen: only draw when both camera OES and a mask
+                    // (GPU refined alpha, or the legacy CPU mask texture) are
+                    // ready. Source remains visible underneath (drawn above);
+                    // no opaque fill.
+                    val maskReady = if (gpuConfig != null) gpuHasRefinedAlpha else hasMaskTexture
+                    if (hasCameraTexImage && maskReady) {
                         drawCameraGreenScreen(cr)
                     }
                     // else: source remains visible, invariant satisfied.
@@ -592,9 +826,15 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         destroyWindowSurfaceQuietly()
         outputSurface = null
 
+        logGpuSegmenterReleaseSummary()
+
         // GL object teardown needs the context current; pbuffer provides that.
         if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {
             makeCurrentQuietly(eglPbufferSurface)
+            // GPU segmenter first: interpreter/delegate, then the native
+            // segmenter's GL objects, then its draw program — all while this
+            // context is still alive and current.
+            teardownGpuSegmenterQuietly()
             try {
                 if (oesProgram != 0) GLES20.glDeleteProgram(oesProgram)
             } catch (_: Throwable) {}
@@ -691,37 +931,53 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             eglDisplay = display
 
             // PBUFFER bit alongside WINDOW so the same config backs both the
-            // bootstrap pbuffer and the output window surface.
-            val attribs = intArrayOf(
-                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT,
-                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
-                EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_NONE,
-            )
-            val configs = arrayOfNulls<EGLConfig>(1)
-            val numConfigs = IntArray(1)
-            if (!EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, numConfigs, 0) ||
-                numConfigs[0] < 1 || configs[0] == null
-            ) {
-                Log.w(TAG, "eglChooseConfig failed")
-                teardownCoreQuietly()
-                return false
+            // bootstrap pbuffer and the output window surface. ES 3 configs are
+            // preferred so the GPU green-screen segmenter can get an ES 3.1
+            // context; the historical ES 2 config/context request is the last
+            // rung, so a device without ES 3 support boots exactly as before.
+            var config: EGLConfig? = chooseConfig(display, EGLExt.EGL_OPENGL_ES3_BIT_KHR)
+            var context: EGLContext? = null
+            var requestedVersion = "none"
+            if (config != null) {
+                context = createContext(
+                    display, config,
+                    intArrayOf(
+                        EGLExt.EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
+                        EGLExt.EGL_CONTEXT_MINOR_VERSION_KHR, 1,
+                        EGL14.EGL_NONE,
+                    ),
+                )
+                requestedVersion = "3.1"
+                if (context == null) {
+                    context = createContext(
+                        display, config, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE),
+                    )
+                    requestedVersion = "3"
+                }
             }
-            val config = configs[0]!!
-            eglConfig = config
-
-            val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-            val context = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
-            if (context == null || context == EGL14.EGL_NO_CONTEXT) {
+            if (context == null) {
+                config = chooseConfig(display, EGL14.EGL_OPENGL_ES2_BIT)
+                if (config == null) {
+                    Log.w(TAG, "eglChooseConfig failed")
+                    teardownCoreQuietly()
+                    return false
+                }
+                context = createContext(
+                    display, config, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+                )
+                requestedVersion = "2"
+            }
+            val chosenConfig = config
+            if (context == null || chosenConfig == null) {
                 Log.w(TAG, "eglCreateContext failed")
                 teardownCoreQuietly()
                 return false
             }
+            eglConfig = chosenConfig
             eglContext = context
 
             val pbufferAttribs = intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE)
-            val pbuffer = EGL14.eglCreatePbufferSurface(display, config, pbufferAttribs, 0)
+            val pbuffer = EGL14.eglCreatePbufferSurface(display, chosenConfig, pbufferAttribs, 0)
             if (pbuffer == null || pbuffer == EGL14.EGL_NO_SURFACE) {
                 Log.w(TAG, "eglCreatePbufferSurface failed")
                 teardownCoreQuietly()
@@ -735,6 +991,14 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
                 return false
             }
 
+            recordGlesVersion()
+            Log.i(
+                TAG,
+                "ANDROID_DUET_PREVIEW_COMPOSITOR_EGL requested=$requestedVersion " +
+                    "gles=$glesMajor.$glesMinor computeCapable=$computeCapable " +
+                    "renderer=${GLES20.glGetString(GLES20.GL_RENDERER)}",
+            )
+
             setupOesProgram()
             setupDecoderIngest()
             setupCameraIngest()
@@ -746,6 +1010,57 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             teardownCoreQuietly()
             return false
         }
+    }
+
+    /** RGBA8 window|pbuffer config for [renderableType], or null when the display has none. */
+    private fun chooseConfig(display: EGLDisplay, renderableType: Int): EGLConfig? {
+        val attribs = intArrayOf(
+            EGL14.EGL_RENDERABLE_TYPE, renderableType,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT,
+            EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_NONE,
+        )
+        val configs = arrayOfNulls<EGLConfig>(1)
+        val numConfigs = IntArray(1)
+        val ok = try {
+            EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, numConfigs, 0)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!ok || numConfigs[0] < 1) return null
+        return configs[0]
+    }
+
+    /** Context for [config] with [contextAttribs], or null (never throws) when EGL rejects the request. */
+    private fun createContext(display: EGLDisplay, config: EGLConfig, contextAttribs: IntArray): EGLContext? {
+        val context = try {
+            EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
+        } catch (_: Throwable) {
+            null
+        }
+        if (context == null || context == EGL14.EGL_NO_CONTEXT) {
+            // Consume the error so a later, successful request starts clean.
+            try { EGL14.eglGetError() } catch (_: Throwable) {}
+            return null
+        }
+        return context
+    }
+
+    /**
+     * Parses "OpenGL ES <major>.<minor> ..." from GL_VERSION on the current
+     * context. GL_MAJOR_VERSION is an invalid enum on an ES 2 context, so the
+     * string form is the only query that is safe on every rung.
+     */
+    private fun recordGlesVersion() {
+        glesMajor = 0
+        glesMinor = 0
+        computeCapable = false
+        val version = try { GLES20.glGetString(GLES20.GL_VERSION) } catch (_: Throwable) { null } ?: return
+        val match = Regex("OpenGL ES (\\d+)\\.(\\d+)").find(version) ?: return
+        glesMajor = match.groupValues[1].toIntOrNull() ?: 0
+        glesMinor = match.groupValues[2].toIntOrNull() ?: 0
+        computeCapable = glesMajor > 3 || (glesMajor == 3 && glesMinor >= 1)
     }
 
     private fun setupDecoderIngest() {
@@ -1123,8 +1438,9 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         if (scissor.width <= 0 || scissor.height <= 0) return
         val viewport = cameraAspectFillViewport(rect)
 
-        ensureGreenScreenProgram()
-        if (greenScreenProgram == 0) return  // compilation failed; skip silently
+        // Program + uniforms + textures for the active mask path (GPU refined
+        // alpha or legacy CPU mask); compilation failure skips silently.
+        val attribs = bindGreenScreenMaterial() ?: return
 
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
@@ -1134,54 +1450,18 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-        GLES20.glUseProgram(greenScreenProgram)
-
-        // Debug-only (RND diagnostic): 0 = normal, 1 = mask_direct,
-        // 2 = mask_mapped, 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y,
-        // 5 = camera_passthrough.
-        val debugViewCode = when (greenScreenDebugView) {
-            "mask_direct" -> 1
-            "mask_mapped" -> 2
-            "mask_direct_mirror_x" -> 3
-            "mask_direct_flip_y" -> 4
-            "camera_passthrough" -> 5
-            else -> 0
-        }
-        GLES20.glUniform1i(gsUDebugViewLoc, debugViewCode)
-
-        // Mask texel size for the normal-mode erosion taps. Falls back to
-        // (1,1) when dimensions are not yet known (e.g. a draw racing ahead of
-        // the first upload): neighbour taps then clamp to the texture edge, so
-        // the shader degrades gracefully instead of reading garbage.
-        val maskTexelW = if (latestMaskWidth > 0) 1f / latestMaskWidth else 1f
-        val maskTexelH = if (latestMaskHeight > 0) 1f / latestMaskHeight else 1f
-        GLES20.glUniform2f(gsUMaskTexelSizeLoc, maskTexelW, maskTexelH)
-
-        // Texture unit 0: camera OES
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
-        GLES20.glUniform1i(gsSCameraLoc, 0)
-        GLES20.glUniformMatrix4fv(gsUSTMatrixLoc, 1, false, cameraStMatrix, 0)
-
-        // Texture unit 1: mask (2D LUMINANCE)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
-        GLES20.glUniform1i(gsUMaskLoc, 1)
-
         quadPositions.position(0)
-        GLES20.glEnableVertexAttribArray(gsAPositionLoc)
-        GLES20.glVertexAttribPointer(gsAPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
+        GLES20.glEnableVertexAttribArray(attribs.positionLoc)
+        GLES20.glVertexAttribPointer(attribs.positionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
         quadTexCoords.position(0)
-        GLES20.glEnableVertexAttribArray(gsATexCoordLoc)
-        GLES20.glVertexAttribPointer(gsATexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+        GLES20.glEnableVertexAttribArray(attribs.texCoordLoc)
+        GLES20.glVertexAttribPointer(attribs.texCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-        GLES20.glDisableVertexAttribArray(gsAPositionLoc)
-        GLES20.glDisableVertexAttribArray(gsATexCoordLoc)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glDisableVertexAttribArray(attribs.positionLoc)
+        GLES20.glDisableVertexAttribArray(attribs.texCoordLoc)
+        unbindGreenScreenMaterial()
 
         GLES20.glDisable(GLES20.GL_BLEND)
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
@@ -1211,8 +1491,9 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         val aspectRect = cameraAspectFillCanvasRect(rect)
         if (aspectRect.width <= 0.0 || aspectRect.height <= 0.0) return
 
-        ensureGreenScreenProgram()
-        if (greenScreenProgram == 0) return  // compilation failed; skip silently
+        // Program + uniforms + textures for the active mask path (GPU refined
+        // alpha or legacy CPU mask); compilation failure skips silently.
+        val attribs = bindGreenScreenMaterial() ?: return
 
         val pivotX = rect.left + foregroundAnchorX * rect.width
         val pivotY = rect.top + foregroundAnchorY * rect.height
@@ -1250,18 +1531,64 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
+        rotatedQuadPositions.position(0)
+        GLES20.glEnableVertexAttribArray(attribs.positionLoc)
+        GLES20.glVertexAttribPointer(attribs.positionLoc, 2, GLES20.GL_FLOAT, false, 0, rotatedQuadPositions)
+        quadTexCoords.position(0)
+        GLES20.glEnableVertexAttribArray(attribs.texCoordLoc)
+        GLES20.glVertexAttribPointer(attribs.texCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(attribs.positionLoc)
+        GLES20.glDisableVertexAttribArray(attribs.texCoordLoc)
+        unbindGreenScreenMaterial()
+
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+    }
+
+    // -- Green-screen camera material (shared by the axis-aligned and rotated draws) --
+
+    /** Vertex attribute locations of the bound green-screen program. */
+    private data class GreenScreenMaterialAttribs(val positionLoc: Int, val texCoordLoc: Int)
+
+    /**
+     * Debug-only (RND diagnostic) view code shared by both mask paths:
+     * 0 = normal, 1 = mask_direct, 2 = mask_mapped, 3 = mask_direct_mirror_x,
+     * 4 = mask_direct_flip_y, 5 = camera_passthrough.
+     */
+    private fun greenScreenDebugViewCode(): Int = when (greenScreenDebugView) {
+        "mask_direct" -> 1
+        "mask_mapped" -> 2
+        "mask_direct_mirror_x" -> 3
+        "mask_direct_flip_y" -> 4
+        "camera_passthrough" -> 5
+        else -> 0
+    }
+
+    /**
+     * Binds the program, uniforms and texture units for the camera draw of
+     * the active mask path (GPU refined alpha when a config is latched, else
+     * the legacy CPU mask) and returns its attribute locations, or null when
+     * the program is unavailable (the caller skips the draw silently, leaving
+     * the source video visible). Geometry, scissor/viewport and blending stay
+     * with the two callers; [unbindGreenScreenMaterial] must follow the draw.
+     */
+    private fun bindGreenScreenMaterial(): GreenScreenMaterialAttribs? =
+        if (gpuConfig != null) bindGpuGreenScreenMaterial() else bindLegacyGreenScreenMaterial()
+
+    private fun bindLegacyGreenScreenMaterial(): GreenScreenMaterialAttribs? {
+        ensureGreenScreenProgram()
+        if (greenScreenProgram == 0) return null  // compilation failed; skip silently
+
         GLES20.glUseProgram(greenScreenProgram)
+        GLES20.glUniform1i(gsUDebugViewLoc, greenScreenDebugViewCode())
 
-        val debugViewCode = when (greenScreenDebugView) {
-            "mask_direct" -> 1
-            "mask_mapped" -> 2
-            "mask_direct_mirror_x" -> 3
-            "mask_direct_flip_y" -> 4
-            "camera_passthrough" -> 5
-            else -> 0
-        }
-        GLES20.glUniform1i(gsUDebugViewLoc, debugViewCode)
-
+        // Mask texel size for the normal-mode erosion taps. Falls back to
+        // (1,1) when dimensions are not yet known (e.g. a draw racing ahead of
+        // the first upload): neighbour taps then clamp to the texture edge, so
+        // the shader degrades gracefully instead of reading garbage.
         val maskTexelW = if (latestMaskWidth > 0) 1f / latestMaskWidth else 1f
         val maskTexelH = if (latestMaskHeight > 0) 1f / latestMaskHeight else 1f
         GLES20.glUniform2f(gsUMaskTexelSizeLoc, maskTexelW, maskTexelH)
@@ -1276,24 +1603,614 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTextureId)
         GLES20.glUniform1i(gsUMaskLoc, 1)
+        return GreenScreenMaterialAttribs(gsAPositionLoc, gsATexCoordLoc)
+    }
 
-        rotatedQuadPositions.position(0)
-        GLES20.glEnableVertexAttribArray(gsAPositionLoc)
-        GLES20.glVertexAttribPointer(gsAPositionLoc, 2, GLES20.GL_FLOAT, false, 0, rotatedQuadPositions)
-        quadTexCoords.position(0)
-        GLES20.glEnableVertexAttribArray(gsATexCoordLoc)
-        GLES20.glVertexAttribPointer(gsATexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+    private fun bindGpuGreenScreenMaterial(): GreenScreenMaterialAttribs? {
+        if (gpuAlphaTextureId == 0) return null
+        ensureGpuMaskedProgram()
+        if (gpuMaskedProgram == 0) return null
 
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glUseProgram(gpuMaskedProgram)
+        GLES20.glUniform1i(gpuUDebugViewLoc, greenScreenDebugViewCode())
+        GLES20.glUniform2f(
+            gpuUAlphaResolutionLoc,
+            maxOf(gpuAlphaWidth, 1).toFloat(),
+            maxOf(gpuAlphaHeight, 1).toFloat(),
+        )
+        GLES20.glUniform1i(gpuUDespillLoc, if (GPU_DESPILL_ENABLED) 1 else 0)
 
-        GLES20.glDisableVertexAttribArray(gsAPositionLoc)
-        GLES20.glDisableVertexAttribArray(gsATexCoordLoc)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        // Texture unit 0: camera OES, sampled through the latched transform
+        // (the same matrix the segmenter used for this frame's alpha).
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraOesTextureId)
+        GLES20.glUniform1i(gpuSCameraLoc, 0)
+        GLES20.glUniformMatrix4fv(gpuUSTMatrixLoc, 1, false, cameraStMatrix, 0)
 
-        GLES20.glDisable(GLES20.GL_BLEND)
-        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        // Texture unit 1: refined alpha (R32F, NEAREST, quad space)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, gpuAlphaTextureId)
+        GLES20.glUniform1i(gpuUAlphaLoc, 1)
+        return GreenScreenMaterialAttribs(gpuAPositionLoc, gpuATexCoordLoc)
+    }
+
+    /** Unbinds the two texture units used by [bindGreenScreenMaterial] and returns to unit 0. */
+    private fun unbindGreenScreenMaterial() {
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+    }
+
+    /**
+     * Lazily compiles the GLES 3.00 program that keys the camera by the GPU
+     * segmenter's refined alpha. The fragment stage is the `maskedCamera`
+     * branch of the committed GPU-resident composite shader
+     * (gles_green_screen_gpu_resident_shaders.h): Hermite-interpolated alpha
+     * at uAlphaResolution, isotropic 8-point boundary contraction,
+     * smoothstep(0.05, 0.95) threshold and inward-normal despill, emitted as
+     * straight alpha so the existing SRC_ALPHA / ONE_MINUS_SRC_ALPHA blend
+     * over the already-drawn background is the same `mix(background,
+     * camera, compAlpha)` the standalone path computes in one pass. Camera UV
+     * policy is identical to the segmenter's passes: quadUv (raw quad texture
+     * coordinate, v=0 at the bottom) through the latched transform matrix;
+     * the alpha texture lives in that quad space and is sampled unflipped.
+     * A compile failure is terminal for the GPU path of this compositor.
+     */
+    private fun ensureGpuMaskedProgram() {
+        if (gpuMaskedProgram != 0 || gpuMaskedProgramFailed) return
+        val vertexSrc = """
+            #version 300 es
+            in vec4 aPosition;
+            in vec4 aTextureCoord;
+            out vec2 vQuadUv;
+            void main() {
+                gl_Position = aPosition;
+                vQuadUv = aTextureCoord.xy;
+            }
+        """.trimIndent()
+        val fragmentSrc = """
+            #version 300 es
+            #extension GL_OES_EGL_image_external_essl3 : require
+            precision highp float;
+            precision highp int;
+
+            in vec2 vQuadUv;
+            out vec4 fragColor;
+
+            uniform samplerExternalOES sCamera;
+            uniform sampler2D uAlphaTexture;
+            uniform vec2 uAlphaResolution;
+            uniform mat4 uSTMatrix;
+            uniform bool uDespillEnabled;
+            // Debug-only (RND diagnostic): 0 = normal, 1 = mask_direct,
+            // 2 = mask_mapped, 3 = mask_direct_mirror_x, 4 = mask_direct_flip_y,
+            // 5 = camera_passthrough.
+            uniform int uDebugView;
+
+            float getLuma(vec3 rgb) {
+                return dot(rgb, vec3(0.299, 0.587, 0.114));
+            }
+
+            vec2 camUvFor(vec2 quadUv) {
+                return (uSTMatrix * vec4(quadUv, 0.0, 1.0)).xy;
+            }
+
+            float sampleHermiteAlpha(vec2 uv) {
+                vec2 res = uAlphaResolution;
+                vec2 pos = uv * res - 0.5;
+                vec2 f = fract(pos);
+                vec2 p = (floor(pos) + 0.5) / res;
+                vec2 d = 1.0 / res;
+                // Cubic Hermite smoothstep for C1-continuous derivatives across texels.
+                vec2 s = f * f * (3.0 - 2.0 * f);
+                float a00 = texture(uAlphaTexture, p).r;
+                float a10 = texture(uAlphaTexture, p + vec2(d.x, 0.0)).r;
+                float a01 = texture(uAlphaTexture, p + vec2(0.0, d.y)).r;
+                float a11 = texture(uAlphaTexture, p + d).r;
+                return mix(mix(a00, a10, s.x), mix(a01, a11, s.x), s.y);
+            }
+
+            void main() {
+                vec2 uv = vQuadUv;
+                if (uDebugView == 5) {
+                    // camera_passthrough: raw live camera feed, no mask.
+                    fragColor = vec4(texture(sCamera, camUvFor(uv)).rgb, 1.0);
+                    return;
+                }
+                if (uDebugView != 0) {
+                    vec2 maskUv = uv;
+                    if (uDebugView == 2) maskUv = clamp(camUvFor(uv), 0.0, 1.0);
+                    else if (uDebugView == 3) maskUv = vec2(1.0 - uv.x, uv.y);
+                    else if (uDebugView == 4) maskUv = vec2(uv.x, 1.0 - uv.y);
+                    float rawAlpha = texture(uAlphaTexture, maskUv).r;
+                    fragColor = vec4(rawAlpha, rawAlpha, rawAlpha, 1.0);
+                    return;
+                }
+
+                vec3 cameraColor = texture(sCamera, camUvFor(uv)).rgb;
+                float alpha = sampleHermiteAlpha(uv);
+
+                // Isotropic 8-point anti-aliased boundary refinement (radius 1.5 alpha pixels).
+                vec2 px = 1.5 / uAlphaResolution;
+                float aN = sampleHermiteAlpha(uv + vec2(0.0, px.y));
+                float aS = sampleHermiteAlpha(uv - vec2(0.0, px.y));
+                float aE = sampleHermiteAlpha(uv + vec2(px.x, 0.0));
+                float aW = sampleHermiteAlpha(uv - vec2(px.x, 0.0));
+
+                vec2 dPx = px * 0.7071068;
+                float aNE = sampleHermiteAlpha(uv + vec2( dPx.x,  dPx.y));
+                float aNW = sampleHermiteAlpha(uv + vec2(-dPx.x,  dPx.y));
+                float aSE = sampleHermiteAlpha(uv + vec2( dPx.x, -dPx.y));
+                float aSW = sampleHermiteAlpha(uv + vec2(-dPx.x, -dPx.y));
+
+                float minCardinal = min(min(aN, aS), min(aE, aW));
+                float minDiagonal = min(min(aNE, aNW), min(aSE, aSW));
+                float isotropicMin = min(minCardinal, minDiagonal);
+
+                // Soft boundary contraction: pulls the boundary inward to remove light wall fringe.
+                float boundaryT = smoothstep(0.10, 0.85, alpha);
+                float softAlpha = mix(isotropicMin, alpha, boundaryT);
+
+                // Continuous sigmoidal threshold with C1 sub-pixel antialiasing.
+                float compAlpha = smoothstep(0.05, 0.95, softAlpha);
+
+                // Ambient wall light decontamination (despill) along the inward normal.
+                if (uDespillEnabled && compAlpha > 0.02 && compAlpha < 0.90) {
+                    vec2 grad = vec2(aE - aW, aN - aS);
+                    float gradLen = length(grad);
+                    if (gradLen > 0.001) {
+                        vec2 inDir = (grad / gradLen) * 3.0 * px;
+                        float inAlpha = sampleHermiteAlpha(uv + inDir);
+                        if (inAlpha > 0.70) {
+                            vec3 inCol = texture(sCamera, camUvFor(clamp(uv + inDir, 0.0, 1.0))).rgb;
+                            float inLuma = getLuma(inCol);
+                            float camLuma = getLuma(cameraColor);
+                            if (camLuma > inLuma * 1.05) {
+                                cameraColor = mix(cameraColor, inCol, (1.0 - compAlpha) * 0.70);
+                            }
+                        }
+                    }
+                }
+
+                fragColor = vec4(cameraColor, compAlpha);
+            }
+        """.trimIndent()
+        try {
+            val vs = compileShader(GLES20.GL_VERTEX_SHADER, vertexSrc)
+            val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSrc)
+            val prog = GLES20.glCreateProgram()
+            GLES20.glAttachShader(prog, vs)
+            GLES20.glAttachShader(prog, fs)
+            GLES20.glLinkProgram(prog)
+            GLES20.glDeleteShader(vs)
+            GLES20.glDeleteShader(fs)
+            val linkStatus = IntArray(1)
+            GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0)
+            if (linkStatus[0] == 0) {
+                val log = GLES20.glGetProgramInfoLog(prog)
+                GLES20.glDeleteProgram(prog)
+                throw IllegalStateException("GPU GS program link failed: $log")
+            }
+            gpuMaskedProgram = prog
+            gpuAPositionLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+            gpuATexCoordLoc = GLES20.glGetAttribLocation(prog, "aTextureCoord")
+            gpuUSTMatrixLoc = GLES20.glGetUniformLocation(prog, "uSTMatrix")
+            gpuSCameraLoc = GLES20.glGetUniformLocation(prog, "sCamera")
+            gpuUAlphaLoc = GLES20.glGetUniformLocation(prog, "uAlphaTexture")
+            gpuUAlphaResolutionLoc = GLES20.glGetUniformLocation(prog, "uAlphaResolution")
+            gpuUDespillLoc = GLES20.glGetUniformLocation(prog, "uDespillEnabled")
+            gpuUDebugViewLoc = GLES20.glGetUniformLocation(prog, "uDebugView")
+        } catch (t: Throwable) {
+            gpuMaskedProgramFailed = true
+            gpuMaskedProgram = 0
+            Log.w(TAG, "ANDROID_DUET_GPU_GREENSCREEN_MASKED_PROGRAM_FAILED ${t.message}")
+            notifyGpuSegmenterUnavailableOnce("masked_program_compile_failed")
+        }
+    }
+
+    // -- GPU green-screen segmenter (render thread, context current) -------------
+
+    private fun logMaskPathOnce(path: String) {
+        if (loggedMaskPath) return
+        loggedMaskPath = true
+        Log.i(TAG, "ANDROID_DUET_GREENSCREEN_MASK_PATH path=$path gles=$glesMajor.$glesMinor computeCapable=$computeCapable")
+    }
+
+    /**
+     * Lazy bootstrap of the GPU segmenter for the latched [gpuConfig], on the
+     * render thread with the window surface current (called from
+     * [drawFrame]): ES 3.1 gate, native segmenter in THIS context, TFLite
+     * interpreter (GPU delegate created right here so its GL backend binds to
+     * this context; CPU XNNPACK only if the delegate fails, mirroring
+     * AndroidGreenScreenGpuResidentPreviewBackend), tensor validation, model
+     * input configuration. Any failure is terminal for this compositor
+     * ([gpuSegmenterFailed]): everything partial is torn down, the camera
+     * layer stays undrawn (source visible) and the listener is told once per
+     * enable so the provider can apply the existing PiP fallback.
+     */
+    private fun ensureGpuSegmenter(): Boolean {
+        if (gpuSegmenterReady) return true
+        if (gpuSegmenterFailed) {
+            notifyGpuSegmenterUnavailableOnce(gpuSegmenterFailureReason ?: "segmenter_unavailable")
+            return false
+        }
+        val config = gpuConfig ?: return false
+        if (!computeCapable) {
+            failGpuSegmenterBootstrap("gles31_unavailable:$glesMajor.$glesMinor")
+            return false
+        }
+        if (cameraOesTextureId == 0) {
+            failGpuSegmenterBootstrap("camera_texture_missing")
+            return false
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        try {
+            val handle = gpuBridge.nativeSegmenterCreate()
+            if (handle == 0L) {
+                failGpuSegmenterBootstrap("native_segmenter_create_failed")
+                return false
+            }
+            gpuSegmenterHandle = handle
+
+            // Interpreter on this very thread with this context current: the
+            // GPU delegate's GL backend binds to the current context.
+            val session = openGpuModelSession(config)
+            gpuModel = session
+
+            if (!gpuBridge.nativeSegmenterConfigureModelInput(handle, session.inputWidth, session.inputHeight)) {
+                failGpuSegmenterBootstrap("model_input_configure_failed:" + gpuBridge.nativeSegmenterLastError(handle))
+                return false
+            }
+            gpuBridge.nativeSegmenterSetFilterToggles(handle, GPU_GUIDED_FILTER_ENABLED, GPU_TEMPORAL_STABILIZER_ENABLED)
+            gpuBridge.nativeSegmenterSetAlphaTargetSize(handle, outputWidthPx, outputHeightPx)
+            gpuBridge.nativeSegmenterSetCameraTransform(handle, cameraStMatrix, CAMERA_UPRIGHT_ASPECT.toFloat())
+
+            gpuSegmenterReady = true
+            gpuSessionStartMs = SystemClock.elapsedRealtime()
+            Log.i(
+                TAG,
+                "ANDROID_DUET_GPU_GREENSCREEN_SEGMENTER_READY delegate=${session.delegateLabel} " +
+                    "model=${config.modelAssetPath} input=${session.inputShape} output=${session.outputShape} " +
+                    "gles=$glesMajor.$glesMinor cameraTexture=$cameraOesTextureId " +
+                    "output=${outputWidthPx}x$outputHeightPx initMs=${SystemClock.elapsedRealtime() - t0}",
+            )
+            try { config.listener.onSegmenterReady(session.delegateLabel) } catch (_: Throwable) {}
+            return true
+        } catch (t: Throwable) {
+            failGpuSegmenterBootstrap("exception:${t.javaClass.simpleName}:${t.message}")
+            return false
+        }
+    }
+
+    private fun failGpuSegmenterBootstrap(reason: String) {
+        Log.w(TAG, "ANDROID_DUET_GPU_GREENSCREEN_SEGMENTER_INIT_FAILED reason=$reason")
+        teardownGpuSegmenterQuietly()
+        gpuSegmenterFailed = true
+        gpuSegmenterFailureReason = reason
+        notifyGpuSegmenterUnavailableOnce(reason)
+    }
+
+    /** Tells the latched config's listener once per enable that no alpha will be produced. */
+    private fun notifyGpuSegmenterUnavailableOnce(reason: String) {
+        if (gpuUnavailableNotified) return
+        gpuUnavailableNotified = true
+        val config = gpuConfig ?: return
+        try { config.listener.onSegmenterUnavailable(reason) } catch (_: Throwable) {}
+    }
+
+    /**
+     * One same-frame transaction for the camera frame latched by the caller:
+     * transform latch -> native downscale -> Interpreter.run -> native coarse
+     * mask upload -> native refine. Returns true when a new refined alpha is
+     * available. Every stage failure counts toward
+     * [GPU_MAX_CONSECUTIVE_INFERENCE_FAILURES]; reaching it disables the GPU
+     * path for this enable (camera layer not drawn, source stays visible) and
+     * notifies the listener once.
+     */
+    private fun runGpuSegmentationOnLatchedFrame(): Boolean {
+        val handle = gpuSegmenterHandle
+        val session = gpuModel ?: return false
+        if (handle == 0L || cameraOesTextureId == 0) return false
+
+        gpuBridge.nativeSegmenterSetCameraTransform(handle, cameraStMatrix, CAMERA_UPRIGHT_ASPECT.toFloat())
+
+        val tDownscale = SystemClock.elapsedRealtimeNanos()
+        session.inputBuffer.rewind()
+        if (!gpuBridge.nativeSegmenterDownscaleCameraToModelInput(handle, cameraOesTextureId, session.inputBuffer)) {
+            return recordGpuSegmentationFailure("downscale", gpuBridge.nativeSegmenterLastError(handle))
+        }
+        val downscaleNs = SystemClock.elapsedRealtimeNanos() - tDownscale
+
+        val tInference = SystemClock.elapsedRealtimeNanos()
+        try {
+            session.inputBuffer.rewind()
+            session.outputBuffer.rewind()
+            session.interpreter.run(session.inputBuffer, session.outputBuffer)
+        } catch (t: Throwable) {
+            return recordGpuSegmentationFailure("inference", "${t.javaClass.simpleName}: ${t.message}")
+        }
+        val inferenceNs = SystemClock.elapsedRealtimeNanos() - tInference
+
+        session.outputBuffer.rewind()
+        if (!gpuBridge.nativeSegmenterUploadCoarseMask(handle, session.outputBuffer, session.maskWidth, session.maskHeight)) {
+            return recordGpuSegmentationFailure("mask_upload", gpuBridge.nativeSegmenterLastError(handle))
+        }
+        val tRefine = SystemClock.elapsedRealtimeNanos()
+        if (!gpuBridge.nativeSegmenterRefineAlpha(handle, cameraOesTextureId)) {
+            return recordGpuSegmentationFailure("refine", gpuBridge.nativeSegmenterLastError(handle))
+        }
+        val refineNs = SystemClock.elapsedRealtimeNanos() - tRefine
+        val alphaTexture = gpuBridge.nativeSegmenterRefinedAlphaTextureId(handle)
+        if (alphaTexture == 0) {
+            return recordGpuSegmentationFailure("alpha_texture_missing", gpuBridge.nativeSegmenterLastError(handle))
+        }
+        gpuAlphaTextureId = alphaTexture
+        gpuAlphaWidth = gpuBridge.nativeSegmenterAlphaWidth(handle)
+        gpuAlphaHeight = gpuBridge.nativeSegmenterAlphaHeight(handle)
+
+        gpuConsecutiveInferenceFailures = 0
+        gpuInferenceCount++
+        gpuTotalInferenceNs += inferenceNs
+        if (inferenceNs > gpuMaxInferenceNs) gpuMaxInferenceNs = inferenceNs
+        gpuHasRefinedAlpha = true
+
+        if (!gpuFirstInferenceLogged) {
+            gpuFirstInferenceLogged = true
+            Log.i(
+                TAG,
+                "ANDROID_DUET_GPU_GREENSCREEN_FIRST_INFERENCE delegate=${session.delegateLabel} " +
+                    "input=${session.inputShape} output=${session.outputShape} " +
+                    "alpha=${gpuAlphaWidth}x$gpuAlphaHeight " +
+                    "downscaleMs=${"%.2f".format(downscaleNs / 1_000_000.0)} " +
+                    "inferenceMs=${"%.2f".format(inferenceNs / 1_000_000.0)} " +
+                    "refineMs=${"%.2f".format(refineNs / 1_000_000.0)} " +
+                    "sinceReadyMs=${SystemClock.elapsedRealtime() - gpuSessionStartMs} " +
+                    "stMatrix=[" + cameraStMatrix.joinToString(",") { "%.3f".format(it) } + "]",
+            )
+        }
+        if (!gpuFirstMaskSignaled) {
+            gpuFirstMaskSignaled = true
+            val config = gpuConfig
+            if (config != null) {
+                try { config.listener.onFirstMask() } catch (_: Throwable) {}
+            }
+        }
+        return true
+    }
+
+    private fun recordGpuSegmentationFailure(stage: String, detail: String): Boolean {
+        gpuInferenceFailureCount++
+        gpuConsecutiveInferenceFailures++
+        Log.w(
+            TAG,
+            "ANDROID_DUET_GPU_GREENSCREEN_SEGMENTATION_FAILED stage=$stage " +
+                "consecutive=$gpuConsecutiveInferenceFailures $detail",
+        )
+        if (gpuConsecutiveInferenceFailures >= GPU_MAX_CONSECUTIVE_INFERENCE_FAILURES) {
+            gpuInferenceDisabled = true
+            gpuHasRefinedAlpha = false
+            gpuAlphaTextureId = 0
+            Log.w(TAG, "ANDROID_DUET_GPU_GREENSCREEN_INFERENCE_DISABLED after $gpuConsecutiveInferenceFailures failures stage=$stage")
+            notifyGpuSegmenterUnavailableOnce("inference_disabled:$stage")
+        }
+        return false
+    }
+
+    /**
+     * Loads the model asset and creates the Interpreter with the RND delegate
+     * policy (same as AndroidGreenScreenGpuResidentPreviewBackend):
+     * CompatibilityList best options when supported (else default options),
+     * INFERENCE_PREFERENCE_SUSTAINED_SPEED, precision loss allowed; CPU
+     * (XNNPACK, 4 threads) only if GPU delegate/interpreter creation fails.
+     * Validates FLOAT32 NHWC [1,h,w,3] input and [1,h,w,1] / [1,h,w] output;
+     * allocates direct native-order buffers from the real tensor byte sizes.
+     * Throws on any unsupported model.
+     */
+    private fun openGpuModelSession(config: AndroidDuetGpuGreenScreenSegmenterBinding.Config): GpuModelSession {
+        val modelBytes = loadGpuModelBytes(config)
+        verifyFlatBufferIdentifier(modelBytes)
+
+        var delegate: GpuDelegate? = null
+        var delegateLabel: String
+        var options = Interpreter.Options()
+        try {
+            var gpuOptions: GpuDelegateFactory.Options? = null
+            var source = "default_options"
+            try {
+                val compatibilityList = CompatibilityList()
+                try {
+                    if (compatibilityList.isDelegateSupportedOnThisDevice) {
+                        gpuOptions = compatibilityList.bestOptionsForThisDevice
+                        source = "compat_best_options"
+                    }
+                } finally {
+                    try { compatibilityList.close() } catch (_: Throwable) {}
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "CompatibilityList unavailable: ${t.javaClass.simpleName}: ${t.message}")
+            }
+            val resolved = gpuOptions ?: GpuDelegateFactory.Options()
+            resolved.setInferencePreference(GpuDelegateFactory.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+            resolved.setPrecisionLossAllowed(true)
+            val gpuDelegate = GpuDelegate(resolved)
+            delegate = gpuDelegate
+            options.addDelegate(gpuDelegate)
+            delegateLabel = "gpu:$source"
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "ANDROID_DUET_GPU_GREENSCREEN_DELEGATE_FALLBACK reason=gpu_delegate_create_failed " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            try { delegate?.close() } catch (_: Throwable) {}
+            delegate = null
+            options = gpuCpuInterpreterOptions()
+            delegateLabel = "cpu_xnnpack"
+        }
+
+        var interpreter: Interpreter
+        try {
+            interpreter = Interpreter(modelBytes, options)
+        } catch (t: Throwable) {
+            val gpuDelegate = delegate ?: throw t
+            Log.w(
+                TAG,
+                "ANDROID_DUET_GPU_GREENSCREEN_DELEGATE_FALLBACK reason=gpu_interpreter_create_failed " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            try { gpuDelegate.close() } catch (_: Throwable) {}
+            delegate = null
+            delegateLabel = "cpu_xnnpack"
+            interpreter = Interpreter(modelBytes, gpuCpuInterpreterOptions())
+        }
+
+        try {
+            interpreter.allocateTensors()
+
+            if (interpreter.inputTensorCount != 1) {
+                throw IllegalStateException("expected 1 input tensor, got ${interpreter.inputTensorCount}")
+            }
+            if (interpreter.outputTensorCount != 1) {
+                throw IllegalStateException("expected 1 output tensor, got ${interpreter.outputTensorCount}")
+            }
+            val inputTensor = interpreter.getInputTensor(0)
+            val outputTensor = interpreter.getOutputTensor(0)
+            if (inputTensor.dataType() != DataType.FLOAT32) {
+                throw IllegalStateException("input dtype must be FLOAT32, got ${inputTensor.dataType()}")
+            }
+            if (outputTensor.dataType() != DataType.FLOAT32) {
+                throw IllegalStateException("output dtype must be FLOAT32, got ${outputTensor.dataType()}")
+            }
+            val inputShape = inputTensor.shape()
+            if (inputShape.size != 4 || inputShape[0] != 1 || inputShape[3] != 3 ||
+                inputShape[1] <= 0 || inputShape[2] <= 0
+            ) {
+                throw IllegalStateException("input must be NHWC [1,h,w,3], got ${inputShape.toList()}")
+            }
+            val inputHeight = inputShape[1]
+            val inputWidth = inputShape[2]
+
+            val outputShape = outputTensor.shape()
+            val maskHeight: Int
+            val maskWidth: Int
+            when {
+                outputShape.size == 4 && outputShape[0] == 1 && outputShape[3] == 1 -> {
+                    maskHeight = outputShape[1]
+                    maskWidth = outputShape[2]
+                }
+                outputShape.size == 3 && outputShape[0] == 1 -> {
+                    maskHeight = outputShape[1]
+                    maskWidth = outputShape[2]
+                }
+                else -> throw IllegalStateException(
+                    "output must be single-channel [1,h,w,1] or [1,h,w], got ${outputShape.toList()}",
+                )
+            }
+            if (maskHeight <= 0 || maskWidth <= 0) {
+                throw IllegalStateException("output has non-positive spatial dims ${outputShape.toList()}")
+            }
+
+            val inputBytes = inputTensor.numBytes()
+            val outputBytes = outputTensor.numBytes()
+            if (inputBytes != inputWidth * inputHeight * 3 * 4) {
+                throw IllegalStateException("input numBytes=$inputBytes does not match [1,$inputHeight,$inputWidth,3] float32")
+            }
+            if (outputBytes != maskWidth * maskHeight * 4) {
+                throw IllegalStateException("output numBytes=$outputBytes does not match [1,$maskHeight,$maskWidth,1] float32")
+            }
+            val inputBuffer = ByteBuffer.allocateDirect(inputBytes).order(ByteOrder.nativeOrder())
+            val outputBuffer = ByteBuffer.allocateDirect(outputBytes).order(ByteOrder.nativeOrder())
+
+            return GpuModelSession(
+                interpreter = interpreter,
+                gpuDelegate = delegate,
+                inputBuffer = inputBuffer,
+                outputBuffer = outputBuffer,
+                inputWidth = inputWidth,
+                inputHeight = inputHeight,
+                maskWidth = maskWidth,
+                maskHeight = maskHeight,
+                delegateLabel = delegateLabel,
+                inputShape = inputShape.toList().toString(),
+                outputShape = outputShape.toList().toString(),
+            )
+        } catch (t: Throwable) {
+            try { interpreter.close() } catch (_: Throwable) {}
+            try { delegate?.close() } catch (_: Throwable) {}
+            throw t
+        }
+    }
+
+    private fun gpuCpuInterpreterOptions(): Interpreter.Options =
+        Interpreter.Options().apply {
+            setNumThreads(GPU_CPU_FALLBACK_THREADS)
+            setUseXNNPACK(true)
+        }
+
+    private fun loadGpuModelBytes(config: AndroidDuetGpuGreenScreenSegmenterBinding.Config): ByteBuffer {
+        val raw = config.applicationContext.assets.open(config.modelAssetPath).use { it.readBytes() }
+        return ByteBuffer.allocateDirect(raw.size).order(ByteOrder.nativeOrder()).apply {
+            put(raw)
+            rewind()
+        }
+    }
+
+    /** A valid .tflite FlatBuffer carries the identifier "TFL3" at bytes [4..7]. */
+    private fun verifyFlatBufferIdentifier(model: ByteBuffer) {
+        if (model.capacity() < 8) {
+            throw IllegalStateException("model too small (${model.capacity()} bytes)")
+        }
+        val ok = model.get(4) == 'T'.code.toByte() && model.get(5) == 'F'.code.toByte() &&
+            model.get(6) == 'L'.code.toByte() && model.get(7) == '3'.code.toByte()
+        if (!ok) throw IllegalStateException("model flatbuffer identifier is not TFL3")
+    }
+
+    /**
+     * Releases everything the GPU path owns, in order: interpreter + delegate
+     * (with this context current), the native segmenter's GL objects (handle
+     * destroyed), then the masked draw program. Never touches the camera OES
+     * texture, the EGL objects or any other compositor state. Idempotent;
+     * requires the compositor's context to be current (callers guarantee it).
+     */
+    private fun teardownGpuSegmenterQuietly() {
+        gpuModel?.closeQuietly()
+        gpuModel = null
+        val handle = gpuSegmenterHandle
+        gpuSegmenterHandle = 0L
+        if (handle != 0L) {
+            try { gpuBridge.nativeSegmenterDestroy(handle) } catch (_: Throwable) {}
+        }
+        if (gpuMaskedProgram != 0) {
+            try { GLES20.glDeleteProgram(gpuMaskedProgram) } catch (_: Throwable) {}
+        }
+        gpuMaskedProgram = 0
+        gpuMaskedProgramFailed = false
+        gpuSegmenterReady = false
+        gpuHasRefinedAlpha = false
+        gpuAlphaTextureId = 0
+        gpuAlphaWidth = 0
+        gpuAlphaHeight = 0
+    }
+
+    /** Physical-proof summary; silent when the GPU path was never engaged (PiP/split logs unchanged). */
+    private fun logGpuSegmenterReleaseSummary() {
+        if (gpuSegmenterHandle == 0L && gpuModel == null && !gpuSegmenterFailed && gpuFrameCount == 0L) return
+        val avgInferenceMs = if (gpuInferenceCount > 0) gpuTotalInferenceNs / gpuInferenceCount / 1_000_000.0 else 0.0
+        val nativeSummary = if (gpuSegmenterHandle != 0L) {
+            try { gpuBridge.nativeSegmenterStatsSummary(gpuSegmenterHandle) } catch (_: Throwable) { "unavailable" }
+        } else "not_created"
+        Log.i(
+            TAG,
+            "ANDROID_DUET_GPU_GREENSCREEN_RELEASE_SUMMARY frames=$gpuFrameCount " +
+                "inferences=$gpuInferenceCount failures=$gpuInferenceFailureCount " +
+                "avgInferenceMs=${"%.2f".format(avgInferenceMs)} " +
+                "maxInferenceMs=${"%.2f".format(gpuMaxInferenceNs / 1_000_000.0)} " +
+                "delegate=${gpuModel?.delegateLabel ?: "none"} inferenceDisabled=$gpuInferenceDisabled " +
+                "bootstrapFailed=$gpuSegmenterFailed reason=${gpuSegmenterFailureReason ?: "none"} " +
+                "gles=$glesMajor.$glesMinor " +
+                "uptimeMs=${if (gpuSessionStartMs > 0) SystemClock.elapsedRealtime() - gpuSessionStartMs else 0} " +
+                "native=[$nativeSummary]",
+        )
     }
 
     // -- Green-screen static background draws -----------------------------------
@@ -1785,6 +2702,12 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     /** Partial-bootstrap cleanup for a failed [ensureCore]; a later attach may retry. */
     private fun teardownCoreQuietly() {
+        // The segmenter is only ever created after coreReady, so this is a
+        // no-op here in practice; kept so no ordering change can leak it.
+        if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {
+            makeCurrentQuietly(eglPbufferSurface)
+            teardownGpuSegmenterQuietly()
+        }
         try { surfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
         try { _decoderInputSurface?.release() } catch (_: Throwable) {}
         _decoderInputSurface = null

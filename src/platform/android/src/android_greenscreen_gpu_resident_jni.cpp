@@ -32,6 +32,7 @@
 #include <unordered_map>
 
 #include "gles_green_screen_gpu_resident_renderer.h"
+#include "gles_green_screen_gpu_segmenter.h"
 
 #define VG_GS_GPU_RESIDENT_JNI_TAG "VanguardGreenScreenGpuResident"
 #define VG_GS_GPU_RESIDENT_JNI_LOGW(...) \
@@ -285,6 +286,183 @@ VG_GS_GPU_RESIDENT_JNI(jstring, nativeStatsSummary)(JNIEnv* env, jobject /*thiz*
 
 VG_GS_GPU_RESIDENT_JNI(jstring, nativeLastError)(JNIEnv* env, jobject /*thiz*/, jlong handle) {
     auto entry = Lookup(handle);
+    if (!entry) return NewJString(env, "unknown_handle");
+    return NewJString(env, entry->lastError);
+}
+
+// ---------------------------------------------------------------------------
+// ANDROID-GREENSCREEN-GPU-SEGMENTER: embeddable segmenter surface
+// (GlesGreenScreenGpuSegmenter) for a host compositor that owns its own EGL
+// context, camera OES texture and final draw (AndroidDuetPreviewCompositor).
+// Separate handle registry from the standalone renderer above; every call
+// except nativeSegmenterCreate/Destroy is a thin forward and requires the
+// host's ES 3.1 context to be current on the calling (render) thread. The
+// camera OES texture is passed per call and never owned here.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using vanguard::render::GlesGreenScreenGpuSegmenter;
+
+struct SegmenterEntry {
+    std::shared_ptr<GlesGreenScreenGpuSegmenter> segmenter;
+    std::string lastError;
+};
+
+std::mutex gSegmenterRegistryMutex;
+std::unordered_map<jlong, std::shared_ptr<SegmenterEntry>> gSegmenterRegistry;
+jlong gNextSegmenterHandle = 1;
+
+std::shared_ptr<SegmenterEntry> LookupSegmenter(jlong handle) {
+    std::lock_guard<std::mutex> lock(gSegmenterRegistryMutex);
+    auto it = gSegmenterRegistry.find(handle);
+    if (it == gSegmenterRegistry.end()) return nullptr;
+    return it->second;
+}
+
+void RecordSegmenterError(const std::shared_ptr<SegmenterEntry>& entry, const std::string& error) {
+    if (!error.empty()) entry->lastError = error;
+}
+
+}  // namespace
+
+VG_GS_GPU_RESIDENT_JNI(jlong, nativeSegmenterCreate)(JNIEnv* /*env*/, jobject /*thiz*/) {
+    auto entry = std::make_shared<SegmenterEntry>();
+    entry->segmenter = std::make_shared<GlesGreenScreenGpuSegmenter>();
+    std::string error;
+    if (!entry->segmenter->Initialize(&error)) {
+        VG_GS_GPU_RESIDENT_JNI_LOGW("ANDROID_GREENSCREEN_GPU_SEGMENTER_NATIVE_CREATE_FAILED %s", error.c_str());
+        entry->segmenter->Destroy();
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(gSegmenterRegistryMutex);
+    const jlong handle = gNextSegmenterHandle++;
+    gSegmenterRegistry[handle] = entry;
+    return handle;
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeSegmenterDestroy)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    std::shared_ptr<SegmenterEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(gSegmenterRegistryMutex);
+        auto it = gSegmenterRegistry.find(handle);
+        if (it == gSegmenterRegistry.end()) return;
+        entry = it->second;
+        gSegmenterRegistry.erase(it);
+    }
+    entry->segmenter->Destroy();
+}
+
+VG_GS_GPU_RESIDENT_JNI(jboolean, nativeSegmenterConfigureModelInput)(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint width, jint height) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return JNI_FALSE;
+    std::string error;
+    const bool ok = entry->segmenter->ConfigureModelInput(width, height, &error);
+    RecordSegmenterError(entry, error);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeSegmenterSetCameraTransform)(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jfloatArray stMatrix, jfloat cameraUprightAspect) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry || stMatrix == nullptr) return;
+    if (env->GetArrayLength(stMatrix) < 16) return;
+    float matrix[16];
+    env->GetFloatArrayRegion(stMatrix, 0, 16, matrix);
+    entry->segmenter->SetCameraTransform(matrix, cameraUprightAspect);
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeSegmenterSetAlphaTargetSize)(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint outputWidthPx, jint outputHeightPx) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return;
+    entry->segmenter->SetAlphaTargetSize(outputWidthPx, outputHeightPx);
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeSegmenterSetFilterToggles)(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jboolean guidedFilter, jboolean temporalStabilizer) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return;
+    entry->segmenter->SetFilterToggles(guidedFilter == JNI_TRUE, temporalStabilizer == JNI_TRUE);
+}
+
+VG_GS_GPU_RESIDENT_JNI(jboolean, nativeSegmenterDownscaleCameraToModelInput)(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jint cameraOesTexture, jobject modelInput) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry || modelInput == nullptr) return JNI_FALSE;
+    float* out = static_cast<float*>(env->GetDirectBufferAddress(modelInput));
+    const jlong capacity = env->GetDirectBufferCapacity(modelInput);
+    if (out == nullptr || capacity <= 0) {
+        RecordSegmenterError(entry, "model input buffer is not direct");
+        return JNI_FALSE;
+    }
+    std::string error;
+    const bool ok = entry->segmenter->DownscaleCameraToModelInput(
+        static_cast<uint32_t>(cameraOesTexture), out, static_cast<size_t>(capacity) / sizeof(float), &error);
+    RecordSegmenterError(entry, error);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+VG_GS_GPU_RESIDENT_JNI(jboolean, nativeSegmenterUploadCoarseMask)(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jobject mask, jint width, jint height) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry || mask == nullptr) return JNI_FALSE;
+    const float* data = static_cast<const float*>(env->GetDirectBufferAddress(mask));
+    const jlong capacity = env->GetDirectBufferCapacity(mask);
+    if (data == nullptr || capacity <= 0) {
+        RecordSegmenterError(entry, "mask buffer is not direct");
+        return JNI_FALSE;
+    }
+    std::string error;
+    const bool ok = entry->segmenter->UploadCoarseMask(
+        data, static_cast<size_t>(capacity) / sizeof(float), width, height, &error);
+    RecordSegmenterError(entry, error);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+VG_GS_GPU_RESIDENT_JNI(jboolean, nativeSegmenterRefineAlpha)(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint cameraOesTexture) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return JNI_FALSE;
+    std::string error;
+    const bool ok = entry->segmenter->RefineAlpha(static_cast<uint32_t>(cameraOesTexture), &error);
+    RecordSegmenterError(entry, error);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+VG_GS_GPU_RESIDENT_JNI(jint, nativeSegmenterRefinedAlphaTextureId)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return 0;
+    return static_cast<jint>(entry->segmenter->RefinedAlphaTextureId());
+}
+
+VG_GS_GPU_RESIDENT_JNI(jint, nativeSegmenterAlphaWidth)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return 0;
+    return static_cast<jint>(entry->segmenter->AlphaWidth());
+}
+
+VG_GS_GPU_RESIDENT_JNI(jint, nativeSegmenterAlphaHeight)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return 0;
+    return static_cast<jint>(entry->segmenter->AlphaHeight());
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeSegmenterResetMaskState)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return;
+    entry->segmenter->ResetMaskState();
+}
+
+VG_GS_GPU_RESIDENT_JNI(jstring, nativeSegmenterStatsSummary)(JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    auto entry = LookupSegmenter(handle);
+    if (!entry) return NewJString(env, "unknown_handle");
+    return NewJString(env, entry->segmenter->StatsSummary());
+}
+
+VG_GS_GPU_RESIDENT_JNI(jstring, nativeSegmenterLastError)(JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    auto entry = LookupSegmenter(handle);
     if (!entry) return NewJString(env, "unknown_handle");
     return NewJString(env, entry->lastError);
 }

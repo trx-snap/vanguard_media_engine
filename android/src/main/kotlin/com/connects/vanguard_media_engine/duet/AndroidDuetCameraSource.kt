@@ -114,6 +114,13 @@ class AndroidDuetCameraSource(private val context: Context) {
             Log.d(TAG, "setAnalysisAnalyzer(): camera not running — ignored")
             return false
         }
+        if (analyzer == null && imageAnalysis == null) {
+            // Nothing to remove: the session is already preview-only (the
+            // production greenScreen path never binds ImageAnalysis). Rebinding
+            // here would needlessly tear down and re-request the live Preview.
+            Log.d(TAG, "setAnalysisAnalyzer(null): no ImageAnalysis bound — preview-only session unchanged")
+            return true
+        }
         val provider = cameraProvider ?: return false
         val surface = heldSurface ?: return false
 
@@ -346,6 +353,10 @@ class AndroidDuetCameraSource(private val context: Context) {
                 Log.d(TAG, "bindPreview() — ImageAnalysis use-case bound (16:9 ~256x144, KEEP_ONLY_LATEST)")
                 arrayOf(previewUseCase, analysisUseCase)
             } else {
+                // Preview-only bind: the compositor-owned camera surface is the
+                // sole consumer (production greenScreen keys the camera on the
+                // GPU from that very stream; no analysis stream, no analyzer thread).
+                Log.d(TAG, "ANDROID_DUET_CAMERA_SOURCE_PREVIEW_ONLY_BIND (no ImageAnalysis use-case)")
                 arrayOf(previewUseCase)
             }
 
