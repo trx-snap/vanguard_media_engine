@@ -2,7 +2,8 @@
 // android_duet_green_screen_video_background_bounded_physical_smoke.dart
 //
 // Dedicated physical smoke harness for a *bounded* visual proof of Android Duet
-// green-screen with decoded moving video background on the production ladder.
+// green-screen with decoded moving video background on the production Duet GPU
+// GreenScreen path.
 //
 // CRITICAL WARNING / MOTIVATION:
 // The existing long harness (android_duet_green_screen_sustained_baseline_physical_smoke.dart)
@@ -34,10 +35,11 @@
 // fixture (source duration was 5928ms). This harness now targets the current fixture
 // duration so a bounded moving-video run can complete against the live device.
 //
-// Production ladder only:
-// Attaches with the production ladder only (mediapipe_cpu -> mlkit):
-// no debugSegmentationBackend, no raw TFLite GPU keys (no debugRawTfliteGpuDelegateMode,
-// no debugRawTfliteGpuModelAssetPath).
+// Production Duet GPU GreenScreen path:
+// Attaches with production engine defaults, omitting legacy/debug segmentation
+// override keys (no debugSegmentationBackend, no debugRawTfliteGpuDelegateMode,
+// no debugRawTfliteGpuModelAssetPath). That now exercises the production Duet GPU
+// GreenScreen path selected by engine defaults, not the old CPU ladder.
 //
 // Background semantics:
 // The harness passes NO static greenScreenBackground in the layout config; absent
@@ -52,13 +54,15 @@
 //         --dart-define=ANDROID_DUET_VIDEO_BACKGROUND_HOLD_SECONDS=4
 //   - Claims allowed:
 //       * local source session init
-//       * attach-time greenScreen layout accepted on the production ladder
-//         (no debugSegmentationBackend / debugRawTfliteGpuDelegateMode /
-//         debugRawTfliteGpuModelAssetPath keys sent)
+//       * attach-time greenScreen layout accepted on production defaults
+//         (omits legacy/debug segmentation override keys: no debugSegmentationBackend,
+//         no debugRawTfliteGpuDelegateMode, no debugRawTfliteGpuModelAssetPath;
+//         exercises the production Duet GPU GreenScreen path selected by engine
+//         defaults, not the old CPU ladder)
 //       * absent greenScreenBackground defaults to decoded source video background
 //       * preview texture attach success
 //       * startRecording activates render loop and camera
-//       * bounded production-ladder segmentation window (mediapipe_cpu -> mlkit) runs
+//       * bounded production Duet GPU GreenScreen segmentation window runs
 //         continuously against the live camera feed for the full observation duration
 //         (default 4s, clamped to a safe maximum of 4s)
 //       * decoded source video plays as genuine moving video background (moving picture,
@@ -66,18 +70,25 @@
 //         safely within the 5.0s trim window of the ~5.928s clip_A.mov fixture)
 //       * zero matching Duet degrade/fallback events during window (green_screen_degraded /
 //         green_screen_fallback for this session, observed via VGDuetEvents.stream)
-//       * native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS /
-//         ANDROID_DUET_GREENSCREEN_SEGMENTATION_SUMMARY) may prove backend-neutral
-//         segmentation completion stats
+//       * production GPU route claimed only when Dart PASS is paired with native logcat markers:
+//           - ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED path=gpu_segmenter stage=start
+//           - ANDROID_DUET_GPU_GREENSCREEN_FIRST_MASK_READY delegate=gpu:default_options
+//           - ANDROID_DUET_GPU_GREENSCREEN_RELEASE_SUMMARY (frames=..., inferences=...,
+//             failures=0, avgInferenceMs=..., maxInferenceMs=..., delegate=gpu:default_options,
+//             inferenceDisabled=false, bootstrapFailed=false, reason=none, gles=3.2,
+//             native=[downscales=..., maskUploads=..., refinePasses=..., alpha=...,
+//             modelInput=256x256, coarseMask=256x256, guided=1, temporal=0])
+//         (the Dart harness itself does not parse logcat)
 //       * stop/detach/dispose/temp cleanup complete
 //   - Non-claims:
 //       * moving decoded source video is claimed ONLY for the bounded in-trim window
-//         (0.0s -> 4.0s <= 5.0s trimEnd < ~5.928s clip duration); no claim of full-duration
-//         looping or playback past trimEnd
+//         (0.0s -> 4.0s <= 5.0s trimEnd < ~5.928s clip duration); no claim of playback
+//         beyond trim or full-duration looping
 //       * no automated pixel or matte-quality proof
 //       * no export or audio proof
 //       * no all-device or low-end device proof
-//       * no GPU promotion (raw_tflite_gpu / mediapipe_gpu are not exercised by this harness)
+//       * no standalone logcat assertion inside Dart (the Dart harness itself does not
+//         parse logcat; GPU route proof requires external pairing with native logcat markers)
 
 // ignore_for_file: avoid_print
 
@@ -316,11 +327,12 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
         }
       });
 
-      // Step 3: Attach preview texture with greenScreen layout on the
-      // production ladder only. Deliberately omits debugSegmentationBackend,
-      // debugRawTfliteGpuDelegateMode, and debugRawTfliteGpuModelAssetPath so
-      // the session starts on the selector's normal primary
-      // (mediapipe_cpu -> mlkit), exactly as a production session would.
+      // Step 3: Attach preview texture with greenScreen layout on production
+      // defaults. Deliberately omits legacy/debug segmentation override keys
+      // (no debugSegmentationBackend, no debugRawTfliteGpuDelegateMode, and
+      // no debugRawTfliteGpuModelAssetPath) so the session exercises the
+      // production Duet GPU GreenScreen path selected by engine defaults,
+      // not the old CPU ladder.
       // Deliberately omits greenScreenBackground so the engine defaults to
       // the decoded source video as the background.
       final layoutConfig = <String, dynamic>{
@@ -330,7 +342,7 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
       };
       await runStep<void>(
         'ATTACH_PREVIEW_GREENSCREEN',
-        'Attaching preview texture (1080x1920, greenScreen, production ladder, default video background)',
+        'Attaching preview texture (1080x1920, greenScreen, production GPU path defaults, default video background)',
         () async {
           final result = await _withTimeout(
             _channel.invokeMethod<Map>(
@@ -379,9 +391,11 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
       // Step 5: Observe the bounded live preview window. Prints a
       // kObserveTickMarker line every kObserveTickIntervalSeconds with the
       // running Duet event count for this session.
-      // Native logcat may show periodic ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS
-      // markers during this window. Fails if any green_screen_degraded /
-      // green_screen_fallback event for this session arrived during the window.
+      // Native logcat shows ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED,
+      // ANDROID_DUET_GPU_GREENSCREEN_FIRST_MASK_READY, and
+      // ANDROID_DUET_GPU_GREENSCREEN_RELEASE_SUMMARY markers during this run.
+      // Fails if any green_screen_degraded / green_screen_fallback event for
+      // this session arrived during the window.
       await runStep<void>(
         'GREENSCREEN_VIDEO_BACKGROUND_BOUNDED_PREVIEW_ACTIVE',
         'Observing greenScreen bounded video background preview (${kBoundedObservationSeconds}s)',
@@ -544,34 +558,38 @@ class _AndroidDuetGreenScreenVideoBackgroundBoundedPhysicalSmokeAppState
         'trimEndSeconds': kTrimEndSeconds,
         'claimsAllowed': <String>[
           'local source session init',
-          'attach-time greenScreen layout accepted on the production ladder '
-              '(no debugSegmentationBackend / debugRawTfliteGpuDelegateMode / '
-              'debugRawTfliteGpuModelAssetPath keys sent)',
+          'attach-time greenScreen layout accepted on production defaults '
+              '(omits legacy/debug segmentation override keys: no debugSegmentationBackend, '
+              'no debugRawTfliteGpuDelegateMode, no debugRawTfliteGpuModelAssetPath; '
+              'exercises the production Duet GPU GreenScreen path selected by engine '
+              'defaults, not the old CPU ladder)',
           'absent greenScreenBackground defaults to decoded source video background',
           'preview texture attach success',
           'startRecording activates render loop and camera',
-          'bounded production-ladder segmentation window (~${kBoundedObservationSeconds}s, '
-              'mediapipe_cpu -> mlkit) runs continuously against the live camera feed',
+          'bounded production Duet GPU GreenScreen segmentation window (~${kBoundedObservationSeconds}s) '
+              'runs continuously against the live camera feed',
           'decoded source video plays as genuine moving video background (not frozen) '
               'for the bounded observation window (0.0s -> ${kBoundedObservationSeconds}s, '
               'safely within the ${kTrimEndSeconds}s trim window of the ~5.928s clip_A.mov fixture)',
           'zero matching Duet degrade/fallback events (green_screen_degraded / '
-              'green_screen_fallback) for this session during the bounded observation window',
-          'native logcat telemetry markers (ANDROID_DUET_GREENSCREEN_SEGMENTATION_STATS / '
-              'ANDROID_DUET_GREENSCREEN_SEGMENTATION_SUMMARY) may prove backend-neutral '
-              'segmentation completion stats',
+              'green_screen_fallback) for this session during the bounded observation window '
+              'via VGDuetEvents.stream',
+          'production Duet GPU route claimed only when Dart PASS is paired with native logcat markers: '
+              'ANDROID_DUET_GREENSCREEN_MASK_PATH_SELECTED path=gpu_segmenter stage=start, '
+              'ANDROID_DUET_GPU_GREENSCREEN_FIRST_MASK_READY delegate=gpu:default_options, and '
+              'ANDROID_DUET_GPU_GREENSCREEN_RELEASE_SUMMARY (the Dart harness itself does not parse logcat)',
           'stop/detach/dispose/temp cleanup complete',
         ],
         'nonClaims': <String>[
           'no moving video proof beyond the bounded trim window: moving decoded source '
               'video is claimed only for the bounded in-trim window (${kBoundedObservationSeconds}s '
               'observation <= ${kTrimEndSeconds}s trimEnd < ~5.928s clip duration); no claim of '
-              'full-duration looping or playback past trimEnd',
+              'playback beyond trim or full-duration looping',
           'no automated pixel or matte-quality proof',
           'no export or audio proof',
           'no all-device or low-end device proof',
-          'no GPU promotion (raw_tflite_gpu / mediapipe_gpu are not exercised by this harness; '
-              'production ladder only)',
+          'no standalone logcat assertion inside Dart (the Dart harness itself does not parse logcat; '
+              'GPU route proof requires external pairing with native logcat markers)',
         ],
         'sessionId': sessionId,
         'textureId': textureId,
