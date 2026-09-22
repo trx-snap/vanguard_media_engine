@@ -56,6 +56,15 @@ class AndroidGreenScreenCameraGraphSource(
         AndroidGreenScreenLayoutGeometry.greenScreen(widthPx.toDouble(), heightPx.toDouble(), null)
     @Volatile private var lastError: String? = null
     @Volatile private var cameraStarted = false
+    /**
+     * Coarse segmentation backend label set at camera-start decision time
+     * (raw_tflite_gpu for the GPU-resident preview backend, mediapipe_cpu on
+     * fallback), mirroring AndroidLiveGreenScreenSessionCoordinator's
+     * segmentationBackend. Null until the first camera-start decision.
+     */
+    @Volatile private var segmentationBackend: String? = null
+    @Volatile private var cameraSourceMode: String? = null
+    @Volatile private var usingFallbackBackend: Boolean = false
 
     // ── Public API ───────────────────────────────────────────────────────────
 
@@ -72,6 +81,9 @@ class AndroidGreenScreenCameraGraphSource(
         cameraStarted = false
         outputAttached = false
         cameraStartGuard.set(false)
+        segmentationBackend = null
+        cameraSourceMode = null
+        usingFallbackBackend = false
 
         val prod = AndroidPreviewSurfaceProducer(
             textureRegistry = textureRegistry,
@@ -86,6 +98,13 @@ class AndroidGreenScreenCameraGraphSource(
         val loop = AndroidGreenScreenPreviewRenderLoop(
             mainHandler = mainHandler,
             cameraInputSurfaceReady = { camSurface -> startCameraSourceIfNeeded(camSurface) },
+            // Primary: GPU-resident self-contained segmentation backend, matching
+            // AndroidLiveGreenScreenSessionCoordinator's backend selection. If its
+            // first attach fails, the loop swaps in the CPU compositor before the
+            // camera ever starts; startCameraSourceIfNeeded reads
+            // usingFallbackBackend to configure the camera source to match.
+            backendFactory = { AndroidGreenScreenGpuResidentPreviewBackend(context) },
+            fallbackBackendFactory = { AndroidGreenScreenPreviewCompositor() },
         )
         renderLoop = loop
 
@@ -160,6 +179,10 @@ class AndroidGreenScreenCameraGraphSource(
         snapshot["layoutRects"] = layoutRectsMap()
         snapshot["lastError"] = lastError
         snapshot["cameraStarted"] = cameraStarted
+        snapshot["segmentationBackend"] = segmentationBackend
+        snapshot["gpuResident"] = segmentationBackend == AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU
+        snapshot["usingFallbackBackend"] = usingFallbackBackend
+        snapshot["cameraSourceMode"] = cameraSourceMode
         snapshot["camera"] = cameraSource?.diagnosticsSnapshot()
         return snapshot
     }
@@ -173,6 +196,9 @@ class AndroidGreenScreenCameraGraphSource(
         outputAttached = false
         cameraStartGuard.set(false)
         cameraStarted = false
+        segmentationBackend = null
+        cameraSourceMode = null
+        usingFallbackBackend = false
 
         val prod = producer
         val loop = renderLoop
@@ -211,12 +237,32 @@ class AndroidGreenScreenCameraGraphSource(
         outputAttached = true
     }
 
-    /** Started lazily once the render loop's compositor camera input surface is ready. Idempotent; retries after a transient camera start failure. */
+    /**
+     * Started lazily once the render loop's compositor camera input surface is
+     * ready. Idempotent; retries after a transient camera start failure.
+     *
+     * Backend-matched camera configuration, mirroring
+     * AndroidLiveGreenScreenSessionCoordinator.startCameraSourceIfNeeded: the
+     * render loop has already settled its backend (primary GPU-resident, or
+     * CPU fallback) before this callback fires. With the GPU-resident backend
+     * the camera source runs preview-only (analysisEnabled=false); on
+     * fallback it runs the CPU clean-segmentation pipeline
+     * (analysisEnabled=true), exactly as before this change.
+     */
     private fun startCameraSourceIfNeeded(camSurface: Surface) {
         if (stopped.get()) return
         if (!cameraStartGuard.compareAndSet(false, true)) return
         val loop = renderLoop
-        val src = AndroidGreenScreenCamera2Source(context)
+        val gpuResident = !(loop?.usingFallbackBackend ?: true)
+        usingFallbackBackend = loop?.usingFallbackBackend ?: false
+        segmentationBackend = if (gpuResident) {
+            AndroidGreenScreenSegmentationBackend.RAW_TFLITE_GPU
+        } else {
+            AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU
+        }
+        cameraSourceMode = if (gpuResident) "camera2_preview_only" else "camera2_clean_segmentation"
+
+        val src = AndroidGreenScreenCamera2Source(context, analysisEnabled = !gpuResident)
         cameraSource = src
         src.start(
             targetSurface = camSurface,
@@ -228,6 +274,8 @@ class AndroidGreenScreenCameraGraphSource(
             },
             onStarted = {
                 cameraStarted = true
+                Log.i(TAG, "ANDROID_UFM_GREENSCREEN_CAMERA_GRAPH_STARTED source=$cameraSourceMode " +
+                    "backend=$segmentationBackend gpuResident=$gpuResident")
             },
             onError = { e ->
                 Log.w(TAG, "green-screen camera start failed: ${e.message}", e)

@@ -16,6 +16,20 @@
 //     native API acceptance plus a byte-level straight-alpha diagnostic
 //     self-test only — no visual transparent-preview claim is made.
 //
+// solidColor-mode diagnostics proof has two possible routes, matching the
+// camera-graph source's backend selection (mirrors the live green-screen
+// session's GPU-resident-primary / CPU-compositor-fallback policy):
+//   A. GPU-resident route (expected default): getCameraGreenScreenDiagnostics()
+//      reports gpuResident==true, segmentationBackend=='raw_tflite_gpu',
+//      cameraSourceMode=='camera2_preview_only', camera.analysisEnabled==false,
+//      camera.source=='camera2_front_preview_only', cameraStarted==true. There
+//      is no CPU pipeline in this route, so getCameraFilterChainDiagnostics()
+//      frame counts are not required.
+//   B. CPU-compositor fallback route (only if the GPU backend's bootstrap
+//      failed on-device): legacy proof via
+//      graphFrameCount/maskFrameCount/steadyMaskFrameCount > 0, exactly as
+//      before this slice.
+//
 // Sequence:
 //   1. print ANDROID_UFM_GREENSCREEN_PHYSICAL_START
 //   2. startCamera with greenScreenLowLatency (front camera: position 2, fps 30);
@@ -25,9 +39,9 @@
 //      VGFilterSpecs.greenScreenSolidColor(argb: parsed argb); alpha mode:
 //      VGFilterSpecs.greenScreenAlpha(). Print
 //      ANDROID_UFM_GREENSCREEN_STEP_APPLY_FILTER_PASS
-//   5. solidColor mode: poll diagnostics until both greenScreenDiagnostics and
-//      filterChainDiagnostics are non-null and graphFrameCount or
-//      maskFrameCount/steadyMaskFrameCount is > 0, or time out after 12
+//   5. solidColor mode: poll diagnostics until greenScreenDiagnostics is
+//      non-null and either the GPU-resident route (A) or the CPU-fallback
+//      frame-count route (B) above is satisfied, or time out after 12
 //      seconds. alpha mode: poll until greenScreenDiagnostics is non-null and
 //      reports the alpha contract fields above, or time out after 12 seconds.
 //      Print ANDROID_UFM_GREENSCREEN_STEP_DIAGNOSTICS_PASS, then for alpha
@@ -245,6 +259,41 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         gsDiag['alphaEncoding'] == 'straight';
   }
 
+  /// GPU-resident route (A): the camera-graph source's backend-selection
+  /// policy (mirrors AndroidLiveGreenScreenSessionCoordinator) defaults to
+  /// AndroidGreenScreenGpuResidentPreviewBackend, which performs
+  /// segmentation inside its own frame transaction — there is no CPU
+  /// clean-segmentation pipeline or ImageReader in this route, so this
+  /// checks the camera-graph diagnostics fields the native side reports for
+  /// it rather than any frame counter.
+  static bool _gpuResidentRouteSatisfied(Map<String, dynamic>? gsDiag) {
+    if (gsDiag == null) return false;
+    final camera = gsDiag['camera'];
+    final cameraMap = camera is Map
+        ? camera.map((k, v) => MapEntry(k.toString(), v))
+        : null;
+    return gsDiag['gpuResident'] == true &&
+        gsDiag['segmentationBackend'] == 'raw_tflite_gpu' &&
+        gsDiag['cameraSourceMode'] == 'camera2_preview_only' &&
+        gsDiag['cameraStarted'] == true &&
+        cameraMap != null &&
+        cameraMap['analysisEnabled'] == false &&
+        cameraMap['source'] == 'camera2_front_preview_only';
+  }
+
+  /// CPU-compositor fallback route (B): only reachable if the GPU-resident
+  /// backend's bootstrap failed on-device, in which case the camera-graph
+  /// source runs the same production CPU clean-segmentation pipeline as
+  /// before this slice.
+  static bool _cpuFallbackRouteSatisfied(
+    Map<String, dynamic>? gsDiag,
+    Map<String, dynamic>? fcDiag,
+  ) {
+    return _extractGraphFrameCount(fcDiag) > 0 ||
+        _extractMaskFrameCount(gsDiag) > 0 ||
+        _extractSteadyMaskFrameCount(gsDiag) > 0;
+  }
+
   static double? _extractMaxLatency(
     Map<String, dynamic>? fcDiag,
     Map<String, dynamic>? gsDiag,
@@ -332,9 +381,9 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
       while (DateTime.now().isBefore(pollDeadline)) {
         final gs = await VanguardEngine.getCameraGreenScreenDiagnostics();
         final fc = await VanguardEngine.getCameraFilterChainDiagnostics();
-        if (gs != null && fc != null) {
+        if (gs != null) {
           lastGsDiag = gs;
-          lastFcDiag = fc;
+          if (fc != null) lastFcDiag = fc;
           _updateDiagnostics(gs, fc);
 
           if (kIsAlphaMode) {
@@ -344,11 +393,10 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
               break;
             }
           } else {
-            final gCount = _extractGraphFrameCount(fc);
-            final mCount = _extractMaskFrameCount(gs);
-            final sCount = _extractSteadyMaskFrameCount(gs);
-
-            if (gCount > 0 || mCount > 0 || sCount > 0) {
+            // Route A (GPU-resident, no CPU pipeline/frame counts to wait on)
+            // or route B (CPU-compositor fallback frame counters).
+            if (_gpuResidentRouteSatisfied(gs) ||
+                _cpuFallbackRouteSatisfied(gs, fc)) {
               diagSatisfied = true;
               break;
             }
@@ -366,8 +414,12 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
                     'backgroundARGB=${lastGsDiag?['backgroundARGB']}, '
                     'alphaByteSelfTestPassed=${lastGsDiag?['alphaByteSelfTestPassed']}, '
                     'alphaEncoding=${lastGsDiag?['alphaEncoding']})'
-              : 'Timed out after 12s waiting for green-screen diagnostics with frame count > 0: '
-                    'gsDiag=${lastGsDiag != null}, fcDiag=${lastFcDiag != null}',
+              : 'Timed out after 12s waiting for green-screen diagnostics on either the '
+                    'GPU-resident route (gpuResident=${lastGsDiag?['gpuResident']}, '
+                    'segmentationBackend=${lastGsDiag?['segmentationBackend']}, '
+                    'cameraSourceMode=${lastGsDiag?['cameraSourceMode']}, '
+                    'cameraStarted=${lastGsDiag?['cameraStarted']}) or the CPU-fallback frame-count '
+                    'route: gsDiag=${lastGsDiag != null}, fcDiag=${lastFcDiag != null}',
         );
       }
       print('ANDROID_UFM_GREENSCREEN_STEP_DIAGNOSTICS_PASS');
@@ -437,6 +489,11 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
       }
 
       // 9. Single-line JSON marker and PASS/FAIL marker
+      final gpuRouteProven =
+          !kIsAlphaMode && _gpuResidentRouteSatisfied(lastGsDiag);
+      final cpuFallbackProven =
+          !kIsAlphaMode && _cpuFallbackRouteSatisfied(lastGsDiag, lastFcDiag);
+
       final jsonPayload = <String, dynamic>{
         'pass': pass,
         'textureId': textureId,
@@ -447,6 +504,8 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
         if (!kIsAlphaMode) 'argb': kParsedArgb,
         'warmupSeconds': kWarmupSeconds,
         'holdSeconds': kHoldSeconds,
+        if (!kIsAlphaMode) 'gpuResidentRouteProven': gpuRouteProven,
+        if (!kIsAlphaMode) 'cpuFallbackRouteProven': cpuFallbackProven,
         'claimsAllowed': kIsAlphaMode
             ? <String>[
                 'public UFM capture profile selected Android green-screen graph path',
@@ -463,7 +522,16 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
                 'public UFM capture profile selected Android green-screen graph path',
                 'solid-color green-screen filter activated through setCameraFilterChain',
                 'preview texture was shown for manual observation',
-                'native diagnostics proved mask frames',
+                if (gpuRouteProven)
+                  'native diagnostics proved the GPU-resident route: gpuResident==true, '
+                      'segmentationBackend==raw_tflite_gpu, '
+                      'cameraSourceMode==camera2_preview_only, '
+                      'camera.analysisEnabled==false, '
+                      'camera.source==camera2_front_preview_only, cameraStarted==true',
+                if (cpuFallbackProven)
+                  'native diagnostics proved mask frames via the CPU-compositor '
+                      'fallback route (graphFrameCount/maskFrameCount/'
+                      'steadyMaskFrameCount > 0)',
                 'filter clear returns diagnostics to null',
               ],
         'nonClaims': kIsAlphaMode
@@ -481,6 +549,12 @@ class _AndroidUfmCameraGreenScreenFilterPhysicalSmokeAppState
                 'no beauty filter',
                 'no export/recording',
                 'no Duet',
+                if (gpuRouteProven && !cpuFallbackProven)
+                  'no CPU clean-segmentation pipeline proof: the GPU-resident '
+                      'backend never opens one on this route',
+                if (cpuFallbackProven && !gpuRouteProven)
+                  'no GPU-resident backend proof: this run used the CPU-compositor '
+                      'fallback route',
               ],
         'greenScreenDiagnostics': ?lastGsDiag,
         'filterChainDiagnostics': ?lastFcDiag,
