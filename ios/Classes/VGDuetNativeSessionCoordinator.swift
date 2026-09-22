@@ -307,7 +307,12 @@ final class VGDuetNativeSessionCoordinator {
         let isGreenScreen = (effectiveMode == "greenScreen")
 
         if session.foregroundProvider == nil {
-            let provider = VGDuetGraphGreenScreenForegroundProvider()
+            let provider: VGDuetForegroundProvider
+            if #available(iOS 13.0, *), VGDuetGPUZeroForegroundProvider.isSupported {
+                provider = VGDuetGPUZeroForegroundProvider(canvasWidth: Int(width), canvasHeight: Int(height))
+            } else {
+                provider = VGDuetGraphGreenScreenForegroundProvider()
+            }
             session.foregroundProvider = provider
             // Wire the fault handler BEFORE start().
             provider.onFault = { [weak self, weak session] fault in

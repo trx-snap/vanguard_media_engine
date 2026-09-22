@@ -371,7 +371,7 @@ final class VGLiveGreenScreenCompositor {
 
     // MARK: - Pool
 
-    private static func makePool(width: Int, height: Int) -> CVPixelBufferPool? {
+    static func makePool(width: Int, height: Int) -> CVPixelBufferPool? {
         let pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String:     Int(kCVPixelFormatType_32BGRA),
             kCVPixelBufferWidthKey as String:               width,
@@ -563,7 +563,8 @@ final class VGGPUZeroMetalPipeline {
         solidColor: SIMD4<Float>,
         cropUniforms: SIMD4<Float> = SIMD4<Float>(0, 0, 1, 1),
         rotationIndex: UInt32 = 0,
-        mirrorCorrection: UInt32 = 0
+        mirrorCorrection: UInt32 = 0,
+        outputMode: UInt32? = nil
     ) -> Bool {
         ensureIntermediateTextures(width: canvasWidth, height: canvasHeight)
         guard let refinedAlpha = refinedAlphaTexture,
@@ -656,7 +657,7 @@ final class VGGPUZeroMetalPipeline {
             var uniforms = GPUZeroCompositeUniforms(
                 resolution: SIMD2<Float>(Float(canvasWidth), Float(canvasHeight)),
                 solidColor: solidColor,
-                outputMode: (backgroundBuffer != nil) ? 2 : 1,
+                outputMode: outputMode ?? ((backgroundBuffer != nil) ? 2 : 1),
                 despillEnabled: 1,
                 cropUniforms: cropUniforms,
                 rotationIndex: rotationIndex,
@@ -712,6 +713,41 @@ final class VGGPUZeroMetalPipeline {
         if ok {
             cmdBuf.commit()
             cmdBuf.waitUntilCompleted()
+        }
+        return ok
+    }
+
+    func renderStraightAlpha(
+        commandBuffer cmdBuf: MTLCommandBuffer? = nil,
+        cameraBuffer: CVPixelBuffer,
+        matteTexture: MTLTexture,
+        outputBuffer: CVPixelBuffer,
+        canvasWidth: Int,
+        canvasHeight: Int,
+        cropUniforms: SIMD4<Float> = SIMD4<Float>(0, 0, 1, 1),
+        rotationIndex: UInt32 = 0,
+        mirrorCorrection: UInt32 = 0
+    ) -> Bool {
+        let cb = cmdBuf ?? commandQueue.makeCommandBuffer()
+        guard let commandBuffer = cb else { return false }
+        commandBuffer.label = "GPUZeroStraightAlpha"
+        let ok = encode(
+            commandBuffer: commandBuffer,
+            cameraBuffer: cameraBuffer,
+            matteTexture: matteTexture,
+            backgroundBuffer: nil,
+            outputBuffer: outputBuffer,
+            canvasWidth: canvasWidth,
+            canvasHeight: canvasHeight,
+            solidColor: SIMD4<Float>(0, 0, 0, 0),
+            cropUniforms: cropUniforms,
+            rotationIndex: rotationIndex,
+            mirrorCorrection: mirrorCorrection,
+            outputMode: 0
+        )
+        if ok && cmdBuf == nil {
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
         }
         return ok
     }
