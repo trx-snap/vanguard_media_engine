@@ -1,24 +1,36 @@
 // VGDuetPreviewRenderLoop.swift
 // VG-DUET-SLICE-4B-B: Display-link driven render loop for the Duet preview texture.
+// VG-DUET-SLICE-4B-C: Idle preview redraw (iOS sibling of Android's camera
+// idle redraw pump -- see AndroidDuetPreviewRenderLoop.kt's
+// cameraIdleRedrawRunnable / CAMERA_IDLE_REDRAW_MS).
 //
 // Responsibilities:
-//   - Owns a CADisplayLink (via weak proxy) while the session is actively
-//     recording; the link is invalidated before every hold / stop.
+//   - Owns exactly ONE CADisplayLink (via weak proxy), shared by two mutually
+//     exclusive presentation modes -- active recording and idle preview --
+//     so there is never more than one link running at a time. The link is
+//     invalidated only when neither mode needs it (both stopped) or on
+//     terminal stop().
 //   - Each main-thread tick reads the target source PTS from an injected
 //     closure, clamps it to the trim window, and requests at most ONE decode
 //     step at a time through the injected decode handler.  Ticks that arrive
 //     while a step is in flight are coalesced into a single pending job.
 //   - Decoded frames are composited on a private serial render queue and
 //     presented on the main thread through the injected present handler.
-//   - Held states (initial / paused / seeked) decode one frame and stay
-//     passive until asked again.  While actively recording, the loop never
-//     goes quiet: once the clamped source target stops changing (e.g. at
-//     trimEnd), each tick redraws the held source frame instead of
-//     re-decoding, so live foreground (camera / green-screen) samples keep
-//     presenting fresh over the held source -- matching Android's continued
-//     live-foreground-over-held-source behavior.  It never mutates session
-//     state and never loops, seeks, or re-decodes source video once the held
-//     frame already covers the target.
+//   - Held states (initial / paused / seeked) decode one frame, then --
+//     unless immediately torn down by stop() -- enter idle preview so the
+//     display link keeps ticking at the SAME cadence and recomposites that
+//     held source frame with a freshly-sampled foreground (camera /
+//     green-screen) frame every tick.  Idle preview never advances,
+//     re-decodes, or re-seeks the source video; it only re-samples
+//     foregroundSampleProvider and redraws.  While actively recording, the
+//     loop never goes quiet either: once the clamped source target stops
+//     changing (e.g. at trimEnd), each tick redraws the held source frame
+//     instead of re-decoding, so live foreground samples keep presenting
+//     fresh over the held source.  Together these two paths match Android's
+//     continued live-foreground-over-held-source behavior both before
+//     recording starts and whenever the source decoder is paused/held.  It
+//     never mutates session state and never loops, seeks, or re-decodes
+//     source video once the held frame already covers the target.
 //
 // Foreground seam (Phase 4A / 4B-A):
 //   - foregroundSampleProvider returns ONE retained VGDuetForegroundSample per render
@@ -157,6 +169,11 @@ final class VGDuetPreviewRenderLoop {
 
     private var isStopped = false
     private var isActive  = false
+    /// True while the loop is presenting live foreground/camera samples over
+    /// `heldSourceFrame` between recording takes (before the first take,
+    /// paused, or seeked/rolled-back).  Mutually exclusive with `isActive`;
+    /// both share the single `displayLink` below -- see `displayLinkFired`.
+    private var isIdlePreview = false
     private var displayLink: CADisplayLink?
 
     /// True from the moment a decode or render is dispatched until its result
@@ -231,32 +248,71 @@ final class VGDuetPreviewRenderLoop {
         submit(.decode(.step(targetPtsMs: target), forceRender: true))
     }
 
-    /// Starts the display link.  Idempotent while already active.
+    /// Starts active-recording presentation.  Idempotent while already
+    /// active.  Takes over the shared display link from idle preview (if
+    /// running) -- the two modes never tick concurrently.
     func startActive() {
         assert(Thread.isMainThread)
         guard !isStopped, !isActive else { return }
+        isIdlePreview = false
         isActive = true
         lastTickTargetPtsMs = nil
         installDisplayLink()
     }
 
-    /// Stops the display link and holds the frame at/after `targetPtsMs`.
+    /// Leaves active-recording presentation, holds the frame at/after
+    /// `targetPtsMs`, then hands the shared display link to idle preview so
+    /// live foreground/camera samples keep presenting over the held frame.
     func pauseAndHold(targetPtsMs: Int) {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
         isActive = false
-        tearDownDisplayLink()
         submit(.decode(.step(targetPtsMs: clamp(targetPtsMs)), forceRender: false))
+        startIdlePreview()
     }
 
-    /// Stops the display link, repositions the decoder at `targetPtsMs` and
-    /// holds that frame.
+    /// Leaves active-recording presentation, repositions the decoder at
+    /// `targetPtsMs` and holds that frame, then hands the shared display
+    /// link to idle preview so live foreground/camera samples keep
+    /// presenting over the held frame.
     func seekAndHold(targetPtsMs: Int) {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
         isActive = false
-        tearDownDisplayLink()
         submit(.decode(.seek(targetPtsMs: clamp(targetPtsMs)), forceRender: false))
+        startIdlePreview()
+    }
+
+    /// Starts idle preview: the display link ticks at the same cadence as
+    /// active recording, but every tick only recomposites `heldSourceFrame`
+    /// with a freshly-sampled foreground (camera / green-screen) frame --
+    /// it never advances, re-decodes, or re-seeks the source video.  This is
+    /// the iOS sibling of Android's camera idle redraw pump, used before the
+    /// first take and whenever the source decoder is paused/held so the
+    /// camera preview never freezes.
+    ///
+    /// Idempotent; a no-op while already active (active ticks already
+    /// redraw live foreground once the clamped target stops changing) or
+    /// already in idle preview.  Shares the single `displayLink` with
+    /// `startActive` -- the two never run concurrently.
+    func startIdlePreview() {
+        assert(Thread.isMainThread)
+        guard !isStopped, !isActive, !isIdlePreview else { return }
+        isIdlePreview = true
+        installDisplayLink()
+    }
+
+    /// Stops idle preview.  Idempotent; safe to call while not in idle
+    /// preview (e.g. from `startActive`, which clears it directly).  Tears
+    /// down the shared display link only when active recording is not about
+    /// to take it over.
+    func stopIdlePreview() {
+        assert(Thread.isMainThread)
+        guard isIdlePreview else { return }
+        isIdlePreview = false
+        if !isActive {
+            tearDownDisplayLink()
+        }
     }
 
     /// Applies new layout rects (plus preview-only foreground rotation metadata)
@@ -279,13 +335,16 @@ final class VGDuetPreviewRenderLoop {
         submit(.decode(.step(targetPtsMs: clamp(targetPtsMs)), forceRender: true))
     }
 
-    /// Terminal.  Invalidates the display link, drops pending work and the
-    /// held frame.  Every later call (and every in-flight completion) is a no-op.
+    /// Terminal.  Invalidates the display link (both active and idle preview
+    /// share it, so this stops whichever mode was running), drops pending
+    /// work and the held frame.  Every later call (and every in-flight
+    /// completion) is a no-op.
     func stop() {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
         isStopped = true
         isActive  = false
+        isIdlePreview = false
         tearDownDisplayLink()
         pendingJob      = nil
         heldSourceFrame = nil
@@ -304,6 +363,7 @@ final class VGDuetPreviewRenderLoop {
             "redrawRequestCount": redrawRequestCount,
             "distinctDecodedSourcePtsCount": distinctDecodedSourcePtsCount,
             "isActive": isActive,
+            "isIdlePreview": isIdlePreview,
             "isStopped": isStopped,
             "hasPresented": hasPresented,
             "trimStartMs": trimStartMs,
@@ -352,24 +412,45 @@ final class VGDuetPreviewRenderLoop {
     }
 
     fileprivate func displayLinkFired(_ sender: CADisplayLink) {
-        guard !isStopped, isActive else { return }
-        displayTickCount += 1
-        let target = clamp(targetPtsProvider())
-        guard target != lastTickTargetPtsMs else {
-            // Source PTS target has not moved (e.g. the clock has clamped at
-            // trimEnd). The source/background frame stays held exactly as-is --
-            // this never decodes, seeks, or otherwise touches the decoder for an
-            // unchanged target -- but an active recording must keep presenting
-            // fresh live foreground (camera / green-screen) samples over that
-            // held frame every tick, matching Android's continued live rendering
-            // once its source hold begins. Submitting .redraw (never .decode)
-            // routes straight to render(frame:), which re-samples
-            // foregroundSampleProvider on every call.
-            submit(.redraw)
+        guard !isStopped else { return }
+
+        if isActive {
+            displayTickCount += 1
+            let target = clamp(targetPtsProvider())
+            guard target != lastTickTargetPtsMs else {
+                // Source PTS target has not moved (e.g. the clock has clamped at
+                // trimEnd). The source/background frame stays held exactly as-is --
+                // this never decodes, seeks, or otherwise touches the decoder for an
+                // unchanged target -- but an active recording must keep presenting
+                // fresh live foreground (camera / green-screen) samples over that
+                // held frame every tick, matching Android's continued live rendering
+                // once its source hold begins. Submitting .redraw (never .decode)
+                // routes straight to render(frame:), which re-samples
+                // foregroundSampleProvider on every call.
+                submit(.redraw)
+                return
+            }
+            lastTickTargetPtsMs = target
+            submit(.decode(.step(targetPtsMs: target), forceRender: false))
             return
         }
-        lastTickTargetPtsMs = target
-        submit(.decode(.step(targetPtsMs: target), forceRender: false))
+
+        guard isIdlePreview else { return }
+        // Idle preview (before the first take, or paused/held): never advance,
+        // re-decode, or re-seek the source PTS. Ordinarily just redraw the
+        // already-held source frame with a fresh foreground sample every tick,
+        // matching Android's camera idle redraw pump. If no held frame exists
+        // yet (e.g. idle preview started before renderInitialFrame's decode
+        // landed), decode once so subsequent ticks have something to redraw --
+        // .redraw against a nil heldSourceFrame would otherwise composite an
+        // empty background every tick until the initial decode happens to land.
+        displayTickCount += 1
+        if heldSourceFrame == nil {
+            let target = clamp(targetPtsProvider())
+            submit(.decode(.step(targetPtsMs: target), forceRender: true))
+            return
+        }
+        submit(.redraw)
     }
 
     // MARK: - Job pipeline (main thread)

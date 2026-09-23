@@ -137,6 +137,10 @@ class VGDuetAndroidSession(
     var onAllTakesFinalized: (() -> Unit)? = null
     // Source-clip audio preview; null when the source has no audio track.
     var previewAudioPlayer: AndroidDuetPreviewAudioPlayer? = null
+    // One-shot latch for the `auto_stop` Duet event: set when the event is
+    // emitted for the active take, reset each time a take begins (start or
+    // resume) so the clamped clock never re-emits while held at trim end.
+    var autoStopEmitted: Boolean = false
 
     fun startSegment() {
         previewClock.startSegment()
@@ -938,6 +942,7 @@ class AndroidDuetSessionCoordinator(
             session.state = VGDuetSessionState.RECORDING
             session.currentRecorder = recorder
             session.currentTakeIndex = session.previewClock.segmentCount()
+            session.autoStopEmitted = false
             // The clock captures its speed at startSegment; the recorder's PTS
             // policy must use exactly that value (a setRecordingSpeed may have
             // landed during the async attach gap).
@@ -949,9 +954,15 @@ class AndroidDuetSessionCoordinator(
                 session.sourceGain,
             )
             // Slice 4B-C: active playback. The provider runs on the main thread only,
-            // so reading the preview clock here is safe.
+            // so reading the preview clock here is safe. It is also the trim-end
+            // observation point for the one-shot `auto_stop` event (see
+            // maybeEmitAutoStop): the loop evaluates it every active tick and
+            // drops it on pause/seek/stop, so nothing else has to schedule or
+            // cancel a timer for the take.
             activeLoop.startActive {
-                session.previewClock.currentSourcePtsMs().toLong()
+                val sourcePtsMs = session.previewClock.currentSourcePtsMs()
+                maybeEmitAutoStop(session, sourcePtsMs)
+                sourcePtsMs.toLong()
             }
             Log.i("DuetCoordinator",
                 "ANDROID_DUET_RECORDING_BEGIN session=${session.sessionId} reason=$reason " +
@@ -1472,6 +1483,43 @@ class AndroidDuetSessionCoordinator(
                 "currentBackend" to currentBackend,
                 "reason" to reason,
                 "userMessage" to userMessage,
+            )
+        )
+    }
+
+    /**
+     * One-shot `auto_stop` signal, emitted via [onDuetEvent] the first time the
+     * active take's source cursor reaches the session's trim end. Called from
+     * the active render-loop PTS provider installed by [beginTake], which the
+     * loop evaluates on the main thread only while a take is active and
+     * replaces on every take, so this rides the existing tick cadence with no
+     * timer of its own. [AndroidDuetPreviewClock.currentSourcePtsMs] clamps at
+     * trimEnd, so without [VGDuetAndroidSession.autoStopEmitted] every later
+     * tick would re-emit while the source frame is held.
+     *
+     * Signal only: nothing here pauses, stops, commits, or finalizes the take.
+     * The Dart session owner reacts by calling its normal pause/stop path, so
+     * pause/stop/dispose keep their single owner and no duplicate finalize can
+     * originate natively. Never emits unless the session is still active and
+     * RECORDING with a live recorder and an open clock segment — i.e. not
+     * paused, completed, stopped, disposed, or before a take has begun.
+     */
+    private fun maybeEmitAutoStop(session: VGDuetAndroidSession, sourcePtsMs: Int) {
+        if (session.autoStopEmitted) return
+        if (activeSession !== session) return
+        if (session.state != VGDuetSessionState.RECORDING) return
+        if (session.currentRecorder == null) return
+        if (!session.previewClock.isRecordingActive) return
+        if (sourcePtsMs < session.trimEndMs) return
+        session.autoStopEmitted = true
+        Log.i("DuetCoordinator",
+            "ANDROID_DUET_AUTO_STOP_EMITTED session=${session.sessionId} " +
+                "takeIndex=${session.currentTakeIndex} sourcePtsMs=$sourcePtsMs trimEndMs=${session.trimEndMs}")
+        onDuetEvent?.invoke(
+            mapOf(
+                "event" to "auto_stop",
+                "sessionId" to session.sessionId,
+                "reason" to "trim_end_reached",
             )
         )
     }

@@ -180,6 +180,80 @@ void main() {
         }
       },
     );
+
+    test('auto_stop parses with only event and sessionId, defaulting the '
+        'green-screen fields to empty strings', () {
+      final event = VGDuetEvent.tryParse({
+        'event': 'auto_stop',
+        'sessionId': 'session-auto-stop-001',
+      });
+
+      expect(event, isNotNull);
+      expect(event!.type, VGDuetEventType.autoStop);
+      expect(event.sessionId, 'session-auto-stop-001');
+      expect(event.previousBackend, '');
+      expect(event.currentBackend, '');
+      expect(event.reason, '');
+      expect(event.userMessage, '');
+    });
+
+    test(
+      'auto_stop preserves the native reason and ignores non-string optional '
+      'fields',
+      () {
+        final event = VGDuetEvent.tryParse({
+          'event': 'auto_stop',
+          'sessionId': 'session-auto-stop-002',
+          'reason': 'trim_end_reached',
+          'previousBackend': 42,
+          'userMessage': null,
+        });
+
+        expect(event, isNotNull);
+        expect(event!.type, VGDuetEventType.autoStop);
+        expect(event.reason, 'trim_end_reached');
+        expect(event.previousBackend, '');
+        expect(event.currentBackend, '');
+        expect(event.userMessage, '');
+      },
+    );
+
+    test('auto_stop still requires a string sessionId', () {
+      expect(
+        VGDuetEvent.tryParse({'event': 'auto_stop'}),
+        isNull,
+        reason: 'Missing sessionId should return null',
+      );
+      expect(
+        VGDuetEvent.tryParse({'event': 'auto_stop', 'sessionId': 999}),
+        isNull,
+        reason: 'Non-string sessionId should return null',
+      );
+      expect(
+        VGDuetEvent.tryParse({'event': 'auto_stop', 'sessionId': null}),
+        isNull,
+        reason: 'Null sessionId should return null',
+      );
+    });
+
+    test('green-screen events still require every backend field even after '
+        'auto_stop relaxed its own contract', () {
+      expect(
+        VGDuetEvent.tryParse({
+          'event': 'green_screen_fallback',
+          'sessionId': 'session-strict-001',
+        }),
+        isNull,
+      );
+      expect(
+        VGDuetEvent.tryParse({
+          'event': 'green_screen_degraded',
+          'sessionId': 'session-strict-002',
+          'reason': 'frame_drop',
+        }),
+        isNull,
+      );
+    });
   });
 
   group('VGDuetEvents.stream', () {
@@ -306,6 +380,29 @@ void main() {
         // Ensure all subscriptions are cancelled and dispatcher listener count returns to zero
         await sub2.cancel();
         expect(dispatcher.duetEventListenerCountForTesting, 0);
+      },
+    );
+
+    test(
+      'a minimal native auto_stop payload reaches VGDuetEvents.stream through '
+      'the same onDuetEvent dispatcher path as the green-screen events',
+      () async {
+        final receivedEvents = <VGDuetEvent>[];
+        final subscription = VGDuetEvents.stream.listen(receivedEvents.add);
+        addTearDown(() async => subscription.cancel());
+
+        await _invokeNative('onDuetEvent', {
+          'event': 'auto_stop',
+          'sessionId': 'session-auto-stop-dispatch',
+          'reason': 'trim_end_reached',
+        });
+        await pumpEventQueue();
+
+        expect(receivedEvents.length, 1);
+        expect(receivedEvents.first.type, VGDuetEventType.autoStop);
+        expect(receivedEvents.first.sessionId, 'session-auto-stop-dispatch');
+        expect(receivedEvents.first.reason, 'trim_end_reached');
+        expect(receivedEvents.first.userMessage, '');
       },
     );
   });

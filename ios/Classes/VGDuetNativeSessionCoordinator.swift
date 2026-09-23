@@ -14,6 +14,9 @@
 //   - Slice 4B-B: owns the preview render loop lifecycle (create on attach, start/hold on
 //     record transitions, stop before texture + decoder teardown).  All decoder stepping
 //     for preview goes through the loop; the coordinator never draws or ticks itself.
+//   - Slice 4B-C: while not recording (before the first take, paused, or after a
+//     seek/rollback) the coordinator keeps the loop in idle preview instead of leaving
+//     it passive, so the camera/foreground preview never freezes before recording starts.
 //   - Preview continuity telemetry: previewContinuityDiagnostics exposes loop diagnostics snapshot.
 
 import AVFoundation
@@ -99,6 +102,11 @@ final class VGDuetNativeSession {
     var currentRecorder: VGDuetSegmentRecorder?
     var audioPlayer: VGDuetPreviewAudioPlayer?
     var micCapture: VGDuetMicrophoneCapture?
+
+    // One-shot latch for the `auto_stop` Duet event: set when the event is
+    // emitted for the active take, reset each time a take begins (start or
+    // resume) so the clamped clock never re-emits while held at trim end.
+    var autoStopEmitted: Bool = false
 
     init(sessionId: String,
          sourceMap: [String: Any],
@@ -327,7 +335,10 @@ final class VGDuetNativeSessionCoordinator {
         // Slice 4B-B: bring up the render loop after registration + rect
         // computation and draw the held frame (trimStart on a fresh session,
         // the current clock cursor otherwise).  If the session is already
-        // recording (re-attach mid-take) the loop goes active immediately.
+        // recording (re-attach mid-take) the loop goes active immediately;
+        // otherwise (Slice 4B-C) it enters idle preview so the camera
+        // preview keeps redrawing live over that held frame instead of
+        // freezing on the single initial snapshot.
         //
         // Phase 4A: the foreground provider is created + started now (not at
         // initializeSession) because the render loop is what consumes its
@@ -370,6 +381,13 @@ final class VGDuetNativeSessionCoordinator {
         session.audioPlayer?.seek(toMilliseconds: session.trimStartMs)
         if session.state == .recording {
             loop.startActive()
+        } else {
+            // Slice 4B-C: before the first take (or on re-attach while
+            // paused/completed), keep live foreground/camera samples
+            // redrawing over the held source frame instead of freezing on
+            // the single renderInitialFrame() snapshot -- iOS sibling of
+            // Android's camera idle redraw pump.
+            loop.startIdlePreview()
         }
 
         var map: [String: Any] = [
@@ -552,7 +570,7 @@ final class VGDuetNativeSessionCoordinator {
     /// Builds the render loop for [session].  The loop never touches the
     /// decoder directly: every request is routed through decoderQueue by the
     /// injected decode handler, and presents go texture → textureFrameAvailable
-    /// on main.  Captures avoid retain cycles (session weak, no self).
+    /// on main.  Captures avoid retain cycles (session and self weak).
     private func makePreviewRenderLoop(
         session:      VGDuetNativeSession,
         texture:      VGDuetPreviewTexture,
@@ -575,8 +593,18 @@ final class VGDuetNativeSessionCoordinator {
             rotationDegrees: rects.rotation.rotationDegrees,
             anchorX:     rects.rotation.anchorX,
             anchorY:     rects.rotation.anchorY,
-            targetPtsProvider: {
-                clock.currentSourcePtsMs()
+            targetPtsProvider: { [weak self, weak session] in
+                // Main thread (display link / renderInitialFrame). Also the
+                // trim-end observation point for the one-shot `auto_stop`
+                // event: the loop evaluates this every active tick and stops
+                // doing so on pause/seek/stop, so no take-scoped timer is
+                // needed. maybeEmitAutoStop itself refuses anything but a live
+                // RECORDING take.
+                let sourcePtsMs = clock.currentSourcePtsMs()
+                if let self = self, let session = session {
+                    self.maybeEmitAutoStop(session: session, sourcePtsMs: sourcePtsMs)
+                }
+                return sourcePtsMs
             },
             decodeHandler: { [weak session] request, completion in
                 // Read on main (loop calls us on main); nil once teardown began.
@@ -933,6 +961,7 @@ final class VGDuetNativeSessionCoordinator {
         mic.start()
 
         session.state = .recording
+        session.autoStopEmitted = false
         session.startSegment()
         session.previewRenderLoop?.startActive()   // Slice 4B-B
 
@@ -1031,6 +1060,7 @@ final class VGDuetNativeSessionCoordinator {
         mic.start()
 
         session.state = .recording
+        session.autoStopEmitted = false
         session.startSegment()
         session.previewRenderLoop?.startActive()   // Slice 4B-B
 
@@ -1272,6 +1302,42 @@ final class VGDuetNativeSessionCoordinator {
             "currentBackend":  "pip",
             "reason":          fault.reason,
             "userMessage":     "Green screen unavailable. Switched to Picture-in-Picture",
+        ])
+    }
+
+    // MARK: - Auto-stop signal
+
+    /// One-shot `auto_stop` signal, emitted via `onDuetEvent` the first time
+    /// the active take's source cursor reaches the session's trim end. Called
+    /// from the render loop's `targetPtsProvider` (main thread), which the loop
+    /// evaluates every active display tick and stops evaluating on
+    /// pause/seek/stop, so this rides the existing tick cadence with no timer
+    /// of its own. `VGDuetPreviewClock.currentSourcePtsMs` clamps at trimEnd,
+    /// so without `VGDuetNativeSession.autoStopEmitted` every later tick would
+    /// re-emit while the source frame is held.
+    ///
+    /// Signal only: nothing here pauses, stops, commits, or finalizes the take.
+    /// The Dart session owner reacts by calling its normal pause/stop path, so
+    /// pause/stop/dispose keep their single owner and no duplicate finalize can
+    /// originate natively. Never emits unless the session is still active and
+    /// `.recording` with a live recorder and an open clock segment -- i.e. not
+    /// paused (the recorder is cleared synchronously at the top of
+    /// pauseRecording, before its async finish lands), completed, stopped,
+    /// disposed, or before a take has begun.
+    private func maybeEmitAutoStop(session: VGDuetNativeSession, sourcePtsMs: Int) {
+        if session.autoStopEmitted { return }
+        guard activeSession === session else { return }
+        guard session.state == .recording else { return }
+        guard session.currentRecorder != nil else { return }
+        guard session.previewClock.isRecordingActive else { return }
+        guard sourcePtsMs >= session.trimEndMs else { return }
+        session.autoStopEmitted = true
+        NSLog("[VGDuetNativeSessionCoordinator] IOS_DUET_AUTO_STOP_EMITTED session=%@ sourcePtsMs=%d trimEndMs=%d",
+              session.sessionId, sourcePtsMs, session.trimEndMs)
+        onDuetEvent?([
+            "event":     "auto_stop",
+            "sessionId": session.sessionId,
+            "reason":    "trim_end_reached",
         ])
     }
 

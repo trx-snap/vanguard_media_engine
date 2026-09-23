@@ -8,14 +8,22 @@ import 'dart:async';
 
 import '../channel/vanguard_channel_dispatcher.dart';
 
-/// Duet green-screen degradation/fallback event kinds.
+/// Duet event kinds.
 ///
 /// `green_screen_degraded` is emitted when native keeps green screen live after
 /// degrading to a lower rung, e.g. Android MediaPipe CPU -> ML Kit;
 /// `green_screen_fallback` is emitted after native switches to safe PiP.
-enum VGDuetEventType { greenScreenDegraded, greenScreenFallback }
+/// `auto_stop` is emitted once per take when active recording reaches the
+/// source trim end; it is a signal only — native never stops or finalizes the
+/// take itself, the Dart owner of the session must invoke its normal stop path.
+enum VGDuetEventType { greenScreenDegraded, greenScreenFallback, autoStop }
 
 /// A single parsed `onDuetEvent` payload.
+///
+/// The green-screen events carry backend metadata in every field. `auto_stop`
+/// requires only `event` and `sessionId`; its remaining fields default to the
+/// empty string when native omits them (native sends `reason` as
+/// `trim_end_reached`).
 final class VGDuetEvent {
   const VGDuetEvent({
     required this.type,
@@ -41,6 +49,18 @@ final class VGDuetEvent {
     if (type == null) return null;
 
     final sessionId = payload['sessionId'];
+    if (type == VGDuetEventType.autoStop) {
+      if (sessionId is! String) return null;
+      return VGDuetEvent(
+        type: type,
+        sessionId: sessionId,
+        previousBackend: _stringOrEmpty(payload['previousBackend']),
+        currentBackend: _stringOrEmpty(payload['currentBackend']),
+        reason: _stringOrEmpty(payload['reason']),
+        userMessage: _stringOrEmpty(payload['userMessage']),
+      );
+    }
+
     final previousBackend = payload['previousBackend'];
     final currentBackend = payload['currentBackend'];
     final reason = payload['reason'];
@@ -69,10 +89,14 @@ final class VGDuetEvent {
         return VGDuetEventType.greenScreenDegraded;
       case 'green_screen_fallback':
         return VGDuetEventType.greenScreenFallback;
+      case 'auto_stop':
+        return VGDuetEventType.autoStop;
       default:
         return null;
     }
   }
+
+  static String _stringOrEmpty(dynamic value) => value is String ? value : '';
 }
 
 /// Public typed stream of Duet green-screen degradation/fallback events.
