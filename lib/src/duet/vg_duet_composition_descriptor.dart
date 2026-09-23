@@ -1,6 +1,7 @@
 // Copyright 2026, Connects. All rights reserved.
 // Pure Dart — no dart:io, no dart:ui, no Flutter geometry types.
 
+import '../../vg_overlay_descriptor.dart';
 import 'vg_duet_source.dart';
 import 'vg_duet_models.dart';
 
@@ -40,10 +41,15 @@ class VGDuetCompositionDescriptor {
   /// Whether the microphone audio track is muted.
   final bool micAudioMuted;
 
+  /// Ordered, unmodifiable list of user creator overlays (text/emoji/sticker)
+  /// to carry downstream of the composited Duet foreground on export.
+  final List<VGOverlayDescriptor> overlays;
+
   /// Constructs an immutable [VGDuetCompositionDescriptor].
   ///
-  /// The [segments] list is defensively copied and made unmodifiable so that
-  /// mutation of the caller's list after construction cannot affect this object.
+  /// The [segments] and [overlays] lists are defensively copied and made
+  /// unmodifiable so that mutation of the caller's list after construction
+  /// cannot affect this object.
   VGDuetCompositionDescriptor({
     required this.source,
     required this.layoutConfig,
@@ -54,7 +60,9 @@ class VGDuetCompositionDescriptor {
     this.micAudioGain = 1.0,
     this.sourceAudioMuted = false,
     this.micAudioMuted = false,
-  }) : segments = List.unmodifiable(segments) {
+    List<VGOverlayDescriptor> overlays = const [],
+  }) : segments = List.unmodifiable(segments),
+       overlays = List.unmodifiable(overlays) {
     _validateSpeed(initialSpeed);
     _validateGain(sourceAudioGain, 'sourceAudioGain');
     _validateGain(micAudioGain, 'micAudioGain');
@@ -96,6 +104,7 @@ class VGDuetCompositionDescriptor {
     double? micAudioGain,
     bool? sourceAudioMuted,
     bool? micAudioMuted,
+    List<VGOverlayDescriptor>? overlays,
   }) {
     return VGDuetCompositionDescriptor(
       source: source ?? this.source,
@@ -107,6 +116,7 @@ class VGDuetCompositionDescriptor {
       micAudioGain: micAudioGain ?? this.micAudioGain,
       sourceAudioMuted: sourceAudioMuted ?? this.sourceAudioMuted,
       micAudioMuted: micAudioMuted ?? this.micAudioMuted,
+      overlays: overlays ?? this.overlays,
     );
   }
 
@@ -122,10 +132,17 @@ class VGDuetCompositionDescriptor {
       'micAudioGain': micAudioGain,
       'sourceAudioMuted': sourceAudioMuted,
       'micAudioMuted': micAudioMuted,
+      'overlays': overlays.map((o) => o.toMap()).toList(),
     };
   }
 
   /// Deserializes from a plain [Map].
+  ///
+  /// `overlays` is parsed defensively (never throws): a missing or
+  /// non-[List] value degrades to an empty list; each list entry that is a
+  /// [Map] is parsed through [VGOverlayDescriptor.fromMap] and a `null`
+  /// parse result (or a non-[Map] entry) is silently skipped rather than
+  /// failing the whole descriptor.
   factory VGDuetCompositionDescriptor.fromMap(Map<String, dynamic> map) {
     final segmentsList =
         (map['segments'] as List<dynamic>?)
@@ -134,6 +151,18 @@ class VGDuetCompositionDescriptor {
             )
             .toList() ??
         [];
+    final overlaysList = <VGOverlayDescriptor>[];
+    final rawOverlays = map['overlays'];
+    if (rawOverlays is List) {
+      for (final entry in rawOverlays) {
+        if (entry is Map) {
+          final parsed = VGOverlayDescriptor.fromMap(
+            Map<Object?, Object?>.from(entry),
+          );
+          if (parsed != null) overlaysList.add(parsed);
+        }
+      }
+    }
     return VGDuetCompositionDescriptor(
       source: VGDuetSource.fromMap(
         Map<String, dynamic>.from(map['source'] as Map),
@@ -150,6 +179,7 @@ class VGDuetCompositionDescriptor {
       micAudioGain: (map['micAudioGain'] as num?)?.toDouble() ?? 1.0,
       sourceAudioMuted: map['sourceAudioMuted'] as bool? ?? false,
       micAudioMuted: map['micAudioMuted'] as bool? ?? false,
+      overlays: overlaysList,
     );
   }
 
@@ -165,9 +195,21 @@ class VGDuetCompositionDescriptor {
           sourceAudioGain == other.sourceAudioGain &&
           micAudioGain == other.micAudioGain &&
           sourceAudioMuted == other.sourceAudioMuted &&
-          micAudioMuted == other.micAudioMuted;
+          micAudioMuted == other.micAudioMuted &&
+          _overlaysEqual(overlays, other.overlays);
 
   static bool _listsEqual(List<VGDuetSegment> a, List<VGDuetSegment> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  static bool _overlaysEqual(
+    List<VGOverlayDescriptor> a,
+    List<VGOverlayDescriptor> b,
+  ) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
       if (a[i] != b[i]) return false;
@@ -186,6 +228,7 @@ class VGDuetCompositionDescriptor {
     micAudioGain,
     sourceAudioMuted,
     micAudioMuted,
+    Object.hashAll(overlays),
   );
 
   @override
@@ -195,7 +238,8 @@ class VGDuetCompositionDescriptor {
       'trim: ${trimWindow.startSeconds}–${trimWindow.endSeconds}s, '
       'speed: ${initialSpeed}x, '
       'segments: ${segments.length}, '
-      'gains: src=${sourceAudioGain}/mic=$micAudioGain)';
+      'gains: src=${sourceAudioGain}/mic=$micAudioGain, '
+      'overlays: ${overlays.length})';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

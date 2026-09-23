@@ -124,6 +124,12 @@ final class VGDuetExportSession {
 
         let layoutConfigMap = descriptorMap["layoutConfig"] as? [String: Any] ?? [:]
 
+        // Creator overlays (Slice 3): read as [[String: Any]] if present, else
+        // empty. The zIndex effective-order policy is applied later in
+        // _performExport, alongside the synthetic foreground overlay it must
+        // render above.
+        let creatorOverlayDicts = descriptorMap["overlays"] as? [[String: Any]] ?? []
+
         // ── Validate source file ──────────────────────────────────────────────
 
         let fm = FileManager.default
@@ -204,16 +210,17 @@ final class VGDuetExportSession {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             self._performExport(
-                sourcePath:       sourcePath,
-                trimStart:        trimStart,
-                trimEnd:          trimEnd,
-                outputPath:       outputPath,
-                outputParentPath: outputParentPath,
-                targetWidth:      targetWidth,
-                targetHeight:     targetHeight,
-                videoBitRate:     videoBitRate,
-                layoutConfigMap:  layoutConfigMap,
-                result:           result
+                sourcePath:          sourcePath,
+                trimStart:           trimStart,
+                trimEnd:             trimEnd,
+                outputPath:          outputPath,
+                outputParentPath:    outputParentPath,
+                targetWidth:         targetWidth,
+                targetHeight:        targetHeight,
+                videoBitRate:        videoBitRate,
+                layoutConfigMap:     layoutConfigMap,
+                creatorOverlayDicts: creatorOverlayDicts,
+                result:              result
             )
         }
     }
@@ -229,16 +236,17 @@ final class VGDuetExportSession {
     // MARK: - Private: export pipeline
 
     private func _performExport(
-        sourcePath:       String,
-        trimStart:        Double,
-        trimEnd:          Double,
-        outputPath:       String,
-        outputParentPath: String,
-        targetWidth:      Int,
-        targetHeight:     Int,
-        videoBitRate:     Int,
-        layoutConfigMap:  [String: Any],
-        result:           @escaping FlutterResult
+        sourcePath:          String,
+        trimStart:           Double,
+        trimEnd:             Double,
+        outputPath:          String,
+        outputParentPath:    String,
+        targetWidth:         Int,
+        targetHeight:        Int,
+        videoBitRate:        Int,
+        layoutConfigMap:     [String: Any],
+        creatorOverlayDicts: [[String: Any]],
+        result:              @escaping FlutterResult
     ) {
         // ── Probe source asset duration ───────────────────────────────────────
 
@@ -366,7 +374,24 @@ final class VGDuetExportSession {
             "zIndex":           1,
             "assetPath":        pngPath,
         ]
-        let overlayDicts: [[String: Any]] = [overlayDict]
+
+        // ── Apply z-order policy to creator overlays ──────────────────────────
+        //
+        // Synthetic foreground stays zIndex 1. Creator overlays must render
+        // above it while preserving their relative order:
+        //   effectiveZIndex = max(2, originalZIndex + 2), Int-overflow-safe.
+        // Only zIndex is remapped -- rotation is left untouched, because
+        // VGOverlayDescriptor.rotation is already radians and VGOverlayNode
+        // expects radians (unlike the synthetic foreground's own
+        // degrees-to-radians conversion above).
+        let effectiveCreatorOverlayDicts = creatorOverlayDicts.map { dict -> [String: Any] in
+            var copy = dict
+            let rawZIndex = (dict["zIndex"] as? NSNumber)?.intValue ?? 0
+            let safeSum = rawZIndex > Int.max - 2 ? Int.max : rawZIndex + 2
+            copy["zIndex"] = max(2, safeSum)
+            return copy
+        }
+        let overlayDicts: [[String: Any]] = [overlayDict] + effectiveCreatorOverlayDicts
 
         // Canvas dictionary for VGOverlayNode.
         let canvasDict: [String: Any] = [

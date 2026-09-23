@@ -6,6 +6,7 @@
 // This file does NOT claim that VGEditorDraft accepts a Duet composition
 // node today, and does not depend on VGEditorDraft or VGClipDescriptor.
 
+import '../../vg_overlay_descriptor.dart';
 import 'vg_duet_composition_descriptor.dart';
 import 'vg_duet_models.dart';
 
@@ -64,11 +65,15 @@ class VGDuetEditorCompositionNode {
   /// Whether microphone audio is muted.
   final bool micAudioMuted;
 
+  /// Ordered, unmodifiable list of user creator overlays (text/emoji/sticker)
+  /// to carry downstream of the composited Duet foreground on export.
+  final List<VGOverlayDescriptor> overlays;
+
   /// Constructs a [VGDuetEditorCompositionNode].
   ///
-  /// Both [segmentAssets] and [segments] are defensively copied and made
-  /// unmodifiable. [validate] is called immediately so invalid nodes can never
-  /// be stored.
+  /// [segmentAssets], [segments], and [overlays] are defensively copied and
+  /// made unmodifiable. [validate] is called immediately so invalid nodes can
+  /// never be stored.
   VGDuetEditorCompositionNode({
     required this.sourceVideoPath,
     required this.layoutMode,
@@ -84,8 +89,10 @@ class VGDuetEditorCompositionNode {
     required this.micAudioGain,
     required this.sourceAudioMuted,
     required this.micAudioMuted,
+    List<VGOverlayDescriptor> overlays = const [],
   }) : segmentAssets = List.unmodifiable(segmentAssets),
-       segments = List.unmodifiable(segments) {
+       segments = List.unmodifiable(segments),
+       overlays = List.unmodifiable(overlays) {
     validate();
   }
 
@@ -151,10 +158,17 @@ class VGDuetEditorCompositionNode {
       'micAudioGain': micAudioGain,
       'sourceAudioMuted': sourceAudioMuted,
       'micAudioMuted': micAudioMuted,
+      'overlays': overlays.map((o) => o.toMap()).toList(),
     };
   }
 
   /// Deserializes from a plain [Map].
+  ///
+  /// `overlays` is parsed defensively (never throws): a missing or
+  /// non-[List] value degrades to an empty list; each list entry that is a
+  /// [Map] is parsed through [VGOverlayDescriptor.fromMap] and a `null`
+  /// parse result (or a non-[Map] entry) is silently skipped rather than
+  /// failing the whole node.
   factory VGDuetEditorCompositionNode.fromMap(Map<String, dynamic> map) {
     final modeName = map['layoutMode'] as String? ?? 'pip';
     final layoutMode = VGDuetLayoutMode.values.firstWhere(
@@ -186,6 +200,18 @@ class VGDuetEditorCompositionNode {
             ?.map((e) => e as String)
             .toList() ??
         [];
+    final overlaysList = <VGOverlayDescriptor>[];
+    final rawOverlays = map['overlays'];
+    if (rawOverlays is List) {
+      for (final entry in rawOverlays) {
+        if (entry is Map) {
+          final parsed = VGOverlayDescriptor.fromMap(
+            Map<Object?, Object?>.from(entry),
+          );
+          if (parsed != null) overlaysList.add(parsed);
+        }
+      }
+    }
     return VGDuetEditorCompositionNode(
       sourceVideoPath: map['sourceVideoPath'] as String? ?? '',
       layoutMode: layoutMode,
@@ -201,6 +227,7 @@ class VGDuetEditorCompositionNode {
       micAudioGain: (map['micAudioGain'] as num?)?.toDouble() ?? 1.0,
       sourceAudioMuted: map['sourceAudioMuted'] as bool? ?? false,
       micAudioMuted: map['micAudioMuted'] as bool? ?? false,
+      overlays: overlaysList,
     );
   }
 
@@ -249,6 +276,7 @@ abstract final class VGDuetExportAdapter {
       micAudioGain: descriptor.micAudioGain,
       sourceAudioMuted: descriptor.sourceAudioMuted,
       micAudioMuted: descriptor.micAudioMuted,
+      overlays: List.unmodifiable(descriptor.overlays),
     );
   }
 

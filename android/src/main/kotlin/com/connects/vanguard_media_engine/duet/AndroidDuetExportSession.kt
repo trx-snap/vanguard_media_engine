@@ -132,6 +132,8 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         val layoutMode: String,
         val foregroundTransform: NativeForegroundTransform?,
         val greenScreenBackground: AndroidDuetGreenScreenBackground,
+        // Creator overlays parsed from Dart descriptor["overlays"]. Empty when absent.
+        val creatorOverlays: List<AndroidTimelineOverlayDescriptor>,
     )
 
     private sealed class ParseResult {
@@ -232,6 +234,28 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             )
         }
 
+        // ── Creator overlays (optional; missing key = empty list) ─────────────
+        // Rotation in AndroidTimelineOverlayDescriptor is radians (parsed from
+        // the Dart VGOverlayDescriptor wire format which already uses radians).
+        // parseList validates all fields; any failure fails the export closed.
+        val rawOverlaysEntry = descriptorMap["overlays"]
+        val creatorOverlays: List<AndroidTimelineOverlayDescriptor> = if (rawOverlaysEntry == null) {
+            emptyList()
+        } else {
+            val rawList = rawOverlaysEntry as? List<*>
+                ?: return ParseResult.Failure(
+                    "source_invalid",
+                    "exportDuetComposition: descriptor.overlays must be a list.",
+                )
+            when (val overlayParseResult = AndroidTimelineOverlayDescriptor.parseList(rawList)) {
+                is AndroidTimelineOverlayDescriptor.ParseResult.Success -> overlayParseResult.overlays
+                is AndroidTimelineOverlayDescriptor.ParseResult.Failure -> return ParseResult.Failure(
+                    overlayParseResult.code.lowercase(),
+                    "exportDuetComposition: ${overlayParseResult.message}",
+                )
+            }
+        }
+
         return ParseResult.Success(
             ExportParams(
                 sourceFilePath         = sourceFilePath,
@@ -243,7 +267,8 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 videoBitRate           = videoBitRate,
                 layoutMode             = layoutMode,
                 foregroundTransform    = fgTransform,
-                greenScreenBackground = greenScreenBg,
+                greenScreenBackground  = greenScreenBg,
+                creatorOverlays        = creatorOverlays,
             )
         )
     }
@@ -362,7 +387,9 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 anchorY         = fgAnchorY,
                 rotationDegrees = fgRotationDegrees,
             )
-            val overlayDescriptor = AndroidTimelineOverlayDescriptor(
+            // AndroidTimelineOverlayDescriptor.rotation is radians.
+            // fgRotationDegrees is in degrees; convert to radians here.
+            val syntheticForegroundOverlay = AndroidTimelineOverlayDescriptor(
                 overlayId        = "duet_synthetic_fg",
                 type             = AndroidTimelineOverlayDescriptor.Type.STICKER,
                 startTimeSeconds = 0.0,
@@ -371,12 +398,25 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 translationY     = overlayOrigin.second,
                 width            = fgRect.width,
                 height           = fgRect.height,
-                rotation         = fgRotationDegrees,
+                rotation         = Math.toRadians(fgRotationDegrees),
                 scale            = 1.0,
                 opacity          = 1.0,
                 zIndex           = 1,
                 assetPath        = overlayFile.absolutePath,
             )
+
+            // ── Apply z-order policy to creator overlays ──────────────────────
+            // Synthetic foreground is zIndex=1. Creator overlays must render
+            // above it: effectiveZIndex = max(2, userZIndex + 2), Int-overflow-safe.
+            // Creator overlay rotation is already in radians from Dart/VGOverlayDescriptor.
+            val adjustedCreatorOverlays = params.creatorOverlays.map { overlay ->
+                val safeZIndex = if (overlay.zIndex > Int.MAX_VALUE - 2) Int.MAX_VALUE
+                                 else maxOf(2, overlay.zIndex + 2)
+                overlay.copy(zIndex = safeZIndex)
+            }
+
+            // Combined overlay list: synthetic foreground first, then creator overlays.
+            val allOverlays = listOf(syntheticForegroundOverlay) + adjustedCreatorOverlays
 
             // ── Encode via selector-routed backend (clips + overlay) ──────────
             val fps = 30
@@ -403,7 +443,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 requestedWidth  = params.targetWidth,
                 requestedHeight = params.targetHeight,
                 transitions     = emptyList(),
-                overlays        = listOf(overlayDescriptor),
+                overlays        = allOverlays,
             )
             val backendDecision = AndroidExportRenderBackendSelector().select(
                 exportScope,
@@ -441,7 +481,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             var encodeResult = buildEncoder(effectiveBackend).encode(
                 clips       = listOf(clip),
                 transitions = emptyList(),
-                overlays    = listOf(overlayDescriptor),
+                overlays    = allOverlays,
                 onProgress  = null,
             )
 
@@ -454,7 +494,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 encodeResult = buildEncoder(effectiveBackend).encode(
                     clips       = listOf(clip),
                     transitions = emptyList(),
-                    overlays    = listOf(overlayDescriptor),
+                    overlays    = allOverlays,
                     onProgress  = null,
                 )
             }

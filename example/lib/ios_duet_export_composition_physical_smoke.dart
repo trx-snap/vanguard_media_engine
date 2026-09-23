@@ -6,12 +6,13 @@
 //   - Descriptor-bound iOS offline video-only composited MP4.
 //   - Source video decode/encode path via VGTimelineExportHelper.
 //   - Synthetic foreground geometry route via VGDuetLayoutGeometry.
+//   - Slice 3 creator overlay carriage and export integration (TEXT overlay in VGDuetCompositionDescriptor.overlays).
 //   - Atomic final output (write to tmp, rename on success).
 //
 // Non-claims:
 //   - No live camera, no ML/human matte, no audio/mic/sync, no Android.
 //   - No ConnectsApp/Universal Editor/upload/backend wiring.
-//   - No rendered pixel assertion (synthetic foreground is magenta rectangle).
+//   - No rendered pixel assertion (synthetic foreground is magenta rectangle; creator overlay verified through descriptor carriage and native export completion without automated pixel sampling).
 //   - No low-end iOS or device matrix proof.
 
 // ignore_for_file: avoid_print
@@ -24,13 +25,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:vanguard_media_engine/vg_duet.dart';
+import 'package:vanguard_media_engine/vg_overlay_descriptor.dart';
 
 // ── Structured log markers ────────────────────────────────────────────────────
 
 const String kStartMarker = 'IOS_DUET_EXPORT_COMPOSITION_SMOKE_START';
-const String kPassMarker  = 'IOS_DUET_EXPORT_COMPOSITION_PHYSICAL_PASS';
-const String kFailMarker  = 'IOS_DUET_EXPORT_COMPOSITION_PHYSICAL_FAIL';
-const String kJsonPrefix  = 'IOS_DUET_EXPORT_COMPOSITION_JSON:';
+const String kPassMarker = 'IOS_DUET_EXPORT_COMPOSITION_PHYSICAL_PASS';
+const String kFailMarker = 'IOS_DUET_EXPORT_COMPOSITION_PHYSICAL_FAIL';
+const String kJsonPrefix = 'IOS_DUET_EXPORT_COMPOSITION_JSON:';
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -123,8 +125,24 @@ class _IosDuetExportCompositionSmokePageState
       throw StateError('clip_B.mov staged but missing or empty.');
     }
 
-    // ── 2. Build greenScreen descriptor ──────────────────────────────────────
+    // ── 2. Build greenScreen descriptor with creator overlay (Slice 3) ───────
     final source = VGDuetSource.localFile(clipFile.path);
+    final creatorOverlay = VGOverlayDescriptor(
+      id: 'slice3_creator_overlay_1',
+      type: VGOverlayType.text,
+      startTimeSeconds: 0.0,
+      durationSeconds: 5.0,
+      translationX: 100.0,
+      translationY: 200.0,
+      width: 400.0,
+      height: 120.0,
+      rotation: 0.0,
+      scale: 1.0,
+      opacity: 1.0,
+      zIndex: 0,
+      textContent: 'SLICE3',
+    );
+
     final descriptor = VGDuetCompositionDescriptor(
       source: source,
       layoutConfig: VGDuetLayoutConfig(
@@ -134,6 +152,7 @@ class _IosDuetExportCompositionSmokePageState
       trimWindow: VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 5.0),
       initialSpeed: 1.0,
       segments: [],
+      overlays: [creatorOverlay],
     );
 
     _log({
@@ -141,13 +160,26 @@ class _IosDuetExportCompositionSmokePageState
       'source': source.filePath,
       'layoutMode': 'greenScreen',
       'fgTransformScale': VGDuetForegroundTransform.creatorOverlay.scale,
+      'creatorOverlayCount': descriptor.overlays.length,
+      'creatorOverlayIds': descriptor.overlays.map((o) => o.id).toList(),
+      'creatorOverlayTypes': descriptor.overlays
+          .map((o) => o.type.value)
+          .toList(),
     });
 
     // ── 3. Prepare output path ────────────────────────────────────────────────
     final outputPath = '${tmpDir.path}/duet_export_output.mp4';
 
     // ── 4. Call public exportDuetComposition ─────────────────────────────────
-    _log({'phase': 'export_start', 'outputPath': outputPath});
+    _log({
+      'phase': 'export_start',
+      'outputPath': outputPath,
+      'creatorOverlayCount': descriptor.overlays.length,
+      'creatorOverlayIds': descriptor.overlays.map((o) => o.id).toList(),
+      'creatorOverlayTypes': descriptor.overlays
+          .map((o) => o.type.value)
+          .toList(),
+    });
 
     final platform = const MethodChannelVGDuetPlatform();
     final VGDuetExportResult result;
@@ -235,10 +267,16 @@ class _IosDuetExportCompositionSmokePageState
       'outputPath': result.outputPath,
       'durationMs': result.durationMs,
       'fileSizeBytes': result.fileSizeBytes,
+      'creatorOverlayCount': descriptor.overlays.length,
+      'creatorOverlayIds': descriptor.overlays.map((o) => o.id).toList(),
+      'creatorOverlayTypes': descriptor.overlays
+          .map((o) => o.type.value)
+          .toList(),
       'claims': [
         'descriptor_bound_ios_offline_video_only_composited_mp4',
         'source_video_decode_encode_path',
         'synthetic_foreground_geometry_route',
+        'slice3_creator_overlay_descriptor_carriage_and_native_export_route',
         'atomic_final_output',
       ],
       'nonClaims': [

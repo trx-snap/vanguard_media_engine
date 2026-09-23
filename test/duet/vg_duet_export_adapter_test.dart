@@ -4,6 +4,7 @@ import 'package:vanguard_media_engine/src/duet/vg_duet_source.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_models.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_composition_descriptor.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_export_adapter.dart';
+import 'package:vanguard_media_engine/vg_overlay_descriptor.dart';
 
 VGDuetCompositionDescriptor _descriptor({
   VGDuetLayoutMode mode = VGDuetLayoutMode.splitLeftRight,
@@ -13,6 +14,7 @@ VGDuetCompositionDescriptor _descriptor({
   VGDuetRect? pipNormalizedRect,
   double initialSpeed = 1.0,
   List<VGDuetSegment>? segments,
+  List<VGOverlayDescriptor>? overlays,
 }) => VGDuetCompositionDescriptor(
   source: VGDuetSource.localFile('/tmp/source.mp4'),
   layoutConfig: VGDuetLayoutConfig(
@@ -27,6 +29,7 @@ VGDuetCompositionDescriptor _descriptor({
   segments: segments ?? [],
   sourceAudioGain: 0.8,
   micAudioGain: 0.6,
+  overlays: overlays ?? const [],
 );
 
 void main() {
@@ -396,4 +399,163 @@ void main() {
       );
     });
   });
+
+  // ── Creator overlays (Slice 3) ───────────────────────────────────────────
+
+  group(
+    'VGDuetExportAdapter & VGDuetEditorCompositionNode overlays (Slice 3)',
+    () {
+      final overlay1 = VGOverlayDescriptor(
+        id: 'slice3_text',
+        type: VGOverlayType.text,
+        startTimeSeconds: 0.0,
+        durationSeconds: 4.0,
+        translationX: 80.0,
+        translationY: 160.0,
+        width: 250.0,
+        height: 60.0,
+        rotation: 0.1,
+        scale: 1.0,
+        opacity: 0.9,
+        zIndex: 0,
+        textContent: 'SLICE3_TEST',
+      );
+
+      final overlay2 = VGOverlayDescriptor(
+        id: 'slice3_sticker',
+        type: VGOverlayType.sticker,
+        startTimeSeconds: 1.0,
+        durationSeconds: 3.0,
+        translationX: 200.0,
+        translationY: 300.0,
+        width: 100.0,
+        height: 100.0,
+        rotation: 0.0,
+        scale: 1.0,
+        opacity: 1.0,
+        zIndex: 3,
+        assetPath: '/assets/stickers/badge.png',
+      );
+
+      test('buildCompositionNode preserves descriptor.overlays', () {
+        final desc = _descriptor(overlays: [overlay1, overlay2]);
+        final node = VGDuetExportAdapter.buildCompositionNode(descriptor: desc);
+        expect(node.overlays.length, 2);
+        expect(node.overlays[0], equals(overlay1));
+        expect(node.overlays[1], equals(overlay2));
+      });
+
+      test('node.toMap and fromMap preserves overlays', () {
+        final desc = _descriptor(overlays: [overlay1, overlay2]);
+        final node = VGDuetExportAdapter.buildCompositionNode(descriptor: desc);
+        final map = node.toMap();
+
+        expect(map.containsKey('overlays'), isTrue);
+        final rawList = map['overlays'] as List<dynamic>;
+        expect(rawList.length, 2);
+
+        final restored = VGDuetEditorCompositionNode.fromMap(map);
+        expect(restored.overlays.length, 2);
+        expect(restored.overlays[0], equals(overlay1));
+        expect(restored.overlays[1], equals(overlay2));
+      });
+
+      test('constructor default overlays is empty for existing call sites', () {
+        // Direct constructor call without overlays
+        final nodeDirect = VGDuetEditorCompositionNode(
+          sourceVideoPath: '/tmp/clip.mp4',
+          layoutMode: VGDuetLayoutMode.splitLeftRight,
+          isSideSwapped: false,
+          isTopBottomSwapped: false,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 5.0,
+          segmentAssets: [],
+          segments: [],
+          sourceAudioGain: 1.0,
+          micAudioGain: 1.0,
+          sourceAudioMuted: false,
+          micAudioMuted: false,
+        );
+        expect(nodeDirect.overlays, isEmpty);
+
+        // Adapter call with default descriptor (no overlays specified)
+        final nodeFromAdapter = VGDuetExportAdapter.buildCompositionNode(
+          descriptor: _descriptor(),
+        );
+        expect(nodeFromAdapter.overlays, isEmpty);
+      });
+
+      test('overlays list is unmodifiable and defensively copied', () {
+        final mutable = <VGOverlayDescriptor>[overlay1];
+        final node = VGDuetEditorCompositionNode(
+          sourceVideoPath: '/tmp/clip.mp4',
+          layoutMode: VGDuetLayoutMode.splitLeftRight,
+          isSideSwapped: false,
+          isTopBottomSwapped: false,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 5.0,
+          segmentAssets: [],
+          segments: [],
+          sourceAudioGain: 1.0,
+          micAudioGain: 1.0,
+          sourceAudioMuted: false,
+          micAudioMuted: false,
+          overlays: mutable,
+        );
+
+        // Mutating source list after construction does not affect node
+        mutable.add(overlay2);
+        expect(node.overlays.length, 1);
+        expect(node.overlays[0], equals(overlay1));
+
+        // Mutating node.overlays throws UnsupportedError
+        expect(() => node.overlays.add(overlay2), throwsUnsupportedError);
+      });
+
+      test(
+        'fromMap defensively handles missing/null/wrong-type/malformed overlays',
+        () {
+          final node = VGDuetExportAdapter.buildCompositionNode(
+            descriptor: _descriptor(),
+          );
+          final baseMap = node.toMap();
+
+          // missing overlays key
+          final missingMap = Map<String, dynamic>.from(baseMap)
+            ..remove('overlays');
+          final restoredMissing = VGDuetEditorCompositionNode.fromMap(
+            missingMap,
+          );
+          expect(restoredMissing.overlays, isEmpty);
+
+          // null overlays
+          final nullMap = Map<String, dynamic>.from(baseMap)
+            ..['overlays'] = null;
+          final restoredNull = VGDuetEditorCompositionNode.fromMap(nullMap);
+          expect(restoredNull.overlays, isEmpty);
+
+          // wrong type string
+          final stringMap = Map<String, dynamic>.from(baseMap)
+            ..['overlays'] = 'invalid';
+          final restoredString = VGDuetEditorCompositionNode.fromMap(stringMap);
+          expect(restoredString.overlays, isEmpty);
+
+          // mixed entries with non-map elements skipped
+          final mixedList = [
+            overlay1.toMap(),
+            'not_a_map',
+            null,
+            123,
+            overlay2.toMap(),
+          ];
+          final mixedMap = Map<String, dynamic>.from(baseMap)
+            ..['overlays'] = mixedList;
+          final restoredMixed = VGDuetEditorCompositionNode.fromMap(mixedMap);
+          expect(restoredMixed.overlays.length, 2);
+          expect(restoredMixed.overlays[0], equals(overlay1));
+          expect(restoredMixed.overlays[1], equals(overlay2));
+        },
+      );
+    },
+  );
 }

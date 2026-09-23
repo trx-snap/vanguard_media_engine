@@ -6,6 +6,7 @@ import 'package:vanguard_media_engine/src/duet/vg_duet_models.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_composition_descriptor.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_export.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_platform_interface.dart';
+import 'package:vanguard_media_engine/vg_overlay_descriptor.dart';
 
 const _channelName = 'vanguard_media_engine';
 const _sessionId = 'test-session-001';
@@ -222,6 +223,7 @@ void main() {
   group('exportDuetComposition (Slice 5B-A)', () {
     VGDuetCompositionDescriptor makeDescriptor({
       VGDuetGreenScreenBackground? greenScreenBackground,
+      List<VGOverlayDescriptor>? overlays,
     }) {
       return VGDuetCompositionDescriptor(
         source: VGDuetSource.localFile('/tmp/source.mp4'),
@@ -233,6 +235,7 @@ void main() {
         trimWindow: VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 5.0),
         initialSpeed: 1.0,
         segments: [],
+        overlays: overlays ?? const [],
       );
     }
 
@@ -553,6 +556,95 @@ void main() {
           renderBackend: 'gles',
         );
         expect(r1, isNot(equals(r2)));
+      },
+    );
+
+    test(
+      'exportDuetComposition method-channel args include descriptor["overlays"] proving carriage of creator overlays',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+
+        final textOverlay = VGOverlayDescriptor(
+          id: 'slice3_text_overlay',
+          type: VGOverlayType.text,
+          startTimeSeconds: 0.5,
+          durationSeconds: 4.0,
+          translationX: 100.0,
+          translationY: 200.0,
+          width: 350.0,
+          height: 90.0,
+          rotation: 0.15,
+          scale: 1.0,
+          opacity: 0.95,
+          zIndex: 4,
+          textContent: 'SLICE3',
+        );
+
+        final stickerOverlay = VGOverlayDescriptor(
+          id: 'slice3_sticker_overlay',
+          type: VGOverlayType.sticker,
+          startTimeSeconds: 1.0,
+          durationSeconds: 3.0,
+          translationX: 40.0,
+          translationY: 80.0,
+          width: 120.0,
+          height: 120.0,
+          rotation: -0.3,
+          scale: 0.9,
+          opacity: 1.0,
+          zIndex: 7,
+          assetPath: '/tmp/assets/sticker.png',
+        );
+
+        final desc = makeDescriptor(overlays: [textOverlay, stickerOverlay]);
+        await platform.exportDuetComposition(
+          descriptor: desc,
+          outputPath: '/tmp/out.mp4',
+        );
+
+        expect(fakeChannel.lastMethod, 'exportDuetComposition');
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        final descMap = args['descriptor'] as Map;
+        expect(descMap.containsKey('overlays'), isTrue);
+
+        final overlaysList = descMap['overlays'] as List;
+        expect(overlaysList.length, 2);
+
+        // Verify text overlay carriage
+        final textMap = overlaysList[0] as Map<String, dynamic>;
+        expect(textMap['id'], 'slice3_text_overlay');
+        expect(textMap['type'], 'text');
+        expect(textMap['startTimeSeconds'], closeTo(0.5, 1e-10));
+        expect(textMap['durationSeconds'], closeTo(4.0, 1e-10));
+        expect(textMap['translationX'], closeTo(100.0, 1e-10));
+        expect(textMap['translationY'], closeTo(200.0, 1e-10));
+        expect(textMap['width'], closeTo(350.0, 1e-10));
+        expect(textMap['height'], closeTo(90.0, 1e-10));
+        expect(textMap['rotation'], closeTo(0.15, 1e-10));
+        expect(textMap['scale'], closeTo(1.0, 1e-10));
+        expect(textMap['opacity'], closeTo(0.95, 1e-10));
+        expect(textMap['zIndex'], 4);
+        expect(textMap['textContent'], 'SLICE3');
+
+        // Verify sticker overlay carriage
+        final stickerMap = overlaysList[1] as Map<String, dynamic>;
+        expect(stickerMap['id'], 'slice3_sticker_overlay');
+        expect(stickerMap['type'], 'sticker');
+        expect(stickerMap['startTimeSeconds'], closeTo(1.0, 1e-10));
+        expect(stickerMap['durationSeconds'], closeTo(3.0, 1e-10));
+        expect(stickerMap['translationX'], closeTo(40.0, 1e-10));
+        expect(stickerMap['translationY'], closeTo(80.0, 1e-10));
+        expect(stickerMap['width'], closeTo(120.0, 1e-10));
+        expect(stickerMap['height'], closeTo(120.0, 1e-10));
+        expect(stickerMap['rotation'], closeTo(-0.3, 1e-10));
+        expect(stickerMap['scale'], closeTo(0.9, 1e-10));
+        expect(stickerMap['opacity'], closeTo(1.0, 1e-10));
+        expect(stickerMap['zIndex'], 7);
+        expect(stickerMap['assetPath'], '/tmp/assets/sticker.png');
       },
     );
   });

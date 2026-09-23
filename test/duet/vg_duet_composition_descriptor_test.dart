@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_source.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_models.dart';
 import 'package:vanguard_media_engine/src/duet/vg_duet_composition_descriptor.dart';
+import 'package:vanguard_media_engine/vg_overlay_descriptor.dart';
 
 VGDuetCompositionDescriptor _makeDescriptor({
   VGDuetLayoutMode mode = VGDuetLayoutMode.splitLeftRight,
@@ -18,6 +19,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
   bool sourceAudioMuted = false,
   bool micAudioMuted = false,
   List<VGDuetSegment>? segments,
+  List<VGOverlayDescriptor>? overlays,
 }) {
   return VGDuetCompositionDescriptor(
     source: VGDuetSource.localFile('/tmp/source.mp4'),
@@ -37,6 +39,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
     micAudioGain: micAudioGain,
     sourceAudioMuted: sourceAudioMuted,
     micAudioMuted: micAudioMuted,
+    overlays: overlays ?? const [],
   );
 }
 
@@ -976,5 +979,195 @@ void main() {
         expect(restoredLayout.greenScreenBackground, isNull);
       },
     );
+  });
+
+  // ── Creator overlays (Slice 3) ───────────────────────────────────────────
+
+  group('VGDuetCompositionDescriptor creator overlays (Slice 3)', () {
+    final textOverlay = VGOverlayDescriptor(
+      id: 'text-overlay-1',
+      type: VGOverlayType.text,
+      startTimeSeconds: 0.0,
+      durationSeconds: 5.0,
+      translationX: 100.0,
+      translationY: 200.0,
+      width: 320.0,
+      height: 80.0,
+      rotation: 0.0,
+      scale: 1.0,
+      opacity: 1.0,
+      zIndex: 0,
+      textContent: 'SLICE3',
+    );
+
+    final emojiOverlay = VGOverlayDescriptor(
+      id: 'emoji-overlay-1',
+      type: VGOverlayType.emoji,
+      startTimeSeconds: 1.0,
+      durationSeconds: 3.5,
+      translationX: 150.0,
+      translationY: 250.0,
+      width: 100.0,
+      height: 100.0,
+      rotation: 0.5,
+      scale: 1.2,
+      opacity: 0.9,
+      zIndex: 1,
+      textContent: '🚀',
+    );
+
+    final stickerOverlay = VGOverlayDescriptor(
+      id: 'sticker-overlay-1',
+      type: VGOverlayType.sticker,
+      startTimeSeconds: 0.5,
+      durationSeconds: 4.0,
+      translationX: 50.0,
+      translationY: 50.0,
+      width: 150.0,
+      height: 150.0,
+      rotation: -0.25,
+      scale: 0.85,
+      opacity: 0.95,
+      zIndex: 2,
+      assetPath: '/assets/stickers/star.png',
+    );
+
+    test(
+      'descriptor with text/emoji/sticker creator overlays round-trips via toMap/fromMap',
+      () {
+        final d = _makeDescriptor(
+          overlays: [textOverlay, emojiOverlay, stickerOverlay],
+        );
+        final map = d.toMap();
+        final restored = VGDuetCompositionDescriptor.fromMap(map);
+
+        expect(restored, equals(d));
+        expect(restored.overlays.length, 3);
+        expect(restored.overlays[0], equals(textOverlay));
+        expect(restored.overlays[1], equals(emojiOverlay));
+        expect(restored.overlays[2], equals(stickerOverlay));
+      },
+    );
+
+    test(
+      'creator overlays are included in toMap under descriptor["overlays"]',
+      () {
+        final d = _makeDescriptor(overlays: [textOverlay, stickerOverlay]);
+        final map = d.toMap();
+        expect(map.containsKey('overlays'), isTrue);
+        final rawOverlays = map['overlays'] as List<dynamic>;
+        expect(rawOverlays.length, 2);
+
+        final textMap = rawOverlays[0] as Map<String, dynamic>;
+        expect(textMap['id'], 'text-overlay-1');
+        expect(textMap['type'], 'text');
+        expect(textMap['textContent'], 'SLICE3');
+        expect(textMap['startTimeSeconds'], 0.0);
+        expect(textMap['durationSeconds'], 5.0);
+        expect(textMap['translationX'], 100.0);
+        expect(textMap['translationY'], 200.0);
+        expect(textMap['width'], 320.0);
+        expect(textMap['height'], 80.0);
+        expect(textMap['rotation'], 0.0);
+        expect(textMap['scale'], 1.0);
+        expect(textMap['opacity'], 1.0);
+        expect(textMap['zIndex'], 0);
+
+        final stickerMap = rawOverlays[1] as Map<String, dynamic>;
+        expect(stickerMap['id'], 'sticker-overlay-1');
+        expect(stickerMap['type'], 'sticker');
+        expect(stickerMap['assetPath'], '/assets/stickers/star.png');
+        expect(stickerMap['zIndex'], 2);
+      },
+    );
+
+    test('creator overlays participate in equality and hashCode', () {
+      final a = _makeDescriptor(overlays: [textOverlay, emojiOverlay]);
+      final bSame = _makeDescriptor(overlays: [textOverlay, emojiOverlay]);
+      final cDifferent = _makeDescriptor(overlays: [textOverlay]);
+      final dEmpty = _makeDescriptor(overlays: []);
+
+      expect(a, equals(bSame));
+      expect(a.hashCode, equals(bSame.hashCode));
+      expect(a, isNot(equals(cDifferent)));
+      expect(a, isNot(equals(dEmpty)));
+    });
+
+    test('copyWith overrides overlays field', () {
+      final d = _makeDescriptor(overlays: [textOverlay]);
+      final d2 = d.copyWith(overlays: [emojiOverlay, stickerOverlay]);
+      expect(d2.overlays.length, 2);
+      expect(d2.overlays[0], equals(emojiOverlay));
+      expect(d2.overlays[1], equals(stickerOverlay));
+      // original remains unchanged
+      expect(d.overlays.length, 1);
+      expect(d.overlays[0], equals(textOverlay));
+    });
+
+    test('overlays list is unmodifiable and defensively copied', () {
+      final mutable = <VGOverlayDescriptor>[textOverlay];
+      final d = VGDuetCompositionDescriptor(
+        source: VGDuetSource.localFile('/tmp/source.mp4'),
+        layoutConfig: VGDuetLayoutConfig(mode: VGDuetLayoutMode.splitLeftRight),
+        trimWindow: VGDuetTrimWindow(startSeconds: 0.0, endSeconds: 5.0),
+        initialSpeed: 1.0,
+        segments: [],
+        overlays: mutable,
+      );
+      // Mutating source list
+      mutable.add(emojiOverlay);
+      expect(d.overlays.length, 1);
+      expect(d.overlays[0], equals(textOverlay));
+
+      // Attempting to modify descriptor's list
+      expect(() => d.overlays.add(stickerOverlay), throwsUnsupportedError);
+    });
+
+    test(
+      'missing/null/wrong-type overlays in fromMap degrade defensively to empty list',
+      () {
+        final baseMap = _makeDescriptor().toMap();
+
+        // missing overlays key
+        final missingMap = Map<String, dynamic>.from(baseMap)
+          ..remove('overlays');
+        final restoredMissing = VGDuetCompositionDescriptor.fromMap(missingMap);
+        expect(restoredMissing.overlays, isEmpty);
+
+        // null overlays
+        final nullMap = Map<String, dynamic>.from(baseMap)..['overlays'] = null;
+        final restoredNull = VGDuetCompositionDescriptor.fromMap(nullMap);
+        expect(restoredNull.overlays, isEmpty);
+
+        // wrong-type string
+        final stringMap = Map<String, dynamic>.from(baseMap)
+          ..['overlays'] = 'not_a_list';
+        final restoredString = VGDuetCompositionDescriptor.fromMap(stringMap);
+        expect(restoredString.overlays, isEmpty);
+
+        // wrong-type number
+        final numMap = Map<String, dynamic>.from(baseMap)..['overlays'] = 42;
+        final restoredNum = VGDuetCompositionDescriptor.fromMap(numMap);
+        expect(restoredNum.overlays, isEmpty);
+      },
+    );
+
+    test('malformed/non-map entries in overlays list are skipped silently', () {
+      final baseMap = _makeDescriptor().toMap();
+      final mixedList = [
+        textOverlay.toMap(),
+        'not_a_map',
+        null,
+        123,
+        <dynamic>[],
+        emojiOverlay.toMap(),
+      ];
+      final mixedMap = Map<String, dynamic>.from(baseMap)
+        ..['overlays'] = mixedList;
+      final restored = VGDuetCompositionDescriptor.fromMap(mixedMap);
+      expect(restored.overlays.length, 2);
+      expect(restored.overlays[0], equals(textOverlay));
+      expect(restored.overlays[1], equals(emojiOverlay));
+    });
   });
 }
