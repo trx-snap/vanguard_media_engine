@@ -11,11 +11,12 @@
 // Android VGEditorController public playback route supports sequential plain
 // local video clips (one or more, hard-cut concatenation only) plus a
 // validated subset of the audio sidecar plan: derived original clip audio
-// tracks and user-added music/sfx/voiceover tracks (Phase 7.8P). It does not
-// yet execute editor compositor features such as transitions, overlays,
-// spatial clip transforms, still-image crop/fit, freeze frames, reverse
-// playback, dual-camera composition, time remap, transform tracks, or color
-// matrix filtering.
+// tracks and user-added music/sfx/voiceover tracks (Phase 7.8P), and
+// freeze-frame clips (Phase 7.17-Android: a video clip with freezePTS holds
+// one source frame for its timeline hold and is silent). It does not yet
+// execute editor compositor features such as transitions, overlays, spatial
+// clip transforms, still-image crop/fit, reverse playback, dual-camera
+// composition, time remap, transform tracks, or color matrix filtering.
 //
 // This pure Dart evaluator preflights a VGEditorDraft and returns a structured
 // report (ready vs blocked) with strongly-typed issue codes, descriptive
@@ -70,7 +71,11 @@ enum VGEditorPreviewReadinessIssueCode {
   /// A clip specifies still-image fit mode or crop rect (crop/fit not executed on Android playback route).
   stillImageFitOrCropPresent,
 
-  /// A clip specifies a freeze frame PTS (freeze frame extraction not executed on Android playback route).
+  /// Reserved for backward compatibility with earlier readiness reports.
+  /// Android editor playback now supports freeze-frame clips (Phase
+  /// 7.17-Android: `freezePTS` holds a single source frame for the clip's
+  /// timeline hold, silently), so this code is never emitted by
+  /// [VGEditorPreviewReadinessEvaluator.evaluate].
   freezeFramePresent,
 
   /// A clip specifies reverse playback (temporal reversal not executed on Android playback route).
@@ -250,7 +255,9 @@ final class VGEditorPreviewReadinessReport {
 ///     it validates only the structural/descriptor-level contract above.
 /// - No spatial clip transform ([VGClipDescriptor.transform] must be null).
 /// - No still-image fit mode or crop ([VGClipDescriptor.fitMode] == [VGStillImageFitMode.fit], [VGClipDescriptor.cropRect] == null).
-/// - No freeze frame ([VGClipDescriptor.freezePTS] must be null).
+/// - Freeze-frame clips are supported ([VGClipDescriptor.freezePTS] may be
+///   non-null on a video clip; the native route holds the frame at that
+///   source PTS for the clip's trim-window hold and plays it silently).
 /// - No reverse playback ([VGClipDescriptor.isReversed] must be false).
 /// - No dual camera ([VGClipDescriptor.dualCamera] must be null).
 /// - No time remap ([VGClipDescriptor.timeRemap] must be null).
@@ -356,17 +363,7 @@ final class VGEditorPreviewReadinessEvaluator {
         );
       }
 
-      // Freeze frame.
-      if (clip.freezePTS != null) {
-        issues.add(
-          VGEditorPreviewReadinessIssue(
-            code: VGEditorPreviewReadinessIssueCode.freezeFramePresent,
-            clipId: clip.id,
-            message:
-                'Clip "${clip.id}" has freezePTS set; freeze frame playback is not supported on the Android editor playback route.',
-          ),
-        );
-      }
+      // Freeze frame: supported (Phase 7.17-Android) -- no issue is emitted.
 
       // Reverse playback.
       if (clip.isReversed) {

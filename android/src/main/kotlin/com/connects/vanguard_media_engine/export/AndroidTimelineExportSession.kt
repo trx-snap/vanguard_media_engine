@@ -39,8 +39,21 @@ import kotlin.math.max
 // by Unit G with rotation metadata + canvas scaling normalization, and by
 // Phase 10 with per-clip colorMatrix parity):
 //   - video-only clips, speed == 1.0, no canvas
-//     contentMode other than "fit", no per-clip crop/freeze/
+//     contentMode other than "fit", no per-clip crop/
 //     time-remap/dual-camera/transformTrack.
+//   - Phase 7.17-Android freeze frame: a VIDEO clip carrying `freezePTS`
+//     (finite, non-negative source-local seconds, validated against the
+//     probed source duration) is a freeze-frame hold: its trim window is
+//     the timeline hold VGEditorDraft.freezeClip emitted (trim [0, hold]),
+//     and AndroidTimelineVideoEncoder's freeze route extracts exactly one
+//     source frame at that PTS and draws it for the whole hold. Freeze
+//     clips are video-derived and silent: any derived role="original"
+//     audioSidecar track addressed to a freeze clip (trackId
+//     "original-<clipId>") is dropped before admission/mux so the source's
+//     audio under the freeze window is never taken. freezePTS on a
+//     non-video clip, on a reversed clip, or alongside clip-level Beauty V2
+//     fails closed before pass-1; AndroidExportRenderBackendSelector never
+//     routes a freeze clip to Vulkan or the GLES transition route.
 //   - P5-CLIP-STATIC-TRANSFORM-EXPORT-A: a narrow static `clip.transform`
 //     subset is accepted for VIDEO clips only: finite uniform scale
 //     (scaleX ≈ scaleY, both > 0, at most MAX_CLIP_TRANSFORM_SCALE), finite
@@ -244,6 +257,8 @@ class AndroidTimelineExportSession(
         // translation still in DRAFT-CANVAS pixels (converted to output
         // pixels when the ClipInput is built). Null = no transform.
         val canvasTransform: AndroidTimelineVideoEncoder.StaticClipTransform? = null,
+        // Phase 7.17-Android: freeze-frame source PTS (seconds); null = normal clip.
+        val freezePTS: Double? = null,
     )
 
     private data class ClipContext(
@@ -260,6 +275,7 @@ class AndroidTimelineExportSession(
         val beautyIntensity: Double? = null,
         val isReversed: Boolean = false,
         val canvasTransform: AndroidTimelineVideoEncoder.StaticClipTransform? = null,
+        val freezePTS: Double? = null,
     )
 
     /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: outcome of parsing one clip's
@@ -416,7 +432,7 @@ class AndroidTimelineExportSession(
         // re-parsing the raw wire list repeatedly.
         val rawSidecarTracks = ((draftMap["audioSidecar"] as? Map<*, *>)?.get("tracks") as? List<*>)
             ?: emptyList<Any?>()
-        val (audioSpecs, _) = AndroidAudioTrackSpec.parseList(rawSidecarTracks)
+        val (parsedAudioSpecs, _) = AndroidAudioTrackSpec.parseList(rawSidecarTracks)
 
         // P5-OVERLAYS-TRANS Route-A N9: overlay preflight parser and admission
         // gate. Static sticker overlays are validated here; feature-shape
@@ -507,6 +523,47 @@ class AndroidTimelineExportSession(
                         "(mediaKind '$mediaKind' with isReversed=true)",
                 )
                 return
+            }
+            // Phase 7.17-Android freeze frame: `freezePTS` is present only for a
+            // freeze-frame clip (VGEditorDraft.freezeClip). It must be a finite,
+            // non-negative number (INVALID_ARG otherwise); it is only defined for
+            // a forward VIDEO clip -- a freeze on a still image or on a reversed
+            // clip (DEC-154: freeze clips cannot be reversed; the reverse
+            // sidecar's PTS space is not the original source's) fails closed with
+            // UNSUPPORTED_EXPORT_FEATURE. The wire isReversed is checked here,
+            // before the sidecar rewrite below may clear it. Its range against
+            // the probed source duration is validated in step 3.
+            val rawFreezePts = map["freezePTS"]
+            var freezePTS: Double? = null
+            if (rawFreezePts != null) {
+                val freezeNumber = rawFreezePts as? Number
+                if (freezeNumber == null) {
+                    onError("INVALID_ARG", "exportTimeline: clip.freezePTS must be a number")
+                    return
+                }
+                val freezeValue = freezeNumber.toDouble()
+                if (!freezeValue.isFinite() || freezeValue < 0.0) {
+                    onError(
+                        "INVALID_ARG",
+                        "exportTimeline: clip.freezePTS must be finite and >= 0.0 (got $freezeValue)",
+                    )
+                    return
+                }
+                if (mediaKind != "video") {
+                    onError(
+                        "UNSUPPORTED_EXPORT_FEATURE",
+                        "exportTimeline: clip.freezePTS is only supported for video clips (mediaKind '$mediaKind')",
+                    )
+                    return
+                }
+                if (isReversed) {
+                    onError(
+                        "UNSUPPORTED_EXPORT_FEATURE",
+                        "exportTimeline: clip.freezePTS on a reversed clip is not supported",
+                    )
+                    return
+                }
+                freezePTS = freezeValue
             }
             var effectiveSourcePath = sourcePath
             var effectiveTrimStart = trimStart
@@ -621,6 +678,15 @@ class AndroidTimelineExportSession(
                 }
                 beautyIntensity = beautyValue
             }
+            if (freezePTS != null && beautyIntensity != null) {
+                // The freeze render route draws a held 2D texture and has no Beauty
+                // seam; AndroidExportRenderBackendSelector mirrors this exclusion.
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: clip.freezePTS combined with clip.beautyIntensity is not supported",
+                )
+                return
+            }
             if (sourcePath.startsWith("http://") || sourcePath.startsWith("https://")) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: remote clip sources are not supported")
                 return
@@ -667,8 +733,36 @@ class AndroidTimelineExportSession(
                     beautyIntensity = beautyIntensity,
                     isReversed = isReversed,
                     canvasTransform = canvasTransform,
+                    freezePTS = freezePTS,
                 ),
             )
+        }
+
+        // Phase 7.17-Android freeze frame: freeze clips are video-derived and
+        // silent. Dart's VGEditorDraft.flattenOriginalClipAudio already skips
+        // freeze clips, but a derived role="original" track addressed to a
+        // freeze clip (trackId "original-<clipId>", the same convention
+        // AndroidEditorPlaybackCoordinator resolves) would otherwise mux the
+        // source's audio under the freeze window -- drop it here, before every
+        // admission gate and pass-2, and log exactly what was dropped. User-added
+        // music/sfx/voiceover lanes are untouched.
+        val freezeClipIds = parsedClips.filter { it.freezePTS != null }.mapNotNull { it.id }.toSet()
+        val audioSpecs = if (freezeClipIds.isEmpty()) {
+            parsedAudioSpecs
+        } else {
+            parsedAudioSpecs.filterNot { spec ->
+                val isFreezeOriginal = spec.role == "original" &&
+                    spec.trackId.startsWith("original-") &&
+                    freezeClipIds.contains(spec.trackId.removePrefix("original-"))
+                if (isFreezeOriginal) {
+                    Log.i(
+                        TAG,
+                        "VG_EXPORT_FREEZE_AUDIO_DROPPED trackId=${spec.trackId} url=${spec.url} " +
+                            "startTime=${spec.startTime} duration=${spec.duration}",
+                    )
+                }
+                isFreezeOriginal
+            }
         }
 
         // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips are a narrow,
@@ -815,6 +909,26 @@ class AndroidTimelineExportSession(
                 onError("FILE_UNREADABLE", "exportTimeline: no readable video track in ${clip.sourcePath}")
                 return
             }
+            // Phase 7.17-Android freeze frame: the sampled PTS must lie strictly
+            // inside the source -- the same `freezePtsUs >= durationUs` rejection
+            // AndroidEditorSequentialPlaybackSession.prepare applies for preview.
+            // OPTION_CLOSEST would otherwise silently resolve a PTS at or past the
+            // end to the last frame -- wrong output -- so fail closed here instead.
+            // An unknown (<= 0) track duration defers to the encoder's own
+            // freeze_frame_decode_failed reason.
+            val freezePTS = clip.freezePTS
+            if (freezePTS != null && probe.durationUs > 0L) {
+                val freezePtsUs = (freezePTS * 1_000_000.0).toLong()
+                if (freezePtsUs >= probe.durationUs) {
+                    onError(
+                        "INVALID_ARG",
+                        "exportTimeline: clip.freezePTS $freezePTS (${freezePtsUs}us) must be strictly " +
+                            "before the source duration ${probe.durationUs / 1_000_000.0} " +
+                            "(${probe.durationUs}us) of ${clip.sourcePath}",
+                    )
+                    return
+                }
+            }
             val normalizedRotation = normalizeRotationDegrees(probe.rotationDegrees)
             if (normalizedRotation != 0 && normalizedRotation != 90 &&
                 normalizedRotation != 180 && normalizedRotation != 270
@@ -852,6 +966,7 @@ class AndroidTimelineExportSession(
                     beautyIntensity = clip.beautyIntensity,
                     isReversed = clip.isReversed,
                     canvasTransform = clip.canvasTransform,
+                    freezePTS = freezePTS,
                 ),
             )
         }
@@ -1054,6 +1169,7 @@ class AndroidTimelineExportSession(
                     beautyIntensity = ctx.beautyIntensity,
                     isReversed = ctx.isReversed,
                     transform = outputTransform,
+                    freezePTS = ctx.freezePTS,
                 ),
             )
         }
@@ -1523,6 +1639,7 @@ class AndroidTimelineExportSession(
                 "overlayCount" to overlays.size,
                 "renderedOverlayFrameCount" to encodeResult.overlayFrameCount,
                 "transformedClipCount" to clipInputs.count { it.transform != null },
+                "freezeClipCount" to clipInputs.count { it.freezePTS != null },
             ),
         )
     }
@@ -1547,7 +1664,9 @@ class AndroidTimelineExportSession(
     /// 0/90/180/270 -- this normalization alone does not guarantee that.
     private fun normalizeRotationDegrees(degrees: Int): Int = ((degrees % 360) + 360) % 360
 
-    private data class VideoProbe(val width: Int, val height: Int, val rotationDegrees: Int)
+    /// [durationUs] is the video track's KEY_DURATION when the container
+    /// reports one, else 0 (unknown) -- consumers must treat <= 0 as unknown.
+    private data class VideoProbe(val width: Int, val height: Int, val rotationDegrees: Int, val durationUs: Long = 0L)
 
     private data class ImageProbe(val width: Int, val height: Int, val exifOrientation: Int)
 
@@ -1572,7 +1691,12 @@ class AndroidTimelineExportSession(
                     } else {
                         0
                     }
-                    return VideoProbe(width, height, rotation)
+                    val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        try { format.getLong(MediaFormat.KEY_DURATION) } catch (_: Throwable) { 0L }
+                    } else {
+                        0L
+                    }
+                    return VideoProbe(width, height, rotation, durationUs)
                 }
             }
             return null
@@ -1640,10 +1764,12 @@ class AndroidTimelineExportSession(
         // absent (P5-CLIP-STATIC-TRANSFORM-EXPORT-A): it is parsed by
         // [parseStaticClipTransform] into the narrow static subset that the
         // same two backends render, and everything outside that subset
-        // still fails closed there. `transformTrack` and `cropRect` remain
-        // unsupported.
+        // still fails closed there. `freezePTS` is absent too (Phase
+        // 7.17-Android): it is parsed/validated explicitly above, carried
+        // through ParsedClip/ClipContext/ClipInput, and rendered by
+        // AndroidTimelineVideoEncoder's freeze route. `transformTrack` and
+        // `cropRect` remain unsupported.
         private val UNSUPPORTED_CLIP_KEYS = listOf(
-            "freezePTS",
             "dualCamera",
             "timeRemap",
             "transformTrack",

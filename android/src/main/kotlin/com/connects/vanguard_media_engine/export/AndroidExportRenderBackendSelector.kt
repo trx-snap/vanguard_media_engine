@@ -223,6 +223,25 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // and [ExportRenderScope.reversedClipNormalizationIneligibleReason] reports
 // `reversed_clip_transform_present`, so such scopes fail closed instead of
 // exporting wrong framing when Vulkan cannot take them.
+//
+// Phase 7.17-Android freeze frame: a clip carrying
+// [AndroidTimelineVideoEncoder.ClipInput.freezePTS] is rendered ONLY by
+// AndroidTimelineVideoEncoder's freeze route (a held 2D texture, sibling of
+// its still-image/reversed routes). AndroidTimelineVulkanVideoEncoder has no
+// freeze route, so [vulkanScopeFailureReason] reports
+// `freeze_unsupported_by_vulkan` for any freeze clip and such a scope always
+// resolves to GLES (or UNAVAILABLE with a precise reason when the scope also
+// requires Vulkan). AndroidTimelineGlesTransitionVideoEncoder has no freeze
+// route either, so [ExportRenderScope.glesTransitionIneligibleReason]
+// reports `freeze_clip_present` -- a freeze clip on a non-hard-cut
+// transition timeline fails closed rather than exporting a decoded (moving)
+// clip in place of the hold. A freeze clip carrying clip-level Beauty V2 is
+// rejected upstream by AndroidTimelineExportSession and reported here as
+// `freeze_clip_beauty_present`; a freeze clip elsewhere in a hard-cut Beauty
+// scope is admitted, since AndroidTimelineVideoEncoder renders each clip on
+// its own route. Overlays composite onto a freeze clip through the same
+// [AndroidTimelineVideoEncoder.drawAndSubmitFrame2D] path a still-image clip
+// already uses, so [glesOverlayEligible] is unchanged for it.
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -279,6 +298,10 @@ data class ExportRenderScope(
     /// static clip transform.
     val hasTransformedClip: Boolean get() = clips.any { it.transform != null }
 
+    /// Phase 7.17-Android: true when any clip is a freeze-frame clip
+    /// ([AndroidTimelineVideoEncoder.ClipInput.freezePTS] non-null).
+    val hasFreezeClip: Boolean get() = clips.any { it.freezePTS != null }
+
     /// P5-REVERSE-COMPOSITION-NORMALIZATION-A: null when [clip] is not
     /// reversed, or is a reversed clip AndroidTimelineReverseNormalizationPrepass
     /// can normalize into a forward temp on GLES (video media kind, zero
@@ -295,6 +318,9 @@ data class ExportRenderScope(
         if (clip.rotationDegrees != 0) return "reversed_non_zero_rotation"
         if (clip.colorMatrix != null) return "reversed_color_matrix_present"
         if (clip.transform != null) return "reversed_clip_transform_present"
+        // Phase 7.17-Android: rejected upstream at parse time (a freeze clip
+        // can never be reversed); kept as an explicit defense here.
+        if (clip.freezePTS != null) return "reversed_freeze_present"
         if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return "reversed_invalid_decoded_dimensions"
         return null
     }
@@ -411,6 +437,10 @@ data class ExportRenderScope(
             // admitted when pass-0 can normalize it into a forward temp
             // before AndroidTimelineGlesTransitionVideoEncoder ever sees it.
             glesReverseNormalizationIneligibleReason?.let { return "reversed_clip_not_normalizable:$it" }
+            // Phase 7.17-Android: AndroidTimelineGlesTransitionVideoEncoder has
+            // no freeze route -- it would decode the freeze clip's trim window
+            // as moving video instead of holding one frame.
+            if (hasFreezeClip) return "freeze_clip_present"
             if (clips.any { it.mediaKind != "video" && it.mediaKind != "image" }) return "unsupported_media_kind_present"
             // P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS: Beauty V2 combined with any
             // still-image clip is out of scope for this route regardless of which
@@ -481,6 +511,12 @@ data class ExportRenderScope(
             // admitted when pass-0 can normalize it into a forward temp
             // before AndroidTimelineVideoEncoder's Beauty path ever sees it.
             glesReverseNormalizationIneligibleReason?.let { return "reversed_clip_not_normalizable:$it" }
+            // Phase 7.17-Android: the freeze route has no Beauty seam, so a
+            // freeze clip that itself carries Beauty is out of scope (also
+            // rejected upstream by AndroidTimelineExportSession). A freeze clip
+            // elsewhere in the scope is fine -- AndroidTimelineVideoEncoder
+            // renders it on its own freeze route.
+            if (clips.any { it.freezePTS != null && it.beautyIntensity != null }) return "freeze_clip_beauty_present"
             if (clips.any { it.mediaKind != "video" }) return "non_video_clip_present"
             if (clips.any { it.colorMatrix != null }) return "color_matrix_present"
             if (clips.any { it.decodedWidth <= 0 || it.decodedHeight <= 0 }) return "invalid_decoded_dimensions"
@@ -760,6 +796,10 @@ class AndroidExportRenderBackendSelector {
         // scope also independently requires Vulkan for a transition/overlay/
         // beauty reason) report the precise cause.
         if (scope.clips.any { it.isReversed }) return "reverse_unsupported_by_vulkan"
+        // Phase 7.17-Android: AndroidTimelineVulkanVideoEncoder has no freeze
+        // route -- a freeze clip always resolves this precise reason so the
+        // scope lands on AndroidTimelineVideoEncoder's freeze route (GLES).
+        if (scope.clips.any { it.freezePTS != null }) return "freeze_unsupported_by_vulkan"
         val allSafe = scope.clips.all { clip ->
             if (clip.mediaKind != "video") return@all false
             if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return@all false

@@ -84,6 +84,16 @@ import kotlin.math.sin
 // ([drawAndSubmitFrame2D]) a still-image clip uses, rather than the OES
 // SurfaceTexture decode path. This is the only reversed-clip render route:
 // AndroidTimelineVulkanVideoEncoder fails closed if it ever receives one.
+//
+// Phase 7.17-Android freeze frame: a video clip with a non-null
+// [ClipInput.freezePTS] is rendered by [renderFreezeClipIntoEncoder] -- a
+// sibling of the still-image and reversed routes -- which extracts exactly one
+// source frame at that PTS via MediaMetadataRetriever.getFrameAtTime
+// (OPTION_CLOSEST), uploads it once as a plain 2D texture, and draws it through
+// the same [drawAndSubmitFrame2D] path for the clip's whole timeline hold
+// (ceil(((trimEnd - trimStart) / speed) * fps) frames, floored at 1). Freeze
+// clips never route to Vulkan or the GLES transition encoder
+// (AndroidExportRenderBackendSelector keeps them on this encoder).
 class AndroidTimelineVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -148,6 +158,13 @@ class AndroidTimelineVideoEncoder(
         // AndroidExportRenderBackendSelector / AndroidTimelineExportSession
         // keep transformed clips away from those routes.
         val transform: StaticClipTransform? = null,
+        // Phase 7.17-Android freeze frame: source-local PTS (seconds) of the
+        // single frame this (video) clip holds for its whole trim window --
+        // the trim window is a timeline hold, not a source window. Null means
+        // a normal clip. Rendered only by this GLES encoder's
+        // [renderFreezeClipIntoEncoder]; AndroidExportRenderBackendSelector
+        // never routes a freeze clip to Vulkan or the GLES transition route.
+        val freezePTS: Double? = null,
     )
 
     /// P5-CLIP-STATIC-TRANSFORM-EXPORT-A: the narrow static clip transform
@@ -336,9 +353,15 @@ class AndroidTimelineVideoEncoder(
     /// [0.0, 1.0] as each muxed sample is written (see [drainEncoder]). This
     /// encoder computes [totalExpectedSamples] once, up front, as the sum
     /// over [clips] of each clip's expected sample count -- still-image
-    /// clips contribute [ClipInput.stillFrameCount]; video clips contribute
-    /// ceil((trimEndSeconds - trimStartSeconds) * fps), floored at 1. When
-    /// the total is <= 0, no sample progress is emitted.
+    /// clips contribute [ClipInput.stillFrameCount]; video clips (including
+    /// freeze-frame clips, whose trim window is their timeline hold)
+    /// contribute ceil(((trimEndSeconds - trimStartSeconds) / speed) * fps),
+    /// floored at 1. When the total is <= 0, no sample progress is emitted.
+    ///
+    /// Per-clip render route: still image -> [renderStillClipIntoEncoder];
+    /// freeze frame ([ClipInput.freezePTS] non-null) ->
+    /// [renderFreezeClipIntoEncoder]; reversed -> [renderReversedClipIntoEncoder];
+    /// otherwise the forward decode route [decodeClipIntoEncoder].
     override fun encode(clips: List<ClipInput>, onProgress: ((Double) -> Unit)?): EncodeResult {
         this.onProgress = onProgress
         totalExpectedSamples = clips.sumOf { clip ->
@@ -405,6 +428,8 @@ class AndroidTimelineVideoEncoder(
                 if (cancelRequested) break
                 val failureReason = if (clip.mediaKind == "image") {
                     renderStillClipIntoEncoder(clip)
+                } else if (clip.freezePTS != null) {
+                    renderFreezeClipIntoEncoder(clip)
                 } else if (clip.isReversed) {
                     renderReversedClipIntoEncoder(clip)
                 } else {
@@ -1444,6 +1469,118 @@ class AndroidTimelineVideoEncoder(
         } catch (t: Throwable) {
             Log.e(TAG, "renderReversedClipIntoEncoder failed for ${clip.sourcePath}: $t", t)
             return "reversed_clip_render_exception:${t.javaClass.simpleName}:${clip.sourcePath}"
+        } finally {
+            try { bitmapToRecycle?.recycle() } catch (_: Throwable) {}
+            if (textureId != 0) {
+                try { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) } catch (_: Throwable) {}
+            }
+            try { retriever.release() } catch (_: Throwable) {}
+        }
+    }
+
+    /// Phase 7.17-Android freeze frame: renders [clip] (mediaKind == "video",
+    /// [ClipInput.freezePTS] non-null) as a single held source frame for its
+    /// whole timeline hold -- the freeze analogue of [renderStillClipIntoEncoder]
+    /// and a sibling of [renderReversedClipIntoEncoder], sharing their plain 2D
+    /// texture upload + [drawAndSubmitFrame2D] draw path (so [ClipInput.colorMatrix]
+    /// and overlay compositing apply identically). Exactly one frame is
+    /// extracted via MediaMetadataRetriever.getFrameAtTime(freezePtsUs,
+    /// OPTION_CLOSEST), uploaded once, and drawn
+    /// ceil(((trimEnd - trimStart) / speed) * fps).coerceAtLeast(1) times --
+    /// the same expected-sample count [encode] pre-computes for it. The
+    /// retriever returns the frame already rotated into display orientation
+    /// (the platform applies the track's rotation metadata to the Bitmap), so
+    /// fit geometry is computed against the Bitmap's own extent with
+    /// rotationDegrees = 0 -- never re-applying [ClipInput.rotationDegrees] --
+    /// while [ClipInput.transform] still applies through [updateClipGeometry]
+    /// exactly as on the hard-cut route. A null Bitmap fails the clip with a
+    /// machine-readable reason -- this backend never substitutes another frame
+    /// to paper over an extraction failure. Freeze combined with reverse or
+    /// clip-level Beauty V2, or on a non-video clip, fails closed here as a
+    /// second defense behind AndroidTimelineExportSession's own admission.
+    /// Returns null on success (including an early-cancelled loop), or a
+    /// machine-readable failure reason string.
+    private fun renderFreezeClipIntoEncoder(clip: ClipInput): String? {
+        val freezePts = clip.freezePTS ?: return "freeze_pts_missing:${clip.sourcePath}"
+        if (!freezePts.isFinite() || freezePts < 0.0) {
+            return "freeze_pts_invalid:$freezePts:${clip.sourcePath}"
+        }
+        if (clip.mediaKind != "video") return "freeze_non_video_unsupported:${clip.sourcePath}"
+        if (clip.isReversed) return "freeze_reversed_unsupported:${clip.sourcePath}"
+        if (clip.beautyIntensity != null) return "freeze_beauty_unsupported:${clip.sourcePath}"
+
+        val retriever = MediaMetadataRetriever()
+        var textureId = 0
+        var bitmapToRecycle: Bitmap? = null
+        try {
+            AndroidUriDataSourceHelper.setRetrieverDataSource(retriever, clip.sourcePath, context)
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+            val clipSpeed = if (clip.speed > 0.0) clip.speed else 1.0
+            val expectedFrames = ceil(((clip.trimEndSeconds - clip.trimStartSeconds) / clipSpeed) * fps)
+                .toInt().coerceAtLeast(1)
+            val freezePtsUs = (freezePts * 1_000_000.0).toLong()
+
+            val frame = retriever.getFrameAtTime(freezePtsUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                ?: return "freeze_frame_decode_failed:freezePtsUs=$freezePtsUs:${clip.sourcePath}"
+            bitmapToRecycle = frame
+
+            val maxTextureSize = IntArray(1)
+            GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, maxTextureSize, 0)
+            // clampToMaxTextureSize recycles its input when it has to scale.
+            val bitmap = AndroidStillImageDecoder.clampToMaxTextureSize(frame, maxTextureSize[0])
+            bitmapToRecycle = bitmap
+            if (bitmap.width <= 0 || bitmap.height <= 0) {
+                return "freeze_frame_invalid_dimensions:${bitmap.width}x${bitmap.height}:${clip.sourcePath}"
+            }
+            val frameWidth = bitmap.width
+            val frameHeight = bitmap.height
+
+            // Display-oriented Bitmap extent, rotation already applied by the retriever.
+            val geometryFailure = updateClipGeometry(
+                clip.copy(decodedWidth = frameWidth, decodedHeight = frameHeight, rotationDegrees = 0),
+            )
+            if (geometryFailure != null) return geometryFailure
+
+            val textures = IntArray(1)
+            GLES20.glGenTextures(1, textures, 0)
+            textureId = textures[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+            val texUploadError = GLES20.glGetError()
+            bitmap.recycle()
+            bitmapToRecycle = null
+            if (texUploadError != GLES20.GL_NO_ERROR) {
+                return "freeze_texture_upload_failed:$texUploadError:${clip.sourcePath}"
+            }
+
+            Log.i(
+                TAG,
+                "VG_EXPORT_FREEZE_CLIP source=${clip.sourcePath} freezePtsUs=$freezePtsUs " +
+                    "frame=${frameWidth}x$frameHeight decoded=${clip.decodedWidth}x${clip.decodedHeight} " +
+                    "rotation=${clip.rotationDegrees} holdFrames=$expectedFrames fps=$fps",
+            )
+
+            var framesRendered = 0
+            for (i in 0 until expectedFrames) {
+                if (cancelRequested) break
+                val drawFailure = drawAndSubmitFrame2D(textureId, clip.colorMatrix)
+                if (drawFailure != null) return drawFailure
+                drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+                framesRendered++
+            }
+
+            if (framesRendered == 0 && !cancelRequested) {
+                return "no_frames_in_freeze_clip:${clip.sourcePath}"
+            }
+            return null
+        } catch (t: Throwable) {
+            Log.e(TAG, "renderFreezeClipIntoEncoder failed for ${clip.sourcePath}: $t", t)
+            return "freeze_clip_render_exception:${t.javaClass.simpleName}:${clip.sourcePath}"
         } finally {
             try { bitmapToRecycle?.recycle() } catch (_: Throwable) {}
             if (textureId != 0) {

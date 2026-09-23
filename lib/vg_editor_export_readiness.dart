@@ -14,11 +14,14 @@
 // only) with direct-copy or PCM mixdown audio sidecar export (Unit H). Still
 // image clips are local files only, fitMode must be 'fit' (default), and
 // cropRect must be null. Per-clip colorMatrix filtering is supported and
-// applied to both decoded video frames and still-image frames.
+// applied to both decoded video frames and still-image frames. Freeze-frame
+// clips (Phase 7.17-Android: a video clip with freezePTS) are supported --
+// the native route extracts one source frame at that PTS and holds it for
+// the clip's trim-window duration, silently.
 // It does not yet execute editor compositor features such as transitions,
-// overlays, spatial clip transforms, still-image crop/fill, freeze frames,
-// reverse playback, dual-camera composition, time remap, transform tracks,
-// or GPU temporal denoise.
+// overlays, spatial clip transforms, still-image crop/fill, reverse
+// playback, dual-camera composition, time remap, transform tracks, or GPU
+// temporal denoise.
 //
 // This pure Dart evaluator preflights a VGEditorDraft and VGEditorExportRequest
 // and returns a structured report (ready vs blocked) with strongly-typed issue
@@ -98,7 +101,9 @@ enum VGEditorExportReadinessIssueCode {
   /// A clip specifies still-image fit mode or crop rect (crop/fit not supported on Android export route).
   stillImageFitOrCropPresent,
 
-  /// A clip specifies a freeze frame PTS (freeze frame extraction not supported on Android export route).
+  /// Unused: freeze-frame clips are supported on the Android export route
+  /// (Phase 7.17-Android) and this code is no longer produced. Retained for
+  /// source/wire compatibility with existing consumers of this enum.
   freezeFramePresent,
 
   /// A clip specifies dual-camera composition (dual-camera compositor not supported on Android export route).
@@ -235,7 +240,9 @@ final class VGEditorExportReadinessReport {
 /// - No reverse playback (`clip.isReversed == false`).
 /// - No spatial clip transform (`clip.transform == null`).
 /// - No still-image fit mode or crop (`clip.fitMode == VGStillImageFitMode.fit`, `clip.cropRect == null`).
-/// - No freeze frame (`clip.freezePTS == null`).
+/// - Freeze-frame clips are supported (`clip.freezePTS` may be non-null on a
+///   video clip; the native route holds the frame at that source PTS for the
+///   clip's trim-window duration and exports it silently).
 /// - No dual camera (`clip.dualCamera == null`).
 /// - No time remap (`clip.timeRemap == null`).
 /// - No transform track (`clip.transformTrack == null`).
@@ -436,17 +443,7 @@ final class VGEditorExportReadinessEvaluator {
         );
       }
 
-      // Freeze frame: not supported.
-      if (clip.freezePTS != null) {
-        issues.add(
-          VGEditorExportReadinessIssue(
-            code: VGEditorExportReadinessIssueCode.freezeFramePresent,
-            clipId: clip.id,
-            message:
-                'Clip "${clip.id}" has freezePTS set; freeze frame export is not supported on the Android export route.',
-          ),
-        );
-      }
+      // Freeze frame: supported (Phase 7.17-Android) -- no issue is emitted.
 
       // Dual camera: not supported.
       if (clip.dualCamera != null) {

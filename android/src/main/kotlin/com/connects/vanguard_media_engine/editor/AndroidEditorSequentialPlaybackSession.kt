@@ -3,7 +3,9 @@ package com.connects.vanguard_media_engine.editor
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
+import com.connects.vanguard_media_engine.codec.AndroidDagPlaybackState
 import com.connects.vanguard_media_engine.codec.AndroidDagSourceInspector
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackControlSession
 import io.flutter.view.TextureRegistry
@@ -30,6 +32,16 @@ import java.util.concurrent.atomic.AtomicLong
  * <= 0.0 means the app muted original sound for this clip: [AndroidEditorSequentialPlaybackSession]
  * then never creates an [AndroidEditorOriginalAudioPreviewRuntime] for it (video preview is
  * unaffected); a positive value is applied as the runtime's MediaPlayer volume.
+ *
+ * [freezePtsUs] (Phase 7.17-Android freeze frame): the source-local PTS of the single frame a
+ * freeze-frame clip holds, or null for a normal clip. A freeze clip's trim window
+ * ([sourceTrimStartUs], [sourceTrimEndUs]) describes only its timeline hold duration --
+ * VGEditorDraft.freezeClip emits trim `[0, holdDuration]` with `durationSeconds == holdDuration`
+ * -- never a source window: the session samples exactly one source frame at [freezePtsUs],
+ * holds it on the texture, and advances the editor timeline with its own freeze clock for
+ * [timelineDurationUs]. Freeze clips are always silent -- no
+ * [AndroidEditorOriginalAudioPreviewRuntime] is ever created for them, regardless of
+ * [originalAudioGain] or whether the source carries an audio track.
  */
 data class AndroidEditorClipPlaybackSpec(
     val clipId: String,
@@ -40,7 +52,11 @@ data class AndroidEditorClipPlaybackSpec(
     val timelineDurationUs: Long,
     val originalAudioGain: Float = 1.0f,
     val speed: Double = 1.0,
-)
+    val freezePtsUs: Long? = null,
+) {
+    /** True when this clip is a freeze-frame hold (see [freezePtsUs]). */
+    val isFreezeFrame: Boolean get() = freezePtsUs != null
+}
 
 /**
  * Phase 7.8G-Android: sequential multi-clip editor playback session.
@@ -53,6 +69,14 @@ data class AndroidEditorClipPlaybackSpec(
  *
  * Cross-clip transitions/overlays/audio-sidecar/transform/speed features are rejected by
  * [AndroidEditorPlaybackCoordinator] before this session is constructed.
+ *
+ * Phase 7.17-Android: a freeze-frame clip ([AndroidEditorClipPlaybackSpec.freezePtsUs]) is
+ * activated by preparing its wrapped session and seeking it exactly once to the freeze PTS,
+ * which renders and holds that frame; the wrapped session is never played. The editor
+ * timeline advances across the clip's hold duration via a session-owned freeze clock on
+ * `orchHandler` (see [startFreezeClock]) that emits [onTimelineFrame] and, at the end of the
+ * hold, routes into the same [handleClipEOS] transition a decoded clip uses. Freeze clips are
+ * silent: no [AndroidEditorOriginalAudioPreviewRuntime] is created for them.
  *
  * Ownership: [AndroidEditorPlaybackCoordinator] owns this session and the [surfaceProducer].
  * This session never releases the [surfaceProducer] — only the
@@ -98,6 +122,15 @@ class AndroidEditorSequentialPlaybackSession(
          * durationUs by more than this still fails closed with trim_exceeds_source_duration.
          */
         private const val TRIM_END_CLAMP_SLACK_US = 250_000L
+
+        /**
+         * Phase 7.17-Android: freeze-clip timeline clock tick period. A freeze clip never
+         * drives the wrapped decoder session; the editor timeline is advanced by a
+         * lightweight [orchHandler]-posted runnable at this cadence (matching the ~30 fps
+         * [onTimelineFrame] cadence a decoded clip produces) until the clip's
+         * [AndroidEditorClipPlaybackSpec.timelineDurationUs] elapses.
+         */
+        private const val FREEZE_CLOCK_TICK_MS = 33L
     }
 
     private val disposed = AtomicBoolean(false)
@@ -166,6 +199,46 @@ class AndroidEditorSequentialPlaybackSession(
      */
     private var activeAudioRuntime: AndroidEditorOriginalAudioPreviewRuntime? = null
 
+    // ── Freeze-frame clip clock (Phase 7.17-Android) ───────────────────────
+    // All of the following are touched only on [orchHandler]. A freeze clip's wrapped
+    // AndroidDagTexturePlaybackControlSession is prepared and seeked once to the freeze
+    // PTS (rendering/holding that single frame) and never played; the timeline position
+    // inside the clip is [freezeElapsedUs], advanced by [freezeClockRunnable] while
+    // [isPlaying] and frozen in place by pause/seek/interruption/activation/dispose.
+
+    /** The currently scheduled freeze tick, or null when no freeze clock is running. */
+    private var freezeClockRunnable: Runnable? = null
+
+    /** Timeline-local position (us) inside the active freeze clip, `[0, timelineDurationUs)`. */
+    private var freezeElapsedUs: Long = 0L
+
+    /** [freezeElapsedUs] at the moment the running freeze clock was (re)started. */
+    private var freezeAnchorElapsedUs: Long = 0L
+
+    /** [SystemClock.elapsedRealtimeNanos] at the moment the running freeze clock was (re)started. */
+    private var freezeAnchorRealtimeNs: Long = 0L
+
+    /**
+     * Public timeline generation surfaced for the active freeze clip -- bumped once per
+     * freeze-clip activation and once per intra-clip seek (see [publicGeneration]); every
+     * freeze-clock tick re-emits it unchanged.
+     */
+    private var freezeGeneration: Long = 0L
+
+    /**
+     * Bounded `play(frameCount)` on a freeze clip (mirrors
+     * [AndroidDagTexturePlaybackControlSession.play]'s target-frame contract): the number
+     * of freeze-clock frame callbacks to emit before [freezePendingPlayCallback] fires, or
+     * null for continuous playback. [freezeFramesEmitted] counts callbacks emitted by the
+     * current freeze-clock run. The pending callback is invoked exactly once -- on target
+     * reached, on hold end, or by [stopFreezeClock] when pause/seek/activation/
+     * interruption/dispose/a superseding play interrupts the run -- never after dispose
+     * has already resolved it.
+     */
+    private var freezeTargetFrameCount: Int? = null
+    private var freezeFramesEmitted: Int = 0
+    private var freezePendingPlayCallback: ((Map<String, Any?>) -> Unit)? = null
+
     // ── prepare ────────────────────────────────────────────────────────────
 
     /**
@@ -207,6 +280,31 @@ class AndroidEditorSequentialPlaybackSession(
                             "raw" to "status=FAIL;reason=clip_inspect_failed;path=${spec.sourcePath};detail=${inspection.failureReason}",
                         ))
                         return@post
+                    }
+                    val freezePtsUs = spec.freezePtsUs
+                    if (freezePtsUs != null) {
+                        // Freeze clip: its trim window is a timeline hold (VGEditorDraft
+                        // .freezeClip emits [0, holdDuration]), not a source window, so the
+                        // trim-vs-source-duration check/clamp below does not apply. Only the
+                        // sampled PTS must lie inside the source; a source with unknown
+                        // (0) duration defers that to the activation seek, which fails
+                        // closed on eos_reached_before_seek_target. Freeze clips are always
+                        // silent, so hasAudio is recorded as false regardless of the source.
+                        if (inspection.durationUs > 0L && freezePtsUs >= inspection.durationUs) {
+                            dispose(null)
+                            onResult(mapOf(
+                                "pass" to false,
+                                "raw" to "status=FAIL;reason=freeze_pts_exceeds_source_duration;path=${spec.sourcePath};" +
+                                    "freezePtsUs=$freezePtsUs;sourceDurationUs=${inspection.durationUs}",
+                            ))
+                            return@post
+                        }
+                        Log.i(TAG, "$LOG_PREFIX clip_inspect_result index=${normalizedSpecs.size} freeze=true " +
+                            "freezePtsUs=$freezePtsUs holdUs=${spec.timelineDurationUs} sourceHasAudio=${inspection.hasAudio} " +
+                            "durationUs=${inspection.durationUs}")
+                        normalizedSpecs.add(spec)
+                        hasAudioByIndex.add(false)
+                        continue
                     }
                     if (spec.sourceTrimEndUs > inspection.durationUs + TRIM_END_CLAMP_SLACK_US) {
                         dispose(null)
@@ -302,6 +400,33 @@ class AndroidEditorSequentialPlaybackSession(
                 onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
                 return@post
             }
+            val freezeSpec = activeFreezeSpec()
+            if (freezeSpec != null) {
+                // Freeze clip: never drive the wrapped decoder session -- the held frame is
+                // already on the texture. Mirror the wrapped session's own surface-lost
+                // refusal so playback never "advances" against a texture that cannot show it.
+                if (session.state == AndroidDagPlaybackState.SurfaceLost) {
+                    onResult(mapOf("pass" to false, "state" to session.state.name, "raw" to "status=FAIL;reason=surface_lost"))
+                    return@post
+                }
+                isPlaying = true
+                if (frameCount != null && frameCount > 0) {
+                    // Bounded play: onResult fires only after frameCount freeze-clock
+                    // frame callbacks (or the hold end / an interruption resolves it).
+                    Log.i(TAG, "$LOG_PREFIX play_request freeze=true index=$activeClipIndex elapsedUs=$freezeElapsedUs " +
+                        "targetFrameCount=$frameCount")
+                    startFreezeClock(activeClipIndex, freezeSpec, sessionToken.get(), frameCount, onResult)
+                    return@post
+                }
+                Log.i(TAG, "$LOG_PREFIX play_request freeze=true index=$activeClipIndex elapsedUs=$freezeElapsedUs")
+                startFreezeClock(activeClipIndex, freezeSpec, sessionToken.get())
+                onResult(mapOf(
+                    "pass" to true,
+                    "state" to AndroidDagPlaybackState.Playing.name,
+                    "raw" to "status=OK;state=Playing;freeze=true;elapsedUs=$freezeElapsedUs",
+                ))
+                return@post
+            }
             isPlaying = true
             Log.i(TAG, "$LOG_PREFIX play_request audio_runtime_present=${activeAudioRuntime != null}")
             activeAudioRuntime?.play()
@@ -329,6 +454,11 @@ class AndroidEditorSequentialPlaybackSession(
             }
             isPlaying = false
             activeAudioRuntime?.pause()
+            // Freeze clip: stop the timeline clock at its current position; the wrapped
+            // session's pause below is a state-only no-op that keeps the held frame visible.
+            // A pending bounded play resolves with the pause outcome, as the wrapped
+            // session's own pause resolves its pending target-frame callback.
+            stopFreezeClock(interruptReason = "paused", interruptPass = true, interruptState = AndroidDagPlaybackState.Paused)
             session.pause(onResult)
         }
     }
@@ -358,10 +488,20 @@ class AndroidEditorSequentialPlaybackSession(
             val targetIndex = resolveClipIndex(clampedUs)
             val targetSpec = effectiveClipSpecs[targetIndex]
             val sourceTargetUs = mapGlobalToSourcePts(clampedUs, targetSpec)
+            // Timeline-local offset inside the target clip; consumed only by freeze clips,
+            // whose source position is fixed at freezePtsUs (see mapGlobalToSourcePts).
+            val timelineOffsetUs = (clampedUs - targetSpec.timelineStartUs).coerceAtLeast(0L)
             isPlaying = resumeAfterSeek
 
             val activeNow = activeSession
             if (targetIndex == activeClipIndex && activeNow != null) {
+                if (targetSpec.isFreezeFrame) {
+                    // Intra-freeze-clip seek: the held frame stays exactly as rendered; only
+                    // the timeline position/generation move.
+                    Log.i(TAG, "$LOG_PREFIX same_clip_seek freeze=true index=$targetIndex offsetUs=$timelineOffsetUs resumeAfterSeek=$resumeAfterSeek")
+                    onResult(seekWithinActiveFreezeClip(targetIndex, targetSpec, activeNow, timelineOffsetUs, resumeAfterSeek))
+                    return@post
+                }
                 // Pause audio before the video seek so it never resumes ahead of a video seek
                 // that might still fail; only seek/resume audio once the video seek's pass/fail
                 // outcome is known (see defect #2).
@@ -380,6 +520,7 @@ class AndroidEditorSequentialPlaybackSession(
                     targetIndex,
                     explicitSourceSeekUs = sourceTargetUs,
                     resumeAfterSeek = resumeAfterSeek,
+                    explicitTimelineOffsetUs = timelineOffsetUs,
                 )
                 onResult(translateSeekResult(activateResult, targetSpec))
             }
@@ -402,6 +543,9 @@ class AndroidEditorSequentialPlaybackSession(
      * past this clip's trim end.
      */
     private fun mapGlobalToSourcePts(globalPtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long {
+        // A freeze clip's source position never moves: every timeline instant inside it
+        // shows the single frame sampled at freezePtsUs.
+        spec.freezePtsUs?.let { return it }
         val speed = if (spec.speed > 0.0) spec.speed else 1.0
         val sourceOffsetUs = ((globalPtsUs - spec.timelineStartUs) * speed).toLong()
         val sourcePtsUs = spec.sourceTrimStartUs + sourceOffsetUs
@@ -431,6 +575,9 @@ class AndroidEditorSequentialPlaybackSession(
     }
 
     private fun translateSeekResult(result: Map<String, Any?>, spec: AndroidEditorClipPlaybackSpec): Map<String, Any?> {
+        // Freeze-clip activation/seek results already report seekTargetUs/seekRenderedPtsUs
+        // in global timeline space (see activateFreezeClipHeldFrame / seekWithinActiveFreezeClip).
+        if (spec.isFreezeFrame) return result
         val out = result.toMutableMap()
         (result["seekTargetUs"] as? Number)?.let { out["seekTargetUs"] = sourceToGlobalPtsRaw(it.toLong(), spec) }
         (result["seekRenderedPtsUs"] as? Number)?.let { out["seekRenderedPtsUs"] = sourceToGlobalPtsRaw(it.toLong(), spec) }
@@ -453,12 +600,21 @@ class AndroidEditorSequentialPlaybackSession(
      * [CountDownLatch] so the whole activation is atomic from the perspective
      * of every other orchHandler-serialized command (no interleaved seek/play/
      * EOS-switch can observe a partially-activated state).
+     *
+     * Freeze-frame clips ([AndroidEditorClipPlaybackSpec.freezePtsUs] non-null)
+     * ignore [explicitSourceSeekUs]: the wrapped session is always seeked to
+     * the freeze PTS to render/hold that single frame, never played, and the
+     * timeline position inside the clip is [explicitTimelineOffsetUs] (null =
+     * the clip's start) -- see [activateFreezeClipHeldFrame]. Any running
+     * freeze clock for the outgoing clip is stopped before it is disposed.
      */
     private fun activateClipBlocking(
         index: Int,
         explicitSourceSeekUs: Long?,
         resumeAfterSeek: Boolean,
+        explicitTimelineOffsetUs: Long? = null,
     ): Map<String, Any?> {
+        stopFreezeClock(interruptReason = "session_disposed")
         val old = activeSession
         activeSession = null
         if (old != null) {
@@ -486,6 +642,7 @@ class AndroidEditorSequentialPlaybackSession(
 
         val mySessionToken = sessionToken.incrementAndGet()
         val spec = effectiveClipSpecs[index]
+        val freezePtsUs = spec.freezePtsUs
 
         // Prepare (and preroll-seek) this clip's original-clip audio, if it has any, before
         // touching video — mirrors the video preroll below and keeps both media confined to
@@ -496,8 +653,10 @@ class AndroidEditorSequentialPlaybackSession(
         // hasAudio=false while the video preview proceeds untouched. A positive policy gain is
         // handed to the runtime as its MediaPlayer volume. Any MediaPlayer setup/seek failure
         // disables the runtime internally without ever failing this activation (see
-        // AndroidEditorOriginalAudioPreviewRuntime).
-        val hasAudio = clipHasAudio.getOrNull(index) ?: false
+        // AndroidEditorOriginalAudioPreviewRuntime). A freeze-frame clip is always silent:
+        // prepare() already records hasAudio=false for it, and the explicit guard here keeps
+        // that invariant even if clipHasAudio were ever populated differently.
+        val hasAudio = (clipHasAudio.getOrNull(index) ?: false) && freezePtsUs == null
         val originalGain = spec.originalAudioGain
         val audioRuntimeEnabled = hasAudio
         val newAudio = if (audioRuntimeEnabled) AndroidEditorOriginalAudioPreviewRuntime(context, originalGain, spec.speed.toFloat()) else null
@@ -511,7 +670,7 @@ class AndroidEditorSequentialPlaybackSession(
             Log.i(TAG, "$LOG_PREFIX audio_prepare_done index=$index")
         } else {
             Log.i(TAG, "$LOG_PREFIX activate_clip_audio_decision index=$index clipId=${spec.clipId} hasAudio=$hasAudio " +
-                "originalGain=$originalGain audioRuntimeEnabled=false")
+                "originalGain=$originalGain audioRuntimeEnabled=false freeze=${freezePtsUs != null}")
         }
         activeAudioRuntime = newAudio
 
@@ -524,10 +683,14 @@ class AndroidEditorSequentialPlaybackSession(
         var lastInnerGeneration: Long? = null
         var sessionPublicGeneration = 0L
 
-        val newSession = AndroidDagTexturePlaybackControlSession(
-            videoPath = spec.sourcePath,
-            surfaceProducer = surfaceProducer,
-            onTimelineFrame = { textureId, localPtsSeconds, innerGenerationId ->
+        // A freeze clip's wrapped session only ever renders its single held frame (the
+        // activation seek below, or a surface-restore re-preroll to that same PTS); its
+        // source-PTS frame callbacks carry no timeline meaning, so they are ignored and the
+        // freeze activation/seek/clock paths emit timeline PTS/generation themselves.
+        val frameCallback: (Long, Double, Long) -> Unit = if (freezePtsUs != null) {
+            { _, _, _ -> }
+        } else {
+            { textureId, localPtsSeconds, innerGenerationId ->
                 if (sessionToken.get() == mySessionToken) {
                     if (lastInnerGeneration != innerGenerationId) {
                         lastInnerGeneration = innerGenerationId
@@ -537,7 +700,13 @@ class AndroidEditorSequentialPlaybackSession(
                     val globalPtsUs = sourceToGlobalPtsClamped(sourcePtsUs, spec)
                     onTimelineFrame(textureId, globalPtsUs / 1_000_000.0, sessionPublicGeneration)
                 }
-            },
+            }
+        }
+
+        val newSession = AndroidDagTexturePlaybackControlSession(
+            videoPath = spec.sourcePath,
+            surfaceProducer = surfaceProducer,
+            onTimelineFrame = frameCallback,
             onTimelineEOS = { _ ->
                 orchHandler?.post {
                     if (sessionToken.get() == mySessionToken && !disposed.get()) {
@@ -545,12 +714,14 @@ class AndroidEditorSequentialPlaybackSession(
                     }
                 }
             },
-            playbackEndPtsUs = spec.sourceTrimEndUs,
+            // A freeze clip is never played, so it has no decoder trim-end boundary.
+            playbackEndPtsUs = if (freezePtsUs != null) null else spec.sourceTrimEndUs,
             onPlaybackInterrupted = { reason ->
                 orchHandler?.post {
                     if (sessionToken.get() == mySessionToken && !disposed.get()) {
                         Log.w(TAG, "onPlaybackInterrupted: pausing audio; reason=$reason")
                         isPlaying = false
+                        stopFreezeClock(interruptReason = reason, interruptState = AndroidDagPlaybackState.SurfaceLost)
                         activeAudioRuntime?.pause()
                     }
                 }
@@ -573,6 +744,19 @@ class AndroidEditorSequentialPlaybackSession(
         val preparePass = prepareResult["pass"] as? Boolean ?: false
         if (!preparePass) {
             return prepareResult
+        }
+
+        if (freezePtsUs != null) {
+            return activateFreezeClipHeldFrame(
+                index = index,
+                spec = spec,
+                freezePtsUs = freezePtsUs,
+                session = newSession,
+                prepareResult = prepareResult,
+                timelineOffsetUs = explicitTimelineOffsetUs ?: 0L,
+                resumeAfterSeek = resumeAfterSeek,
+                token = mySessionToken,
+            )
         }
 
         // Audio was already prerolled to initialAudioPtsUs above; only resume it here, in
@@ -616,6 +800,327 @@ class AndroidEditorSequentialPlaybackSession(
         return prepareResult + seekResult
     }
 
+    // ── Freeze-frame clip lifecycle (Phase 7.17-Android) ───────────────────
+
+    /** The active clip's spec when it is a freeze-frame clip, else null. Must be called from [orchHandler]. */
+    private fun activeFreezeSpec(): AndroidEditorClipPlaybackSpec? =
+        effectiveClipSpecs.getOrNull(activeClipIndex)?.takeIf { it.isFreezeFrame }
+
+    /**
+     * Must be called from [orchHandler], after [session] (the freshly prepared wrapped
+     * session for freeze clip [index]) passed prepare. Seeks it exactly once to
+     * [freezePtsUs] so the wrapped session renders and holds that frame (Paused state,
+     * frame visible on the texture -- the same held-frame contract a normal clip's
+     * non-resuming seek has), never calls play() on it, positions the freeze clock at
+     * [timelineOffsetUs], bumps the public generation, emits the first timeline frame for
+     * the clip, and starts the freeze clock when [resumeAfterSeek]. A failed held-frame
+     * seek fails the activation exactly like a failed preroll seek on a normal clip. The
+     * returned map merges the prepared metadata with global-timeline seek fields, so
+     * [translateSeekResult] must not re-map it (it returns freeze results as-is).
+     */
+    private fun activateFreezeClipHeldFrame(
+        index: Int,
+        spec: AndroidEditorClipPlaybackSpec,
+        freezePtsUs: Long,
+        session: AndroidDagTexturePlaybackControlSession,
+        prepareResult: Map<String, Any?>,
+        timelineOffsetUs: Long,
+        resumeAfterSeek: Boolean,
+        token: Long,
+    ): Map<String, Any?> {
+        val seekLatch = CountDownLatch(1)
+        var seekResult: Map<String, Any?> = emptyMap()
+        session.seek(freezePtsUs, false) { r ->
+            seekResult = r
+            seekLatch.countDown()
+        }
+        seekLatch.await()
+        val seekPass = seekResult["pass"] as? Boolean ?: false
+        if (!seekPass) {
+            Log.w(TAG, "$LOG_PREFIX freeze_frame_seek_failed index=$index clipId=${spec.clipId} freezePtsUs=$freezePtsUs result=$seekResult")
+            // Overlay keeps pass=false/raw from the seek while preserving prepared metadata.
+            return prepareResult + seekResult
+        }
+
+        val maxOffsetUs = (spec.timelineDurationUs - 1L).coerceAtLeast(0L)
+        freezeElapsedUs = timelineOffsetUs.coerceIn(0L, maxOffsetUs)
+        freezeGeneration = publicGeneration.incrementAndGet()
+        val globalPtsUs = spec.timelineStartUs + freezeElapsedUs
+        Log.i(TAG, "$LOG_PREFIX freeze_clip_activated index=$index clipId=${spec.clipId} freezePtsUs=$freezePtsUs " +
+            "renderedSourcePtsUs=${seekResult["seekRenderedPtsUs"]} offsetUs=$freezeElapsedUs " +
+            "holdUs=${spec.timelineDurationUs} generation=$freezeGeneration resumeAfterSeek=$resumeAfterSeek")
+        onTimelineFrame(surfaceProducer.id(), globalPtsUs / 1_000_000.0, freezeGeneration)
+        if (resumeAfterSeek) {
+            startFreezeClock(index, spec, token)
+        }
+        val stateName = if (resumeAfterSeek) AndroidDagPlaybackState.Playing.name else AndroidDagPlaybackState.Paused.name
+        return prepareResult + mapOf(
+            "pass" to true,
+            "state" to stateName,
+            "seekTargetUs" to globalPtsUs,
+            "seekRenderedPtsUs" to globalPtsUs,
+            "generationId" to freezeGeneration,
+            "freezeSourcePtsUs" to freezePtsUs,
+            "raw" to "status=OK;state=$stateName;freeze=true;seekTargetUs=$globalPtsUs;" +
+                "seekRenderedPtsUs=$globalPtsUs;generationId=$freezeGeneration",
+        )
+    }
+
+    /**
+     * Must be called from [orchHandler]. Intra-clip seek on the active freeze clip
+     * [index]/[spec]: the held frame is left exactly as rendered on [session]; the freeze
+     * clock is stopped, repositioned to [timelineOffsetUs], a fresh public generation is
+     * emitted with the new timeline PTS (which also acknowledges the Dart controller's
+     * in-flight seek), and the clock restarts when [resumeAfterSeek]. Mirrors the wrapped
+     * session's own surface-lost refusal so a seek never reports success against a texture
+     * that cannot show the frame.
+     */
+    private fun seekWithinActiveFreezeClip(
+        index: Int,
+        spec: AndroidEditorClipPlaybackSpec,
+        session: AndroidDagTexturePlaybackControlSession,
+        timelineOffsetUs: Long,
+        resumeAfterSeek: Boolean,
+    ): Map<String, Any?> {
+        stopFreezeClock(interruptReason = "seek_interrupted")
+        val wrappedState = session.state
+        if (wrappedState == AndroidDagPlaybackState.SurfaceLost) {
+            isPlaying = false
+            return mapOf("pass" to false, "state" to wrappedState.name, "raw" to "status=FAIL;reason=surface_lost")
+        }
+        if (wrappedState == AndroidDagPlaybackState.Failed || wrappedState == AndroidDagPlaybackState.Disposed) {
+            isPlaying = false
+            return mapOf("pass" to false, "state" to wrappedState.name, "raw" to "status=FAIL;reason=freeze_session_${wrappedState.name.lowercase()}")
+        }
+        val maxOffsetUs = (spec.timelineDurationUs - 1L).coerceAtLeast(0L)
+        freezeElapsedUs = timelineOffsetUs.coerceIn(0L, maxOffsetUs)
+        freezeGeneration = publicGeneration.incrementAndGet()
+        val globalPtsUs = spec.timelineStartUs + freezeElapsedUs
+        onTimelineFrame(surfaceProducer.id(), globalPtsUs / 1_000_000.0, freezeGeneration)
+        if (resumeAfterSeek) {
+            startFreezeClock(index, spec, sessionToken.get())
+        }
+        val stateName = if (resumeAfterSeek) AndroidDagPlaybackState.Playing.name else AndroidDagPlaybackState.Paused.name
+        return mapOf(
+            "pass" to true,
+            "state" to stateName,
+            "seekTargetUs" to globalPtsUs,
+            "seekRenderedPtsUs" to globalPtsUs,
+            "generationId" to freezeGeneration,
+            "raw" to "status=OK;state=$stateName;freeze=true;seekTargetUs=$globalPtsUs;" +
+                "seekRenderedPtsUs=$globalPtsUs;generationId=$freezeGeneration",
+        )
+    }
+
+    /**
+     * Must be called from [orchHandler]. Starts (or restarts) the freeze clock for the
+     * active freeze clip [index]/[spec] from the current [freezeElapsedUs]. Each tick
+     * re-derives the position from a monotonic anchor (never by accumulating tick periods),
+     * emits [onTimelineFrame] with the global PTS and [freezeGeneration], and re-posts
+     * itself; once [AndroidEditorClipPlaybackSpec.timelineDurationUs] elapses it emits the
+     * clip's final timeline frame and routes into the existing [handleClipEOS] transition
+     * so the next clip activates (and resumes) exactly as after a decoded clip's EOS. A tick
+     * is a no-op once superseded ([freezeClockRunnable] no longer refers to it), after
+     * [dispose], while not [isPlaying], after the session [token] changed (another clip was
+     * activated), or if [activeClipIndex] moved.
+     *
+     * Bounded play (mirrors [AndroidDagTexturePlaybackControlSession.play]'s
+     * target-frame contract): when [frameCount] is a positive count, the clock emits that
+     * many frame callbacks at the freeze cadence, then stops itself (position preserved,
+     * no EOS transition) and invokes [onTargetReached] once with pass=true. If the hold
+     * end arrives first, the clip still transitions through [handleClipEOS] and
+     * [onTargetReached] resolves with pass only when the emitted count reached the target
+     * (`playback_end_before_target` otherwise) -- exactly the wrapped session's own
+     * end-before-target outcome. Any interruption resolves it via [stopFreezeClock].
+     */
+    private fun startFreezeClock(
+        index: Int,
+        spec: AndroidEditorClipPlaybackSpec,
+        token: Long,
+        frameCount: Int? = null,
+        onTargetReached: ((Map<String, Any?>) -> Unit)? = null,
+    ) {
+        stopFreezeClock(interruptReason = "superseded_by_play")
+        val h = orchHandler
+        val target = frameCount?.takeIf { it > 0 }
+        if (h == null) {
+            // Never happens after prepare(); resolve a bounded caller rather than leaking it.
+            onTargetReached?.takeIf { target != null }?.invoke(
+                mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"),
+            )
+            return
+        }
+        val durationUs = spec.timelineDurationUs
+        freezeAnchorElapsedUs = freezeElapsedUs.coerceIn(0L, (durationUs - 1L).coerceAtLeast(0L))
+        freezeAnchorRealtimeNs = SystemClock.elapsedRealtimeNanos()
+        freezeFramesEmitted = 0
+        freezeTargetFrameCount = target
+        freezePendingPlayCallback = if (target != null) onTargetReached else null
+        val textureId = surfaceProducer.id()
+        val runnable = object : Runnable {
+            override fun run() {
+                if (freezeClockRunnable !== this || disposed.get() || !isPlaying ||
+                    sessionToken.get() != token || activeClipIndex != index
+                ) {
+                    return
+                }
+                val elapsedUs = freezeAnchorElapsedUs +
+                    (SystemClock.elapsedRealtimeNanos() - freezeAnchorRealtimeNs) / 1_000L
+                if (elapsedUs >= durationUs) {
+                    freezeClockRunnable = null
+                    freezeElapsedUs = (durationUs - 1L).coerceAtLeast(0L)
+                    val globalPtsUs = spec.timelineStartUs + freezeElapsedUs
+                    onTimelineFrame(textureId, globalPtsUs / 1_000_000.0, freezeGeneration)
+                    freezeFramesEmitted++
+                    Log.i(TAG, "$LOG_PREFIX freeze_clip_end index=$index clipId=${spec.clipId} holdUs=$durationUs " +
+                        "framesEmitted=$freezeFramesEmitted targetFrameCount=$freezeTargetFrameCount")
+                    // Resolve a pending bounded play BEFORE the EOS transition (which
+                    // would otherwise resolve it as session_disposed): pass only when the
+                    // hold end also satisfied the requested count.
+                    resolvePendingFreezePlay(
+                        state = AndroidDagPlaybackState.Completed,
+                        lastGlobalPtsUs = globalPtsUs,
+                        passWhenTargetReached = true,
+                        completionReason = "playback_end_reached",
+                        shortfallReason = "playback_end_before_target",
+                    )
+                    handleClipEOS(index)
+                    return
+                }
+                freezeElapsedUs = elapsedUs
+                val globalPtsUs = spec.timelineStartUs + elapsedUs
+                onTimelineFrame(textureId, globalPtsUs / 1_000_000.0, freezeGeneration)
+                freezeFramesEmitted++
+                val pendingTarget = freezeTargetFrameCount
+                if (pendingTarget != null && freezeFramesEmitted >= pendingTarget) {
+                    // Target reached: stop advancing (position preserved for a later
+                    // play/resume), no EOS transition, resolve the bounded caller once.
+                    freezeClockRunnable = null
+                    Log.i(TAG, "$LOG_PREFIX freeze_play_target_reached index=$index clipId=${spec.clipId} " +
+                        "framesEmitted=$freezeFramesEmitted elapsedUs=$elapsedUs")
+                    resolvePendingFreezePlay(
+                        state = AndroidDagPlaybackState.Playing,
+                        lastGlobalPtsUs = globalPtsUs,
+                        passWhenTargetReached = true,
+                        completionReason = "target_reached",
+                        shortfallReason = "target_reached",
+                    )
+                    return
+                }
+                h.postDelayed(this, FREEZE_CLOCK_TICK_MS)
+            }
+        }
+        freezeClockRunnable = runnable
+        h.postDelayed(runnable, FREEZE_CLOCK_TICK_MS)
+    }
+
+    /**
+     * Must be called from [orchHandler]. Invokes and clears the pending bounded-play
+     * callback (if any) exactly once with the wrapped session's result shape. pass is
+     * true when [passWhenTargetReached] and the emitted count reached the target;
+     * [completionReason]/[shortfallReason] select the raw status token accordingly.
+     */
+    private fun resolvePendingFreezePlay(
+        state: AndroidDagPlaybackState,
+        lastGlobalPtsUs: Long,
+        passWhenTargetReached: Boolean,
+        completionReason: String,
+        shortfallReason: String,
+    ) {
+        val callback = freezePendingPlayCallback ?: run {
+            freezeTargetFrameCount = null
+            return
+        }
+        val target = freezeTargetFrameCount
+        val emitted = freezeFramesEmitted
+        freezePendingPlayCallback = null
+        freezeTargetFrameCount = null
+        val targetReached = target != null && emitted >= target
+        val pass = passWhenTargetReached && targetReached
+        val raw = if (pass) {
+            "status=OK;$completionReason;freeze=true;renderedFrames=$emitted;targetFrameCount=$target"
+        } else {
+            "status=FAIL;reason=$shortfallReason;freeze=true;renderedFrames=$emitted;targetFrameCount=$target"
+        }
+        callback(mapOf(
+            "pass" to pass,
+            "state" to state.name,
+            "renderedFrames" to emitted,
+            "targetFrameCount" to target,
+            "lastPtsUs" to lastGlobalPtsUs,
+            "raw" to raw,
+        ))
+    }
+
+    /**
+     * Must be called from [orchHandler]. Cancels the pending freeze tick (if any) and
+     * snapshots the position it had reached into [freezeElapsedUs], so a later resume,
+     * pause-then-play, or diagnostic read continues from where the timeline actually
+     * stopped. A pending bounded play ([freezePendingPlayCallback]) is resolved exactly
+     * once with [interruptPass]/[interruptState] and [interruptReason] (pause resolves it
+     * with the pause outcome, exactly as the wrapped session's pause resolves its own
+     * pending target-frame callback; every other interruption resolves it as cancelled /
+     * failed). No-op when no freeze clock is running and nothing is pending.
+     */
+    private fun stopFreezeClock(
+        interruptReason: String = "freeze_clock_stopped",
+        interruptPass: Boolean = false,
+        interruptState: AndroidDagPlaybackState = AndroidDagPlaybackState.Paused,
+    ) {
+        val runnable = freezeClockRunnable
+        if (runnable != null) {
+            freezeClockRunnable = null
+            orchHandler?.removeCallbacks(runnable)
+            val durationUs = effectiveClipSpecs.getOrNull(activeClipIndex)?.timelineDurationUs ?: 1L
+            val elapsedUs = freezeAnchorElapsedUs +
+                (SystemClock.elapsedRealtimeNanos() - freezeAnchorRealtimeNs) / 1_000L
+            freezeElapsedUs = elapsedUs.coerceIn(0L, (durationUs - 1L).coerceAtLeast(0L))
+        }
+        val callback = freezePendingPlayCallback ?: run {
+            freezeTargetFrameCount = null
+            return
+        }
+        val target = freezeTargetFrameCount
+        val emitted = freezeFramesEmitted
+        freezePendingPlayCallback = null
+        freezeTargetFrameCount = null
+        val status = if (interruptPass) "OK" else "CANCELLED"
+        Log.i(TAG, "$LOG_PREFIX freeze_play_interrupted reason=$interruptReason pass=$interruptPass " +
+            "framesEmitted=$emitted targetFrameCount=$target")
+        callback(mapOf(
+            "pass" to interruptPass,
+            "state" to interruptState.name,
+            "renderedFrames" to emitted,
+            "targetFrameCount" to target,
+            "raw" to "status=$status;reason=$interruptReason;freeze=true;renderedFrames=$emitted;targetFrameCount=$target",
+        ))
+    }
+
+    /**
+     * Must be called from [orchHandler]. Resumes playback of the already-activated active
+     * clip: a freeze clip starts its freeze clock (the wrapped session is never played);
+     * a normal clip resumes its original-audio runtime and the wrapped session together,
+     * pausing audio again if the video play fails. [site] is a log tag only.
+     */
+    private fun resumeActiveClipPlayback(site: String) {
+        val index = activeClipIndex
+        val spec = effectiveClipSpecs.getOrNull(index) ?: return
+        isPlaying = true
+        if (spec.isFreezeFrame) {
+            Log.i(TAG, "$LOG_PREFIX $site index=$index freeze=true elapsedUs=$freezeElapsedUs")
+            startFreezeClock(index, spec, sessionToken.get())
+            return
+        }
+        Log.i(TAG, "$LOG_PREFIX $site index=$index audio_runtime_present=${activeAudioRuntime != null}")
+        activeAudioRuntime?.play()
+        activeSession?.play(null) { playResult ->
+            val playPass = playResult["pass"] as? Boolean ?: false
+            if (!playPass) {
+                activeAudioRuntime?.pause()
+            }
+        }
+    }
+
     /** Must be called from [orchHandler]. Handles non-final vs. final clip EOS. */
     private fun handleClipEOS(finishedIndex: Int) {
         if (disposed.get()) return
@@ -639,14 +1144,7 @@ class AndroidEditorSequentialPlaybackSession(
             return
         }
         if (wasPlaying) {
-            Log.i(TAG, "$LOG_PREFIX cross_clip_eos_resume index=${finishedIndex + 1} audio_runtime_present=${activeAudioRuntime != null}")
-            activeAudioRuntime?.play()
-            activeSession?.play(null) { playResult ->
-                val playPass = playResult["pass"] as? Boolean ?: false
-                if (!playPass) {
-                    activeAudioRuntime?.pause()
-                }
-            }
+            resumeActiveClipPlayback(site = "cross_clip_eos_resume")
         }
     }
 
@@ -704,6 +1202,7 @@ class AndroidEditorSequentialPlaybackSession(
         }
 
         h.post {
+            stopFreezeClock(interruptReason = "session_disposed", interruptState = AndroidDagPlaybackState.Disposed)
             val session = activeSession
             activeSession = null
             val audio = activeAudioRuntime

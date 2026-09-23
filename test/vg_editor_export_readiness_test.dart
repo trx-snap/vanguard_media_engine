@@ -541,18 +541,54 @@ void main() {
       },
     );
 
-    test('freeze frame blocks readiness with freezeFramePresent', () {
-      final clip = makePlainVideoClip(id: 'c-freeze', freezePTS: 2.5);
+    test('freeze frame clip is ready for Android export', () {
+      // VGEditorDraft.freezeClip shape: trim window is the timeline hold,
+      // durationSeconds is the hold, freezePTS is the source-local PTS.
+      final clip = makePlainVideoClip(
+        id: 'c-freeze',
+        durationSeconds: 2.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 2.0,
+        freezePTS: 2.5,
+      );
       final draft = makeSingleClipDraft(clip: clip);
 
       final report = evaluator.evaluate(draft: draft);
 
-      expect(report.decision, VGEditorExportReadinessDecision.blocked);
-      expect(report.canUseAndroidEditorExportRoute, isFalse);
-      final issue = report.issues.firstWhere(
-        (i) => i.code == VGEditorExportReadinessIssueCode.freezeFramePresent,
+      expect(report.decision, VGEditorExportReadinessDecision.ready);
+      expect(report.canUseAndroidEditorExportRoute, isTrue);
+      expect(report.issues, isEmpty);
+      expect(
+        report.issues.any(
+          (i) => i.code == VGEditorExportReadinessIssueCode.freezeFramePresent,
+        ),
+        isFalse,
       );
-      expect(issue.clipId, 'c-freeze');
+    });
+
+    test('left/freeze/right split produced by freezeClip is ready', () {
+      final source = makePlainVideoClip(
+        id: 'clip-A',
+        durationSeconds: 10.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 10.0,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-freeze',
+        clips: [source],
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        fps: 30,
+      ).freezeClip('clip-A', 3.0, 2.0);
+      expect(draft.clips.length, 3);
+      expect(draft.clips[1].freezePTS, 3.0);
+
+      final report = evaluator.evaluate(draft: draft);
+
+      expect(report.decision, VGEditorExportReadinessDecision.ready);
+      expect(report.canUseAndroidEditorExportRoute, isTrue);
+      expect(report.issues, isEmpty);
+      expect(report.diagnostics['clipCount'], 3);
     });
 
     test('dual camera blocks readiness with dualCameraPresent', () {
@@ -720,17 +756,17 @@ void main() {
       expect(report.decision, VGEditorExportReadinessDecision.blocked);
       expect(report.canUseAndroidEditorExportRoute, isFalse);
 
+      // freezePTS no longer blocks export, so it contributes no issue here.
       final codes = report.issues.map((i) => i.code).toList();
       expect(codes, [
         VGEditorExportReadinessIssueCode.overlaysPresent,
         VGEditorExportReadinessIssueCode.unsupportedCanvasContentMode,
         VGEditorExportReadinessIssueCode.reversedClipPresent,
         VGEditorExportReadinessIssueCode.clipTransformPresent,
-        VGEditorExportReadinessIssueCode.freezeFramePresent,
         VGEditorExportReadinessIssueCode.invalidRequestDimensions,
         VGEditorExportReadinessIssueCode.unsupportedTemporalDenoise,
       ]);
-      expect(report.diagnostics['issueCount'], 7);
+      expect(report.diagnostics['issueCount'], 6);
       expect(report.diagnostics['overlayCount'], 1);
       expect(report.diagnostics['clipCount'], 1);
       expect(report.diagnostics['hasTemporalDenoiseRequest'], isTrue);

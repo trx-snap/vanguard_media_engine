@@ -879,18 +879,54 @@ void main() {
       expect(issue.clipId, 'c-crop');
     });
 
-    test('freeze frame blocks readiness with freezeFramePresent', () {
-      final clip = makePlainVideoClip(id: 'c-freeze', freezePTS: 2.5);
+    test('freeze frame clip is ready for Android preview', () {
+      // VGEditorDraft.freezeClip shape: trim window is the timeline hold,
+      // durationSeconds is the hold, freezePTS is the source-local PTS.
+      final clip = makePlainVideoClip(
+        id: 'c-freeze',
+        durationSeconds: 2.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 2.0,
+        freezePTS: 2.5,
+      );
       final draft = makeSingleClipDraft(clip: clip);
 
       final report = evaluator.evaluate(draft);
 
-      expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
-      expect(report.canUseAndroidEditorPlaybackRoute, isFalse);
-      final issue = report.issues.firstWhere(
-        (i) => i.code == VGEditorPreviewReadinessIssueCode.freezeFramePresent,
+      expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+      expect(report.canUseAndroidEditorPlaybackRoute, isTrue);
+      expect(report.issues, isEmpty);
+      expect(
+        report.issues.any(
+          (i) => i.code == VGEditorPreviewReadinessIssueCode.freezeFramePresent,
+        ),
+        isFalse,
       );
-      expect(issue.clipId, 'c-freeze');
+    });
+
+    test('left/freeze/right split produced by freezeClip is ready', () {
+      final source = makePlainVideoClip(
+        id: 'clip-A',
+        durationSeconds: 10.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 10.0,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-freeze',
+        clips: [source],
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        fps: 30,
+      ).freezeClip('clip-A', 3.0, 2.0);
+      expect(draft.clips.length, 3);
+      expect(draft.clips[1].freezePTS, 3.0);
+
+      final report = evaluator.evaluate(draft);
+
+      expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+      expect(report.canUseAndroidEditorPlaybackRoute, isTrue);
+      expect(report.issues, isEmpty);
+      expect(report.diagnostics['clipCount'], 3);
     });
 
     test('reversed clip blocks readiness with reversedClipPresent', () {
@@ -1022,8 +1058,15 @@ void main() {
 
       expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
       expect(report.canUseAndroidEditorPlaybackRoute, isFalse);
-      expect(report.issues.length, 4); // overlays, transform, freeze, reverse
-      expect(report.diagnostics['issueCount'], 4);
+      // overlays, transform, reverse -- freezePTS no longer blocks preview.
+      expect(report.issues.length, 3);
+      expect(
+        report.issues.any(
+          (i) => i.code == VGEditorPreviewReadinessIssueCode.freezeFramePresent,
+        ),
+        isFalse,
+      );
+      expect(report.diagnostics['issueCount'], 3);
       expect(report.diagnostics['overlayCount'], 1);
       expect(report.diagnostics['clipCount'], 1);
     });

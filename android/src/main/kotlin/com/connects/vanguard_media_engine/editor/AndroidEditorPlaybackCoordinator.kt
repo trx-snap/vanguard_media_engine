@@ -15,10 +15,13 @@ import java.util.concurrent.atomic.AtomicInteger
  * (one or more clips, hard-cut concatenation only).
  *
  * Supports plain hard-cut video plus validated added-audio sidecar preview
- * for the original/music/sfx/voiceover lanes (Phase 7.8O-Android). Validates
+ * for the original/music/sfx/voiceover lanes (Phase 7.8O-Android), reversed
+ * clips through their prepared reverse sidecar, and freeze-frame clips
+ * (Phase 7.17-Android: `freezePTS` is parsed here and executed by the session
+ * as a single held source frame over the clip's timeline hold). Validates
  * each draft against the current unsupported-feature guardrails (transitions,
- * overlays, per-clip transform, non-default fit/crop, freeze frame, reverse
- * playback, dual camera, time remap, transform track, color matrix) and
+ * overlays, per-clip transform, non-default fit/crop, dual camera, time
+ * remap, transform track, color matrix, freeze on a reversed clip) and
  * delegates execution to [AndroidEditorSequentialPlaybackSession]. Does not
  * own streaming/cache/RTC/export/compositor policy — those remain owned by
  * their respective coordinators or are left unimplemented for this slice
@@ -201,7 +204,6 @@ class AndroidEditorPlaybackCoordinator(
             if (clip["transform"] != null ||
                 clip["fitMode"] != null ||
                 clip["cropRect"] != null ||
-                clip["freezePTS"] != null ||
                 clip["dualCamera"] != null ||
                 clip["timeRemap"] != null ||
                 clip["transformTrack"] != null ||
@@ -231,6 +233,37 @@ class AndroidEditorPlaybackCoordinator(
             }
 
             val isReversed = clip["isReversed"] as? Boolean ?: false
+
+            // Phase 7.17-Android: `freezePTS` is present in VGClipDescriptor.toMap() only for
+            // a freeze-frame clip (VGEditorDraft.freezeClip): a finite, non-negative source-
+            // local PTS (seconds) of the single frame to hold. The clip's trim window is its
+            // timeline hold (trim [0, holdDuration]), so no trim/PTS cross-check happens here;
+            // the session validates the PTS against the inspected source at prepare time. A
+            // freeze clip can never also be reversed (DEC-154; the reverse sidecar's PTS space
+            // is not the original source's), so that combination fails closed.
+            val rawFreezePts = clip["freezePTS"]
+            var freezePtsUs: Long? = null
+            if (rawFreezePts != null) {
+                val freezePts = (rawFreezePts as? Number)?.toDouble()
+                if (freezePts == null || !freezePts.isFinite() || freezePts < 0.0) {
+                    result.error(
+                        "INVALID_CLIP",
+                        "clip \"$clipId\" has a non-numeric, non-finite, or negative freezePTS",
+                        null,
+                    )
+                    return
+                }
+                if (isReversed) {
+                    result.error(
+                        "UNSUPPORTED_TIMELINE_FEATURE",
+                        "clip \"$clipId\" combines freezePTS with isReversed, which is not supported",
+                        null,
+                    )
+                    return
+                }
+                freezePtsUs = (freezePts * 1_000_000.0).toLong()
+            }
+
             var effectiveSourcePath = sourcePath
             if (isReversed) {
                 val sidecarPath = reverseSidecarPathProvider?.invoke(clipId)
@@ -331,6 +364,13 @@ class AndroidEditorPlaybackCoordinator(
                 return
             }
 
+            if (freezePtsUs != null) {
+                Log.i(
+                    TAG,
+                    "VG_EDITOR_FREEZE_PREVIEW clip_parsed clipId=$clipId freezePtsUs=$freezePtsUs " +
+                        "holdUs=$timelineDurationUs timelineStartUs=$cursorUs",
+                )
+            }
             clipSpecs.add(
                 AndroidEditorClipPlaybackSpec(
                     clipId = clipId,
@@ -340,6 +380,7 @@ class AndroidEditorPlaybackCoordinator(
                     sourceTrimEndUs = sourceTrimEndUs,
                     timelineDurationUs = timelineDurationUs,
                     speed = speed,
+                    freezePtsUs = freezePtsUs,
                 ),
             )
             cursorUs += timelineDurationUs
