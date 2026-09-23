@@ -209,6 +209,8 @@ class AndroidDuetPreviewRenderLoop(
         cameraRect: VGDuetPixelRect,
         targetPtsMs: Long,
         foregroundRotation: VGDuetForegroundRotation = VGDuetForegroundRotation.IDENTITY,
+        sourceScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
+        cameraScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
     ) {
         if (isStopped.get()) return
         val generation = surfaceGeneration.incrementAndGet()
@@ -217,6 +219,7 @@ class AndroidDuetPreviewRenderLoop(
             // A newer attach/loss superseded this one before it ran.
             if (generation != surfaceGeneration.get()) return@post
             if (!compositor.attachOutputSurface(surface, widthPx, heightPx)) return@post
+            compositor.setLayerScaleModes(sourceScaleMode, cameraScaleMode)
             compositor.setLayout(sourceRect, cameraRect)
             compositor.setForegroundRotation(
                 foregroundRotation.rotationDegrees, foregroundRotation.anchorX, foregroundRotation.anchorY,
@@ -347,11 +350,14 @@ class AndroidDuetPreviewRenderLoop(
         cameraRect: VGDuetPixelRect,
         targetPtsMs: Long,
         foregroundRotation: VGDuetForegroundRotation = VGDuetForegroundRotation.IDENTITY,
+        sourceScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
+        cameraScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
     ) {
         if (isStopped.get()) return
         val generation = surfaceGeneration.get()
         renderHandler.post {
             if (isStopped.get()) return@post
+            compositor.setLayerScaleModes(sourceScaleMode, cameraScaleMode)
             compositor.setLayout(sourceRect, cameraRect)
             compositor.setForegroundRotation(
                 foregroundRotation.rotationDegrees, foregroundRotation.anchorX, foregroundRotation.anchorY,

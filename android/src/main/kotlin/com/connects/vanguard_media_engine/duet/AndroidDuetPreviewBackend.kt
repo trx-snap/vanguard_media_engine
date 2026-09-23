@@ -44,7 +44,16 @@ interface AndroidDuetSegmentRecorderSurfaceTarget {
  * thread-safe delivery is explicitly supported (such as [updateGreenScreenMask]
  * and [updateGreenScreenMaskHardwareBuffer]).
  */
+enum class AndroidDuetLayerScaleMode {
+    ASPECT_FILL,
+    ASPECT_FIT,
+}
+
 interface AndroidDuetPreviewBackend {
+    fun setLayerScaleModes(
+        sourceScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
+        cameraScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
+    ) {}
     val cameraInputSurface: Surface?
     val decoderInputSurface: Surface?
     val hasPendingSourceFrame: Boolean

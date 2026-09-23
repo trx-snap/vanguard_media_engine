@@ -149,6 +149,8 @@ class AndroidDuetOfflineCompositorVideoEncoder(
         cameraRect: VGDuetPixelRect,
         durationSeconds: Double,
         overlays: List<AndroidTimelineOverlayDescriptor>,
+        sourceScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
+        cameraScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
     ): AndroidTimelineVideoEncoder.EncodeResult {
         if (width <= 0 || height <= 0 || fps <= 0 || bitrateBps <= 0) {
             return failure("invalid_encoder_config:${width}x${height}@${fps}fps:${bitrateBps}bps")
@@ -196,10 +198,12 @@ class AndroidDuetOfflineCompositorVideoEncoder(
 
             val sourceGeometry = computeLayerGeometry(
                 source.label, sourceRect, source.rotationDegrees, sp.decodedWidth, sp.decodedHeight,
+                scaleMode = sourceScaleMode,
             )
             if (sourceGeometry.failure != null) return failure(sourceGeometry.failure)
             val cameraGeometry = computeLayerGeometry(
                 camera.label, cameraRect, camera.rotationDegrees, cp.decodedWidth, cp.decodedHeight,
+                scaleMode = cameraScaleMode,
             )
             if (cameraGeometry.failure != null) return failure(cameraGeometry.failure)
 
@@ -463,6 +467,7 @@ class AndroidDuetOfflineCompositorVideoEncoder(
         rotationDegrees: Int,
         decodedWidth: Int,
         decodedHeight: Int,
+        scaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
     ): LayerGeometry {
         if (!rect.left.isFinite() || !rect.top.isFinite() ||
             !rect.width.isFinite() || !rect.height.isFinite() ||
@@ -490,16 +495,26 @@ class AndroidDuetOfflineCompositorVideoEncoder(
         val rectAspect = rect.width / rect.height
         val drawnW: Double
         val drawnH: Double
-        if (videoAspect > rectAspect) {
-            drawnH = rect.height
-            drawnW = rect.height * videoAspect
+        if (scaleMode == AndroidDuetLayerScaleMode.ASPECT_FIT) {
+            if (videoAspect > rectAspect) {
+                drawnW = rect.width
+                drawnH = rect.width / videoAspect
+            } else {
+                drawnH = rect.height
+                drawnW = rect.height * videoAspect
+            }
         } else {
-            drawnW = rect.width
-            drawnH = rect.width / videoAspect
+            if (videoAspect > rectAspect) {
+                drawnH = rect.height
+                drawnW = rect.height * videoAspect
+            } else {
+                drawnW = rect.width
+                drawnH = rect.width / videoAspect
+            }
         }
         val viewport = toGlRect(
-            rect.left - (drawnW - rect.width) / 2.0,
-            rect.top - (drawnH - rect.height) / 2.0,
+            rect.left + (rect.width - drawnW) / 2.0,
+            rect.top + (rect.height - drawnH) / 2.0,
             drawnW,
             drawnH,
         )

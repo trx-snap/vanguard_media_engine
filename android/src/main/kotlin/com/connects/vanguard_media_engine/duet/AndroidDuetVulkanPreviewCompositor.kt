@@ -412,6 +412,13 @@ class AndroidDuetVulkanPreviewCompositor : AndroidDuetPreviewBackend {
         invalidLayoutRectLoggedOnce.set(false)
     }
 
+    override fun setLayerScaleModes(
+        sourceScaleMode: AndroidDuetLayerScaleMode,
+        cameraScaleMode: AndroidDuetLayerScaleMode,
+    ) {
+        fallbackDelegate?.setLayerScaleModes(sourceScaleMode, cameraScaleMode)
+    }
+
     override fun setSourceVideoSize(widthPx: Int, heightPx: Int) {
         if (isReleased) return
         fallbackDelegate?.let {

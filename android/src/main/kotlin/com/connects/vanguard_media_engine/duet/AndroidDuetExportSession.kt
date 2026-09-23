@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.media.MediaMetadataRetriever
 import android.os.Handler
+import android.util.Log
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.export.AndroidAudioTrackSpec
@@ -37,8 +38,13 @@ import kotlin.math.min
 //     AndroidDuetLayoutGeometry.
 //   - Real-take route (Slice 4B, exactly one `segmentAssets` entry): source +
 //     recorded segment composited by AndroidDuetOfflineCompositorVideoEncoder
-//     (pip / splitTopBottom, creator overlays above), then source + mic audio
-//     mixed/muxed by AndroidTimelineAudioPass2Muxer.
+//     (pip / splitTopBottom / splitLeftRight -- the latter honoring
+//     layoutConfig.isSideSwapped and aspect-fitting both layers -- with
+//     creator overlays above), then source + mic audio mixed/muxed by
+//     AndroidTimelineAudioPass2Muxer.
+//   - Every native export failure is logged once as
+//     ANDROID_DUET_EXPORT_ERROR code=<code> message=<message> (see postError)
+//     so a physical run exposes the exact failure in logcat.
 //   - Atomic final output (write to tmp, rename on success, delete on failure).
 //
 // Non-claims:
@@ -160,6 +166,10 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         // Slice 4B PiP placement inputs from layoutConfig (real-take route only).
         val pipNormalizedRect: PipNormalizedRect?,
         val pipAnchor: String?,
+        // layoutConfig.isSideSwapped (Dart VGDuetLayoutConfig wire key). Only
+        // meaningful for splitLeftRight: false = source left / camera right,
+        // true = camera left / source right. Default false.
+        val isSideSwapped: Boolean,
     )
 
     /** Normalized (0..1 canvas fraction) PiP camera rect from layoutConfig.pipNormalizedRect. */
@@ -284,11 +294,15 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         val pipNormalizedRect = parsePipNormalizedRect(layoutMap?.get("pipNormalizedRect") as? Map<*, *>)
         val pipAnchor         = layoutMap?.get("pipAnchor") as? String
 
+        // ── splitLeftRight side swap (real-take route only) ──────────────────
+        val isSideSwapped = layoutMap?.get("isSideSwapped") as? Boolean ?: false
+
         // ── Real-take segmentAssets (Slice 4B) ───────────────────────────────
         // Top-level MethodChannel arg. Absent/null/empty preserves the synthetic
         // export route exactly. A non-empty list must contain exactly one
         // non-blank readable path, and the real-take route supports only
-        // pip / splitTopBottom (unswapped) at initialSpeed 1.0. Wording mirrors
+        // pip / splitTopBottom (unswapped) / splitLeftRight (isSideSwapped
+        // honored) at initialSpeed 1.0. Wording mirrors
         // ios/Classes/VGDuetExportSession.swift.
         var realSegmentPath: String? = null
         if (segmentAssetsRaw != null) {
@@ -311,10 +325,10 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                     return ParseResult.Failure("source_invalid",
                         "exportDuetComposition: segment file is missing or not readable: $candidatePath")
                 }
-                if (layoutMode != "pip" && layoutMode != "splitTopBottom") {
+                if (layoutMode != "pip" && layoutMode != "splitTopBottom" && layoutMode != "splitLeftRight") {
                     return ParseResult.Failure("unsupported_export_feature",
                         "exportDuetComposition: real-take export only supports layoutConfig.mode " +
-                            "'pip' or 'splitTopBottom'; got $layoutMode.")
+                            "'pip', 'splitTopBottom', or 'splitLeftRight'; got $layoutMode.")
                 }
                 val initialSpeed = (descriptorMap["initialSpeed"] as? Number)?.toDouble() ?: 1.0
                 if (!initialSpeed.isFinite() || abs(initialSpeed - 1.0) >= 0.0001) {
@@ -376,6 +390,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 micAudioMuted          = micAudioMuted,
                 pipNormalizedRect      = pipNormalizedRect,
                 pipAnchor              = pipAnchor,
+                isSideSwapped          = isSideSwapped,
             )
         )
     }
@@ -769,6 +784,12 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 bitrateBps   = params.videoBitRate,
                 nativeBridge = nativeBridge,
             )
+            val isSplitLeftRight = params.layoutMode == "splitLeftRight"
+            val layerScaleMode = if (isSplitLeftRight) {
+                AndroidDuetLayerScaleMode.ASPECT_FIT
+            } else {
+                AndroidDuetLayerScaleMode.ASPECT_FILL
+            }
             val encodeResult = encoder.encode(
                 source = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
                     label              = "source",
@@ -790,6 +811,8 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 cameraRect      = layoutRects.camera,
                 durationSeconds = effectiveExportDurationSec,
                 overlays        = adjustedCreatorOverlays,
+                sourceScaleMode = layerScaleMode,
+                cameraScaleMode = layerScaleMode,
             )
             if (!encodeResult.success) {
                 throw ExportException("composition_failed",
@@ -852,11 +875,15 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
     }
 
     /**
-     * Real-take layout: splitTopBottom is the unswapped 50/50 split (swap was
-     * rejected at parse time); pip is a full-canvas source with the camera
-     * at `layoutConfig.pipNormalizedRect` when present and positive, else the
-     * conservative anchored default. Valid Dart rects are preserved as-is
-     * (the compositor's scissor clips any overflow).
+     * Real-take layout: splitTopBottom is the unswapped 50/50 vertical split
+     * (swap was rejected at parse time); splitLeftRight is the 50/50
+     * horizontal split with `layoutConfig.isSideSwapped` honored (source
+     * left / camera right by default, camera left / source right when
+     * swapped -- AndroidDuetLayoutGeometry.splitLeftRight); pip is a
+     * full-canvas source with the camera at `layoutConfig.pipNormalizedRect`
+     * when present and positive, else the conservative anchored default.
+     * Valid Dart rects are preserved as-is (the compositor's scissor clips
+     * any overflow).
      */
     private fun computeRealTakeLayoutRects(
         params: ExportParams,
@@ -868,6 +895,9 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
     ): VGDuetLayoutRects {
         if (params.layoutMode == "splitTopBottom") {
             return AndroidDuetLayoutGeometry.splitTopBottom(canvasW, canvasH, false)
+        }
+        if (params.layoutMode == "splitLeftRight") {
+            return AndroidDuetLayoutGeometry.splitLeftRight(canvasW, canvasH, params.isSideSwapped)
         }
         val source = AndroidDuetLayoutGeometry.pipSourceRect(canvasW, canvasH)
         val normalized = params.pipNormalizedRect
@@ -1112,11 +1142,20 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         result: Map<String, Any?>,
     ) { mainHandler.post { callback(result, null) } }
 
+    /**
+     * Delivers a failure to Dart and logs it exactly once with a stable logcat
+     * marker (one row per failed export -- never per-frame), so a physical run
+     * exposes the native reason even when the app only surfaces a generic
+     * "failed to render" message.
+     */
     private fun postError(
         callback: (Map<String, Any?>?, String?) -> Unit,
         code: String,
         message: String,
-    ) { mainHandler.post { callback(null, "$code|$message") } }
+    ) {
+        Log.e(TAG, "ANDROID_DUET_EXPORT_ERROR code=$code message=$message")
+        mainHandler.post { callback(null, "$code|$message") }
+    }
 
     private fun safeDelete(file: File) {
         try { file.delete() } catch (_: Exception) {}
@@ -1127,6 +1166,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
     private class ExportException(val code: String, message: String) : Exception(message)
 
     companion object {
+        private const val TAG = "VGDuetExportSession"
         /** Fixed output frame rate for the real-take offline compositor. */
         private const val REAL_TAKE_FPS = 30
         /** Wire name reported for the real-take route; never claims Vulkan. */

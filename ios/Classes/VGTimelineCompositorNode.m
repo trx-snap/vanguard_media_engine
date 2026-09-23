@@ -682,9 +682,32 @@ typedef struct {
     CGSize secondarySourceSize;
 } _VGTCNPiPLayoutConfig;
 
+/// Split-screen band direction. Wire values: "topBottom" (default) / "leftRight".
+typedef NS_ENUM(NSInteger, _VGTCNSplitScreenDirection) {
+    _VGTCNSplitScreenDirectionTopBottom = 0, ///< Default; bands stacked vertically.
+    _VGTCNSplitScreenDirectionLeftRight = 1, ///< Bands side by side.
+};
+
 /// Parsed split-screen layout config. Stored per clip at init time.
 typedef struct {
-    double splitRatio; ///< 0.2–0.8; primary (top) fraction of canvas height.
+    double splitRatio; ///< 0.2–0.8; first band's (top / left) fraction of the canvas along the split axis.
+    /// Package A: band direction. Missing/unknown wire values parse as topBottom.
+    _VGTCNSplitScreenDirection direction;
+    /// Package A: NO (default) places the primary clip in the first band (top
+    /// for topBottom, left for leftRight) and the secondary in the other; YES
+    /// swaps them. Supported internally for both directions.
+    BOOL swapped;
+    /// Package A: display dimensions of the primary source video after
+    /// preferredTransform rotation, stored at reader build time (mirrors
+    /// _VGTCNPiPLayoutConfig.primarySourceSize) so the split compositor can
+    /// crop the primary buffer to its visible content before aspect-filling
+    /// its band. CGSizeZero when unknown (full buffer is used).
+    CGSize primarySourceSize;
+    /// Package A: display dimensions of the secondary source video after
+    /// preferredTransform rotation, stored at secondary reader build time
+    /// (mirrors _VGTCNPiPLayoutConfig.secondarySourceSize). CGSizeZero when
+    /// unknown (full buffer is used).
+    CGSize secondarySourceSize;
 } _VGTCNSplitScreenLayoutConfig;
 
 /// Tagged layout config union — carries mode + relevant sub-config.
@@ -706,6 +729,8 @@ static NSString * const kVGTCNQPiPMarginFracKey= @"marginFraction";
 static NSString * const kVGTCNQPiPCornerRadKey = @"cornerRadius";
 static NSString * const kVGTCNQPiPOpacityKey   = @"opacity";
 static NSString * const kVGTCNQSplitRatioKey   = @"splitRatio";
+static NSString * const kVGTCNQSplitDirectionKey = @"direction"; ///< Package A: "topBottom" | "leftRight"
+static NSString * const kVGTCNQSplitSwappedKey   = @"swapped";   ///< Package A: NSNumber(BOOL)
 
 /// Parse PiP anchor from wire string; falls back to BottomRight.
 static _VGTCNPiPAnchor _VGTCNParsePiPAnchor(NSString * _Nullable str) {
@@ -750,14 +775,29 @@ static _VGTCNPiPLayoutConfig _VGTCNParsePiPLayout(NSDictionary * _Nullable dict)
 }
 
 /// Parse split-screen layout config from Dart-side splitLayout dict.
-/// Absent/invalid keys fall back to splitRatio=0.5.
+/// Absent/invalid keys fall back to splitRatio=0.5, direction=topBottom,
+/// swapped=NO. Source sizes start at CGSizeZero and are filled in at reader
+/// build time.
 static _VGTCNSplitScreenLayoutConfig _VGTCNParseSplitLayout(NSDictionary * _Nullable dict) {
     _VGTCNSplitScreenLayoutConfig cfg;
-    cfg.splitRatio = 0.5;
+    cfg.splitRatio          = 0.5;
+    cfg.direction           = _VGTCNSplitScreenDirectionTopBottom;
+    cfg.swapped             = NO;
+    cfg.primarySourceSize   = CGSizeZero;
+    cfg.secondarySourceSize = CGSizeZero;
     if (!dict || ![dict isKindOfClass:[NSDictionary class]]) return cfg;
     NSNumber *sr = dict[kVGTCNQSplitRatioKey];
     if ([sr isKindOfClass:[NSNumber class]] && sr.doubleValue >= 0.2 && sr.doubleValue <= 0.8)
         cfg.splitRatio = sr.doubleValue;
+    // Package A: direction -- only the exact "leftRight" wire value selects
+    // the horizontal split; anything else (missing, wrong type, unknown
+    // string) is the pre-existing top/bottom behavior.
+    NSString *dir = dict[kVGTCNQSplitDirectionKey];
+    if ([dir isKindOfClass:[NSString class]] && [dir isEqualToString:@"leftRight"])
+        cfg.direction = _VGTCNSplitScreenDirectionLeftRight;
+    NSNumber *sw = dict[kVGTCNQSplitSwappedKey];
+    if ([sw isKindOfClass:[NSNumber class]])
+        cfg.swapped = sw.boolValue;
     return cfg;
 }
 
@@ -1101,7 +1141,23 @@ static CVPixelBufferRef _VGTCNCompositePiP(
 
 // ── Phase 7.x-Q3B: Split-screen composition helper ──────────────────────────
 //
-// Primary → top band, secondary → bottom band. Portrait vertical split only.
+// Each clip fills one band of the canvas. Package A generalizes the original
+// top/bottom-only port:
+//   - direction topBottom (default): bands stacked vertically, first band on
+//     top; direction leftRight: bands side by side, first band on the left.
+//     splitRatio is the first band's fraction of the canvas along the split
+//     axis (Duet sends 0.5 for 50/50 bands).
+//   - swapped NO (default): primary in the first band, secondary in the
+//     other; YES: the reverse (supported for both directions, even though
+//     the Duet export route only forwards a swap for leftRight).
+//   - Aspect-fill correction: each input pixel buffer was aspect-fit into the
+//     full canvas by its AVComposition, so it carries letterbox/pillarbox
+//     bars. When the true source display size is known (primarySourceSize /
+//     secondarySourceSize, stored at reader build time), the buffer is first
+//     cropped to its visible content rect and only that content is
+//     aspect-filled into its band -- the same source-size correction
+//     _VGTCNCompositePiP applies to its secondary. Unknown (zero) sizes fall
+//     back to the full buffer, i.e. the pre-existing behavior.
 // Canvas authority: output allocated at canvasSize.
 // Port of VGDualCameraCompositorNode._compositeWithSplitScreen:secondary:
 static CVPixelBufferRef _VGTCNCompositeSplitScreen(
@@ -1123,41 +1179,97 @@ static CVPixelBufferRef _VGTCNCompositeSplitScreen(
         return NULL;
     }
 
-    // Split geometry (Y-up: top band has higher Y values).
     double sr = split.splitRatio;
     if (sr < 0.2) { sr = 0.2; }
     if (sr > 0.8) { sr = 0.8; }
-    double topH    = floor((double)primH * sr);
-    double bottomH = (double)primH - topH;
-    if (topH < 1.0 || bottomH < 1.0) {
-        os_log_error(OS_LOG_DEFAULT,
-                     "[VGTCNode-Q3B] Split: degenerate band heights topH=%.0f bottomH=%.0f.",
-                     topH, bottomH);
-        return NULL;
-    }
     double canvasW = (double)primW;
     double canvasH = (double)primH;
+    BOOL leftRight = (split.direction == _VGTCNSplitScreenDirectionLeftRight);
+
+    // Band rects in CoreImage Y-up coordinates. firstRect is the top band
+    // (topBottom) or the left band (leftRight); secondRect is the other one.
+    CGRect firstRect;
+    CGRect secondRect;
+    if (leftRight) {
+        double leftW  = floor(canvasW * sr);
+        double rightW = canvasW - leftW;
+        if (leftW < 1.0 || rightW < 1.0) {
+            os_log_error(OS_LOG_DEFAULT,
+                         "[VGTCNode-Q3B] Split: degenerate band widths leftW=%.0f rightW=%.0f.",
+                         leftW, rightW);
+            return NULL;
+        }
+        firstRect  = CGRectMake(0.0,   0.0, leftW,  canvasH);
+        secondRect = CGRectMake(leftW, 0.0, rightW, canvasH);
+    } else {
+        // Y-up: the top band has the higher Y values.
+        double topH    = floor(canvasH * sr);
+        double bottomH = canvasH - topH;
+        if (topH < 1.0 || bottomH < 1.0) {
+            os_log_error(OS_LOG_DEFAULT,
+                         "[VGTCNode-Q3B] Split: degenerate band heights topH=%.0f bottomH=%.0f.",
+                         topH, bottomH);
+            return NULL;
+        }
+        firstRect  = CGRectMake(0.0, bottomH, canvasW, topH);
+        secondRect = CGRectMake(0.0, 0.0,     canvasW, bottomH);
+    }
+    CGRect primaryRect   = split.swapped ? secondRect : firstRect;
+    CGRect secondaryRect = split.swapped ? firstRect  : secondRect;
+
+    // Visible content rects: strip the canvas aspect-fit bars when the true
+    // source display size is known; otherwise the whole buffer is content.
+    CGRect fullPrimRect = CGRectMake(0.0, 0.0, (double)primW, (double)primH);
+    CGRect fullSecRect  = CGRectMake(0.0, 0.0, (double)secW,  (double)secH);
+    CGRect visPrimRect = fullPrimRect;
+    if (split.primarySourceSize.width > 0.0 && split.primarySourceSize.height > 0.0) {
+        visPrimRect = _VGTCNAspectFitRect(split.primarySourceSize,
+                                          CGSizeMake((double)primW, (double)primH));
+    }
+    if (CGRectGetWidth(visPrimRect) <= 0.0 || CGRectGetHeight(visPrimRect) <= 0.0) {
+        visPrimRect = fullPrimRect;
+    }
+    CGRect visSecRect = fullSecRect;
+    if (split.secondarySourceSize.width > 0.0 && split.secondarySourceSize.height > 0.0) {
+        visSecRect = _VGTCNAspectFitRect(split.secondarySourceSize,
+                                         CGSizeMake((double)secW, (double)secH));
+    }
+    if (CGRectGetWidth(visSecRect) <= 0.0 || CGRectGetHeight(visSecRect) <= 0.0) {
+        visSecRect = fullSecRect;
+    }
 
     CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
     CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
     if (!primaryCI || !secondaryCI) return NULL;
 
-    // Aspect-fill helper: normalize → scale-to-fill → center → crop to rect.
-    CIImage *(^aspectFillIntoRect)(CIImage *, size_t, size_t, CGRect) =
-        ^CIImage *(CIImage *src, size_t srcW, size_t srcH, CGRect targetRect) {
+    // Aspect-fill helper: normalize origin → crop to the visible content rect
+    // → normalize the cropped origin → scale-to-fill → center → crop to band.
+    // With a full-buffer visibleRect this reduces exactly to the original
+    // normalize → scale-to-fill → center → crop pipeline.
+    CIImage *(^aspectFillIntoRect)(CIImage *, CGRect, CGRect) =
+        ^CIImage *(CIImage *src, CGRect visibleRect, CGRect targetRect) {
             CIImage *norm = src;
             CGPoint origin = norm.extent.origin;
             if (origin.x != 0.0 || origin.y != 0.0) {
                 norm = [norm imageByApplyingTransform:
                         CGAffineTransformMakeTranslation(-origin.x, -origin.y)];
             }
-            double sX = (srcW > 0) ? CGRectGetWidth(targetRect)  / (double)srcW : 1.0;
-            double sY = (srcH > 0) ? CGRectGetHeight(targetRect) / (double)srcH : 1.0;
-            double s  = MAX(sX, sY);
+            CIImage *content = [norm imageByCroppingToRect:visibleRect];
+            if (visibleRect.origin.x != 0.0 || visibleRect.origin.y != 0.0) {
+                content = [content imageByApplyingTransform:
+                           CGAffineTransformMakeTranslation(-visibleRect.origin.x,
+                                                            -visibleRect.origin.y)];
+            }
+            double srcW = CGRectGetWidth(visibleRect);
+            double srcH = CGRectGetHeight(visibleRect);
+            double sX = (srcW > 0.0) ? CGRectGetWidth(targetRect)  / srcW : 1.0;
+            double sY = (srcH > 0.0) ? CGRectGetHeight(targetRect) / srcH : 1.0;
+            // Aspect-fit (contain) for splitLeftRight; aspect-fill (cover) for splitTopBottom.
+            double s  = leftRight ? MIN(sX, sY) : MAX(sX, sY);
             if (s <= 0.0) { s = 1.0; }
-            CIImage *scaled = [norm imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
-            double scaledW = (double)srcW * s;
-            double scaledH = (double)srcH * s;
+            CIImage *scaled = [content imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
+            double scaledW = srcW * s;
+            double scaledH = srcH * s;
             double offX = CGRectGetMinX(targetRect) + (CGRectGetWidth(targetRect)  - scaledW) * 0.5;
             double offY = CGRectGetMinY(targetRect) + (CGRectGetHeight(targetRect) - scaledH) * 0.5;
             CIImage *centered = [scaled imageByApplyingTransform:
@@ -1165,19 +1277,17 @@ static CVPixelBufferRef _VGTCNCompositeSplitScreen(
             return [centered imageByCroppingToRect:targetRect];
         };
 
-    // CoreImage Y-up: top band rect has higher Y.
-    CGRect topRect    = CGRectMake(0.0, bottomH, canvasW, topH);
-    CGRect bottomRect = CGRectMake(0.0, 0.0,     canvasW, bottomH);
-    CIImage *topBand    = aspectFillIntoRect(primaryCI,   primW, primH, topRect);
-    CIImage *bottomBand = aspectFillIntoRect(secondaryCI, secW,  secH,  bottomRect);
-    if (!topBand || !bottomBand) return NULL;
+    CIImage *primaryBand   = aspectFillIntoRect(primaryCI,   visPrimRect, primaryRect);
+    CIImage *secondaryBand = aspectFillIntoRect(secondaryCI, visSecRect,  secondaryRect);
+    if (!primaryBand || !secondaryBand) return NULL;
 
-    // Black canvas backing prevents any gaps at the split boundary.
+    // Black canvas backing prevents any gaps at the split boundary. The bands
+    // are disjoint, so composition order does not change the result.
     CGRect canvasRect  = CGRectMake(0, 0, canvasW, canvasH);
     CIImage *blackBase = [[CIImage imageWithColor:[CIColor blackColor]]
                           imageByCroppingToRect:canvasRect];
-    CIImage *withBottom = [bottomBand imageByCompositingOverImage:blackBase];
-    CIImage *composited = [topBand    imageByCompositingOverImage:withBottom];
+    CIImage *withSecondary = [secondaryBand imageByCompositingOverImage:blackBase];
+    CIImage *composited    = [primaryBand   imageByCompositingOverImage:withSecondary];
     if (!composited) return NULL;
 
     // Allocate canvas-authoritative output buffer.
@@ -1199,9 +1309,21 @@ static CVPixelBufferRef _VGTCNCompositeSplitScreen(
     _VGTCNTagSDR709PixelBuffer(outputBuf); // C1E: tag output as BT.709/sRGB
 
     os_log(OS_LOG_DEFAULT,
-           "[VGTCNode-Q3B] Split composited: prim=%zux%zu sec=%zux%zu "
-           "topH=%.0f bottomH=%.0f splitRatio=%.3f",
-           primW, primH, secW, secH, topH, bottomH, sr);
+           "[VGTCNode-Q3B] Split composited: direction=%{public}s swapped=%d "
+           "prim=%zux%zu sec=%zux%zu primaryBand=(%.0f,%.0f,%.0f,%.0f) "
+           "secondaryBand=(%.0f,%.0f,%.0f,%.0f) visPrim=(%.0f,%.0f,%.0f,%.0f) "
+           "visSec=(%.0f,%.0f,%.0f,%.0f) splitRatio=%.3f",
+           leftRight ? "leftRight" : "topBottom", (int)split.swapped,
+           primW, primH, secW, secH,
+           CGRectGetMinX(primaryRect), CGRectGetMinY(primaryRect),
+           CGRectGetWidth(primaryRect), CGRectGetHeight(primaryRect),
+           CGRectGetMinX(secondaryRect), CGRectGetMinY(secondaryRect),
+           CGRectGetWidth(secondaryRect), CGRectGetHeight(secondaryRect),
+           CGRectGetMinX(visPrimRect), CGRectGetMinY(visPrimRect),
+           CGRectGetWidth(visPrimRect), CGRectGetHeight(visPrimRect),
+           CGRectGetMinX(visSecRect), CGRectGetMinY(visSecRect),
+           CGRectGetWidth(visSecRect), CGRectGetHeight(visSecRect),
+           sr);
 
     return outputBuf; // Caller owns +1
 }
@@ -4949,12 +5071,16 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     // Phase 7.x-Q3D: Store primary source display dimensions in the layout config
     // so _VGTCNCompositePiP can compute the visible primary rect at composition
     // time and anchor the PiP over the actual video content (not black bars).
+    // Package A: the split config carries the same size so
+    // _VGTCNCompositeSplitScreen can crop the primary to its visible content
+    // before aspect-filling its band.
     if (clipIndex < _dualCameraLayoutConfigs.count) {
       NSValue *cfgValue = _dualCameraLayoutConfigs[clipIndex];
       _VGTCNDualCameraLayoutConfig cfg;
       [cfgValue getValue:&cfg];
       if (cfg.enabled) {
-        cfg.pip.primarySourceSize = CGSizeMake(displayW, displayH);
+        cfg.pip.primarySourceSize   = CGSizeMake(displayW, displayH);
+        cfg.split.primarySourceSize = CGSizeMake(displayW, displayH);
         NSMutableArray *mutableConfigs =
             [NSMutableArray arrayWithArray:_dualCameraLayoutConfigs];
         mutableConfigs[clipIndex] =
@@ -5310,20 +5436,27 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     // Phase 7.x-Q3E: Store secondary source display dimensions in the layout
     // config so _VGTCNCompositePiP can aspect-fill the visible secondary content
     // into the PiP rect (removing black bars from the secondary canvas aspect-fit).
+    // Package A: the split-screen config stores it too, so
+    // _VGTCNCompositeSplitScreen can crop the secondary to its visible content
+    // before aspect-filling its band.
     if (clipIndex < _dualCameraLayoutConfigs.count) {
       NSValue *cfgValue = _dualCameraLayoutConfigs[clipIndex];
       _VGTCNDualCameraLayoutConfig cfg;
       [cfgValue getValue:&cfg];
-      if (cfg.enabled && cfg.mode == _VGTCNDualCameraLayoutModePiP) {
-        cfg.pip.secondarySourceSize = CGSizeMake(secDisplayW, secDisplayH);
+      if (cfg.enabled) {
+        if (cfg.mode == _VGTCNDualCameraLayoutModePiP) {
+          cfg.pip.secondarySourceSize = CGSizeMake(secDisplayW, secDisplayH);
+        } else {
+          cfg.split.secondarySourceSize = CGSizeMake(secDisplayW, secDisplayH);
+        }
         NSMutableArray *mutableConfigs =
             [NSMutableArray arrayWithArray:_dualCameraLayoutConfigs];
         mutableConfigs[clipIndex] =
             [NSValue value:&cfg withObjCType:@encode(_VGTCNDualCameraLayoutConfig)];
         _dualCameraLayoutConfigs = [mutableConfigs copy];
         os_log(sTimelineLog,
-               "[VGTCNode-Q3E] stored secondarySourceSize=%.0fx%.0f for clip=%lu",
-               secDisplayW, secDisplayH, (unsigned long)clipIndex);
+               "[VGTCNode-Q3E] stored secondarySourceSize=%.0fx%.0f for clip=%lu mode=%ld",
+               secDisplayW, secDisplayH, (unsigned long)clipIndex, (long)cfg.mode);
       }
     }
   }

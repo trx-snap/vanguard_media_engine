@@ -298,6 +298,8 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     private var sourceRect: VGDuetPixelRect? = null
     private var cameraRect: VGDuetPixelRect? = null
+    private var sourceScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL
+    private var cameraScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL
 
     /** Raw decoded source video dimensions used for aspect-fill; 0 means unknown (stretch). */
     private var sourceVideoWidthPx = 0
@@ -580,6 +582,14 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     override fun setLayout(sourceRect: VGDuetPixelRect, cameraRect: VGDuetPixelRect) {
         this.sourceRect = sourceRect
         this.cameraRect = cameraRect
+    }
+
+    override fun setLayerScaleModes(
+        sourceScaleMode: AndroidDuetLayerScaleMode,
+        cameraScaleMode: AndroidDuetLayerScaleMode,
+    ) {
+        this.sourceScaleMode = sourceScaleMode
+        this.cameraScaleMode = cameraScaleMode
     }
 
     /**
@@ -2678,7 +2688,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private fun drawSourceRect(rect: VGDuetPixelRect) {
         val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
         if (scissor.width <= 0 || scissor.height <= 0) return
-        val viewport = aspectFillViewport(rect)
+        val viewport = if (sourceScaleMode == AndroidDuetLayerScaleMode.ASPECT_FIT) {
+            aspectFitViewport(rect)
+        } else {
+            aspectFillViewport(rect)
+        }
 
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
@@ -2732,7 +2746,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     private fun drawCameraRect(rect: VGDuetPixelRect) {
         val scissor = toGlRect(rect.left, rect.top, rect.width, rect.height)
         if (scissor.width <= 0 || scissor.height <= 0) return
-        val viewport = cameraAspectFillViewport(rect)
+        val viewport = if (cameraScaleMode == AndroidDuetLayerScaleMode.ASPECT_FIT) {
+            cameraAspectFitViewport(rect)
+        } else {
+            cameraAspectFillViewport(rect)
+        }
 
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         GLES20.glScissor(scissor.x, scissor.y, scissor.width, scissor.height)
@@ -2872,6 +2890,70 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
         return VGDuetPixelRect(
             left   = rect.left - (drawnW - rectW) / 2.0,
             top    = rect.top - (drawnH - rectH) / 2.0,
+            width  = drawnW,
+            height = drawnH,
+        )
+    }
+
+    private fun aspectFitViewport(rect: VGDuetPixelRect): GlRect {
+        val rectW = rect.width
+        val rectH = rect.height
+        if (sourceVideoWidthPx <= 0 || sourceVideoHeightPx <= 0 || rectW <= 0.0 || rectH <= 0.0) {
+            return toGlRect(rect.left, rect.top, rectW, rectH)
+        }
+        val displayWidthPx: Int
+        val displayHeightPx: Int
+        if (sourceVideoRotationDegrees == 90 || sourceVideoRotationDegrees == 270) {
+            displayWidthPx = sourceVideoHeightPx
+            displayHeightPx = sourceVideoWidthPx
+        } else {
+            displayWidthPx = sourceVideoWidthPx
+            displayHeightPx = sourceVideoHeightPx
+        }
+        val videoAspect = displayWidthPx.toDouble() / displayHeightPx.toDouble()
+        val rectAspect = rectW / rectH
+        val drawnW: Double
+        val drawnH: Double
+        if (videoAspect > rectAspect) {
+            drawnW = rectW
+            drawnH = rectW / videoAspect
+        } else {
+            drawnH = rectH
+            drawnW = rectH * videoAspect
+        }
+        return toGlRect(
+            rect.left + (rectW - drawnW) / 2.0,
+            rect.top + (rectH - drawnH) / 2.0,
+            drawnW,
+            drawnH,
+        )
+    }
+
+    private fun cameraAspectFitViewport(rect: VGDuetPixelRect): GlRect {
+        val aspectRect = cameraAspectFitCanvasRect(rect)
+        return toGlRect(aspectRect.left, aspectRect.top, aspectRect.width, aspectRect.height)
+    }
+
+    private fun cameraAspectFitCanvasRect(rect: VGDuetPixelRect): VGDuetPixelRect {
+        val rectW = rect.width
+        val rectH = rect.height
+        if (rectW <= 0.0 || rectH <= 0.0) {
+            return rect
+        }
+        val cameraAspect = CAMERA_UPRIGHT_ASPECT
+        val rectAspect = rectW / rectH
+        val drawnW: Double
+        val drawnH: Double
+        if (cameraAspect > rectAspect) {
+            drawnW = rectW
+            drawnH = rectW / cameraAspect
+        } else {
+            drawnH = rectH
+            drawnW = rectH * cameraAspect
+        }
+        return VGDuetPixelRect(
+            left   = rect.left + (rectW - drawnW) / 2.0,
+            top    = rect.top + (rectH - drawnH) / 2.0,
             width  = drawnW,
             height = drawnH,
         )

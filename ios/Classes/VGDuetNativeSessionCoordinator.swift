@@ -583,6 +583,9 @@ final class VGDuetNativeSessionCoordinator {
         let compositor   = VGDuetPreviewCompositor(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
         let clock        = session.previewClock
         let decoderQueue = self.decoderQueue
+        let mode         = session.layoutConfigMap["mode"] as? String ?? "pip"
+        let isSplitLeftRight = (mode == "splitLeftRight")
+        let scaleMode: VGDuetScaleMode = isSplitLeftRight ? .aspectFit : .aspectFill
 
         return VGDuetPreviewRenderLoop(
             compositor:  compositor,
@@ -593,6 +596,7 @@ final class VGDuetNativeSessionCoordinator {
             rotationDegrees: rects.rotation.rotationDegrees,
             anchorX:     rects.rotation.anchorX,
             anchorY:     rects.rotation.anchorY,
+            scaleMode:   scaleMode,
             targetPtsProvider: { [weak self, weak session] in
                 // Main thread (display link / renderInitialFrame). Also the
                 // trim-end observation point for the one-shot `auto_stop`
@@ -868,12 +872,16 @@ final class VGDuetNativeSessionCoordinator {
             )
             session.previewLayoutRects = typedRects.map { serializeLayoutRects((source: $0.source, camera: $0.camera)) }
             let rects = typedRects ?? Self.fallbackPreviewRects(canvasWidth: width, canvasHeight: height)
+            let mode = layoutConfigMap["mode"] as? String ?? "pip"
+            let isSplitLeftRight = (mode == "splitLeftRight")
+            let scaleMode: VGDuetScaleMode = isSplitLeftRight ? .aspectFit : .aspectFill
             session.previewRenderLoop?.updateLayout(
                 sourceRect:  rects.source,
                 cameraRect:  rects.camera,
                 rotationDegrees: rects.rotation.rotationDegrees,
                 anchorX:     rects.rotation.anchorX,
                 anchorY:     rects.rotation.anchorY,
+                scaleMode:   scaleMode,
                 targetPtsMs: session.previewClock.currentSourcePtsMs())
         }
         reply(nil, nil)
@@ -1288,6 +1296,7 @@ final class VGDuetNativeSessionCoordinator {
                 rotationDegrees: rects.rotation.rotationDegrees,
                 anchorX:     rects.rotation.anchorX,
                 anchorY:     rects.rotation.anchorY,
+                scaleMode:   .aspectFill,
                 targetPtsMs: session.previewClock.currentSourcePtsMs())
         }
 

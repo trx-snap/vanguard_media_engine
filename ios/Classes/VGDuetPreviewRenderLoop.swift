@@ -166,6 +166,10 @@ final class VGDuetPreviewRenderLoop {
     private var rotationDegrees: CGFloat
     private var anchorX: CGFloat
     private var anchorY: CGFloat
+    /// Layer scale mode handed to `VGDuetPreviewCompositor.composite` on every
+    /// render (`.aspectFit` for splitLeftRight, `.aspectFill` otherwise).  Set at
+    /// init and by `updateLayout`, captured alongside the rects in `render`.
+    private(set) var scaleMode: VGDuetScaleMode = .aspectFill
 
     private var isStopped = false
     private var isActive  = false
@@ -215,6 +219,7 @@ final class VGDuetPreviewRenderLoop {
          rotationDegrees: CGFloat = 0.0,
          anchorX: CGFloat = 0.5,
          anchorY: CGFloat = 0.5,
+         scaleMode: VGDuetScaleMode = .aspectFill,
          targetPtsProvider: @escaping TargetPtsProvider,
          decodeHandler: @escaping DecodeHandler,
          presentHandler: @escaping PresentHandler,
@@ -227,6 +232,7 @@ final class VGDuetPreviewRenderLoop {
         self.rotationDegrees          = rotationDegrees
         self.anchorX                  = anchorX
         self.anchorY                  = anchorY
+        self.scaleMode                = scaleMode
         self.targetPtsProvider        = targetPtsProvider
         self.decodeHandler            = decodeHandler
         self.presentHandler           = presentHandler
@@ -324,6 +330,7 @@ final class VGDuetPreviewRenderLoop {
                       rotationDegrees: CGFloat = 0.0,
                       anchorX: CGFloat = 0.5,
                       anchorY: CGFloat = 0.5,
+                      scaleMode: VGDuetScaleMode = .aspectFill,
                       targetPtsMs: Int) {
         assert(Thread.isMainThread)
         guard !isStopped else { return }
@@ -332,6 +339,7 @@ final class VGDuetPreviewRenderLoop {
         self.rotationDegrees = rotationDegrees
         self.anchorX         = anchorX
         self.anchorY         = anchorY
+        self.scaleMode       = scaleMode
         submit(.decode(.step(targetPtsMs: clamp(targetPtsMs)), forceRender: true))
     }
 
@@ -545,6 +553,7 @@ final class VGDuetPreviewRenderLoop {
         let rotationDeg = rotationDegrees
         let anchorXVal  = anchorX
         let anchorYVal  = anchorY
+        let mode        = scaleMode
         let compositor  = self.compositor
         // Take ONE foreground sample *before* crossing the queue boundary.  Frame and
         // matte are each +1; the sample is released exactly once after compositing,
@@ -575,7 +584,8 @@ final class VGDuetPreviewRenderLoop {
                                               cameraFrameUsesStraightAlpha: usesStraightAlpha,
                                               cameraRotationDegrees: rotationDeg,
                                               cameraAnchorX: anchorXVal,
-                                              cameraAnchorY: anchorYVal)
+                                              cameraAnchorY: anchorYVal,
+                                              scaleMode: mode)
             // Release the retained sample now that compositing is done (all modes).
             sample?.release()
             DispatchQueue.main.async {

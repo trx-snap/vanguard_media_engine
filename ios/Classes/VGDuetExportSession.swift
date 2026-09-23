@@ -207,13 +207,13 @@ final class VGDuetExportSession {
                 return
             }
 
-            // Only pip and splitTopBottom are supported by the real-take export
-            // path in this slice; splitLeftRight, greenScreen, and any
-            // unrecognised mode fail closed.
-            guard layoutMode == "pip" || layoutMode == "splitTopBottom" else {
+            // pip, splitTopBottom, and splitLeftRight (Package A) are supported
+            // by the real-take export path; greenScreen and any unrecognised
+            // mode fail closed.
+            guard layoutMode == "pip" || layoutMode == "splitTopBottom" || layoutMode == "splitLeftRight" else {
                 result(FlutterError(
                     code:    "unsupported_export_feature",
-                    message: "exportDuetComposition: real-take export only supports layoutConfig.mode 'pip' or 'splitTopBottom'; got \(layoutMode ?? "<nil>").",
+                    message: "exportDuetComposition: real-take export only supports layoutConfig.mode 'pip', 'splitTopBottom', or 'splitLeftRight'; got \(layoutMode ?? "<nil>").",
                     details: nil))
                 return
             }
@@ -232,10 +232,12 @@ final class VGDuetExportSession {
                 return
             }
 
-            // The compositor's splitScreen path always renders the primary
-            // clip on top and the secondary on the bottom band with no
-            // ordering-swap support; a swap request must fail closed rather
-            // than silently render the wrong order.
+            // Duet does not expose a top/bottom swap for export in this slice
+            // (the compositor's splitScreen path accepts a `swapped` flag,
+            // but only splitLeftRight forwards one -- see the splitLayout
+            // dictionaries built in _performExport); a top/bottom swap request
+            // must keep failing closed rather than silently render the wrong
+            // order.
             if layoutMode == "splitTopBottom" {
                 let isTopBottomSwapped = (layoutConfigMap["isTopBottomSwapped"] as? NSNumber)?.boolValue ?? false
                 guard !isTopBottomSwapped else {
@@ -431,8 +433,9 @@ final class VGDuetExportSession {
             // Creator overlays render on top of that composited frame via the
             // existing zIndex remap above.
             //
-            // layoutMode is guaranteed to be "pip" or "splitTopBottom" here —
-            // validated in export(args:result:) before busy was marked.
+            // layoutMode is guaranteed to be "pip", "splitTopBottom", or
+            // "splitLeftRight" here — validated in export(args:result:) before
+            // busy was marked.
             let layoutMode = layoutConfigMap["mode"] as? String
 
             // ── Probe recorded segment duration ─────────────────────────────────
@@ -477,8 +480,27 @@ final class VGDuetExportSession {
             ]
 
             if layoutMode == "splitTopBottom" {
+                // Explicit direction/swapped so VGTimelineCompositorNode's split
+                // path never depends on its own defaults for this route.
                 dualCameraDict["layoutMode"] = "splitScreen"
-                dualCameraDict["splitLayout"] = ["splitRatio": 0.5]
+                dualCameraDict["splitLayout"] = [
+                    "splitRatio": 0.5,
+                    "direction":  "topBottom",
+                    "swapped":    false,
+                ]
+            } else if layoutMode == "splitLeftRight" {
+                // Package A: 50/50 left/right bands. `isSideSwapped` is the Dart
+                // VGDuetLayoutConfig wire key: false = source (primary) on the
+                // left and the recorded take (secondary) on the right; true =
+                // recorded take on the left. VGTimelineCompositorNode maps
+                // `swapped` onto that primary/secondary band order.
+                let isSideSwapped = (layoutConfigMap["isSideSwapped"] as? NSNumber)?.boolValue ?? false
+                dualCameraDict["layoutMode"] = "splitScreen"
+                dualCameraDict["splitLayout"] = [
+                    "splitRatio": 0.5,
+                    "direction":  "leftRight",
+                    "swapped":    isSideSwapped,
+                ]
             } else {
                 let pipAnchor = (layoutConfigMap["pipAnchor"] as? String) ?? "bottomRight"
                 dualCameraDict["layoutMode"] = "pip"

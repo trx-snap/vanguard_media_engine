@@ -104,6 +104,8 @@ class VGDuetAndroidSession(
     // fed to the render loop alongside it on (re)attach and updateLayout.
     // Identity outside greenScreen mode; never sent over the MethodChannel.
     var previewForegroundRotation: VGDuetForegroundRotation = VGDuetForegroundRotation.IDENTITY
+    // Layer scale mode (aspect-fit for splitLeftRight, aspect-fill otherwise).
+    var previewLayerScaleMode: AndroidDuetLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL
     // startDuetRecording reply parked behind the barrier. Non-null only while
     // state == INITIALIZED and a start is pending; cleared by completion/cancel.
     var pendingStartReply: ((Any?, String?) -> Unit)? = null
@@ -566,8 +568,15 @@ class AndroidDuetSessionCoordinator(
         if (widthPx != null && heightPx != null) {
             val typedRects = buildTypedLayoutRects(layoutConfigMap, widthPx.toDouble(), heightPx.toDouble())
             val foregroundRotation = buildForegroundRotation(layoutConfigMap)
+            val isSplitLeftRight = newMode == "splitLeftRight"
+            val layerScaleMode = if (isSplitLeftRight) {
+                AndroidDuetLayerScaleMode.ASPECT_FIT
+            } else {
+                AndroidDuetLayerScaleMode.ASPECT_FILL
+            }
             session.previewTypedLayoutRects = typedRects
             session.previewForegroundRotation = foregroundRotation
+            session.previewLayerScaleMode = layerScaleMode
             session.previewLayoutRects = typedRects?.let {
                 mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
             }
@@ -577,6 +586,8 @@ class AndroidDuetSessionCoordinator(
                     typedRects.camera,
                     session.previewClock.currentSourcePtsMs().toLong(),
                     foregroundRotation,
+                    sourceScaleMode = layerScaleMode,
+                    cameraScaleMode = layerScaleMode,
                 )
             }
             // Enable/disable green-screen compositing based on the new mode.
@@ -1286,6 +1297,12 @@ class AndroidDuetSessionCoordinator(
         }
         val typedRects = buildTypedLayoutRects(effectiveLayoutMap, widthPx.toDouble(), heightPx.toDouble())
         val foregroundRotation = buildForegroundRotation(effectiveLayoutMap)
+        val isSplitLeftRight = effectiveLayoutMap["mode"] == "splitLeftRight"
+        val layerScaleMode = if (isSplitLeftRight) {
+            AndroidDuetLayerScaleMode.ASPECT_FIT
+        } else {
+            AndroidDuetLayerScaleMode.ASPECT_FILL
+        }
         val layoutRects = typedRects?.let {
             mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
         }
@@ -1296,6 +1313,7 @@ class AndroidDuetSessionCoordinator(
         session.previewLayoutRects = layoutRects
         session.previewTypedLayoutRects = typedRects
         session.previewForegroundRotation = foregroundRotation
+        session.previewLayerScaleMode = layerScaleMode
 
         // The eager probe in the producer's init never fires the availability
         // hook, so bootstrap the render loop here when the surface already exists.
@@ -1309,6 +1327,8 @@ class AndroidDuetSessionCoordinator(
                     typedRects.source, typedRects.camera,
                     session.previewClock.currentSourcePtsMs().toLong(),
                     foregroundRotation,
+                    sourceScaleMode = layerScaleMode,
+                    cameraScaleMode = layerScaleMode,
                 )
             }
         }
@@ -1345,6 +1365,8 @@ class AndroidDuetSessionCoordinator(
             typedRects.source, typedRects.camera,
             session.previewClock.currentSourcePtsMs().toLong(),
             session.previewForegroundRotation,
+            sourceScaleMode = session.previewLayerScaleMode,
+            cameraScaleMode = session.previewLayerScaleMode,
         )
     }
 
@@ -1574,6 +1596,7 @@ class AndroidDuetSessionCoordinator(
             // metadata scoped to the green-screen camera layer, so it resets
             // to identity here rather than carrying over a stale angle.
             session.previewForegroundRotation = VGDuetForegroundRotation.IDENTITY
+            session.previewLayerScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL
             session.previewLayoutRects = typedRects?.let {
                 mapOf("source" to it.source.toMap(), "camera" to it.camera.toMap())
             }
@@ -1583,6 +1606,8 @@ class AndroidDuetSessionCoordinator(
                     typedRects.camera,
                     session.previewClock.currentSourcePtsMs().toLong(),
                     VGDuetForegroundRotation.IDENTITY,
+                    sourceScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
+                    cameraScaleMode = AndroidDuetLayerScaleMode.ASPECT_FILL,
                 )
             }
         }

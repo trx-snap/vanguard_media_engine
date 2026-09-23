@@ -25,6 +25,15 @@
 //   flips Y and snaps edges to whole pixels, so geometry intent is preserved to
 //   within 1 px.
 //
+// Layer scale mode (Duet splitLeftRight): composite(scaleMode:) selects how the source
+// and camera/foreground frames are placed into their rects.  `.aspectFill` (default) is
+// the scale-to-fill + center-crop every existing layout (PiP, splitTopBottom, Green
+// Screen) uses and keeps their output unchanged.  `.aspectFit` is scale-to-fit +
+// center with the dark canvas showing through the padding; VGDuetNativeSessionCoordinator
+// selects it for the 50/50 left/right split so neither half is aggressively cropped.
+// The scale mode never affects the placeholder, the rotation pivot, or the
+// straight-alpha premultiply/source-over ordering below.
+//
 // Straight-alpha foreground ingest (Phase 4B-A; the proven Duet production path):
 // composite(cameraFrameUsesStraightAlpha: true) treats `cameraFrame` as a foreground that
 // was ALREADY keyed upstream: BGRA with STRAIGHT (non-premultiplied) alpha, RGB = 0 where
@@ -45,6 +54,17 @@ import CoreImage
 import CoreVideo
 import Foundation
 import Metal
+
+/// How a Duet preview layer (source or camera/foreground frame) is placed into its
+/// layout rect by `VGDuetPreviewCompositor.composite`.  Owned by the Duet preview
+/// path; `VGDuetPreviewRenderLoop` stores the active mode and
+/// `VGDuetNativeSessionCoordinator` derives it from `layoutConfig.mode`.
+enum VGDuetScaleMode {
+    /// Scale-to-fill + center-crop (the default; every pre-existing layout).
+    case aspectFill
+    /// Scale-to-fit + center, padding shows the canvas (splitLeftRight).
+    case aspectFit
+}
 
 final class VGDuetPreviewCompositor {
 
@@ -140,6 +160,12 @@ final class VGDuetPreviewCompositor {
     ///                      cameraRect. Defaults (0.0, 0.5, 0.5) are a no-op identity rotation
     ///                      so existing callers stay source-compatible. The source/background
     ///                      layer is never rotated.
+    ///   - scaleMode:       How the source frame and the camera/foreground frame are placed
+    ///                      into their rects.  `.aspectFill` (default) is the pre-existing
+    ///                      scale-to-fill + center-crop; `.aspectFit` scales to fit and
+    ///                      centers, leaving the canvas visible in the padding
+    ///                      (splitLeftRight).  Applied to both frame layers identically and
+    ///                      before rotation; the placeholder is unaffected.
     /// - Returns: a pool-backed BGRA buffer, or nil when the pool is exhausted / unavailable.
     func composite(sourceFrame: CVPixelBuffer?,
                    sourceRect: CGRect,
@@ -148,7 +174,8 @@ final class VGDuetPreviewCompositor {
                    cameraFrameUsesStraightAlpha: Bool = false,
                    cameraRotationDegrees: CGFloat = 0.0,
                    cameraAnchorX: CGFloat = 0.5,
-                   cameraAnchorY: CGFloat = 0.5) -> CVPixelBuffer? {
+                   cameraAnchorY: CGFloat = 0.5,
+                   scaleMode: VGDuetScaleMode = .aspectFill) -> CVPixelBuffer? {
         guard let pool = pool else { return nil }
 
         // Final guard: sanitize non-finite rotation/anchor inputs regardless of
@@ -171,7 +198,7 @@ final class VGDuetPreviewCompositor {
         let ciSource = ciRect(fromTopLeft: sourceRect)
         if let frame = sourceFrame, !ciSource.isEmpty {
             let sourceImage = CIImage(cvPixelBuffer: frame)
-            image = aspectFill(sourceImage, into: ciSource).composited(over: image)
+            image = place(sourceImage, into: ciSource, mode: scaleMode).composited(over: image)
         }
 
         let ciCamera = ciRect(fromTopLeft: cameraRect)
@@ -181,11 +208,11 @@ final class VGDuetPreviewCompositor {
                 //   The frame's bytes are STRAIGHT alpha (fg.rgb, a).  CoreImage treats a
                 //   BGRA pixel buffer as premultiplied, so premultiply first, giving
                 //   (fg.rgb*a, a), and do it BEFORE resampling so transparent texels never
-                //   bleed colour into edges; then aspect-fill into the unrotated cameraRect,
-                //   rotate the resulting layer, then source-over onto the canvas
-                //   (C = C_fg*a + C_bg*(1-a)).
+                //   bleed colour into edges; then place (aspect-fill, or aspect-fit for
+                //   splitLeftRight) into the unrotated cameraRect, rotate the resulting
+                //   layer, then source-over onto the canvas (C = C_fg*a + C_bg*(1-a)).
                 let camPremultiplied = CIImage(cvPixelBuffer: camFrame).premultiplyingAlpha()
-                let filled = aspectFill(camPremultiplied, into: ciCamera)
+                let filled = place(camPremultiplied, into: ciCamera, mode: scaleMode)
                 let rotated = rotateCameraLayer(filled, in: ciCamera,
                                                 rotationDegrees: sanitizedRotationDegrees,
                                                 anchorX: sanitizedAnchorX,
@@ -198,9 +225,10 @@ final class VGDuetPreviewCompositor {
                     NSLog("[VGDuetPreviewCompositor] IOS_DUET_FOREGROUND_STRAIGHT_ALPHA_COMPOSITE_FIRST pre-keyed straight-alpha foreground premultiplied and source-over composited into cameraRect; no matte, no refinement")
                 }
             } else if let camFrame = cameraFrame {
-                // Opaque live camera frame: aspect-fill into the unrotated slot, then rotate.
+                // Opaque live camera frame: place (aspect-fill, or aspect-fit for
+                // splitLeftRight) into the unrotated slot, then rotate.
                 let camImage = CIImage(cvPixelBuffer: camFrame)
-                let filled = aspectFill(camImage, into: ciCamera)
+                let filled = place(camImage, into: ciCamera, mode: scaleMode)
                 let rotated = rotateCameraLayer(filled, in: ciCamera,
                                                 rotationDegrees: sanitizedRotationDegrees,
                                                 anchorX: sanitizedAnchorX,
@@ -241,11 +269,35 @@ final class VGDuetPreviewCompositor {
         return clipped.isNull ? .zero : clipped
     }
 
+    /// Places `image` into `rect` (CI coordinates) per `mode`:
+    /// `.aspectFill` -> `aspectFill(_:into:)`, `.aspectFit` -> `aspectFit(_:into:)`.
+    func place(_ image: CIImage, into rect: CGRect, mode: VGDuetScaleMode) -> CIImage {
+        switch mode {
+        case .aspectFill: return aspectFill(image, into: rect)
+        case .aspectFit:  return aspectFit(image, into: rect)
+        }
+    }
+
     /// Scale-to-fill + center-crop `image` into `rect` (CI coordinates).
     func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {
         let extent = image.extent
         guard extent.width > 0, extent.height > 0 else { return CIImage.empty() }
         let scale  = max(rect.width / extent.width, rect.height / extent.height)
+        let scaledW = extent.width  * scale
+        let scaledH = extent.height * scale
+        let tx = rect.minX + (rect.width  - scaledW) / 2 - extent.minX * scale
+        let ty = rect.minY + (rect.height - scaledH) / 2 - extent.minY * scale
+        let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: tx, ty: ty)
+        return image.transformed(by: transform).cropped(to: rect)
+    }
+
+    /// Scale-to-fit + center `image` into `rect` (CI coordinates).  The padding
+    /// left/right or above/below the fitted image is not drawn, so the dark canvas
+    /// (or whatever was composited below) shows through.  Used for splitLeftRight.
+    func aspectFit(_ image: CIImage, into rect: CGRect) -> CIImage {
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return CIImage.empty() }
+        let scale  = min(rect.width / extent.width, rect.height / extent.height)
         let scaledW = extent.width  * scale
         let scaledH = extent.height * scale
         let tx = rect.minX + (rect.width  - scaledW) / 2 - extent.minX * scale
