@@ -707,6 +707,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         cameraGraphTransactionCoordinator = AndroidCameraGraphTransactionCoordinator(
             hasActiveCameraProvider = { cameraSource != null },
             setBeautyIntensity = { intensity -> cameraSource?.setBeautyIntensity(intensity) },
+            setColorFilter = { filterState -> cameraSource?.setColorFilter(filterState) },
+            updateColorFilterIntensity = { intensity -> cameraSource?.updateColorFilterIntensity(intensity) },
         )
         multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
             context               = binding.applicationContext,

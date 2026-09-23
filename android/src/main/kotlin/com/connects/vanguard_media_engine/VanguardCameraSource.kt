@@ -74,6 +74,7 @@ import androidx.lifecycle.LifecycleRegistry
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.camera.AndroidCameraBeautySurfaceProcessor
 import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalFpsActuator
+import com.connects.vanguard_media_engine.camera.CameraColorFilterState
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.concurrent.Executor
@@ -202,6 +203,7 @@ class VanguardCameraSource(
     // ── LIVE-CAMERA-BEAUTY-PARITY: beauty filter state ────────────────────────
     private var beautyProcessor: AndroidCameraBeautySurfaceProcessor? = null
     @Volatile private var beautyIntensity: Float = 0f
+    @Volatile private var activeColorFilter: CameraColorFilterState? = null
 
     // Telemetry from the most recent applyThermalTargetFps() attempt (any
     // outcome -- applied, rejected, or stale). Reset to null on every fresh
@@ -439,6 +441,7 @@ class VanguardCameraSource(
         }
         val processor = AndroidCameraBeautySurfaceProcessor(bridge).also {
             it.intensity = beautyIntensity
+            it.setColorFilter(activeColorFilter)
             beautyProcessor = it
         }
 
@@ -548,6 +551,7 @@ class VanguardCameraSource(
         // LIVE-CAMERA-BEAUTY-PARITY: release the GPU processor on stop.
         beautyProcessor?.release()
         beautyProcessor = null
+        activeColorFilter = null
 
         camera        = null
         preview       = null
@@ -1209,6 +1213,30 @@ class VanguardCameraSource(
         beautyIntensity = intensity.coerceIn(0f, 1f)
         beautyProcessor?.intensity = beautyIntensity
         Log.d(TAG, "setBeautyIntensity: $beautyIntensity")
+    }
+
+    /**
+     * CAM-01: sets or clears the active camera color filter (ColorMatrix / 2D LUT).
+     * Thread-safe: updates are forwarded to the GPU processor.
+     */
+    fun setColorFilter(filterState: CameraColorFilterState?) {
+        activeColorFilter = filterState
+        beautyProcessor?.setColorFilter(filterState)
+        Log.d(TAG, "setColorFilter: ${filterState?.mode} intensity=${filterState?.intensity}")
+    }
+
+    /**
+     * CAM-01: updates the intensity of the active color filter or applies a warm preset
+     * with the specified intensity if none was active.
+     */
+    fun updateColorFilterIntensity(intensity: Float) {
+        val current = activeColorFilter
+        val updated = if (current != null) {
+            current.copy(intensity = intensity.coerceIn(0f, 1f))
+        } else {
+            CameraColorFilterState.fromPreset("warm", intensity)
+        }
+        setColorFilter(updated)
     }
 
     // ─────────────────────────────────────────────────────────────────────────

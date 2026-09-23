@@ -40,9 +40,11 @@ import io.flutter.plugin.common.MethodChannel
 class AndroidCameraGraphTransactionCoordinator(
     private val hasActiveCameraProvider: () -> Boolean,
     private val setBeautyIntensity: (Float) -> Unit = {},
+    private val setColorFilter: (CameraColorFilterState?) -> Unit = {},
+    private val updateColorFilterIntensity: ((Float) -> Unit)? = null,
 ) {
     companion object {
-        private val KNOWN_FILTER_TYPES = setOf("lut", "beauty", "segmentation")
+        private val KNOWN_FILTER_TYPES = setOf("lut", "beauty", "colormatrix", "colorMatrix", "segmentation")
 
         private val OWNED_METHODS = setOf(
             "applyGraphTransaction",
@@ -114,16 +116,18 @@ class AndroidCameraGraphTransactionCoordinator(
                     )
                     return
                 }
-                if (type !in KNOWN_FILTER_TYPES) {
+                val isKnown = KNOWN_FILTER_TYPES.any { it.equals(type, ignoreCase = true) }
+                if (!isKnown) {
                     result.error("UNKNOWN_FILTER", "applyGraphTransaction: unrecognized filter type: $type", null)
                     return
                 }
             }
 
             // Empty filter list -- "no filters are applied" is trivially satisfied.
-            // Also reset beauty intensity to 0 (passthrough).
+            // Also reset beauty and color filters to passthrough.
             if (rawFilterStack.isEmpty()) {
                 setBeautyIntensity(0f)
+                setColorFilter(null)
                 result.success(null)
                 return
             }
@@ -134,61 +138,59 @@ class AndroidCameraGraphTransactionCoordinator(
             if (!anyEnabled) {
                 // All filters disabled — reset to passthrough.
                 setBeautyIntensity(0f)
+                setColorFilter(null)
                 result.success(null)
                 return
             }
 
-            // LIVE-CAMERA-BEAUTY-PARITY: route beauty filters to the live
-            // camera beauty SurfaceProcessor. Non-beauty filters still fail closed.
+            // CAM-01 / LIVE-CAMERA-BEAUTY-PARITY: route beauty and color/LUT filters to
+            // the live camera beauty SurfaceProcessor pipeline.
             var beautyHandled = false
-            var hasNonBeautyEnabled = false
+            var colorFilterHandled = false
+            var hasUnsupportedEnabled = false
 
             for (filter in filterStack) {
                 val type = filter["type"] as? String ?: continue
                 val enabled = (filter["enabled"] as? Boolean) ?: true
                 if (!enabled) continue
 
-                when (type) {
+                when (type.lowercase()) {
                     "beauty" -> {
-                        // Extract intensity from the filter parameters.
-                        // Dart sends: { "type": "beauty", "enabled": true,
-                        //               "intensity": 0.5 }  (or preset name)
                         val intensityValue = extractBeautyIntensity(filter)
                         setBeautyIntensity(intensityValue)
                         beautyHandled = true
                     }
+                    "lut", "colormatrix" -> {
+                        val filterState = CameraColorFilterState.fromFilterMap(filter, defaultType = type)
+                        setColorFilter(filterState)
+                        colorFilterHandled = true
+                    }
                     else -> {
-                        // LUT, segmentation — not yet available on Android.
-                        hasNonBeautyEnabled = true
+                        // Segmentation — not yet available on Android live camera.
+                        hasUnsupportedEnabled = true
                     }
                 }
             }
 
-            if (hasNonBeautyEnabled && !beautyHandled) {
-                // Only non-beauty filters present — fail closed.
+            // In a rebuild transaction, any unmentioned effect is reset.
+            if (!beautyHandled) {
+                setBeautyIntensity(0f)
+            }
+            if (!colorFilterHandled) {
+                setColorFilter(null)
+            }
+
+            if (hasUnsupportedEnabled && !beautyHandled && !colorFilterHandled) {
+                // Only unsupported (e.g. segmentation) filters present — fail closed.
                 result.error(
                     "GRAPH_MODE_DISABLED",
-                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty filters.",
+                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT filters.",
                     null,
                 )
                 return
             }
 
-            if (hasNonBeautyEnabled && beautyHandled) {
-                // Mixed: beauty handled, but non-beauty filters are silently
-                // ignored (best-effort parity — beauty is applied even if
-                // LUT/segmentation aren't available).
-                result.success(null)
-                return
-            }
-
-            // Beauty-only (or all disabled — already handled above).
-            if (beautyHandled) {
-                result.success(null)
-                return
-            }
-
-            // Fallback (shouldn't reach here with the logic above).
+            // At least one valid filter handled (or best-effort parity with unsupported filters).
             result.success(null)
             return
         }
@@ -199,9 +201,11 @@ class AndroidCameraGraphTransactionCoordinator(
             return
         }
 
-        // ── C. Hot parameter path — route beauty parameter updates ────────────
+        // ── C. Hot parameter path — route beauty & LUT parameter updates ────────────
         @Suppress("UNCHECKED_CAST")
         val parameterUpdates = rawParameterUpdates as? Map<String, Any?>
+        var handledAny = false
+
         if (parameterUpdates != null) {
             // Check for beauty intensity in parameter updates.
             val beautyParams = parameterUpdates["beauty"] as? Map<*, *>
@@ -209,16 +213,35 @@ class AndroidCameraGraphTransactionCoordinator(
                 val intensityValue = (beautyParams["intensity"] as? Number)?.toFloat()
                 if (intensityValue != null) {
                     setBeautyIntensity(intensityValue.coerceIn(0f, 1f))
-                    result.success(null)
-                    return
+                    handledAny = true
+                }
+            }
+
+            // Check for lut / colorMatrix in parameter updates.
+            val lutParams = (parameterUpdates["lut"] ?: parameterUpdates["colorMatrix"] ?: parameterUpdates["colormatrix"]) as? Map<*, *>
+            if (lutParams != null) {
+                val intensityValue = (lutParams["intensity"] as? Number)?.toFloat()
+                val hasPresetOrMatrix = lutParams.containsKey("preset") || lutParams.containsKey("matrix")
+                if (intensityValue != null && !hasPresetOrMatrix && updateColorFilterIntensity != null) {
+                    updateColorFilterIntensity.invoke(intensityValue.coerceIn(0f, 1f))
+                    handledAny = true
+                } else {
+                    val filterState = CameraColorFilterState.fromFilterMap(lutParams, defaultType = "lut")
+                    setColorFilter(filterState)
+                    handledAny = true
                 }
             }
         }
 
-        // Non-beauty hot parameter updates — fail closed.
+        if (handledAny) {
+            result.success(null)
+            return
+        }
+
+        // Non-supported hot parameter updates — fail closed.
         result.error(
             "GRAPH_MODE_DISABLED",
-            "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty parameter updates.",
+            "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT parameter updates.",
             null,
         )
     }
