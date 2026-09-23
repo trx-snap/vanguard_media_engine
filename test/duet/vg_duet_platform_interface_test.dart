@@ -647,5 +647,95 @@ void main() {
         expect(stickerMap['assetPath'], '/tmp/assets/sticker.png');
       },
     );
+
+    test(
+      'exportDuetComposition passes segmentAssets through to MethodChannel args when supplied',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        final assets = ['/tmp/seg_0.mp4', '/tmp/seg_1.mp4'];
+        await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/out.mp4',
+          segmentAssets: assets,
+        );
+        expect(fakeChannel.lastMethod, 'exportDuetComposition');
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        expect(args.containsKey('segmentAssets'), isTrue);
+        expect(args['segmentAssets'], equals(assets));
+      },
+    );
+
+    test(
+      'exportDuetComposition passes empty segmentAssets list through to MethodChannel args when supplied',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/out.mp4',
+          segmentAssets: const [],
+        );
+        expect(fakeChannel.lastMethod, 'exportDuetComposition');
+        final args = fakeChannel.lastArgs as Map<String, dynamic>;
+        expect(args.containsKey('segmentAssets'), isTrue);
+        expect(args['segmentAssets'], isEmpty);
+      },
+    );
+
+    test(
+      'exportDuetComposition omits segmentAssets from MethodChannel args when omitted or null',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/tmp/out.mp4',
+          'durationMs': 5000,
+          'fileSizeBytes': 1024 * 1024,
+        };
+        // Omitted
+        await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/out.mp4',
+        );
+        var args = fakeChannel.lastArgs as Map<String, dynamic>;
+        expect(args.containsKey('segmentAssets'), isFalse);
+
+        // Explicit null
+        await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/tmp/out.mp4',
+          segmentAssets: null,
+        );
+        args = fakeChannel.lastArgs as Map<String, dynamic>;
+        expect(args.containsKey('segmentAssets'), isFalse);
+      },
+    );
+
+    test(
+      'exportDuetComposition parses export result when segmentAssets is supplied',
+      () async {
+        fakeChannel.returnValue = {
+          'outputPath': '/data/exported_duet.mp4',
+          'durationMs': 4500,
+          'fileSizeBytes': 1500000,
+          'renderBackend': 'vulkan',
+        };
+        final result = await platform.exportDuetComposition(
+          descriptor: makeDescriptor(),
+          outputPath: '/data/exported_duet.mp4',
+          segmentAssets: ['/tmp/seg_0.mp4'],
+        );
+        expect(result, isA<VGDuetExportResult>());
+        expect(result.outputPath, '/data/exported_duet.mp4');
+        expect(result.durationMs, 4500);
+        expect(result.fileSizeBytes, 1500000);
+        expect(result.renderBackend, 'vulkan');
+      },
+    );
   });
 }

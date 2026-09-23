@@ -124,11 +124,14 @@ abstract class VGDuetPlatformInterface {
   /// - [outputPath]: absolute path for the final MP4 output.
   /// - [targetSize]: output video dimensions (default 1080×1920).
   /// - [videoBitRate]: encoding bit rate in bits/s (default 8 Mbps).
+  /// - [segmentAssets]: optional ordered list of recorded segment video file
+  ///   paths to composite or concatenate.
   Future<VGDuetExportResult> exportDuetComposition({
     required VGDuetCompositionDescriptor descriptor,
     required String outputPath,
     VGDuetSize targetSize = const VGDuetSize(1080, 1920),
     int videoBitRate = 8000000,
+    List<String>? segmentAssets,
   });
 }
 
@@ -456,7 +459,8 @@ class MethodChannelVGDuetPlatform extends VGDuetPlatformInterface {
   /// Native method name: `exportDuetComposition`
   ///
   /// Payload keys: `descriptor` (Map), `outputPath` (String),
-  ///   `targetSize` (Map{width, height}), `videoBitRate` (int).
+  ///   `targetSize` (Map{width, height}), `videoBitRate` (int),
+  ///   and optionally `segmentAssets` (`List<String>?`, included only when non-null).
   ///
   /// Success reply: Map with keys `outputPath`, `durationMs`, `fileSizeBytes`.
   /// Error codes from native: `export_busy`, `source_invalid`, `disk_full`, etc.
@@ -467,6 +471,7 @@ class MethodChannelVGDuetPlatform extends VGDuetPlatformInterface {
     required String outputPath,
     VGDuetSize targetSize = const VGDuetSize(1080, 1920),
     int videoBitRate = 8000000,
+    List<String>? segmentAssets,
   }) async {
     try {
       final result = await channel
@@ -475,6 +480,7 @@ class MethodChannelVGDuetPlatform extends VGDuetPlatformInterface {
             'outputPath': outputPath,
             'targetSize': targetSize.toMap(),
             'videoBitRate': videoBitRate,
+            'segmentAssets': ?segmentAssets,
           });
       if (result == null) {
         throw VGDuetException(

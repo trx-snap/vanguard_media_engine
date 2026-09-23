@@ -1726,6 +1726,238 @@ final class VGDuetSegmentRecorder {
     }
 }
 
+// MARK: - GSD-08: Microphone WSOLA time-stretcher
+//
+// Lightweight time-domain WSOLA (Waveform Similarity Overlap-Add) time-stretcher.
+//
+// Pure DSP: operates only on mono Float32 sample arrays, independent of CMSampleBuffer /
+// AVFoundation. Driven incrementally from a live capture callback via `process(_:)`, which
+// buffers newly arrived input samples and returns whatever output samples became available;
+// `flush()` drains the remainder at end-of-stream, zero-padding the final analysis window if
+// the buffered input runs out mid-window. Over a whole take, the total emitted output sample
+// count approximates inputSamples * speedMultiplier.
+//
+// Structure mirrors the proven AndroidDuetWsolaFilter.kt: an absolute input base index, a
+// running count of real (non-padded) samples ever appended, a fractional absolute analysis
+// position, threshold-gated safe compaction of the consumed input prefix, EOS zero padding of
+// the analysis window, a sliding OLA accumulator, and a previous-frame-tail similarity search
+// used to pick each new frame's alignment.
+//
+// Packaging note: this type lives in this file (rather than its own source file) so it is
+// compiled by the existing example Pods project without requiring a Pods project mutation.
+// `ios/Classes/VGDuetWsolaFilter.swift` is a comment-only placeholder for that reason.
+
+fileprivate final class VGDuetWsolaFilter {
+
+    static let windowLength = 1024
+    static let synthesisHop = 512
+    static let searchRadius = 256
+    private static let overlapLength = windowLength - synthesisHop
+
+    /// Below this many samples of buffer growth, don't bother compacting yet.
+    private static let compactThreshold = 8192
+
+    private var speed: Double
+    // SYNTHESIS_HOP / speed, floored at 1.0 sample/frame so a pathological speed can never
+    // stall the analysis position (which would otherwise spin flush()'s drain loop forever).
+    private var analysisHop: Double
+
+    // Samples received but not yet dropped by compaction.
+    private var inputBuffer: [Float] = []
+    // Absolute sample index (since the last reset) of inputBuffer[0].
+    private var inputBufferBaseIndex: Int = 0
+    // Absolute count of real (non-padded) samples ever appended via process().
+    private var totalRealAppended: Int = 0
+
+    // Fractional analysis-frame read position, in absolute input-sample coordinates.
+    private var analysisPos: Double = 0
+    private var hasPlacedFirstFrame = false
+
+    // Raw (unwindowed) tail of the most recently placed analysis frame, used as the
+    // similarity reference for locating the next frame's best alignment.
+    private var previousFrameTail: [Float]
+
+    // Sliding overlap-add accumulator; accumulator[0..<synthesisHop] is finalized output
+    // once a frame has been added, then shifted left by synthesisHop each iteration.
+    private var accumulator: [Float]
+
+    // Periodic Hann window: sum of two copies offset by windowLength/2 is exactly 1.0,
+    // giving unity-gain overlap-add at the fixed 50% synthesis hop used here.
+    private let window: [Float]
+
+    init(speedMultiplier: Double = 1.0) {
+        let clamped = VGDuetWsolaFilter.clampedSpeed(speedMultiplier)
+        self.speed = clamped
+        self.analysisHop = VGDuetWsolaFilter.computeAnalysisHop(speed: clamped)
+        self.accumulator = [Float](repeating: 0, count: Self.windowLength)
+        self.previousFrameTail = [Float](repeating: 0, count: Self.overlapLength)
+        self.window = VGDuetWsolaFilter.makeHannWindow(length: Self.windowLength)
+    }
+
+    func setSpeedMultiplier(_ speedMultiplier: Double) {
+        self.speed = VGDuetWsolaFilter.clampedSpeed(speedMultiplier)
+        self.analysisHop = VGDuetWsolaFilter.computeAnalysisHop(speed: self.speed)
+    }
+
+    /// Drops all buffered state. Call when starting a new, unrelated audio stream so no
+    /// stale samples bleed across the discontinuity.
+    func reset() {
+        inputBuffer.removeAll(keepingCapacity: true)
+        inputBufferBaseIndex = 0
+        totalRealAppended = 0
+        analysisPos = 0
+        hasPlacedFirstFrame = false
+        previousFrameTail = [Float](repeating: 0, count: Self.overlapLength)
+        accumulator = [Float](repeating: 0, count: Self.windowLength)
+    }
+
+    /// Feeds newly captured mono samples and returns any output samples now available.
+    /// May return an empty array if not enough input has accumulated yet to place
+    /// another analysis frame; the input is retained internally for the next call.
+    func process(_ input: [Float]) -> [Float] {
+        guard !input.isEmpty else { return [] }
+        inputBuffer.append(contentsOf: input)
+        totalRealAppended += input.count
+
+        var output: [Float] = []
+        while tryProduceFrame(allowPad: false, output: &output) { }
+        compact()
+        return output
+    }
+
+    /// Signals end-of-input: drains every remaining real sample (zero-padding the final
+    /// analysis window if it runs past the buffered input) plus the last window's
+    /// un-overlapped OLA tail, then returns the whole remainder. Leaves the filter in a
+    /// freshly reset state afterward.
+    func flush() -> [Float] {
+        var output: [Float] = []
+        while true {
+            let nominalAbs = hasPlacedFirstFrame ? Int(analysisPos.rounded()) : 0
+            if nominalAbs >= totalRealAppended { break }
+            if !tryProduceFrame(allowPad: true, output: &output) { break }
+        }
+        if hasPlacedFirstFrame {
+            // Only one window ever contributed to this tail (natural fade-out).
+            output.append(contentsOf: accumulator[0..<Self.overlapLength])
+        }
+        reset()
+        return output
+    }
+
+    // MARK: - Input buffer
+
+    /// Zero-pads inputBuffer up to local length `uptoAbs - inputBufferBaseIndex` (EOS-only helper).
+    private func padInputTo(_ uptoAbs: Int) {
+        let uptoLocal = uptoAbs - inputBufferBaseIndex
+        guard uptoLocal > inputBuffer.count else { return }
+        inputBuffer.append(contentsOf: repeatElement(0, count: uptoLocal - inputBuffer.count))
+    }
+
+    /// Drops already-consumed prefix once it grows past compactThreshold; keeps the search margin intact.
+    private func compact() {
+        let safeAbs = Int(analysisPos.rounded()) - Self.searchRadius - 1
+        let dropAbs = min(safeAbs, inputBufferBaseIndex + inputBuffer.count) - inputBufferBaseIndex
+        guard dropAbs >= Self.compactThreshold else { return }
+        let drop = min(max(dropAbs, 0), inputBuffer.count)
+        guard drop > 0 else { return }
+        inputBuffer.removeFirst(drop)
+        inputBufferBaseIndex += drop
+    }
+
+    // MARK: - WSOLA core
+
+    /// Attempts to produce exactly one synthesis frame; false means "wait for more input"
+    /// (or, at EOS, "nothing left").
+    @discardableResult
+    private func tryProduceFrame(allowPad: Bool, output: inout [Float]) -> Bool {
+        let nominalAbs = hasPlacedFirstFrame ? Int(analysisPos.rounded()) : 0
+        var availableAbsEnd = inputBufferBaseIndex + inputBuffer.count
+
+        if !hasPlacedFirstFrame {
+            if nominalAbs + Self.windowLength > availableAbsEnd {
+                guard allowPad else { return false }
+                padInputTo(nominalAbs + Self.windowLength)
+            }
+            guard totalRealAppended > 0 else { return false }
+            emitFrame(startAbs: nominalAbs, output: &output)
+            return true
+        }
+
+        guard nominalAbs < availableAbsEnd else { return false }
+
+        var searchMaxStart = availableAbsEnd - Self.windowLength
+        if nominalAbs > searchMaxStart {
+            guard allowPad else { return false }
+            padInputTo(nominalAbs + Self.searchRadius + Self.windowLength)
+            availableAbsEnd = inputBufferBaseIndex + inputBuffer.count
+            searchMaxStart = availableAbsEnd - Self.windowLength
+        }
+
+        let loBound = max(inputBufferBaseIndex, nominalAbs - Self.searchRadius)
+        let hiBound = min(searchMaxStart, nominalAbs + Self.searchRadius)
+        var bestStart = min(max(nominalAbs, loBound), max(loBound, hiBound))
+        if hiBound >= loBound {
+            var bestScore = Double.greatestFiniteMagnitude
+            var candidate = loBound
+            while candidate <= hiBound {
+                let local = candidate - inputBufferBaseIndex
+                var score: Double = 0
+                for j in 0..<Self.overlapLength {
+                    score += abs(Double(inputBuffer[local + j]) - Double(previousFrameTail[j]))
+                }
+                if score < bestScore {
+                    bestScore = score
+                    bestStart = candidate
+                }
+                candidate += 1
+            }
+        }
+        emitFrame(startAbs: bestStart, output: &output)
+        return true
+    }
+
+    /// Windows+OLA-accumulates the windowLength-length segment at startAbs, emits its ready
+    /// hop, advances the analysis position.
+    private func emitFrame(startAbs: Int, output: inout [Float]) {
+        let local = startAbs - inputBufferBaseIndex
+        for j in 0..<Self.windowLength {
+            accumulator[j] += inputBuffer[local + j] * window[j]
+        }
+        for j in 0..<Self.overlapLength {
+            previousFrameTail[j] = inputBuffer[local + Self.synthesisHop + j]
+        }
+        hasPlacedFirstFrame = true
+        output.append(contentsOf: accumulator[0..<Self.synthesisHop])
+        for i in 0..<Self.overlapLength {
+            accumulator[i] = accumulator[i + Self.synthesisHop]
+        }
+        for i in Self.overlapLength..<Self.windowLength {
+            accumulator[i] = 0
+        }
+        analysisPos += analysisHop
+    }
+
+    private static func clampedSpeed(_ speed: Double) -> Double {
+        guard speed.isFinite, speed > 0 else { return 1.0 }
+        return min(max(speed, 0.1), 4.0)
+    }
+
+    private static func computeAnalysisHop(speed: Double) -> Double {
+        max(Double(synthesisHop) / speed, 1.0)
+    }
+
+    /// Periodic (DFT-even) Hann window: w(n) = 0.5 - 0.5*cos(2*pi*n/N). Unlike the
+    /// "symmetric" Hann window (which divides by N-1), this variant satisfies the
+    /// constant-overlap-add identity w(n) + w(n + N/2) == 1 exactly at a 50% hop.
+    private static func makeHannWindow(length: Int) -> [Float] {
+        var w = [Float](repeating: 0, count: length)
+        for i in 0..<length {
+            w[i] = Float(0.5 - 0.5 * cos(2.0 * Double.pi * Double(i) / Double(length)))
+        }
+        return w
+    }
+}
+
 // MARK: - Slice 1: Microphone Capture
 
 final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -1743,9 +1975,20 @@ final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
     private var firstPTS: CMTime?
     private var isCapturing: Bool = false
 
+    // GSD-08: WSOLA time-stretch path for non-1.0 speeds. `wsolaOutputSampleCursor` is
+    // seeded lazily from the wall-clock elapsed time at the moment WSOLA output first
+    // becomes available, so a live speed change away from 1.0x hands off from the
+    // metadata-retimed clock without an immediate large PTS jump.
+    private static let wsolaTargetSampleRate: Double = 44100
+    private let wsolaFilter: VGDuetWsolaFilter
+    private var wsolaOutputSampleCursor: Int64?
+    private var pcmAudioConverter: AVAudioConverter?
+    private var pcmConverterSourceFormat: AVAudioFormat?
+
     init(speedMultiplier: Double = 1.0, onAudioBuffer: @escaping AudioBufferHandler) {
         self.speedMultiplier = speedMultiplier
         self.onAudioBuffer = onAudioBuffer
+        self.wsolaFilter = VGDuetWsolaFilter(speedMultiplier: speedMultiplier)
         super.init()
     }
 
@@ -1764,6 +2007,8 @@ final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
         captureQueue.async { [weak self] in
             guard let self = self, !self.isCapturing else { return }
             self.firstPTS = nil
+            self.wsolaOutputSampleCursor = nil
+            self.wsolaFilter.reset()
 
             let session = AVCaptureSession()
             guard let mic = AVCaptureDevice.default(for: .audio),
@@ -1789,14 +2034,40 @@ final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
         }
     }
 
+    /// GSD-08: synchronizes the WSOLA tail flush + `onAudioBuffer` teardown on
+    /// `captureQueue` -- the same serial queue `captureOutput` runs on as the
+    /// output's delegate queue -- so no in-flight `captureOutput` call can
+    /// interleave with (or run after) the final flushed append. Blocking the
+    /// caller here is intentional: `handler(tailBuffer)` must complete before
+    /// `stop()` returns so `pauseRecording`/`stopRecording` enqueue the tail
+    /// onto the recorder's writer queue before `finishWriting` marks audio
+    /// finished.
     func stop() {
-        isCapturing = false
-        onAudioBuffer = nil
+        captureQueue.sync { [self] in
+            if abs(self.speedMultiplier - 1.0) >= 0.001, let cursor = self.wsolaOutputSampleCursor {
+                let tailSamples = self.wsolaFilter.flush()
+                if !tailSamples.isEmpty, let handler = self.onAudioBuffer {
+                    let pts = CMTime(value: cursor, timescale: Int32(Self.wsolaTargetSampleRate))
+                    if let tailBuffer = Self.makeMonoFloatSampleBuffer(
+                        samples: tailSamples,
+                        sampleRate: Self.wsolaTargetSampleRate,
+                        presentationTimeStamp: pts
+                    ) {
+                        handler(tailBuffer)
+                    }
+                }
+            }
+
+            self.isCapturing = false
+            self.onAudioBuffer = nil
+            self.wsolaOutputSampleCursor = nil
+            self.firstPTS = nil
+        }
+
         let session = self.captureSession
         let output = self.audioOutput
         self.captureSession = nil
         self.audioOutput = nil
-        self.firstPTS = nil
 
         output?.setSampleBufferDelegate(nil, queue: nil)
         if let s = session, s.isRunning {
@@ -1808,7 +2079,9 @@ final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
 
     func setSpeedMultiplier(_ speed: Double) {
         captureQueue.async { [weak self] in
-            self?.speedMultiplier = speed
+            guard let self = self else { return }
+            self.speedMultiplier = speed
+            self.wsolaFilter.setSpeedMultiplier(speed)
         }
     }
 
@@ -1825,21 +2098,200 @@ final class VGDuetMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBuf
         guard let startPTS = firstPTS else { return }
 
         if abs(speedMultiplier - 1.0) < 0.001 {
+            // Low-risk path: original PCM bytes pass through untouched, only the
+            // presentation timestamp metadata is rewritten.
             let elapsed = CMTimeSubtract(rawPTS, startPTS)
             if let timedBuffer = Self.retimedSampleBuffer(sampleBuffer, newPTS: elapsed) {
                 handler(timedBuffer)
             } else {
                 handler(sampleBuffer)
             }
-        } else {
-            let elapsedSec = CMTimeGetSeconds(CMTimeSubtract(rawPTS, startPTS))
-            let scaledSec = max(0.0, elapsedSec * speedMultiplier)
-            let scaledPTS = CMTimeMakeWithSeconds(scaledSec, preferredTimescale: 44100)
-
-            if let timedBuffer = Self.retimedSampleBuffer(sampleBuffer, newPTS: scaledPTS) {
-                handler(timedBuffer)
-            }
+            return
         }
+
+        // GSD-08: non-1.0 speeds must actually time-scale the waveform (WSOLA), not just
+        // rewrite timestamps -- metadata-only retiming leaves silent gaps in the encoded
+        // audio for speed > 1.0 and produces overlapping/non-monotonic timing for speed < 1.0
+        // once appended to AVAssetWriter.
+        guard let inputSamples = extractMonoFloatSamples(from: sampleBuffer) else {
+            // Fail-soft: drop this chunk rather than risk feeding malformed audio to the writer.
+            return
+        }
+
+        if wsolaOutputSampleCursor == nil {
+            let elapsedSec = CMTimeGetSeconds(CMTimeSubtract(rawPTS, startPTS))
+            wsolaOutputSampleCursor = Int64(max(0.0, elapsedSec) * Self.wsolaTargetSampleRate)
+        }
+
+        let outputSamples = wsolaFilter.process(inputSamples)
+        guard !outputSamples.isEmpty, let cursor = wsolaOutputSampleCursor else { return }
+
+        let pts = CMTime(value: cursor, timescale: Int32(Self.wsolaTargetSampleRate))
+        guard let stretchedBuffer = Self.makeMonoFloatSampleBuffer(
+            samples: outputSamples,
+            sampleRate: Self.wsolaTargetSampleRate,
+            presentationTimeStamp: pts
+        ) else {
+            return
+        }
+
+        wsolaOutputSampleCursor = cursor + Int64(outputSamples.count)
+        handler(stretchedBuffer)
+    }
+
+    /// Extracts mono Float32 PCM at the WSOLA target sample rate from a captured
+    /// CMSampleBuffer, converting from whatever native format the capture device
+    /// produced. Returns nil (fail-soft) if the buffer cannot be parsed or converted.
+    private func extractMonoFloatSamples(from sampleBuffer: CMSampleBuffer) -> [Float]? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return nil
+        }
+        guard let sourceFormat = AVAudioFormat(streamDescription: asbdPointer) else { return nil }
+
+        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frameCount > 0,
+              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
+            return nil
+        }
+        sourceBuffer.frameLength = AVAudioFrameCount(frameCount)
+
+        let copyStatus = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer, at: 0, frameCount: Int32(frameCount), into: sourceBuffer.mutableAudioBufferList
+        )
+        guard copyStatus == noErr else { return nil }
+
+        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                sampleRate: Self.wsolaTargetSampleRate,
+                                                channels: 1,
+                                                interleaved: false) else {
+            return nil
+        }
+
+        if sourceFormat.commonFormat == targetFormat.commonFormat,
+           sourceFormat.sampleRate == targetFormat.sampleRate,
+           sourceFormat.channelCount == targetFormat.channelCount,
+           sourceFormat.isInterleaved == targetFormat.isInterleaved,
+           let floatData = sourceBuffer.floatChannelData {
+            return Array(UnsafeBufferPointer(start: floatData[0], count: frameCount))
+        }
+
+        if pcmAudioConverter == nil || !(pcmConverterSourceFormat?.isEqual(sourceFormat) ?? false) {
+            pcmAudioConverter = AVAudioConverter(from: sourceFormat, to: targetFormat)
+            pcmConverterSourceFormat = sourceFormat
+        }
+        guard let converter = pcmAudioConverter else { return nil }
+
+        let ratio = targetFormat.sampleRate / max(sourceFormat.sampleRate, 1)
+        let outCapacity = AVAudioFrameCount(Double(frameCount) * ratio) + 32
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return nil }
+
+        // Streaming contract: the converter is cached and reused across capture
+        // buffers, so after supplying this buffer we must report `.noDataNow`
+        // (not `.endOfStream`). `.endOfStream` latches the converter into EOF and
+        // every subsequent call would produce zero frames for the rest of the take.
+        var hasSuppliedInput = false
+        var conversionError: NSError?
+        let status = converter.convert(to: outBuffer, error: &conversionError) { _, inputStatus in
+            if hasSuppliedInput {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            hasSuppliedInput = true
+            inputStatus.pointee = .haveData
+            return sourceBuffer
+        }
+
+        guard status != .error, conversionError == nil, let floatData = outBuffer.floatChannelData else {
+            return nil
+        }
+
+        return Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
+    }
+
+    /// Builds a mono Float32 PCM CMSampleBuffer at the WSOLA target sample rate with the
+    /// given start presentation timestamp. AVAssetWriterInput transcodes uncompressed PCM
+    /// of any supported format to its configured AAC output settings, so this does not need
+    /// to match the original capture device's native format.
+    private static func makeMonoFloatSampleBuffer(samples: [Float],
+                                                    sampleRate: Double,
+                                                    presentationTimeStamp: CMTime) -> CMSampleBuffer? {
+        guard !samples.isEmpty else { return nil }
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+
+        var formatDescription: CMAudioFormatDescription?
+        let fmtStatus = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            asbd: &asbd,
+            layoutSize: 0,
+            layout: nil,
+            magicCookieSize: 0,
+            magicCookie: nil,
+            extensions: nil,
+            formatDescriptionOut: &formatDescription
+        )
+        guard fmtStatus == noErr, let format = formatDescription else { return nil }
+
+        let dataLength = samples.count * MemoryLayout<Float>.size
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: dataLength,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: dataLength,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard blockStatus == kCMBlockBufferNoErr, let buffer = blockBuffer else { return nil }
+
+        let copyStatus = samples.withUnsafeBufferPointer { ptr -> OSStatus in
+            guard let base = ptr.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+            return CMBlockBufferReplaceDataBytes(
+                with: base,
+                blockBuffer: buffer,
+                offsetIntoDestination: 0,
+                dataLength: dataLength
+            )
+        }
+        guard copyStatus == kCMBlockBufferNoErr else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: Int32(sampleRate)),
+            presentationTimeStamp: presentationTimeStamp,
+            decodeTimeStamp: .invalid
+        )
+
+        var sampleBuffer: CMSampleBuffer?
+        let sbStatus = CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: buffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: format,
+            sampleCount: samples.count,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 0,
+            sampleSizeArray: nil,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sbStatus == noErr else { return nil }
+        return sampleBuffer
     }
 
     private static func retimedSampleBuffer(_ buffer: CMSampleBuffer, newPTS: CMTime) -> CMSampleBuffer? {

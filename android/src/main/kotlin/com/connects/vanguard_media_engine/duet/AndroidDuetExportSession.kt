@@ -8,7 +8,9 @@ import android.media.MediaMetadataRetriever
 import android.os.Handler
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
+import com.connects.vanguard_media_engine.export.AndroidAudioTrackSpec
 import com.connects.vanguard_media_engine.export.AndroidExportRenderBackendSelector
+import com.connects.vanguard_media_engine.export.AndroidTimelineAudioPass2Muxer
 import com.connects.vanguard_media_engine.export.AndroidTimelineOverlayDescriptor
 import com.connects.vanguard_media_engine.export.AndroidTimelineVideoEncoder
 import com.connects.vanguard_media_engine.export.AndroidTimelineVideoPassEncoder
@@ -21,21 +23,29 @@ import java.io.FileOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.min
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VG-DUET-SLICE-5B-A: Descriptor-bound Android offline Duet export session.
+// VG-DUET-SLICE-5B-A / 4B: Descriptor-bound Android offline Duet export session.
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Claims (this slice only):
-//   - Descriptor-bound Android offline video-only composited MP4.
-//   - Source video decode/encode path via AndroidTimelineVideoEncoder.
-//   - Synthetic foreground geometry route via AndroidDuetLayoutGeometry.
+// Claims:
+//   - Synthetic route (no `segmentAssets`): descriptor-bound Android offline
+//     video-only composited MP4; source video decode/encode path via
+//     AndroidTimelineVideoEncoder; synthetic foreground geometry route via
+//     AndroidDuetLayoutGeometry.
+//   - Real-take route (Slice 4B, exactly one `segmentAssets` entry): source +
+//     recorded segment composited by AndroidDuetOfflineCompositorVideoEncoder
+//     (pip / splitTopBottom, creator overlays above), then source + mic audio
+//     mixed/muxed by AndroidTimelineAudioPass2Muxer.
 //   - Atomic final output (write to tmp, rename on success, delete on failure).
 //
 // Non-claims:
-//   - No live camera, no ML/human matte, no audio/mic/sync, no iOS.
+//   - No live camera, no ML/human matte, no iOS.
 //   - No ConnectsApp/Universal Editor/upload/backend wiring.
 //   - No rendered pixel assertion (synthetic foreground is magenta rectangle).
+//   - No speed remap / audio time-stretch for real-take export.
 //   - No low-end Android proof.
 
 /**
@@ -93,8 +103,12 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         val outputPath    = safeArgs["outputPath"] as? String
         val targetSizeMap = safeArgs["targetSize"] as? Map<String, Any?>
         val videoBitRate  = (safeArgs["videoBitRate"] as? Number)?.toInt() ?: 8_000_000
+        // Slice 4B: top-level real-take segment list (absent/empty = synthetic route).
+        val segmentAssetsRaw = safeArgs["segmentAssets"]
 
-        val parseResult = parseAndValidate(descriptorMap, outputPath, targetSizeMap, videoBitRate)
+        val parseResult = parseAndValidate(
+            descriptorMap, outputPath, targetSizeMap, videoBitRate, segmentAssetsRaw,
+        )
         if (parseResult is ParseResult.Failure) {
             busy.set(false)
             postError(callback, parseResult.code, parseResult.message)
@@ -134,6 +148,26 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         val greenScreenBackground: AndroidDuetGreenScreenBackground,
         // Creator overlays parsed from Dart descriptor["overlays"]. Empty when absent.
         val creatorOverlays: List<AndroidTimelineOverlayDescriptor>,
+        // Slice 4B: the single validated real-take segment path, or null for
+        // the synthetic export route.
+        val realSegmentPath: String?,
+        // Slice 4B audio mix (descriptor fields; defaults 1.0/1.0/false/false).
+        // Consumed only by the real-take route.
+        val sourceAudioGain: Double,
+        val micAudioGain: Double,
+        val sourceAudioMuted: Boolean,
+        val micAudioMuted: Boolean,
+        // Slice 4B PiP placement inputs from layoutConfig (real-take route only).
+        val pipNormalizedRect: PipNormalizedRect?,
+        val pipAnchor: String?,
+    )
+
+    /** Normalized (0..1 canvas fraction) PiP camera rect from layoutConfig.pipNormalizedRect. */
+    private data class PipNormalizedRect(
+        val left: Double,
+        val top: Double,
+        val width: Double,
+        val height: Double,
     )
 
     private sealed class ParseResult {
@@ -147,6 +181,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         outputPath: String?,
         targetSizeMap: Map<String, Any?>?,
         videoBitRate: Int,
+        segmentAssetsRaw: Any?,
     ): ParseResult {
         // top-level presence
         if (descriptorMap == null) {
@@ -234,6 +269,71 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             )
         }
 
+        // ── Audio mix fields (Slice 4B) ──────────────────────────────────────
+        // Defaults match the Dart VGDuetCompositionDescriptor.fromMap contract
+        // (gain 1.0, unmuted). Non-finite gains degrade to 0.0 so they can
+        // never reach the muxer.
+        val rawSourceAudioGain = (descriptorMap["sourceAudioGain"] as? Number)?.toDouble() ?: 1.0
+        val rawMicAudioGain    = (descriptorMap["micAudioGain"]    as? Number)?.toDouble() ?: 1.0
+        val sourceAudioGain  = if (rawSourceAudioGain.isFinite()) rawSourceAudioGain else 0.0
+        val micAudioGain     = if (rawMicAudioGain.isFinite())    rawMicAudioGain    else 0.0
+        val sourceAudioMuted = descriptorMap["sourceAudioMuted"] as? Boolean ?: false
+        val micAudioMuted    = descriptorMap["micAudioMuted"]    as? Boolean ?: false
+
+        // ── PiP placement inputs (Slice 4B; real-take route only) ────────────
+        val pipNormalizedRect = parsePipNormalizedRect(layoutMap?.get("pipNormalizedRect") as? Map<*, *>)
+        val pipAnchor         = layoutMap?.get("pipAnchor") as? String
+
+        // ── Real-take segmentAssets (Slice 4B) ───────────────────────────────
+        // Top-level MethodChannel arg. Absent/null/empty preserves the synthetic
+        // export route exactly. A non-empty list must contain exactly one
+        // non-blank readable path, and the real-take route supports only
+        // pip / splitTopBottom (unswapped) at initialSpeed 1.0. Wording mirrors
+        // ios/Classes/VGDuetExportSession.swift.
+        var realSegmentPath: String? = null
+        if (segmentAssetsRaw != null) {
+            val segmentAssets = segmentAssetsRaw as? List<*>
+                ?: return ParseResult.Failure("source_invalid",
+                    "exportDuetComposition: segmentAssets must be a list of file paths.")
+            if (segmentAssets.isNotEmpty()) {
+                if (segmentAssets.size != 1) {
+                    return ParseResult.Failure("unsupported_export_feature",
+                        "exportDuetComposition: multiple segmentAssets are not supported in this slice; " +
+                            "exactly one real-take segment is required.")
+                }
+                val candidatePath = (segmentAssets[0] as? String)?.trim() ?: ""
+                if (candidatePath.isEmpty()) {
+                    return ParseResult.Failure("source_invalid",
+                        "exportDuetComposition: segmentAssets[0] is empty.")
+                }
+                val segmentFile = File(candidatePath)
+                if (!segmentFile.isFile || !segmentFile.canRead()) {
+                    return ParseResult.Failure("source_invalid",
+                        "exportDuetComposition: segment file is missing or not readable: $candidatePath")
+                }
+                if (layoutMode != "pip" && layoutMode != "splitTopBottom") {
+                    return ParseResult.Failure("unsupported_export_feature",
+                        "exportDuetComposition: real-take export only supports layoutConfig.mode " +
+                            "'pip' or 'splitTopBottom'; got $layoutMode.")
+                }
+                val initialSpeed = (descriptorMap["initialSpeed"] as? Number)?.toDouble() ?: 1.0
+                if (!initialSpeed.isFinite() || abs(initialSpeed - 1.0) >= 0.0001) {
+                    return ParseResult.Failure("unsupported_export_feature",
+                        "exportDuetComposition: real-take export requires initialSpeed 1.0 " +
+                            "(got $initialSpeed); source video speed remapping and source audio " +
+                            "time-stretching are not supported for offline export in this slice.")
+                }
+                if (layoutMode == "splitTopBottom" &&
+                    (layoutMap?.get("isTopBottomSwapped") as? Boolean) == true
+                ) {
+                    return ParseResult.Failure("unsupported_export_feature",
+                        "exportDuetComposition: isTopBottomSwapped is not supported by the " +
+                            "export compositor in this slice.")
+                }
+                realSegmentPath = candidatePath
+            }
+        }
+
         // ── Creator overlays (optional; missing key = empty list) ─────────────
         // Rotation in AndroidTimelineOverlayDescriptor is radians (parsed from
         // the Dart VGOverlayDescriptor wire format which already uses radians).
@@ -269,8 +369,32 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 foregroundTransform    = fgTransform,
                 greenScreenBackground  = greenScreenBg,
                 creatorOverlays        = creatorOverlays,
+                realSegmentPath        = realSegmentPath,
+                sourceAudioGain        = sourceAudioGain,
+                micAudioGain           = micAudioGain,
+                sourceAudioMuted       = sourceAudioMuted,
+                micAudioMuted          = micAudioMuted,
+                pipNormalizedRect      = pipNormalizedRect,
+                pipAnchor              = pipAnchor,
             )
         )
+    }
+
+    /**
+     * Parses `layoutConfig.pipNormalizedRect` ({left, top, width, height} as
+     * 0..1 canvas fractions). Returns null when absent, malformed, non-finite,
+     * or non-positive in size, so the caller falls back to the default PiP
+     * placement instead of rendering a degenerate rect.
+     */
+    private fun parsePipNormalizedRect(rectMap: Map<*, *>?): PipNormalizedRect? {
+        if (rectMap == null) return null
+        val left   = (rectMap["left"]   as? Number)?.toDouble() ?: return null
+        val top    = (rectMap["top"]    as? Number)?.toDouble() ?: return null
+        val width  = (rectMap["width"]  as? Number)?.toDouble() ?: return null
+        val height = (rectMap["height"] as? Number)?.toDouble() ?: return null
+        if (!left.isFinite() || !top.isFinite() || !width.isFinite() || !height.isFinite()) return null
+        if (width <= 0.0 || height <= 0.0) return null
+        return PipNormalizedRect(left = left, top = top, width = width, height = height)
     }
 
     /**
@@ -316,6 +440,15 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         params: ExportParams,
         callback: (Map<String, Any?>?, String?) -> Unit,
     ) {
+        // Slice 4B: a validated real-take segment routes to the offline
+        // compositor + audio pass; everything below is the unchanged
+        // synthetic magenta-overlay route.
+        val realSegmentPath = params.realSegmentPath
+        if (realSegmentPath != null) {
+            runRealTakeExport(params, realSegmentPath, callback)
+            return
+        }
+
         val tmpPath = params.outputPath + ".tmp"
         val tmpFile = File(tmpPath)
         var overlayFile: File? = null
@@ -544,6 +677,312 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         }
     }
 
+    // ── Internal: real-take export (Slice 4B) ─────────────────────────────────
+
+    /**
+     * Real-take route: composites the trimmed source and the recorded
+     * [segmentPath] into `outputPath.video.tmp` via
+     * [AndroidDuetOfflineCompositorVideoEncoder], then runs the existing
+     * audio pass-2 muxer (source + mic mix, or a video-only remux when both
+     * are muted/silent) into `outputPath.tmp`, and renames that to
+     * `outputPath` only after success. Every temp is deleted on failure; the
+     * video/audio temps are deleted on success as well.
+     */
+    private fun runRealTakeExport(
+        params: ExportParams,
+        segmentPath: String,
+        callback: (Map<String, Any?>?, String?) -> Unit,
+    ) {
+        val videoTmpPath = params.outputPath + ".video.tmp"
+        val audioTmpPath = params.outputPath + ".audio.tmp"
+        val finalTmpPath = params.outputPath + ".tmp"
+        val videoTmpFile = File(videoTmpPath)
+        val audioTmpFile = File(audioTmpPath)
+        val finalTmpFile = File(finalTmpPath)
+        var succeeded = false
+        try {
+            // Never inherit stale temps from an earlier aborted run.
+            safeDelete(videoTmpFile)
+            safeDelete(audioTmpFile)
+            safeDelete(finalTmpFile)
+
+            // ── Probe durations; export = min(trim window, recorded segment) ──
+            val sourceDurationSec = probeSourceDurationUs(params.sourceFilePath) / 1_000_000.0
+            val effectiveTrimEndSec =
+                if (params.trimEndSec > 0.0 && params.trimEndSec <= sourceDurationSec) {
+                    params.trimEndSec
+                } else {
+                    sourceDurationSec
+                }
+            val trimDurationSec = effectiveTrimEndSec - params.trimStartSec
+            if (trimDurationSec <= 0.0) {
+                throw ExportException("source_invalid",
+                    "exportDuetComposition: trim window produces zero-duration clip.")
+            }
+            val segmentDurationSec = probeSourceDurationUs(segmentPath) / 1_000_000.0
+            if (!segmentDurationSec.isFinite() || segmentDurationSec <= 0.0) {
+                throw ExportException("source_invalid",
+                    "exportDuetComposition: recorded segment has no readable duration: $segmentPath")
+            }
+            val effectiveExportDurationSec = min(trimDurationSec, segmentDurationSec)
+            if (!effectiveExportDurationSec.isFinite() || effectiveExportDurationSec <= 0.0) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: effective real-take export duration is zero " +
+                        "(trim ${trimDurationSec}s, segment ${segmentDurationSec}s).")
+            }
+
+            val (srcWidth, srcHeight, srcRotation) = probeSourceDimensionsAndRotation(params.sourceFilePath)
+            val (segWidth, segHeight, segRotation) = probeSourceDimensionsAndRotation(segmentPath)
+            val srcRotationNormalized = normalizeRotationDegrees(srcRotation)
+            val segRotationNormalized = normalizeRotationDegrees(segRotation)
+
+            // ── Layout rects for the real-take compositor ─────────────────────
+            val canvasW = params.targetWidth.toDouble()
+            val canvasH = params.targetHeight.toDouble()
+            val layoutRects = computeRealTakeLayoutRects(
+                params, canvasW, canvasH, segWidth, segHeight, segRotationNormalized,
+            )
+
+            // ── Creator overlays: same z-order policy as the synthetic route ──
+            // The composited dual-video frame is the base; creator overlays
+            // render above it with effectiveZIndex = max(2, userZIndex + 2),
+            // Int-overflow-safe. Rotation is already radians from Dart.
+            val adjustedCreatorOverlays = params.creatorOverlays.map { overlay ->
+                val safeZIndex = if (overlay.zIndex > Int.MAX_VALUE - 2) Int.MAX_VALUE
+                                 else maxOf(2, overlay.zIndex + 2)
+                overlay.copy(zIndex = safeZIndex)
+            }
+
+            // ── Pass 1: video composite ───────────────────────────────────────
+            val diagnostics = VanguardDiagnostics()
+            val lifecycleObserver = VanguardLifecycleObserver(diagnostics)
+            val nativeBridge = VanguardNativeBridge(
+                lifecycleObserver = lifecycleObserver,
+                diagnostics       = diagnostics,
+                codecAdapter      = null,
+            )
+            val encoder = AndroidDuetOfflineCompositorVideoEncoder(
+                outputPath   = videoTmpPath,
+                width        = params.targetWidth,
+                height       = params.targetHeight,
+                fps          = REAL_TAKE_FPS,
+                bitrateBps   = params.videoBitRate,
+                nativeBridge = nativeBridge,
+            )
+            val encodeResult = encoder.encode(
+                source = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
+                    label              = "source",
+                    sourcePath         = params.sourceFilePath,
+                    startOffsetSeconds = params.trimStartSec,
+                    rotationDegrees    = srcRotationNormalized,
+                    hintWidth          = srcWidth,
+                    hintHeight         = srcHeight,
+                ),
+                sourceRect = layoutRects.source,
+                camera = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
+                    label              = "camera",
+                    sourcePath         = segmentPath,
+                    startOffsetSeconds = 0.0,
+                    rotationDegrees    = segRotationNormalized,
+                    hintWidth          = segWidth,
+                    hintHeight         = segHeight,
+                ),
+                cameraRect      = layoutRects.camera,
+                durationSeconds = effectiveExportDurationSec,
+                overlays        = adjustedCreatorOverlays,
+            )
+            if (!encodeResult.success) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: real-take video pass failed: ${encodeResult.reason}")
+            }
+            if (!videoTmpFile.exists() || videoTmpFile.length() <= 0L) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: real-take video pass produced no output.")
+            }
+
+            // ── Pass 2: audio mix / mux ───────────────────────────────────────
+            val audioSpecs = buildRealTakeAudioSpecs(params, segmentPath, effectiveExportDurationSec)
+            val audioFailure = AndroidTimelineAudioPass2Muxer(context = null).run(
+                specs         = audioSpecs,
+                videoTempPath = videoTmpPath,
+                audioTempPath = audioTmpPath,
+                finalTmpPath  = finalTmpPath,
+            )
+            if (audioFailure != null) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: real-take audio pass failed: $audioFailure")
+            }
+            if (!finalTmpFile.exists() || finalTmpFile.length() <= 0L) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: final output missing or empty after audio pass.")
+            }
+
+            // ── Atomic rename ─────────────────────────────────────────────────
+            val outFile = File(params.outputPath)
+            if (!finalTmpFile.renameTo(outFile)) {
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: failed to rename tmp to final output.")
+            }
+            succeeded = true
+
+            val durationMs    = (effectiveExportDurationSec * 1000.0).toLong().coerceAtLeast(1L)
+            val fileSizeBytes = outFile.length()
+
+            postSuccess(callback, mapOf(
+                "outputPath"    to params.outputPath,
+                "durationMs"    to durationMs,
+                "fileSizeBytes" to fileSizeBytes,
+                "renderBackend" to REAL_TAKE_RENDER_BACKEND,
+                "preferredRenderBackend" to REAL_TAKE_RENDER_BACKEND,
+                "renderBackendReason" to "duet_real_take_offline_compositor",
+                "renderBackendFallbackReason" to null,
+                "glesSupported" to true,
+            ))
+        } catch (ex: ExportException) {
+            postError(callback, ex.code, ex.message ?: "exportDuetComposition failed.")
+        } catch (ex: Exception) {
+            postError(callback, "composition_failed",
+                "exportDuetComposition: unexpected error: ${ex.message}")
+        } finally {
+            safeDelete(videoTmpFile)
+            safeDelete(audioTmpFile)
+            if (!succeeded) safeDelete(finalTmpFile)
+            busy.set(false)
+        }
+    }
+
+    /**
+     * Real-take layout: splitTopBottom is the unswapped 50/50 split (swap was
+     * rejected at parse time); pip is a full-canvas source with the camera
+     * at `layoutConfig.pipNormalizedRect` when present and positive, else the
+     * conservative anchored default. Valid Dart rects are preserved as-is
+     * (the compositor's scissor clips any overflow).
+     */
+    private fun computeRealTakeLayoutRects(
+        params: ExportParams,
+        canvasW: Double,
+        canvasH: Double,
+        segWidth: Int,
+        segHeight: Int,
+        segRotation: Int,
+    ): VGDuetLayoutRects {
+        if (params.layoutMode == "splitTopBottom") {
+            return AndroidDuetLayoutGeometry.splitTopBottom(canvasW, canvasH, false)
+        }
+        val source = AndroidDuetLayoutGeometry.pipSourceRect(canvasW, canvasH)
+        val normalized = params.pipNormalizedRect
+        if (normalized != null) {
+            val rect = AndroidDuetLayoutGeometry.pipCameraRect(
+                canvasW, canvasH,
+                normalized.left, normalized.top, normalized.width, normalized.height,
+            )
+            if (rect.width > 0.0 && rect.height > 0.0) {
+                return VGDuetLayoutRects(source = source, camera = rect)
+            }
+        }
+        return VGDuetLayoutRects(
+            source = source,
+            camera = defaultPipCameraRect(canvasW, canvasH, params.pipAnchor, segWidth, segHeight, segRotation),
+        )
+    }
+
+    /**
+     * Default PiP camera rect matching the iOS real-take fallback intent:
+     * about 35% of the canvas width, a small margin, anchored per
+     * `layoutConfig.pipAnchor` (default bottomRight), with height following
+     * the recorded segment's upright aspect (9:16 when unknown) and scaled
+     * down uniformly if it would not fit the canvas.
+     */
+    private fun defaultPipCameraRect(
+        canvasW: Double,
+        canvasH: Double,
+        pipAnchor: String?,
+        segWidth: Int,
+        segHeight: Int,
+        segRotation: Int,
+    ): VGDuetPixelRect {
+        val margin = canvasW * DEFAULT_PIP_MARGIN_FRACTION
+        var pipW = canvasW * DEFAULT_PIP_WIDTH_FRACTION
+        val aspectHOverW = if (segWidth > 0 && segHeight > 0) {
+            if (segRotation == 90 || segRotation == 270) {
+                segWidth.toDouble() / segHeight.toDouble()
+            } else {
+                segHeight.toDouble() / segWidth.toDouble()
+            }
+        } else {
+            16.0 / 9.0
+        }
+        var pipH = pipW * aspectHOverW
+        val maxH = canvasH - 2.0 * margin
+        if (maxH > 0.0 && pipH > maxH) {
+            val scale = maxH / pipH
+            pipH = maxH
+            pipW *= scale
+        }
+        val anchorLeft = pipAnchor == "topLeft" || pipAnchor == "bottomLeft"
+        val anchorTop  = pipAnchor == "topLeft" || pipAnchor == "topRight"
+        val left = if (anchorLeft) margin else canvasW - margin - pipW
+        val top  = if (anchorTop)  margin else canvasH - margin - pipH
+        return VGDuetPixelRect(left = left, top = top, width = pipW, height = pipH)
+    }
+
+    /**
+     * Audio sidecar specs for the real-take route. Both tracks start at
+     * output time 0 and span the effective export duration: the source track
+     * reads from the trim start, the mic track is the recorded segment's own
+     * audio from its origin. Muted or effectively silent tracks are omitted;
+     * an empty list makes the pass-2 muxer perform a video-only remux
+     * (intentional silent output, not an error).
+     */
+    private fun buildRealTakeAudioSpecs(
+        params: ExportParams,
+        segmentPath: String,
+        durationSec: Double,
+    ): List<AndroidAudioTrackSpec> {
+        val specs = ArrayList<AndroidAudioTrackSpec>(2)
+        if (!params.sourceAudioMuted && params.sourceAudioGain > 0.0001) {
+            specs.add(
+                AndroidAudioTrackSpec(
+                    trackId         = "duet_source_audio",
+                    url             = params.sourceFilePath,
+                    startTime       = 0.0,
+                    duration        = durationSec,
+                    volume          = params.sourceAudioGain,
+                    role            = "original",
+                    fadeInSeconds   = 0.0,
+                    fadeOutSeconds  = 0.0,
+                    sourceTrimStart = params.trimStartSec,
+                    volumeKeyframes = null,
+                    mixGain         = 1.0,
+                )
+            )
+        }
+        if (!params.micAudioMuted && params.micAudioGain > 0.0001) {
+            specs.add(
+                AndroidAudioTrackSpec(
+                    trackId         = "duet_mic_audio",
+                    url             = segmentPath,
+                    startTime       = 0.0,
+                    duration        = durationSec,
+                    volume          = params.micAudioGain,
+                    role            = "voiceover",
+                    fadeInSeconds   = 0.0,
+                    fadeOutSeconds  = 0.0,
+                    sourceTrimStart = 0.0,
+                    volumeKeyframes = null,
+                    mixGain         = 1.0,
+                )
+            )
+        }
+        return specs
+    }
+
+    /** Normalizes probed rotation to 0/90/180/270; anything else degrades to 0. */
+    private fun normalizeRotationDegrees(degrees: Int): Int {
+        val wrapped = ((degrees % 360) + 360) % 360
+        return if (wrapped == 90 || wrapped == 180 || wrapped == 270) wrapped else 0
+    }
+
     // ── Internal: layout ──────────────────────────────────────────────────────
 
     private fun computeLayoutRects(
@@ -686,4 +1125,14 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
     // ── Internal: typed exception ─────────────────────────────────────────────
 
     private class ExportException(val code: String, message: String) : Exception(message)
+
+    companion object {
+        /** Fixed output frame rate for the real-take offline compositor. */
+        private const val REAL_TAKE_FPS = 30
+        /** Wire name reported for the real-take route; never claims Vulkan. */
+        private const val REAL_TAKE_RENDER_BACKEND = "gles_duet_offline"
+        /** Default PiP fallback (iOS parity): ~35% canvas width, ~1.8% margin. */
+        private const val DEFAULT_PIP_WIDTH_FRACTION = 0.35
+        private const val DEFAULT_PIP_MARGIN_FRACTION = 0.018
+    }
 }

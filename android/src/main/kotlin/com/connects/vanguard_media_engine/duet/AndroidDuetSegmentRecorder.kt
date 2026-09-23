@@ -24,16 +24,25 @@ package com.connects.vanguard_media_engine.duet
 // grace window (AUDIO_TRACK_GRACE_MS) / at finish. Pre-start samples of both
 // tracks are buffered (bounded) so the IDR frame at PTS 0 is never lost.
 //
-// Timing policy (deliberate, documented non-claims):
+// Timing policy:
 //   - The take timeline origin is the wall-clock instant of the FIRST camera
 //     frame the compositor submits; that frame carries PTS 0.
 //   - Video PTS = wall elapsed since origin * [speedMultiplier] (the Duet
 //     preview clock's "T_out = S * T_wall" policy), so the file's video
 //     duration equals the clock segment's output duration for this take.
-//   - Mic audio PTS is UNSCALED wall time (natural acoustic rate). No WSOLA /
-//     time-stretch DSP is performed in this pass: for speed != 1.0 the mic
-//     track's duration is the wall duration and intentionally does NOT match
-//     the retimed video track. Acoustic speed handling is deferred.
+//   - Mic audio is time-stretched to match: for |speedMultiplier - 1| above a
+//     small epsilon, captured PCM is run through AndroidDuetWsolaFilter (a
+//     self-contained WSOLA time-domain stretcher) before AAC encoding, so the
+//     emitted sample count approximates inputSamples * speedMultiplier and
+//     pitch is preserved. Speeds within the epsilon of 1.0 bypass the filter
+//     (direct passthrough) as a low-risk path. The filter is instantiated once
+//     per take from the speed frozen before [originNanos] is set (a take never
+//     changes rate mid-file — see [setSpeedMultiplier]), so one constant speed
+//     per take is assumed. Audio encoder PTS is derived from
+//     [audioSamplesFed], which counts samples actually submitted to the AAC
+//     encoder (post-WSOLA output samples for non-1.0 speed), not raw mic
+//     samples read, so it stays continuous and the audio track's duration now
+//     matches the retimed video track within about one frame.
 //   - [micGain] is descriptor metadata applied at export; the mic lane records
 //     unity gain so the descriptor's gain is never baked in twice.
 //
@@ -64,6 +73,7 @@ import java.nio.ByteOrder
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 
 class AndroidDuetSegmentRecorder(
     private val context: Context,
@@ -100,6 +110,9 @@ class AndroidDuetSegmentRecorder(
 
         /** Bounded pre-muxer sample buffering per track (~4 s of video at 30 fps). */
         private const val MAX_PENDING_SAMPLES = 120
+
+        /** Speeds within this of 1.0 bypass WSOLA entirely (direct/low-risk passthrough). */
+        private const val WSOLA_BYPASS_EPSILON = 0.001
     }
 
     // -- Public state ---------------------------------------------------------------
@@ -694,6 +707,11 @@ class AndroidDuetSegmentRecorder(
             return
         }
         val pcm = ShortArray(audioReadBufferShorts)
+        // Decided lazily on the first post-origin chunk, once [speedMultiplier]
+        // is frozen (setSpeedMultiplier is a no-op once originNanos is set, and
+        // the coordinator always sets the final speed before the first frame).
+        var wsolaDecided = false
+        var wsola: AndroidDuetWsolaFilter? = null
         while (audioActive && !canceled.get()) {
             val n = try {
                 record.read(pcm, 0, pcm.size)
@@ -711,29 +729,74 @@ class AndroidDuetSegmentRecorder(
             // take timeline starts there (PTS 0) for both tracks.
             val origin = originNanos
             if (origin < 0L) continue
-            if (audioSamplesFed == 0L) {
-                // The chunk was captured over the preceding read interval:
-                // back-date it by its own duration so audio starts near 0 and
-                // continues gap-free from the sample counter afterwards.
-                val chunkUs = n.toLong() * 1_000_000L / AUDIO_SAMPLE_RATE
-                audioBasePtsUs = ((System.nanoTime() - origin) / 1_000L - chunkUs).coerceAtLeast(0L)
+            if (!wsolaDecided) {
+                wsolaDecided = true
+                val speed = speedMultiplier
+                if (abs(speed - 1.0) > WSOLA_BYPASS_EPSILON) {
+                    wsola = AndroidDuetWsolaFilter(speed)
+                    Log.i(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_WSOLA_ENABLED speed=$speed")
+                }
             }
-            feedAudioEncoder(pcm, n)
-            drainAudioEncoder(endOfStream = false)
+            val filter = wsola
+            if (filter != null) {
+                val transformed = filter.process(pcm, n)
+                feedTransformedAudioChunk(transformed, transformed.size, origin)
+            } else {
+                feedTransformedAudioChunk(pcm, n, origin)
+            }
         }
         if (!canceled.get()) {
+            val filter = wsola
+            if (filter != null) {
+                // We only reach here after stopAudioLaneAndJoin() cleared
+                // `audioActive`, so the WSOLA tail must bypass that guard or it
+                // is silently dropped before EOS. Cancellation still aborts it.
+                val tail = filter.flush()
+                feedTransformedAudioChunk(tail, tail.size, originNanos, allowAfterStopForFlush = true)
+            }
             feedAudioEncoderEos()
             drainAudioEncoder(endOfStream = true)
         }
         try { record.stop() } catch (_: Throwable) {}
     }
 
-    /** Unscaled wall-time PTS from the continuous sample counter (see header non-claims). */
-    private fun feedAudioEncoder(pcm: ShortArray, count: Int) {
+    /**
+     * Feeds [count] already-output-rate samples (raw mic PCM for the ~1.0
+     * speed bypass, or WSOLA-transformed PCM otherwise) to the AAC encoder.
+     * The first non-empty chunk of the take back-dates [audioBasePtsUs] by
+     * its own duration so audio starts near PTS 0 and stays gap-free from
+     * [audioSamplesFed] afterwards.
+     *
+     * [allowAfterStopForFlush] is set only for the WSOLA tail flushed right
+     * before [feedAudioEncoderEos]; that tail is produced after [audioActive]
+     * has already been cleared by stop, so it must not be gated on it.
+     */
+    private fun feedTransformedAudioChunk(
+        samples: ShortArray,
+        count: Int,
+        origin: Long,
+        allowAfterStopForFlush: Boolean = false,
+    ) {
+        if (count <= 0) return
+        if (audioSamplesFed == 0L) {
+            val chunkUs = count.toLong() * 1_000_000L / AUDIO_SAMPLE_RATE
+            audioBasePtsUs = ((System.nanoTime() - origin) / 1_000L - chunkUs).coerceAtLeast(0L)
+        }
+        feedAudioEncoder(samples, count, allowAfterStopForFlush)
+        drainAudioEncoder(endOfStream = false)
+    }
+
+    /**
+     * PTS derived from [audioSamplesFed]: a continuous counter of samples actually submitted to the encoder.
+     * Normal chunks stop submitting once [audioActive] is cleared; the pre-EOS
+     * flush tail passes [allowAfterStopForFlush] so it is still submitted.
+     * Cancellation always aborts submission regardless.
+     */
+    private fun feedAudioEncoder(pcm: ShortArray, count: Int, allowAfterStopForFlush: Boolean = false) {
         val enc = audioEncoder ?: return
         var offset = 0
         var stalls = 0
-        while (offset < count && audioActive && !canceled.get()) {
+        while (offset < count && (audioActive || allowAfterStopForFlush) && !canceled.get()) {
             try {
                 val inIdx = enc.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
                 if (inIdx >= 0) {
