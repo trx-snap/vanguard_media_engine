@@ -245,6 +245,9 @@ class AndroidTimelineExportSession(
         val trimStart: Double,
         val trimEnd: Double,
         val mediaKind: String,
+        // Image-only placement: "fit" (default, letterbox) or "fill" (cover-crop).
+        // Always "fit" for a video clip (fitMode is rejected on video upstream).
+        val fitMode: String = "fit",
         val speed: Double = 1.0,
         val colorMatrix: FloatArray? = null,
         val beautyIntensity: Double? = null,
@@ -269,6 +272,7 @@ class AndroidTimelineExportSession(
         val decodedHeight: Int,
         val rotationDegrees: Int,
         val mediaKind: String,
+        val fitMode: String = "fit",
         val speed: Double = 1.0,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
         val colorMatrix: FloatArray? = null,
@@ -485,8 +489,15 @@ class AndroidTimelineExportSession(
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.mediaKind '$mediaKind' is not supported")
                 return
             }
+            // fitMode is image-only: null/"fit"/"fill". A video clip must never carry
+            // it (unchanged from before this slice).
             val fitMode = map["fitMode"] as? String
-            if (fitMode != null && fitMode != "fit") {
+            if (mediaKind == "image") {
+                if (fitMode != null && fitMode != "fit" && fitMode != "fill") {
+                    onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.fitMode '$fitMode' is not supported")
+                    return
+                }
+            } else if (fitMode != null) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.fitMode '$fitMode' is not supported")
                 return
             }
@@ -728,6 +739,7 @@ class AndroidTimelineExportSession(
                     trimStart = effectiveTrimStart,
                     trimEnd = effectiveTrimEnd,
                     mediaKind = mediaKind,
+                    fitMode = if (mediaKind == "image") (fitMode ?: "fit") else "fit",
                     speed = speed,
                     colorMatrix = colorMatrix,
                     beautyIntensity = beautyIntensity,
@@ -893,6 +905,7 @@ class AndroidTimelineExportSession(
                         decodedHeight = imageProbe.height,
                         rotationDegrees = 0,
                         mediaKind = clip.mediaKind,
+                        fitMode = clip.fitMode,
                         speed = clip.speed,
                         exifOrientation = imageProbe.exifOrientation,
                         colorMatrix = clip.colorMatrix,
@@ -961,6 +974,7 @@ class AndroidTimelineExportSession(
                     decodedHeight = probe.height,
                     rotationDegrees = normalizedRotation,
                     mediaKind = clip.mediaKind,
+                    fitMode = clip.fitMode,
                     speed = clip.speed,
                     colorMatrix = clip.colorMatrix,
                     beautyIntensity = clip.beautyIntensity,
@@ -1162,6 +1176,7 @@ class AndroidTimelineExportSession(
                     decodedHeight = ctx.decodedHeight,
                     rotationDegrees = ctx.rotationDegrees,
                     mediaKind = ctx.mediaKind,
+                    fitMode = ctx.fitMode,
                     speed = ctx.speed,
                     stillFrameCount = stillFrameCount,
                     exifOrientation = ctx.exifOrientation,

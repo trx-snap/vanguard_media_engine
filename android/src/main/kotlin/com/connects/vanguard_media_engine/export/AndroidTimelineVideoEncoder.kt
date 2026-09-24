@@ -133,6 +133,11 @@ class AndroidTimelineVideoEncoder(
         val decodedHeight: Int,
         val rotationDegrees: Int,
         val mediaKind: String = "video",
+        // Image-only placement: "fit" (default, letterbox) or "fill" (cover-crop).
+        // Ignored for a video clip -- video placement is driven by the encoder-wide
+        // [AndroidTimelineVideoEncoder]'s `contentMode` constructor param instead
+        // (see [updateClipGeometry]), keeping video export behaviour unchanged.
+        val fitMode: String = "fit",
         val stillFrameCount: Int = 0,
         val speed: Double = 1.0,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
@@ -1028,7 +1033,14 @@ class AndroidTimelineVideoEncoder(
             displayWidth = decodedWidth.toFloat()
             displayHeight = decodedHeight.toFloat()
         }
-        val scale = min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        // Image clips use their own per-clip fitMode; video clips keep using the
+        // encoder-wide canvas contentMode exactly as before this slice.
+        val effectiveContentMode = if (clip.mediaKind == "image") clip.fitMode else contentMode
+        val scale = if (effectiveContentMode == "fill") {
+            max(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        } else {
+            min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        }
         val halfPixelX = decodedWidth.toFloat() * scale / 2f
         val halfPixelY = decodedHeight.toFloat() * scale / 2f
 

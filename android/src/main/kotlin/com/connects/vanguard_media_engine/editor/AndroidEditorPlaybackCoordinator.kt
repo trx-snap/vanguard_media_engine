@@ -211,8 +211,8 @@ class AndroidEditorPlaybackCoordinator(
                 return
             }
 
-            val mediaKind = clip["mediaKind"] as? String
-            if (mediaKind != null && mediaKind != "video") {
+            val mediaKind = (clip["mediaKind"] as? String) ?: "video"
+            if (mediaKind != "video" && mediaKind != "image") {
                 result.error("UNSUPPORTED_MEDIA_KIND", "mediaKind=$mediaKind is not supported", null)
                 return
             }

@@ -53,9 +53,17 @@ data class AndroidEditorClipPlaybackSpec(
     val originalAudioGain: Float = 1.0f,
     val speed: Double = 1.0,
     val freezePtsUs: Long? = null,
+    /** "video" (default) or "image". An image clip has no wrapped decoder session --
+     * see [AndroidEditorStaticImageRenderer] -- and never carries audio/freeze. */
+    val mediaKind: String = "video",
+    /** Image-only placement: "fit" (default, letterbox) or "fill" (cover-crop). Ignored for video. */
+    val fitMode: String = "fit",
 ) {
     /** True when this clip is a freeze-frame hold (see [freezePtsUs]). */
     val isFreezeFrame: Boolean get() = freezePtsUs != null
+
+    /** True when this clip is a still image (see [mediaKind]). */
+    val isImage: Boolean get() = mediaKind == "image"
 }
 
 /**
@@ -108,7 +116,14 @@ class AndroidEditorSequentialPlaybackSession(
      * clip with a null context fails closed at [prepare] (clip_inspect_failed).
      */
     private val context: Context? = null,
-) {
+    /**
+     * Draft-requested canvas size (root `canvasWidth`/`canvasHeight`), used only to
+     * place image clips (see [AndroidEditorClipPlaybackSpec.fitMode] /
+     * [AndroidEditorStaticImageRenderer]). A video-only timeline never reads this.
+     */
+    private val canvasWidth: Int = 0,
+    private val canvasHeight: Int = 0,
+) : AndroidEditorPlaybackSession {
     companion object {
         private const val TAG = "EditorSeqPlaybackSession"
         private const val LOG_PREFIX = "VG_EDITOR_AUDIO_PREVIEW"
@@ -184,6 +199,15 @@ class AndroidEditorSequentialPlaybackSession(
     private var isPlaying: Boolean = false
 
     /**
+     * Lazily created on the first image clip activation, reused across every later
+     * image clip in this session (its EGL context/program persist; only the window
+     * surface and decoded texture are replaced per clip -- see
+     * [AndroidEditorStaticImageRenderer]). Released once in [dispose]. Null for a
+     * video-only timeline, which never touches it.
+     */
+    private var imageRenderer: AndroidEditorStaticImageRenderer? = null
+
+    /**
      * Phase 7.8I-Android: per-clip original-audio availability, indexed by [effectiveClipSpecs] position.
      * Populated during [prepare]'s metadata-inspection pass from [AndroidDagSourceInspector]'s
      * `hasAudio`. A clip with no audio track never gets an [AndroidEditorOriginalAudioPreviewRuntime]
@@ -250,7 +274,7 @@ class AndroidEditorSequentialPlaybackSession(
      * [AndroidEditorPlaybackCoordinator] already expects from a single-clip
      * [AndroidDagTexturePlaybackControlSession.prepare].
      */
-    fun prepare(onResult: (Map<String, Any?>) -> Unit) {
+    override fun prepare(onResult: (Map<String, Any?>) -> Unit) {
         if (requestedClipSpecs.isEmpty()) {
             onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=empty_clip_list"))
             return
@@ -271,6 +295,17 @@ class AndroidEditorSequentialPlaybackSession(
             val hasAudioByIndex = mutableListOf<Boolean>()
             val normalizedSpecs = mutableListOf<AndroidEditorClipPlaybackSpec>()
             for (spec in requestedClipSpecs) {
+                if (spec.isImage) {
+                    // Image clip: bypass AndroidDagSourceInspector entirely -- it probes
+                    // video/container metadata this clip has none of. Its own decode/EXIF
+                    // probing happens later, in activateImageClip via
+                    // AndroidEditorStaticImageRenderer, not during this metadata pass.
+                    Log.i(TAG, "$LOG_PREFIX clip_inspect_result index=${normalizedSpecs.size} image=true " +
+                        "fitMode=${spec.fitMode} holdUs=${spec.timelineDurationUs}")
+                    normalizedSpecs.add(spec)
+                    hasAudioByIndex.add(false)
+                    continue
+                }
                 val inspection = AndroidDagSourceInspector().inspect(spec.sourcePath, context)
                 try {
                     if (!inspection.pass) {
@@ -388,15 +423,51 @@ class AndroidEditorSequentialPlaybackSession(
 
     // ── play / pause ───────────────────────────────────────────────────────
 
-    fun play(frameCount: Int?, onResult: (Map<String, Any?>) -> Unit) {
+    override fun play(frameCount: Int?, onResult: (Map<String, Any?>) -> Unit) {
         val h = orchHandler
         if (h == null || disposed.get()) {
             onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
             return
         }
         h.post {
+            if (disposed.get()) {
+                onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
+                return@post
+            }
+            // Image clip: no wrapped AndroidDagTexturePlaybackControlSession exists at
+            // all (activeSession stays null) -- checked before the video/freeze
+            // session-null guard below, which would otherwise incorrectly reject it.
+            val imageSpec = activeImageSpec()
+            if (imageSpec != null) {
+                // Mirror the wrapped session's own SurfaceLost refusal (see the freeze
+                // branch below): never start the clock -- and never claim isPlaying --
+                // against a renderer whose output window surface is genuinely lost.
+                if (imageRenderer?.canPresentOutput() != true) {
+                    onResult(mapOf(
+                        "pass" to false,
+                        "state" to AndroidDagPlaybackState.SurfaceLost.name,
+                        "raw" to "status=FAIL;reason=surface_lost",
+                    ))
+                    return@post
+                }
+                isPlaying = true
+                if (frameCount != null && frameCount > 0) {
+                    Log.i(TAG, "$LOG_PREFIX play_request image=true index=$activeClipIndex elapsedUs=$freezeElapsedUs " +
+                        "targetFrameCount=$frameCount")
+                    startFreezeClock(activeClipIndex, imageSpec, sessionToken.get(), frameCount, onResult)
+                    return@post
+                }
+                Log.i(TAG, "$LOG_PREFIX play_request image=true index=$activeClipIndex elapsedUs=$freezeElapsedUs")
+                startFreezeClock(activeClipIndex, imageSpec, sessionToken.get())
+                onResult(mapOf(
+                    "pass" to true,
+                    "state" to AndroidDagPlaybackState.Playing.name,
+                    "raw" to "status=OK;state=Playing;image=true;elapsedUs=$freezeElapsedUs",
+                ))
+                return@post
+            }
             val session = activeSession
-            if (disposed.get() || session == null) {
+            if (session == null) {
                 onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
                 return@post
             }
@@ -440,15 +511,29 @@ class AndroidEditorSequentialPlaybackSession(
         }
     }
 
-    fun pause(onResult: (Map<String, Any?>) -> Unit) {
+    override fun pause(onResult: (Map<String, Any?>) -> Unit) {
         val h = orchHandler
         if (h == null || disposed.get()) {
             onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
             return
         }
         h.post {
+            if (disposed.get()) {
+                onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
+                return@post
+            }
+            if (activeImageSpec() != null) {
+                isPlaying = false
+                stopFreezeClock(interruptReason = "paused", interruptPass = true, interruptState = AndroidDagPlaybackState.Paused)
+                onResult(mapOf(
+                    "pass" to true,
+                    "state" to AndroidDagPlaybackState.Paused.name,
+                    "raw" to "status=OK;state=Paused;image=true;elapsedUs=$freezeElapsedUs",
+                ))
+                return@post
+            }
             val session = activeSession
-            if (disposed.get() || session == null) {
+            if (session == null) {
                 onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
                 return@post
             }
@@ -472,7 +557,7 @@ class AndroidEditorSequentialPlaybackSession(
      * first (via [activateClipBlocking]) and then seeks the freshly-activated session to the
      * mapped source-local target.
      */
-    fun seek(targetGlobalPtsUs: Long, resumeAfterSeek: Boolean, onResult: (Map<String, Any?>) -> Unit) {
+    override fun seek(targetGlobalPtsUs: Long, resumeAfterSeek: Boolean, onResult: (Map<String, Any?>) -> Unit) {
         val h = orchHandler
         if (h == null || disposed.get()) {
             onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
@@ -492,6 +577,30 @@ class AndroidEditorSequentialPlaybackSession(
             // whose source position is fixed at freezePtsUs (see mapGlobalToSourcePts).
             val timelineOffsetUs = (clampedUs - targetSpec.timelineStartUs).coerceAtLeast(0L)
             isPlaying = resumeAfterSeek
+
+            if (targetIndex == activeClipIndex && activeImageSpec() != null) {
+                // Mirror the wrapped session's own SurfaceLost refusal (seekWithinActiveFreezeClip's
+                // freeze-clip branch reads session.state, which is null and therefore skipped
+                // entirely for an image clip): fail closed here, before touching the clock or
+                // emitting a timeline frame, when the renderer's output window surface is
+                // genuinely lost, so a seek is never reported successful against an
+                // unavailable texture.
+                if (imageRenderer?.canPresentOutput() != true) {
+                    isPlaying = false
+                    onResult(mapOf(
+                        "pass" to false,
+                        "state" to AndroidDagPlaybackState.SurfaceLost.name,
+                        "raw" to "status=FAIL;reason=surface_lost",
+                    ))
+                    return@post
+                }
+                // Intra-image-clip seek: the decoded texture stays exactly as rendered
+                // (an image never changes with timeline position); only the timeline
+                // position/generation move. No wrapped session exists to seek.
+                Log.i(TAG, "$LOG_PREFIX same_clip_seek image=true index=$targetIndex offsetUs=$timelineOffsetUs resumeAfterSeek=$resumeAfterSeek")
+                onResult(seekWithinActiveFreezeClip(targetIndex, targetSpec, null, timelineOffsetUs, resumeAfterSeek))
+                return@post
+            }
 
             val activeNow = activeSession
             if (targetIndex == activeClipIndex && activeNow != null) {
@@ -575,9 +684,10 @@ class AndroidEditorSequentialPlaybackSession(
     }
 
     private fun translateSeekResult(result: Map<String, Any?>, spec: AndroidEditorClipPlaybackSpec): Map<String, Any?> {
-        // Freeze-clip activation/seek results already report seekTargetUs/seekRenderedPtsUs
-        // in global timeline space (see activateFreezeClipHeldFrame / seekWithinActiveFreezeClip).
-        if (spec.isFreezeFrame) return result
+        // Freeze-clip and image-clip activation/seek results already report
+        // seekTargetUs/seekRenderedPtsUs in global timeline space (see
+        // activateFreezeClipHeldFrame / activateImageClip / seekWithinActiveFreezeClip).
+        if (spec.isFreezeFrame || spec.isImage) return result
         val out = result.toMutableMap()
         (result["seekTargetUs"] as? Number)?.let { out["seekTargetUs"] = sourceToGlobalPtsRaw(it.toLong(), spec) }
         (result["seekRenderedPtsUs"] as? Number)?.let { out["seekRenderedPtsUs"] = sourceToGlobalPtsRaw(it.toLong(), spec) }
@@ -633,6 +743,13 @@ class AndroidEditorSequentialPlaybackSession(
             audioReleaseLatch.await()
         }
 
+        // Relinquish the image renderer's window surface + surface callback before
+        // anything else touches surfaceProducer -- a no-op when no image renderer was
+        // ever created, or when it is not currently attached. If the new clip is also
+        // an image, activateImageClip below reattaches it fresh, mirroring how a video
+        // clip always gets a brand-new AndroidDagTexturePlaybackControlSession above.
+        imageRenderer?.detachOutputSurface()
+
         if (disposed.get()) {
             return mapOf("pass" to false, "raw" to "status=FAIL;reason=disposed")
         }
@@ -642,6 +759,17 @@ class AndroidEditorSequentialPlaybackSession(
 
         val mySessionToken = sessionToken.incrementAndGet()
         val spec = effectiveClipSpecs[index]
+
+        if (spec.isImage) {
+            return activateImageClip(
+                index = index,
+                spec = spec,
+                timelineOffsetUs = explicitTimelineOffsetUs ?: 0L,
+                resumeAfterSeek = resumeAfterSeek,
+                token = mySessionToken,
+            )
+        }
+
         val freezePtsUs = spec.freezePtsUs
 
         // Prepare (and preroll-seek) this clip's original-clip audio, if it has any, before
@@ -800,11 +928,160 @@ class AndroidEditorSequentialPlaybackSession(
         return prepareResult + seekResult
     }
 
+    // ── Static image clip lifecycle ─────────────────────────────────────────
+
+    /**
+     * Must be called from [orchHandler], from within [activateClipBlocking] (which has
+     * already disposed any outgoing video/freeze session and detached the image
+     * renderer from a possible previous image clip). Lazily creates [imageRenderer]
+     * on first use, (re)attaches it to [surfaceProducer], decodes and draws [spec]'s
+     * image exactly once, then positions the static-hold timeline clock at
+     * [timelineOffsetUs] and emits the clip's first timeline frame. The clock fields
+     * ([freezeElapsedUs] et al.) and [startFreezeClock] / [stopFreezeClock] are
+     * shared verbatim with freeze-frame clips: both are decoder-less, clock-driven
+     * timeline holds over an already-rendered texture, so no image-specific clock
+     * is needed. A decode/attach/render failure fails the activation exactly like a
+     * failed video prepare.
+     */
+    private fun activateImageClip(
+        index: Int,
+        spec: AndroidEditorClipPlaybackSpec,
+        timelineOffsetUs: Long,
+        resumeAfterSeek: Boolean,
+        token: Long,
+    ): Map<String, Any?> {
+        val renderer = imageRenderer ?: AndroidEditorStaticImageRenderer().also { imageRenderer = it }
+        val attachFailure = renderer.attachOutputSurface(
+            surfaceProducer,
+            canvasWidth,
+            canvasHeight,
+            onSurfaceLost = { orchHandler?.post { handleImageSurfaceLost() } },
+            onSurfaceRestored = { orchHandler?.post { handleImageSurfaceRestored() } },
+        )
+        if (attachFailure != null) {
+            // A failed attach may still have partially registered the callback/window
+            // surface (see attachOutputSurface's own internal steps) -- detach so the
+            // image renderer never ends up owning the shared SurfaceProducer callback
+            // or window surface after a failed activation. This never touches the
+            // reusable EGL context/program (only release()/dispose() do).
+            renderer.detachOutputSurface()
+            Log.w(TAG, "$LOG_PREFIX image_attach_failed index=$index clipId=${spec.clipId} reason=$attachFailure")
+            return mapOf("pass" to false, "raw" to "status=FAIL;reason=$attachFailure")
+        }
+
+        val renderResult = renderer.renderImage(spec.sourcePath, spec.fitMode, canvasWidth, canvasHeight)
+        val outcome = renderResult.outcome
+        if (outcome == null) {
+            // Attach succeeded but the render did not: relinquish the callback/window
+            // surface here too, for the same reason as the attach-failure branch above.
+            renderer.detachOutputSurface()
+            val reason = renderResult.failure ?: "image_render_failed"
+            Log.w(TAG, "$LOG_PREFIX image_render_failed index=$index clipId=${spec.clipId} reason=$reason")
+            return mapOf("pass" to false, "raw" to "status=FAIL;reason=$reason")
+        }
+
+        activeSession = null
+        activeClipIndex = index
+
+        val maxOffsetUs = (spec.timelineDurationUs - 1L).coerceAtLeast(0L)
+        freezeElapsedUs = timelineOffsetUs.coerceIn(0L, maxOffsetUs)
+        freezeGeneration = publicGeneration.incrementAndGet()
+        val globalPtsUs = spec.timelineStartUs + freezeElapsedUs
+        // outcome.displayWidth/displayHeight (the decoded source image's post-EXIF
+        // size) is diagnostic/logging only. The reported width/height must be the
+        // canvas the texture was actually rendered into (see attachOutputSurface's
+        // setSize call above) -- the native texture contract for this route is the
+        // editor canvas, not the raw image, exactly like every video/freeze clip on
+        // this same session already reports canvas/decoder-surface dimensions here.
+        Log.i(TAG, "$LOG_PREFIX image_clip_activated index=$index clipId=${spec.clipId} fitMode=${spec.fitMode} " +
+            "sourceDisplay=${outcome.displayWidth}x${outcome.displayHeight} canvas=${canvasWidth}x$canvasHeight " +
+            "offsetUs=$freezeElapsedUs holdUs=${spec.timelineDurationUs} generation=$freezeGeneration " +
+            "resumeAfterSeek=$resumeAfterSeek")
+        onTimelineFrame(surfaceProducer.id(), globalPtsUs / 1_000_000.0, freezeGeneration)
+        if (resumeAfterSeek) {
+            startFreezeClock(index, spec, token)
+        }
+        val stateName = if (resumeAfterSeek) AndroidDagPlaybackState.Playing.name else AndroidDagPlaybackState.Paused.name
+        return mapOf(
+            "pass" to true,
+            "textureId" to surfaceProducer.id(),
+            "width" to canvasWidth,
+            "height" to canvasHeight,
+            "state" to stateName,
+            "seekTargetUs" to globalPtsUs,
+            "seekRenderedPtsUs" to globalPtsUs,
+            "generationId" to freezeGeneration,
+            "raw" to "status=OK;state=$stateName;image=true;seekTargetUs=$globalPtsUs;" +
+                "seekRenderedPtsUs=$globalPtsUs;generationId=$freezeGeneration",
+        )
+    }
+
+    /**
+     * Must be called from [orchHandler] (see [attachOutputSurface]'s callback
+     * contract). Mirrors [AndroidEditorTransitionPlaybackSession.handleSurfaceCleanup]:
+     * stops the clock and pauses, then tells [imageRenderer] to destroy ONLY its
+     * EGL window surface (context/program/texture/cache stay intact) and mark
+     * itself surface-lost -- the renderer never unregisters its surface
+     * callback here, only [detachOutputSurface] / [release] do that.
+     */
+    private fun handleImageSurfaceLost() {
+        if (disposed.get()) return
+        stopFreezeClock(interruptReason = "surface_cleanup", interruptState = AndroidDagPlaybackState.SurfaceLost)
+        isPlaying = false
+        imageRenderer?.handleSurfaceLost()
+        Log.i(TAG, "$LOG_PREFIX image_surface_lost index=$activeClipIndex")
+    }
+
+    /**
+     * Must be called from [orchHandler]. Mirrors
+     * [AndroidEditorTransitionPlaybackSession.handleSurfaceAvailable]: asks
+     * [imageRenderer] to re-size the [TextureRegistry.SurfaceProducer] to the
+     * draft canvas, recreate its EGL window surface, and redraw the active image
+     * clip's cached texture (no re-decode). The renderer's typed
+     * [AndroidEditorStaticImageRenderer.RestoreOutcome] is what decides logging
+     * here -- [AndroidEditorStaticImageRenderer.RestoreOutcome.NoOp] (a
+     * spurious/duplicate callback that never followed a genuine
+     * [AndroidEditorStaticImageRenderer.handleSurfaceLost]) never logs
+     * `image_surface_restored`, since nothing was actually restored. On
+     * [AndroidEditorStaticImageRenderer.RestoreOutcome.Failed] the renderer
+     * stays surface-lost for a later retry; this method only logs it. Neither
+     * outcome ever auto-resumes -- the caller must call [play] again
+     * regardless. A no-op if the active clip is no longer an image (e.g. a
+     * clip switch raced the restore).
+     */
+    private fun handleImageSurfaceRestored() {
+        if (disposed.get()) return
+        val spec = activeImageSpec() ?: return
+        when (val outcome = imageRenderer?.handleSurfaceRestored(canvasWidth, canvasHeight)) {
+            null, AndroidEditorStaticImageRenderer.RestoreOutcome.NoOp -> {
+                // No renderer, or a spurious/duplicate callback with no genuine loss
+                // to restore from: nothing changed, so nothing is logged as restored.
+            }
+            AndroidEditorStaticImageRenderer.RestoreOutcome.Restored -> {
+                Log.i(TAG, "$LOG_PREFIX image_surface_restored index=$activeClipIndex clipId=${spec.clipId}")
+            }
+            is AndroidEditorStaticImageRenderer.RestoreOutcome.Failed -> {
+                Log.w(TAG, "$LOG_PREFIX image_surface_restore_failed index=$activeClipIndex clipId=${spec.clipId} " +
+                    "reason=${outcome.reason}")
+            }
+        }
+    }
+
     // ── Freeze-frame clip lifecycle (Phase 7.17-Android) ───────────────────
 
     /** The active clip's spec when it is a freeze-frame clip, else null. Must be called from [orchHandler]. */
     private fun activeFreezeSpec(): AndroidEditorClipPlaybackSpec? =
         effectiveClipSpecs.getOrNull(activeClipIndex)?.takeIf { it.isFreezeFrame }
+
+    /**
+     * The active clip's spec when it is a still image clip, else null. Must be
+     * called from [orchHandler]. An image clip has no wrapped
+     * [AndroidDagTexturePlaybackControlSession] ([activeSession] stays null for
+     * it), so every command handler checks this before its `activeSession == null`
+     * guard, exactly as it already checks [activeFreezeSpec] first.
+     */
+    private fun activeImageSpec(): AndroidEditorClipPlaybackSpec? =
+        effectiveClipSpecs.getOrNull(activeClipIndex)?.takeIf { it.isImage }
 
     /**
      * Must be called from [orchHandler], after [session] (the freshly prepared wrapped
@@ -873,17 +1150,20 @@ class AndroidEditorSequentialPlaybackSession(
      * emitted with the new timeline PTS (which also acknowledges the Dart controller's
      * in-flight seek), and the clock restarts when [resumeAfterSeek]. Mirrors the wrapped
      * session's own surface-lost refusal so a seek never reports success against a texture
-     * that cannot show the frame.
+     * that cannot show the frame. [session] is null for an image clip (no wrapped session
+     * exists -- see [AndroidEditorClipPlaybackSpec.isImage]), which skips the wrapped-state
+     * refusal entirely: an image's surface loss/restore is handled by
+     * [AndroidEditorStaticImageRenderer]'s own callback, not surfaced through [session].
      */
     private fun seekWithinActiveFreezeClip(
         index: Int,
         spec: AndroidEditorClipPlaybackSpec,
-        session: AndroidDagTexturePlaybackControlSession,
+        session: AndroidDagTexturePlaybackControlSession?,
         timelineOffsetUs: Long,
         resumeAfterSeek: Boolean,
     ): Map<String, Any?> {
         stopFreezeClock(interruptReason = "seek_interrupted")
-        val wrappedState = session.state
+        val wrappedState = session?.state
         if (wrappedState == AndroidDagPlaybackState.SurfaceLost) {
             isPlaying = false
             return mapOf("pass" to false, "state" to wrappedState.name, "raw" to "status=FAIL;reason=surface_lost")
@@ -901,13 +1181,14 @@ class AndroidEditorSequentialPlaybackSession(
             startFreezeClock(index, spec, sessionToken.get())
         }
         val stateName = if (resumeAfterSeek) AndroidDagPlaybackState.Playing.name else AndroidDagPlaybackState.Paused.name
+        val kindTag = if (spec.isImage) "image=true" else "freeze=true"
         return mapOf(
             "pass" to true,
             "state" to stateName,
             "seekTargetUs" to globalPtsUs,
             "seekRenderedPtsUs" to globalPtsUs,
             "generationId" to freezeGeneration,
-            "raw" to "status=OK;state=$stateName;freeze=true;seekTargetUs=$globalPtsUs;" +
+            "raw" to "status=OK;state=$stateName;$kindTag;seekTargetUs=$globalPtsUs;" +
                 "seekRenderedPtsUs=$globalPtsUs;generationId=$freezeGeneration",
         )
     }
@@ -1105,6 +1386,19 @@ class AndroidEditorSequentialPlaybackSession(
     private fun resumeActiveClipPlayback(site: String) {
         val index = activeClipIndex
         val spec = effectiveClipSpecs.getOrNull(index) ?: return
+        if (spec.isImage) {
+            // Mirror play()'s / intra-image seek's own SurfaceLost refusal: never claim
+            // isPlaying or start the clock against a renderer whose output window
+            // surface is genuinely lost.
+            if (imageRenderer?.canPresentOutput() != true) {
+                Log.w(TAG, "$LOG_PREFIX $site index=$index image=true reason=surface_lost")
+                return
+            }
+            isPlaying = true
+            Log.i(TAG, "$LOG_PREFIX $site index=$index image=true elapsedUs=$freezeElapsedUs")
+            startFreezeClock(index, spec, sessionToken.get())
+            return
+        }
         isPlaying = true
         if (spec.isFreezeFrame) {
             Log.i(TAG, "$LOG_PREFIX $site index=$index freeze=true elapsedUs=$freezeElapsedUs")
@@ -1155,7 +1449,7 @@ class AndroidEditorSequentialPlaybackSession(
      * clip activations retain the updated gain, and immediately updates the active
      * [AndroidEditorOriginalAudioPreviewRuntime] if [clipId] is currently active.
      */
-    fun setOriginalTrackGain(clipId: String, gain: Float) {
+    override fun setOriginalTrackGain(clipId: String, gain: Float) {
         val clamped = gain.coerceIn(0.0f, 1.0f)
         orchHandler?.post {
             effectiveClipSpecs = effectiveClipSpecs.map { spec ->
@@ -1171,7 +1465,7 @@ class AndroidEditorSequentialPlaybackSession(
     /**
      * Updates original audio gain across all clips live.
      */
-    fun setAllOriginalTracksGain(gain: Float) {
+    override fun setAllOriginalTracksGain(gain: Float) {
         val clamped = gain.coerceIn(0.0f, 1.0f)
         orchHandler?.post {
             effectiveClipSpecs = effectiveClipSpecs.map { spec ->
@@ -1188,7 +1482,7 @@ class AndroidEditorSequentialPlaybackSession(
      * orchestration [HandlerThread]. Idempotent. Never releases
      * [surfaceProducer] — the coordinator owns that.
      */
-    fun dispose(onResult: ((Map<String, Any?>) -> Unit)? = null) {
+    override fun dispose(onResult: ((Map<String, Any?>) -> Unit)?) {
         if (!disposed.compareAndSet(false, true)) {
             onResult?.invoke(mapOf("pass" to true, "raw" to "status=OK;already_disposed"))
             return
@@ -1203,6 +1497,8 @@ class AndroidEditorSequentialPlaybackSession(
 
         h.post {
             stopFreezeClock(interruptReason = "session_disposed", interruptState = AndroidDagPlaybackState.Disposed)
+            imageRenderer?.release()
+            imageRenderer = null
             val session = activeSession
             activeSession = null
             val audio = activeAudioRuntime
