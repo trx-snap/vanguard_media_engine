@@ -117,6 +117,7 @@ void main() {
       }
       expect(supportedTransitionWireNames, contains('dissolve'));
       expect(supportedTransitionWireNames, contains('crossfade'));
+      expect(supportedTransitionWireNames, contains('fade'));
       expect(
         supportedTransitionWireNames.where((n) => n.startsWith('slide')),
         hasLength(4),
@@ -142,13 +143,20 @@ void main() {
       );
     });
 
-    test('fade is unsupported and never remapped', () {
-      expect(failClosedTransitionWireNames, contains('fade'));
-      expect(supportedTransitionWireNames, isNot(contains('fade')));
+    test('fade is supported as its own family; unknown types fail closed', () {
+      expect(failClosedTransitionWireNames, isNot(contains('fade')));
       expect(
         VGTimelineTransitionExportWireKind.classify('fade'),
-        VGTimelineTransitionExportWireKind.unsupported,
+        VGTimelineTransitionExportWireKind.supported,
       );
+      for (final name in failClosedTransitionWireNames) {
+        expect(supportedTransitionWireNames, isNot(contains(name)));
+        expect(
+          VGTimelineTransitionExportWireKind.classify(name),
+          VGTimelineTransitionExportWireKind.unsupported,
+          reason: name,
+        );
+      }
       expect(
         VGTimelineTransitionExportWireKind.classify('zoom'),
         VGTimelineTransitionExportWireKind.unsupported,
@@ -175,12 +183,20 @@ void main() {
           closeTo(4.0, 1e-9),
         );
         expect(
-          _request(type: 'fade').expectedDurationSeconds,
+          _request(type: 'zoom').expectedDurationSeconds,
           closeTo(4.0, 1e-9),
         );
-        expect(_request(type: 'fade').supportedTransitionCount, 0);
+        expect(_request(type: 'zoom').supportedTransitionCount, 0);
       },
     );
+
+    test('fade shortens expected duration like any supported overlap', () {
+      expect(
+        _request(type: 'fade').expectedDurationSeconds,
+        closeTo(3.5, 1e-9),
+      );
+      expect(_request(type: 'fade').supportedTransitionCount, 1);
+    });
 
     test('expected duration never goes negative', () {
       final request = VGTimelineTransitionExportSmokeRequest(
@@ -508,8 +524,8 @@ void main() {
     test('a fail-closed lane that succeeded fails', () {
       final report = VGTimelineTransitionExportSmokeLaneReport.fromExportResult(
         _request(
-          laneId: 'fade',
-          type: 'fade',
+          laneId: 'zoom',
+          type: 'zoom',
           expectation:
               const VGTimelineTransitionExportSmokeExpectation.failClosed(
                 errorCode: unsupportedExportFeatureCode,
@@ -524,12 +540,12 @@ void main() {
   });
 
   group('lane report from PlatformException (fail-closed contract)', () {
-    test('fade fail-closed passes with matching code and message token', () {
+    test('unknown-type fail-closed passes with matching code and token', () {
       final report =
           VGTimelineTransitionExportSmokeLaneReport.fromPlatformException(
             _request(
-              laneId: 'fade',
-              type: 'fade',
+              laneId: 'zoom',
+              type: 'zoom',
               expectation:
                   const VGTimelineTransitionExportSmokeExpectation.failClosed(
                     errorCode: unsupportedExportFeatureCode,
@@ -539,7 +555,7 @@ void main() {
             PlatformException(
               code: unsupportedExportFeatureCode,
               message:
-                  "exportTimeline: transition type 'fade' is not supported",
+                  "exportTimeline: transition type 'zoom' is not supported",
             ),
           );
       expect(report.pass, isTrue);
@@ -619,8 +635,8 @@ void main() {
       final report =
           VGTimelineTransitionExportSmokeLaneReport.fromPlatformException(
             _request(
-              laneId: 'fade',
-              type: 'fade',
+              laneId: 'zoom',
+              type: 'zoom',
               expectation:
                   const VGTimelineTransitionExportSmokeExpectation.failClosed(
                     errorCode: unsupportedExportFeatureCode,
@@ -657,8 +673,8 @@ void main() {
       final failClosed =
           VGTimelineTransitionExportSmokeLaneReport.fromPlatformException(
             _request(
-              laneId: 'fade',
-              type: 'fade',
+              laneId: 'zoom',
+              type: 'zoom',
               expectation:
                   const VGTimelineTransitionExportSmokeExpectation.failClosed(
                     errorCode: unsupportedExportFeatureCode,
@@ -783,16 +799,16 @@ void main() {
     );
 
     test(
-      'fail-closed PlatformException from native passes the fade lane',
+      'fail-closed PlatformException from native passes the unknown-type lane',
       () async {
         _setMockHandler((method, args) async {
           final draft = (args as Map)['draft'] as Map;
           final type = ((draft['transitions'] as List).single as Map)['type'];
-          if (type == 'fade') {
+          if (type == 'zoom') {
             throw PlatformException(
               code: unsupportedExportFeatureCode,
               message:
-                  "exportTimeline: transition type 'fade' is not supported",
+                  "exportTimeline: transition type 'zoom' is not supported",
             );
           }
           return _successResult();
@@ -805,8 +821,8 @@ void main() {
             .run(<VGTimelineTransitionExportSmokeRequest>[
               _request(),
               _request(
-                laneId: 'fade',
-                type: 'fade',
+                laneId: 'zoom',
+                type: 'zoom',
                 expectation:
                     const VGTimelineTransitionExportSmokeExpectation.failClosed(
                       errorCode: unsupportedExportFeatureCode,

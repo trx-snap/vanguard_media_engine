@@ -33,7 +33,11 @@ enum class TransitionType {
     kSlideLeft,
     kSlideRight,
     kSlideUp,
-    kSlideDown
+    kSlideDown,
+    // Two-phase fade through black: the outgoing layer dips to black over
+    // the first half of the window, the incoming layer rises from black over
+    // the second half. Never an alias of kCrossfade.
+    kFade
 };
 
 // A single clip placed on the timeline.
@@ -87,9 +91,13 @@ struct TimelineNormalizedRect {
 // Resolved transition progress and geometry at one timeline instant.
 //
 // Blend weights: for kCrossfade, from = 1 - progress and to = progress. For
-// slide/wipe families both layers are fully opaque (1.0) and the geometry
-// alone describes visibility. When no transition is active the struct holds
-// identity geometry with from = 1.0, to = 0.0.
+// kFade (dip to black) the weights are single-sided over identity geometry:
+// progress < 0.5 -> from = 1 - 2p, to = 0; progress >= 0.5 -> from = 0,
+// to = 2p - 1 (both zero at exactly 0.5: the frame is black). Renderers
+// honour a partial single-layer weight by drawing that layer scaled over an
+// explicit black base. For slide/wipe families both layers are fully opaque
+// (1.0) and the geometry alone describes visibility. When no transition is
+// active the struct holds identity geometry with from = 1.0, to = 0.0.
 struct TimelineTransitionProgress {
     bool                   isTransitionActive = false;
     TransitionType         type               = TransitionType::kNone;

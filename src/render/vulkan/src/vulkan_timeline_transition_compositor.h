@@ -43,6 +43,17 @@
 //   * both weights >= 1             -> layered opaque paint-over: "from" at
 //                                      its geometry, then "to" at its
 //                                      geometry (slide / wipe families).
+//   * blendWeightTo <= 0 and
+//     0 < blendWeightFrom < 1        -> fade first half: full-canvas opaque
+//                                      black draw, then "from" constant-alpha
+//                                      blended over it with
+//                                      alpha = blendWeightFrom; both
+//                                      viewports must be identity. (Weight 0
+//                                      on both sides -- the fade midpoint --
+//                                      also lands here and yields black.)
+//   * blendWeightFrom <= 0 and
+//     0 < blendWeightTo < 1          -> fade second half: black base, then
+//                                      "to" blended with alpha = blendWeightTo.
 //   * otherwise                     -> full-canvas "from" opaque draw, then
 //                                      full-canvas "to" constant-alpha blend
 //                                      draw with alpha = blendWeightTo

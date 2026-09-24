@@ -156,17 +156,29 @@ const char* kMixVertexShaderSrc =
 
 const char* kOesExtensionDirective = "#extension GL_OES_EGL_image_external : require\n";
 
-// Single-sampler opaque layer fragment shader; sampler type per target.
-std::string BuildSingleFragmentShaderSrc(bool oes) {
+// Single-sampler layer fragment shader; sampler type per target. The
+// opaque variant (weighted == false) is byte-identical to the pre-fade
+// shader. The weighted variant scales the sampled colour by uWeight, i.e.
+// the layer composited over black with that weight (fade-through-black
+// half-phases); the sampled alpha is passed through unchanged.
+std::string BuildSingleFragmentShaderSrc(bool oes, bool weighted) {
     std::string src;
     if (oes) src += kOesExtensionDirective;
     src += "precision mediump float;\n"
            "varying vec2 vTexCoord;\n";
     src += oes ? "uniform samplerExternalOES uTexture;\n"
                : "uniform sampler2D uTexture;\n";
-    src += "void main() {\n"
-           "    gl_FragColor = texture2D(uTexture, vTexCoord);\n"
-           "}\n";
+    if (weighted) {
+        src += "uniform float uWeight;\n"
+               "void main() {\n"
+               "    vec4 c = texture2D(uTexture, vTexCoord);\n"
+               "    gl_FragColor = vec4(c.rgb * uWeight, c.a);\n"
+               "}\n";
+    } else {
+        src += "void main() {\n"
+               "    gl_FragColor = texture2D(uTexture, vTexCoord);\n"
+               "}\n";
+    }
     return src;
 }
 
@@ -276,20 +288,27 @@ bool UploadQuad(const GLfloat* data, GLsizeiptr bytes, TemporaryProgram& tmp, st
     return true;
 }
 
-// Draws one opaque layer scoped to its resolved placement. Does nothing (and
-// succeeds) when the placement is not visible. Leaves the viewport at the
-// layer rect; the caller restores the full-surface viewport.
+// Draws one layer scoped to its resolved placement. [colorWeight] >= 1.0
+// draws the layer opaque through the unchanged single-sampler shader;
+// [colorWeight] < 1.0 draws it through the weighted shader (layer colour
+// scaled by the weight == the layer composited over black), which is how a
+// fade half-phase renders. Does nothing (and succeeds) when the placement is
+// not visible. Leaves the viewport at the layer rect; the caller restores
+// the full-surface viewport.
 bool DrawOpaqueLayer(GLuint texture,
                      uint32_t textureTarget,
                      const vanguard::render::GlesTimelineLayerPlacement& placement,
+                     float colorWeight,
                      std::string* outError) {
     if (!placement.visible) {
         return true;
     }
+    const bool weighted = colorWeight < 1.0f;
     const GLenum glTarget = static_cast<GLenum>(textureTarget);
     TemporaryProgram tmp;
     bool ok = BuildProgram(kSingleVertexShaderSrc,
-                           BuildSingleFragmentShaderSrc(textureTarget == kTextureTargetExternalOes),
+                           BuildSingleFragmentShaderSrc(textureTarget == kTextureTargetExternalOes,
+                                                        weighted),
                            tmp, outError);
 
     if (ok) {
@@ -312,7 +331,8 @@ bool DrawOpaqueLayer(GLuint texture,
         const GLint positionLoc = glGetAttribLocation(tmp.program, "aPosition");
         const GLint texCoordLoc = glGetAttribLocation(tmp.program, "aTexCoord");
         const GLint textureLoc  = glGetUniformLocation(tmp.program, "uTexture");
-        if (positionLoc < 0 || texCoordLoc < 0 || textureLoc < 0) {
+        const GLint weightLoc   = weighted ? glGetUniformLocation(tmp.program, "uWeight") : 0;
+        if (positionLoc < 0 || texCoordLoc < 0 || textureLoc < 0 || weightLoc < 0) {
             ok = false;
             if (outError) *outError = "gles_timeline_transition_compositor_draw_failed";
         } else {
@@ -326,6 +346,9 @@ bool DrawOpaqueLayer(GLuint texture,
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(glTarget, texture);
             glUniform1i(textureLoc, 0);
+            if (weighted) {
+                glUniform1f(weightLoc, colorWeight < 0.0f ? 0.0f : colorWeight);
+            }
 
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             if (glGetError() != GL_NO_ERROR) {
@@ -492,18 +515,27 @@ bool GlesTimelineTransitionCompositor::drawTransition(uint32_t textureFrom,
     const double weightFrom = ClampUnit(geometry.blendWeightFrom);
     const double weightTo   = ClampUnit(geometry.blendWeightTo);
 
-    enum class DrawMode { kFromOnly, kToOnly, kLayeredOpaque, kMix };
+    // Draw model from the weights alone (never a family enum). A single-sided
+    // PARTIAL weight (the other side <= 0, this side < 1) is a fade half-phase:
+    // that layer is drawn scaled by its weight over black instead of opaque,
+    // so fade-through-black is honoured rather than collapsing to from-only /
+    // to-only. Hard cut (1,0), crossfade endpoints (1,0)/(0,1), crossfade
+    // interior (mix) and the opaque slide/wipe pair (1,1) resolve exactly as
+    // before.
+    enum class DrawMode { kFromOnly, kToOnly, kLayeredOpaque, kMix, kFromFade, kToFade };
     DrawMode mode;
     if (weightTo <= 0.0) {
-        mode = DrawMode::kFromOnly;
+        mode = weightFrom >= 1.0 ? DrawMode::kFromOnly : DrawMode::kFromFade;
     } else if (weightFrom <= 0.0) {
-        mode = DrawMode::kToOnly;
+        mode = weightTo >= 1.0 ? DrawMode::kToOnly : DrawMode::kToFade;
     } else if (weightFrom >= 1.0 && weightTo >= 1.0) {
         mode = DrawMode::kLayeredOpaque;
     } else {
         mode = DrawMode::kMix;
     }
-    if (mode == DrawMode::kMix &&
+    const bool requiresIdentityViewports =
+        mode == DrawMode::kMix || mode == DrawMode::kFromFade || mode == DrawMode::kToFade;
+    if (requiresIdentityViewports &&
         (!IsIdentityRect(geometry.fromViewport) || !IsIdentityRect(geometry.toViewport))) {
         if (outError) *outError = "gles_timeline_transition_compositor_unsupported_geometry";
         return false;
@@ -519,24 +551,42 @@ bool GlesTimelineTransitionCompositor::drawTransition(uint32_t textureFrom,
         case DrawMode::kFromOnly: {
             const GlesTimelineLayerPlacement placement = ResolveTimelineLayerPlacement(
                 geometry.fromViewport, geometry.fromCrop, surfaceWidth, surfaceHeight);
-            ok = DrawOpaqueLayer(textureFrom, textureTargetFrom, placement, outError);
+            ok = DrawOpaqueLayer(textureFrom, textureTargetFrom, placement, 1.0f, outError);
             break;
         }
         case DrawMode::kToOnly: {
             const GlesTimelineLayerPlacement placement = ResolveTimelineLayerPlacement(
                 geometry.toViewport, geometry.toCrop, surfaceWidth, surfaceHeight);
-            ok = DrawOpaqueLayer(textureTo, textureTargetTo, placement, outError);
+            ok = DrawOpaqueLayer(textureTo, textureTargetTo, placement, 1.0f, outError);
             break;
         }
         case DrawMode::kLayeredOpaque: {
             const GlesTimelineLayerPlacement fromPlacement = ResolveTimelineLayerPlacement(
                 geometry.fromViewport, geometry.fromCrop, surfaceWidth, surfaceHeight);
-            ok = DrawOpaqueLayer(textureFrom, textureTargetFrom, fromPlacement, outError);
+            ok = DrawOpaqueLayer(textureFrom, textureTargetFrom, fromPlacement, 1.0f, outError);
             if (ok) {
                 const GlesTimelineLayerPlacement toPlacement = ResolveTimelineLayerPlacement(
                     geometry.toViewport, geometry.toCrop, surfaceWidth, surfaceHeight);
-                ok = DrawOpaqueLayer(textureTo, textureTargetTo, toPlacement, outError);
+                ok = DrawOpaqueLayer(textureTo, textureTargetTo, toPlacement, 1.0f, outError);
             }
+            break;
+        }
+        case DrawMode::kFromFade: {
+            // Fade first half: "from" scaled by its weight over black. Identity
+            // viewport by contract, so with an identity crop the draw covers the
+            // whole canvas (weight 0 at the midpoint yields a black frame).
+            const GlesTimelineLayerPlacement placement = ResolveTimelineLayerPlacement(
+                geometry.fromViewport, geometry.fromCrop, surfaceWidth, surfaceHeight);
+            ok = DrawOpaqueLayer(textureFrom, textureTargetFrom, placement,
+                                 static_cast<float>(weightFrom), outError);
+            break;
+        }
+        case DrawMode::kToFade: {
+            // Fade second half: "to" scaled by its weight over black.
+            const GlesTimelineLayerPlacement placement = ResolveTimelineLayerPlacement(
+                geometry.toViewport, geometry.toCrop, surfaceWidth, surfaceHeight);
+            ok = DrawOpaqueLayer(textureTo, textureTargetTo, placement,
+                                 static_cast<float>(weightTo), outError);
             break;
         }
         case DrawMode::kMix:

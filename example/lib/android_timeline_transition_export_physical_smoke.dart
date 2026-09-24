@@ -10,6 +10,7 @@
 //   Lane dissolve   : dissolve 0.5 s   -> success, renderBackend=vulkan,
 //                     file exists, duration ~= 2.0 + 2.0 - 0.5
 //   Lane crossfade  : crossfade alias  -> same assertions
+//   Lane fade       : fade 0.5 s (fade through black) -> same assertions
 //   Lane slideLeft  : slide family     -> same assertions
 //   Lane wipeRight  : wipe family      -> same assertions
 //   Lane dissolve_audio_sidecar_success : dissolve 0.5 s + two audioSidecar
@@ -17,8 +18,6 @@
 //                     the overlap-adjusted output timeline (P5-TRANSITION-
 //                     AUDIO-SIDECAR-EXPORT) -> success, renderBackend=vulkan,
 //                     duration ~= 3.5, transitionCount=1, output exists.
-//   Lane fade       : `fade` must fail closed (UNSUPPORTED_EXPORT_FEATURE);
-//                     it is never remapped to dissolve.
 //   Lane noVulkan   : still image + video with a dissolve is outside the
 //                     Vulkan safe scope; the selector must resolve to
 //                     UNAVAILABLE and the session must fail closed with
@@ -131,6 +130,7 @@ class _AndroidTimelineTransitionExportSmokeAppState
       final requests = <VGTimelineTransitionExportSmokeRequest>[
         positiveLane('dissolve'),
         positiveLane('crossfade'),
+        positiveLane('fade'),
         positiveLane('slideLeft'),
         positiveLane('wipeRight'),
         VGTimelineTransitionExportSmokeRequest(
@@ -172,28 +172,6 @@ class _AndroidTimelineTransitionExportSmokeAppState
               '${tempDir.path}/vg_trans_export_dissolve_audio_sidecar_success_$stamp.mp4',
           expectation:
               const VGTimelineTransitionExportSmokeExpectation.success(),
-        ),
-        VGTimelineTransitionExportSmokeRequest(
-          laneId: 'fade_fail_closed',
-          clips: <VGTimelineTransitionExportSmokeClip>[
-            videoClip('clip-a', clipA.path),
-            videoClip('clip-b', clipB.path),
-          ],
-          transitions: const <VGTimelineTransitionExportSmokeTransition>[
-            VGTimelineTransitionExportSmokeTransition(
-              id: 'tr-fade',
-              type: 'fade',
-              durationSeconds: _transitionSeconds,
-              fromClipId: 'clip-a',
-              toClipId: 'clip-b',
-            ),
-          ],
-          outputPath: '${tempDir.path}/vg_trans_export_fade_$stamp.mp4',
-          expectation:
-              const VGTimelineTransitionExportSmokeExpectation.failClosed(
-                errorCode: unsupportedExportFeatureCode,
-                messageContains: 'not supported',
-              ),
         ),
         VGTimelineTransitionExportSmokeRequest(
           laneId: 'no_vulkan_no_gles_fallback',

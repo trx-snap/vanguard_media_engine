@@ -156,6 +156,21 @@ TimelineTransitionProgress ComputeTransitionGeometry(TransitionType type, double
             result.blendWeightTo   = p;
             break;
 
+        // Fade: two-phase dip to black over identity geometry (iOS parity with
+        // VGTimelineCompositorNode's VGTransitionTypeFade). First half fades
+        // the outgoing layer to black while the incoming layer is invisible;
+        // second half fades the incoming layer in from black while the
+        // outgoing layer is invisible. At p == 0.5 both weights are zero.
+        case TransitionType::kFade:
+            if (p < 0.5) {
+                result.blendWeightFrom = 1.0 - (p * 2.0);
+                result.blendWeightTo   = 0.0;
+            } else {
+                result.blendWeightFrom = 0.0;
+                result.blendWeightTo   = (p - 0.5) * 2.0;
+            }
+            break;
+
         // Slides: full-size viewports translated across the canvas. Viewport
         // x/y intentionally leave [0,1] to describe off-canvas motion.
         case TransitionType::kSlideLeft:

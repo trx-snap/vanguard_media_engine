@@ -12,17 +12,19 @@
 //
 // The draft is built here from raw wire maps rather than VGEditorDraft so
 // that every transition wire type the native parser supports
-// (dissolve/crossfade, slideLeft/Right/Up/Down, wipeLeft/Right/Up/Down) can
-// be exercised -- the typed VGTransitionType enum only spells `none`,
+// (dissolve/crossfade, fade, slideLeft/Right/Up/Down, wipeLeft/Right/Up/Down)
+// can be exercised -- the typed VGTransitionType enum only spells `none`,
 // `fade`, `dissolve`. The wire shape is exactly VGEditorDraft.toMap() /
 // VGClipDescriptor.toMap() / VGTransitionDescriptor.toMap() for the keys the
 // native session reads.
 //
 // Contract mirrored from AndroidTimelineTransitionDescriptor /
 // AndroidTimelineExportSession:
-//   - supported non-hard-cut types: [supportedTransitionWireNames];
-//   - `fade` (and any unknown type) fails closed with
-//     UNSUPPORTED_EXPORT_FEATURE -- it is never mapped to dissolve/hard cut;
+//   - supported non-hard-cut types: [supportedTransitionWireNames]; `fade`
+//     is the two-phase fade through black (never remapped to dissolve);
+//   - any unknown type (e.g. [failClosedTransitionWireNames]) fails closed
+//     with UNSUPPORTED_EXPORT_FEATURE -- it is never mapped to a supported
+//     family or a hard cut;
 //   - a transition timeline that cannot be routed to Vulkan fails closed
 //     with UNSUPPORTED_EXPORT_FEATURE carrying `transitions_require_vulkan`;
 //   - a successful transition export reports renderBackend == 'vulkan' and
@@ -41,6 +43,7 @@ import 'package:flutter/services.dart';
 const List<String> supportedTransitionWireNames = <String>[
   'dissolve',
   'crossfade',
+  'fade',
   'slideLeft',
   'slideRight',
   'slideUp',
@@ -54,8 +57,11 @@ const List<String> supportedTransitionWireNames = <String>[
 /// Wire name of a hard cut (accepted and dropped natively).
 const String hardCutTransitionWireName = 'none';
 
-/// Wire names that must fail closed natively (never remapped).
-const List<String> failClosedTransitionWireNames = <String>['fade'];
+/// Wire names that must fail closed natively (never remapped). No
+/// product-facing VGTransitionType fails closed any more (fade is rendered
+/// as a true dip to black); this unknown family keeps the parser's
+/// fail-closed lane exercised.
+const List<String> failClosedTransitionWireNames = <String>['zoom'];
 
 /// The production MethodChannel error code for a fail-closed feature.
 const String unsupportedExportFeatureCode = 'UNSUPPORTED_EXPORT_FEATURE';

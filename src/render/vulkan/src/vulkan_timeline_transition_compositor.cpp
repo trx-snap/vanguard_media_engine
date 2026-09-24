@@ -235,14 +235,32 @@ struct Temporaries {
     }
 };
 
-// One recorded fullscreen-triangle draw scoped to a placement.
+// One recorded fullscreen-triangle draw scoped to a placement. [blackFill]
+// draws opaque black (zero colour matrix, alpha offset 1) instead of the
+// sampled layer: the explicit base a fade half-phase is blended over.
 struct LayerDraw {
     VkPipeline                    pipeline = VK_NULL_HANDLE;
     VkDescriptorSet               set      = VK_NULL_HANDLE;
     VulkanTimelineLayerPlacement  placement;
     bool                          useBlendConstants = false;
     float                         blendConstant     = 0.0f;
+    bool                          blackFill         = false;
 };
+
+// Full-canvas placement (identity UV range) for the black fill draw.
+VulkanTimelineLayerPlacement FullCanvasPlacement(uint32_t extentWidth, uint32_t extentHeight) {
+    VulkanTimelineLayerPlacement p;
+    p.visible  = extentWidth > 0 && extentHeight > 0;
+    p.xPx      = 0;
+    p.yTopPx   = 0;
+    p.widthPx  = extentWidth;
+    p.heightPx = extentHeight;
+    p.u0 = 0.0f;
+    p.u1 = 1.0f;
+    p.v0 = 0.0f;
+    p.v1 = 1.0f;
+    return p;
+}
 
 bool CreateShaderModules(Temporaries& t, std::string* outError) {
     if (!t.vertex.create(t.device, shaders::kPassthroughVertSpv, shaders::kPassthroughVertSpvSize,
@@ -517,8 +535,11 @@ bool CreatePipeline(Temporaries& t, bool blend, VkPipeline* outPipeline, std::st
 }
 
 // Push constants: crop UV range in the vertex UV transform rows, identity
-// color matrix in the fragment half.
-VideoTransformFullPushConstants MakeLayerPushConstants(const VulkanTimelineLayerPlacement& p) {
+// color matrix in the fragment half. A black fill keeps the UV rows and
+// zeroes every colour row, forcing opaque black regardless of the sampled
+// texel (alpha offset 1).
+VideoTransformFullPushConstants MakeLayerPushConstants(const VulkanTimelineLayerPlacement& p,
+                                                       bool blackFill) {
     VideoTransformFullPushConstants pc{};
     pc.uv.uvTransform0[0] = p.u1 - p.u0;
     pc.uv.uvTransform0[1] = 0.0f;
@@ -528,6 +549,10 @@ VideoTransformFullPushConstants MakeLayerPushConstants(const VulkanTimelineLayer
     pc.uv.uvTransform1[1] = p.v1 - p.v0;
     pc.uv.uvTransform1[2] = 0.0f;
     pc.uv.uvTransform1[3] = p.v0;
+    if (blackFill) {
+        pc.color.offset[3] = 1.0f;
+        return pc;
+    }
     pc.color.row0[0] = 1.0f;
     pc.color.row1[1] = 1.0f;
     pc.color.row2[2] = 1.0f;
@@ -557,7 +582,7 @@ void RecordLayerDraw(VkCommandBuffer cb, VkPipelineLayout layout, const LayerDra
                                     draw.blendConstant, draw.blendConstant};
         vkCmdSetBlendConstants(cb, constants);
     }
-    const VideoTransformFullPushConstants pc = MakeLayerPushConstants(draw.placement);
+    const VideoTransformFullPushConstants pc = MakeLayerPushConstants(draw.placement, draw.blackFill);
     vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, static_cast<uint32_t>(sizeof(pc)), &pc);
     vkCmdDraw(cb, 3, 1, 0, 0);
@@ -721,18 +746,23 @@ bool VulkanTimelineTransitionCompositor::renderTransition(
     const double weightFrom = ClampUnit(geometry.blendWeightFrom);
     const double weightTo   = ClampUnit(geometry.blendWeightTo);
 
-    enum class DrawMode { kFromOnly, kToOnly, kLayeredOpaque, kMix };
+    // Draw model from the weights alone (see the header): a single-sided
+    // PARTIAL weight is a fade half-phase rendered as that layer blended over
+    // an explicit black base, never as an opaque from-only / to-only frame.
+    enum class DrawMode { kFromOnly, kToOnly, kLayeredOpaque, kMix, kFromFade, kToFade };
     DrawMode mode;
     if (weightTo <= 0.0) {
-        mode = DrawMode::kFromOnly;
+        mode = weightFrom >= 1.0 ? DrawMode::kFromOnly : DrawMode::kFromFade;
     } else if (weightFrom <= 0.0) {
-        mode = DrawMode::kToOnly;
+        mode = weightTo >= 1.0 ? DrawMode::kToOnly : DrawMode::kToFade;
     } else if (weightFrom >= 1.0 && weightTo >= 1.0) {
         mode = DrawMode::kLayeredOpaque;
     } else {
         mode = DrawMode::kMix;
     }
-    if (mode == DrawMode::kMix &&
+    const bool usesBlendPipeline =
+        mode == DrawMode::kMix || mode == DrawMode::kFromFade || mode == DrawMode::kToFade;
+    if (usesBlendPipeline &&
         (!IsIdentityRect(geometry.fromViewport) || !IsIdentityRect(geometry.toViewport))) {
         if (outError) *outError = kErrUnsupportedGeometry;
         return false;
@@ -747,7 +777,7 @@ bool VulkanTimelineTransitionCompositor::renderTransition(
               CreateDescriptorObjects(t, from, to, outError) &&
               CreateRenderPassObjects(t, target, outError) &&
               CreatePipeline(t, /*blend=*/false, &t.opaquePipeline, outError);
-    if (ok && mode == DrawMode::kMix) {
+    if (ok && usesBlendPipeline) {
         ok = CreatePipeline(t, /*blend=*/true, &t.blendPipeline, outError);
     }
 
@@ -788,6 +818,38 @@ bool VulkanTimelineTransitionCompositor::renderTransition(
                 draws[0].set       = t.setFrom;
                 draws[0].placement = ResolveVulkanTimelineLayerPlacement(
                     geometry.fromViewport, geometry.fromCrop, target.extentWidth, target.extentHeight);
+                draws[1].pipeline          = t.blendPipeline;
+                draws[1].set               = t.setTo;
+                draws[1].placement         = ResolveVulkanTimelineLayerPlacement(
+                    geometry.toViewport, geometry.toCrop, target.extentWidth, target.extentHeight);
+                draws[1].useBlendConstants = true;
+                draws[1].blendConstant     = static_cast<float>(weightTo);
+                drawCount = 2;
+                break;
+            case DrawMode::kFromFade:
+                // Fade first half: explicit full-canvas black base (opaque
+                // pipeline, black push constants), then "from" blended over it
+                // with constant alpha == blendWeightFrom. Identity viewport by
+                // contract. Weight 0 (the midpoint) yields a black frame.
+                draws[0].pipeline  = t.opaquePipeline;
+                draws[0].set       = t.setFrom;
+                draws[0].placement = FullCanvasPlacement(target.extentWidth, target.extentHeight);
+                draws[0].blackFill = true;
+                draws[1].pipeline          = t.blendPipeline;
+                draws[1].set               = t.setFrom;
+                draws[1].placement         = ResolveVulkanTimelineLayerPlacement(
+                    geometry.fromViewport, geometry.fromCrop, target.extentWidth, target.extentHeight);
+                draws[1].useBlendConstants = true;
+                draws[1].blendConstant     = static_cast<float>(weightFrom);
+                drawCount = 2;
+                break;
+            case DrawMode::kToFade:
+                // Fade second half: black base, then "to" blended over it with
+                // constant alpha == blendWeightTo.
+                draws[0].pipeline  = t.opaquePipeline;
+                draws[0].set       = t.setTo;
+                draws[0].placement = FullCanvasPlacement(target.extentWidth, target.extentHeight);
+                draws[0].blackFill = true;
                 draws[1].pipeline          = t.blendPipeline;
                 draws[1].set               = t.setTo;
                 draws[1].placement         = ResolveVulkanTimelineLayerPlacement(

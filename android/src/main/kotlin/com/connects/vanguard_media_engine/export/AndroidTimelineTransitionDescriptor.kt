@@ -14,12 +14,14 @@ import kotlin.math.roundToInt
 // decoders, MethodChannels, or rendering.
 //
 // Closed supported type set (Type): none (hard cut), dissolve/crossfade,
-// slideLeft/Right/Up/Down, wipeLeft/Right/Up/Down -- exactly the families the
-// native compositor math (vanguard::compositors::TransitionType) and the
-// production Vulkan transition seam implement. Any other type -- including
-// `fade`, whose fade-through-black semantics are not implemented by this
-// route -- fails closed with UNSUPPORTED_EXPORT_FEATURE; it is never silently
-// mapped to a dissolve or a hard cut.
+// fade (two-phase fade through black: the outgoing clip dips to black over
+// the first half of the overlap, the incoming clip rises from black over the
+// second half -- never aliased to a dissolve), slideLeft/Right/Up/Down,
+// wipeLeft/Right/Up/Down -- exactly the families the native compositor math
+// (vanguard::compositors::TransitionType) and the production Vulkan / GLES
+// transition seams implement. Any other type fails closed with
+// UNSUPPORTED_EXPORT_FEATURE; it is never silently mapped to a dissolve or a
+// hard cut.
 //
 // Validation rules for a non-hard-cut transition (all fail closed):
 //   - fromClipId / toClipId present, non-blank, and resolving to parsed clips
@@ -61,8 +63,12 @@ data class AndroidTimelineTransitionDescriptor(
 
     /**
      * Supported transition families. [nativeCode] is the wire code consumed by
-     * VanguardNativeBridge.renderAndroidTimelineVulkanExportTransitionFrame
-     * (0 = hard cut, never sent to that route).
+     * VanguardNativeBridge.renderAndroidTimelineVulkanExportTransitionFrame and
+     * VanguardNativeBridge.drawAndroidTimelineGlesTransitionExportFrame
+     * (0 = hard cut, never sent to those routes). Codes map 1:1 onto
+     * vanguard::compositors::TransitionType in the Android JNI translation
+     * units; FADE (10) is the two-phase fade-through-black family
+     * (TransitionType::kFade), distinct from CROSSFADE (1).
      */
     enum class Type(val wireNames: List<String>, val nativeCode: Int) {
         NONE(listOf("none"), 0),
@@ -75,6 +81,7 @@ data class AndroidTimelineTransitionDescriptor(
         SLIDE_RIGHT(listOf("slideRight"), 7),
         SLIDE_UP(listOf("slideUp"), 8),
         SLIDE_DOWN(listOf("slideDown"), 9),
+        FADE(listOf("fade"), 10),
         ;
 
         /** Canonical wire name (first alias). */

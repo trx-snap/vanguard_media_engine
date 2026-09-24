@@ -90,6 +90,12 @@ constexpr Rgb kCyan     = {0, 255, 255};
 constexpr Rgb kGreen    = {0, 255, 0};
 constexpr Rgb kBlack    = {0, 0, 0};
 constexpr Rgb kPurple   = {128, 0, 128}; // crossfade midpoint of red/blue
+// Fade (two-phase dip to black) expectations over the same solid red -> blue
+// pair: quarter = red at half weight, midpoint = black, three-quarter = blue
+// at half weight.
+constexpr Rgb kFadeHalfRed  = {128, 0, 0};
+constexpr Rgb kFadeBlack    = {0, 0, 0};
+constexpr Rgb kFadeHalfBlue = {0, 0, 128};
 constexpr Rgb kSentinel = {40, 40, 40};  // clear color; must never survive a tiling draw
 
 // Quadrant texture A (from): TL red, TR yellow, BL magenta, BR white.
@@ -524,6 +530,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     bool crossfadeStartOk = false;
     bool crossfadeMidOk = false;
     bool crossfadeEndOk = false;
+    bool fadeStartOk = false, fadeQuarterOk = false, fadeMidOk = false;
+    bool fadeThreeQuarterOk = false, fadeEndOk = false;
     bool slideLeftOk = false, slideRightOk = false, slideUpOk = false, slideDownOk = false;
     bool wipeLeftOk = false, wipeRightOk = false, wipeUpOk = false, wipeDownOk = false;
     bool texture2dTargetAcceptedOk = false;
@@ -673,6 +681,25 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                         kBlue, "crossfadeEnd", details, &laneFailure);
         if (!crossfadeEndOk) fail(laneFailure);
 
+        // ── Lane 2b: fade (dip to black) start / quarter / mid / three-quarter / end ──
+        // Single-sided partial weights must render the layer scaled over black,
+        // never as an opaque from-only / to-only frame; the midpoint is black.
+        fadeStartOk = RunUniformCase(compositor, solidRed, solidBlue, TransitionType::kFade, 0.0,
+                                     kRed, "fadeStart", details, &laneFailure);
+        if (!fadeStartOk) fail(laneFailure);
+        fadeQuarterOk = RunUniformCase(compositor, solidRed, solidBlue, TransitionType::kFade, 0.25,
+                                       kFadeHalfRed, "fadeQuarter", details, &laneFailure);
+        if (!fadeQuarterOk) fail(laneFailure);
+        fadeMidOk = RunUniformCase(compositor, solidRed, solidBlue, TransitionType::kFade, 0.5,
+                                   kFadeBlack, "fadeMid", details, &laneFailure);
+        if (!fadeMidOk) fail(laneFailure);
+        fadeThreeQuarterOk = RunUniformCase(compositor, solidRed, solidBlue, TransitionType::kFade, 0.75,
+                                            kFadeHalfBlue, "fadeThreeQuarter", details, &laneFailure);
+        if (!fadeThreeQuarterOk) fail(laneFailure);
+        fadeEndOk = RunUniformCase(compositor, solidRed, solidBlue, TransitionType::kFade, 1.0,
+                                   kBlue, "fadeEnd", details, &laneFailure);
+        if (!fadeEndOk) fail(laneFailure);
+
         // ── Lane 3: slides at p=0.5 (viewport translation, clipped UVs) ────
         // Expected canvas quadrant ownership derived by hand from
         // ComputeTransitionGeometry: slide-left shows A's right half on the
@@ -750,14 +777,16 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         // GL_TEXTURE_2D fully accepted: every lane 2-4 draw above went
         // through the 2D+2D route.
         texture2dTargetAcceptedOk = hardCutNoneOk && crossfadeStartOk && crossfadeMidOk &&
-                                    crossfadeEndOk && slideLeftOk && slideRightOk &&
+                                    crossfadeEndOk && fadeStartOk && fadeQuarterOk && fadeMidOk && fadeThreeQuarterOk && fadeEndOk &&
+                                    slideLeftOk && slideRightOk &&
                                     slideUpOk && slideDownOk && wipeLeftOk && wipeRightOk &&
                                     wipeUpOk && wipeDownOk;
         if (!texture2dTargetAcceptedOk) fail("texture_2d_target_route_not_fully_accepted");
 
         // GL_TEXTURE_EXTERNAL_OES structural route: every sampler permutation
-        // (OES from / OES to / both, mix and opaque-layer shaders) must pass
-        // target validation and, where the extension exists, compile/link.
+        // (OES from / OES to / both; mix, opaque-layer and weighted fade-layer
+        // shaders) must pass target validation and, where the extension
+        // exists, compile/link.
         // Never-imaged external texture names are used; no SurfaceTexture or
         // decoder OES frame is claimed.
         {
@@ -766,13 +795,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                 uint32_t targetFrom;
                 uint32_t targetTo;
                 TransitionType type;
+                double progress;
             };
             const OesCase cases[] = {
-                {"oesFromMix",     kTargetOes, kTarget2D,  TransitionType::kCrossfade},
-                {"oesToMix",       kTarget2D,  kTargetOes, TransitionType::kCrossfade},
-                {"oesBothMix",     kTargetOes, kTargetOes, TransitionType::kCrossfade},
-                {"oesFromOpaque",  kTargetOes, kTarget2D,  TransitionType::kSlideLeft},
-                {"oesToOpaque",    kTarget2D,  kTargetOes, TransitionType::kWipeLeft},
+                {"oesFromMix",     kTargetOes, kTarget2D,  TransitionType::kCrossfade, 0.5},
+                {"oesToMix",       kTarget2D,  kTargetOes, TransitionType::kCrossfade, 0.5},
+                {"oesBothMix",     kTargetOes, kTargetOes, TransitionType::kCrossfade, 0.5},
+                {"oesFromOpaque",  kTargetOes, kTarget2D,  TransitionType::kSlideLeft, 0.5},
+                {"oesToOpaque",    kTarget2D,  kTargetOes, TransitionType::kWipeLeft,  0.5},
+                // Weighted single-sampler (fade half-phase) shader, OES on the
+                // faded side: first half fades "from", second half fades "to".
+                {"oesFromFade",    kTargetOes, kTarget2D,  TransitionType::kFade,      0.25},
+                {"oesToFade",      kTarget2D,  kTargetOes, TransitionType::kFade,      0.75},
             };
             bool structuralOk = true;
             for (const OesCase& c : cases) {
@@ -783,7 +817,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                 const GLuint texTo   = c.targetTo == kTargetOes ? oesNameTo : solidBlue;
                 const bool drawOk = compositor.drawTransition(
                     texFrom, c.targetFrom, texTo, c.targetTo,
-                    kSurfaceWidth, kSurfaceHeight, GeometryFor(c.type, 0.5), &oesErr);
+                    kSurfaceWidth, kSurfaceHeight, GeometryFor(c.type, c.progress), &oesErr);
                 const bool rejectedAsUnsupported = oesErr == kErrUnsupportedTarget;
                 const bool compileOrLinkFailed = oesErr == kErrCompileFailed || oesErr == kErrLinkFailed;
                 details.Bool((std::string(c.name) + "DrawOk").c_str(), drawOk);
@@ -814,6 +848,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         invalidTextureRejectedOk && invalidDimensionsRejectedOk &&
         nonFiniteProgressRejectedOk && nonFiniteWeightRejectedOk && unsupportedTargetRejectedOk &&
         hardCutNoneOk && crossfadeStartOk && crossfadeMidOk && crossfadeEndOk &&
+        fadeStartOk && fadeQuarterOk && fadeMidOk && fadeThreeQuarterOk && fadeEndOk &&
         slideLeftOk && slideRightOk && slideUpOk && slideDownOk &&
         wipeLeftOk && wipeRightOk && wipeUpOk && wipeDownOk &&
         texture2dTargetAcceptedOk && oesTargetStructuralOk && unsupportedTargetStillRejectedOk &&
@@ -836,6 +871,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "\"crossfadeStartOk\":" << BoolStr(crossfadeStartOk) << ","
         << "\"crossfadeMidOk\":" << BoolStr(crossfadeMidOk) << ","
         << "\"crossfadeEndOk\":" << BoolStr(crossfadeEndOk) << ","
+        << "\"fadeStartOk\":" << BoolStr(fadeStartOk) << ","
+        << "\"fadeQuarterOk\":" << BoolStr(fadeQuarterOk) << ","
+        << "\"fadeMidOk\":" << BoolStr(fadeMidOk) << ","
+        << "\"fadeThreeQuarterOk\":" << BoolStr(fadeThreeQuarterOk) << ","
+        << "\"fadeEndOk\":" << BoolStr(fadeEndOk) << ","
         << "\"slideLeftOk\":" << BoolStr(slideLeftOk) << ","
         << "\"slideRightOk\":" << BoolStr(slideRightOk) << ","
         << "\"slideUpOk\":" << BoolStr(slideUpOk) << ","

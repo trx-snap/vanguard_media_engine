@@ -40,12 +40,18 @@ namespace render {
 // Draw model (see render_transform.h VideoTransitionFrameTransform doc).
 // ---------------------------------------------------------------------------
 
-enum class VulkanTransitionDrawMode { kFromOnly, kToOnly, kPaintOver, kCrossfade };
+// kFromFade / kToFade: a single-sided PARTIAL weight (the other side <= 0,
+// this side < 1) is a fade-through-black half-phase -- that one layer is
+// constant-alpha blended over an explicit full-canvas black base with
+// alpha == its weight (see AppendVulkanTransitionBlackCanvas). Hard cut
+// (1,0), the crossfade endpoints (1,0)/(0,1), the crossfade interior and the
+// opaque (1,1) paint-over pair resolve exactly as before.
+enum class VulkanTransitionDrawMode { kFromOnly, kToOnly, kPaintOver, kCrossfade, kFromFade, kToFade };
 
 // Resolves the draw model purely from the descriptor's weights. Returns
 // false (fail closed, nothing rendered) when any weight / progress is
-// non-finite, or when a crossfade carries non-identity viewport / crop
-// geometry. [outMode] is only written on success.
+// non-finite, or when a crossfade or fade half-phase carries non-identity
+// viewport / crop geometry. [outMode] is only written on success.
 bool ResolveVulkanTransitionDrawMode(const VideoTransitionFrameTransform& transition,
                                      VulkanTransitionDrawMode* outMode);
 
@@ -114,6 +120,18 @@ bool AppendVulkanTransitionLayer(VulkanTransitionPassParams* params,
                                  const VulkanTransitionLayerResources& res,
                                  const VulkanTransitionLayerPlacement& placement,
                                  bool includeBands);
+
+// Appends one full-canvas opaque black draw (black push constants, blend
+// constants forced off) through [res]'s pipeline / layout / descriptor set:
+// the explicit black base a fade half-phase layer is then blended over, so
+// the dip to black never depends on the pass clear colour. [res.pipeline]
+// must be an OPAQUE pipeline for that layout (never the constant-alpha blend
+// variant). Returns false only when the draw list would exceed
+// kVulkanTransitionMaxLayerDraws or the extent is zero.
+bool AppendVulkanTransitionBlackCanvas(VulkanTransitionPassParams* params,
+                                       const VulkanTransitionLayerResources& res,
+                                       uint32_t extentWidth,
+                                       uint32_t extentHeight);
 
 // Constant-alpha blend variant of VulkanGraphicsPipeline::create (same
 // fullscreen-triangle fixed state; src = CONSTANT_ALPHA,

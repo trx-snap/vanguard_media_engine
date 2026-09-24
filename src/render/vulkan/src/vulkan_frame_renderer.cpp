@@ -288,6 +288,9 @@ struct VulkanFrameRenderer::Impl {
     std::unique_ptr<VulkanGraphicsPipeline> transitionFromPipeline;
     std::unique_ptr<VulkanGraphicsPipeline> transitionToOpaquePipeline;
     VkPipeline transitionToBlendPipeline = VK_NULL_HANDLE;
+    // Fade first half only: "from" constant-alpha blend variant (same
+    // lifecycle as transitionToBlendPipeline).
+    VkPipeline transitionFromBlendPipeline = VK_NULL_HANDLE;
 
     // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: lazily constructed on the first
     // beauty-enabled renderFrame() call. Owns its own crop/placement pipeline
@@ -454,7 +457,8 @@ struct VulkanFrameRenderer::Impl {
     bool hasTransitionPipelines() const {
         return transitionFromPipeline != nullptr ||
                transitionToOpaquePipeline != nullptr ||
-               transitionToBlendPipeline != VK_NULL_HANDLE;
+               transitionToBlendPipeline != VK_NULL_HANDLE ||
+               transitionFromBlendPipeline != VK_NULL_HANDLE;
     }
 
     void invalidateTransitionPipelines() {
@@ -471,6 +475,12 @@ struct VulkanFrameRenderer::Impl {
                 vkDestroyPipeline(device, transitionToBlendPipeline, nullptr);
             }
             transitionToBlendPipeline = VK_NULL_HANDLE;
+        }
+        if (transitionFromBlendPipeline != VK_NULL_HANDLE) {
+            if (device != VK_NULL_HANDLE) {
+                vkDestroyPipeline(device, transitionFromBlendPipeline, nullptr);
+            }
+            transitionFromBlendPipeline = VK_NULL_HANDLE;
         }
     }
 
@@ -1979,7 +1989,7 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     VulkanTransitionDrawMode mode;
     if (!ResolveVulkanTransitionDrawMode(transition, &mode)) {
         VGLOG_VFR("renderTransitionFrame: non-finite weights/progress or non-identity "
-                  "crossfade geometry; failing closed");
+                  "crossfade/fade geometry; failing closed");
         return RenderFrameResult::kVulkanFailure;
     }
 
@@ -2030,10 +2040,16 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     }
     s.invalidatePipeline();
 
-    const bool needFrom = mode != VulkanTransitionDrawMode::kToOnly;
+    // Fade half-phases: the opaque pipeline of the faded side draws the
+    // explicit black base, its blend variant draws the layer over it.
+    const bool needFrom = mode != VulkanTransitionDrawMode::kToOnly &&
+                          mode != VulkanTransitionDrawMode::kToFade;
+    const bool needFromBlend = mode == VulkanTransitionDrawMode::kFromFade;
     const bool needToOpaque =
-        mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver;
-    const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade;
+        mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver ||
+        mode == VulkanTransitionDrawMode::kToFade;
+    const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade ||
+                             mode == VulkanTransitionDrawMode::kToFade;
     // P5-BEAUTY-V2-TRANSITION-COMP: a beautified layer is drawn through its
     // own VulkanBeautyFrameRenderer placement pipeline (built later, after
     // prepareTransitionLayer runs), never through an AHB-import-layout
@@ -2061,6 +2077,15 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
                                                  coreShaders.vertex.get(),
                                                  coreShaders.fragment.get(),
                                                  &s.transitionToBlendPipeline)) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+    if (needFromBlend && !fromBeauty.enabled) {
+        if (!CreateVulkanTransitionBlendPipeline(s.device, fromLayout, renderPass,
+                                                 coreShaders.vertex.get(),
+                                                 coreShaders.fragment.get(),
+                                                 &s.transitionFromBlendPipeline)) {
             s.invalidatePipeline();
             return RenderFrameResult::kVulkanFailure;
         }
@@ -2134,6 +2159,9 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
 
     VulkanTransitionLayerResources fromRes;
     VulkanTransitionLayerResources toRes;
+    // Opaque "to" pipeline (AHB import or Beauty placement) for the fade
+    // second half's black base; toRes itself carries the blend variant then.
+    VkPipeline toOpaquePipeline = VK_NULL_HANDLE;
 
     if (!anyBeauty) {
         // Byte-identical to the pre-existing non-beauty transition path.
@@ -2153,6 +2181,8 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
         } else if (s.transitionToOpaquePipeline) {
             toRes.pipeline = s.transitionToOpaquePipeline->get();
         }
+        toOpaquePipeline =
+            s.transitionToOpaquePipeline ? s.transitionToOpaquePipeline->get() : VK_NULL_HANDLE;
 
         bool planOk = true;
         switch (mode) {
@@ -2167,6 +2197,32 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
                 planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
                          AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
                 break;
+            case VulkanTransitionDrawMode::kFromFade: {
+                // Fade first half: explicit full-canvas black base through the
+                // opaque "from" resources, then "from" constant-alpha blended
+                // over it with alpha == blendWeightFrom (weight 0 == black).
+                VulkanTransitionLayerResources fromFade = fromRes;
+                fromFade.pipeline = s.transitionFromBlendPipeline;
+                fromFade.useBlendConstants = true;
+                fromFade.blendConstant =
+                    static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightFrom)));
+                planOk = fromFade.pipeline != VK_NULL_HANDLE &&
+                         AppendVulkanTransitionBlackCanvas(&passParams, fromRes, extentWidth, extentHeight) &&
+                         AppendVulkanTransitionLayer(&passParams, fromFade, fromPlacement, false);
+                break;
+            }
+            case VulkanTransitionDrawMode::kToFade: {
+                // Fade second half: black base through the opaque "to"
+                // pipeline, then "to" blended over it (toRes already carries
+                // the blend pipeline and alpha == blendWeightTo).
+                VulkanTransitionLayerResources toFill = toRes;
+                toFill.pipeline = toOpaquePipeline;
+                toFill.useBlendConstants = false;
+                planOk = toOpaquePipeline != VK_NULL_HANDLE && toRes.useBlendConstants &&
+                         AppendVulkanTransitionBlackCanvas(&passParams, toFill, extentWidth, extentHeight) &&
+                         AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+                break;
+            }
         }
         if (!planOk) {
             return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
@@ -2229,6 +2285,14 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
                 return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
             }
         }
+        // Same layout rule for a beautified "from" layer in a fade first half.
+        if (needFromBlend && fromBeauty.enabled) {
+            if (!CreateVulkanTransitionBlendPipeline(s.device, fromBeautyRes.pipelineLayout, renderPass,
+                                                     coreShaders.vertex.get(), coreShaders.fragment.get(),
+                                                     &s.transitionFromBlendPipeline)) {
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
 
         if (fromBeauty.enabled) {
             fromRes.pipeline = fromBeautyRes.pipeline;
@@ -2261,6 +2325,9 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
         } else if (s.transitionToOpaquePipeline) {
             toRes.pipeline = s.transitionToOpaquePipeline->get();
         }
+        toOpaquePipeline = toBeauty.enabled
+            ? toBeautyRes.pipeline
+            : (s.transitionToOpaquePipeline ? s.transitionToOpaquePipeline->get() : VK_NULL_HANDLE);
 
         bool planOk = true;
         switch (mode) {
@@ -2275,6 +2342,32 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
                 planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
                          AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
                 break;
+            case VulkanTransitionDrawMode::kFromFade: {
+                // Fade first half: explicit full-canvas black base through the
+                // opaque "from" resources, then "from" constant-alpha blended
+                // over it with alpha == blendWeightFrom (weight 0 == black).
+                VulkanTransitionLayerResources fromFade = fromRes;
+                fromFade.pipeline = s.transitionFromBlendPipeline;
+                fromFade.useBlendConstants = true;
+                fromFade.blendConstant =
+                    static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightFrom)));
+                planOk = fromFade.pipeline != VK_NULL_HANDLE &&
+                         AppendVulkanTransitionBlackCanvas(&passParams, fromRes, extentWidth, extentHeight) &&
+                         AppendVulkanTransitionLayer(&passParams, fromFade, fromPlacement, false);
+                break;
+            }
+            case VulkanTransitionDrawMode::kToFade: {
+                // Fade second half: black base through the opaque "to"
+                // pipeline, then "to" blended over it (toRes already carries
+                // the blend pipeline and alpha == blendWeightTo).
+                VulkanTransitionLayerResources toFill = toRes;
+                toFill.pipeline = toOpaquePipeline;
+                toFill.useBlendConstants = false;
+                planOk = toOpaquePipeline != VK_NULL_HANDLE && toRes.useBlendConstants &&
+                         AppendVulkanTransitionBlackCanvas(&passParams, toFill, extentWidth, extentHeight) &&
+                         AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+                break;
+            }
         }
         if (!planOk) {
             return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
@@ -2503,7 +2596,7 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     VulkanTransitionDrawMode mode;
     if (!ResolveVulkanTransitionDrawMode(transition, &mode)) {
         VGLOG_VFR("renderTransitionFrame(overlay): non-finite weights/progress or non-identity "
-                  "crossfade geometry; failing closed");
+                  "crossfade/fade geometry; failing closed");
         return RenderFrameResult::kVulkanFailure;
     }
 
@@ -2566,10 +2659,16 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     }
     s.invalidatePipeline();
 
-    const bool needFrom = mode != VulkanTransitionDrawMode::kToOnly;
+    // Fade half-phases: the opaque pipeline of the faded side draws the
+    // explicit black base, its blend variant draws the layer over it.
+    const bool needFrom = mode != VulkanTransitionDrawMode::kToOnly &&
+                          mode != VulkanTransitionDrawMode::kToFade;
+    const bool needFromBlend = mode == VulkanTransitionDrawMode::kFromFade;
     const bool needToOpaque =
-        mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver;
-    const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade;
+        mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver ||
+        mode == VulkanTransitionDrawMode::kToFade;
+    const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade ||
+                             mode == VulkanTransitionDrawMode::kToFade;
     // A beautified layer is drawn through its own VulkanBeautyFrameRenderer
     // placement pipeline (built later, after prepareTransitionLayer runs),
     // never through an AHB-import-layout pipeline built here.
@@ -2596,6 +2695,15 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
                                                  coreShaders.vertex.get(),
                                                  coreShaders.fragment.get(),
                                                  &s.transitionToBlendPipeline)) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+    if (needFromBlend && !fromBeauty.enabled) {
+        if (!CreateVulkanTransitionBlendPipeline(s.device, fromLayout, renderPass,
+                                                 coreShaders.vertex.get(),
+                                                 coreShaders.fragment.get(),
+                                                 &s.transitionFromBlendPipeline)) {
             s.invalidatePipeline();
             return RenderFrameResult::kVulkanFailure;
         }
@@ -2679,6 +2787,9 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
 
     VulkanTransitionLayerResources fromRes;
     VulkanTransitionLayerResources toRes;
+    // Opaque "to" pipeline (AHB import or Beauty placement) for the fade
+    // second half's black base; toRes itself carries the blend variant then.
+    VkPipeline toOpaquePipeline = VK_NULL_HANDLE;
 
     if (!anyBeauty) {
         // Byte-identical construction to the pre-existing non-beauty
@@ -2699,6 +2810,8 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
         } else if (s.transitionToOpaquePipeline) {
             toRes.pipeline = s.transitionToOpaquePipeline->get();
         }
+        toOpaquePipeline =
+            s.transitionToOpaquePipeline ? s.transitionToOpaquePipeline->get() : VK_NULL_HANDLE;
     } else {
         // Beauty transition path: vkBeginCommandBuffer already happened
         // above; run the beauty prepasses and resource construction exactly
@@ -2751,6 +2864,15 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
                 return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
             }
         }
+        // Same layout rule for a beautified "from" layer in a fade first half.
+        if (needFromBlend && fromBeauty.enabled) {
+            if (!CreateVulkanTransitionBlendPipeline(s.device, fromBeautyRes.pipelineLayout, renderPass,
+                                                     coreShaders.vertex.get(), coreShaders.fragment.get(),
+                                                     &s.transitionFromBlendPipeline)) {
+                abandonRecordingCommandBuffer(frame->commandBuffer);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
 
         if (fromBeauty.enabled) {
             fromRes.pipeline = fromBeautyRes.pipeline;
@@ -2783,6 +2905,9 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
         } else if (s.transitionToOpaquePipeline) {
             toRes.pipeline = s.transitionToOpaquePipeline->get();
         }
+        toOpaquePipeline = toBeauty.enabled
+            ? toBeautyRes.pipeline
+            : (s.transitionToOpaquePipeline ? s.transitionToOpaquePipeline->get() : VK_NULL_HANDLE);
     }
 
     // Shared transition mode plan switch: identical to the non-beauty and
@@ -2800,6 +2925,32 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
             planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
                      AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
             break;
+        case VulkanTransitionDrawMode::kFromFade: {
+            // Fade first half: explicit full-canvas black base through the
+            // opaque "from" resources, then "from" constant-alpha blended
+            // over it with alpha == blendWeightFrom (weight 0 == black).
+            VulkanTransitionLayerResources fromFade = fromRes;
+            fromFade.pipeline = s.transitionFromBlendPipeline;
+            fromFade.useBlendConstants = true;
+            fromFade.blendConstant =
+                static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightFrom)));
+            planOk = fromFade.pipeline != VK_NULL_HANDLE &&
+                     AppendVulkanTransitionBlackCanvas(&passParams, fromRes, extentWidth, extentHeight) &&
+                     AppendVulkanTransitionLayer(&passParams, fromFade, fromPlacement, false);
+            break;
+        }
+        case VulkanTransitionDrawMode::kToFade: {
+            // Fade second half: black base through the opaque "to"
+            // pipeline, then "to" blended over it (toRes already carries
+            // the blend pipeline and alpha == blendWeightTo).
+            VulkanTransitionLayerResources toFill = toRes;
+            toFill.pipeline = toOpaquePipeline;
+            toFill.useBlendConstants = false;
+            planOk = toOpaquePipeline != VK_NULL_HANDLE && toRes.useBlendConstants &&
+                     AppendVulkanTransitionBlackCanvas(&passParams, toFill, extentWidth, extentHeight) &&
+                     AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+            break;
+        }
     }
     if (!planOk) {
         // The command buffer is recording but no render pass has been opened

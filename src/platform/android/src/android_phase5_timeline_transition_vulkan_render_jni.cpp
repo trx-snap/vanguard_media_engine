@@ -94,6 +94,12 @@ constexpr Rgb kCyan     = {0, 255, 255};
 constexpr Rgb kGreen    = {0, 255, 0};
 constexpr Rgb kBlack    = {0, 0, 0};
 constexpr Rgb kPurple   = {128, 0, 128}; // crossfade midpoint of red/blue
+// Fade (two-phase dip to black) expectations over the same solid red -> blue
+// pair: quarter = red at half weight, midpoint = black, three-quarter = blue
+// at half weight.
+constexpr Rgb kFadeHalfRed  = {128, 0, 0};
+constexpr Rgb kFadeBlack    = {0, 0, 0};
+constexpr Rgb kFadeHalfBlue = {0, 0, 128};
 constexpr Rgb kSentinel = {40, 40, 40};  // clear color; must never survive a tiling draw
 
 // Quadrant texture A (from): TL red, TR yellow, BL magenta, BR white.
@@ -847,6 +853,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     bool crossfadeStartOk = false;
     bool crossfadeMidOk = false;
     bool crossfadeEndOk = false;
+    bool fadeStartOk = false, fadeQuarterOk = false, fadeMidOk = false;
+    bool fadeThreeQuarterOk = false, fadeEndOk = false;
     bool slideLeftOk = false, slideRightOk = false, slideUpOk = false, slideDownOk = false;
     bool wipeLeftOk = false, wipeRightOk = false, wipeUpOk = false, wipeDownOk = false;
     bool helperResourcesReleasedOk = false;
@@ -1027,6 +1035,25 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                         kBlue, "crossfadeEnd", details, &laneFailure);
         if (!crossfadeEndOk) fail(laneFailure);
 
+        // ── Lane 2b: fade (dip to black) start / quarter / mid / three-quarter / end ──
+        // Single-sided partial weights must render the layer scaled over black,
+        // never as an opaque from-only / to-only frame; the midpoint is black.
+        fadeStartOk = RunUniformCase(ctx, solidRed, solidBlue, TransitionType::kFade, 0.0,
+                                     kRed, "fadeStart", details, &laneFailure);
+        if (!fadeStartOk) fail(laneFailure);
+        fadeQuarterOk = RunUniformCase(ctx, solidRed, solidBlue, TransitionType::kFade, 0.25,
+                                       kFadeHalfRed, "fadeQuarter", details, &laneFailure);
+        if (!fadeQuarterOk) fail(laneFailure);
+        fadeMidOk = RunUniformCase(ctx, solidRed, solidBlue, TransitionType::kFade, 0.5,
+                                   kFadeBlack, "fadeMid", details, &laneFailure);
+        if (!fadeMidOk) fail(laneFailure);
+        fadeThreeQuarterOk = RunUniformCase(ctx, solidRed, solidBlue, TransitionType::kFade, 0.75,
+                                            kFadeHalfBlue, "fadeThreeQuarter", details, &laneFailure);
+        if (!fadeThreeQuarterOk) fail(laneFailure);
+        fadeEndOk = RunUniformCase(ctx, solidRed, solidBlue, TransitionType::kFade, 1.0,
+                                   kBlue, "fadeEnd", details, &laneFailure);
+        if (!fadeEndOk) fail(laneFailure);
+
         // ── Lane 3: slides at p=0.5 (viewport translation, clipped UVs) ────
         // Expected canvas quadrant ownership derived by hand from
         // ComputeTransitionGeometry (top-left canvas coordinates): slide-left
@@ -1104,6 +1131,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         invalidHandleRejectedOk && invalidDimensionsRejectedOk &&
         nonFiniteProgressRejectedOk && nonFiniteWeightRejectedOk && invalidGeometryRejectedOk &&
         hardCutNoneOk && crossfadeStartOk && crossfadeMidOk && crossfadeEndOk &&
+        fadeStartOk && fadeQuarterOk && fadeMidOk && fadeThreeQuarterOk && fadeEndOk &&
         slideLeftOk && slideRightOk && slideUpOk && slideDownOk &&
         wipeLeftOk && wipeRightOk && wipeUpOk && wipeDownOk &&
         helperResourcesReleasedOk && diagnosticTeardownOk;
@@ -1127,6 +1155,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "\"crossfadeStartOk\":" << BoolStr(crossfadeStartOk) << ","
         << "\"crossfadeMidOk\":" << BoolStr(crossfadeMidOk) << ","
         << "\"crossfadeEndOk\":" << BoolStr(crossfadeEndOk) << ","
+        << "\"fadeStartOk\":" << BoolStr(fadeStartOk) << ","
+        << "\"fadeQuarterOk\":" << BoolStr(fadeQuarterOk) << ","
+        << "\"fadeMidOk\":" << BoolStr(fadeMidOk) << ","
+        << "\"fadeThreeQuarterOk\":" << BoolStr(fadeThreeQuarterOk) << ","
+        << "\"fadeEndOk\":" << BoolStr(fadeEndOk) << ","
         << "\"slideLeftOk\":" << BoolStr(slideLeftOk) << ","
         << "\"slideRightOk\":" << BoolStr(slideRightOk) << ","
         << "\"slideUpOk\":" << BoolStr(slideUpOk) << ","

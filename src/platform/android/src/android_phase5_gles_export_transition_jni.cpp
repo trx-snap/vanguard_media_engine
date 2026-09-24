@@ -27,12 +27,12 @@
 // unit is one of the composition roots that links the compositors and
 // vanguard_render_gles libraries together (they never include each other).
 //
-// [transitionTypeCode] must be one of the nine wire codes
+// [transitionTypeCode] must be one of the ten wire codes
 // AndroidTimelineTransitionDescriptor.Type defines for a non-hard-cut
 // transition (1=crossfade, 2..5=wipeLeft/Right/Up/Down, 6..9=slideLeft/
-// Right/Up/Down; 0/hard-cut is never sent to this route by the Kotlin
-// caller). Any other value fails closed before any GL call with
-// "unsupported_transition_type:code=<n>".
+// Right/Up/Down, 10=fade (two-phase dip to black); 0/hard-cut is never sent
+// to this route by the Kotlin caller). Any other value fails closed before
+// any GL call with "unsupported_transition_type:code=<n>".
 //
 // Production route only for the narrow GLES-transition-eligible shape gated
 // by AndroidExportRenderBackendSelector.ExportRenderScope.glesTransitionEligible
@@ -79,21 +79,22 @@ std::string BuildStatus(bool ok, const std::string& detail) {
     return ok ? ("status=OK;" + detail) : ("status=FAIL;reason=" + detail);
 }
 
-// Maps AndroidTimelineTransitionDescriptor.Type.nativeCode (1..9) to the
+// Maps AndroidTimelineTransitionDescriptor.Type.nativeCode (1..10) to the
 // matching vanguard::compositors::TransitionType. Returns false (leaving
 // *outType untouched) for 0 (hard cut, never sent to this route by the
 // Kotlin caller) or any code outside the closed wire set.
 bool TransitionTypeFromWireCode(jint code, TransitionType* outType) {
     switch (code) {
-        case 1: *outType = TransitionType::kCrossfade;  return true;
-        case 2: *outType = TransitionType::kWipeLeft;   return true;
-        case 3: *outType = TransitionType::kWipeRight;  return true;
-        case 4: *outType = TransitionType::kWipeUp;     return true;
-        case 5: *outType = TransitionType::kWipeDown;   return true;
-        case 6: *outType = TransitionType::kSlideLeft;  return true;
-        case 7: *outType = TransitionType::kSlideRight; return true;
-        case 8: *outType = TransitionType::kSlideUp;    return true;
-        case 9: *outType = TransitionType::kSlideDown;  return true;
+        case 1:  *outType = TransitionType::kCrossfade;  return true;
+        case 2:  *outType = TransitionType::kWipeLeft;   return true;
+        case 3:  *outType = TransitionType::kWipeRight;  return true;
+        case 4:  *outType = TransitionType::kWipeUp;     return true;
+        case 5:  *outType = TransitionType::kWipeDown;   return true;
+        case 6:  *outType = TransitionType::kSlideLeft;  return true;
+        case 7:  *outType = TransitionType::kSlideRight; return true;
+        case 8:  *outType = TransitionType::kSlideUp;    return true;
+        case 9:  *outType = TransitionType::kSlideDown;  return true;
+        case 10: *outType = TransitionType::kFade;       return true;
         default: return false;
     }
 }

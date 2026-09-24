@@ -355,6 +355,7 @@ bool TransitionTypeFromCode(jint code,
         case 7: *outType = T::kSlideRight; *outName = "slideRight"; return true;
         case 8: *outType = T::kSlideUp;    *outName = "slideUp";    return true;
         case 9: *outType = T::kSlideDown;  *outName = "slideDown";  return true;
+        case 10: *outType = T::kFade;      *outName = "fade";       return true;
         default: *outName = "unknown"; return false;
     }
 }

@@ -31,18 +31,31 @@ bool ResolveVulkanTransitionDrawMode(const VideoTransitionFrameTransform& transi
         return false;
     }
     VulkanTransitionDrawMode mode;
+    bool requiresIdentityGeometry = false;
     if (wTo <= 0.0) {
-        mode = VulkanTransitionDrawMode::kFromOnly;
+        if (wFrom >= 1.0) {
+            mode = VulkanTransitionDrawMode::kFromOnly;
+        } else {
+            mode = VulkanTransitionDrawMode::kFromFade;
+            requiresIdentityGeometry = true;
+        }
     } else if (wFrom <= 0.0) {
-        mode = VulkanTransitionDrawMode::kToOnly;
+        if (wTo >= 1.0) {
+            mode = VulkanTransitionDrawMode::kToOnly;
+        } else {
+            mode = VulkanTransitionDrawMode::kToFade;
+            requiresIdentityGeometry = true;
+        }
     } else if (wFrom >= 1.0 && wTo >= 1.0) {
         mode = VulkanTransitionDrawMode::kPaintOver;
     } else {
         mode = VulkanTransitionDrawMode::kCrossfade;
-        if (!transition.fromViewport.isIdentity() || !transition.toViewport.isIdentity() ||
-            !transition.fromCrop.isIdentity() || !transition.toCrop.isIdentity()) {
-            return false;
-        }
+        requiresIdentityGeometry = true;
+    }
+    if (requiresIdentityGeometry &&
+        (!transition.fromViewport.isIdentity() || !transition.toViewport.isIdentity() ||
+         !transition.fromCrop.isIdentity() || !transition.toCrop.isIdentity())) {
+        return false;
     }
     *outMode = mode;
     return true;
@@ -227,6 +240,22 @@ bool AppendVulkanTransitionLayer(VulkanTransitionPassParams* params,
         }
     }
     return appendTransitionDraw(params, res, placement.viewport, C, res.pushConstants);
+}
+
+bool AppendVulkanTransitionBlackCanvas(VulkanTransitionPassParams* params,
+                                       const VulkanTransitionLayerResources& res,
+                                       uint32_t extentWidth,
+                                       uint32_t extentHeight) {
+    if (params == nullptr || extentWidth == 0 || extentHeight == 0) return false;
+    VulkanTransitionLayerResources fill = res;
+    fill.useBlendConstants = false;
+    fill.blendConstant = 0.0f;
+    VulkanTransitionPixelRect canvas;
+    canvas.x = 0;
+    canvas.y = 0;
+    canvas.right = static_cast<int32_t>(extentWidth);
+    canvas.bottom = static_cast<int32_t>(extentHeight);
+    return appendTransitionDraw(params, fill, canvas, canvas, makeBlackPushConstants());
 }
 
 // ---------------------------------------------------------------------------

@@ -298,6 +298,59 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         if (!crossfadeEndOk) fail("crossfade_end_mismatch");
     }
 
+    // ── Scenario 4b: fade (two-phase dip to black) quarter / mid / three-quarter ──
+    // Single-sided weights over identity geometry: first half from = 1 - 2p,
+    // to = 0; second half from = 0, to = 2p - 1; both zero at exactly 0.5.
+    bool fadeQuarterOk      = false;
+    bool fadeMidOk          = false;
+    bool fadeThreeQuarterOk = false;
+    {
+        VGTimelineCompositorNode n("fade");
+        n.setClips({MakeClip("A", 0, 2000000, 0, 1.0),
+                    MakeClip("B", 1500000, 2000000, 0, 1.0)});
+        n.setTransitions({MakeTransition("fade", TransitionType::kFade,
+                                         "A", "B", 1500000, 500000)});
+
+        const auto sQ = n.evaluate(1625000);
+        fadeQuarterOk =
+            sQ.hasActiveClip && sQ.transition.isTransitionActive &&
+            sQ.transition.type == TransitionType::kFade &&
+            sQ.primaryClipId == "A" && sQ.secondaryClipId == "B" &&
+            NearlyEqual(sQ.transition.progress, 0.25) &&
+            NearlyEqual(sQ.transition.blendWeightFrom, 0.5) &&
+            NearlyEqual(sQ.transition.blendWeightTo, 0.0) &&
+            RectIsIdentity(sQ.transition.fromViewport) &&
+            RectIsIdentity(sQ.transition.toViewport) &&
+            RectIsIdentity(sQ.transition.fromCrop) &&
+            RectIsIdentity(sQ.transition.toCrop) &&
+            NearlyEqual(n.blendWeightAt(1625000), 0.5);
+        if (!fadeQuarterOk) fail("fade_quarter_mismatch");
+
+        const auto sMid = n.evaluate(1750000);
+        fadeMidOk =
+            sMid.hasActiveClip && sMid.transition.isTransitionActive &&
+            sMid.transition.type == TransitionType::kFade &&
+            NearlyEqual(sMid.transition.progress, 0.5) &&
+            NearlyEqual(sMid.transition.blendWeightFrom, 0.0) &&
+            NearlyEqual(sMid.transition.blendWeightTo, 0.0) &&
+            RectIsIdentity(sMid.transition.fromViewport) &&
+            RectIsIdentity(sMid.transition.toViewport) &&
+            NearlyEqual(n.blendWeightAt(1750000), 0.0);
+        if (!fadeMidOk) fail("fade_mid_mismatch");
+
+        const auto sTq = n.evaluate(1875000);
+        fadeThreeQuarterOk =
+            sTq.hasActiveClip && sTq.transition.isTransitionActive &&
+            sTq.transition.type == TransitionType::kFade &&
+            NearlyEqual(sTq.transition.progress, 0.75) &&
+            NearlyEqual(sTq.transition.blendWeightFrom, 0.0) &&
+            NearlyEqual(sTq.transition.blendWeightTo, 0.5) &&
+            RectIsIdentity(sTq.transition.fromViewport) &&
+            RectIsIdentity(sTq.transition.toViewport) &&
+            GeometryIsFinite(sTq);
+        if (!fadeThreeQuarterOk) fail("fade_three_quarter_mismatch");
+    }
+
     // ── Scenario 5: slide-left mid ──────────────────────────────────────────
     bool slideLeftMidOk = false;
     {
@@ -463,6 +516,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const bool allNativeLanesPass =
         kindOk && typeOk && inputPortCountOk && outputPortCountOk && portIdsOk &&
         hardCutOk && crossfadeStartOk && crossfadeMidOk && crossfadeEndOk &&
+        fadeQuarterOk && fadeMidOk && fadeThreeQuarterOk &&
         slideLeftMidOk && wipeLeftMidOk && speedMappingOk && outsideTimelineOk &&
         invalidTransitionIgnoredOk && zeroDurationSafeOk && overflowSafeOk;
 
@@ -482,6 +536,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "\"crossfadeStartOk\":" << BoolStr(crossfadeStartOk) << ","
         << "\"crossfadeMidOk\":" << BoolStr(crossfadeMidOk) << ","
         << "\"crossfadeEndOk\":" << BoolStr(crossfadeEndOk) << ","
+        << "\"fadeQuarterOk\":" << BoolStr(fadeQuarterOk) << ","
+        << "\"fadeMidOk\":" << BoolStr(fadeMidOk) << ","
+        << "\"fadeThreeQuarterOk\":" << BoolStr(fadeThreeQuarterOk) << ","
         << "\"slideLeftMidOk\":" << BoolStr(slideLeftMidOk) << ","
         << "\"wipeLeftMidOk\":" << BoolStr(wipeLeftMidOk) << ","
         << "\"speedMappingOk\":" << BoolStr(speedMappingOk) << ","

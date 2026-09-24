@@ -3,6 +3,7 @@ package com.connects.vanguard_media_engine.editor
 import android.content.Context
 import android.os.Handler
 import android.util.Log
+import com.connects.vanguard_media_engine.export.AndroidTimelineTransitionDescriptor
 import com.connects.vanguard_media_engine.util.AndroidUriDataSourceHelper
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
@@ -19,10 +20,17 @@ import java.util.concurrent.atomic.AtomicInteger
  * clips through their prepared reverse sidecar, and freeze-frame clips
  * (Phase 7.17-Android: `freezePTS` is parsed here and executed by the session
  * as a single held source frame over the clip's timeline hold). Validates
- * each draft against the current unsupported-feature guardrails (transitions,
- * overlays, per-clip transform, non-default fit/crop, dual camera, time
- * remap, transform track, color matrix, freeze on a reversed clip) and
- * delegates execution to [AndroidEditorSequentialPlaybackSession]. Does not
+ * each draft against the current unsupported-feature guardrails (overlays,
+ * per-clip transform, non-default fit/crop, dual camera, time remap,
+ * transform track, color matrix, freeze on a reversed clip, transitions
+ * touching a freeze clip) and delegates execution to an
+ * [AndroidEditorPlaybackSession]: [AndroidEditorSequentialPlaybackSession] for
+ * hard-cut-only timelines, [AndroidEditorTransitionPlaybackSession] when the
+ * draft carries at least one non-hard-cut transition (parsed through the
+ * export descriptor contract, so preview and export validate identically) OR
+ * requests a "fill" canvas over more than one clip (mixed-orientation
+ * cover-crop needs that session's canvas-aware quad geometry even with zero
+ * real transitions). Does not
  * own streaming/cache/RTC/export/compositor policy — those remain owned by
  * their respective coordinators or are left unimplemented for this slice
  * (exportTimeline, clearTimelineCache, timeline cache stats).
@@ -93,13 +101,13 @@ class AndroidEditorPlaybackCoordinator(
 
     private data class ActiveEntry(
         val textureId: Long,
-        val session: AndroidEditorSequentialPlaybackSession,
+        val session: AndroidEditorPlaybackSession,
         val surfaceProducer: TextureRegistry.SurfaceProducer,
         /**
          * Added-audio preview runtimes: zero or more, one per validated audioSidecar track
          * (Phase 7.8O-Android: multiple non-overlapping tracks may share a lane; Phase
          * 7.8Q-Android: `music`, `sfx`, and `voiceover` are each their own independent lane —
-         * see [validateAndAddLaneWindow]). Attached after [AndroidEditorSequentialPlaybackSession
+         * see [validateAndAddLaneWindow]). Attached after [AndroidEditorPlaybackSession
          * .prepare] succeeds (see [createOrUpdateTimeline]); owned/released by this coordinator,
          * never by the session (which only owns per-clip original-audio runtimes).
          */
@@ -167,12 +175,19 @@ class AndroidEditorPlaybackCoordinator(
 
         // Draft-level unsupported-feature guardrails. 'transitions' and 'overlays'
         // are always-present keys in VGEditorDraft.toMap() (possibly empty lists);
-        // 'audioSidecar' is present only when a plan is set.
-        val transitions = draft["transitions"] as? List<*>
-        if (transitions != null && transitions.isNotEmpty()) {
-            result.error("UNSUPPORTED_TIMELINE_FEATURE", "transitions are not supported in this slice", null)
-            return
-        }
+        // 'audioSidecar' is present only when a plan is set. Transitions are parsed
+        // after the clip loop (they bind to the parsed clip order); overlays fail closed.
+        val rawTransitions: List<*> = draft["transitions"] as? List<*> ?: emptyList<Any?>()
+
+        // Root canvasWidth/canvasHeight are unconditionally present in
+        // VGEditorDraft.toMap(); the nested 'canvas' map (with 'contentMode') is
+        // present only when VGEditorDraft.canvas is non-null. A mixed-orientation
+        // "fill" draft's canvas is defined by its first clip and must reach the
+        // transition session unchanged, not re-derived from a later clip's geometry.
+        val requestedCanvasWidth = (draft["canvasWidth"] as? Number)?.toInt() ?: 0
+        val requestedCanvasHeight = (draft["canvasHeight"] as? Number)?.toInt() ?: 0
+        val canvasMap = draft["canvas"] as? Map<*, *>
+        val canvasContentMode = (canvasMap?.get("contentMode") as? String) ?: "fit"
         val overlays = draft["overlays"] as? List<*>
         if (overlays != null && overlays.isNotEmpty()) {
             result.error("UNSUPPORTED_TIMELINE_FEATURE", "overlays are not supported in this slice", null)
@@ -184,6 +199,11 @@ class AndroidEditorPlaybackCoordinator(
         // not the wire startTimeSeconds, which VGEditorDraft may leave at 0.0 for every
         // clip. See correction below where each clip is appended.
         var cursorUs = 0L
+        // Wire startTimeSeconds per clip, index-aligned with clipSpecs (each clip either
+        // errors out and returns, or is appended to both together). Validated after the
+        // loop, once parsedTransitions below is known — see the comment at that check for
+        // why this cannot be validated inline against the pure sequential cursor.
+        val wireStartTimeSecondsByIndex = mutableListOf<Double>()
         for (rawClip in clips) {
             val clip = rawClip as? Map<*, *>
             if (clip == null) {
@@ -200,9 +220,9 @@ class AndroidEditorPlaybackCoordinator(
             // Per-clip unsupported-feature guardrails. Each of these wire keys is
             // present in VGClipDescriptor.toMap() only when the field differs from
             // its supported default (see vg_clip_descriptor.dart), so presence
-            // alone identifies an unsupported clip.
+            // alone identifies an unsupported clip. 'fitMode' is validated
+            // separately below (per-mediaKind: image-only, fit/fill).
             if (clip["transform"] != null ||
-                clip["fitMode"] != null ||
                 clip["cropRect"] != null ||
                 clip["dualCamera"] != null ||
                 clip["timeRemap"] != null ||
@@ -212,6 +232,29 @@ class AndroidEditorPlaybackCoordinator(
                 result.error(
                     "UNSUPPORTED_TIMELINE_FEATURE",
                     "clip \"${clip["id"]}\" uses an unsupported timeline feature",
+                    null,
+                )
+                return
+            }
+
+            // fitMode is omitted from VGClipDescriptor.toMap() when it equals the
+            // default ('fit'); present ('fill') only for a still image clip. A
+            // video clip must never carry it (continue rejecting fitMode on video
+            // clips); an image clip may carry null/"fit"/"fill" only.
+            val fitMode = clip["fitMode"] as? String
+            if (mediaKind == "video") {
+                if (fitMode != null) {
+                    result.error(
+                        "UNSUPPORTED_TIMELINE_FEATURE",
+                        "clip \"${clip["id"]}\" uses an unsupported timeline feature",
+                        null,
+                    )
+                    return
+                }
+            } else if (fitMode != null && fitMode != "fit" && fitMode != "fill") {
+                result.error(
+                    "UNSUPPORTED_TIMELINE_FEATURE",
+                    "clip \"${clip["id"]}\" has unsupported fitMode '$fitMode'",
                     null,
                 )
                 return
@@ -350,19 +393,13 @@ class AndroidEditorPlaybackCoordinator(
                 return
             }
 
-            // Wire startTimeSeconds is advisory only: reject a non-zero value that
-            // disagrees with the computed sequential cursor by more than 1ms, but never
-            // treat it as authoritative layout (multiple clips may all report 0.0).
-            val wireStartTimeUs = (startTimeSeconds * 1_000_000.0).toLong()
-            if (startTimeSeconds != 0.0 && Math.abs(wireStartTimeUs - cursorUs) > STARTTIME_TOLERANCE_US) {
-                result.error(
-                    "INVALID_CLIP",
-                    "clip \"${clip["id"]}\" startTimeSeconds=$startTimeSeconds disagrees with " +
-                        "computed sequential position ${cursorUs / 1_000_000.0}",
-                    null,
-                )
-                return
-            }
+            // Wire startTimeSeconds is advisory only (multiple clips may all report 0.0)
+            // and is never treated as authoritative layout. It IS validated, but not here:
+            // a transition-aware draft's expected clip position depends on transitions,
+            // which are only known once every clip's timelineDurationUs has been derived
+            // below, so the disagreement check is deferred to just after transition parsing
+            // (see "Wire startTimeSeconds validation" below the clip loop).
+            wireStartTimeSecondsByIndex.add(startTimeSeconds)
 
             if (freezePtsUs != null) {
                 Log.i(
@@ -381,9 +418,114 @@ class AndroidEditorPlaybackCoordinator(
                     timelineDurationUs = timelineDurationUs,
                     speed = speed,
                     freezePtsUs = freezePtsUs,
+                    mediaKind = mediaKind,
+                    fitMode = if (mediaKind == "image") (fitMode ?: "fit") else "fit",
                 ),
             )
             cursorUs += timelineDurationUs
+        }
+
+        // Transitions: parsed by the export descriptor parser so preview and export share
+        // one validation contract (adjacency, closed type set, duration vs. adjacent clip
+        // timeline durations, one overlap per frame). Hard cuts are dropped by the parser.
+        // A non-empty result routes this timeline to AndroidEditorTransitionPlaybackSession.
+        val parsedTransitions: List<AndroidTimelineTransitionDescriptor> = when (
+            val parse = AndroidTimelineTransitionDescriptor.parseList(
+                rawTransitions,
+                clipSpecs.map { spec ->
+                    AndroidTimelineTransitionDescriptor.ClipRef(
+                        id = spec.clipId,
+                        durationSeconds = spec.timelineDurationUs / 1_000_000.0,
+                    )
+                },
+            )
+        ) {
+            is AndroidTimelineTransitionDescriptor.ParseResult.Success -> parse.transitions
+            is AndroidTimelineTransitionDescriptor.ParseResult.Failure -> {
+                result.error(parse.code, parse.message.replaceFirst("exportTimeline: ", "updateTimeline: "), null)
+                return
+            }
+        }
+
+        // Image slideshow transitions are not supported in this slice: fail closed
+        // before any session is constructed, rather than letting a still image reach
+        // AndroidEditorTransitionPlaybackSession (which never routes image clips).
+        if (parsedTransitions.isNotEmpty() && clipSpecs.any { it.mediaKind == "image" }) {
+            result.error(
+                "UNSUPPORTED_TIMELINE_FEATURE",
+                "image slideshow transitions are not supported in this slice",
+                null,
+            )
+            return
+        }
+
+        // Wire startTimeSeconds validation (deferred from the clip loop above): reject a
+        // non-zero value that disagrees with the expected clip position by more than 1ms.
+        // "Expected" depends on whether this draft carries any parsed non-hard-cut
+        // transition: with none, it is the pure sequential cursor clipSpecs[i].timelineStartUs
+        // (byte-for-byte what the old inline check compared against, so hard-cut/sequential
+        // drafts validate identically to before). With one or more, VGEditorDraft
+        // .sequentialWithTransitions is the Dart-side source of truth (DEC-143) for
+        // overlap-adjusted layout, and native must validate against that same formula:
+        //   expected[0] = 0
+        //   expected[i+1] = expected[i] + clipSpecs[i].timelineDurationUs - outgoing
+        //                    transition overlap from clip[i] to clip[i+1] (0 if none)
+        // parseList already guarantees toClipIndex == fromClipIndex + 1 for every entry in
+        // parsedTransitions (adjacency) and has already dropped hard cuts, so a lookup keyed
+        // by fromClipIndex is unambiguous.
+        val expectedStartUsByIndex: LongArray = if (parsedTransitions.isEmpty()) {
+            LongArray(clipSpecs.size) { clipSpecs[it].timelineStartUs }
+        } else {
+            val overlapUsByFromIndex = HashMap<Int, Long>()
+            for (transition in parsedTransitions) {
+                overlapUsByFromIndex[transition.fromClipIndex] = (transition.durationSeconds * 1_000_000.0).toLong()
+            }
+            val expected = LongArray(clipSpecs.size)
+            for (i in 1 until clipSpecs.size) {
+                val overlapUs = overlapUsByFromIndex[i - 1] ?: 0L
+                expected[i] = expected[i - 1] + clipSpecs[i - 1].timelineDurationUs - overlapUs
+            }
+            expected
+        }
+        for (i in clipSpecs.indices) {
+            val wireStartTimeSeconds = wireStartTimeSecondsByIndex[i]
+            if (wireStartTimeSeconds == 0.0) continue
+            val wireStartTimeUs = (wireStartTimeSeconds * 1_000_000.0).toLong()
+            val expectedUs = expectedStartUsByIndex[i]
+            if (Math.abs(wireStartTimeUs - expectedUs) > STARTTIME_TOLERANCE_US) {
+                result.error(
+                    "INVALID_CLIP",
+                    "clip \"${clipSpecs[i].clipId}\" startTimeSeconds=$wireStartTimeSeconds disagrees with " +
+                        "computed ${if (parsedTransitions.isEmpty()) "sequential" else "transition-aware"} " +
+                        "position ${expectedUs / 1_000_000.0}",
+                    null,
+                )
+                return
+            }
+        }
+
+        // Fail closed before any session allocation: the transition preview route renders
+        // through the export decoder chain, which has no freeze-frame seam.
+        for (transition in parsedTransitions) {
+            val fromFreeze = clipSpecs.getOrNull(transition.fromClipIndex)?.freezePtsUs != null
+            val toFreeze = clipSpecs.getOrNull(transition.toClipIndex)?.freezePtsUs != null
+            if (fromFreeze || toFreeze) {
+                result.error(
+                    "UNSUPPORTED_TIMELINE_FEATURE",
+                    "transitions touching freeze clips are not supported in this slice",
+                    null,
+                )
+                return
+            }
+        }
+        if (parsedTransitions.isNotEmpty()) {
+            Log.i(
+                TAG,
+                "VG_EDITOR_TRANSITION_PREVIEW transitions_parsed count=${parsedTransitions.size} " +
+                    parsedTransitions.joinToString(" ") { t ->
+                        "${t.transitionId}:${t.type.name}:${t.durationSeconds}s:${t.fromClipIndex}->${t.toClipIndex}"
+                    },
+            )
         }
 
         // 'audioSidecar' is present in VGEditorDraft.toMap() only when a plan is
@@ -682,25 +824,67 @@ class AndroidEditorPlaybackCoordinator(
             val surfaceProducer = textureRegistry.createSurfaceProducer(TextureRegistry.SurfaceLifecycle.resetInBackground)
             val textureId = surfaceProducer.id()
 
-            val session = AndroidEditorSequentialPlaybackSession(
-                clipSpecs = resolvedClipSpecs,
-                surfaceProducer = surfaceProducer,
-                context = context,
-                onTimelineFrame = { id, ptsSeconds, generationId ->
-                    mainHandler.post {
-                        channel.invokeMethod(
-                            "onTimelineFrame",
-                            mapOf("textureId" to id, "pts" to ptsSeconds, "generation" to generationId),
-                        )
-                    }
-                },
-                onTimelineEOS = { id ->
-                    pauseAddedAudioRuntimesIfActive(id)
-                    mainHandler.post {
-                        channel.invokeMethod("onTimelineEOS", mapOf("textureId" to id))
-                    }
-                },
-            )
+            val onTimelineFrame: (Long, Double, Long) -> Unit = { id, ptsSeconds, generationId ->
+                mainHandler.post {
+                    channel.invokeMethod(
+                        "onTimelineFrame",
+                        mapOf("textureId" to id, "pts" to ptsSeconds, "generation" to generationId),
+                    )
+                }
+            }
+            val onTimelineEOS: (Long) -> Unit = { id ->
+                pauseAddedAudioRuntimesIfActive(id)
+                mainHandler.post {
+                    channel.invokeMethod("onTimelineEOS", mapOf("textureId" to id))
+                }
+            }
+            // Route selection: the transition session is instantiated when at least one
+            // non-hard-cut transition survived parsing, OR when the draft requests a
+            // "fill" canvas over more than one VIDEO clip (mixed-orientation cover-crop
+            // needs this session's canvas-aware quad geometry even with zero real
+            // transitions). Image clips never enter AndroidEditorTransitionPlaybackSession
+            // in this slice: it is video-only and inspects every clip through
+            // AndroidDagSourceInspector, so a slideshow always stays on
+            // AndroidEditorSequentialPlaybackSession regardless of canvasContentMode --
+            // the image+transitions combination is already rejected above, before this
+            // point, and the canvas-fill multi-clip route is gated to video-only here.
+            // Every other draft keeps the exact sequential (hard-cut) session it used
+            // before this slice.
+            val hasImageClip = resolvedClipSpecs.any { it.isImage }
+            val isFillMultiClip = canvasContentMode == "fill" && resolvedClipSpecs.size > 1 && !hasImageClip
+            // MULTI-VIDEO-BLURFILL: a "blurFill" canvas over more than one VIDEO clip
+            // is likewise routed to the transition session (its blurred-background +
+            // sharp-foreground draw lives there), including hard-cut-only drafts. A
+            // draft carrying any freeze clip stays on the sequential session (plain
+            // fit): freeze holds have no seam on the transition route, and freeze
+            // clips fail closed to "fit" in this slice anyway.
+            val hasFreezeClip = resolvedClipSpecs.any { it.freezePtsUs != null }
+            val isBlurFillMultiClip = canvasContentMode == "blurFill" && resolvedClipSpecs.size > 1 &&
+                !hasImageClip && !hasFreezeClip
+            val routeToTransitionSession = parsedTransitions.isNotEmpty() || isFillMultiClip || isBlurFillMultiClip
+            val session: AndroidEditorPlaybackSession = if (routeToTransitionSession) {
+                AndroidEditorTransitionPlaybackSession(
+                    clipSpecs = resolvedClipSpecs,
+                    transitions = parsedTransitions,
+                    surfaceProducer = surfaceProducer,
+                    onTimelineFrame = onTimelineFrame,
+                    onTimelineEOS = onTimelineEOS,
+                    context = context,
+                    requestedCanvasWidth = requestedCanvasWidth,
+                    requestedCanvasHeight = requestedCanvasHeight,
+                    canvasContentMode = canvasContentMode,
+                )
+            } else {
+                AndroidEditorSequentialPlaybackSession(
+                    clipSpecs = resolvedClipSpecs,
+                    surfaceProducer = surfaceProducer,
+                    context = context,
+                    onTimelineFrame = onTimelineFrame,
+                    onTimelineEOS = onTimelineEOS,
+                    canvasWidth = requestedCanvasWidth,
+                    canvasHeight = requestedCanvasHeight,
+                )
+            }
 
             synchronized(lock) {
                 active = ActiveEntry(textureId, session, surfaceProducer)
@@ -875,7 +1059,7 @@ class AndroidEditorPlaybackCoordinator(
     // ── active-entry helpers ───────────────────────────────────────────────────
 
     /** True if [active] still refers to the given [textureId] / [session] pair. */
-    private fun isActiveEntry(textureId: Long, session: AndroidEditorSequentialPlaybackSession): Boolean {
+    private fun isActiveEntry(textureId: Long, session: AndroidEditorPlaybackSession): Boolean {
         return synchronized(lock) {
             active?.textureId == textureId && active?.session === session
         }
@@ -887,7 +1071,7 @@ class AndroidEditorPlaybackCoordinator(
      * owned the entry and must finish its own cleanup), false if it had
      * already been disposed/replaced by someone else.
      */
-    private fun removeActiveIfSame(textureId: Long, session: AndroidEditorSequentialPlaybackSession): Boolean {
+    private fun removeActiveIfSame(textureId: Long, session: AndroidEditorPlaybackSession): Boolean {
         return synchronized(lock) {
             if (active?.textureId == textureId && active?.session === session) {
                 active = null
@@ -918,7 +1102,7 @@ class AndroidEditorPlaybackCoordinator(
      */
     private fun attachAddedAudioRuntimes(
         textureId: Long,
-        session: AndroidEditorSequentialPlaybackSession,
+        session: AndroidEditorPlaybackSession,
         runtimes: List<AndroidEditorAddedAudioPreviewRuntime>,
     ): Boolean {
         return synchronized(lock) {

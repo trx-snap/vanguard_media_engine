@@ -15,6 +15,8 @@
 //                                    renderBackend=gles, file exists,
 //                                    duration ~= 3.5, transitionCount=1
 //   Lane forced crossfade success  : crossfade 0.5 s (clip_A + clip_A) -> same expectations
+//   Lane forced fade success       : fade 0.5 s (clip_A + clip_A) -> same expectations
+//                                    (true fade through black supported on GLES)
 //   Lane forced slideLeft success  : slideLeft 0.5 s (clip_A + clip_A) -> same expectations
 //   Lane forced wipeRight success  : wipeRight 0.5 s (clip_A + clip_A) -> same expectations
 //   Lane forced rotated clip success: dissolve 0.5 s (clip_A + rotated clip_B) -> success,
@@ -24,11 +26,6 @@
 //                                    AndroidTimelineVideoEncoder's hard-cut path) renders
 //                                    a real clip carrying standard Android rotation
 //                                    metadata correctly on this route
-//   Lane forced fade fail closed   : fade 0.5 s (clip_A + clip_A) -> fails closed before
-//                                    pass-1 (UNSUPPORTED_EXPORT_FEATURE, unsupported wire type
-//                                    -- fade is never GLES-eligible: it fails at
-//                                    AndroidTimelineTransitionDescriptor parse time, before
-//                                    any render-backend selection)
 //   Lane forced still-image dissolve success: image + video (still_C + clip_A) -> success,
 //                                    renderBackend=gles, file exists,
 //                                    duration ~= 3.5, transitionCount=1 -- proves
@@ -179,11 +176,6 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
         );
       }
 
-      final fadeOutPath =
-          '${tempDir.path}/vg_gles_trans_export_fade_$stamp.mp4';
-      cleanupTargets.add(File(fadeOutPath));
-      cleanupTargets.add(File('$fadeOutPath.roi.json'));
-
       final stillOutPath =
           '${tempDir.path}/vg_gles_trans_export_still_dissolve_$stamp.mp4';
       cleanupTargets.add(File(stillOutPath));
@@ -202,32 +194,9 @@ class _AndroidTimelineGlesTransitionExportSmokeAppState
       final requests = <VGTimelineTransitionExportSmokeRequest>[
         positiveLane('dissolve'),
         positiveLane('crossfade'),
+        positiveLane('fade'),
         positiveLane('slideLeft'),
         positiveLane('wipeRight'),
-        VGTimelineTransitionExportSmokeRequest(
-          laneId: 'forced_fade_fail_closed',
-          clips: <VGTimelineTransitionExportSmokeClip>[
-            videoClip('clip-a', clipA1.path),
-            videoClip('clip-b', clipA2.path),
-          ],
-          transitions: const <VGTimelineTransitionExportSmokeTransition>[
-            VGTimelineTransitionExportSmokeTransition(
-              id: 'tr-fade',
-              type: 'fade',
-              durationSeconds: _transitionSeconds,
-              fromClipId: 'clip-a',
-              toClipId: 'clip-b',
-            ),
-          ],
-          outputPath: fadeOutPath,
-          expectedRenderBackend: 'gles',
-          debugForceRenderBackend: 'gles',
-          expectation:
-              const VGTimelineTransitionExportSmokeExpectation.failClosed(
-                errorCode: unsupportedExportFeatureCode,
-                messageContains: 'not supported',
-              ),
-        ),
         VGTimelineTransitionExportSmokeRequest(
           laneId: 'forced_still_image_dissolve_success',
           clips: <VGTimelineTransitionExportSmokeClip>[
