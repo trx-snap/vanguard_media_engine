@@ -368,6 +368,35 @@ static bool VulkanCompositeFrame(VulkanDualCamSession& s,
         static_cast<int32_t>(std::round(res.secondaryViewport.height * canvasH)),
     };
 
+    if (layout.mode == vanguard::compositors::MultiCamLayoutMode::kSplitScreen &&
+        layout.direction == vanguard::compositors::MultiCamSplitDirection::kLeftRight) {
+        // Vertical Split (Left/Right): Aspect-fit (BoxFit.contain) each stream within its
+        // allocated half-width slot, centering vertically and preserving uncropped 9:16
+        // framing with black letterbox bands on top and bottom (TikTok-style).
+        auto fitToSlot = [&](const vanguard::compositors::NormalizedRect& vp) -> RenderDestinationRect {
+            const double slotX = vp.x * canvasW;
+            const double slotY = vp.y * canvasH;
+            const double slotW = vp.width * canvasW;
+            const double slotH = vp.height * canvasH;
+            double fittedW = slotW;
+            double fittedH = (canvasAr > 0.0) ? (slotW / canvasAr) : slotH;
+            if (fittedH > slotH) {
+                fittedH = slotH;
+                fittedW = slotH * canvasAr;
+            }
+            const double offX = slotX + (slotW - fittedW) * 0.5;
+            const double offY = slotY + (slotH - fittedH) * 0.5;
+            return RenderDestinationRect{
+                static_cast<int32_t>(std::round(offX)),
+                static_cast<int32_t>(std::round(offY)),
+                static_cast<int32_t>(std::round(fittedW)),
+                static_cast<int32_t>(std::round(fittedH)),
+            };
+        };
+        backRect = fitToSlot(res.primaryViewport);
+        frontRect = fitToSlot(res.secondaryViewport);
+    }
+
     const float cameraCornerRadiusPx = static_cast<float>(
         std::max(0.0, res.secondaryCornerRadiusFractionOfCanvasWidth * canvasW));
 

@@ -253,4 +253,17 @@ VGDCAspectFillResult VGDCLayoutComputeAspectFill(size_t srcW,
                                                    size_t srcH,
                                                    CGRect targetRect);
 
+/// Compute the uniform scale and center offsets to aspect-fit a source into
+/// a target rect (scale-to-fit with letterbox/pillarbox padding, no cropping).
+/// Matches TikTok-style containment for Vertical Split (left/right).
+///
+/// @param srcW        Source image width in pixels (must be > 0).
+/// @param srcH        Source image height in pixels (must be > 0).
+/// @param targetRect  Target CGRect (in the CIImage coordinate space of the caller).
+/// @return            Scale and offsets. If srcW or srcH is 0, scale = 1 and
+///                    offsets = 0 (safe no-op).
+VGDCAspectFillResult VGDCLayoutComputeAspectFit(size_t srcW,
+                                                  size_t srcH,
+                                                  CGRect targetRect);
+
 NS_ASSUME_NONNULL_END

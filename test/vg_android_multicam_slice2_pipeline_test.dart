@@ -11,7 +11,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
-import 'package:vanguard_media_engine/vg_dual_camera_preview.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -151,6 +150,58 @@ void main() {
       // In dual-texture mode, both textures are rendered in PiP
       final textureFinder = find.byType(Texture);
       expect(textureFinder, findsNWidgets(2));
+    });
+
+    testWidgets('VGDualCameraPreview defaults to BoxFit.contain in splitH layout', (WidgetTester tester) async {
+      const session = VGMultiCamRenderTextureSession(
+        textureId: 42,
+        outputWidth: 1080,
+        outputHeight: 1920,
+        backTextureId: null,
+      );
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: VGDualCameraPreview(
+              session: session,
+              gridOption: VGDualCameraGridOption.splitH,
+            ),
+          ),
+        ),
+      );
+
+      final fittedBoxFinder = find.byType(FittedBox);
+      expect(fittedBoxFinder, findsOneWidget);
+
+      final FittedBox box = tester.widget<FittedBox>(fittedBoxFinder);
+      expect(box.fit, equals(BoxFit.contain));
+    });
+
+    testWidgets('VGDualCameraPreview defaults to BoxFit.contain in splitV layout', (WidgetTester tester) async {
+      const session = VGMultiCamRenderTextureSession(
+        textureId: 42,
+        outputWidth: 1080,
+        outputHeight: 1920,
+        backTextureId: null,
+      );
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: VGDualCameraPreview(
+              session: session,
+              gridOption: VGDualCameraGridOption.splitV,
+            ),
+          ),
+        ),
+      );
+
+      final fittedBoxFinder = find.byType(FittedBox);
+      expect(fittedBoxFinder, findsOneWidget);
+
+      final FittedBox box = tester.widget<FittedBox>(fittedBoxFinder);
+      expect(box.fit, equals(BoxFit.contain));
     });
 
     test('stopMultiCamPreview dispatches method call correctly', () async {

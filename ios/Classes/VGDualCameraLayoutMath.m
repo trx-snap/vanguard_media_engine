@@ -309,3 +309,39 @@ VGDCAspectFillResult VGDCLayoutComputeAspectFill(size_t srcW,
     result.offsetY = offsetY;
     return result;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - VGDCLayoutComputeAspectFit
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Uniform aspect-fit (BoxFit.contain) into targetRect with letterbox/pillarbox.
+// Scale is MIN(targetW / srcW, targetH / srcH). Preserves full camera frame
+// without any cropping.
+
+VGDCAspectFillResult VGDCLayoutComputeAspectFit(size_t srcW,
+                                                  size_t srcH,
+                                                  CGRect targetRect) {
+    VGDCAspectFillResult result;
+    result.scale   = 1.0;
+    result.offsetX = 0.0;
+    result.offsetY = 0.0;
+
+    if (srcW == 0 || srcH == 0) {
+        return result;
+    }
+
+    double scaleX = CGRectGetWidth(targetRect)  / (double)srcW;
+    double scaleY = CGRectGetHeight(targetRect) / (double)srcH;
+    double scale  = (scaleX < scaleY) ? scaleX : scaleY;  // MIN (BoxFit.contain)
+    if (scale <= 0.0) { scale = 1.0; }
+
+    double scaledW  = (double)srcW * scale;
+    double scaledH  = (double)srcH * scale;
+    double offsetX  = CGRectGetMinX(targetRect) + (CGRectGetWidth(targetRect)  - scaledW) * 0.5;
+    double offsetY  = CGRectGetMinY(targetRect) + (CGRectGetHeight(targetRect) - scaledH) * 0.5;
+
+    result.scale   = scale;
+    result.offsetX = offsetX;
+    result.offsetY = offsetY;
+    return result;
+}

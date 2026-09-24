@@ -1157,12 +1157,12 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     if (_layoutConfig.layoutMode == VGDualCameraLayoutModeSplitScreen) {
 
         if (_layoutConfig.splitConfig.direction == VGSplitScreenDirectionLeftRight) {
-            // ── Left/Right V-split path (always 50/50 locked) ─────────────────
+            // ── Left/Right V-split path (always 50/50 locked, AspectFit / contain) ─────
             VGDCSplitRectsLR lrRects = VGDCLayoutComputeSplitRectsLeftRight(
                 primW, primH, _layoutConfig.splitConfig);
             if (lrRects.isValid) {
-                // Scale and crop primary into left band.
-                VGDCAspectFillResult primFill = VGDCLayoutComputeAspectFill(
+                // Scale primary into left band using AspectFit (BoxFit.contain).
+                VGDCAspectFillResult primFill = VGDCLayoutComputeAspectFit(
                     primW, primH, lrRects.leftRect);
                 CGPoint primOrigin = primaryCI.extent.origin;
                 CIImage *primNorm = (primOrigin.x != 0.0 || primOrigin.y != 0.0)
@@ -1174,8 +1174,8 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
                     imageByApplyingTransform:CGAffineTransformMakeTranslation(primFill.offsetX, primFill.offsetY)];
                 CIImage *primCropped = [primFilled imageByCroppingToRect:lrRects.leftRect];
 
-                // Scale and crop secondary into right band.
-                VGDCAspectFillResult secFill = VGDCLayoutComputeAspectFill(
+                // Scale secondary into right band using AspectFit (BoxFit.contain).
+                VGDCAspectFillResult secFill = VGDCLayoutComputeAspectFit(
                     secW, secH, lrRects.rightRect);
                 CGPoint secOrigin = secondaryCI.extent.origin;
                 CIImage *secNorm = (secOrigin.x != 0.0 || secOrigin.y != 0.0)

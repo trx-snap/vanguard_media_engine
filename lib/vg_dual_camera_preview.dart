@@ -34,6 +34,7 @@ class VGDualCameraPreview extends StatefulWidget {
     this.pipWidth = 0.0,
     this.pipHeight = 0.0,
     this.splitRatio = 0.5,
+    this.fit,
   });
 
   /// The active dual-camera session.
@@ -60,6 +61,11 @@ class VGDualCameraPreview extends StatefulWidget {
   /// Height split ratio for Horizontal Split (top stream height fraction, 0.2–0.8).
   final double splitRatio;
 
+  /// Custom [BoxFit] for preview presentation. Defaults to [BoxFit.contain] for
+  /// [VGDualCameraGridOption.splitH] and [VGDualCameraGridOption.splitV] (preserving uncropped 9:16 framing with black
+  /// letterbox padding like TikTok), and [BoxFit.cover] for PiP.
+  final BoxFit? fit;
+
   @override
   State<VGDualCameraPreview> createState() => _VGDualCameraPreviewState();
 }
@@ -83,10 +89,16 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
 
   @override
   Widget build(BuildContext context) {
+    final effectiveFit = widget.fit ??
+        ((widget.gridOption == VGDualCameraGridOption.splitH ||
+                widget.gridOption == VGDualCameraGridOption.splitV)
+            ? BoxFit.contain
+            : BoxFit.cover);
+
     // If only one texture exists (iOS Metal or Android Vulkan/GLES compositor),
     // render aspect-correct texture so it never stretches on non-16:9 displays.
     if (widget.session.backTextureId == null) {
-      return _buildAspectCorrectTexture(widget.session.textureId);
+      return _buildAspectCorrectTexture(widget.session.textureId, fit: effectiveFit);
     }
 
     final frontTid = widget.session.textureId;
@@ -105,10 +117,22 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
 
         switch (widget.gridOption) {
           case VGDualCameraGridOption.splitH:
-            return _buildHorizontalSplit(primaryTid, secondaryTid, primaryLabel, secondaryLabel);
+            return _buildHorizontalSplit(
+              primaryTid,
+              secondaryTid,
+              primaryLabel,
+              secondaryLabel,
+              fit: effectiveFit,
+            );
 
           case VGDualCameraGridOption.splitV:
-            return _buildVerticalSplit(primaryTid, secondaryTid, primaryLabel, secondaryLabel);
+            return _buildVerticalSplit(
+              primaryTid,
+              secondaryTid,
+              primaryLabel,
+              secondaryLabel,
+              fit: effectiveFit,
+            );
 
           case VGDualCameraGridOption.pip:
             return _buildFloatingPip(
@@ -129,8 +153,9 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
     int topTid,
     int bottomTid,
     String topLabel,
-    String bottomLabel,
-  ) {
+    String bottomLabel, {
+    BoxFit fit = BoxFit.contain,
+  }) {
     final topFlex = (widget.splitRatio.clamp(0.2, 0.8) * 1000).round();
     final bottomFlex = 1000 - topFlex;
 
@@ -141,7 +166,7 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              _buildAspectCorrectTexture(topTid),
+              _buildAspectCorrectTexture(topTid, fit: fit),
               _buildStreamBadge(topLabel, Alignment.topLeft),
             ],
           ),
@@ -152,7 +177,7 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              _buildAspectCorrectTexture(bottomTid),
+              _buildAspectCorrectTexture(bottomTid, fit: fit),
               _buildStreamBadge(bottomLabel, Alignment.topLeft),
             ],
           ),
@@ -166,15 +191,16 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
     int leftTid,
     int rightTid,
     String leftLabel,
-    String rightLabel,
-  ) {
+    String rightLabel, {
+    BoxFit fit = BoxFit.contain,
+  }) {
     return Row(
       children: [
         Expanded(
           child: Stack(
             fit: StackFit.expand,
             children: [
-              _buildAspectCorrectTexture(leftTid),
+              _buildAspectCorrectTexture(leftTid, fit: fit),
               _buildStreamBadge(leftLabel, Alignment.topLeft),
             ],
           ),
@@ -184,7 +210,7 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              _buildAspectCorrectTexture(rightTid),
+              _buildAspectCorrectTexture(rightTid, fit: fit),
               _buildStreamBadge(rightLabel, Alignment.topLeft),
             ],
           ),
@@ -278,9 +304,9 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
     );
   }
 
-  /// Wraps a texture in ClipRect + FittedBox(fit: BoxFit.cover) to preserve
+  /// Wraps a texture in ClipRect + Container(black) + FittedBox(fit: fit) to preserve
   /// native 1080x1920 sensor geometry without squishing or stretching.
-  Widget _buildAspectCorrectTexture(int textureId) {
+  Widget _buildAspectCorrectTexture(int textureId, {BoxFit fit = BoxFit.cover}) {
     final isBack = widget.session.backTextureId != null &&
         textureId == widget.session.backTextureId;
     final fallbackW = widget.session.outputWidth > 0 ? widget.session.outputWidth : 1080;
@@ -301,13 +327,17 @@ class _VGDualCameraPreviewState extends State<VGDualCameraPreview> {
     final nativeH = (rawW > rawH ? rawW : rawH).toDouble();
 
     return ClipRect(
-      child: FittedBox(
-        fit: BoxFit.cover,
+      child: Container(
+        color: Colors.black,
         alignment: Alignment.center,
-        child: SizedBox(
-          width: nativeW,
-          height: nativeH,
-          child: Texture(textureId: textureId),
+        child: FittedBox(
+          fit: fit,
+          alignment: Alignment.center,
+          child: SizedBox(
+            width: nativeW,
+            height: nativeH,
+            child: Texture(textureId: textureId),
+          ),
         ),
       ),
     );
