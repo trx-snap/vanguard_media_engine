@@ -1397,6 +1397,60 @@ bool GlesGreenScreenGpuResidentRenderer::RunComposite(CameraMode cameraMode, std
 }
 
 bool GlesGreenScreenGpuResidentRenderer::RenderFrame(CameraMode cameraMode, bool refineMask, std::string* error) {
+    return RenderFrameInternal(cameraMode, refineMask, nullptr, 0, nullptr, error);
+}
+
+bool GlesGreenScreenGpuResidentRenderer::RenderFrameCapturing(CameraMode cameraMode, bool refineMask,
+                                                              uint8_t* outRgba, size_t outRgbaCapacityBytes,
+                                                              bool* outCaptured, std::string* error) {
+    if (outCaptured) *outCaptured = false;
+    if (outRgba == nullptr) {
+        SetError(error, "RenderFrameCapturing without a capture buffer");
+        // Still present the frame: the preview must not drop a frame because
+        // the caller's capture buffer was missing.
+        return RenderFrameInternal(cameraMode, refineMask, nullptr, 0, nullptr, nullptr);
+    }
+    return RenderFrameInternal(cameraMode, refineMask, outRgba, outRgbaCapacityBytes, outCaptured, error);
+}
+
+bool GlesGreenScreenGpuResidentRenderer::ReadCompositeToCpu(uint8_t* outRgba, size_t outRgbaCapacityBytes,
+                                                            std::string* error) {
+    const size_t required =
+        static_cast<size_t>(outputWidth_) * static_cast<size_t>(outputHeight_) * static_cast<size_t>(4);
+    if (outRgba == nullptr || outputWidth_ <= 0 || outputHeight_ <= 0 || outRgbaCapacityBytes < required) {
+        std::ostringstream ss;
+        ss << "composite capture buffer too small: capacity=" << outRgbaCapacityBytes
+           << " required=" << required << " (" << outputWidth_ << "x" << outputHeight_ << ")";
+        SetError(error, ss.str());
+        return false;
+    }
+    // Drain stale GL errors (bounded: a lost context reports forever) so the
+    // read-back verdict below is exact.
+    for (int i = 0; i < 8 && glGetError() != GL_NO_ERROR; ++i) {
+    }
+    // RunComposite drew into the default framebuffer (the preview window);
+    // read it back to client memory: no pack buffer, tightly packed rows.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glReadPixels(0, 0, outputWidth_, outputHeight_, GL_RGBA, GL_UNSIGNED_BYTE, outRgba);
+    const GLenum glErr = glGetError();
+    if (glErr != GL_NO_ERROR) {
+        std::ostringstream ss;
+        ss << "composite capture glReadPixels GL error: 0x" << std::hex << glErr;
+        SetError(error, ss.str());
+        return false;
+    }
+    return true;
+}
+
+bool GlesGreenScreenGpuResidentRenderer::RenderFrameInternal(CameraMode cameraMode, bool refineMask,
+                                                             uint8_t* captureRgba, size_t captureCapacityBytes,
+                                                             bool* outCaptured, std::string* error) {
+    if (outCaptured) *outCaptured = false;
     // A recorder pass may only re-draw a composite this call fully prepared.
     hasRecordableComposite_ = false;
     if (!initialized_) {
@@ -1440,9 +1494,31 @@ bool GlesGreenScreenGpuResidentRenderer::RenderFrame(CameraMode cameraMode, bool
     lastCompositedMode_ = effectiveMode;
     hasRecordableComposite_ = true;
 
+    // VG-LIVE-GREENSCREEN-PHOTO: one-shot CPU copy of exactly this composite,
+    // taken BEFORE the swap (the back buffer is undefined afterwards). A
+    // failed read-back never changes the preview outcome of this frame; its
+    // reason is left in *error (the swap below only overwrites it on its own
+    // failure). The read time is accounted in lastCaptureReadMs and excluded
+    // from the composite timing so the preview telemetry stays comparable.
+    float captureMs = 0.0f;
+    if (captureRgba != nullptr) {
+        const auto readStart = Clock::now();
+        const bool captured = ReadCompositeToCpu(captureRgba, captureCapacityBytes, error);
+        captureMs = ElapsedMs(readStart);
+        stats_.lastCaptureReadMs = captureMs;
+        if (captured) {
+            stats_.compositeCaptures++;
+            VG_GS_GPU_RESIDENT_LOGI("ANDROID_GREENSCREEN_GPU_RESIDENT_COMPOSITE_CAPTURED size=%dx%d mode=%d readMs=%.2f",
+                                    outputWidth_, outputHeight_, static_cast<int>(effectiveMode), captureMs);
+        } else {
+            stats_.compositeCaptureFailures++;
+        }
+        if (outCaptured) *outCaptured = captured;
+    }
+
     const EGLBoolean swapped = eglSwapBuffers(static_cast<EGLDisplay>(eglDisplay_),
                                               static_cast<EGLSurface>(eglWindowSurface_));
-    stats_.lastCompositeMs = ElapsedMs(compositeStart);
+    stats_.lastCompositeMs = std::max(0.0f, ElapsedMs(compositeStart) - captureMs);
     stats_.totalCompositeMs += stats_.lastCompositeMs;
     stats_.framesRendered++;
     if (swapped == EGL_TRUE) {
@@ -1571,7 +1647,10 @@ std::string GlesGreenScreenGpuResidentRenderer::StatsSummary() const {
        << " recorderSkipped=" << stats_.recorderFramesSkipped
        << " recorderFailures=" << stats_.recorderFailures
        << " avgRecorderCompositeMs=" << (stats_.totalRecorderCompositeMs / recorderFrames)
-       << " maxRecorderSwapMs=" << stats_.maxRecorderSwapMs;
+       << " maxRecorderSwapMs=" << stats_.maxRecorderSwapMs
+       << " compositeCaptures=" << stats_.compositeCaptures
+       << " compositeCaptureFailures=" << stats_.compositeCaptureFailures
+       << " lastCaptureReadMs=" << stats_.lastCaptureReadMs;
     return ss.str();
 }
 
@@ -1617,6 +1696,11 @@ void GlesGreenScreenGpuResidentRenderer::SetFilterToggles(bool, bool, bool) {}
 bool GlesGreenScreenGpuResidentRenderer::DownscaleCameraToModelInput(float*, size_t, std::string* error) { SetUnavailable(error); return false; }
 bool GlesGreenScreenGpuResidentRenderer::UploadCoarseMask(const float*, size_t, int, int, std::string* error) { SetUnavailable(error); return false; }
 bool GlesGreenScreenGpuResidentRenderer::RenderFrame(CameraMode, bool, std::string* error) { SetUnavailable(error); return false; }
+bool GlesGreenScreenGpuResidentRenderer::RenderFrameCapturing(CameraMode, bool, uint8_t*, size_t, bool* outCaptured, std::string* error) {
+    if (outCaptured) *outCaptured = false;
+    SetUnavailable(error);
+    return false;
+}
 std::string GlesGreenScreenGpuResidentRenderer::StatsSummary() const { return "unavailable"; }
 
 }  // namespace render

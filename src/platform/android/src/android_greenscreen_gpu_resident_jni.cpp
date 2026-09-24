@@ -68,6 +68,21 @@ jstring NewJString(JNIEnv* env, const std::string& value) {
     return env->NewStringUTF(value.c_str());
 }
 
+// Kotlin camera-mode int (AndroidGreenScreenGpuResidentPreviewBackend
+// CAMERA_MODE_*) -> renderer enum; unknown values fail closed to kNone.
+GlesGreenScreenGpuResidentRenderer::CameraMode ToCameraMode(jint cameraMode) {
+    switch (cameraMode) {
+        case 1: return GlesGreenScreenGpuResidentRenderer::CameraMode::kPlaceholder;
+        case 2: return GlesGreenScreenGpuResidentRenderer::CameraMode::kPassthrough;
+        case 3: return GlesGreenScreenGpuResidentRenderer::CameraMode::kMasked;
+        default: return GlesGreenScreenGpuResidentRenderer::CameraMode::kNone;
+    }
+}
+
+// nativeRenderFrameCapturing result bits (mirrored by the Kotlin backend).
+constexpr jint kRenderFrameSwappedBit = 1;
+constexpr jint kRenderFrameCapturedBit = 2;
+
 }  // namespace
 
 #define VG_GS_GPU_RESIDENT_JNI(ret, name) \
@@ -335,17 +350,42 @@ VG_GS_GPU_RESIDENT_JNI(jboolean, nativeRenderFrame)(
     JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint cameraMode, jboolean refineMask) {
     auto entry = Lookup(handle);
     if (!entry) return JNI_FALSE;
-    GlesGreenScreenGpuResidentRenderer::CameraMode mode;
-    switch (cameraMode) {
-        case 1: mode = GlesGreenScreenGpuResidentRenderer::CameraMode::kPlaceholder; break;
-        case 2: mode = GlesGreenScreenGpuResidentRenderer::CameraMode::kPassthrough; break;
-        case 3: mode = GlesGreenScreenGpuResidentRenderer::CameraMode::kMasked; break;
-        default: mode = GlesGreenScreenGpuResidentRenderer::CameraMode::kNone; break;
-    }
     std::string error;
-    const bool ok = entry->renderer->RenderFrame(mode, refineMask == JNI_TRUE, &error);
+    const bool ok = entry->renderer->RenderFrame(ToCameraMode(cameraMode), refineMask == JNI_TRUE, &error);
     RecordError(entry, error);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// VG-LIVE-GREENSCREEN-PHOTO: nativeRenderFrame plus a one-shot read-back of
+// the presented composite into the direct buffer rgbaOut (RGBA8, GL
+// bottom-left row order, capacity >= outputWidth*outputHeight*4). Returns a
+// bitmask: bit 0 = swapped (the nativeRenderFrame result), bit 1 = captured.
+// The frame is always rendered/presented; a missing or non-direct buffer
+// only fails the capture bit (reason in nativeLastError), never the preview.
+VG_GS_GPU_RESIDENT_JNI(jint, nativeRenderFrameCapturing)(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jint cameraMode, jboolean refineMask, jobject rgbaOut) {
+    auto entry = Lookup(handle);
+    if (!entry) return 0;
+    const auto mode = ToCameraMode(cameraMode);
+    uint8_t* out = nullptr;
+    jlong capacity = 0;
+    if (rgbaOut != nullptr) {
+        out = static_cast<uint8_t*>(env->GetDirectBufferAddress(rgbaOut));
+        capacity = env->GetDirectBufferCapacity(rgbaOut);
+    }
+    if (out == nullptr || capacity <= 0) {
+        RecordError(entry, "composite capture buffer is missing or not direct");
+        std::string error;
+        const bool swapped = entry->renderer->RenderFrame(mode, refineMask == JNI_TRUE, &error);
+        RecordError(entry, error);
+        return swapped ? kRenderFrameSwappedBit : 0;
+    }
+    std::string error;
+    bool captured = false;
+    const bool swapped = entry->renderer->RenderFrameCapturing(
+        mode, refineMask == JNI_TRUE, out, static_cast<size_t>(capacity), &captured, &error);
+    RecordError(entry, error);
+    return (swapped ? kRenderFrameSwappedBit : 0) | (captured ? kRenderFrameCapturedBit : 0);
 }
 
 VG_GS_GPU_RESIDENT_JNI(jstring, nativeStatsSummary)(JNIEnv* env, jobject /*thiz*/, jlong handle) {

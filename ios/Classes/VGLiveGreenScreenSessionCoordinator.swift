@@ -50,6 +50,16 @@
 //                      VGDuetLayoutGeometry.greenScreen(canvasWidth:canvasHeight:transform:)
 //                      and swap it on the engine / loop.
 //   stopSession      → idempotent for unknown/already-stopped ids.
+//   takePhoto        → still photo of the composited output
+//                      (VG-LIVE-GREENSCREEN-PHOTO): the latest composited
+//                      CVPixelBuffer the session texture already presents
+//                      (adapter presentHandler / ARKit engine, the same
+//                      buffer the recorder taps) is retained under the
+//                      texture lock and JPEG-encoded on a background queue;
+//                      the reply lands on main only after the file exists
+//                      and is non-empty. Never the raw camera, never a
+//                      texture screenshot; the preview and any recording
+//                      keep running.
 //   diagnostics      → diagnostic-only read of the active engine's matte
 //                      latency / publication telemetry plus the camera's
 //                      selected session preset for the active session id
@@ -136,10 +146,12 @@
 import ARKit
 import AVFoundation
 import CoreGraphics
+import CoreImage
 import CoreMedia
 import CoreVideo
 import Flutter
 import Foundation
+import ImageIO
 import os.lock
 
 // MARK: - Start request
@@ -502,6 +514,22 @@ final class VGLiveGreenScreenSessionCoordinator {
     private static let minFreeDiskBytesForRecording: Int64 = 200 * 1024 * 1024
     /// Temporary-directory subfolder used when the caller supplies no outputPath.
     private static let defaultRecordingDirectoryName = "vanguard_live_green_screen"
+
+    // Still photo (VG-LIVE-GREENSCREEN-PHOTO).
+
+    /// JPEG quality for a still photo of the composited output (matches the
+    /// MultiCam composited-still and camera photo sinks).
+    private static let photoJPEGQuality: Double = 0.9
+    /// Serial background queue for JPEG encoding + file I/O of still photos:
+    /// never the main (plugin) thread and never the engine render path.
+    private static let photoEncodeQueue = DispatchQueue(
+        label: "com.connects.vanguard.livegreenscreen.photo", qos: .userInitiated)
+    /// Dedicated CIContext for still-photo encoding (CIContext is thread-safe).
+    /// Working color space disabled so the composited BGRA pixels are encoded
+    /// exactly as the texture presents them, with no color matching.
+    private static let photoCIContext = CIContext(options: [
+        CIContextOption.workingColorSpace: NSNull(),
+    ])
 
     // MARK: Event payload values
 
@@ -1190,6 +1218,136 @@ final class VGLiveGreenScreenSessionCoordinator {
                                                  reply: reply) else { return }
         discardRecording(session, reason: "cancel")
         reply(nil, nil)
+    }
+
+    // MARK: - still photo (VG-LIVE-GREENSCREEN-PHOTO)
+
+    /// Captures the composited output of the session as one JPEG at
+    /// `outputPath` and replies with `{filePath, width, height, fileSizeBytes}`.
+    ///
+    /// The frame is the latest composited CVPixelBuffer the session texture
+    /// already presents (both engines hand every composited frame to
+    /// `texture.update(pixelBuffer:)`; the recorder taps the same buffer), so
+    /// the photo is exactly what the preview shows: never the raw camera,
+    /// never a Flutter texture screenshot, never an export-time recomposition.
+    ///
+    /// Threading: the snapshot is retained under the texture lock on main (a
+    /// pointer read); JPEG encoding and file I/O run on `photoEncodeQueue`;
+    /// the reply always lands on main. The retained buffer is a strong ARC
+    /// reference captured by the encode block and released on every path when
+    /// that block completes. The preview and any active recording are not
+    /// touched.
+    ///
+    /// Fails closed with `session_not_found`, `INVALID_ARG` (relative /
+    /// existing outputPath) or `recording_failed` (no composited frame yet,
+    /// unwritable directory, JPEG encode failure, write failure, or an empty
+    /// file after the write); no partial file is left at `outputPath`.
+    func takePhoto(sessionId: String,
+                   outputPath: String,
+                   reply: @escaping (Any?, FlutterError?) -> Void) {
+        assert(Thread.isMainThread)
+        let route = "takeLiveGreenScreenPhoto"
+        guard let session = resolveActiveSession(sessionId: sessionId, route: route, reply: reply) else { return }
+        guard outputPath.hasPrefix("/") else {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                message: "\(route): 'outputPath' must be an absolute local path (got '\(outputPath)').",
+                details: nil))
+            return
+        }
+        let fm = FileManager.default
+        if fm.fileExists(atPath: outputPath) {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                message: "\(route): 'outputPath' already exists: \(outputPath)",
+                details: nil))
+            return
+        }
+        let outputURL = URL(fileURLWithPath: outputPath)
+        let parentDir = outputURL.deletingLastPathComponent()
+        do {
+            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true, attributes: nil)
+        } catch {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorRecordingFailed,
+                message: "\(route): cannot create the photo directory \(parentDir.path): \(error.localizedDescription)",
+                details: nil))
+            return
+        }
+
+        // Snapshot: strong reference to the latest composited frame, taken
+        // under the texture lock (retain only; no encoding inside the lock).
+        guard let snapshot = session.texture.latestPixelBufferRetained() else {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorRecordingFailed,
+                message: "\(route): no composited frame has been presented yet on session '\(sessionId)'.",
+                details: nil))
+            return
+        }
+        let width  = CVPixelBufferGetWidth(snapshot)
+        let height = CVPixelBufferGetHeight(snapshot)
+        let sid = session.sessionId
+        let engine = session.arkitEngine != nil
+            ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit
+            : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter
+        let quality = VGLiveGreenScreenSessionCoordinator.photoJPEGQuality
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Encode + write off the main / render path. `snapshot` is the only
+        // session-derived object captured; it is released when this block
+        // finishes on every path below.
+        VGLiveGreenScreenSessionCoordinator.photoEncodeQueue.async {
+            let fail: (String) -> Void = { reason in
+                // Never leave a partial at the final path.
+                try? fm.removeItem(at: outputURL)
+                NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_PHOTO_FAILED sessionId=\(sid) reason=\(reason)")
+                DispatchQueue.main.async {
+                    reply(nil, FlutterError(
+                        code:    VGLiveGreenScreenSessionCoordinator.errorRecordingFailed,
+                        message: "\(route): \(reason)",
+                        details: nil))
+                }
+            }
+            guard width > 0, height > 0 else {
+                fail("the composited frame has an invalid size (\(width)x\(height)).")
+                return
+            }
+            let ciImage = CIImage(cvPixelBuffer: snapshot)
+            let colorSpace = ciImage.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+            let qualityKey = CIImageRepresentationOption(
+                rawValue: kCGImageDestinationLossyCompressionQuality as String)
+            let options: [CIImageRepresentationOption: Any] = [qualityKey: quality]
+            guard let jpegData = VGLiveGreenScreenSessionCoordinator.photoCIContext.jpegRepresentation(
+                of: ciImage, colorSpace: colorSpace, options: options),
+                  !jpegData.isEmpty else {
+                fail("JPEG encoding of the composited frame failed.")
+                return
+            }
+            do {
+                try jpegData.write(to: outputURL, options: .atomic)
+            } catch {
+                fail("the photo could not be written to \(outputPath): \(error.localizedDescription)")
+                return
+            }
+            // Validate the committed file before replying: exists and non-empty.
+            guard let attrs = try? fm.attributesOfItem(atPath: outputPath),
+                  let sizeNumber = attrs[.size] as? NSNumber,
+                  sizeNumber.int64Value > 0 else {
+                fail("the written photo is missing or empty at \(outputPath).")
+                return
+            }
+            let fileSizeBytes = sizeNumber.int64Value
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+            NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_PHOTO_COMMITTED sessionId=\(sid) file=\(outputPath) size=\(width)x\(height) bytes=\(fileSizeBytes) segmentationEngine=\(engine) elapsedMs=\(String(format: "%.1f", elapsedMs))")
+            DispatchQueue.main.async {
+                reply([
+                    "filePath":      outputPath,
+                    "width":         width,
+                    "height":        height,
+                    "fileSizeBytes": fileSizeBytes,
+                ], nil)
+            }
+        }
     }
 
     /// Stops feeding the recorder: clears the ARKit tap and stops the

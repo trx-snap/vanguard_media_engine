@@ -143,6 +143,10 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         private const val RECORDER_FRAME_SKIPPED = 1
         private const val RECORDER_FRAME_FAILED = 2
 
+        // nativeRenderFrameCapturing result bits (VG-LIVE-GREENSCREEN-PHOTO).
+        private const val RENDER_FRAME_SWAPPED_BIT = 1
+        private const val RENDER_FRAME_CAPTURED_BIT = 2
+
         // RND defaults (gl_renderer.h): guided filter on, temporal off, despill on.
         private const val GUIDED_FILTER_ENABLED = true
         private const val TEMPORAL_STABILIZER_ENABLED = false
@@ -222,6 +226,14 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
     private var recorderFramesSkipped = 0L
     private var recorderFailureLogged = false
 
+    /**
+     * Armed one-shot still-photo read-back (VG-LIVE-GREENSCREEN-PHOTO),
+     * consumed by the next [drawFrame] that reaches its native composite
+     * (nativeRenderFrameCapturing). Render-thread only; failed (never left
+     * dangling) by [detachOutputSurface] and [release].
+     */
+    private var compositeCaptureRequest: AndroidGreenScreenCompositeCaptureRequest? = null
+
     // -- Green-screen state ----------------------------------------------------
 
     private var greenScreenEnabled = false
@@ -291,6 +303,9 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
     }
 
     override fun detachOutputSurface() {
+        // A still-photo read-back armed against this output must not resolve
+        // against a later re-attached one.
+        failCompositeCaptureQuietly("output_detached")
         outputAttached = false
         outputWidthPx = 0
         outputHeightPx = 0
@@ -412,13 +427,22 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
                 refineMask = runSegmentationOnLatchedFrame(handle)
             }
 
-            // 4. Composite frame N with mask N and swap.
+            // 4. Composite frame N with mask N and swap. With a still-photo
+            // read-back armed (VG-LIVE-GREENSCREEN-PHOTO), native additionally
+            // glReadPixels the composite between its composite pass and the
+            // swap, so the photo is exactly this presented frame.
             val cameraMode = when {
                 !hasCameraTexImage -> if (greenScreenEnabled) CAMERA_MODE_NONE else CAMERA_MODE_PLACEHOLDER
                 greenScreenEnabled -> if (hasMask) CAMERA_MODE_MASKED else CAMERA_MODE_NONE
                 else -> CAMERA_MODE_PASSTHROUGH
             }
-            val swapped = bridge.nativeRenderFrame(handle, cameraMode, refineMask)
+            val capture = compositeCaptureRequest
+            val swapped = if (capture != null) {
+                compositeCaptureRequest = null
+                renderFrameCapturing(handle, cameraMode, refineMask, capture)
+            } else {
+                bridge.nativeRenderFrame(handle, cameraMode, refineMask)
+            }
             frameCount++
             if (swapped) swappedFrameCount++
 
@@ -501,6 +525,106 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             )
         }
         return true
+    }
+
+    // -- Still photo read-back (VG-LIVE-GREENSCREEN-PHOTO) ---------------------
+
+    /**
+     * Arms/disarms the one-shot composite read-back (see
+     * [AndroidGreenScreenPreviewBackend.setCompositeCaptureRequest]). Rejects
+     * (false, nothing armed) when released, before the native core exists, or
+     * without an attached output: there is no composite to read. Render-thread only.
+     */
+    override fun setCompositeCaptureRequest(request: AndroidGreenScreenCompositeCaptureRequest?): Boolean {
+        if (request == null) {
+            compositeCaptureRequest = null
+            return true
+        }
+        if (isReleased.get() || !coreReady || !outputAttached || nativeHandle == 0L) {
+            Log.w(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_PHOTO_REJECTED backend=gpu_resident reason=not_ready " +
+                    "released=${isReleased.get()} coreReady=$coreReady outputAttached=$outputAttached",
+            )
+            return false
+        }
+        compositeCaptureRequest = request
+        return true
+    }
+
+    /**
+     * [drawFrame] step 4 with an armed read-back: renders and swaps exactly
+     * like nativeRenderFrame, but native also glReadPixels the composite
+     * (RGBA8, GL bottom-left row order) into a direct buffer between its
+     * composite pass and the swap. Resolves [request] exactly once and
+     * returns the swap result, so the preview outcome of this frame is
+     * unchanged whether or not the read-back succeeded. Requires at least one
+     * latched camera frame (a composite without the camera layer is not a
+     * photo of the user). Never throws; render-thread only.
+     */
+    private fun renderFrameCapturing(
+        handle: Long,
+        cameraMode: Int,
+        refineMask: Boolean,
+        request: AndroidGreenScreenCompositeCaptureRequest,
+    ): Boolean {
+        val widthPx = outputWidthPx
+        val heightPx = outputHeightPx
+        if (!hasCameraTexImage || widthPx <= 0 || heightPx <= 0) {
+            failCompositeCapture(request, if (!hasCameraTexImage) "no_camera_frame" else "invalid_output_size")
+            return bridge.nativeRenderFrame(handle, cameraMode, refineMask)
+        }
+        val rgba: ByteBuffer
+        val status: Int
+        val readMs: Double
+        try {
+            val startNs = System.nanoTime()
+            rgba = ByteBuffer.allocateDirect(widthPx * heightPx * 4).order(ByteOrder.nativeOrder())
+            status = bridge.nativeRenderFrameCapturing(handle, cameraMode, refineMask, rgba)
+            readMs = (System.nanoTime() - startNs) / 1_000_000.0
+        } catch (t: Throwable) {
+            Log.w(TAG, "nativeRenderFrameCapturing threw: ${t.javaClass.simpleName}: ${t.message}")
+            failCompositeCapture(request, "readback_exception:${t.javaClass.simpleName}")
+            return false
+        }
+        val swapped = (status and RENDER_FRAME_SWAPPED_BIT) != 0
+        if ((status and RENDER_FRAME_CAPTURED_BIT) == 0) {
+            val nativeError = try { bridge.nativeLastError(handle) } catch (_: Throwable) { "unavailable" }
+            Log.w(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_PHOTO_READBACK_FAILED backend=gpu_resident swapped=$swapped error=$nativeError",
+            )
+            failCompositeCapture(request, "native_readback_failed:" + sanitizeReason(nativeError))
+            return swapped
+        }
+        rgba.rewind()
+        Log.i(
+            TAG,
+            "ANDROID_LIVE_GREENSCREEN_PHOTO_CAPTURED backend=gpu_resident size=${widthPx}x$heightPx " +
+                "renderReadMs=${"%.2f".format(readMs)} swapped=$swapped greenScreen=$greenScreenEnabled " +
+                "maskReady=$hasMask cameraMode=$cameraMode",
+        )
+        try {
+            request.onCaptured(rgba, widthPx, heightPx)
+        } catch (t: Throwable) {
+            Log.w(TAG, "composite capture onCaptured threw: ${t.message}")
+        }
+        return swapped
+    }
+
+    private fun failCompositeCapture(request: AndroidGreenScreenCompositeCaptureRequest, reason: String) {
+        try {
+            request.onFailed(reason)
+        } catch (t: Throwable) {
+            Log.w(TAG, "composite capture onFailed threw: ${t.message}")
+        }
+    }
+
+    /** Fails and forgets an armed read-back so it never resolves on a later, unrelated frame. */
+    private fun failCompositeCaptureQuietly(reason: String) {
+        val request = compositeCaptureRequest ?: return
+        compositeCaptureRequest = null
+        failCompositeCapture(request, reason)
     }
 
     // -- Live recording (VG-LIVE-GREENSCREEN-RECORDING) ------------------------
@@ -673,6 +797,8 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         if (!isReleased.compareAndSet(false, true)) return
 
         try { cameraSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
+        // Still-photo read-back armed for a frame that will never be drawn.
+        failCompositeCaptureQuietly("released")
 
         val handle = nativeHandle
         val avgInferenceMs = if (inferenceCount > 0) totalInferenceNs / inferenceCount / 1_000_000.0 else 0.0

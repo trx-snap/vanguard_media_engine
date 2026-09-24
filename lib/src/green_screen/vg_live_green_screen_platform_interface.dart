@@ -105,6 +105,23 @@ abstract class VGLiveGreenScreenPlatformInterface {
   /// Idempotent: completes normally when no recording is running. The preview
   /// keeps running.
   Future<void> cancelLiveGreenScreenRecording({required String sessionId});
+
+  /// Captures the composited output of [sessionId] as one JPEG at
+  /// [outputPath] (an absolute local path that must not already exist) and
+  /// returns the committed file. The engine snapshots the latest frame it
+  /// already presents on the session texture, so the photo is exactly what
+  /// the preview shows; the preview and any active recording keep running.
+  ///
+  /// Throws [VGLiveGreenScreenException] with
+  /// [VGLiveGreenScreenErrorCode.sessionNotFound] for an unknown session,
+  /// [VGLiveGreenScreenErrorCode.invalidArgument] for a relative or existing
+  /// [outputPath], and [VGLiveGreenScreenErrorCode.recordingFailed] when no
+  /// composited frame exists yet or the JPEG could not be encoded, written,
+  /// or validated (the partial file is deleted).
+  Future<VGLiveGreenScreenPhotoResult> takeLiveGreenScreenPhoto({
+    required String sessionId,
+    required String outputPath,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,7 +135,8 @@ abstract class VGLiveGreenScreenPlatformInterface {
 /// Native method names: `startLiveGreenScreenSession`,
 /// `updateLiveGreenScreenBackground`, `updateLiveGreenScreenTransform`,
 /// `stopLiveGreenScreenSession`, `startLiveGreenScreenRecording`,
-/// `stopLiveGreenScreenRecording`, `cancelLiveGreenScreenRecording`.
+/// `stopLiveGreenScreenRecording`, `cancelLiveGreenScreenRecording`,
+/// `takeLiveGreenScreenPhoto`.
 /// Error codes from native: `INVALID_ARG`, `live_busy`, `cameraUnavailable`,
 /// `composition_failed`, `session_not_found`, `recording_active`,
 /// `recording_not_active`, `recording_failed`, `disk_full`.
@@ -139,6 +157,7 @@ class MethodChannelVGLiveGreenScreenPlatform
   static const String _methodStartRecording = 'startLiveGreenScreenRecording';
   static const String _methodStopRecording = 'stopLiveGreenScreenRecording';
   static const String _methodCancelRecording = 'cancelLiveGreenScreenRecording';
+  static const String _methodTakePhoto = 'takeLiveGreenScreenPhoto';
 
   @override
   Future<VGLiveGreenScreenSession> startLiveGreenScreenSession(
@@ -240,6 +259,34 @@ class MethodChannelVGLiveGreenScreenPlatform
     await _invoke<void>(_methodCancelRecording, <String, dynamic>{
       'sessionId': sessionId,
     });
+  }
+
+  @override
+  Future<VGLiveGreenScreenPhotoResult> takeLiveGreenScreenPhoto({
+    required String sessionId,
+    required String outputPath,
+  }) async {
+    final result = await _invoke<Map>(_methodTakePhoto, <String, dynamic>{
+      'sessionId': sessionId,
+      'outputPath': outputPath,
+    });
+    if (result == null) {
+      throw const VGLiveGreenScreenException(
+        code: VGLiveGreenScreenErrorCode.recordingFailed,
+        message: '$_methodTakePhoto returned null result.',
+      );
+    }
+    try {
+      return VGLiveGreenScreenPhotoResult.fromMap(
+        Map<String, dynamic>.from(result),
+      );
+    } on ArgumentError catch (e) {
+      throw VGLiveGreenScreenException(
+        code: VGLiveGreenScreenErrorCode.recordingFailed,
+        message: '$_methodTakePhoto returned a malformed result: ${e.message}',
+        cause: e,
+      );
+    }
   }
 
   Future<T?> _invoke<T>(String method, Map<String, dynamic> arguments) async {

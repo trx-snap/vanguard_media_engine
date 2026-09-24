@@ -160,6 +160,14 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
     private var recorderFramesSkipped = 0L
     private var recorderFailureLogged = false
 
+    /**
+     * Armed one-shot still-photo read-back (VG-LIVE-GREENSCREEN-PHOTO),
+     * consumed by the next [drawFrame] that reaches [drawCompositeScene].
+     * Render-thread only; failed (never left dangling) by
+     * [detachOutputSurface] and [release].
+     */
+    private var compositeCaptureRequest: AndroidGreenScreenCompositeCaptureRequest? = null
+
     private val cameraStMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
     // -- Output / layout state -------------------------------------------------
@@ -354,6 +362,9 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
      * teardown error; never throws. Idempotent.
      */
     override fun detachOutputSurface() {
+        // A still-photo read-back armed against this output must not resolve
+        // against a later re-attached one.
+        failCompositeCaptureQuietly("output_detached")
         destroyWindowSurfaceQuietly()
         outputSurface = null
         outputWidthPx = 0
@@ -465,6 +476,16 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
 
             drawCompositeScene()
 
+            // VG-LIVE-GREENSCREEN-PHOTO: one-shot read-back of exactly the
+            // composite just drawn, BEFORE the swap (the back buffer's
+            // contents are undefined after eglSwapBuffers). Pixel read only:
+            // row-flipping and JPEG encoding happen off this thread.
+            val capture = compositeCaptureRequest
+            if (capture != null) {
+                compositeCaptureRequest = null
+                readBackComposite(capture)
+            }
+
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
             val presented = EGL14.eglSwapBuffers(display, window)
 
@@ -524,6 +545,89 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
                     drawCameraPlaceholder(cr)
                 }
             }
+        }
+    }
+
+    // -- Still photo read-back (VG-LIVE-GREENSCREEN-PHOTO) ---------------------
+
+    /**
+     * Arms/disarms the one-shot composite read-back (see
+     * [AndroidGreenScreenPreviewBackend.setCompositeCaptureRequest]). Rejects
+     * (false, nothing armed) once released. Render-thread only.
+     */
+    override fun setCompositeCaptureRequest(request: AndroidGreenScreenCompositeCaptureRequest?): Boolean {
+        if (request == null) {
+            compositeCaptureRequest = null
+            return true
+        }
+        if (isReleased.get()) return false
+        compositeCaptureRequest = request
+        return true
+    }
+
+    /**
+     * Reads the composite [drawCompositeScene] just drew into the current
+     * (preview window) surface back to a direct RGBA8 buffer with
+     * glReadPixels (GL bottom-left origin; the receiver flips rows) and
+     * resolves [request] exactly once. Requires at least one latched camera
+     * frame: a composite without the camera layer is not a photo of the
+     * user, so it fails with `no_camera_frame` instead. Render-thread only,
+     * called by [drawFrame] with the preview surface current, before the swap.
+     */
+    private fun readBackComposite(request: AndroidGreenScreenCompositeCaptureRequest) {
+        val widthPx = outputWidthPx
+        val heightPx = outputHeightPx
+        if (!hasCameraTexImage) {
+            request.onFailed("no_camera_frame")
+            return
+        }
+        if (widthPx <= 0 || heightPx <= 0) {
+            request.onFailed("invalid_output_size")
+            return
+        }
+        val rgba: ByteBuffer
+        val readMs: Double
+        try {
+            val startNs = System.nanoTime()
+            rgba = ByteBuffer.allocateDirect(widthPx * heightPx * 4).order(ByteOrder.nativeOrder())
+            // Drain stale GL errors (bounded) so the read-back verdict below is exact.
+            var drained = 0
+            while (drained < 8 && GLES20.glGetError() != GLES20.GL_NO_ERROR) drained++
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 4)
+            GLES20.glReadPixels(0, 0, widthPx, heightPx, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rgba)
+            val glErr = GLES20.glGetError()
+            if (glErr != GLES20.GL_NO_ERROR) {
+                request.onFailed("glReadPixels_error_0x${Integer.toHexString(glErr)}")
+                return
+            }
+            rgba.rewind()
+            readMs = (System.nanoTime() - startNs) / 1_000_000.0
+        } catch (t: Throwable) {
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_PHOTO_READBACK_FAILED backend=gles_compositor ${t.javaClass.simpleName}: ${t.message}")
+            request.onFailed("readback_exception:${t.javaClass.simpleName}")
+            return
+        }
+        Log.i(
+            TAG,
+            "ANDROID_LIVE_GREENSCREEN_PHOTO_CAPTURED backend=gles_compositor size=${widthPx}x$heightPx " +
+                "readMs=${"%.2f".format(readMs)} greenScreen=$greenScreenEnabled maskReady=$hasMaskTexture",
+        )
+        try {
+            request.onCaptured(rgba, widthPx, heightPx)
+        } catch (t: Throwable) {
+            Log.w(TAG, "composite capture onCaptured threw: ${t.message}")
+        }
+    }
+
+    /** Fails and forgets an armed read-back so it never resolves on a later, unrelated frame. */
+    private fun failCompositeCaptureQuietly(reason: String) {
+        val request = compositeCaptureRequest ?: return
+        compositeCaptureRequest = null
+        try {
+            request.onFailed(reason)
+        } catch (t: Throwable) {
+            Log.w(TAG, "composite capture onFailed threw: ${t.message}")
         }
     }
 
@@ -703,6 +807,8 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
 
         try { cameraSurfaceTexture?.setOnFrameAvailableListener(null) } catch (_: Throwable) {}
 
+        // Still-photo read-back armed for a frame that will never be drawn.
+        failCompositeCaptureQuietly("released")
         destroyWindowSurfaceQuietly()
         outputSurface = null
         // Recording encoder EGL wrapper (never the recorder-owned Surface).

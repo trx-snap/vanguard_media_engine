@@ -34,6 +34,10 @@
 //   composite -> eglSwapBuffers) -> [while recording: RenderRecorderFrame
 //   (composite only, same textures and effective mode ->
 //   eglPresentationTimeANDROID -> eglSwapBuffers on the encoder surface)].
+// A still photo (VG-LIVE-GREENSCREEN-PHOTO) is RenderFrameCapturing: the
+// same transaction with one glReadPixels of the composite inserted between
+// the composite pass and the preview eglSwapBuffers, so the CPU copy is
+// exactly the frame that is presented (and that a recorder pass re-draws).
 //
 // Threading: single render thread only. No internal locking.
 //
@@ -79,6 +83,10 @@ struct GlesGreenScreenGpuResidentStats {
     double totalRecorderCompositeMs = 0.0;
     float lastRecorderSwapMs = 0.0f;
     float maxRecorderSwapMs = 0.0f;
+    // Still photo read-backs (RenderFrameCapturing), cumulative.
+    uint64_t compositeCaptures = 0;
+    uint64_t compositeCaptureFailures = 0;
+    float lastCaptureReadMs = 0.0f;
 };
 
 class GlesGreenScreenGpuResidentRenderer {
@@ -263,6 +271,20 @@ public:
      */
     bool RenderFrame(CameraMode cameraMode, bool refineMask, std::string* error);
 
+    /**
+     * RenderFrame plus a one-shot CPU read-back of the composite it presents
+     * (VG-LIVE-GREENSCREEN-PHOTO). After the composite pass and BEFORE
+     * eglSwapBuffers, the full output (outputWidth x outputHeight, tightly
+     * packed RGBA8, GL bottom-left row order) is glReadPixels'd into outRgba,
+     * whose capacity must be >= outputWidth * outputHeight * 4 bytes.
+     * *outCaptured reports the read-back; the return value is the swap
+     * result exactly as RenderFrame, and the frame is presented whether or
+     * not the read-back succeeded (a failed read-back only sets *error).
+     * Same thread / context rules as RenderFrame.
+     */
+    bool RenderFrameCapturing(CameraMode cameraMode, bool refineMask, uint8_t* outRgba,
+                              size_t outRgbaCapacityBytes, bool* outCaptured, std::string* error);
+
     const GlesGreenScreenGpuResidentStats& stats() const { return stats_; }
     std::string StatsSummary() const;
 
@@ -293,6 +315,16 @@ private:
     bool RunGuidedFilter(std::string* error);
     bool RunTemporalStabilizer(std::string* error);
     bool RunComposite(CameraMode cameraMode, std::string* error);
+
+    // Shared body of RenderFrame / RenderFrameCapturing: captureRgba == nullptr
+    // means no read-back; otherwise the composite is read into it before the
+    // swap and *outCaptured (may be nullptr) reports the read-back.
+    bool RenderFrameInternal(CameraMode cameraMode, bool refineMask, uint8_t* captureRgba,
+                             size_t captureCapacityBytes, bool* outCaptured, std::string* error);
+    // glReadPixels of the current default-framebuffer composite into outRgba
+    // (RGBA8, bottom-left origin). Requires the preview window current and a
+    // just-completed composite pass.
+    bool ReadCompositeToCpu(uint8_t* outRgba, size_t outRgbaCapacityBytes, std::string* error);
 
     // EGL (void* aliases of EGLDisplay / EGLConfig / EGLContext / EGLSurface).
     void* eglDisplay_ = nullptr;

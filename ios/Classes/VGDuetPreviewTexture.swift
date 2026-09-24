@@ -55,6 +55,28 @@ final class VGDuetPreviewTexture: NSObject, FlutterTexture {
         lock.unlock()
     }
 
+    // MARK: - Still-photo snapshot (VG-LIVE-GREENSCREEN-PHOTO)
+
+    /// Returns a strong (+1, ARC-owned) reference to the most recently supplied
+    /// composited pixel buffer, or nil when no frame has been supplied yet or
+    /// the texture was invalidated.
+    ///
+    /// The lock is held only for the invalidation check and the retain (a
+    /// pointer read), never across encoding. The retain keeps the buffer out
+    /// of its pool for as long as the caller holds the reference: a later
+    /// `update(pixelBuffer:)` only replaces the stored pointer and never
+    /// mutates the pixels of the buffer returned here, so the caller may
+    /// encode the snapshot on any thread. ARC releases the reference when the
+    /// caller's last strong reference goes away (there is no manual
+    /// CVPixelBufferRelease in Swift), so every caller path releases it by
+    /// letting the local go out of scope.
+    func latestPixelBufferRetained() -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !_invalidated, let buf = _latestPixelBuffer else { return nil }
+        return buf
+    }
+
     // MARK: - Teardown
 
     /// Drops the retained pixel buffer and marks the texture as detached.

@@ -100,6 +100,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 // every case except session stop. A backend without an encoder draw route
 // (the GPU-resident backend today) rejects the attach and start fails closed
 // with `recording_failed` -- never a black or raw-camera file.
+//
+// Still photo (VG-LIVE-GREENSCREEN-PHOTO): `takePhoto` asks the render loop
+// for a one-shot read-back of the SAME composite the preview backend
+// presents (background + keyed camera, current layout; both backends read it
+// between their composite pass and the preview swap, the GPU-resident one
+// through native). Only the pixel read runs on the render thread; row-flip,
+// JPEG encode and the ".tmp" -> final commit run on a worker thread, and the
+// reply lands on main only after the committed file is validated non-empty.
+// Never the raw camera, never a Flutter texture screenshot, never an
+// export-time recomposition; the preview and any active recording keep
+// running, and a failure deletes the partial and leaves the session alive.
 
 class AndroidLiveGreenScreenSessionCoordinator(
     private val mainHandler: Handler,
@@ -561,6 +572,93 @@ class AndroidLiveGreenScreenSessionCoordinator(
         Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_DISCARDED session=${session.sessionId} reason=$reason stage=recording")
         val loop = session.renderLoop
         if (loop != null) loop.detachSegmentRecorder { recorder.cancel() } else recorder.cancel()
+    }
+
+    // ── still photo (VG-LIVE-GREENSCREEN-PHOTO) ───────────────────────────────
+
+    /**
+     * Captures the composited output of [sessionId] as one JPEG at
+     * [outputPath] (absolute local path that must not exist yet) and replies
+     * with `{filePath, width, height, fileSizeBytes}` once the file is
+     * committed and validated non-empty. The frame is the composite the
+     * preview backend presents right now (see the class doc); the preview and
+     * any active recording are untouched. Fails closed with `INVALID_ARG`
+     * (relative / existing path) or `recording_failed` (preview not attached
+     * or suspended, unwritable directory, no camera frame yet, read-back /
+     * encode / commit failure); no file is left at [outputPath] on failure and
+     * the session stays alive for a retry.
+     */
+    fun takePhoto(sessionId: String, outputPath: String, reply: (Any?, String?) -> Unit) {
+        val route = "takeLiveGreenScreenPhoto"
+        val session = resolveSession(sessionId, route, reply) ?: return
+        val file = File(outputPath)
+        if (!file.isAbsolute) {
+            reply(null, errorMsg(ERROR_INVALID_ARG,
+                "$route: 'outputPath' must be an absolute local path (got '$outputPath')."))
+            return
+        }
+        if (file.exists()) {
+            reply(null, errorMsg(ERROR_INVALID_ARG,
+                "$route: 'outputPath' already exists: $outputPath"))
+            return
+        }
+        val loop = session.renderLoop
+        if (loop == null || session.producer == null) {
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: the preview is not attached, so no composited frame is available."))
+            return
+        }
+        if (session.suspended) {
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: the preview output is suspended, so no composited frame is being presented."))
+            return
+        }
+        val dir = file.parentFile
+        if (dir == null || (!dir.exists() && !dir.mkdirs() && !dir.exists())) {
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: cannot create the photo directory ${dir?.absolutePath ?: "<none>"}."))
+            return
+        }
+        val backend = if (loop.usingFallbackBackend) "gles_compositor" else "gpu_resident"
+        // The loop delivers on the main thread exactly once.
+        loop.captureCompositePhoto(file) { result ->
+            onPhotoFinished(session, route, backend, file, result, reply)
+        }
+    }
+
+    /** Main-thread landing of a still photo's capture/encode/commit result. */
+    private fun onPhotoFinished(
+        session: LiveSession,
+        route: String,
+        backend: String,
+        file: File,
+        result: Result<AndroidGreenScreenPreviewRenderLoop.CompositePhotoOutcome>,
+        reply: (Any?, String?) -> Unit,
+    ) {
+        val outcome = result.getOrNull()
+        if (outcome == null) {
+            val reason = result.exceptionOrNull()?.message ?: "unknown"
+            // Never leave a partial at the final path (the loop already
+            // deleted its own temp; this is the belt to that suspender).
+            try { if (file.exists()) file.delete() } catch (_: Throwable) {}
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_PHOTO_FAILED session=${session.sessionId} " +
+                "backend=$backend reason=$reason")
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: the composited photo could not be captured ($reason)."))
+            return
+        }
+        Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_PHOTO_COMMITTED session=${session.sessionId} " +
+            "backend=$backend file=${outcome.file.absolutePath} size=${outcome.widthPx}x${outcome.heightPx} " +
+            "bytes=${outcome.fileSizeBytes}")
+        reply(
+            mapOf(
+                "filePath" to outcome.file.absolutePath,
+                "width" to outcome.widthPx,
+                "height" to outcome.heightPx,
+                "fileSizeBytes" to outcome.fileSizeBytes,
+            ),
+            null,
+        )
     }
 
     // ── disposeAll ────────────────────────────────────────────────────────────

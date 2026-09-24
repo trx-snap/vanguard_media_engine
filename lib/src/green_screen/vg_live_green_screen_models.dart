@@ -16,6 +16,9 @@
 // of an active session to one MP4: the engine taps the same composited frame
 // it presents on the texture, so the recorded video is exactly what the
 // preview shows, at fixed 1.0x speed, with best-effort microphone audio.
+// Still photos ([VGLiveGreenScreenPhotoResult]) capture that same native
+// composited frame once, as a JPEG: never the raw camera, never a Flutter
+// texture screenshot, never an export-time recomposition.
 //
 // Wire contract (MethodChannel `vanguard_media_engine`):
 //   startLiveGreenScreenSession     → [VGLiveGreenScreenConfig.toMap]
@@ -27,6 +30,8 @@
 //   stopLiveGreenScreenRecording    → {sessionId}
 //                                     ← [VGLiveGreenScreenRecordingResult.fromMap]
 //   cancelLiveGreenScreenRecording  → {sessionId}
+//   takeLiveGreenScreenPhoto        → {sessionId, outputPath}
+//                                     ← [VGLiveGreenScreenPhotoResult.fromMap]
 //   errors → `INVALID_ARG`, `live_busy`, `cameraUnavailable`,
 //            `composition_failed`, `session_not_found`, `recording_active`,
 //            `recording_not_active`, `recording_failed`, `disk_full`, mapped
@@ -468,6 +473,92 @@ class VGLiveGreenScreenRecordingResult {
       'VGLiveGreenScreenRecordingResult(filePath: $filePath, '
       'durationMs: $durationMs, fileSizeBytes: $fileSizeBytes, '
       'size: ${width}x$height, hasAudio: $hasAudio)';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Photo result
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The committed JPEG produced by `takeLiveGreenScreenPhoto`.
+///
+/// The engine snapshots the latest composited frame it already presents on
+/// the session texture (background + keyed camera in the current layout),
+/// encodes it off the render path, and replies only after the file exists
+/// and is non-empty at [filePath]. Every failure path deletes the partial,
+/// so a result always names a complete file.
+class VGLiveGreenScreenPhotoResult {
+  /// Absolute local path of the committed JPEG.
+  final String filePath;
+
+  /// Encoded image width in pixels (the session canvas width).
+  final int width;
+
+  /// Encoded image height in pixels (the session canvas height).
+  final int height;
+
+  /// Size of the committed file in bytes.
+  final int fileSizeBytes;
+
+  const VGLiveGreenScreenPhotoResult({
+    required this.filePath,
+    required this.width,
+    required this.height,
+    required this.fileSizeBytes,
+  });
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+    'filePath': filePath,
+    'width': width,
+    'height': height,
+    'fileSizeBytes': fileSizeBytes,
+  };
+
+  /// Parses the native photo reply. Throws [ArgumentError] when `filePath` is
+  /// missing, not a string, or empty, or when a present numeric field is not
+  /// a number. Absent numeric fields default to `0`, mirroring
+  /// [VGLiveGreenScreenRecordingResult.fromMap].
+  factory VGLiveGreenScreenPhotoResult.fromMap(Map<String, dynamic> map) {
+    final filePath = map['filePath'];
+    if (filePath is! String || filePath.isEmpty) {
+      throw ArgumentError(
+        'VGLiveGreenScreenPhotoResult.fromMap: missing or invalid "filePath".',
+      );
+    }
+    return VGLiveGreenScreenPhotoResult(
+      filePath: filePath,
+      width: _intField(map, 'width'),
+      height: _intField(map, 'height'),
+      fileSizeBytes: _intField(map, 'fileSizeBytes'),
+    );
+  }
+
+  static int _intField(Map<String, dynamic> map, String key) {
+    final value = map[key];
+    if (value == null) return 0;
+    if (value is! num) {
+      throw ArgumentError(
+        'VGLiveGreenScreenPhotoResult.fromMap: "$key" must be a number.',
+      );
+    }
+    return value.toInt();
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGLiveGreenScreenPhotoResult &&
+          filePath == other.filePath &&
+          width == other.width &&
+          height == other.height &&
+          fileSizeBytes == other.fileSizeBytes;
+
+  @override
+  int get hashCode => Object.hash(filePath, width, height, fileSizeBytes);
+
+  @override
+  String toString() =>
+      'VGLiveGreenScreenPhotoResult(filePath: $filePath, '
+      'size: ${width}x$height, fileSizeBytes: $fileSizeBytes)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

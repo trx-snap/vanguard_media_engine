@@ -1,6 +1,32 @@
 package com.connects.vanguard_media_engine.greenscreen
 
 import android.view.Surface
+import java.nio.ByteBuffer
+
+/**
+ * One-shot CPU read-back of the composited preview frame for a still photo
+ * (VG-LIVE-GREENSCREEN-PHOTO), armed on a backend through
+ * [AndroidGreenScreenPreviewBackend.setCompositeCaptureRequest]. The backend
+ * reads back EXACTLY the composite it presents (background + keyed camera in
+ * the current layout, the same pass the preview swap and the recorder see),
+ * after its composite pass and before the preview swap, and resolves the
+ * request exactly once on its render thread: [onCaptured] with the raw
+ * pixels, or [onFailed] with a diagnostic token. Only the pixel read happens
+ * on the render thread; the receiver must move row-flipping and JPEG encoding
+ * off it (see [AndroidGreenScreenPreviewRenderLoop.captureCompositePhoto]).
+ */
+interface AndroidGreenScreenCompositeCaptureRequest {
+    /**
+     * [widthPx] x [heightPx] tightly packed RGBA8 pixels of the composite in
+     * GL read-back order (row 0 = BOTTOM of the image); a direct buffer with
+     * position 0 that the receiver now owns. Alpha is not meaningful (the
+     * composite is opaque over its background). Render thread, at most once.
+     */
+    fun onCaptured(rgbaBottomUp: ByteBuffer, widthPx: Int, heightPx: Int)
+
+    /** No pixels were read ([reason] is a diagnostic token). Render thread, at most once. */
+    fun onFailed(reason: String)
+}
 
 /**
  * Encoder-surface target a live green-screen recording hands to the preview
@@ -107,6 +133,22 @@ interface AndroidGreenScreenPreviewBackend {
      * file. Render-thread only.
      */
     fun setSegmentRecorderTarget(target: AndroidGreenScreenSegmentRecorderSurfaceTarget?): Boolean = target == null
+
+    /**
+     * Arms (non-null) or disarms (null) a one-shot still-photo read-back of
+     * the composited frame (VG-LIVE-GREENSCREEN-PHOTO). An armed request is
+     * consumed by the next [drawFrame] that reaches its composite pass, which
+     * resolves it exactly once (captured or failed) before that draw returns;
+     * a [drawFrame] that returns early without compositing (no output
+     * surface, released) leaves the request armed, so the caller disarms it
+     * and fails its own way. Arming replaces any previously armed request
+     * without resolving it. Returns true when the request is armed (or a
+     * null request was cleared). Both production backends override this; the
+     * default supports disarm only, so a backend without a read-back route
+     * fails a photo closed instead of returning a raw or black image.
+     * Render-thread only.
+     */
+    fun setCompositeCaptureRequest(request: AndroidGreenScreenCompositeCaptureRequest?): Boolean = request == null
 
     /**
      * Read-only, render-thread-only diagnostics snapshot for regression

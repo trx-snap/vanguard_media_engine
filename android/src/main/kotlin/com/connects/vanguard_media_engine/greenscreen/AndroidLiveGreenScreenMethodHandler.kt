@@ -12,9 +12,10 @@ import java.io.File
 /**
  * Thin MethodChannel handler for the generic live green-screen routes:
  * `startLiveGreenScreenSession`, `updateLiveGreenScreenBackground`,
- * `updateLiveGreenScreenTransform`, `stopLiveGreenScreenSession`, and the
+ * `updateLiveGreenScreenTransform`, `stopLiveGreenScreenSession`, the
  * recording routes `startLiveGreenScreenRecording`,
- * `stopLiveGreenScreenRecording`, `cancelLiveGreenScreenRecording`.
+ * `stopLiveGreenScreenRecording`, `cancelLiveGreenScreenRecording`, and the
+ * still-photo route `takeLiveGreenScreenPhoto`.
  *
  * The plugin only routes here. This class owns argument parsing and
  * validation (`INVALID_ARG`) and error-code decoding; every lifecycle
@@ -43,6 +44,7 @@ class AndroidLiveGreenScreenMethodHandler(
         const val METHOD_START_RECORDING = "startLiveGreenScreenRecording"
         const val METHOD_STOP_RECORDING = "stopLiveGreenScreenRecording"
         const val METHOD_CANCEL_RECORDING = "cancelLiveGreenScreenRecording"
+        const val METHOD_TAKE_PHOTO = "takeLiveGreenScreenPhoto"
 
         private val OWNED_METHODS = setOf(
             METHOD_START,
@@ -52,6 +54,7 @@ class AndroidLiveGreenScreenMethodHandler(
             METHOD_START_RECORDING,
             METHOD_STOP_RECORDING,
             METHOD_CANCEL_RECORDING,
+            METHOD_TAKE_PHOTO,
         )
 
         private const val ERROR_INVALID_ARG = "INVALID_ARG"
@@ -148,6 +151,22 @@ class AndroidLiveGreenScreenMethodHandler(
             METHOD_CANCEL_RECORDING -> {
                 val sid = requireSessionId(safeArgs, method, result) ?: return
                 coordinator.cancelRecording(sid) { value, errStr ->
+                    replyFromCoordinator(result, value, errStr)
+                }
+            }
+
+            METHOD_TAKE_PHOTO -> {
+                // VG-LIVE-GREENSCREEN-PHOTO: {sessionId, outputPath} -> still
+                // JPEG of the composited output. outputPath is required
+                // (non-blank string; the coordinator validates absolute /
+                // not-existing itself).
+                val sid = requireSessionId(safeArgs, method, result) ?: return
+                val outputPath = (safeArgs["outputPath"] as? String)?.trim()
+                if (outputPath.isNullOrEmpty()) {
+                    result.error(ERROR_INVALID_ARG, "$method: missing required string argument 'outputPath'.", null)
+                    return
+                }
+                coordinator.takePhoto(sid, outputPath) { value, errStr ->
                     replyFromCoordinator(result, value, errStr)
                 }
             }

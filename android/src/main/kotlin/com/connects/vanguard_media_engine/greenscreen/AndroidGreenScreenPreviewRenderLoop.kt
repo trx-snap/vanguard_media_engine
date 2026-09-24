@@ -1,10 +1,14 @@
 package com.connects.vanguard_media_engine.greenscreen
 
+import android.graphics.Bitmap
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -90,7 +94,21 @@ class AndroidGreenScreenPreviewRenderLoop(
 
         /** Camera idle redraw cadence (~30 fps) — the sole frame source for this loop. */
         private const val CAMERA_REDRAW_MS = 33L
+
+        /** JPEG quality for a still photo of the composited preview (VG-LIVE-GREENSCREEN-PHOTO). */
+        private const val PHOTO_JPEG_QUALITY = 92
+
+        /** Per-photo worker thread name for row-flip + JPEG encode (never the render thread). */
+        private const val PHOTO_ENCODE_THREAD_NAME = "vg.greenscreen.photo"
     }
+
+    /** Committed still photo of the composited preview: the JPEG file and its pixel size. */
+    class CompositePhotoOutcome(
+        val file: File,
+        val widthPx: Int,
+        val heightPx: Int,
+        val fileSizeBytes: Long,
+    )
 
     // -- Owned render thread + compositor (render-thread-confined) -------------
 
@@ -388,6 +406,222 @@ class AndroidGreenScreenPreviewRenderLoop(
             done()
         }
         if (!posted) done()
+    }
+
+    // -- Still photo of the composited preview (VG-LIVE-GREENSCREEN-PHOTO) ----
+
+    /**
+     * Captures the composited preview exactly as it is presented now and
+     * commits it as a JPEG at [outputFile]. [onResult] lands on [mainHandler]
+     * exactly once with the committed file, or with a failure whose message
+     * is a diagnostic token; on failure no file is left at [outputFile].
+     * Safe from any thread.
+     *
+     * Mechanism: on the render thread a one-shot read-back is armed on the
+     * backend ([AndroidGreenScreenPreviewBackend.setCompositeCaptureRequest])
+     * and one [AndroidGreenScreenPreviewBackend.drawFrame] is issued
+     * immediately (the same pattern [updateLayout] uses), which re-composites
+     * the currently latched camera frame, mask and background -- exactly what
+     * the texture shows -- reads the composite back before its swap, and
+     * presents it again. The backend resolves the request before that draw
+     * returns; a draw that never reached its composite (output lost, backend
+     * released) is failed here instead of leaving the request armed for a
+     * later, unrelated frame. Only the pixel read happens on the render
+     * thread: row-flipping, JPEG encoding and file I/O run on a per-photo
+     * worker thread, so preview pacing and an active recording are never
+     * blocked on encoding. The recorder's encoder pass is gated on a newly
+     * latched camera frame, so this extra draw never duplicates a recorded
+     * frame.
+     */
+    fun captureCompositePhoto(
+        outputFile: File,
+        onResult: (Result<CompositePhotoOutcome>) -> Unit,
+    ) {
+        val deliver: (Result<CompositePhotoOutcome>) -> Unit = { result ->
+            mainHandler.post { onResult(result) }
+        }
+        if (isStopped.get()) {
+            deliver(Result.failure(IllegalStateException("render_loop_stopped")))
+            return
+        }
+        val generation = surfaceGeneration.get()
+        val posted = renderHandler.post {
+            if (isStopped.get()) {
+                deliver(Result.failure(IllegalStateException("render_loop_stopped")))
+                return@post
+            }
+            // A loss/stop/re-attach since the request means the frame the
+            // caller saw is gone (or nothing is being presented at all).
+            if (generation != surfaceGeneration.get() || !canSubmit.get()) {
+                deliver(Result.failure(IllegalStateException("output_surface_unavailable")))
+                return@post
+            }
+            val request = object : AndroidGreenScreenCompositeCaptureRequest {
+                var resolved = false
+
+                override fun onCaptured(rgbaBottomUp: ByteBuffer, widthPx: Int, heightPx: Int) {
+                    resolved = true
+                    encodeCompositePhotoAsync(rgbaBottomUp, widthPx, heightPx, outputFile, deliver)
+                }
+
+                override fun onFailed(reason: String) {
+                    resolved = true
+                    deliver(Result.failure(IllegalStateException(reason)))
+                }
+            }
+            val armed = try {
+                compositor.setCompositeCaptureRequest(request)
+            } catch (t: Throwable) {
+                Log.w(TAG, "setCompositeCaptureRequest threw: ${t.message}")
+                false
+            }
+            if (!armed) {
+                deliver(Result.failure(IllegalStateException("backend_rejected_capture")))
+                return@post
+            }
+            try {
+                compositor.drawFrame()
+            } catch (t: Throwable) {
+                Log.w(TAG, "drawFrame for composite photo threw: ${t.message}")
+            }
+            if (!request.resolved) {
+                // The draw returned before compositing (no window surface /
+                // released): disarm so no later frame resolves this request.
+                try { compositor.setCompositeCaptureRequest(null) } catch (_: Throwable) {}
+                deliver(Result.failure(IllegalStateException("frame_not_composited")))
+            }
+        }
+        if (!posted) {
+            deliver(Result.failure(IllegalStateException("render_thread_unavailable")))
+        }
+    }
+
+    /**
+     * Hands the raw read-back to a per-photo worker thread for row-flip +
+     * JPEG encode + commit, delivering the outcome through [deliver]. Called
+     * on the render thread; returns immediately.
+     */
+    private fun encodeCompositePhotoAsync(
+        rgbaBottomUp: ByteBuffer,
+        widthPx: Int,
+        heightPx: Int,
+        outputFile: File,
+        deliver: (Result<CompositePhotoOutcome>) -> Unit,
+    ) {
+        val worker = Thread(
+            { deliver(encodeCompositePhoto(rgbaBottomUp, widthPx, heightPx, outputFile)) },
+            PHOTO_ENCODE_THREAD_NAME,
+        )
+        try {
+            worker.start()
+        } catch (t: Throwable) {
+            Log.w(TAG, "photo encode thread start failed: ${t.message}")
+            deliver(Result.failure(IllegalStateException("encode_thread_start_failed", t)))
+        }
+    }
+
+    /**
+     * Worker-thread JPEG commit of one composite read-back:
+     *   1. row-flip the GL bottom-left pixels to image top-left, forcing every
+     *      alpha byte opaque (the composite is opaque over its background and
+     *      the framebuffer alpha is not meaningful; an opaque ARGB_8888 bitmap
+     *      also keeps the premultiplied encode path exact),
+     *   2. wrap the pixels in an ARGB_8888 [Bitmap] (RGBA byte order matches
+     *      GL_RGBA read-back),
+     *   3. encode to "<output>.tmp",
+     *   4. validate the temp is non-empty, rename it to [outputFile] and
+     *      validate the final file.
+     * Every failure deletes the temp and the final path and returns a failure
+     * whose message is a diagnostic token. Never throws.
+     */
+    private fun encodeCompositePhoto(
+        rgbaBottomUp: ByteBuffer,
+        widthPx: Int,
+        heightPx: Int,
+        outputFile: File,
+    ): Result<CompositePhotoOutcome> {
+        val tmpFile = File(outputFile.path + ".tmp")
+        var bitmap: Bitmap? = null
+        try {
+            if (widthPx <= 0 || heightPx <= 0) {
+                return Result.failure(IllegalStateException("invalid_capture_size"))
+            }
+            val rowBytes = widthPx * 4
+            val totalBytes = rowBytes * heightPx
+            if (rgbaBottomUp.capacity() < totalBytes) {
+                return Result.failure(IllegalStateException("capture_buffer_too_small"))
+            }
+            val startNs = System.nanoTime()
+
+            // 1. Row flip + opaque alpha.
+            val source = ByteArray(totalBytes)
+            rgbaBottomUp.rewind()
+            rgbaBottomUp.get(source, 0, totalBytes)
+            val topDown = ByteArray(totalBytes)
+            for (row in 0 until heightPx) {
+                System.arraycopy(source, (heightPx - 1 - row) * rowBytes, topDown, row * rowBytes, rowBytes)
+            }
+            var alphaIndex = 3
+            while (alphaIndex < totalBytes) {
+                topDown[alphaIndex] = 0xFF.toByte()
+                alphaIndex += 4
+            }
+
+            // 2. Bitmap.
+            val bmp = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888)
+            bitmap = bmp
+            bmp.copyPixelsFromBuffer(ByteBuffer.wrap(topDown))
+            bmp.setHasAlpha(false)
+
+            // 3. JPEG -> temp.
+            deleteQuietly(tmpFile)
+            val encoded = FileOutputStream(tmpFile).use { out ->
+                val ok = bmp.compress(Bitmap.CompressFormat.JPEG, PHOTO_JPEG_QUALITY, out)
+                out.flush()
+                ok
+            }
+            if (!encoded) {
+                deleteQuietly(tmpFile)
+                return Result.failure(IllegalStateException("jpeg_encode_failed"))
+            }
+            if (tmpFile.length() <= 0L) {
+                deleteQuietly(tmpFile)
+                return Result.failure(IllegalStateException("jpeg_output_empty"))
+            }
+
+            // 4. Commit + validate.
+            val renamed = try { tmpFile.renameTo(outputFile) } catch (_: Throwable) { false }
+            if (!renamed) {
+                deleteQuietly(tmpFile)
+                deleteQuietly(outputFile)
+                return Result.failure(IllegalStateException("commit_rename_failed"))
+            }
+            val finalLength = outputFile.length()
+            if (!outputFile.isFile || finalLength <= 0L) {
+                deleteQuietly(outputFile)
+                return Result.failure(IllegalStateException("commit_validation_failed"))
+            }
+            Log.i(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_PHOTO_ENCODED file=${outputFile.absolutePath} " +
+                    "size=${widthPx}x$heightPx bytes=$finalLength " +
+                    "encodeMs=${"%.1f".format((System.nanoTime() - startNs) / 1_000_000.0)}",
+            )
+            return Result.success(CompositePhotoOutcome(outputFile, widthPx, heightPx, finalLength))
+        } catch (t: Throwable) {
+            Log.w(TAG, "composite photo encode failed: ${t.javaClass.simpleName}: ${t.message}")
+            deleteQuietly(tmpFile)
+            deleteQuietly(outputFile)
+            return Result.failure(IllegalStateException("encode_exception:${t.javaClass.simpleName}", t))
+        } finally {
+            try { bitmap?.recycle() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun deleteQuietly(file: File) {
+        try {
+            if (file.exists()) file.delete()
+        } catch (_: Throwable) {}
     }
 
     /**

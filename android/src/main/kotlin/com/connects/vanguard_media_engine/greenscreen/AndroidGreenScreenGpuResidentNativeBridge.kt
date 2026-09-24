@@ -117,6 +117,19 @@ object AndroidGreenScreenGpuResidentNativeBridge {
      */
     external fun nativeRenderFrame(handle: Long, cameraMode: Int, refineMask: Boolean): Boolean
 
+    /**
+     * VG-LIVE-GREENSCREEN-PHOTO: [nativeRenderFrame] plus a one-shot CPU
+     * read-back of the composite it presents. After the composite pass and
+     * BEFORE eglSwapBuffers, native glReadPixels the full output
+     * (outputWidth x outputHeight, tightly packed RGBA8, GL bottom-left row
+     * order) into [rgbaOut], which must be direct with capacity >=
+     * width*height*4. Returns a bitmask: bit 0 (1) = the preview frame was
+     * swapped (the [nativeRenderFrame] result), bit 1 (2) = the read-back
+     * succeeded. The frame is rendered and presented even when the read-back
+     * fails; see [nativeLastError] for the reason.
+     */
+    external fun nativeRenderFrameCapturing(handle: Long, cameraMode: Int, refineMask: Boolean, rgbaOut: ByteBuffer): Int
+
     external fun nativeStatsSummary(handle: Long): String
     external fun nativeLastError(handle: Long): String
 

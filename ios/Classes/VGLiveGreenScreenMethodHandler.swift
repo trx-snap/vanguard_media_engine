@@ -142,6 +142,7 @@ final class VGLiveGreenScreenMethodHandler {
         "startLiveGreenScreenRecording",
         "stopLiveGreenScreenRecording",
         "cancelLiveGreenScreenRecording",
+        "takeLiveGreenScreenPhoto",
         "getLiveGreenScreenDiagnostics",
         "setLiveGreenScreenDiagnosticsOptions",
         "replayLiveGreenScreenInputBundle",
@@ -264,6 +265,31 @@ final class VGLiveGreenScreenMethodHandler {
         case "cancelLiveGreenScreenRecording":
             guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
             coordinator.cancelRecording(sessionId: sid) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
+
+        case "takeLiveGreenScreenPhoto":
+            // VG-LIVE-GREENSCREEN-PHOTO: {sessionId, outputPath} → still JPEG of
+            // the composited output. outputPath is required (absolute; the
+            // coordinator validates the path itself).
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            guard let rawPath = args?["outputPath"], !(rawPath is NSNull),
+                  let path = rawPath as? String else {
+                result(FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "\(method): missing required string argument 'outputPath'.",
+                    details: nil))
+                return
+            }
+            let outputPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !outputPath.isEmpty else {
+                result(FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "\(method): 'outputPath' must not be blank.",
+                    details: nil))
+                return
+            }
+            coordinator.takePhoto(sessionId: sid, outputPath: outputPath) { val, err in
                 self.reply(result: result, value: val, error: err)
             }
 
