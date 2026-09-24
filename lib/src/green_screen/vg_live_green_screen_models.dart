@@ -11,7 +11,11 @@
 // v1 scope: the engine owns the camera; the background is a static solid
 // color or image filling the full canvas; the foreground transform moves and
 // scales only the keyed camera layer. Video backgrounds, external frame
-// ingest, recording/export, and app UI wiring are deferred.
+// ingest, and app UI wiring are deferred. Recording (this file's
+// [VGLiveGreenScreenRecordingResult]) captures the final composited output
+// of an active session to one MP4: the engine taps the same composited frame
+// it presents on the texture, so the recorded video is exactly what the
+// preview shows, at fixed 1.0x speed, with best-effort microphone audio.
 //
 // Wire contract (MethodChannel `vanguard_media_engine`):
 //   startLiveGreenScreenSession     → [VGLiveGreenScreenConfig.toMap]
@@ -19,9 +23,14 @@
 //   updateLiveGreenScreenBackground → {sessionId, background}
 //   updateLiveGreenScreenTransform  → {sessionId, foregroundTransform}
 //   stopLiveGreenScreenSession      → {sessionId}
+//   startLiveGreenScreenRecording   → {sessionId, outputPath?}
+//   stopLiveGreenScreenRecording    → {sessionId}
+//                                     ← [VGLiveGreenScreenRecordingResult.fromMap]
+//   cancelLiveGreenScreenRecording  → {sessionId}
 //   errors → `INVALID_ARG`, `live_busy`, `cameraUnavailable`,
-//            `composition_failed`, `session_not_found`, mapped by
-//            [VGLiveGreenScreenErrorCode.fromPlatformCode].
+//            `composition_failed`, `session_not_found`, `recording_active`,
+//            `recording_not_active`, `recording_failed`, `disk_full`, mapped
+//            by [VGLiveGreenScreenErrorCode.fromPlatformCode].
 
 import 'vg_green_screen_models.dart'
     show
@@ -348,6 +357,120 @@ class VGLiveGreenScreenSession {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Recording result
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The committed MP4 produced by `stopLiveGreenScreenRecording`.
+///
+/// The engine writes to a `.tmp` sibling while recording and commits it to
+/// [filePath] only after the writer finished and the file is non-empty;
+/// cancel and session stop delete the partial instead, so a result always
+/// names a complete file.
+class VGLiveGreenScreenRecordingResult {
+  /// Absolute local path of the committed MP4.
+  final String filePath;
+
+  /// Recorded video duration in milliseconds (last written video PTS).
+  final int durationMs;
+
+  /// Size of the committed file in bytes.
+  final int fileSizeBytes;
+
+  /// Encoded frame width in pixels (the session canvas width).
+  final int width;
+
+  /// Encoded frame height in pixels (the session canvas height).
+  final int height;
+
+  /// Whether a microphone audio track was recorded alongside the video. False
+  /// when microphone permission was not granted or audio capture could not be
+  /// started; the video is still complete in that case.
+  final bool hasAudio;
+
+  const VGLiveGreenScreenRecordingResult({
+    required this.filePath,
+    required this.durationMs,
+    required this.fileSizeBytes,
+    this.width = 0,
+    this.height = 0,
+    this.hasAudio = false,
+  });
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+    'filePath': filePath,
+    'durationMs': durationMs,
+    'fileSizeBytes': fileSizeBytes,
+    'width': width,
+    'height': height,
+    'hasAudio': hasAudio,
+  };
+
+  /// Parses the native stop reply. Throws [ArgumentError] when `filePath` is
+  /// missing, not a string, or empty, or when a present numeric field is not
+  /// a number. Absent numeric fields default to `0` and an absent `hasAudio`
+  /// to `false`.
+  factory VGLiveGreenScreenRecordingResult.fromMap(Map<String, dynamic> map) {
+    final filePath = map['filePath'];
+    if (filePath is! String || filePath.isEmpty) {
+      throw ArgumentError(
+        'VGLiveGreenScreenRecordingResult.fromMap: missing or invalid "filePath".',
+      );
+    }
+    return VGLiveGreenScreenRecordingResult(
+      filePath: filePath,
+      durationMs: _intField(map, 'durationMs'),
+      fileSizeBytes: _intField(map, 'fileSizeBytes'),
+      width: _intField(map, 'width'),
+      height: _intField(map, 'height'),
+      hasAudio: _boolField(map, 'hasAudio'),
+    );
+  }
+
+  static int _intField(Map<String, dynamic> map, String key) {
+    final value = map[key];
+    if (value == null) return 0;
+    if (value is! num) {
+      throw ArgumentError(
+        'VGLiveGreenScreenRecordingResult.fromMap: "$key" must be a number.',
+      );
+    }
+    return value.toInt();
+  }
+
+  static bool _boolField(Map<String, dynamic> map, String key) {
+    final value = map[key];
+    if (value == null) return false;
+    if (value is! bool) {
+      throw ArgumentError(
+        'VGLiveGreenScreenRecordingResult.fromMap: "$key" must be a bool.',
+      );
+    }
+    return value;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGLiveGreenScreenRecordingResult &&
+          filePath == other.filePath &&
+          durationMs == other.durationMs &&
+          fileSizeBytes == other.fileSizeBytes &&
+          width == other.width &&
+          height == other.height &&
+          hasAudio == other.hasAudio;
+
+  @override
+  int get hashCode =>
+      Object.hash(filePath, durationMs, fileSizeBytes, width, height, hasAudio);
+
+  @override
+  String toString() =>
+      'VGLiveGreenScreenRecordingResult(filePath: $filePath, '
+      'durationMs: $durationMs, fileSizeBytes: $fileSizeBytes, '
+      'size: ${width}x$height, hasAudio: $hasAudio)';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -371,6 +494,19 @@ enum VGLiveGreenScreenErrorCode {
   /// No active live session matches the given id (`session_not_found`).
   sessionNotFound,
 
+  /// A recording is already active on the session (`recording_active`).
+  recordingActive,
+
+  /// No recording is active on the session (`recording_not_active`).
+  recordingNotActive,
+
+  /// The recorder could not be started, the encoder or writer failed, or the
+  /// finished file could not be committed (`recording_failed`).
+  recordingFailed,
+
+  /// Not enough free disk space to start a recording (`disk_full`).
+  diskFull,
+
   /// Any other platform or channel error.
   unknown;
 
@@ -382,6 +518,10 @@ enum VGLiveGreenScreenErrorCode {
         'cameraUnavailable' => VGLiveGreenScreenErrorCode.cameraUnavailable,
         'composition_failed' => VGLiveGreenScreenErrorCode.compositionFailed,
         'session_not_found' => VGLiveGreenScreenErrorCode.sessionNotFound,
+        'recording_active' => VGLiveGreenScreenErrorCode.recordingActive,
+        'recording_not_active' => VGLiveGreenScreenErrorCode.recordingNotActive,
+        'recording_failed' => VGLiveGreenScreenErrorCode.recordingFailed,
+        'disk_full' => VGLiveGreenScreenErrorCode.diskFull,
         _ => VGLiveGreenScreenErrorCode.unknown,
       };
 }

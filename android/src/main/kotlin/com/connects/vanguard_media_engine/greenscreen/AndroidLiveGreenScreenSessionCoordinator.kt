@@ -11,6 +11,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCameraSessionAdmission
 import com.connects.vanguard_media_engine.camera.AndroidPreviewSurfaceProducer
 import com.connects.vanguard_media_engine.camera.AndroidPreviewSurfaceState
 import io.flutter.view.TextureRegistry
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -81,9 +82,24 @@ import java.util.concurrent.atomic.AtomicBoolean
 // Cleanup order on stop/dispose (matches the render loop's documented
 // contract — prepareForCameraStop must precede the Camera2 stop so no
 // drawFrame races the last OES write):
-//   producer.beginRelease -> renderLoop.prepareForCameraStop -> camera.stop
-//   -> renderLoop.stopBlocking() -> producer.finishRelease
+//   recording discard (detach encoder surface -> recorder.cancel, partial
+//   deleted) -> producer.beginRelease -> renderLoop.prepareForCameraStop
+//   -> camera.stop -> renderLoop.stopBlocking() -> producer.finishRelease
 //   -> admission.release. No Surface.release on producer-owned surfaces.
+//
+// Recording (VG-LIVE-GREENSCREEN-RECORDING): at most one
+// AndroidGreenScreenSegmentRecorder per session. start attaches the
+// recorder's encoder surface to the preview backend through the render loop
+// (async, render thread); the backend then draws the SAME full composite it
+// presents on the texture into the encoder once per newly latched camera
+// frame, so the file is exactly what the preview shows at 1.0x. stop detaches
+// first (so no render-thread work can touch the encoder surface), then
+// finalizes asynchronously and commits ".tmp" -> final only after non-empty
+// validation. cancel / session stop / dispose / any encoder failure delete
+// the partial and clear the recording state; the preview keeps running in
+// every case except session stop. A backend without an encoder draw route
+// (the GPU-resident backend today) rejects the attach and start fails closed
+// with `recording_failed` -- never a black or raw-camera file.
 
 class AndroidLiveGreenScreenSessionCoordinator(
     private val mainHandler: Handler,
@@ -108,6 +124,17 @@ class AndroidLiveGreenScreenSessionCoordinator(
         const val ERROR_CAMERA_UNAVAILABLE = "cameraUnavailable"
         const val ERROR_COMPOSITION_FAILED = "composition_failed"
         const val ERROR_SESSION_NOT_FOUND = "session_not_found"
+        const val ERROR_INVALID_ARG = "INVALID_ARG"
+        const val ERROR_RECORDING_ACTIVE = "recording_active"
+        const val ERROR_RECORDING_NOT_ACTIVE = "recording_not_active"
+        const val ERROR_RECORDING_FAILED = "recording_failed"
+        const val ERROR_DISK_FULL = "disk_full"
+
+        /** Minimum free space on the recording volume before a recording may start. */
+        private const val MIN_FREE_DISK_BYTES = 200L * 1024L * 1024L
+
+        /** Cache subdirectory used when the caller supplies no outputPath. */
+        private const val RECORDING_DIR_NAME = "vanguard_live_green_screen"
 
         // Event names on the `onLiveGreenScreenEvent` payload.
         const val EVENT_DEGRADED = "green_screen_degraded"
@@ -146,6 +173,17 @@ class AndroidLiveGreenScreenSessionCoordinator(
          * mediapipe_cpu for the CPU compositor fallback. Set at camera start.
          */
         var segmentationBackend: String = AndroidGreenScreenSegmentationBackend.MEDIAPIPE_CPU
+
+        /** Recorder whose encoder surface is attached to the preview backend (RECORDING). */
+        var recorder: AndroidGreenScreenSegmentRecorder? = null
+
+        /**
+         * Recorder whose encoder-surface attach is still in flight on the render
+         * thread; its start reply is parked in [pendingRecordingReply] until the
+         * attach lands (or the session/recording is canceled underneath it).
+         */
+        var pendingRecorder: AndroidGreenScreenSegmentRecorder? = null
+        var pendingRecordingReply: ((Any?, String?) -> Unit)? = null
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -312,6 +350,219 @@ class AndroidLiveGreenScreenSessionCoordinator(
         reply(null, null)
     }
 
+    // ── recording: start ──────────────────────────────────────────────────────
+
+    /**
+     * Starts recording the composited output of [sessionId] to [outputPath]
+     * (absolute local path; null → a fresh file in the app cache). Replies
+     * only once the encoder surface is attached to the preview backend, so a
+     * success reply means frames are being encoded. Fails closed (nothing
+     * left recording, no file left behind) with `recording_active`,
+     * `disk_full`, `INVALID_ARG` (bad/existing outputPath) or
+     * `recording_failed`; the preview is untouched by any failure.
+     */
+    fun startRecording(sessionId: String, outputPath: String?, reply: (Any?, String?) -> Unit) {
+        val route = "startLiveGreenScreenRecording"
+        val session = resolveSession(sessionId, route, reply) ?: return
+        if (session.recorder != null || session.pendingRecorder != null) {
+            reply(null, errorMsg(ERROR_RECORDING_ACTIVE,
+                "$route: a recording is already active on session '$sessionId'."))
+            return
+        }
+        val ctx = context
+        if (ctx == null) {
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: application context unavailable; cannot persist the recording."))
+            return
+        }
+        val loop = session.renderLoop
+        if (loop == null || session.producer == null) {
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: the preview is not attached, so composited frames are unavailable."))
+            return
+        }
+        val file: File
+        if (outputPath != null) {
+            val candidate = File(outputPath)
+            if (!candidate.isAbsolute) {
+                reply(null, errorMsg(ERROR_INVALID_ARG,
+                    "$route: 'outputPath' must be an absolute local path (got '$outputPath')."))
+                return
+            }
+            if (candidate.exists()) {
+                reply(null, errorMsg(ERROR_INVALID_ARG,
+                    "$route: 'outputPath' already exists: $outputPath"))
+                return
+            }
+            file = candidate
+        } else {
+            file = File(
+                File(ctx.cacheDir, RECORDING_DIR_NAME),
+                "live_gs_${sessionId.take(8)}_${System.currentTimeMillis()}.mp4",
+            )
+        }
+        val dir = file.parentFile
+        if (dir == null || (!dir.exists() && !dir.mkdirs() && !dir.exists())) {
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: cannot create the recording directory ${dir?.absolutePath ?: "<none>"}."))
+            return
+        }
+        val freeBytes = try { dir.usableSpace } catch (_: Throwable) { Long.MAX_VALUE }
+        if (freeBytes in 0 until MIN_FREE_DISK_BYTES) {
+            reply(null, errorMsg(ERROR_DISK_FULL,
+                "$route: insufficient free space (${freeBytes / (1024L * 1024L)} MB free; " +
+                    "${MIN_FREE_DISK_BYTES / (1024L * 1024L)} MB required)."))
+            return
+        }
+
+        val recorder = AndroidGreenScreenSegmentRecorder(
+            context = ctx,
+            outputFile = file,
+            widthPx = session.widthPx,
+            heightPx = session.heightPx,
+        )
+        if (!recorder.start()) {
+            recorder.cancel()
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: the recording encoder/muxer could not be started."))
+            return
+        }
+        session.pendingRecorder = recorder
+        session.pendingRecordingReply = reply
+        loop.attachSegmentRecorder(recorder) { attached ->
+            if (activeSession !== session || session.pendingRecorder !== recorder) {
+                // Canceled underneath (session released / recording canceled while
+                // attaching): cancelPendingRecording already failed the parked reply.
+                recorder.cancel()
+                return@attachSegmentRecorder
+            }
+            session.pendingRecorder = null
+            session.pendingRecordingReply = null
+            if (!attached) {
+                recorder.cancel()
+                val backend = if (loop.usingFallbackBackend) "gles_compositor" else "gpu_resident"
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_ATTACH_FAILED session=${session.sessionId} " +
+                    "backend=$backend file=${file.name}")
+                reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                    "$route: the preview backend ($backend) could not accept the recording encoder surface."))
+                return@attachSegmentRecorder
+            }
+            session.recorder = recorder
+            Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_STARTED session=${session.sessionId} " +
+                "file=${file.absolutePath} size=${session.widthPx}x${session.heightPx} " +
+                "audio=${recorder.audioEnabled}")
+            reply(null, null)
+        }
+    }
+
+    // ── recording: stop (commit) ──────────────────────────────────────────────
+
+    /**
+     * Detaches the active recorder's encoder surface from the preview backend,
+     * finalizes it asynchronously and replies with the committed file
+     * (`{filePath, durationMs, fileSizeBytes, width, height, hasAudio}`), or
+     * `recording_failed` with the recorder's reason when the file could not
+     * be committed (the partial is deleted). `recording_not_active` when no
+     * recording is running. The preview keeps running in every case.
+     */
+    fun stopRecording(sessionId: String, reply: (Any?, String?) -> Unit) {
+        val route = "stopLiveGreenScreenRecording"
+        val session = resolveSession(sessionId, route, reply) ?: return
+        if (session.pendingRecorder != null) {
+            // The start was still attaching: it never began encoding, so there is
+            // nothing to commit. Discard it and report no active recording.
+            cancelPendingRecording(session, "stop_during_attach")
+            reply(null, errorMsg(ERROR_RECORDING_NOT_ACTIVE,
+                "$route: the recording was still starting and has been discarded."))
+            return
+        }
+        val recorder = session.recorder
+        if (recorder == null) {
+            reply(null, errorMsg(ERROR_RECORDING_NOT_ACTIVE,
+                "$route: no recording is active on session '$sessionId'."))
+            return
+        }
+        session.recorder = null
+        val proceed = {
+            recorder.finishAsync { result ->
+                mainHandler.post { onRecordingFinished(session, route, result, reply) }
+            }
+        }
+        val loop = session.renderLoop
+        if (loop != null) loop.detachSegmentRecorder { proceed() } else proceed()
+    }
+
+    /** Main-thread landing of a recording's finalize result. */
+    private fun onRecordingFinished(
+        session: LiveSession,
+        route: String,
+        result: Result<AndroidGreenScreenSegmentRecorder.Outcome>,
+        reply: (Any?, String?) -> Unit,
+    ) {
+        val outcome = result.getOrNull()
+        if (outcome == null) {
+            val reason = result.exceptionOrNull()?.message ?: "unknown"
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_FAILED session=${session.sessionId} reason=$reason")
+            reply(null, errorMsg(ERROR_RECORDING_FAILED,
+                "$route: the recording could not be committed ($reason); the partial file was deleted."))
+            return
+        }
+        Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_COMMITTED session=${session.sessionId} " +
+            "file=${outcome.file.absolutePath} bytes=${outcome.fileSizeBytes} durationMs=${outcome.durationMs} " +
+            "audio=${outcome.hasAudio}")
+        reply(
+            mapOf(
+                "filePath" to outcome.file.absolutePath,
+                "durationMs" to outcome.durationMs,
+                "fileSizeBytes" to outcome.fileSizeBytes,
+                "width" to session.widthPx,
+                "height" to session.heightPx,
+                "hasAudio" to outcome.hasAudio,
+            ),
+            null,
+        )
+    }
+
+    // ── recording: cancel (idempotent) ────────────────────────────────────────
+
+    /**
+     * Discards the active (or still-attaching) recording, deleting its partial
+     * file. Completes normally when no recording is running. The preview
+     * keeps running.
+     */
+    fun cancelRecording(sessionId: String, reply: (Any?, String?) -> Unit) {
+        val session = resolveSession(sessionId, "cancelLiveGreenScreenRecording", reply) ?: return
+        cancelPendingRecording(session, "cancel")
+        discardActiveRecording(session, "cancel")
+        reply(null, null)
+    }
+
+    /**
+     * Fails a start whose encoder-surface attach is still in flight: the
+     * parked reply gets `recording_failed`, the recorder is canceled (its
+     * partial deleted), and the attach callback later sees a foreign
+     * [LiveSession.pendingRecorder] and cancels again (idempotent).
+     */
+    private fun cancelPendingRecording(session: LiveSession, reason: String) {
+        val pending = session.pendingRecorder ?: return
+        val parked = session.pendingRecordingReply
+        session.pendingRecorder = null
+        session.pendingRecordingReply = null
+        pending.cancel()
+        Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_DISCARDED session=${session.sessionId} reason=$reason stage=attaching")
+        parked?.invoke(null, errorMsg(ERROR_RECORDING_FAILED,
+            "startLiveGreenScreenRecording: the recording was canceled while starting ($reason)."))
+    }
+
+    /** Detaches the encoder surface first, then discards the recorder (partial deleted). */
+    private fun discardActiveRecording(session: LiveSession, reason: String) {
+        val recorder = session.recorder ?: return
+        session.recorder = null
+        Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_DISCARDED session=${session.sessionId} reason=$reason stage=recording")
+        val loop = session.renderLoop
+        if (loop != null) loop.detachSegmentRecorder { recorder.cancel() } else recorder.cancel()
+    }
+
     // ── disposeAll ────────────────────────────────────────────────────────────
 
     fun disposeAll() {
@@ -438,6 +689,11 @@ class AndroidLiveGreenScreenSessionCoordinator(
         val producer = session.producer
         val renderLoop = session.renderLoop
         val camSource = session.cameraSource
+        // Phase 0: discard any recording (partial deleted). The detach is posted
+        // to the render thread ahead of stopBlocking's release below, so no
+        // render-thread work touches the encoder surface after this point.
+        cancelPendingRecording(session, why)
+        discardActiveRecording(session, why)
         // Phase 1: stop new producer submissions (no hook fires).
         producer?.beginRelease()
         // Phase 2: halt render-thread pumps and block swap acceptance BEFORE

@@ -139,6 +139,9 @@ final class VGLiveGreenScreenMethodHandler {
         "updateLiveGreenScreenBackground",
         "updateLiveGreenScreenTransform",
         "stopLiveGreenScreenSession",
+        "startLiveGreenScreenRecording",
+        "stopLiveGreenScreenRecording",
+        "cancelLiveGreenScreenRecording",
         "getLiveGreenScreenDiagnostics",
         "setLiveGreenScreenDiagnosticsOptions",
         "replayLiveGreenScreenInputBundle",
@@ -227,6 +230,40 @@ final class VGLiveGreenScreenMethodHandler {
             // Idempotent: a missing/unknown id completes normally in the coordinator.
             let sid = args?["sessionId"] as? String ?? ""
             coordinator.stopSession(sessionId: sid) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
+
+        case "startLiveGreenScreenRecording":
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            // Optional absolute output path; absent/blank lets the coordinator
+            // pick a cache path. A present non-string is a malformed argument.
+            let outputPath: String?
+            if let raw = args?["outputPath"], !(raw is NSNull) {
+                guard let path = raw as? String else {
+                    result(FlutterError(
+                        code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                        message: "\(method): 'outputPath' must be a string.",
+                        details: nil))
+                    return
+                }
+                let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+                outputPath = trimmed.isEmpty ? nil : trimmed
+            } else {
+                outputPath = nil
+            }
+            coordinator.startRecording(sessionId: sid, outputPath: outputPath) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
+
+        case "stopLiveGreenScreenRecording":
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            coordinator.stopRecording(sessionId: sid) { val, err in
+                self.reply(result: result, value: val, error: err)
+            }
+
+        case "cancelLiveGreenScreenRecording":
+            guard let sid = requireSessionId(args: args, method: method, result: result) else { return }
+            coordinator.cancelRecording(sessionId: sid) { val, err in
                 self.reply(result: result, value: val, error: err)
             }
 

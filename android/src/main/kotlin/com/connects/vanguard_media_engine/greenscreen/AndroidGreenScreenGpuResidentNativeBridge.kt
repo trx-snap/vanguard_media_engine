@@ -45,6 +45,29 @@ object AndroidGreenScreenGpuResidentNativeBridge {
     /** Destroys only the EGL window surface; camera texture and context survive. */
     external fun nativeDetachOutputSurface(handle: Long)
 
+    // VG-LIVE-GREENSCREEN-RECORDING: secondary encoder window surface.
+
+    /**
+     * Wraps a live recording's encoder [surface] in a second EGL window surface
+     * on the renderer's own display/config/context (never releases the
+     * Surface). Requires an attached output of exactly [widthPx] x [heightPx]
+     * and eglPresentationTimeANDROID; fails closed otherwise (see
+     * [nativeLastError]). Re-attaching replaces the previous recorder surface.
+     */
+    external fun nativeAttachRecorderSurface(handle: Long, surface: Surface, widthPx: Int, heightPx: Int): Boolean
+
+    /** Destroys only the recorder EGL window surface; the output, camera texture and context survive. */
+    external fun nativeDetachRecorderSurface(handle: Long)
+
+    /**
+     * Re-draws the composite [nativeRenderFrame] just presented into the
+     * recorder surface (composite pass only), stamps [presentationTimeNs] and
+     * swaps. Returns 0 submitted, 1 skipped (no recorder / no fresh composite /
+     * output lost or resized), 2 failed (EGL/GL error: the owner must detach
+     * the recorder). Leaves the preview surface current again.
+     */
+    external fun nativeRenderRecorderFrame(handle: Long, presentationTimeNs: Long): Int
+
     /** Canvas-pixel rects (top-left origin) for the background (source) and the camera layer. */
     external fun nativeSetLayout(
         handle: Long,

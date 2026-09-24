@@ -9,6 +9,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
   VGDuetLayoutMode mode = VGDuetLayoutMode.splitLeftRight,
   bool isSideSwapped = false,
   bool isTopBottomSwapped = false,
+  bool isPreComposited = false,
   VGDuetPiPAnchor? pipAnchor,
   VGDuetRect? pipNormalizedRect,
   VGDuetForegroundTransform? foregroundTransform,
@@ -27,6 +28,7 @@ VGDuetCompositionDescriptor _makeDescriptor({
       mode: mode,
       isSideSwapped: isSideSwapped,
       isTopBottomSwapped: isTopBottomSwapped,
+      isPreComposited: isPreComposited,
       pipAnchor: pipAnchor,
       pipNormalizedRect: pipNormalizedRect,
       foregroundTransform: foregroundTransform,
@@ -1168,6 +1170,128 @@ void main() {
       expect(restored.overlays.length, 2);
       expect(restored.overlays[0], equals(textOverlay));
       expect(restored.overlays[1], equals(emojiOverlay));
+    });
+
+    // ── isPreComposited routing flag ──────────────────────────────────────────
+
+    group('VGDuetLayoutConfig.isPreComposited export routing flag', () {
+      test('defaults to false on layout config', () {
+        final cfg = VGDuetLayoutConfig(mode: VGDuetLayoutMode.greenScreen);
+        expect(cfg.isPreComposited, isFalse);
+      });
+
+      test('toMap omits isPreComposited when false', () {
+        final cfg = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: false,
+        );
+        final map = cfg.toMap();
+        expect(map.containsKey('isPreComposited'), isFalse);
+      });
+
+      test('toMap emits isPreComposited: true when true', () {
+        final cfg = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: true,
+        );
+        final map = cfg.toMap();
+        expect(map['isPreComposited'], isTrue);
+      });
+
+      test('fromMap parses isPreComposited: true', () {
+        final map = <String, dynamic>{
+          'mode': 'greenScreen',
+          'isPreComposited': true,
+        };
+        final cfg = VGDuetLayoutConfig.fromMap(map);
+        expect(cfg.isPreComposited, isTrue);
+      });
+
+      test(
+        'fromMap defaults isPreComposited to false when missing or null',
+        () {
+          final mapMissing = <String, dynamic>{'mode': 'greenScreen'};
+          expect(
+            VGDuetLayoutConfig.fromMap(mapMissing).isPreComposited,
+            isFalse,
+          );
+
+          final mapNull = <String, dynamic>{
+            'mode': 'greenScreen',
+            'isPreComposited': null,
+          };
+          expect(VGDuetLayoutConfig.fromMap(mapNull).isPreComposited, isFalse);
+        },
+      );
+
+      test('fromMap and toMap preserve isPreComposited: true round-trip', () {
+        final original = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: true,
+        );
+        final map = original.toMap();
+        expect(map['isPreComposited'], isTrue);
+        final restored = VGDuetLayoutConfig.fromMap(map);
+        expect(restored.isPreComposited, isTrue);
+        expect(restored, equals(original));
+      });
+
+      test('copyWith preserves or overrides isPreComposited', () {
+        final base = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: true,
+        );
+        expect(base.copyWith().isPreComposited, isTrue);
+        expect(base.copyWith(isPreComposited: false).isPreComposited, isFalse);
+      });
+
+      test('isPreComposited participates in equality and hashCode', () {
+        final a = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: true,
+        );
+        final b = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: true,
+        );
+        final c = VGDuetLayoutConfig(
+          mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: false,
+        );
+
+        expect(a, equals(b));
+        expect(a.hashCode, equals(b.hashCode));
+        expect(a, isNot(equals(c)));
+      });
+
+      test(
+        'VGDuetCompositionDescriptor round-trip preserves descriptor.layoutConfig.isPreComposited',
+        () {
+          final descPreComposited = _makeDescriptor(
+            mode: VGDuetLayoutMode.greenScreen,
+            isPreComposited: true,
+          );
+          final map = descPreComposited.toMap();
+          expect((map['layoutConfig'] as Map)['isPreComposited'], isTrue);
+
+          final restored = VGDuetCompositionDescriptor.fromMap(map);
+          expect(restored.layoutConfig.isPreComposited, isTrue);
+          expect(restored, equals(descPreComposited));
+
+          final descNormal = _makeDescriptor(
+            mode: VGDuetLayoutMode.greenScreen,
+            isPreComposited: false,
+          );
+          final normalMap = descNormal.toMap();
+          expect(
+            (normalMap['layoutConfig'] as Map).containsKey('isPreComposited'),
+            isFalse,
+          );
+          final restoredNormal = VGDuetCompositionDescriptor.fromMap(normalMap);
+          expect(restoredNormal.layoutConfig.isPreComposited, isFalse);
+          expect(restoredNormal, equals(descNormal));
+        },
+      );
     });
   });
 }

@@ -279,9 +279,11 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * Attached encoder target ([setSegmentRecorderTarget]) and the EGL window
      * surface wrapping its MediaCodec input Surface. The window surface is
      * created against this compositor's own [eglConfig]/[eglContext] so the
-     * already-latched [cameraOesTextureId] can be drawn into it directly (zero
-     * copy). Independent of the preview output surface: it survives output
-     * loss and is destroyed by [setSegmentRecorderTarget] (null) or [release].
+     * already-latched [cameraOesTextureId] (and, in green-screen mode, the
+     * whole composited scene: background + keyed camera) can be drawn into it
+     * directly (zero copy). Independent of the preview output surface: it
+     * survives output loss and is destroyed by [setSegmentRecorderTarget]
+     * (null) or [release].
      */
     private var recorderTarget: AndroidDuetSegmentRecorderSurfaceTarget? = null
     private var eglRecorderSurface: EGLSurface = EGL14.EGL_NO_SURFACE
@@ -635,6 +637,7 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
      * the segmenter, model session and GL objects alive for a cheap re-enable.
      */
     override fun setGreenScreenEnabled(enabled: Boolean) {
+        if (greenScreenEnabled == enabled) return
         greenScreenEnabled = enabled
         if (!enabled) {
             // Clear pending mask so stale data is not shown if re-enabled later.
@@ -781,15 +784,23 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
     }
 
     /**
-     * Draws the camera frame latched by the enclosing [drawFrame] into the
-     * attached encoder surface: full encoder frame, camera aspect-filled and
-     * oriented exactly as the preview draws it ([cameraStMatrix] + the shared
-     * [drawCameraOesQuad]), stamped with the target's presentation time, then
-     * swapped. Runs after the preview swap so preview latency is untouched,
-     * and restores the preview surface as current before returning. Every
-     * EGL/GL failure is logged (first swap failure once) and never thrown.
-     * Frames the target declines (negative PTS: recorder finishing/canceled)
-     * are skipped without touching the encoder surface.
+     * Draws the frame latched by the enclosing [drawFrame] into the attached
+     * encoder surface, stamped with the target's presentation time, then
+     * swapped. What is drawn depends on the layout mode:
+     *   - PiP / Split (green screen off): the raw camera frame, full encoder
+     *     frame, aspect-filled and oriented exactly as the preview draws it
+     *     ([cameraStMatrix] + the shared [drawCameraOesQuad]); the offline
+     *     export compositor places it into the layout later. Unchanged.
+     *   - Green screen: the SAME final composited scene the preview just
+     *     presented (background + keyed camera foreground, current layout)
+     *     through [drawCompositedSceneIntoRecorderFrame], so the take is
+     *     already the finished picture and the export only remuxes it.
+     * Runs after the preview swap so preview latency is untouched, and
+     * restores the preview surface as current (and every dimension/layout
+     * field it borrowed) before returning. Every EGL/GL failure is logged
+     * (first swap failure once) and never thrown. Frames the target declines
+     * (negative PTS: recorder finishing/canceled) are skipped without touching
+     * the encoder surface.
      */
     private fun encodeRecorderFrame() {
         val target = recorderTarget ?: return
@@ -811,22 +822,34 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             }
             val frameW = target.widthPx
             val frameH = target.heightPx
-            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-            GLES20.glDisable(GLES20.GL_BLEND)
-            GLES20.glViewport(0, 0, frameW, frameH)
-            GLES20.glClearColor(0f, 0f, 0f, 1f)
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-            val viewport = recorderCameraAspectFillViewport(frameW, frameH)
-            GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
-            drawCameraOesQuad()
+            val recorderMode: String
+            val viewportLabel: String
+            if (greenScreenEnabled) {
+                // ANDROID-DUET-GREENSCREEN-LIVE-COMPOSITE: record the finished
+                // picture (source/background + keyed camera), never the raw camera.
+                recorderMode = "green_screen_composite"
+                viewportLabel = "0,0,${frameW}x$frameH"
+                drawCompositedSceneIntoRecorderFrame(frameW, frameH)
+            } else {
+                recorderMode = "raw_camera"
+                GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+                GLES20.glDisable(GLES20.GL_BLEND)
+                GLES20.glViewport(0, 0, frameW, frameH)
+                GLES20.glClearColor(0f, 0f, 0f, 1f)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                val viewport = recorderCameraAspectFillViewport(frameW, frameH)
+                viewportLabel = "${viewport.x},${viewport.y},${viewport.width}x${viewport.height}"
+                GLES20.glViewport(viewport.x, viewport.y, viewport.width, viewport.height)
+                drawCameraOesQuad()
+            }
             EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurf, ptsNs)
             if (EGL14.eglSwapBuffers(eglDisplay, eglSurf)) {
                 recorderFramesSubmitted++
                 target.onFrameSubmitted(ptsNs)
                 if (recorderFramesSubmitted == 1L) {
                     Log.i(TAG, "ANDROID_DUET_SEGMENT_RECORDER_FIRST_FRAME ptsNs=$ptsNs " +
-                        "viewport=${viewport.x},${viewport.y},${viewport.width}x${viewport.height} " +
-                        "frame=${frameW}x$frameH")
+                        "mode=$recorderMode viewport=$viewportLabel " +
+                        "frame=${frameW}x$frameH preview=${outputWidthPx}x$outputHeightPx")
                 }
             } else if (!recorderSwapFailureLogged) {
                 recorderSwapFailureLogged = true
@@ -842,6 +865,44 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             restorePreviewCurrentQuietly()
         }
     }
+
+    /**
+     * ANDROID-DUET-GREENSCREEN-LIVE-COMPOSITE: draws the identical composited
+     * scene the preview just presented ([drawCompositedScene]) into the
+     * encoder frame that is current. The scene geometry ([toGlRect],
+     * [fullSurfaceRect], the aspect-fill viewports and the rotated keyed quad)
+     * is derived from [outputWidthPx]/[outputHeightPx] and the canvas-pixel
+     * layout rects, so for this pass only the output dimensions are pointed at
+     * the encoder frame and [sourceRect]/[cameraRect] are scaled from the
+     * preview canvas to it (identity for the default 1080x1920 canvas and take
+     * size). Every borrowed field is restored before returning, whatever
+     * happens; the caller restores the current EGL surface.
+     */
+    private fun drawCompositedSceneIntoRecorderFrame(frameW: Int, frameH: Int) {
+        val savedWidthPx = outputWidthPx
+        val savedHeightPx = outputHeightPx
+        val savedSourceRect = sourceRect
+        val savedCameraRect = cameraRect
+        try {
+            if (savedWidthPx > 0 && savedHeightPx > 0 && (savedWidthPx != frameW || savedHeightPx != frameH)) {
+                val sx = frameW.toDouble() / savedWidthPx.toDouble()
+                val sy = frameH.toDouble() / savedHeightPx.toDouble()
+                sourceRect = savedSourceRect?.let { scaleRect(it, sx, sy) }
+                cameraRect = savedCameraRect?.let { scaleRect(it, sx, sy) }
+            }
+            outputWidthPx = frameW
+            outputHeightPx = frameH
+            drawCompositedScene()
+        } finally {
+            outputWidthPx = savedWidthPx
+            outputHeightPx = savedHeightPx
+            sourceRect = savedSourceRect
+            cameraRect = savedCameraRect
+        }
+    }
+
+    private fun scaleRect(rect: VGDuetPixelRect, sx: Double, sy: Double): VGDuetPixelRect =
+        VGDuetPixelRect(rect.left * sx, rect.top * sy, rect.width * sx, rect.height * sy)
 
     /**
      * Viewport for an aspect-fill of the upright camera image into the whole
@@ -894,11 +955,13 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
 
     /**
      * Composites one frame into the attached output surface:
-     *   1. updateTexImage (only when the decoder queued a new frame),
-     *   2. full clear to black,
-     *   3. source OES texture aspect-filled into the source rect,
-     *   4. deterministic placeholder fill over the camera rect,
-     *   5. eglSwapBuffers.
+     *   1. updateTexImage (only when the decoder / camera queued a new frame),
+     *   2. green-screen mask production for the latched camera frame,
+     *   3. [drawCompositedScene]: full clear to black, background (source
+     *      video, or the green-screen background), camera layer (keyed
+     *      camera, live OES frame or placeholder),
+     *   4. eglSwapBuffers,
+     *   5. the attached take recorder pass ([encodeRecorderFrame]).
      *
      * Returns true when a frame was actually presented (swap succeeded).
      * Returns false (without throwing) when released, no output is attached,
@@ -957,55 +1020,16 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
                 }
             }
 
-            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-            GLES20.glViewport(0, 0, outputWidthPx, outputHeightPx)
-            GLES20.glClearColor(0f, 0f, 0f, 1f)
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-
-            // Background: in green-screen mode, the background may be the
-            // source video (default, unchanged behavior), a solid color, or a
-            // static image — drawn before the masked camera. Every other
-            // layout mode keeps the unconditional source-video draw.
-            if (greenScreenEnabled) {
-                drawGreenScreenBackground(sourceRect ?: fullSurfaceRect())
-            } else if (hasTexImage) {
-                drawSourceRect(sourceRect ?: fullSurfaceRect())
-            }
-
-            // Camera rect drawing:
-            // - Green-screen mode: draw camera masked by the segmentation mask.
-            //   If no camera frame has arrived yet or no mask texture is ready,
-            //   leave the source video visible (do NOT draw an opaque placeholder).
-            // - Normal mode: draw live OES frame when available, else placeholder.
-            val cr = cameraRect
-            if (cr != null) {
-                if (greenScreenEnabled) {
-                    // Green-screen: only draw when both camera OES and a mask
-                    // (GPU refined alpha, or the legacy CPU mask texture) are
-                    // ready. Source remains visible underneath (drawn above);
-                    // no opaque fill.
-                    val maskReady = if (gpuConfig != null) gpuHasRefinedAlpha else hasMaskTexture
-                    if (hasCameraTexImage && maskReady) {
-                        drawCameraGreenScreen(cr)
-                    }
-                    // else: source remains visible, invariant satisfied.
-                } else {
-                    if (hasCameraTexImage) {
-                        drawCameraRect(cr)
-                    } else {
-                        drawCameraPlaceholder(cr)
-                    }
-                }
-            }
-
-            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            drawCompositedScene()
             val presented = EGL14.eglSwapBuffers(display, window)
 
             // ANDROID-DUET-SLICE-1A: after the preview swap, feed the SAME
             // latched camera frame to the attached take recorder (once per
-            // new camera frame, so the encoder never sees duplicates). The
-            // preview output above is unchanged by this; encodeRecorderFrame
-            // restores the preview surface as current before returning.
+            // new camera frame, so the encoder never sees duplicates): raw
+            // camera for PiP/Split, the identical composited scene in
+            // green-screen mode. The preview output above is unchanged by
+            // this; encodeRecorderFrame restores the preview surface as
+            // current before returning.
             if (latchedNewCameraFrame && recorderTarget != null) {
                 encodeRecorderFrame()
             }
@@ -1014,6 +1038,63 @@ class AndroidDuetPreviewCompositor : AndroidDuetPreviewBackend {
             Log.w(TAG, "drawFrame failed: ${t.message}")
             return false
         }
+    }
+
+    /**
+     * Draws the full composited scene for the CURRENT EGL surface at
+     * [outputWidthPx] x [outputHeightPx]: full clear to black, then the
+     * background (the green-screen background in green-screen mode, else the
+     * source video once a frame has latched), then the camera layer (keyed
+     * camera in green-screen mode, live OES frame or placeholder otherwise).
+     * Shared verbatim by the preview pass ([drawFrame]) and the green-screen
+     * take recorder pass ([encodeRecorderFrame]) so the recorded take and the
+     * preview can never diverge. Uses only state already latched / produced
+     * by the enclosing drawFrame: never latches, never segments, never swaps.
+     * Leaves the scissor test disabled.
+     */
+    private fun drawCompositedScene() {
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glViewport(0, 0, outputWidthPx, outputHeightPx)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        // Background: in green-screen mode, the background may be the
+        // source video (default, unchanged behavior), a solid color, or a
+        // static image — drawn before the masked camera. Every other
+        // layout mode keeps the unconditional source-video draw.
+        if (greenScreenEnabled) {
+            drawGreenScreenBackground(sourceRect ?: fullSurfaceRect())
+        } else if (hasTexImage) {
+            drawSourceRect(sourceRect ?: fullSurfaceRect())
+        }
+
+        // Camera rect drawing:
+        // - Green-screen mode: draw camera masked by the segmentation mask.
+        //   If no camera frame has arrived yet or no mask texture is ready,
+        //   leave the source video visible (do NOT draw an opaque placeholder).
+        // - Normal mode: draw live OES frame when available, else placeholder.
+        val cr = cameraRect
+        if (cr != null) {
+            if (greenScreenEnabled) {
+                // Green-screen: only draw when both camera OES and a mask
+                // (GPU refined alpha, or the legacy CPU mask texture) are
+                // ready. Source remains visible underneath (drawn above);
+                // no opaque fill.
+                val maskReady = if (gpuConfig != null) gpuHasRefinedAlpha else hasMaskTexture
+                if (hasCameraTexImage && maskReady) {
+                    drawCameraGreenScreen(cr)
+                }
+                // else: source remains visible, invariant satisfied.
+            } else {
+                if (hasCameraTexImage) {
+                    drawCameraRect(cr)
+                } else {
+                    drawCameraPlaceholder(cr)
+                }
+            }
+        }
+
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
 

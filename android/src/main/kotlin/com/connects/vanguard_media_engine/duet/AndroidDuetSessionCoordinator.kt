@@ -162,9 +162,21 @@ class VGDuetAndroidSession(
 
     fun buildStopResult(): Map<String, Any?> {
         val segmentMaps = previewClock.segments.map { it.toMap() }
+        // ANDROID-DUET-GREENSCREEN-LIVE-COMPOSITE: greenScreen takes are
+        // recorded as the final composited preview (background + keyed camera)
+        // by AndroidDuetPreviewCompositor.encodeRecorderFrame, so the export
+        // must remux them instead of re-compositing (AndroidDuetExportSession
+        // bypasses the offline green-screen compositor on this flag). PiP /
+        // Split takes stay raw camera and carry no flag.
+        val exportLayoutConfig: Map<String, Any?> =
+            if ((layoutConfigMap["mode"] as? String) == "greenScreen") {
+                layoutConfigMap + ("isPreComposited" to true)
+            } else {
+                layoutConfigMap
+            }
         val descriptor: Map<String, Any?> = mapOf(
             "source"           to sourceMap,
-            "layoutConfig"     to layoutConfigMap,
+            "layoutConfig"     to exportLayoutConfig,
             "trimWindow"       to trimWindowMap,
             "initialSpeed"     to speedMultiplier,
             "segments"         to segmentMaps,
@@ -546,6 +558,7 @@ class AndroidDuetSessionCoordinator(
                 if (err != null) { reply(null, errorMsg("source_invalid", err)); return }
             }
         }
+        val oldMode = session.layoutConfigMap["mode"] as? String ?: "pip"
         session.layoutConfigMap = layoutConfigMap
         // Debug-only (RND diagnostic): forward the raw mask visualization
         // opt-in on every updateLayout call. Invalid/absent values disable
@@ -590,34 +603,39 @@ class AndroidDuetSessionCoordinator(
                     cameraScaleMode = layerScaleMode,
                 )
             }
-            // Enable/disable green-screen compositing based on the new mode.
-            if (newMode == "greenScreen") {
-                // Switching into greenScreen: the provider builds/rebinds its
-                // adapter as needed. If it cannot enable keying, fall back to
-                // safe PiP immediately. When no provider exists yet (camera not
-                // started), that mirrors a bind failure (no camera to bind to),
-                // since the render loop guaranteed by this branch means adapter
-                // construction itself would not have failed.
-                val provider = session.foregroundProvider
-                val enabled = provider?.setGreenScreenEnabled(true, layoutConfigMap) ?: false
-                if (!enabled) {
-                    val reason = provider?.lastEnableFailureReason() ?: "bind_failed"
-                    Log.w("DuetCoordinator",
-                        "foregroundProvider.setGreenScreenEnabled(true) failed ($reason) — PiP fallback")
-                    handleGreenScreenFallback(session,
-                        provider?.reportedBackendId() ?: DuetSegmentationBackend.NONE,
-                        reason)
-                    reply(null, null)
-                    return
+            // Enable/disable green-screen compositing based on mode transitions.
+            // When remaining in greenScreen (e.g. gesture pan/zoom/rotate), do NOT
+            // re-enable or wipe the active GPU mask state.
+            val modeChanged = oldMode != newMode
+            if (modeChanged) {
+                if (newMode == "greenScreen") {
+                    // Switching into greenScreen: the provider builds/rebinds its
+                    // adapter as needed. If it cannot enable keying, fall back to
+                    // safe PiP immediately. When no provider exists yet (camera not
+                    // started), that mirrors a bind failure (no camera to bind to),
+                    // since the render loop guaranteed by this branch means adapter
+                    // construction itself would not have failed.
+                    val provider = session.foregroundProvider
+                    val enabled = provider?.setGreenScreenEnabled(true, layoutConfigMap) ?: false
+                    if (!enabled) {
+                        val reason = provider?.lastEnableFailureReason() ?: "bind_failed"
+                        Log.w("DuetCoordinator",
+                            "foregroundProvider.setGreenScreenEnabled(true) failed ($reason) — PiP fallback")
+                        handleGreenScreenFallback(session,
+                            provider?.reportedBackendId() ?: DuetSegmentationBackend.NONE,
+                            reason)
+                        reply(null, null)
+                        return
+                    }
+                } else if (oldMode == "greenScreen") {
+                    // Switching away from greenScreen: provider removes the analysis
+                    // use-case, stops its adapter, disables compositor. Camera Preview
+                    // continues.
+                    session.foregroundProvider?.setGreenScreenEnabled(false, layoutConfigMap)
+                    // Leaving greenScreen while a start is parked behind the first-mask
+                    // barrier: no mask will ever arrive, so begin immediately.
+                    completePendingStart(session, "layout_left_green_screen")
                 }
-            } else {
-                // Switching away from greenScreen: provider removes the analysis
-                // use-case, stops its adapter, disables compositor. Camera Preview
-                // continues.
-                session.foregroundProvider?.setGreenScreenEnabled(false, layoutConfigMap)
-                // Leaving greenScreen while a start is parked behind the first-mask
-                // barrier: no mask will ever arrive, so begin immediately.
-                completePendingStart(session, "layout_left_green_screen")
             }
         }
         reply(null, null)

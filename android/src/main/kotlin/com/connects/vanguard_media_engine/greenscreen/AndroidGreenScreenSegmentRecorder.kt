@@ -1,22 +1,27 @@
-package com.connects.vanguard_media_engine.duet
+package com.connects.vanguard_media_engine.greenscreen
 
 // -----------------------------------------------------------------------------
-// ANDROID-DUET-SLICE-1A: Per-take live segment recorder for the Duet preview
-// (H.264 surface-input video + best-effort AAC microphone audio -> MP4).
+// VG-LIVE-GREENSCREEN-RECORDING: per-take recorder for the live green-screen
+// preview (H.264 surface-input video + best-effort AAC microphone audio -> MP4).
 // -----------------------------------------------------------------------------
 //
-// One instance == one take == one MP4 file. The GLES preview compositor draws
-// the upright live camera frame it has ALREADY latched for the preview into
-// [inputSurface] on its own render thread (AndroidDuetPreviewCompositor.
-// setSegmentRecorderTarget); this class never touches GL, never reads pixels
-// back, never sees a Bitmap and never binds a CameraX ImageAnalysis stream.
-// It owns:
+// One instance == one recording == one MP4 file. The preview backend (GLES
+// AndroidGreenScreenPreviewCompositor or the GPU-resident
+// AndroidGreenScreenGpuResidentPreviewBackend) draws the SAME full
+// green-screen composite it presents on the texture (background + keyed
+// camera, current layout) into [inputSurface] on its own render thread
+// (AndroidGreenScreenPreviewBackend.setSegmentRecorderTarget); this class
+// never touches GL, never reads pixels back and never sees a Bitmap. It owns:
 //   - the AVC MediaCodec (COLOR_FormatSurface) and its input Surface,
 //   - a best-effort AudioRecord -> AAC MediaCodec microphone lane,
 //   - the MediaMuxer writing "<output>.tmp", atomically renamed on success,
-//   - one worker thread ("vg.duet.rec.video") that drains the video encoder,
-//     arbitrates muxer start and runs finalize, plus one audio thread
-//     ("vg.duet.rec.audio").
+//   - one worker thread ("vg.greenscreen.rec.video") that drains the video
+//     encoder, arbitrates muxer start and runs finalize, plus one audio thread
+//     ("vg.greenscreen.rec.audio").
+//
+// Structure mirrors the proven duet/AndroidDuetSegmentRecorder.kt minus every
+// Duet-only concern: fixed 1.0x speed (no WSOLA, no speed multiplier), no mic
+// gain metadata, no clock segment coupling.
 //
 // Muxer start policy (never deadlocks waiting for a track): the muxer starts
 // once the video output format exists AND the audio lane is either disabled,
@@ -24,36 +29,29 @@ package com.connects.vanguard_media_engine.duet
 // grace window (AUDIO_TRACK_GRACE_MS) / at finish. Pre-start samples of both
 // tracks are buffered (bounded) so the IDR frame at PTS 0 is never lost.
 //
-// Timing policy:
-//   - The take timeline origin is the wall-clock instant of the FIRST camera
-//     frame the compositor submits; that frame carries PTS 0.
-//   - Video PTS = wall elapsed since origin * [speedMultiplier] (the Duet
-//     preview clock's "T_out = S * T_wall" policy), so the file's video
-//     duration equals the clock segment's output duration for this take.
-//   - Mic audio is time-stretched to match: for |speedMultiplier - 1| above a
-//     small epsilon, captured PCM is run through AndroidDuetWsolaFilter (a
-//     self-contained WSOLA time-domain stretcher) before AAC encoding, so the
-//     emitted sample count approximates inputSamples * speedMultiplier and
-//     pitch is preserved. Speeds within the epsilon of 1.0 bypass the filter
-//     (direct passthrough) as a low-risk path. The filter is instantiated once
-//     per take from the speed frozen before [originNanos] is set (a take never
-//     changes rate mid-file — see [setSpeedMultiplier]), so one constant speed
-//     per take is assumed. Audio encoder PTS is derived from
-//     [audioSamplesFed], which counts samples actually submitted to the AAC
-//     encoder (post-WSOLA output samples for non-1.0 speed), not raw mic
-//     samples read, so it stays continuous and the audio track's duration now
-//     matches the retimed video track within about one frame.
-//   - [micGain] is descriptor metadata applied at export; the mic lane records
-//     unity gain so the descriptor's gain is never baked in twice.
+// Timing policy: the recording origin is the wall-clock instant of the FIRST
+// composite frame the compositor submits; that frame carries PTS 0. Video
+// PTS = wall elapsed since origin (1.0x). Microphone PCM captured before the
+// origin is dropped so both tracks start at the same instant; audio PTS is
+// derived from the count of samples actually fed to the AAC encoder, so it
+// stays continuous and never runs backwards.
 //
-// Threading / contract:
+// Terminal contract:
 //   - start() is called once on the caller's thread (the coordinator's main
-//     thread); it does the bounded codec/muxer configuration inline (needed
-//     to hand out [inputSurface] synchronously) and spawns the workers.
+//     thread); it configures codecs/muxer inline (needed to hand out
+//     [inputSurface] synchronously) and spawns the workers. It returns false
+//     with everything released and no file left behind on any video/muxer
+//     failure; an audio failure only logs and continues video-only.
 //   - nextFramePresentationTimeNs()/onFrameSubmitted() are render-thread only.
+//   - onSurfaceFailed() (render thread) marks the encoder surface dead: no
+//     further presentation time is handed out and the worker aborts with
+//     "recorder_surface_failed:<reason>" (partial deleted) instead of
+//     committing a file truncated at the failure.
 //   - finishAsync()/cancel() are safe from any thread, idempotent, and never
 //     block the caller. Exactly one completion result is ever produced; a
-//     finishAsync() after completion re-delivers that same result.
+//     finishAsync() after completion re-delivers that same result. A
+//     successful result names the committed final file; every failure path
+//     deletes the .tmp partial (and never leaves a partial at the final path).
 
 import android.Manifest
 import android.content.Context
@@ -65,8 +63,6 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import android.view.Surface
 import java.io.File
@@ -75,28 +71,23 @@ import java.nio.ByteOrder
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.abs
 
-class AndroidDuetSegmentRecorder(
+class AndroidGreenScreenSegmentRecorder(
     private val context: Context,
     val outputFile: File,
-    override val widthPx: Int = DEFAULT_WIDTH_PX,
-    override val heightPx: Int = DEFAULT_HEIGHT_PX,
+    override val widthPx: Int,
+    override val heightPx: Int,
     private val bitRate: Int = DEFAULT_BIT_RATE,
     private val fps: Int = DEFAULT_FPS,
-    speedMultiplier: Double = 1.0,
-    private val micGain: Double = 1.0,
-) : AndroidDuetSegmentRecorderSurfaceTarget {
+) : AndroidGreenScreenSegmentRecorderSurfaceTarget {
 
     companion object {
-        private const val TAG = "DuetSegmentRecorder"
+        private const val TAG = "GreenScreenSegmentRecorder"
 
-        const val DEFAULT_WIDTH_PX = 1080
-        const val DEFAULT_HEIGHT_PX = 1920
         const val DEFAULT_BIT_RATE = 10_000_000
         const val DEFAULT_FPS = 30
 
-        /** GOP of one second at [DEFAULT_FPS] (<= 30 frames). */
+        /** GOP of one second at [DEFAULT_FPS]. */
         private const val I_FRAME_INTERVAL_SEC = 1
 
         private const val DEQUEUE_TIMEOUT_US = 10_000L
@@ -112,30 +103,15 @@ class AndroidDuetSegmentRecorder(
 
         /** Bounded pre-muxer sample buffering per track (~4 s of video at 30 fps). */
         private const val MAX_PENDING_SAMPLES = 120
-
-        /** Speeds within this of 1.0 bypass WSOLA entirely (direct/low-risk passthrough). */
-        private const val WSOLA_BYPASS_EPSILON = 0.001
     }
 
-    // -- Public state ---------------------------------------------------------------
-
-    /** Positive speed multiplier applied to video PTS; adjustable until the first frame is stamped. */
-    @Volatile
-    private var speedMultiplier: Double = sanitizeSpeed(speedMultiplier)
-
-    /**
-     * Updates the video PTS speed policy. Takes effect only while no frame has
-     * been stamped yet (the coordinator calls this right before the clock's
-     * segment opens, after the async encoder-surface attach); later calls are
-     * ignored so a take never changes rate mid-file.
-     */
-    fun setSpeedMultiplier(speed: Double) {
-        if (originNanos >= 0L) return
-        speedMultiplier = sanitizeSpeed(speed)
-    }
-
-    private fun sanitizeSpeed(speed: Double): Double =
-        if (speed.isFinite() && speed > 0.0) speed else 1.0
+    /** Terminal outcome of a recording delivered to [finishAsync]. */
+    class Outcome(
+        val file: File,
+        val durationMs: Long,
+        val fileSizeBytes: Long,
+        val hasAudio: Boolean,
+    )
 
     private val tmpFile = File(outputFile.path + ".tmp")
 
@@ -156,8 +132,8 @@ class AndroidDuetSegmentRecorder(
     private var workerOwnsCleanup = false
 
     private val completionLock = Any()
-    private var completion: ((Result<File>) -> Unit)? = null
-    private var finalResult: Result<File>? = null
+    private var completion: ((Result<Outcome>) -> Unit)? = null
+    private var finalResult: Result<Outcome>? = null
 
     // -- Timeline ---------------------------------------------------------------------
 
@@ -174,16 +150,17 @@ class AndroidDuetSegmentRecorder(
     private var workerThread: Thread? = null
     private val videoWrittenSamples = AtomicInteger(0)
 
-    /** Set when the AVC encoder entered an error state; the worker then aborts the take. */
+    /** Set when the AVC encoder entered an error state; the worker then aborts the recording. */
     @Volatile private var videoEncoderFailed = false
+
+    /** Set once by [onSurfaceFailed]; the worker then aborts with recorder_surface_failed:<reason>. */
+    @Volatile private var surfaceFailedReason: String? = null
 
     // -- Audio lane (best-effort) ---------------------------------------------------------
 
     private var audioThread: Thread? = null
     private var audioRecord: AudioRecord? = null
     private var audioEncoder: MediaCodec? = null
-    private var echoCanceler: AcousticEchoCanceler? = null
-    private var noiseSuppressor: NoiseSuppressor? = null
     private var audioReadBufferShorts = 0
     @Volatile private var audioConfigured = false
     @Volatile private var audioActive = false
@@ -191,7 +168,10 @@ class AndroidDuetSegmentRecorder(
     @Volatile private var audioPermanentlyDisabled = false
     private var audioSamplesFed = 0L
     private var audioBasePtsUs = 0L
-    private var audioDisabledReason: String? = null
+    @Volatile private var audioDisabledReason: String? = null
+
+    /** True while the recording carries a microphone lane that has not been given up on. */
+    val audioEnabled: Boolean get() = audioConfigured && !audioPermanentlyDisabled
 
     // -- Muxer (shared by both lanes under muxerLock) -------------------------------------
 
@@ -222,15 +202,15 @@ class AndroidDuetSegmentRecorder(
         }
         if (canceled.get()) return false
         if (widthPx <= 0 || heightPx <= 0) {
-            Log.e(TAG, "start: invalid take size ${widthPx}x$heightPx")
-            deliver(Result.failure(IllegalArgumentException("invalid take size")))
+            Log.e(TAG, "start: invalid recording size ${widthPx}x$heightPx")
+            deliver(Result.failure(IllegalArgumentException("invalid_recording_size")))
             return false
         }
         try {
             val parent = outputFile.parentFile
             if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
                 Log.e(TAG, "start: cannot create ${parent.absolutePath}")
-                deliver(Result.failure(IllegalStateException("segment directory unavailable")))
+                deliver(Result.failure(IllegalStateException("output_directory_unavailable")))
                 return false
             }
             if (tmpFile.exists()) tmpFile.delete()
@@ -256,11 +236,11 @@ class AndroidDuetSegmentRecorder(
             surface = enc.createInputSurface()
             enc.start()
         } catch (t: Throwable) {
-            Log.e(TAG, "ANDROID_DUET_SEGMENT_RECORDER_START_FAILED stage=video_encoder ${t.javaClass.simpleName}: ${t.message}")
+            Log.e(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_START_FAILED stage=video_encoder ${t.javaClass.simpleName}: ${t.message}")
             try { encoder?.stop() } catch (_: Throwable) {}
             try { encoder?.release() } catch (_: Throwable) {}
             try { surface?.release() } catch (_: Throwable) {}
-            deliver(Result.failure(t))
+            deliver(Result.failure(IllegalStateException("video_encoder_start_failed")))
             return false
         }
         videoEncoder = encoder
@@ -269,40 +249,39 @@ class AndroidDuetSegmentRecorder(
         try {
             muxer = MediaMuxer(tmpFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         } catch (t: Throwable) {
-            Log.e(TAG, "ANDROID_DUET_SEGMENT_RECORDER_START_FAILED stage=muxer ${t.javaClass.simpleName}: ${t.message}")
+            Log.e(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_START_FAILED stage=muxer ${t.javaClass.simpleName}: ${t.message}")
             releaseVideoResourcesQuietly()
             deleteQuietly(tmpFile)
-            deliver(Result.failure(t))
+            deliver(Result.failure(IllegalStateException("muxer_start_failed")))
             return false
         }
 
         setupAudioBestEffort()
 
-        val worker = Thread({ runWorker() }, "vg.duet.rec.video")
+        val worker = Thread({ runWorker() }, "vg.greenscreen.rec.video")
         workerThread = worker
         workerOwnsCleanup = true
         worker.start()
         Log.i(
             TAG,
-            "ANDROID_DUET_SEGMENT_RECORDER_STARTED file=${outputFile.name} size=${widthPx}x$heightPx " +
-                "bitRate=$bitRate fps=$fps speed=$speedMultiplier micGain=$micGain " +
+            "ANDROID_LIVE_GREENSCREEN_RECORDER_STARTED file=${outputFile.name} size=${widthPx}x$heightPx " +
+                "bitRate=$bitRate fps=$fps " +
                 "audio=${if (audioConfigured) "aac_${AUDIO_SAMPLE_RATE}_mono" else "disabled:${audioDisabledReason ?: "unknown"}"}",
         )
         return true
     }
 
-    // ── Render-thread frame timing (AndroidDuetSegmentRecorderSurfaceTarget) ────
+    // ── Render-thread frame timing (AndroidGreenScreenSegmentRecorderSurfaceTarget) ────
 
     override fun nextFramePresentationTimeNs(): Long {
-        if (!started.get() || finishRequested.get() || canceled.get()) return -1L
+        if (!started.get() || finishRequested.get() || canceled.get() || surfaceFailedReason != null) return -1L
         val now = System.nanoTime()
         var origin = originNanos
         if (origin < 0L) {
             origin = now
             originNanos = now
         }
-        val wallNs = (now - origin).coerceAtLeast(0L)
-        var pts = (wallNs.toDouble() * speedMultiplier).toLong()
+        var pts = (now - origin).coerceAtLeast(0L)
         // Strictly monotonic container timestamps (two swaps can never share a PTS).
         if (pts <= lastVideoPtsNs) pts = lastVideoPtsNs + 1_000L
         lastVideoPtsNs = pts
@@ -313,17 +292,33 @@ class AndroidDuetSegmentRecorder(
         framesSubmitted.incrementAndGet()
     }
 
+    /**
+     * The backend can no longer draw into [inputSurface]. Recorded once; the
+     * worker observes it and aborts the take (partial deleted) so a stop can
+     * never commit a file that silently ends at the failure while the audio
+     * lane kept running.
+     */
+    override fun onSurfaceFailed(reason: String) {
+        if (surfaceFailedReason != null) return
+        surfaceFailedReason = reason
+        Log.w(
+            TAG,
+            "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_LOST reason=$reason framesSubmitted=${framesSubmitted.get()}",
+        )
+    }
+
     // ── finish / cancel ───────────────────────────────────────────────────────────
 
     /**
      * Stops capture, drains both encoders to end-of-stream, stops the muxer
      * and atomically renames the .tmp file to [outputFile]. Never blocks the
      * caller: [completion] is invoked exactly once on the recorder worker (or
-     * synchronously here when the take never ran / already completed) with the
-     * final file, or a failure whose message is a stable reason token.
+     * synchronously here when the recording never ran / already completed)
+     * with the committed file, or a failure whose message is a stable reason
+     * token.
      */
-    fun finishAsync(completion: (Result<File>) -> Unit) {
-        val immediate: Result<File>?
+    fun finishAsync(completion: (Result<Outcome>) -> Unit) {
+        val immediate: Result<Outcome>?
         synchronized(completionLock) {
             val existing = finalResult
             if (existing != null) {
@@ -354,8 +349,8 @@ class AndroidDuetSegmentRecorder(
     }
 
     /**
-     * Discards the take: stops capture, releases every codec/muxer resource
-     * and deletes the .tmp file. Idempotent; never blocks. A pending
+     * Discards the recording: stops capture, releases every codec/muxer
+     * resource and deletes the .tmp file. Idempotent; never blocks. A pending
      * [finishAsync] completion (if any) is delivered with a "canceled" failure.
      */
     fun cancel() {
@@ -368,11 +363,11 @@ class AndroidDuetSegmentRecorder(
         // else: the worker observes `canceled` and aborts + delivers.
     }
 
-    // ── Worker (vg.duet.rec.video) ─────────────────────────────────────────────
+    // ── Worker (vg.greenscreen.rec.video) ──────────────────────────────────────
 
     private fun runWorker() {
         try {
-            while (!finishRequested.get() && !canceled.get() && !videoEncoderFailed) {
+            while (!finishRequested.get() && !canceled.get() && !videoEncoderFailed && surfaceFailedReason == null) {
                 // dequeueOutputBuffer's 10 ms timeout paces this loop while idle.
                 drainVideoEncoder(endOfStream = false)
                 checkAudioGraceTimeout()
@@ -383,6 +378,11 @@ class AndroidDuetSegmentRecorder(
             }
             if (videoEncoderFailed) {
                 abortAndDeliver("video_encoder_error")
+                return
+            }
+            val surfaceFailure = surfaceFailedReason
+            if (surfaceFailure != null) {
+                abortAndDeliver("recorder_surface_failed:$surfaceFailure")
                 return
             }
             finishInternal()
@@ -397,7 +397,7 @@ class AndroidDuetSegmentRecorder(
         stopAudioLaneAndJoin()
         if (canceled.get()) { abortAndDeliver("canceled"); return }
 
-        // 2. Video EOS. A take without a single submitted frame has nothing to keep.
+        // 2. Video EOS. A recording without a single submitted frame has nothing to keep.
         val frames = framesSubmitted.get()
         if (frames == 0) {
             abortAndDeliver("no_video_frames")
@@ -440,12 +440,20 @@ class AndroidDuetSegmentRecorder(
         releaseVideoResourcesQuietly()
         if (!stopOk) {
             deleteQuietly(tmpFile)
-            Log.w(TAG, "ANDROID_DUET_SEGMENT_TAKE_FAILED reason=muxer_not_finalized frames=$frames written=${videoWrittenSamples.get()}")
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_FAILED reason=muxer_not_finalized frames=$frames written=${videoWrittenSamples.get()}")
             deliver(Result.failure(IllegalStateException("muxer_not_finalized")))
             return
         }
 
-        // 5. Atomic rename to the final path; verify the result is non-empty.
+        // 5. Validate the temp is non-empty, then atomically rename to the
+        //    final path and verify the committed file.
+        val tmpLength = try { tmpFile.length() } catch (_: Throwable) { 0L }
+        if (!tmpFile.exists() || tmpLength <= 0L) {
+            deleteQuietly(tmpFile)
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_FAILED reason=empty_output frames=$frames")
+            deliver(Result.failure(IllegalStateException("empty_output")))
+            return
+        }
         try {
             if (outputFile.exists()) outputFile.delete()
         } catch (_: Throwable) {}
@@ -454,21 +462,19 @@ class AndroidDuetSegmentRecorder(
         if (!renamed || !outputFile.exists() || finalLength <= 0L) {
             deleteQuietly(tmpFile)
             deleteQuietly(outputFile)
-            Log.w(TAG, "ANDROID_DUET_SEGMENT_TAKE_FAILED reason=rename_failed renamed=$renamed length=$finalLength")
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_FAILED reason=rename_failed renamed=$renamed length=$finalLength")
             deliver(Result.failure(IllegalStateException("rename_failed")))
             return
         }
-        val origin = originNanos
-        val wallMs = if (origin > 0L) (System.nanoTime() - origin) / 1_000_000L else 0L
+        val durationMs = (lastVideoPtsNs.coerceAtLeast(0L)) / 1_000_000L
+        val hasAudio = audioTrackIndex >= 0 && !audioPermanentlyDisabled
         Log.i(
             TAG,
-            "ANDROID_DUET_SEGMENT_TAKE_FINALIZED file=${outputFile.name} bytes=$finalLength " +
-                "framesSubmitted=$frames videoSamples=${videoWrittenSamples.get()} " +
-                "lastVideoPtsMs=${lastVideoPtsNs / 1_000_000L} wallMs=$wallMs speed=$speedMultiplier " +
-                "audioTrack=${audioTrackIndex >= 0 && !audioPermanentlyDisabled} " +
-                "audioSamplesFed=$audioSamplesFed audioDisabled=${audioDisabledReason ?: "none"}",
+            "ANDROID_LIVE_GREENSCREEN_RECORDING_FINALIZED file=${outputFile.name} bytes=$finalLength " +
+                "framesSubmitted=$frames videoSamples=${videoWrittenSamples.get()} durationMs=$durationMs " +
+                "audioTrack=$hasAudio audioSamplesFed=$audioSamplesFed audioDisabled=${audioDisabledReason ?: "none"}",
         )
-        deliver(Result.success(outputFile))
+        deliver(Result.success(Outcome(outputFile, durationMs, finalLength, hasAudio)))
     }
 
     private fun abortAndDeliver(reason: String) {
@@ -482,12 +488,12 @@ class AndroidDuetSegmentRecorder(
         }
         releaseVideoResourcesQuietly()
         deleteQuietly(tmpFile)
-        Log.i(TAG, "ANDROID_DUET_SEGMENT_TAKE_DISCARDED file=${outputFile.name} reason=$reason frames=${framesSubmitted.get()}")
+        Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDING_DISCARDED file=${outputFile.name} reason=$reason frames=${framesSubmitted.get()}")
         deliver(Result.failure(IllegalStateException(reason)))
     }
 
-    private fun deliver(result: Result<File>) {
-        val cb: ((Result<File>) -> Unit)?
+    private fun deliver(result: Result<Outcome>) {
+        val cb: ((Result<Outcome>) -> Unit)?
         synchronized(completionLock) {
             if (finalResult != null) return
             finalResult = result
@@ -582,7 +588,7 @@ class AndroidDuetSegmentRecorder(
         val arrivedAt = videoFormatArrivedAtNanos
         if (arrivedAt == 0L) return
         if ((System.nanoTime() - arrivedAt) / 1_000_000L < AUDIO_TRACK_GRACE_MS) return
-        Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=audio_format_timeout graceMs=$AUDIO_TRACK_GRACE_MS")
+        Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=audio_format_timeout graceMs=$AUDIO_TRACK_GRACE_MS")
         audioPermanentlyDisabled = true
         audioDisabledReason = "audio_format_timeout"
         audioActive = false
@@ -601,7 +607,7 @@ class AndroidDuetSegmentRecorder(
             muxerStarted = true
             Log.i(
                 TAG,
-                "ANDROID_DUET_SEGMENT_RECORDER_MUXER_STARTED audioTrack=${audioTrackIndex >= 0 && !audioPermanentlyDisabled} " +
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_MUXER_STARTED audioTrack=${audioTrackIndex >= 0 && !audioPermanentlyDisabled} " +
                     "pendingVideo=${pendingVideoSamples.size} pendingAudio=${pendingAudioSamples.size}",
             )
             flushPendingLocked(mx, videoTrackIndex, pendingVideoSamples, countVideo = true)
@@ -638,7 +644,7 @@ class AndroidDuetSegmentRecorder(
         try {
             if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 audioDisabledReason = "record_audio_not_granted"
-                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=record_audio_not_granted")
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=record_audio_not_granted")
                 return
             }
             val minBuf = AudioRecord.getMinBufferSize(
@@ -646,11 +652,11 @@ class AndroidDuetSegmentRecorder(
             )
             if (minBuf <= 0) {
                 audioDisabledReason = "min_buffer_size_$minBuf"
-                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=min_buffer_size value=$minBuf")
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=min_buffer_size value=$minBuf")
                 return
             }
             val record = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.MIC,
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -659,83 +665,9 @@ class AndroidDuetSegmentRecorder(
             if (record.state != AudioRecord.STATE_INITIALIZED) {
                 try { record.release() } catch (_: Throwable) {}
                 audioDisabledReason = "audio_record_uninitialized"
-                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=audio_record_uninitialized")
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=audio_record_uninitialized")
                 return
             }
-            val sessionId = record.audioSessionId
-            var aecCreated = false
-            var aecEnabled = false
-            var aecReason: String? = null
-            val aecAvailable = try {
-                AcousticEchoCanceler.isAvailable()
-            } catch (t: Throwable) {
-                aecReason = "isAvailable_${t.javaClass.simpleName}"
-                false
-            }
-            if (aecAvailable) {
-                try {
-                    val aec = AcousticEchoCanceler.create(sessionId)
-                    if (aec != null) {
-                        aecCreated = true
-                        aec.enabled = true
-                        aecEnabled = aec.enabled
-                        if (aecEnabled) {
-                            echoCanceler = aec
-                        } else {
-                            aecReason = "enable_failed"
-                            try { aec.release() } catch (_: Throwable) {}
-                        }
-                    } else {
-                        aecReason = "create_returned_null"
-                    }
-                } catch (t: Throwable) {
-                    aecReason = "create_failed_${t.javaClass.simpleName}"
-                }
-            } else if (aecReason == null) {
-                aecReason = "not_available"
-            }
-            val aecReasonSuffix = if (aecReason != null) " reason=$aecReason" else ""
-            Log.i(
-                TAG,
-                "ANDROID_DUET_SEGMENT_RECORDER_AEC_STATUS available=$aecAvailable created=$aecCreated enabled=$aecEnabled sessionId=$sessionId$aecReasonSuffix",
-            )
-
-            var nsCreated = false
-            var nsEnabled = false
-            var nsReason: String? = null
-            val nsAvailable = try {
-                NoiseSuppressor.isAvailable()
-            } catch (t: Throwable) {
-                nsReason = "isAvailable_${t.javaClass.simpleName}"
-                false
-            }
-            if (nsAvailable) {
-                try {
-                    val ns = NoiseSuppressor.create(sessionId)
-                    if (ns != null) {
-                        nsCreated = true
-                        ns.enabled = true
-                        nsEnabled = ns.enabled
-                        if (nsEnabled) {
-                            noiseSuppressor = ns
-                        } else {
-                            nsReason = "enable_failed"
-                            try { ns.release() } catch (_: Throwable) {}
-                        }
-                    } else {
-                        nsReason = "create_returned_null"
-                    }
-                } catch (t: Throwable) {
-                    nsReason = "create_failed_${t.javaClass.simpleName}"
-                }
-            } else if (nsReason == null) {
-                nsReason = "not_available"
-            }
-            val nsReasonSuffix = if (nsReason != null) " reason=$nsReason" else ""
-            Log.i(
-                TAG,
-                "ANDROID_DUET_SEGMENT_RECORDER_NS_STATUS available=$nsAvailable created=$nsCreated enabled=$nsEnabled sessionId=$sessionId$nsReasonSuffix",
-            )
             val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                 setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BIT_RATE)
@@ -747,13 +679,9 @@ class AndroidDuetSegmentRecorder(
                 enc.start()
             } catch (t: Throwable) {
                 try { enc?.release() } catch (_: Throwable) {}
-                try { echoCanceler?.release() } catch (_: Throwable) {}
-                try { noiseSuppressor?.release() } catch (_: Throwable) {}
-                echoCanceler = null
-                noiseSuppressor = null
                 try { record.release() } catch (_: Throwable) {}
                 audioDisabledReason = "aac_encoder_failed"
-                Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=aac_encoder_failed ${t.javaClass.simpleName}: ${t.message}")
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=aac_encoder_failed ${t.javaClass.simpleName}: ${t.message}")
                 return
             }
             audioRecord = record
@@ -761,18 +689,14 @@ class AndroidDuetSegmentRecorder(
             audioReadBufferShorts = maxOf(256, minBuf / 2)
             audioConfigured = true
             audioActive = true
-            val thread = Thread({ runAudioLoop() }, "vg.duet.rec.audio")
+            val thread = Thread({ runAudioLoop() }, "vg.greenscreen.rec.audio")
             audioThread = thread
             thread.start()
         } catch (t: Throwable) {
             audioDisabledReason = "audio_setup_exception"
-            Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=audio_setup_exception ${t.javaClass.simpleName}: ${t.message}")
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=audio_setup_exception ${t.javaClass.simpleName}: ${t.message}")
             audioConfigured = false
             audioActive = false
-            try { echoCanceler?.release() } catch (_: Throwable) {}
-            try { noiseSuppressor?.release() } catch (_: Throwable) {}
-            echoCanceler = null
-            noiseSuppressor = null
             try { audioEncoder?.release() } catch (_: Throwable) {}
             try { audioRecord?.release() } catch (_: Throwable) {}
             audioEncoder = null
@@ -785,7 +709,7 @@ class AndroidDuetSegmentRecorder(
         try {
             record.startRecording()
         } catch (t: Throwable) {
-            Log.w(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_DISABLED reason=start_recording_failed ${t.message}")
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_AUDIO_DISABLED reason=start_recording_failed ${t.message}")
             audioActive = false
             audioPermanentlyDisabled = true
             audioDisabledReason = "start_recording_failed"
@@ -793,11 +717,6 @@ class AndroidDuetSegmentRecorder(
             return
         }
         val pcm = ShortArray(audioReadBufferShorts)
-        // Decided lazily on the first post-origin chunk, once [speedMultiplier]
-        // is frozen (setSpeedMultiplier is a no-op once originNanos is set, and
-        // the coordinator always sets the final speed before the first frame).
-        var wsolaDecided = false
-        var wsola: AndroidDuetWsolaFilter? = null
         while (audioActive && !canceled.get()) {
             val n = try {
                 record.read(pcm, 0, pcm.size)
@@ -812,34 +731,12 @@ class AndroidDuetSegmentRecorder(
                 break
             }
             // Drop microphone audio captured before the first video frame; the
-            // take timeline starts there (PTS 0) for both tracks.
+            // recording timeline starts there (PTS 0) for both tracks.
             val origin = originNanos
             if (origin < 0L) continue
-            if (!wsolaDecided) {
-                wsolaDecided = true
-                val speed = speedMultiplier
-                if (abs(speed - 1.0) > WSOLA_BYPASS_EPSILON) {
-                    wsola = AndroidDuetWsolaFilter(speed)
-                    Log.i(TAG, "ANDROID_DUET_SEGMENT_RECORDER_AUDIO_WSOLA_ENABLED speed=$speed")
-                }
-            }
-            val filter = wsola
-            if (filter != null) {
-                val transformed = filter.process(pcm, n)
-                feedTransformedAudioChunk(transformed, transformed.size, origin)
-            } else {
-                feedTransformedAudioChunk(pcm, n, origin)
-            }
+            feedAudioChunk(pcm, n, origin)
         }
         if (!canceled.get()) {
-            val filter = wsola
-            if (filter != null) {
-                // We only reach here after stopAudioLaneAndJoin() cleared
-                // `audioActive`, so the WSOLA tail must bypass that guard or it
-                // is silently dropped before EOS. Cancellation still aborts it.
-                val tail = filter.flush()
-                feedTransformedAudioChunk(tail, tail.size, originNanos, allowAfterStopForFlush = true)
-            }
             feedAudioEncoderEos()
             drainAudioEncoder(endOfStream = true)
         }
@@ -847,42 +744,31 @@ class AndroidDuetSegmentRecorder(
     }
 
     /**
-     * Feeds [count] already-output-rate samples (raw mic PCM for the ~1.0
-     * speed bypass, or WSOLA-transformed PCM otherwise) to the AAC encoder.
-     * The first non-empty chunk of the take back-dates [audioBasePtsUs] by
-     * its own duration so audio starts near PTS 0 and stays gap-free from
+     * Feeds [count] raw mic PCM samples to the AAC encoder. The first
+     * non-empty chunk of the recording back-dates [audioBasePtsUs] by its own
+     * duration so audio starts near PTS 0 and stays gap-free from
      * [audioSamplesFed] afterwards.
-     *
-     * [allowAfterStopForFlush] is set only for the WSOLA tail flushed right
-     * before [feedAudioEncoderEos]; that tail is produced after [audioActive]
-     * has already been cleared by stop, so it must not be gated on it.
      */
-    private fun feedTransformedAudioChunk(
-        samples: ShortArray,
-        count: Int,
-        origin: Long,
-        allowAfterStopForFlush: Boolean = false,
-    ) {
+    private fun feedAudioChunk(samples: ShortArray, count: Int, origin: Long) {
         if (count <= 0) return
         if (audioSamplesFed == 0L) {
             val chunkUs = count.toLong() * 1_000_000L / AUDIO_SAMPLE_RATE
             audioBasePtsUs = ((System.nanoTime() - origin) / 1_000L - chunkUs).coerceAtLeast(0L)
         }
-        feedAudioEncoder(samples, count, allowAfterStopForFlush)
+        feedAudioEncoder(samples, count)
         drainAudioEncoder(endOfStream = false)
     }
 
     /**
-     * PTS derived from [audioSamplesFed]: a continuous counter of samples actually submitted to the encoder.
-     * Normal chunks stop submitting once [audioActive] is cleared; the pre-EOS
-     * flush tail passes [allowAfterStopForFlush] so it is still submitted.
-     * Cancellation always aborts submission regardless.
+     * PTS derived from [audioSamplesFed]: a continuous counter of samples
+     * actually submitted to the encoder, so the audio track can never run
+     * backwards. Submission stops once [audioActive] is cleared or on cancel.
      */
-    private fun feedAudioEncoder(pcm: ShortArray, count: Int, allowAfterStopForFlush: Boolean = false) {
+    private fun feedAudioEncoder(pcm: ShortArray, count: Int) {
         val enc = audioEncoder ?: return
         var offset = 0
         var stalls = 0
-        while (offset < count && (audioActive || allowAfterStopForFlush) && !canceled.get()) {
+        while (offset < count && audioActive && !canceled.get()) {
             try {
                 val inIdx = enc.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
                 if (inIdx >= 0) {
@@ -986,10 +872,6 @@ class AndroidDuetSegmentRecorder(
     }
 
     private fun releaseAudioResourcesQuietly() {
-        try { echoCanceler?.release() } catch (_: Throwable) {}
-        try { noiseSuppressor?.release() } catch (_: Throwable) {}
-        echoCanceler = null
-        noiseSuppressor = null
         try { audioRecord?.release() } catch (_: Throwable) {}
         try { audioEncoder?.stop() } catch (_: Throwable) {}
         try { audioEncoder?.release() } catch (_: Throwable) {}

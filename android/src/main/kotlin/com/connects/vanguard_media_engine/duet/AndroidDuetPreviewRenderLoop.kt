@@ -340,10 +340,13 @@ class AndroidDuetPreviewRenderLoop(
         submitDecoderOp(DecoderOp.Seek(targetPtsMs, surfaceGeneration.get()))
     }
 
+    private var lastUpdateLayoutSourceRect: VGDuetPixelRect? = null
+
     /**
      * Applies new layout rects and redraws immediately with the currently
      * latched frame; while holding (not active) it additionally steps to
-     * [targetPtsMs] so the held frame matches the caller's timeline position.
+     * [targetPtsMs] so the held frame matches the caller's timeline position
+     * whenever the source rect layout changes.
      */
     fun updateLayout(
         sourceRect: VGDuetPixelRect,
@@ -366,7 +369,9 @@ class AndroidDuetPreviewRenderLoop(
                 compositor.drawFrame()
             }
         }
-        if (!isActive) {
+        val sourceChanged = lastUpdateLayoutSourceRect != sourceRect
+        lastUpdateLayoutSourceRect = sourceRect
+        if (!isActive && sourceChanged) {
             submitDecoderOp(DecoderOp.Step(targetPtsMs, generation))
         }
     }

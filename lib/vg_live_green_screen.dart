@@ -12,6 +12,7 @@ export 'src/green_screen/vg_live_green_screen_models.dart'
         VGLiveGreenScreenForegroundTransform,
         VGLiveGreenScreenConfig,
         VGLiveGreenScreenSession,
+        VGLiveGreenScreenRecordingResult,
         VGLiveGreenScreenErrorCode,
         VGLiveGreenScreenException;
 export 'src/green_screen/vg_live_green_screen_platform_interface.dart'

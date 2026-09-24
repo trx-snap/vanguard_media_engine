@@ -12,13 +12,16 @@ import java.io.File
 /**
  * Thin MethodChannel handler for the generic live green-screen routes:
  * `startLiveGreenScreenSession`, `updateLiveGreenScreenBackground`,
- * `updateLiveGreenScreenTransform`, `stopLiveGreenScreenSession`.
+ * `updateLiveGreenScreenTransform`, `stopLiveGreenScreenSession`, and the
+ * recording routes `startLiveGreenScreenRecording`,
+ * `stopLiveGreenScreenRecording`, `cancelLiveGreenScreenRecording`.
  *
  * The plugin only routes here. This class owns argument parsing and
  * validation (`INVALID_ARG`) and error-code decoding; every lifecycle
  * decision lives in [AndroidLiveGreenScreenSessionCoordinator], which replies
- * with `live_busy`, `cameraUnavailable`, `composition_failed` or
- * `session_not_found`.
+ * with `live_busy`, `cameraUnavailable`, `composition_failed`,
+ * `session_not_found`, `recording_active`, `recording_not_active`,
+ * `recording_failed` or `disk_full`.
  *
  * Caller-agnostic: live meeting/calling, going live, camera, and the
  * Universal Editor are all expected callers; nothing here is Duet-owned.
@@ -37,12 +40,18 @@ class AndroidLiveGreenScreenMethodHandler(
         const val METHOD_UPDATE_BACKGROUND = "updateLiveGreenScreenBackground"
         const val METHOD_UPDATE_TRANSFORM = "updateLiveGreenScreenTransform"
         const val METHOD_STOP = "stopLiveGreenScreenSession"
+        const val METHOD_START_RECORDING = "startLiveGreenScreenRecording"
+        const val METHOD_STOP_RECORDING = "stopLiveGreenScreenRecording"
+        const val METHOD_CANCEL_RECORDING = "cancelLiveGreenScreenRecording"
 
         private val OWNED_METHODS = setOf(
             METHOD_START,
             METHOD_UPDATE_BACKGROUND,
             METHOD_UPDATE_TRANSFORM,
             METHOD_STOP,
+            METHOD_START_RECORDING,
+            METHOD_STOP_RECORDING,
+            METHOD_CANCEL_RECORDING,
         )
 
         private const val ERROR_INVALID_ARG = "INVALID_ARG"
@@ -106,6 +115,39 @@ class AndroidLiveGreenScreenMethodHandler(
             METHOD_STOP -> {
                 val sid = requireSessionId(safeArgs, method, result) ?: return
                 coordinator.stopSession(sid) { value, errStr ->
+                    replyFromCoordinator(result, value, errStr)
+                }
+            }
+
+            METHOD_START_RECORDING -> {
+                val sid = requireSessionId(safeArgs, method, result) ?: return
+                // Optional absolute output path; absent/blank lets the
+                // coordinator pick a cache path. A present non-string is a
+                // malformed argument.
+                val rawOutputPath = safeArgs["outputPath"]
+                val outputPath: String? = when (rawOutputPath) {
+                    null -> null
+                    is String -> rawOutputPath.trim().takeIf { it.isNotEmpty() }
+                    else -> {
+                        result.error(ERROR_INVALID_ARG, "$method: 'outputPath' must be a string.", null)
+                        return
+                    }
+                }
+                coordinator.startRecording(sid, outputPath) { value, errStr ->
+                    replyFromCoordinator(result, value, errStr)
+                }
+            }
+
+            METHOD_STOP_RECORDING -> {
+                val sid = requireSessionId(safeArgs, method, result) ?: return
+                coordinator.stopRecording(sid) { value, errStr ->
+                    replyFromCoordinator(result, value, errStr)
+                }
+            }
+
+            METHOD_CANCEL_RECORDING -> {
+                val sid = requireSessionId(safeArgs, method, result) ?: return
+                coordinator.cancelRecording(sid) { value, errStr ->
                     replyFromCoordinator(result, value, errStr)
                 }
             }

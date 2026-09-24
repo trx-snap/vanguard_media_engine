@@ -492,6 +492,16 @@ final class VGLiveGreenScreenSessionCoordinator {
     static let errorLiveBusy          = "live_busy"
     static let errorCompositionFailed = "composition_failed"
     static let errorSessionNotFound   = "session_not_found"
+    // Recording (VG-LIVE-GREENSCREEN-RECORDING).
+    static let errorRecordingActive    = "recording_active"
+    static let errorRecordingNotActive = "recording_not_active"
+    static let errorRecordingFailed    = "recording_failed"
+    static let errorDiskFull           = "disk_full"
+
+    /// Minimum free space on the recording volume before a recording may start.
+    private static let minFreeDiskBytesForRecording: Int64 = 200 * 1024 * 1024
+    /// Temporary-directory subfolder used when the caller supplies no outputPath.
+    private static let defaultRecordingDirectoryName = "vanguard_live_green_screen"
 
     // MARK: Event payload values
 
@@ -614,6 +624,14 @@ final class VGLiveGreenScreenSessionCoordinator {
         var terminalDiagnostics: [String: Any]?
         /// Set once the first PTS-aligned mask/camera pair was logged (main thread).
         var loggedFirstAlignedPair = false
+
+        // Recording (VG-LIVE-GREENSCREEN-RECORDING): at most one recorder per
+        // session, main-thread owned. The adapter path's presentHandler and the
+        // ARKit engine's onCompositedFrame both feed `recorder` the same
+        // composited buffer the texture shows; the microphone capture feeds it
+        // audio, which the recorder drops until the first video frame anchors t0.
+        var recorder: VGLiveGreenScreenRecorder?
+        var microphone: VGLiveGreenScreenMicrophoneCapture?
 
         init(sessionId: String,
              textureId: Int64,
@@ -1005,6 +1023,206 @@ final class VGLiveGreenScreenSessionCoordinator {
         reply(nil, nil)
     }
 
+    // MARK: - recording (VG-LIVE-GREENSCREEN-RECORDING)
+
+    /// Starts recording the composited output of the session to an MP4.
+    /// Replies once the writer is running and the frame tap is installed;
+    /// the first composited video frame then anchors the recording timeline
+    /// (t0), and microphone audio captured before it is dropped. Fails closed
+    /// with nothing recording and no file left behind: `recording_active`,
+    /// `disk_full`, `INVALID_ARG` (bad / existing outputPath) or
+    /// `recording_failed` (writer could not be created). Missing microphone
+    /// permission or an audio capture start failure degrades to video-only.
+    func startRecording(sessionId: String,
+                        outputPath: String?,
+                        reply: @escaping (Any?, FlutterError?) -> Void) {
+        assert(Thread.isMainThread)
+        let route = "startLiveGreenScreenRecording"
+        guard let session = resolveActiveSession(sessionId: sessionId, route: route, reply: reply) else { return }
+        if session.recorder != nil {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorRecordingActive,
+                message: "\(route): a recording is already active on session '\(sessionId)'.",
+                details: nil))
+            return
+        }
+        let fm = FileManager.default
+        let finalURL: URL
+        if let outputPath = outputPath {
+            guard outputPath.hasPrefix("/") else {
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "\(route): 'outputPath' must be an absolute local path (got '\(outputPath)').",
+                    details: nil))
+                return
+            }
+            if fm.fileExists(atPath: outputPath) {
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorInvalidArg,
+                    message: "\(route): 'outputPath' already exists: \(outputPath)",
+                    details: nil))
+                return
+            }
+            finalURL = URL(fileURLWithPath: outputPath)
+        } else {
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent(VGLiveGreenScreenSessionCoordinator.defaultRecordingDirectoryName, isDirectory: true)
+            let stamp = Int(Date().timeIntervalSince1970 * 1000)
+            finalURL = dir.appendingPathComponent("live_gs_\(String(sessionId.suffix(8)))_\(stamp).mp4")
+        }
+        let parentDir = finalURL.deletingLastPathComponent()
+        do {
+            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true, attributes: nil)
+        } catch {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorRecordingFailed,
+                message: "\(route): cannot create the recording directory \(parentDir.path): \(error.localizedDescription)",
+                details: nil))
+            return
+        }
+        let freeBytes = VGLiveGreenScreenSessionCoordinator.availableDiskSpaceBytes(forPath: parentDir.path)
+        if freeBytes >= 0, freeBytes < VGLiveGreenScreenSessionCoordinator.minFreeDiskBytesForRecording {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorDiskFull,
+                message: "\(route): insufficient free space (\(freeBytes / (1024 * 1024)) MB free; \(VGLiveGreenScreenSessionCoordinator.minFreeDiskBytesForRecording / (1024 * 1024)) MB required).",
+                details: nil))
+            return
+        }
+
+        // Microphone: video-only when not authorized. The writer still gets an
+        // audio input only when we intend to feed it.
+        let micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+
+        let recorder: VGLiveGreenScreenRecorder
+        do {
+            recorder = try VGLiveGreenScreenRecorder(finalURL: finalURL,
+                                                     width: session.canvasWidth,
+                                                     height: session.canvasHeight,
+                                                     includeAudio: micAuthorized)
+        } catch {
+            // Nothing was mutated on the session; the recorder cleaned up its temp.
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorRecordingFailed,
+                message: "\(route): the recording writer could not be started: \(error.localizedDescription)",
+                details: nil))
+            return
+        }
+        session.recorder = recorder
+
+        var audioLane = "disabled:microphone_not_authorized"
+        if micAuthorized {
+            let mic = VGLiveGreenScreenMicrophoneCapture { [weak recorder] sampleBuffer in
+                recorder?.appendAudioSampleBuffer(sampleBuffer)
+            }
+            if mic.start() {
+                session.microphone = mic
+                audioLane = "aac_mono"
+            } else {
+                audioLane = "disabled:microphone_capture_start_failed"
+            }
+        }
+
+        // Frame tap. Adapter path: startCameraPipeline's presentHandler reads
+        // `session.recorder` on main for every presented frame. ARKit path:
+        // the engine's render-queue tap feeds the recorder directly; the weak
+        // capture means a stopped/canceled recorder simply stops receiving.
+        session.arkitEngine?.onCompositedFrame = { [weak recorder] pixelBuffer in
+            recorder?.appendVideoFrame(pixelBuffer)
+        }
+
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_RECORDING_STARTED sessionId=\(sessionId) file=\(finalURL.path) size=\(session.canvasWidth)x\(session.canvasHeight) audio=\(audioLane) segmentationEngine=\(session.arkitEngine != nil ? VGLiveGreenScreenSessionCoordinator.segmentationEngineARKit : VGLiveGreenScreenSessionCoordinator.segmentationEngineAdapter)")
+        reply(nil, nil)
+    }
+
+    /// Stops the active recording: detaches the frame tap and microphone,
+    /// finishes the writer, and commits ".tmp" → final only after the writer
+    /// completed with a non-empty file. Replies with
+    /// `{filePath, durationMs, fileSizeBytes, width, height, hasAudio}` or
+    /// `recording_failed` (partial deleted); `recording_not_active` when no
+    /// recording is running. The preview keeps running.
+    func stopRecording(sessionId: String,
+                       reply: @escaping (Any?, FlutterError?) -> Void) {
+        assert(Thread.isMainThread)
+        let route = "stopLiveGreenScreenRecording"
+        guard let session = resolveActiveSession(sessionId: sessionId, route: route, reply: reply) else { return }
+        guard let recorder = session.recorder else {
+            reply(nil, FlutterError(
+                code:    VGLiveGreenScreenSessionCoordinator.errorRecordingNotActive,
+                message: "\(route): no recording is active on session '\(sessionId)'.",
+                details: nil))
+            return
+        }
+        detachRecordingSources(session)
+        session.recorder = nil
+        let width = session.canvasWidth
+        let height = session.canvasHeight
+        let sid = session.sessionId
+        recorder.finish { result in
+            // Completion is delivered on main.
+            switch result {
+            case .success(let outcome):
+                NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_RECORDING_COMMITTED sessionId=\(sid) file=\(outcome.filePath) bytes=\(outcome.fileSizeBytes) durationMs=\(outcome.durationMs) audio=\(outcome.hasAudio)")
+                reply([
+                    "filePath":      outcome.filePath,
+                    "durationMs":    outcome.durationMs,
+                    "fileSizeBytes": outcome.fileSizeBytes,
+                    "width":         width,
+                    "height":        height,
+                    "hasAudio":      outcome.hasAudio,
+                ], nil)
+            case .failure(let error):
+                NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_RECORDING_FAILED sessionId=\(sid) reason=\(error.localizedDescription)")
+                reply(nil, FlutterError(
+                    code:    VGLiveGreenScreenSessionCoordinator.errorRecordingFailed,
+                    message: "\(route): the recording could not be committed (\(error.localizedDescription)); the partial file was deleted.",
+                    details: nil))
+            }
+        }
+    }
+
+    /// Discards the active recording (partial deleted). Idempotent: completes
+    /// normally when no recording is running. The preview keeps running.
+    func cancelRecording(sessionId: String,
+                         reply: @escaping (Any?, FlutterError?) -> Void) {
+        assert(Thread.isMainThread)
+        guard let session = resolveActiveSession(sessionId: sessionId,
+                                                 route: "cancelLiveGreenScreenRecording",
+                                                 reply: reply) else { return }
+        discardRecording(session, reason: "cancel")
+        reply(nil, nil)
+    }
+
+    /// Stops feeding the recorder: clears the ARKit tap and stops the
+    /// microphone. The adapter presentHandler stops on its own once
+    /// `session.recorder` is nil.
+    private func detachRecordingSources(_ session: LiveSession) {
+        assert(Thread.isMainThread)
+        session.arkitEngine?.onCompositedFrame = nil
+        session.microphone?.stop()
+        session.microphone = nil
+    }
+
+    /// Cancels the recorder (writer canceled, ".tmp" deleted) after detaching
+    /// its sources. No-op without an active recorder.
+    private func discardRecording(_ session: LiveSession, reason: String) {
+        assert(Thread.isMainThread)
+        detachRecordingSources(session)
+        guard let recorder = session.recorder else { return }
+        session.recorder = nil
+        recorder.cancel()
+        NSLog("[VGLiveGreenScreenSessionCoordinator] IOS_LIVE_GREENSCREEN_RECORDING_DISCARDED sessionId=\(session.sessionId) reason=\(reason)")
+    }
+
+    /// Free bytes on the volume holding `path`, or -1 when unknown (never
+    /// blocks a recording on an unreadable attribute).
+    private static func availableDiskSpaceBytes(forPath path: String) -> Int64 {
+        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: path),
+              let free = attrs[.systemFreeSize] as? NSNumber else {
+            return -1
+        }
+        return free.int64Value
+    }
+
     // MARK: - diagnostics (diagnostic-only; physical smoke telemetry)
 
     /// Returns the adapter's aggregated segmentation timing / matte publication
@@ -1144,6 +1362,10 @@ final class VGLiveGreenScreenSessionCoordinator {
     /// created exist (adapter path xor ARKit engine); every step is idempotent.
     private func release(_ session: LiveSession) {
         assert(Thread.isMainThread)
+
+        // A recording never survives its session: discard it (partial deleted)
+        // before any frame source is torn down.
+        discardRecording(session, reason: "session_release")
 
         // Clear the video provider before stopping the render loop so the
         // loop cannot call into a player that is being torn down.
@@ -1319,9 +1541,12 @@ final class VGLiveGreenScreenSessionCoordinator {
                 return VGLiveGreenScreenRenderLoop.MaskSnapshot(buffer: Unmanaged.passRetained(mask),
                                                                 sourcePTS: sourcePTS)
             },
-            presentHandler: { pixelBuffer in
+            presentHandler: { [weak session] pixelBuffer in
                 texture.update(pixelBuffer: pixelBuffer)
                 registry.textureFrameAvailable(textureId)
+                // Recording tap (main thread): the same composited buffer the
+                // texture just received. nil recorder costs nothing.
+                session?.recorder?.appendVideoFrame(pixelBuffer)
             },
             backgroundFrameProvider: videoProvider)
         session.renderLoop = loop
@@ -1632,5 +1857,423 @@ final class VGLiveGreenScreenSessionCoordinator {
         case .image(_, let mode):
             return mode == .aspectFill ? "image(aspectFill)" : "image(aspectFit)"
         }
+    }
+}
+
+// MARK: - VGLiveGreenScreenRecorder (file-private; VG-LIVE-GREENSCREEN-RECORDING)
+//
+// One instance == one recording == one MP4. AVAssetWriter writes to
+// "<final>.tmp"; `finish` commits the temp to the final path only after the
+// writer completed and the file is non-empty; `cancel` (and every failure
+// path) deletes the temp and never touches the final path.
+//
+// Timeline: the FIRST composited video frame anchors t0 (host clock) and is
+// written at PTS 0; every later video PTS is host-now minus t0. Audio sample
+// buffers (AVCaptureAudioDataOutput, host-clock timestamps) are retimed to
+// the same t0; any buffer that would land before PTS 0 -- captured before the
+// first video frame or before t0 existed -- is dropped. Both tracks are kept
+// strictly monotonic, so no out-of-order PTS is ever appended.
+//
+// Packaging note: defined here (not in its own source file) so it compiles
+// through the existing Pods project without a project mutation.
+
+fileprivate final class VGLiveGreenScreenRecorder {
+
+    struct Outcome {
+        let filePath: String
+        let durationMs: Int
+        let fileSizeBytes: Int
+        let hasAudio: Bool
+    }
+
+    private struct RecorderError: LocalizedError {
+        let reason: String
+        var errorDescription: String? { reason }
+    }
+
+    let finalURL: URL
+    let tmpURL: URL
+    let width: Int
+    let height: Int
+    let includesAudio: Bool
+
+    private let writerQueue = DispatchQueue(label: "com.connects.vanguard.livegreenscreen.recorder",
+                                            qos: .userInitiated)
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var audioInput: AVAssetWriterInput?
+
+    // writerQueue-confined state.
+    private var originHostTime: CMTime?
+    private var lastVideoPTS: CMTime = .invalid
+    private var lastAudioPTS: CMTime = .invalid
+    private var videoFramesAppended = 0
+    private var videoFramesDropped = 0
+    private var audioBuffersAppended = 0
+    private var isFinishing = false
+    private var isCancelled = false
+    private var loggedVideoAppendFailure = false
+    private var loggedAudioAppendFailure = false
+
+    init(finalURL: URL, width: Int, height: Int, includeAudio: Bool,
+         averageBitRate: Int = 10_000_000) throws {
+        self.finalURL = finalURL
+        self.tmpURL = URL(fileURLWithPath: finalURL.path + ".tmp")
+        self.width = width
+        self.height = height
+        self.includesAudio = includeAudio
+
+        let fm = FileManager.default
+        if fm.fileExists(atPath: tmpURL.path) {
+            try? fm.removeItem(at: tmpURL)
+        }
+
+        let assetWriter = try AVAssetWriter(outputURL: tmpURL, fileType: .mp4)
+
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: averageBitRate,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoExpectedSourceFrameRateKey: 30,
+                AVVideoAllowFrameReorderingKey: false,
+            ],
+        ]
+        let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        vInput.expectsMediaDataInRealTime = true
+        guard assetWriter.canAdd(vInput) else {
+            try? fm.removeItem(at: tmpURL)
+            throw RecorderError(reason: "cannot_add_video_input")
+        }
+        assetWriter.add(vInput)
+        let pixelAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vInput,
+                                                                sourcePixelBufferAttributes: nil)
+
+        if includeAudio {
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100.0,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderBitRateKey: 128_000,
+            ]
+            let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            aInput.expectsMediaDataInRealTime = true
+            if assetWriter.canAdd(aInput) {
+                assetWriter.add(aInput)
+                self.audioInput = aInput
+            } else {
+                NSLog("[VGLiveGreenScreenRecorder] audio input rejected by AVAssetWriter; recording video-only")
+            }
+        }
+
+        guard assetWriter.startWriting() else {
+            let error = assetWriter.error
+            try? fm.removeItem(at: tmpURL)
+            throw error ?? RecorderError(reason: "asset_writer_start_failed")
+        }
+
+        self.writer = assetWriter
+        self.videoInput = vInput
+        self.adaptor = pixelAdaptor
+    }
+
+    // MARK: Video
+
+    /// Appends one composited frame. Safe from any thread; the host time is
+    /// sampled synchronously so queueing latency never skews the timeline.
+    func appendVideoFrame(_ pixelBuffer: CVPixelBuffer) {
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        writerQueue.async { [self] in
+            guard let writer = self.writer,
+                  let input = self.videoInput,
+                  let adaptor = self.adaptor,
+                  !self.isFinishing, !self.isCancelled,
+                  writer.status == .writing else { return }
+
+            if self.originHostTime == nil {
+                self.originHostTime = now
+                writer.startSession(atSourceTime: .zero)
+                NSLog("[VGLiveGreenScreenRecorder] IOS_LIVE_GREENSCREEN_RECORDING_FIRST_FRAME t0Host=\(String(format: "%.6f", CMTimeGetSeconds(now)))")
+            }
+            guard let origin = self.originHostTime else { return }
+            let pts = CMTimeSubtract(now, origin)
+            guard pts >= .zero else { return }
+            if self.lastVideoPTS.isValid, pts <= self.lastVideoPTS { return }
+            guard input.isReadyForMoreMediaData else {
+                self.videoFramesDropped += 1
+                return
+            }
+            if adaptor.append(pixelBuffer, withPresentationTime: pts) {
+                self.lastVideoPTS = pts
+                self.videoFramesAppended += 1
+            } else if !self.loggedVideoAppendFailure {
+                self.loggedVideoAppendFailure = true
+                NSLog("[VGLiveGreenScreenRecorder] appendVideo failed: status=%ld error=%@",
+                      writer.status.rawValue, String(describing: writer.error))
+            }
+        }
+    }
+
+    // MARK: Audio
+
+    /// Appends one captured microphone buffer, retimed to the recording
+    /// timeline. Dropped while no video frame has anchored t0 and for any
+    /// buffer that would land before PTS 0 or behind the last appended one.
+    func appendAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        writerQueue.async { [self] in
+            guard let writer = self.writer,
+                  let input = self.audioInput,
+                  let origin = self.originHostTime,
+                  !self.isFinishing, !self.isCancelled,
+                  writer.status == .writing else { return }
+
+            let rawPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            guard rawPTS.isNumeric else { return }
+            let pts = CMTimeSubtract(rawPTS, origin)
+            guard pts >= .zero else { return }
+            if self.lastAudioPTS.isValid, pts <= self.lastAudioPTS { return }
+            guard let retimed = VGLiveGreenScreenRecorder.retimed(sampleBuffer, to: pts) else { return }
+            guard input.isReadyForMoreMediaData else { return }
+            if input.append(retimed) {
+                self.lastAudioPTS = pts
+                self.audioBuffersAppended += 1
+            } else if !self.loggedAudioAppendFailure {
+                self.loggedAudioAppendFailure = true
+                NSLog("[VGLiveGreenScreenRecorder] appendAudio failed: status=%ld error=%@",
+                      writer.status.rawValue, String(describing: writer.error))
+            }
+        }
+    }
+
+    // MARK: Finish / cancel
+
+    /// Finishes the writer and commits the temp to `finalURL`; `completion`
+    /// is delivered on the main thread exactly once. Every failure deletes
+    /// the temp and leaves nothing at the final path.
+    func finish(completion: @escaping (Result<Outcome, Error>) -> Void) {
+        writerQueue.async { [self] in
+            guard !self.isFinishing, !self.isCancelled, let writer = self.writer else {
+                self.deliver(.failure(RecorderError(reason: "recorder_not_active")), completion)
+                return
+            }
+            self.isFinishing = true
+
+            guard self.originHostTime != nil, self.videoFramesAppended > 0 else {
+                // No video frame ever anchored the session: AVAssetWriter must
+                // never be asked to finish a session that was not started.
+                if writer.status == .writing { writer.cancelWriting() }
+                self.releaseWriter()
+                self.removeTemp()
+                self.deliver(.failure(RecorderError(reason: "no_video_frames")), completion)
+                return
+            }
+            guard writer.status == .writing else {
+                let error = writer.error ?? RecorderError(reason: "writer_status_\(writer.status.rawValue)")
+                if writer.status == .writing { writer.cancelWriting() }
+                self.releaseWriter()
+                self.removeTemp()
+                self.deliver(.failure(error), completion)
+                return
+            }
+
+            self.videoInput?.markAsFinished()
+            self.audioInput?.markAsFinished()
+            let tmp = self.tmpURL
+            let finalFile = self.finalURL
+            let durationMs = Int((CMTimeGetSeconds(self.lastVideoPTS) * 1000.0).rounded())
+            let hasAudio = self.audioBuffersAppended > 0
+            let framesAppended = self.videoFramesAppended
+            let framesDropped = self.videoFramesDropped
+            writer.finishWriting { [self] in
+                self.writerQueue.async {
+                    self.releaseWriter()
+                    guard writer.status == .completed else {
+                        let error = writer.error ?? RecorderError(reason: "finish_writing_failed_status_\(writer.status.rawValue)")
+                        self.removeTemp()
+                        self.deliver(.failure(error), completion)
+                        return
+                    }
+                    let fm = FileManager.default
+                    let attrs = try? fm.attributesOfItem(atPath: tmp.path)
+                    let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+                    guard size > 0 else {
+                        self.removeTemp()
+                        self.deliver(.failure(RecorderError(reason: "empty_output")), completion)
+                        return
+                    }
+                    if fm.fileExists(atPath: finalFile.path) {
+                        try? fm.removeItem(at: finalFile)
+                    }
+                    do {
+                        try fm.moveItem(at: tmp, to: finalFile)
+                    } catch {
+                        self.removeTemp()
+                        self.deliver(.failure(RecorderError(reason: "commit_move_failed: \(error.localizedDescription)")), completion)
+                        return
+                    }
+                    let finalAttrs = try? fm.attributesOfItem(atPath: finalFile.path)
+                    let finalSize = (finalAttrs?[.size] as? NSNumber)?.int64Value ?? 0
+                    guard finalSize > 0 else {
+                        try? fm.removeItem(at: finalFile)
+                        self.deliver(.failure(RecorderError(reason: "empty_output_after_commit")), completion)
+                        return
+                    }
+                    NSLog("[VGLiveGreenScreenRecorder] IOS_LIVE_GREENSCREEN_RECORDING_FINALIZED file=\(finalFile.lastPathComponent) bytes=\(finalSize) durationMs=\(durationMs) framesAppended=\(framesAppended) framesDropped=\(framesDropped) audioBuffers=\(self.audioBuffersAppended)")
+                    self.deliver(.success(Outcome(filePath: finalFile.path,
+                                                  durationMs: durationMs,
+                                                  fileSizeBytes: Int(finalSize),
+                                                  hasAudio: hasAudio)), completion)
+                }
+            }
+        }
+    }
+
+    /// Discards the recording: cancels the writer and deletes the temp.
+    /// Idempotent; never touches `finalURL`.
+    func cancel() {
+        writerQueue.async { [self] in
+            guard !self.isCancelled else { return }
+            self.isCancelled = true
+            if let writer = self.writer, writer.status == .writing {
+                writer.cancelWriting()
+            }
+            self.releaseWriter()
+            self.removeTemp()
+            NSLog("[VGLiveGreenScreenRecorder] IOS_LIVE_GREENSCREEN_RECORDING_DISCARDED file=\(self.finalURL.lastPathComponent) framesAppended=\(self.videoFramesAppended)")
+        }
+    }
+
+    // MARK: Private
+
+    private func releaseWriter() {
+        writer = nil
+        videoInput = nil
+        adaptor = nil
+        audioInput = nil
+    }
+
+    private func removeTemp() {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: tmpURL.path) {
+            try? fm.removeItem(at: tmpURL)
+        }
+    }
+
+    private func deliver(_ result: Result<Outcome, Error>,
+                         _ completion: @escaping (Result<Outcome, Error>) -> Void) {
+        DispatchQueue.main.async { completion(result) }
+    }
+
+    /// Copies `sampleBuffer` with its presentation time replaced by `pts`
+    /// (duration preserved, no decode timestamp), so the writer sees
+    /// recording-relative timing while the PCM bytes pass through untouched.
+    private static func retimed(_ sampleBuffer: CMSampleBuffer, to pts: CMTime) -> CMSampleBuffer? {
+        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(sampleBuffer),
+                                        presentationTimeStamp: pts,
+                                        decodeTimeStamp: .invalid)
+        var copy: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                           sampleBuffer: sampleBuffer,
+                                                           sampleTimingEntryCount: 1,
+                                                           sampleTimingArray: &timing,
+                                                           sampleBufferOut: &copy)
+        guard status == noErr else { return nil }
+        return copy
+    }
+}
+
+// MARK: - VGLiveGreenScreenMicrophoneCapture (file-private; VG-LIVE-GREENSCREEN-RECORDING)
+//
+// Audio-only AVCaptureSession delivering raw microphone sample buffers
+// (host-clock timestamps) to the recorder, which retimes them to its own t0.
+// Independent of the video source: it runs alongside the adapter path's
+// VGLiveGreenScreenCameraSource or the ARKit engine's ARSession without
+// touching either. Packaged in this file for the same Pods-project reason as
+// the recorder above.
+
+fileprivate final class VGLiveGreenScreenMicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+
+    typealias AudioBufferHandler = (CMSampleBuffer) -> Void
+
+    private let captureQueue = DispatchQueue(label: "com.connects.vanguard.livegreenscreen.mic",
+                                             qos: .userInitiated)
+    private var captureSession: AVCaptureSession?
+    private var audioOutput: AVCaptureAudioDataOutput?
+    private var onAudioBuffer: AudioBufferHandler?
+    private var isCapturing = false
+
+    init(onAudioBuffer: @escaping AudioBufferHandler) {
+        self.onAudioBuffer = onAudioBuffer
+        super.init()
+    }
+
+    deinit {
+        let session = captureSession
+        let output = audioOutput
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        if let s = session, s.isRunning {
+            captureQueue.async { s.stopRunning() }
+        }
+    }
+
+    /// Builds the audio capture graph synchronously (so the caller learns
+    /// whether a microphone lane exists) and starts it asynchronously.
+    /// Returns false, with nothing running, when no microphone device/input
+    /// is available or the output cannot be attached.
+    func start() -> Bool {
+        var configured = false
+        captureQueue.sync { [self] in
+            guard !self.isCapturing else { configured = true; return }
+            let session = AVCaptureSession()
+            guard let mic = AVCaptureDevice.default(for: .audio),
+                  let input = try? AVCaptureDeviceInput(device: mic),
+                  session.canAddInput(input) else {
+                NSLog("[VGLiveGreenScreenMicrophoneCapture] microphone device/input unavailable; recording video-only")
+                return
+            }
+            session.addInput(input)
+            let output = AVCaptureAudioDataOutput()
+            output.setSampleBufferDelegate(self, queue: self.captureQueue)
+            guard session.canAddOutput(output) else {
+                NSLog("[VGLiveGreenScreenMicrophoneCapture] audio data output rejected; recording video-only")
+                return
+            }
+            session.addOutput(output)
+            self.captureSession = session
+            self.audioOutput = output
+            self.isCapturing = true
+            configured = true
+        }
+        if configured, let session = captureSession, !session.isRunning {
+            captureQueue.async { session.startRunning() }
+        }
+        return configured
+    }
+
+    /// Stops delivery synchronously on the capture queue (so no buffer can be
+    /// handed out after this returns), then stops the session asynchronously.
+    func stop() {
+        captureQueue.sync { [self] in
+            self.isCapturing = false
+            self.onAudioBuffer = nil
+        }
+        let session = captureSession
+        let output = audioOutput
+        captureSession = nil
+        audioOutput = nil
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        if let s = session, s.isRunning {
+            captureQueue.async { s.stopRunning() }
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard isCapturing, let handler = onAudioBuffer else { return }
+        handler(sampleBuffer)
     }
 }

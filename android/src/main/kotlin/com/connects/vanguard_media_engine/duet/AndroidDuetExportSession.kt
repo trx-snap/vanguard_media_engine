@@ -4,8 +4,11 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.Handler
+import android.system.Os
 import android.util.Log
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
@@ -42,6 +45,13 @@ import kotlin.math.min
 //     layoutConfig.isSideSwapped and aspect-fitting both layers -- with
 //     creator overlays above), then source + mic audio mixed/muxed by
 //     AndroidTimelineAudioPass2Muxer.
+//   - Real-take greenScreen route: a take recorded with
+//     layoutConfig.isPreComposited == true already IS the final composited
+//     picture (AndroidDuetPreviewCompositor draws the live preview scene into
+//     the take encoder), so the video pass is a hardlink/copy of the segment
+//     into the video temp followed by the same audio pass; the offline
+//     AndroidDuetGreenScreenOfflineCompositorVideoEncoder is kept only for
+//     older descriptors without that flag.
 //   - Every native export failure is logged once as
 //     ANDROID_DUET_EXPORT_ERROR code=<code> message=<message> (see postError)
 //     so a physical run exposes the exact failure in logcat.
@@ -170,6 +180,11 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         // meaningful for splitLeftRight: false = source left / camera right,
         // true = camera left / source right. Default false.
         val isSideSwapped: Boolean,
+        // layoutConfig.isPreComposited: the recorded greenScreen take already
+        // holds the final composited picture (see runRealTakeExport). Only
+        // meaningful for greenScreen; absent/false selects the offline
+        // compositor fallback. Default false.
+        val isPreComposited: Boolean,
     )
 
     /** Normalized (0..1 canvas fraction) PiP camera rect from layoutConfig.pipNormalizedRect. */
@@ -269,8 +284,13 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         val greenScreenBg = AndroidDuetGreenScreenBackground.parse(
             layoutMap?.get("greenScreenBackground") as? Map<*, *>
         )
+        val isPreComposited = layoutMode == "greenScreen" &&
+            (layoutMap?.get("isPreComposited") as? Boolean) == true
 
-        if (layoutMode == "greenScreen" &&
+        // A pre-composited take already carries its (video / solid / image)
+        // background baked in, so only the offline-compositor fallback is
+        // limited to the source-video background.
+        if (layoutMode == "greenScreen" && !isPreComposited &&
             greenScreenBg.type != AndroidDuetGreenScreenBackgroundType.VIDEO
         ) {
             return ParseResult.Failure(
@@ -325,10 +345,12 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                     return ParseResult.Failure("source_invalid",
                         "exportDuetComposition: segment file is missing or not readable: $candidatePath")
                 }
-                if (layoutMode != "pip" && layoutMode != "splitTopBottom" && layoutMode != "splitLeftRight") {
+                if (layoutMode != "pip" && layoutMode != "splitTopBottom" &&
+                    layoutMode != "splitLeftRight" && layoutMode != "greenScreen"
+                ) {
                     return ParseResult.Failure("unsupported_export_feature",
                         "exportDuetComposition: real-take export only supports layoutConfig.mode " +
-                            "'pip', 'splitTopBottom', or 'splitLeftRight'; got $layoutMode.")
+                            "'pip', 'splitTopBottom', 'splitLeftRight', or 'greenScreen'; got $layoutMode.")
                 }
                 val initialSpeed = (descriptorMap["initialSpeed"] as? Number)?.toDouble() ?: 1.0
                 if (!initialSpeed.isFinite() || abs(initialSpeed - 1.0) >= 0.0001) {
@@ -391,6 +413,7 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 pipNormalizedRect      = pipNormalizedRect,
                 pipAnchor              = pipAnchor,
                 isSideSwapped          = isSideSwapped,
+                isPreComposited        = isPreComposited,
             )
         )
     }
@@ -697,11 +720,17 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
     /**
      * Real-take route: composites the trimmed source and the recorded
      * [segmentPath] into `outputPath.video.tmp` via
-     * [AndroidDuetOfflineCompositorVideoEncoder], then runs the existing
-     * audio pass-2 muxer (source + mic mix, or a video-only remux when both
-     * are muted/silent) into `outputPath.tmp`, and renames that to
-     * `outputPath` only after success. Every temp is deleted on failure; the
-     * video/audio temps are deleted on success as well.
+     * [AndroidDuetOfflineCompositorVideoEncoder] (or the offline green-screen
+     * compositor), then runs the existing audio pass-2 muxer (source + mic
+     * mix, or a video-only remux when both are muted/silent) into
+     * `outputPath.tmp`, and renames that to `outputPath` only after success.
+     * A pre-composited greenScreen take (layoutConfig.isPreComposited) skips
+     * the video composite entirely: the segment is staged into the video
+     * temp by hardlink/copy ([stagePreCompositedSegment]) and goes straight
+     * to the audio pass. Every temp is deleted on failure; the video/audio
+     * temps are deleted on success as well. The original segment file is
+     * never handed to a helper that could delete it and is never deleted
+     * here.
      */
     private fun runRealTakeExport(
         params: ExportParams,
@@ -769,54 +798,116 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             }
 
             // ── Pass 1: video composite ───────────────────────────────────────
-            val diagnostics = VanguardDiagnostics()
-            val lifecycleObserver = VanguardLifecycleObserver(diagnostics)
-            val nativeBridge = VanguardNativeBridge(
-                lifecycleObserver = lifecycleObserver,
-                diagnostics       = diagnostics,
-                codecAdapter      = null,
-            )
-            val encoder = AndroidDuetOfflineCompositorVideoEncoder(
-                outputPath   = videoTmpPath,
-                width        = params.targetWidth,
-                height       = params.targetHeight,
-                fps          = REAL_TAKE_FPS,
-                bitrateBps   = params.videoBitRate,
-                nativeBridge = nativeBridge,
-            )
-            val isSplitLeftRight = params.layoutMode == "splitLeftRight"
-            val layerScaleMode = if (isSplitLeftRight) {
-                AndroidDuetLayerScaleMode.ASPECT_FIT
+            //
+            // layoutMode == "greenScreen" with isPreComposited: the take is
+            // already the final composited picture (live preview scene drawn
+            // into the take encoder), so it is staged as the video temp
+            // without decoding or re-encoding a single frame.
+            // layoutMode == "greenScreen" without the flag (older descriptors)
+            // routes to the sibling offline compositor (ML Kit CPU
+            // SelfieSegmenter, source-video background). All other real-take
+            // modes (pip, splitTopBottom, splitLeftRight) go through the
+            // existing AndroidDuetOfflineCompositorVideoEncoder; their
+            // PiP/Split behavior is NOT changed.
+            val preComposited = params.layoutMode == "greenScreen" && params.isPreComposited
+            if (preComposited) {
+                val staged = stagePreCompositedSegment(segmentPath, videoTmpFile)
+                Log.i(
+                    TAG,
+                    "ANDROID_DUET_EXPORT_PRECOMPOSITED_BYPASS segment=${segWidth}x$segHeight rot=$segRotationNormalized " +
+                        "segmentSec=${"%.3f".format(segmentDurationSec)} exportSec=${"%.3f".format(effectiveExportDurationSec)} " +
+                        "target=${params.targetWidth}x${params.targetHeight} staged=$staged bytes=${videoTmpFile.length()}",
+                )
+            } else if (params.layoutMode == "greenScreen") {
+                // Green-screen compositor: source video background, camera foreground
+                // keyed by ML Kit CPU SelfieSegmenter, composited in cameraRect.
+                val gsEncoder = AndroidDuetGreenScreenOfflineCompositorVideoEncoder(
+                    outputPath = videoTmpPath,
+                    width      = params.targetWidth,
+                    height     = params.targetHeight,
+                    fps        = REAL_TAKE_FPS,
+                    bitrateBps = params.videoBitRate,
+                )
+                val gsResult = gsEncoder.encode(
+                    source = AndroidDuetGreenScreenOfflineCompositorVideoEncoder.VideoInput(
+                        label              = "source",
+                        sourcePath         = params.sourceFilePath,
+                        startOffsetSeconds = params.trimStartSec,
+                        rotationDegrees    = srcRotationNormalized,
+                        hintWidth          = srcWidth,
+                        hintHeight         = srcHeight,
+                    ),
+                    sourceRect = layoutRects.source,
+                    camera = AndroidDuetGreenScreenOfflineCompositorVideoEncoder.VideoInput(
+                        label              = "camera",
+                        sourcePath         = segmentPath,
+                        startOffsetSeconds = 0.0,
+                        rotationDegrees    = segRotationNormalized,
+                        hintWidth          = segWidth,
+                        hintHeight         = segHeight,
+                    ),
+                    cameraRect      = layoutRects.camera,
+                    durationSeconds = effectiveExportDurationSec,
+                    // Defect 1 fix: pass foreground free-rotation so the rotated-quad
+                    // blend path matches live preview.  Zero/null → identity (no rotation).
+                    foregroundRotationDegrees = params.foregroundTransform?.rotationDegrees ?: 0.0,
+                    foregroundAnchorX         = params.foregroundTransform?.anchorX ?: 0.5,
+                    foregroundAnchorY         = params.foregroundTransform?.anchorY ?: 0.5,
+                )
+                if (!gsResult.success) {
+                    throw ExportException("composition_failed",
+                        "exportDuetComposition: green-screen video pass failed: ${gsResult.reason}")
+                }
             } else {
-                AndroidDuetLayerScaleMode.ASPECT_FILL
-            }
-            val encodeResult = encoder.encode(
-                source = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
-                    label              = "source",
-                    sourcePath         = params.sourceFilePath,
-                    startOffsetSeconds = params.trimStartSec,
-                    rotationDegrees    = srcRotationNormalized,
-                    hintWidth          = srcWidth,
-                    hintHeight         = srcHeight,
-                ),
-                sourceRect = layoutRects.source,
-                camera = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
-                    label              = "camera",
-                    sourcePath         = segmentPath,
-                    startOffsetSeconds = 0.0,
-                    rotationDegrees    = segRotationNormalized,
-                    hintWidth          = segWidth,
-                    hintHeight         = segHeight,
-                ),
-                cameraRect      = layoutRects.camera,
-                durationSeconds = effectiveExportDurationSec,
-                overlays        = adjustedCreatorOverlays,
-                sourceScaleMode = layerScaleMode,
-                cameraScaleMode = layerScaleMode,
-            )
-            if (!encodeResult.success) {
-                throw ExportException("composition_failed",
-                    "exportDuetComposition: real-take video pass failed: ${encodeResult.reason}")
+                val diagnostics = VanguardDiagnostics()
+                val lifecycleObserver = VanguardLifecycleObserver(diagnostics)
+                val nativeBridge = VanguardNativeBridge(
+                    lifecycleObserver = lifecycleObserver,
+                    diagnostics       = diagnostics,
+                    codecAdapter      = null,
+                )
+                val encoder = AndroidDuetOfflineCompositorVideoEncoder(
+                    outputPath   = videoTmpPath,
+                    width        = params.targetWidth,
+                    height       = params.targetHeight,
+                    fps          = REAL_TAKE_FPS,
+                    bitrateBps   = params.videoBitRate,
+                    nativeBridge = nativeBridge,
+                )
+                val isSplitLeftRight = params.layoutMode == "splitLeftRight"
+                val layerScaleMode = if (isSplitLeftRight) {
+                    AndroidDuetLayerScaleMode.ASPECT_FIT
+                } else {
+                    AndroidDuetLayerScaleMode.ASPECT_FILL
+                }
+                val encodeResult = encoder.encode(
+                    source = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
+                        label              = "source",
+                        sourcePath         = params.sourceFilePath,
+                        startOffsetSeconds = params.trimStartSec,
+                        rotationDegrees    = srcRotationNormalized,
+                        hintWidth          = srcWidth,
+                        hintHeight         = srcHeight,
+                    ),
+                    sourceRect = layoutRects.source,
+                    camera = AndroidDuetOfflineCompositorVideoEncoder.VideoInput(
+                        label              = "camera",
+                        sourcePath         = segmentPath,
+                        startOffsetSeconds = 0.0,
+                        rotationDegrees    = segRotationNormalized,
+                        hintWidth          = segWidth,
+                        hintHeight         = segHeight,
+                    ),
+                    cameraRect      = layoutRects.camera,
+                    durationSeconds = effectiveExportDurationSec,
+                    overlays        = adjustedCreatorOverlays,
+                    sourceScaleMode = layerScaleMode,
+                    cameraScaleMode = layerScaleMode,
+                )
+                if (!encodeResult.success) {
+                    throw ExportException("composition_failed",
+                        "exportDuetComposition: real-take video pass failed: ${encodeResult.reason}")
+                }
             }
             if (!videoTmpFile.exists() || videoTmpFile.length() <= 0L) {
                 throw ExportException("composition_failed",
@@ -824,7 +915,11 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             }
 
             // ── Pass 2: audio mix / mux ───────────────────────────────────────
-            val audioSpecs = buildRealTakeAudioSpecs(params, segmentPath, effectiveExportDurationSec)
+            // The mic lane is read from the staged copy on the pre-composited
+            // route (same bytes as the segment) so the original take file is
+            // never handed to any helper.
+            val micAudioPath = if (preComposited) videoTmpPath else segmentPath
+            val audioSpecs = buildRealTakeAudioSpecs(params, micAudioPath, effectiveExportDurationSec)
             val audioFailure = AndroidTimelineAudioPass2Muxer(context = null).run(
                 specs         = audioSpecs,
                 videoTempPath = videoTmpPath,
@@ -857,7 +952,8 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
                 "fileSizeBytes" to fileSizeBytes,
                 "renderBackend" to REAL_TAKE_RENDER_BACKEND,
                 "preferredRenderBackend" to REAL_TAKE_RENDER_BACKEND,
-                "renderBackendReason" to "duet_real_take_offline_compositor",
+                "renderBackendReason" to
+                    if (preComposited) "duet_real_take_precomposited_remux" else "duet_real_take_offline_compositor",
                 "renderBackendFallbackReason" to null,
                 "glesSupported" to true,
             ))
@@ -871,6 +967,71 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
             safeDelete(audioTmpFile)
             if (!succeeded) safeDelete(finalTmpFile)
             busy.set(false)
+        }
+    }
+
+    /**
+     * Stages a pre-composited greenScreen take at [videoTmpFile] for the audio
+     * pass: a hardlink when the filesystem allows it (same volume, no bytes
+     * copied), else a full copy. Then validates the staged file is non-empty,
+     * byte-for-byte the segment's size, and carries a readable video track.
+     * Only ever reads [segmentPath]; the original take file is never moved,
+     * truncated or deleted (the caller's `finally` deletes the staged temp,
+     * which for a hardlink only drops that directory entry). Returns the
+     * staging method used, for the structured log.
+     */
+    private fun stagePreCompositedSegment(segmentPath: String, videoTmpFile: File): String {
+        val segmentFile = File(segmentPath)
+        val segmentBytes = segmentFile.length()
+        if (!segmentFile.isFile || segmentBytes <= 0L) {
+            throw ExportException("source_invalid",
+                "exportDuetComposition: pre-composited segment is missing or empty: $segmentPath")
+        }
+        safeDelete(videoTmpFile)
+        var method = "hardlink"
+        try {
+            Os.link(segmentFile.absolutePath, videoTmpFile.absolutePath)
+        } catch (t: Throwable) {
+            // Cross-volume, unsupported filesystem or permission: copy instead.
+            safeDelete(videoTmpFile)
+            method = "copy"
+            try {
+                segmentFile.copyTo(videoTmpFile, overwrite = true)
+            } catch (copyError: Throwable) {
+                safeDelete(videoTmpFile)
+                throw ExportException("composition_failed",
+                    "exportDuetComposition: could not stage the pre-composited segment " +
+                        "(hardlink: ${t.message}; copy: ${copyError.message}).")
+            }
+        }
+        val stagedBytes = videoTmpFile.length()
+        if (!videoTmpFile.isFile || stagedBytes <= 0L || stagedBytes != segmentBytes) {
+            safeDelete(videoTmpFile)
+            throw ExportException("composition_failed",
+                "exportDuetComposition: staged pre-composited segment is invalid " +
+                    "($stagedBytes bytes staged, $segmentBytes expected, via $method).")
+        }
+        if (!hasReadableVideoTrack(videoTmpFile.absolutePath)) {
+            safeDelete(videoTmpFile)
+            throw ExportException("composition_failed",
+                "exportDuetComposition: staged pre-composited segment has no readable video track.")
+        }
+        return method
+    }
+
+    /** True when [path] opens in MediaExtractor and exposes at least one `video/` track. */
+    private fun hasReadableVideoTrack(path: String): Boolean {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(path)
+            (0 until extractor.trackCount).any { index ->
+                extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "pre-composited segment probe failed: ${t.javaClass.simpleName}: ${t.message}")
+            false
+        } finally {
+            try { extractor.release() } catch (_: Throwable) {}
         }
     }
 
@@ -898,6 +1059,11 @@ class AndroidDuetExportSession(private val mainHandler: Handler) {
         }
         if (params.layoutMode == "splitLeftRight") {
             return AndroidDuetLayoutGeometry.splitLeftRight(canvasW, canvasH, params.isSideSwapped)
+        }
+        if (params.layoutMode == "greenScreen") {
+            // Source rect = full canvas (background video fills canvas).
+            // Camera rect = transform-derived overlay placement for the keyed foreground.
+            return AndroidDuetLayoutGeometry.greenScreen(canvasW, canvasH, params.foregroundTransform)
         }
         val source = AndroidDuetLayoutGeometry.pipSourceRect(canvasW, canvasH)
         val normalized = params.pipNormalizedRect

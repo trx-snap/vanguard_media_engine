@@ -325,6 +325,28 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
     /// before stopping. Not used by the probe.
     var onTerminalFailure: ((String) -> Void)?
 
+    /// Production recording tap (VG-LIVE-GREENSCREEN-RECORDING): fired on the
+    /// render queue with every composited BGRA frame, immediately after that
+    /// same buffer was handed to the texture, so a recorder receives exactly
+    /// what the preview shows. The buffer is pool-backed; the handler must not
+    /// retain it beyond a short-lived encoder append. Read under `lock` on
+    /// every publish and cleared by `stopFrameDelivery`, so setting it from
+    /// the owner's main thread is safe at any time. Nil (default) costs
+    /// nothing per frame.
+    var onCompositedFrame: ((CVPixelBuffer) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return compositedFrameHandler
+        }
+        set {
+            lock.lock()
+            compositedFrameHandler = newValue
+            lock.unlock()
+        }
+    }
+    private var compositedFrameHandler: ((CVPixelBuffer) -> Void)?
+
     private var session: ARSession?
     private var resources: RenderResources?
 
@@ -636,6 +658,8 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         if !wasStarted, failureReason == nil {
             failureReason = "not_started"
         }
+        // No composited frame may reach a recorder after delivery stops.
+        compositedFrameHandler = nil
         lock.unlock()
 
         // 1. Stop frame delivery.
@@ -957,6 +981,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
                 let compositeMs = (CACurrentMediaTime() - compositeStart) * 1000.0
 
                 texture.update(pixelBuffer: output)
+                onCompositedFrame?(output)
                 let publishTime = CACurrentMediaTime()
 
                 lock.lock()
@@ -1119,6 +1144,7 @@ final class VGARKitLiveGreenScreenPreviewCoordinator: NSObject, ARSessionDelegat
         let compositeMs = (CACurrentMediaTime() - compositeStart) * 1000.0
 
         texture.update(pixelBuffer: output)
+        onCompositedFrame?(output)
         let publishTime = CACurrentMediaTime()
 
         lock.lock()

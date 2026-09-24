@@ -10,10 +10,11 @@
 // call except nativeDestroy to its single render thread; the registry only
 // guards against stale handles after destroy.
 //
-// Ownership: the renderer owns EGL/GL objects only. The Android Surface
-// passed to nativeAttachOutputSurface is borrowed (ANativeWindow acquired for
-// the duration of the attach and released on detach/destroy); the
-// SurfaceTexture, camera Surface and TFLite interpreter stay in Kotlin.
+// Ownership: the renderer owns EGL/GL objects only. The Android Surfaces
+// passed to nativeAttachOutputSurface and nativeAttachRecorderSurface are
+// borrowed (ANativeWindow acquired for the duration of the attach and
+// released on detach/destroy); the SurfaceTexture, camera Surface, recorder
+// MediaCodec/Surface and TFLite interpreter stay in Kotlin.
 // Direct ByteBuffers are read/written in place through
 // GetDirectBufferAddress; no JNI copies of frame data.
 
@@ -144,6 +145,49 @@ VG_GS_GPU_RESIDENT_JNI(void, nativeDetachOutputSurface)(JNIEnv* /*env*/, jobject
     auto entry = Lookup(handle);
     if (!entry) return;
     entry->renderer->DetachOutputWindow();
+}
+
+// ---------------------------------------------------------------------------
+// VG-LIVE-GREENSCREEN-RECORDING: secondary encoder window surface. The
+// recorder's MediaCodec input Surface is borrowed exactly like the output
+// Surface above; the renderer acquires its own ANativeWindow reference for
+// the duration of the attach and never releases the Surface itself.
+// ---------------------------------------------------------------------------
+
+VG_GS_GPU_RESIDENT_JNI(jboolean, nativeAttachRecorderSurface)(
+    JNIEnv* env, jobject /*thiz*/, jlong handle, jobject surface, jint widthPx, jint heightPx) {
+    auto entry = Lookup(handle);
+    if (!entry || surface == nullptr) return JNI_FALSE;
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (window == nullptr) {
+        RecordError(entry, "ANativeWindow_fromSurface(recorder) returned null");
+        return JNI_FALSE;
+    }
+    std::string error;
+    const bool ok = entry->renderer->AttachRecorderWindow(window, widthPx, heightPx, &error);
+    // The renderer acquired its own reference on success; drop the JNI one.
+    ANativeWindow_release(window);
+    RecordError(entry, error);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+VG_GS_GPU_RESIDENT_JNI(void, nativeDetachRecorderSurface)(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    auto entry = Lookup(handle);
+    if (!entry) return;
+    entry->renderer->DetachRecorderWindow();
+}
+
+// Returns GlesGreenScreenGpuResidentRenderer::RecorderFrameStatus as an int
+// (0 submitted, 1 skipped, 2 failed). An unknown handle fails closed as 2 so
+// the Kotlin owner detaches the recorder instead of feeding a dead renderer.
+VG_GS_GPU_RESIDENT_JNI(jint, nativeRenderRecorderFrame)(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jlong presentationTimeNs) {
+    auto entry = Lookup(handle);
+    if (!entry) return static_cast<jint>(GlesGreenScreenGpuResidentRenderer::RecorderFrameStatus::kFailed);
+    std::string error;
+    const auto status = entry->renderer->RenderRecorderFrame(static_cast<int64_t>(presentationTimeNs), &error);
+    RecordError(entry, error);
+    return static_cast<jint>(status);
 }
 
 VG_GS_GPU_RESIDENT_JNI(void, nativeSetLayout)(

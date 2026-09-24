@@ -15,6 +15,9 @@
 //     current on the render thread while no output is attached),
 //   - an optional EGL window surface over a borrowed ANativeWindow (attached /
 //     detached independently of the camera input, which survives output loss),
+//   - an optional second EGL window surface over a live recording's encoder
+//     ANativeWindow (AttachRecorderWindow; same display/config/context, so the
+//     presented composite is re-drawn into it with zero copies),
 //   - the camera OES texture name (created here, handed to Kotlin for
 //     SurfaceTexture construction),
 //   - model-input RGBA8 texture + FBO, coarse R8 mask texture, R32F alpha
@@ -28,7 +31,9 @@
 // One frame transaction (all on the render thread, context current):
 //   DownscaleCameraToModelInput -> [Kotlin: Interpreter.run] ->
 //   UploadCoarseMask -> RenderFrame (guided filter -> optional temporal ->
-//   composite -> eglSwapBuffers).
+//   composite -> eglSwapBuffers) -> [while recording: RenderRecorderFrame
+//   (composite only, same textures and effective mode ->
+//   eglPresentationTimeANDROID -> eglSwapBuffers on the encoder surface)].
 //
 // Threading: single render thread only. No internal locking.
 //
@@ -67,6 +72,13 @@ struct GlesGreenScreenGpuResidentStats {
     float lastDownscaleMs = 0.0f;
     float lastRefineMs = 0.0f;
     float lastCompositeMs = 0.0f;
+    // Live recording (RenderRecorderFrame), cumulative across takes.
+    uint64_t recorderFramesSubmitted = 0;
+    uint64_t recorderFramesSkipped = 0;
+    uint64_t recorderFailures = 0;
+    double totalRecorderCompositeMs = 0.0;
+    float lastRecorderSwapMs = 0.0f;
+    float maxRecorderSwapMs = 0.0f;
 };
 
 class GlesGreenScreenGpuResidentRenderer {
@@ -85,6 +97,13 @@ public:
         kMasked = 3,       // latched camera frame keyed by the refined alpha
     };
 
+    /** Outcome of one RenderRecorderFrame call. */
+    enum class RecorderFrameStatus : int32_t {
+        kSubmitted = 0,  // composite swapped into the encoder surface with its PTS
+        kSkipped = 1,    // nothing to record (no recorder / no fresh composite / no output); not an error
+        kFailed = 2,     // EGL/GL failure on the encoder surface; the owner must detach it
+    };
+
     GlesGreenScreenGpuResidentRenderer();
     ~GlesGreenScreenGpuResidentRenderer();
 
@@ -101,8 +120,9 @@ public:
      */
     bool Initialize(std::string* error);
 
-    /** Terminal teardown (idempotent, never throws). Destroys the window
-     *  surface, every GL object, the pbuffer, the context and the display. */
+    /** Terminal teardown (idempotent, never throws). Destroys the recorder
+     *  surface, the window surface, every GL object, the pbuffer, the
+     *  context and the display. */
     void Destroy();
 
     bool IsInitialized() const { return initialized_; }
@@ -132,6 +152,37 @@ public:
     void DetachOutputWindow();
 
     bool HasOutputWindow() const { return eglWindowSurface_ != nullptr; }
+
+    // -- Recorder window (VG-LIVE-GREENSCREEN-RECORDING) ----------------------
+
+    /**
+     * Wraps a live recording's encoder ANativeWindow (acquired here; released
+     * on detach/destroy) in a second EGL window surface on this renderer's
+     * own display/config/context, probes that it can be made current, then
+     * hands the preview window back. Requires an attached output window of
+     * exactly widthPx x heightPx (the composite geometry is derived from the
+     * output size) and eglPresentationTimeANDROID (resolved once through
+     * eglGetProcAddress); fails closed otherwise. Re-attaching destroys the
+     * previous recorder surface first. Never releases the Android Surface.
+     */
+    bool AttachRecorderWindow(void* nativeWindow, int widthPx, int heightPx, std::string* error);
+
+    /** Destroys ONLY the recorder EGL window surface (and drops its window
+     *  ref); the preview window, the context and every GL object survive. */
+    void DetachRecorderWindow();
+
+    bool HasRecorderWindow() const { return eglRecorderSurface_ != nullptr; }
+
+    /**
+     * Re-composites the frame the last RenderFrame presented (same latched
+     * camera frame, refined alpha, background, layout and effective camera
+     * mode) into the recorder surface, stamps presentationTimeNs and swaps.
+     * Runs the composite pass only: no segmentation, no refinement, no alpha
+     * reallocation and no preview frame counters. Consumes the composite
+     * (at most one recorder frame per RenderFrame) and leaves the preview
+     * window (or the pbuffer) current again on every path.
+     */
+    RecorderFrameStatus RenderRecorderFrame(int64_t presentationTimeNs, std::string* error);
 
     // -- State ---------------------------------------------------------------
 
@@ -205,7 +256,10 @@ public:
      * Guided filter (+ optional temporal) over the coarse mask when
      * refineMask is set (or when no refined alpha exists yet), then the
      * composite into the window surface and eglSwapBuffers. Returns the swap
-     * result; false without an attached window.
+     * result; false without an attached window. Remembers the effective
+     * camera mode it actually composited (kMasked degrades to kNone before
+     * the first coarse mask) so RenderRecorderFrame records exactly what was
+     * presented.
      */
     bool RenderFrame(CameraMode cameraMode, bool refineMask, std::string* error);
 
@@ -227,6 +281,7 @@ private:
     bool EnsureCoarseAlphaTexture(int width, int height, std::string* error);
     void DestroyGlObjects();
     void DestroyWindowSurfaceQuietly();
+    void DestroyRecorderSurfaceQuietly();
     void MakePbufferCurrentQuietly();
 
     GlRect ToGl(const GlesGreenScreenGpuResidentRect& rect) const;
@@ -247,6 +302,22 @@ private:
     void* eglWindowSurface_ = nullptr;
     void* nativeWindow_ = nullptr;  // ANativeWindow*, acquired on attach
     bool initialized_ = false;
+
+    // Recorder (encoder) window surface; same config/context as the preview.
+    void* eglRecorderSurface_ = nullptr;
+    void* recorderNativeWindow_ = nullptr;  // ANativeWindow*, acquired on attach
+    int recorderWidth_ = 0;
+    int recorderHeight_ = 0;
+    void (*presentationTimeProc_)() = nullptr;  // eglPresentationTimeANDROID, resolved on first attach
+    CameraMode lastCompositedMode_ = CameraMode::kNone;
+    bool hasRecordableComposite_ = false;
+    bool recorderSizeMismatchLogged_ = false;
+    // Per-take counters (reset on attach) for the detach summary log.
+    uint64_t recorderTakeSubmitted_ = 0;
+    uint64_t recorderTakeSkipped_ = 0;
+    uint64_t recorderTakeFailed_ = 0;
+    double recorderTakeCompositeMs_ = 0.0;
+    float recorderTakeMaxSwapMs_ = 0.0f;
 
     int outputWidth_ = 0;
     int outputHeight_ = 0;

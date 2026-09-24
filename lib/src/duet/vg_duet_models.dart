@@ -593,6 +593,12 @@ class VGDuetLayoutConfig {
   /// source is on the bottom (inverted from default).
   final bool isTopBottomSwapped;
 
+  /// Export-routing flag from native completed Green Screen captures indicating
+  /// that recorded video segments are already pre-composited by native hardware.
+  ///
+  /// App/preview layout configs should normally leave it `false`.
+  final bool isPreComposited;
+
   /// Active PiP corner anchor. Only meaningful in [VGDuetLayoutMode.pip].
   final VGDuetPiPAnchor? pipAnchor;
 
@@ -622,6 +628,7 @@ class VGDuetLayoutConfig {
     required this.mode,
     this.isSideSwapped = false,
     this.isTopBottomSwapped = false,
+    this.isPreComposited = false,
     this.pipAnchor,
     this.pipNormalizedRect,
     this.foregroundTransform,
@@ -662,6 +669,7 @@ class VGDuetLayoutConfig {
     VGDuetLayoutMode? mode,
     bool? isSideSwapped,
     bool? isTopBottomSwapped,
+    bool? isPreComposited,
     VGDuetPiPAnchor? pipAnchor,
     VGDuetRect? pipNormalizedRect,
     VGDuetForegroundTransform? foregroundTransform,
@@ -675,6 +683,7 @@ class VGDuetLayoutConfig {
       mode: mode ?? this.mode,
       isSideSwapped: isSideSwapped ?? this.isSideSwapped,
       isTopBottomSwapped: isTopBottomSwapped ?? this.isTopBottomSwapped,
+      isPreComposited: isPreComposited ?? this.isPreComposited,
       pipAnchor: clearPipAnchor ? null : (pipAnchor ?? this.pipAnchor),
       pipNormalizedRect: clearPipRect
           ? null
@@ -692,6 +701,7 @@ class VGDuetLayoutConfig {
     'mode': mode.name,
     'isSideSwapped': isSideSwapped,
     'isTopBottomSwapped': isTopBottomSwapped,
+    if (isPreComposited) 'isPreComposited': true,
     if (pipAnchor != null) 'pipAnchor': pipAnchor!.name,
     if (pipNormalizedRect != null)
       'pipNormalizedRect': pipNormalizedRect!.toMap(),
@@ -738,6 +748,7 @@ class VGDuetLayoutConfig {
       mode: mode,
       isSideSwapped: map['isSideSwapped'] as bool? ?? false,
       isTopBottomSwapped: map['isTopBottomSwapped'] as bool? ?? false,
+      isPreComposited: map['isPreComposited'] as bool? ?? false,
       pipAnchor: pipAnchor,
       pipNormalizedRect: pipRect,
       foregroundTransform: foregroundTransform,
@@ -752,6 +763,7 @@ class VGDuetLayoutConfig {
           mode == other.mode &&
           isSideSwapped == other.isSideSwapped &&
           isTopBottomSwapped == other.isTopBottomSwapped &&
+          isPreComposited == other.isPreComposited &&
           pipAnchor == other.pipAnchor &&
           pipNormalizedRect == other.pipNormalizedRect &&
           foregroundTransform == other.foregroundTransform &&
@@ -762,6 +774,7 @@ class VGDuetLayoutConfig {
     mode,
     isSideSwapped,
     isTopBottomSwapped,
+    isPreComposited,
     pipAnchor,
     pipNormalizedRect,
     foregroundTransform,
@@ -771,7 +784,8 @@ class VGDuetLayoutConfig {
   @override
   String toString() =>
       'VGDuetLayoutConfig(mode: ${mode.name}, swap: $isSideSwapped, '
-      'tbSwap: $isTopBottomSwapped, pipAnchor: ${pipAnchor?.name}, '
+      'tbSwap: $isTopBottomSwapped, isPreComposited: $isPreComposited, '
+      'pipAnchor: ${pipAnchor?.name}, '
       'foregroundTransform: $foregroundTransform, '
       'greenScreenBackground: $greenScreenBackground)';
 }

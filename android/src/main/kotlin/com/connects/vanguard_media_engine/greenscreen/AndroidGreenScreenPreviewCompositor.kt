@@ -5,6 +5,7 @@ import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
+import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
@@ -63,6 +64,14 @@ import kotlin.math.roundToInt
 // only cross-thread touch point is the camera SurfaceTexture frame-available
 // callback (which may fire on any looper and therefore only sets
 // [cameraFramePending]) and [updateGreenScreenMask] (AtomicReference).
+//
+// Recording (VG-LIVE-GREENSCREEN-RECORDING): [setSegmentRecorderTarget]
+// wraps a recorder's MediaCodec input Surface in a second EGL window surface
+// on this same context; after every preview swap that latched a new camera
+// frame, [encodeRecorderFrame] draws the identical composite
+// ([drawCompositeScene]: background + masked camera, current layout) into
+// it with the recorder's presentation time. The recorded file is therefore
+// exactly what the preview shows -- never the raw camera alone.
 
 class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
 
@@ -133,6 +142,23 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
 
     /** True when a new camera frame is waiting to be consumed. */
     override val hasPendingCameraFrame: Boolean get() = cameraFramePending.get()
+
+    // -- Live recording encoder target (VG-LIVE-GREENSCREEN-RECORDING; render-thread only) --
+
+    /**
+     * Attached encoder target ([setSegmentRecorderTarget]) and the EGL window
+     * surface wrapping its MediaCodec input Surface. The window surface is
+     * created against this compositor's own [eglConfig]/[eglContext] so the
+     * already-latched camera OES texture, mask texture and background can be
+     * drawn into it directly (zero copy). Independent of the preview output
+     * surface: it survives output loss and is destroyed by
+     * [setSegmentRecorderTarget] (null) or [release].
+     */
+    private var recorderTarget: AndroidGreenScreenSegmentRecorderSurfaceTarget? = null
+    private var eglRecorderSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+    private var recorderFramesSubmitted = 0L
+    private var recorderFramesSkipped = 0L
+    private var recorderFailureLogged = false
 
     private val cameraStMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
@@ -405,11 +431,13 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
             if (!EGL14.eglMakeCurrent(display, window, window, eglContext)) return false
 
             // Latch camera frame if one arrived since last draw.
+            var latchedNewCameraFrame = false
             val camSt = cameraSurfaceTexture
             if (camSt != null && cameraFramePending.compareAndSet(true, false)) {
                 camSt.updateTexImage()
                 camSt.getTransformMatrix(cameraStMatrix)
                 hasCameraTexImage = true
+                latchedNewCameraFrame = true
             }
 
             // Latch a new background video frame if one arrived since last
@@ -435,41 +463,231 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
                 }
             }
 
-            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-            GLES20.glViewport(0, 0, outputWidthPx, outputHeightPx)
-            GLES20.glClearColor(0f, 0f, 0f, 1f)
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-
-            if (greenScreenEnabled) {
-                drawGreenScreenBackground(sourceRect ?: fullSurfaceRect())
-            }
-
-            // Camera rect drawing:
-            // - Green-screen mode: draw camera masked by the segmentation mask.
-            //   If no camera frame has arrived yet or no mask texture is ready,
-            //   leave the background visible underneath (do NOT draw an opaque placeholder).
-            // - Disabled: draw live OES frame when available, else placeholder.
-            val cr = cameraRect
-            if (cr != null) {
-                if (greenScreenEnabled) {
-                    if (hasCameraTexImage && hasMaskTexture) {
-                        drawCameraGreenScreen(cr)
-                    }
-                    // else: background remains visible, invariant satisfied.
-                } else {
-                    if (hasCameraTexImage) {
-                        drawCameraRect(cr)
-                    } else {
-                        drawCameraPlaceholder(cr)
-                    }
-                }
-            }
+            drawCompositeScene()
 
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-            return EGL14.eglSwapBuffers(display, window)
+            val presented = EGL14.eglSwapBuffers(display, window)
+
+            // VG-LIVE-GREENSCREEN-RECORDING: after the preview swap, draw the
+            // SAME composite (same latched camera frame, mask, background and
+            // layout) into the attached recorder surface -- once per new camera
+            // frame, so the encoder never sees duplicates. The preview output
+            // above is unchanged; encodeRecorderFrame restores the preview
+            // surface as current before returning.
+            if (latchedNewCameraFrame && recorderTarget != null) {
+                encodeRecorderFrame()
+            }
+            return presented
         } catch (t: Throwable) {
             Log.w(TAG, "drawFrame failed: ${t.message}")
             return false
+        }
+    }
+
+    /**
+     * Draws the full green-screen composite for the current output dimensions
+     * ([outputWidthPx] x [outputHeightPx]) into whatever EGL surface is
+     * current: full clear to black, the green-screen background (solid color /
+     * image / video) when enabled, then the masked camera over it -- or, with
+     * green-screen disabled, the plain camera passthrough / placeholder.
+     * Shared verbatim by the preview pass ([drawFrame]) and the recording
+     * pass ([encodeRecorderFrame]) so the recorded file is exactly what the
+     * preview shows. Assumes the camera/mask/background textures for this
+     * frame were already latched/uploaded by [drawFrame].
+     */
+    private fun drawCompositeScene() {
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glViewport(0, 0, outputWidthPx, outputHeightPx)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        if (greenScreenEnabled) {
+            drawGreenScreenBackground(sourceRect ?: fullSurfaceRect())
+        }
+
+        // Camera rect drawing:
+        // - Green-screen mode: draw camera masked by the segmentation mask.
+        //   If no camera frame has arrived yet or no mask texture is ready,
+        //   leave the background visible underneath (do NOT draw an opaque placeholder).
+        // - Disabled: draw live OES frame when available, else placeholder.
+        val cr = cameraRect
+        if (cr != null) {
+            if (greenScreenEnabled) {
+                if (hasCameraTexImage && hasMaskTexture) {
+                    drawCameraGreenScreen(cr)
+                }
+                // else: background remains visible, invariant satisfied.
+            } else {
+                if (hasCameraTexImage) {
+                    drawCameraRect(cr)
+                } else {
+                    drawCameraPlaceholder(cr)
+                }
+            }
+        }
+    }
+
+    // -- Live recording encoder surface (VG-LIVE-GREENSCREEN-RECORDING) --------
+
+    /**
+     * Attaches or detaches the live recording's encoder surface (see
+     * [AndroidGreenScreenPreviewBackend.setSegmentRecorderTarget]). Any
+     * previously attached encoder surface is destroyed first, so this is
+     * idempotent and a replace is a detach + attach. Attaching bootstraps the
+     * EGL core if the preview has not attached yet, wraps the target's Surface
+     * in an EGL window surface on this compositor's config/context, verifies
+     * it can be made current, then restores the preview (window or pbuffer)
+     * as the current surface. Returns false, with nothing attached, on any
+     * failure so the coordinator can fail the recording start cleanly. Must
+     * run on the render thread.
+     */
+    override fun setSegmentRecorderTarget(target: AndroidGreenScreenSegmentRecorderSurfaceTarget?): Boolean {
+        destroyRecorderSurfaceQuietly()
+        if (target == null) return true
+        if (isReleased.get()) return false
+        if (!ensureCore()) return false
+        val surface = target.inputSurface
+        if (surface == null || !surface.isValid || target.widthPx <= 0 || target.heightPx <= 0) {
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_REJECTED valid=${surface?.isValid} " +
+                "size=${target.widthPx}x${target.heightPx}")
+            return false
+        }
+        try {
+            val eglSurf = EGL14.eglCreateWindowSurface(
+                eglDisplay, eglConfig, surface, intArrayOf(EGL14.EGL_NONE), 0,
+            )
+            if (eglSurf == null || eglSurf == EGL14.EGL_NO_SURFACE) {
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_FAILED stage=eglCreateWindowSurface " +
+                    "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                restorePreviewCurrentQuietly()
+                return false
+            }
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)) {
+                Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_FAILED stage=eglMakeCurrent " +
+                    "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                restorePreviewCurrentQuietly()
+                try { EGL14.eglDestroySurface(eglDisplay, eglSurf) } catch (_: Throwable) {}
+                return false
+            }
+            restorePreviewCurrentQuietly()
+            eglRecorderSurface = eglSurf
+            recorderTarget = target
+            recorderFramesSubmitted = 0L
+            recorderFramesSkipped = 0L
+            recorderFailureLogged = false
+            Log.i(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_ATTACHED size=${target.widthPx}x${target.heightPx} " +
+                    "cameraLatched=$hasCameraTexImage maskReady=$hasMaskTexture greenScreen=$greenScreenEnabled",
+            )
+            return true
+        } catch (t: Throwable) {
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_FAILED stage=exception ${t.javaClass.simpleName}: ${t.message}")
+            restorePreviewCurrentQuietly()
+            return false
+        }
+    }
+
+    /**
+     * Draws the full composite latched by the enclosing [drawFrame] into the
+     * attached encoder surface ([drawCompositeScene] against the encoder
+     * frame's dimensions -- the recorder is always sized to the session canvas,
+     * so the same layout rects apply), stamped with the target's presentation
+     * time, then swapped. Runs after the preview swap so preview latency is
+     * untouched, and restores the preview dimensions and surface before
+     * returning. Every EGL/GL failure is logged once and never thrown. Frames
+     * the target declines (negative PTS: recorder finishing/canceled) are
+     * skipped without touching the encoder surface.
+     */
+    private fun encodeRecorderFrame() {
+        val target = recorderTarget ?: return
+        val eglSurf = eglRecorderSurface
+        if (eglSurf == EGL14.EGL_NO_SURFACE) return
+        val ptsNs = target.nextFramePresentationTimeNs()
+        if (ptsNs < 0L) {
+            recorderFramesSkipped++
+            return
+        }
+        val savedWidthPx = outputWidthPx
+        val savedHeightPx = outputHeightPx
+        try {
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurf, eglSurf, eglContext)) {
+                failRecorderSurface("eglMakeCurrent", "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                return
+            }
+            // toGlRect / fullSurfaceRect derive viewport, scissor and aspect
+            // math from the output dimensions; point them at the encoder frame
+            // for this pass only.
+            outputWidthPx = target.widthPx
+            outputHeightPx = target.heightPx
+            drawCompositeScene()
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurf, ptsNs)
+            if (EGL14.eglSwapBuffers(eglDisplay, eglSurf)) {
+                recorderFramesSubmitted++
+                target.onFrameSubmitted(ptsNs)
+                if (recorderFramesSubmitted == 1L) {
+                    Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_FIRST_FRAME ptsNs=$ptsNs " +
+                        "frame=${target.widthPx}x${target.heightPx} greenScreen=$greenScreenEnabled " +
+                        "maskReady=$hasMaskTexture")
+                }
+            } else {
+                failRecorderSurface("eglSwapBuffers", "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+            }
+        } catch (t: Throwable) {
+            failRecorderSurface("exception", "${t.javaClass.simpleName}: ${t.message}")
+        } finally {
+            outputWidthPx = savedWidthPx
+            outputHeightPx = savedHeightPx
+            restorePreviewCurrentQuietly()
+        }
+    }
+
+    /**
+     * The encoder surface can no longer be drawn into (EGL/GL failure, or the
+     * recorder released it underneath us). Logs once, tells the target so the
+     * recorder aborts instead of committing a file truncated at the failure,
+     * then detaches the surface so no further frame touches it. Structurally
+     * once per attach: the target is cleared here and [encodeRecorderFrame]
+     * is never entered without one.
+     */
+    private fun failRecorderSurface(stage: String, detail: String) {
+        val target = recorderTarget ?: return
+        if (!recorderFailureLogged) {
+            recorderFailureLogged = true
+            Log.w(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_FRAME_FAILED backend=gles_compositor stage=$stage $detail")
+        }
+        try {
+            target.onSurfaceFailed("gles_compositor_recorder_frame_failed:$stage")
+        } catch (t: Throwable) {
+            Log.w(TAG, "onSurfaceFailed threw: ${t.message}")
+        }
+        destroyRecorderSurfaceQuietly()
+    }
+
+    /** Makes the preview window surface current again when attached, else the bootstrap pbuffer. */
+    private fun restorePreviewCurrentQuietly() {
+        val window = eglWindowSurface
+        makeCurrentQuietly(if (window != EGL14.EGL_NO_SURFACE) window else eglPbufferSurface)
+    }
+
+    /**
+     * Destroys only the encoder EGL window surface (never the recorder-owned
+     * Surface behind it) after switching the preview/pbuffer back to current,
+     * and forgets the target. Idempotent; tolerates a recorder Surface that is
+     * already dead (recorder canceled first).
+     */
+    private fun destroyRecorderSurfaceQuietly() {
+        val surf = eglRecorderSurface
+        val target = recorderTarget
+        eglRecorderSurface = EGL14.EGL_NO_SURFACE
+        recorderTarget = null
+        if (surf == EGL14.EGL_NO_SURFACE || eglDisplay == EGL14.EGL_NO_DISPLAY) return
+        restorePreviewCurrentQuietly()
+        try { EGL14.eglDestroySurface(eglDisplay, surf) } catch (_: Throwable) {}
+        if (target != null) {
+            Log.i(TAG, "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_DETACHED " +
+                "framesSubmitted=$recorderFramesSubmitted framesSkipped=$recorderFramesSkipped")
         }
     }
 
@@ -487,6 +705,8 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
 
         destroyWindowSurfaceQuietly()
         outputSurface = null
+        // Recording encoder EGL wrapper (never the recorder-owned Surface).
+        destroyRecorderSurfaceQuietly()
 
         // GL object teardown needs the context current; pbuffer provides that.
         if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {

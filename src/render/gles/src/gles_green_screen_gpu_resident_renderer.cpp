@@ -46,6 +46,9 @@
 #ifndef GL_TEXTURE_EXTERNAL_OES
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
 #endif
+#ifndef EGL_RECORDABLE_ANDROID
+#define EGL_RECORDABLE_ANDROID 0x3142
+#endif
 
 #define VG_GS_GPU_RESIDENT_TAG "VanguardGreenScreenGpuResident"
 #define VG_GS_GPU_RESIDENT_LOGI(...) \
@@ -71,6 +74,12 @@ constexpr float kPlaceholderG = 0.14f;
 constexpr float kPlaceholderB = 0.17f;
 
 using Clock = std::chrono::steady_clock;
+
+// eglPresentationTimeANDROID is resolved through eglGetProcAddress on the
+// first recorder attach (never linked directly) so a driver without it fails
+// that attach closed instead of producing an unstamped encoder stream.
+// EGLnsecsANDROID is khronos_stime_nanoseconds_t, i.e. int64_t.
+typedef EGLBoolean (EGLAPIENTRYP VgEglPresentationTimeAndroidProc)(EGLDisplay, EGLSurface, int64_t);
 
 float ElapsedMs(Clock::time_point start) {
     return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
@@ -539,6 +548,10 @@ void GlesGreenScreenGpuResidentRenderer::Destroy() {
     }
     EGLDisplay display = static_cast<EGLDisplay>(eglDisplay_);
 
+    // Recorder surface first: it must never outlive the context, and the
+    // Kotlin-side detach may have been skipped by a render loop that was
+    // already stopping when the recording was discarded.
+    DestroyRecorderSurfaceQuietly();
     DestroyWindowSurfaceQuietly();
 
     if (eglContext_ != nullptr) {
@@ -561,6 +574,9 @@ void GlesGreenScreenGpuResidentRenderer::Destroy() {
     initialized_ = false;
     outputWidth_ = 0;
     outputHeight_ = 0;
+    presentationTimeProc_ = nullptr;
+    lastCompositedMode_ = CameraMode::kNone;
+    hasRecordableComposite_ = false;
 }
 
 void GlesGreenScreenGpuResidentRenderer::DestroyGlObjects() {
@@ -685,6 +701,131 @@ void GlesGreenScreenGpuResidentRenderer::DestroyWindowSurfaceQuietly() {
         ANativeWindow_release(static_cast<ANativeWindow*>(nativeWindow_));
         nativeWindow_ = nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recorder window (VG-LIVE-GREENSCREEN-RECORDING)
+// ---------------------------------------------------------------------------
+
+bool GlesGreenScreenGpuResidentRenderer::AttachRecorderWindow(void* nativeWindow, int widthPx, int heightPx,
+                                                              std::string* error) {
+    if (!initialized_) {
+        SetError(error, "AttachRecorderWindow before Initialize");
+        return false;
+    }
+    if (nativeWindow == nullptr || widthPx <= 0 || heightPx <= 0) {
+        SetError(error, "AttachRecorderWindow: invalid window or size");
+        return false;
+    }
+    DestroyRecorderSurfaceQuietly();
+
+    // The composite geometry (ToGl / viewport / gl_FragCoord rects) is derived
+    // from the output size, so the encoder frame must be the same size as the
+    // attached preview output.
+    if (eglWindowSurface_ == nullptr || outputWidth_ <= 0 || outputHeight_ <= 0) {
+        SetError(error, "AttachRecorderWindow: no_output_window");
+        return false;
+    }
+    if (widthPx != outputWidth_ || heightPx != outputHeight_) {
+        std::ostringstream ss;
+        ss << "AttachRecorderWindow: recorder_size_mismatch recorder=" << widthPx << "x" << heightPx
+           << " output=" << outputWidth_ << "x" << outputHeight_;
+        SetError(error, ss.str());
+        return false;
+    }
+    if (presentationTimeProc_ == nullptr) {
+        presentationTimeProc_ = reinterpret_cast<void (*)()>(eglGetProcAddress("eglPresentationTimeANDROID"));
+    }
+    if (presentationTimeProc_ == nullptr) {
+        SetError(error, "AttachRecorderWindow: presentation_time_unavailable (eglPresentationTimeANDROID)");
+        return false;
+    }
+
+    ANativeWindow* window = static_cast<ANativeWindow*>(nativeWindow);
+    ANativeWindow_acquire(window);
+    EGLDisplay display = static_cast<EGLDisplay>(eglDisplay_);
+    EGLConfig config = static_cast<EGLConfig>(eglConfig_);
+    EGLContext context = static_cast<EGLContext>(eglContext_);
+    EGLSurface surface = eglCreateWindowSurface(display, config, window, nullptr);
+    if (surface == EGL_NO_SURFACE) {
+        SetError(error, EglErrorString("eglCreateWindowSurface(recorder)"));
+        ANativeWindow_release(window);
+        if (!MakeCurrent()) MakePbufferCurrentQuietly();
+        return false;
+    }
+    // Probe once that the encoder surface can be drawn into, then hand the
+    // preview window back before returning; the encoder surface is only ever
+    // current inside RenderRecorderFrame.
+    if (!eglMakeCurrent(display, surface, surface, context)) {
+        SetError(error, EglErrorString("eglMakeCurrent(recorder)"));
+        if (!MakeCurrent()) MakePbufferCurrentQuietly();
+        eglDestroySurface(display, surface);
+        ANativeWindow_release(window);
+        return false;
+    }
+    if (!MakeCurrent()) {
+        SetError(error, EglErrorString("eglMakeCurrent(preview after recorder probe)"));
+        MakePbufferCurrentQuietly();
+        eglDestroySurface(display, surface);
+        ANativeWindow_release(window);
+        return false;
+    }
+
+    eglRecorderSurface_ = surface;
+    recorderNativeWindow_ = window;
+    recorderWidth_ = widthPx;
+    recorderHeight_ = heightPx;
+    hasRecordableComposite_ = false;
+    recorderSizeMismatchLogged_ = false;
+    recorderTakeSubmitted_ = 0;
+    recorderTakeSkipped_ = 0;
+    recorderTakeFailed_ = 0;
+    recorderTakeCompositeMs_ = 0.0;
+    recorderTakeMaxSwapMs_ = 0.0f;
+
+    // Diagnostics only: the config is chosen without EGL_RECORDABLE_ANDROID
+    // (like the proven GLES fallback); report what the driver gave us.
+    EGLint recordable = -1;
+    if (!eglGetConfigAttrib(display, config, EGL_RECORDABLE_ANDROID, &recordable)) {
+        recordable = -1;
+        (void)eglGetError();  // consume EGL_BAD_ATTRIBUTE so later errors are not misattributed
+    }
+    VG_GS_GPU_RESIDENT_LOGI(
+        "ANDROID_GREENSCREEN_GPU_RESIDENT_RECORDER_ATTACHED size=%dx%d recordableConfig=%d",
+        widthPx, heightPx, static_cast<int>(recordable));
+    return true;
+}
+
+void GlesGreenScreenGpuResidentRenderer::DetachRecorderWindow() {
+    DestroyRecorderSurfaceQuietly();
+}
+
+void GlesGreenScreenGpuResidentRenderer::DestroyRecorderSurfaceQuietly() {
+    hasRecordableComposite_ = false;
+    if (eglDisplay_ == nullptr) return;
+    EGLDisplay display = static_cast<EGLDisplay>(eglDisplay_);
+    void* surface = eglRecorderSurface_;
+    eglRecorderSurface_ = nullptr;
+    if (surface != nullptr) {
+        // The encoder surface must not be current while it is destroyed.
+        if (!MakeCurrent()) MakePbufferCurrentQuietly();
+        eglDestroySurface(display, static_cast<EGLSurface>(surface));
+        const double submitted = recorderTakeSubmitted_ > 0 ? static_cast<double>(recorderTakeSubmitted_) : 1.0;
+        VG_GS_GPU_RESIDENT_LOGI(
+            "ANDROID_GREENSCREEN_GPU_RESIDENT_RECORDER_DETACHED submitted=%llu skipped=%llu failed=%llu "
+            "avgCompositeMs=%.3f maxSwapMs=%.3f",
+            static_cast<unsigned long long>(recorderTakeSubmitted_),
+            static_cast<unsigned long long>(recorderTakeSkipped_),
+            static_cast<unsigned long long>(recorderTakeFailed_),
+            recorderTakeCompositeMs_ / submitted,
+            static_cast<double>(recorderTakeMaxSwapMs_));
+    }
+    if (recorderNativeWindow_ != nullptr) {
+        ANativeWindow_release(static_cast<ANativeWindow*>(recorderNativeWindow_));
+        recorderNativeWindow_ = nullptr;
+    }
+    recorderWidth_ = 0;
+    recorderHeight_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1397,8 @@ bool GlesGreenScreenGpuResidentRenderer::RunComposite(CameraMode cameraMode, std
 }
 
 bool GlesGreenScreenGpuResidentRenderer::RenderFrame(CameraMode cameraMode, bool refineMask, std::string* error) {
+    // A recorder pass may only re-draw a composite this call fully prepared.
+    hasRecordableComposite_ = false;
     if (!initialized_) {
         SetError(error, "RenderFrame before Initialize");
         return false;
@@ -1292,6 +1435,10 @@ bool GlesGreenScreenGpuResidentRenderer::RenderFrame(CameraMode cameraMode, bool
 
     const auto compositeStart = Clock::now();
     if (!RunComposite(effectiveMode, error)) return false;
+    // The composite now on the preview back buffer is what a recorder pass
+    // re-draws (whatever the preview swap below returns).
+    lastCompositedMode_ = effectiveMode;
+    hasRecordableComposite_ = true;
 
     const EGLBoolean swapped = eglSwapBuffers(static_cast<EGLDisplay>(eglDisplay_),
                                               static_cast<EGLSurface>(eglWindowSurface_));
@@ -1307,11 +1454,108 @@ bool GlesGreenScreenGpuResidentRenderer::RenderFrame(CameraMode cameraMode, bool
     return swapped == EGL_TRUE;
 }
 
+GlesGreenScreenGpuResidentRenderer::RecorderFrameStatus GlesGreenScreenGpuResidentRenderer::RenderRecorderFrame(
+    int64_t presentationTimeNs, std::string* error) {
+    if (!initialized_ || eglRecorderSurface_ == nullptr) return RecorderFrameStatus::kSkipped;
+    if (!hasRecordableComposite_) {
+        stats_.recorderFramesSkipped++;
+        recorderTakeSkipped_++;
+        return RecorderFrameStatus::kSkipped;
+    }
+    // One recorder frame per preview composite, whatever happens below.
+    hasRecordableComposite_ = false;
+    if (eglWindowSurface_ == nullptr || outputWidth_ <= 0 || outputHeight_ <= 0) {
+        stats_.recorderFramesSkipped++;
+        recorderTakeSkipped_++;
+        return RecorderFrameStatus::kSkipped;
+    }
+    if (recorderWidth_ != outputWidth_ || recorderHeight_ != outputHeight_) {
+        // The output was re-attached at a different size mid-take: the
+        // composite geometry no longer matches the encoder frame. Skip
+        // (never stretch) until the sizes agree again.
+        if (!recorderSizeMismatchLogged_) {
+            recorderSizeMismatchLogged_ = true;
+            VG_GS_GPU_RESIDENT_LOGW(
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_RECORDER_SIZE_MISMATCH recorder=%dx%d output=%dx%d",
+                recorderWidth_, recorderHeight_, outputWidth_, outputHeight_);
+        }
+        stats_.recorderFramesSkipped++;
+        recorderTakeSkipped_++;
+        return RecorderFrameStatus::kSkipped;
+    }
+
+    std::string localError;
+    std::string* err = error != nullptr ? error : &localError;
+    EGLDisplay display = static_cast<EGLDisplay>(eglDisplay_);
+    EGLSurface surface = static_cast<EGLSurface>(eglRecorderSurface_);
+    EGLContext context = static_cast<EGLContext>(eglContext_);
+    const auto start = Clock::now();
+    const char* stage = "eglMakeCurrent";
+    float compositeMs = 0.0f;
+
+    bool ok = eglMakeCurrent(display, surface, surface, context) == EGL_TRUE;
+    if (!ok) SetError(err, EglErrorString("eglMakeCurrent(recorder)"));
+    if (ok) {
+        // Composite only: the alpha textures, temporal history, coarse mask
+        // and stats of the preview pass are left exactly as RenderFrame set
+        // them. RunComposite resets every piece of GL state it touches.
+        stage = "composite";
+        ok = RunComposite(lastCompositedMode_, err);
+        compositeMs = ElapsedMs(start);
+    }
+    const auto swapStart = Clock::now();
+    if (ok) {
+        stage = "eglPresentationTimeANDROID";
+        auto setPresentationTime = reinterpret_cast<VgEglPresentationTimeAndroidProc>(presentationTimeProc_);
+        ok = setPresentationTime != nullptr &&
+             setPresentationTime(display, surface, presentationTimeNs) == EGL_TRUE;
+        if (!ok) SetError(err, EglErrorString("eglPresentationTimeANDROID"));
+    }
+    if (ok) {
+        stage = "eglSwapBuffers";
+        ok = eglSwapBuffers(display, surface) == EGL_TRUE;
+        if (!ok) SetError(err, EglErrorString("eglSwapBuffers(recorder)"));
+    }
+
+    RecorderFrameStatus status;
+    if (ok) {
+        status = RecorderFrameStatus::kSubmitted;
+        const float swapMs = ElapsedMs(swapStart);
+        stats_.recorderFramesSubmitted++;
+        stats_.totalRecorderCompositeMs += compositeMs;
+        stats_.lastRecorderSwapMs = swapMs;
+        if (swapMs > stats_.maxRecorderSwapMs) stats_.maxRecorderSwapMs = swapMs;
+        recorderTakeSubmitted_++;
+        recorderTakeCompositeMs_ += compositeMs;
+        if (swapMs > recorderTakeMaxSwapMs_) recorderTakeMaxSwapMs_ = swapMs;
+        if (recorderTakeSubmitted_ == 1) {
+            VG_GS_GPU_RESIDENT_LOGI(
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_RECORDER_FIRST_FRAME ptsNs=%lld mode=%d",
+                static_cast<long long>(presentationTimeNs), static_cast<int>(lastCompositedMode_));
+        }
+    } else {
+        status = RecorderFrameStatus::kFailed;
+        stats_.recorderFailures++;
+        recorderTakeFailed_++;
+        // Leave no GL error queued for the next preview composite (bounded:
+        // a lost context can report GL_CONTEXT_LOST forever).
+        for (int i = 0; i < 8 && glGetError() != GL_NO_ERROR; ++i) {
+        }
+        VG_GS_GPU_RESIDENT_LOGW("ANDROID_GREENSCREEN_GPU_RESIDENT_RECORDER_FRAME_FAILED stage=%s error=%s",
+                                stage, err->c_str());
+    }
+    // Every path hands the preview window (or the pbuffer) back.
+    if (!MakeCurrent()) MakePbufferCurrentQuietly();
+    return status;
+}
+
 std::string GlesGreenScreenGpuResidentRenderer::StatsSummary() const {
     std::ostringstream ss;
     const double frames = stats_.framesRendered > 0 ? static_cast<double>(stats_.framesRendered) : 1.0;
     const double downscales = stats_.downscales > 0 ? static_cast<double>(stats_.downscales) : 1.0;
     const double refines = stats_.refinePasses > 0 ? static_cast<double>(stats_.refinePasses) : 1.0;
+    const double recorderFrames =
+        stats_.recorderFramesSubmitted > 0 ? static_cast<double>(stats_.recorderFramesSubmitted) : 1.0;
     ss << "framesRendered=" << stats_.framesRendered
        << " framesSwapped=" << stats_.framesSwapped
        << " downscales=" << stats_.downscales
@@ -1322,7 +1566,12 @@ std::string GlesGreenScreenGpuResidentRenderer::StatsSummary() const {
        << " avgCompositeMs=" << (stats_.totalCompositeMs / frames)
        << " alpha=" << alphaWidth_ << "x" << alphaHeight_
        << " modelInput=" << modelInputWidth_ << "x" << modelInputHeight_
-       << " coarseMask=" << coarseAlphaWidth_ << "x" << coarseAlphaHeight_;
+       << " coarseMask=" << coarseAlphaWidth_ << "x" << coarseAlphaHeight_
+       << " recorderSubmitted=" << stats_.recorderFramesSubmitted
+       << " recorderSkipped=" << stats_.recorderFramesSkipped
+       << " recorderFailures=" << stats_.recorderFailures
+       << " avgRecorderCompositeMs=" << (stats_.totalRecorderCompositeMs / recorderFrames)
+       << " maxRecorderSwapMs=" << stats_.maxRecorderSwapMs;
     return ss.str();
 }
 
@@ -1351,6 +1600,9 @@ bool GlesGreenScreenGpuResidentRenderer::MakeCurrent() { return false; }
 bool GlesGreenScreenGpuResidentRenderer::ConfigureModelInput(int, int, std::string* error) { SetUnavailable(error); return false; }
 bool GlesGreenScreenGpuResidentRenderer::AttachOutputWindow(void*, int, int, std::string* error) { SetUnavailable(error); return false; }
 void GlesGreenScreenGpuResidentRenderer::DetachOutputWindow() {}
+bool GlesGreenScreenGpuResidentRenderer::AttachRecorderWindow(void*, int, int, std::string* error) { SetUnavailable(error); return false; }
+void GlesGreenScreenGpuResidentRenderer::DetachRecorderWindow() {}
+GlesGreenScreenGpuResidentRenderer::RecorderFrameStatus GlesGreenScreenGpuResidentRenderer::RenderRecorderFrame(int64_t, std::string* error) { SetUnavailable(error); return RecorderFrameStatus::kFailed; }
 void GlesGreenScreenGpuResidentRenderer::SetLayout(const GlesGreenScreenGpuResidentRect&, const GlesGreenScreenGpuResidentRect&) {}
 void GlesGreenScreenGpuResidentRenderer::SetCameraTransform(const float[16], float) {}
 void GlesGreenScreenGpuResidentRenderer::SetBackgroundBlack() {}

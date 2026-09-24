@@ -216,6 +216,32 @@ void main() {
         );
       },
     );
+
+    test(
+      'preserves native layoutConfig.isPreComposited: true into VGDuetCaptureResult.compositionDescriptor',
+      () async {
+        final greenScreenDescriptorMap = descriptorMap()
+          ..['layoutConfig'] = {
+            'mode': 'greenScreen',
+            'isSideSwapped': false,
+            'isTopBottomSwapped': false,
+            'isPreComposited': true,
+          };
+        fakeChannel.returnValue = {
+          'compositionDescriptor': greenScreenDescriptorMap,
+          'segmentAssets': ['/tmp/seg0.mp4'],
+          'totalDurationMs': 2000,
+          'segmentCount': 1,
+        };
+
+        final result = await platform.stopRecording(sessionId: _sessionId);
+
+        expect(
+          result.compositionDescriptor.layoutConfig.isPreComposited,
+          isTrue,
+        );
+      },
+    );
   });
 
   // ── Slice 5B-A: exportDuetComposition ────────────────────────────────────
@@ -223,12 +249,14 @@ void main() {
   group('exportDuetComposition (Slice 5B-A)', () {
     VGDuetCompositionDescriptor makeDescriptor({
       VGDuetGreenScreenBackground? greenScreenBackground,
+      bool isPreComposited = false,
       List<VGOverlayDescriptor>? overlays,
     }) {
       return VGDuetCompositionDescriptor(
         source: VGDuetSource.localFile('/tmp/source.mp4'),
         layoutConfig: VGDuetLayoutConfig(
           mode: VGDuetLayoutMode.greenScreen,
+          isPreComposited: isPreComposited,
           foregroundTransform: VGDuetForegroundTransform.creatorOverlay,
           greenScreenBackground: greenScreenBackground,
         ),
@@ -277,6 +305,22 @@ void main() {
         expect((descMap['source'] as Map)['filePath'], '/tmp/source.mp4');
       },
     );
+
+    test('payload conveys isPreComposited: true in layoutConfig', () async {
+      fakeChannel.returnValue = {
+        'outputPath': '/tmp/out.mp4',
+        'durationMs': 4000,
+        'fileSizeBytes': 512000,
+      };
+      await platform.exportDuetComposition(
+        descriptor: makeDescriptor(isPreComposited: true),
+        outputPath: '/tmp/out.mp4',
+      );
+      final args = fakeChannel.lastArgs as Map<String, dynamic>;
+      final descMap = args['descriptor'] as Map;
+      final layoutConfigMap = descMap['layoutConfig'] as Map;
+      expect(layoutConfigMap['isPreComposited'], isTrue);
+    });
 
     test('maps native result to VGDuetExportResult', () async {
       fakeChannel.returnValue = {

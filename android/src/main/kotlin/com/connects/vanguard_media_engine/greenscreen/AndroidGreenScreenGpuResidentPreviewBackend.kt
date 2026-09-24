@@ -84,6 +84,22 @@ import kotlin.math.max
 // harder cut) or black at session start stays visible. [updateGreenScreenMask]
 // is ignored (segmentation is internal).
 //
+// Recording (VG-LIVE-GREENSCREEN-RECORDING): [setSegmentRecorderTarget]
+// hands the recorder's MediaCodec input Surface to native
+// (nativeAttachRecorderSurface), which wraps it in a second EGL window
+// surface on the renderer's own display/config/context; it must be the same
+// size as the attached output because the native composite geometry is
+// derived from the output size. After every preview [drawFrame] that
+// latched a new camera frame, [encodeRecorderFrame] asks native to re-draw
+// the composite it just presented (composite pass only: same latched camera
+// frame, refined alpha, background, layout and effective camera mode; no
+// segmentation, refinement or alpha reallocation) into the encoder surface
+// with the recorder's presentation time. The recorded file is therefore
+// exactly what the preview shows, including background-only frames before
+// the first mask. A failed encoder swap detaches the recorder here and
+// reports [AndroidGreenScreenSegmentRecorderSurfaceTarget.onSurfaceFailed]
+// so the recorder aborts instead of committing a truncated file.
+//
 // Threading: render-thread-only, except the SurfaceTexture frame-available
 // callback (any looper; only sets [cameraFramePending]) and the volatile
 // [cameraInputSurface] read.
@@ -121,6 +137,11 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         private const val CAMERA_MODE_PLACEHOLDER = 1
         private const val CAMERA_MODE_PASSTHROUGH = 2
         private const val CAMERA_MODE_MASKED = 3
+
+        // Native recorder frame status (GlesGreenScreenGpuResidentRenderer::RecorderFrameStatus).
+        private const val RECORDER_FRAME_SUBMITTED = 0
+        private const val RECORDER_FRAME_SKIPPED = 1
+        private const val RECORDER_FRAME_FAILED = 2
 
         // RND defaults (gl_renderer.h): guided filter on, temporal off, despill on.
         private const val GUIDED_FILTER_ENABLED = true
@@ -184,6 +205,22 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
     private var cameraRect: AndroidGreenScreenPixelRect? = null
 
     private val isReleased = AtomicBoolean(false)
+
+    // -- Live recording encoder target (VG-LIVE-GREENSCREEN-RECORDING; render-thread only) --
+
+    /**
+     * Attached encoder target ([setSegmentRecorderTarget]). The EGL window
+     * surface wrapping its MediaCodec input Surface lives in native
+     * (nativeAttachRecorderSurface / nativeDetachRecorderSurface) on the
+     * renderer's own config/context. Cleared by [setSegmentRecorderTarget]
+     * (null), by a failed encoder frame ([encodeRecorderFrame]) and by
+     * [release]; native additionally destroys the surface inside nativeDestroy
+     * for the stop-during-recording case where the loop's detach is skipped.
+     */
+    private var recorderTarget: AndroidGreenScreenSegmentRecorderSurfaceTarget? = null
+    private var recorderFramesSubmitted = 0L
+    private var recorderFramesSkipped = 0L
+    private var recorderFailureLogged = false
 
     // -- Green-screen state ----------------------------------------------------
 
@@ -384,6 +421,16 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             val swapped = bridge.nativeRenderFrame(handle, cameraMode, refineMask)
             frameCount++
             if (swapped) swappedFrameCount++
+
+            // 5. VG-LIVE-GREENSCREEN-RECORDING: after the preview swap, have
+            // native re-draw the SAME composite (same latched camera frame,
+            // alpha, background, layout, effective mode) into the attached
+            // encoder surface -- once per new camera frame, so the encoder
+            // never sees duplicates, whatever the preview swap returned. Never
+            // changes this frame's preview result.
+            if (latchedNewFrame && recorderTarget != null) {
+                encodeRecorderFrame(handle)
+            }
             return swapped
         } catch (t: Throwable) {
             Log.w(TAG, "drawFrame failed: ${t.javaClass.simpleName}: ${t.message}")
@@ -456,6 +503,170 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         return true
     }
 
+    // -- Live recording (VG-LIVE-GREENSCREEN-RECORDING) ------------------------
+
+    /**
+     * Attaches (non-null) or detaches (null) a live recording's encoder
+     * surface (see [AndroidGreenScreenPreviewBackend.setSegmentRecorderTarget]).
+     * Any previously attached target is detached first, so this is idempotent
+     * and a replace is a detach + attach. Attaching requires the core and an
+     * attached output of exactly the target's size (native derives the
+     * composite geometry from the output size and rejects anything else);
+     * native then wraps the target's Surface in a second EGL window surface on
+     * its own config/context, probes it and hands the preview window back.
+     * Returns false, with nothing attached, on any failure so the coordinator
+     * can fail the recording start cleanly. Must run on the render thread.
+     */
+    override fun setSegmentRecorderTarget(target: AndroidGreenScreenSegmentRecorderSurfaceTarget?): Boolean {
+        detachRecorderQuietly()
+        if (target == null) return true
+        val handle = nativeHandle
+        if (isReleased.get() || !coreReady || !outputAttached || handle == 0L) {
+            Log.w(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_REJECTED backend=gpu_resident reason=not_ready " +
+                    "released=${isReleased.get()} coreReady=$coreReady outputAttached=$outputAttached",
+            )
+            return false
+        }
+        val surface = target.inputSurface
+        if (surface == null || !surface.isValid || target.widthPx <= 0 || target.heightPx <= 0) {
+            Log.w(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_REJECTED backend=gpu_resident reason=invalid_surface " +
+                    "valid=${surface?.isValid} size=${target.widthPx}x${target.heightPx}",
+            )
+            return false
+        }
+        if (target.widthPx != outputWidthPx || target.heightPx != outputHeightPx) {
+            Log.w(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_REJECTED backend=gpu_resident reason=size_mismatch " +
+                    "recorder=${target.widthPx}x${target.heightPx} output=${outputWidthPx}x$outputHeightPx",
+            )
+            return false
+        }
+        return try {
+            if (!bridge.nativeAttachRecorderSurface(handle, surface, target.widthPx, target.heightPx)) {
+                Log.w(
+                    TAG,
+                    "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_FAILED backend=gpu_resident stage=nativeAttach " +
+                        bridge.nativeLastError(handle),
+                )
+                return false
+            }
+            recorderTarget = target
+            recorderFramesSubmitted = 0L
+            recorderFramesSkipped = 0L
+            recorderFailureLogged = false
+            Log.i(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_ATTACHED backend=gpu_resident " +
+                    "size=${target.widthPx}x${target.heightPx} cameraLatched=$hasCameraTexImage " +
+                    "maskReady=$hasMask greenScreen=$greenScreenEnabled inferenceDisabled=$inferenceDisabled",
+            )
+            true
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_FAILED backend=gpu_resident stage=exception " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            try { bridge.nativeDetachRecorderSurface(handle) } catch (_: Throwable) {}
+            false
+        }
+    }
+
+    /**
+     * Asks native to re-draw the composite [drawFrame] just presented into the
+     * attached encoder surface, stamped with the target's presentation time.
+     * Frames the target declines (negative PTS: recorder finishing / canceled)
+     * are skipped without a native call. A native failure (EGL/GL error on the
+     * encoder surface, typically the recorder having released it after its
+     * own encoder failure) is logged once, reported through
+     * [AndroidGreenScreenSegmentRecorderSurfaceTarget.onSurfaceFailed] exactly
+     * once so the recorder aborts instead of committing a truncated file, and
+     * detaches the recorder. Never throws and never affects the preview result.
+     */
+    private fun encodeRecorderFrame(handle: Long) {
+        val target = recorderTarget ?: return
+        val ptsNs = try {
+            target.nextFramePresentationTimeNs()
+        } catch (t: Throwable) {
+            -1L
+        }
+        if (ptsNs < 0L) {
+            recorderFramesSkipped++
+            return
+        }
+        val status = try {
+            bridge.nativeRenderRecorderFrame(handle, ptsNs)
+        } catch (t: Throwable) {
+            Log.w(TAG, "nativeRenderRecorderFrame threw: ${t.javaClass.simpleName}: ${t.message}")
+            RECORDER_FRAME_FAILED
+        }
+        when (status) {
+            RECORDER_FRAME_SUBMITTED -> {
+                recorderFramesSubmitted++
+                try { target.onFrameSubmitted(ptsNs) } catch (_: Throwable) {}
+                if (recorderFramesSubmitted == 1L) {
+                    Log.i(
+                        TAG,
+                        "ANDROID_LIVE_GREENSCREEN_RECORDER_FIRST_FRAME backend=gpu_resident ptsNs=$ptsNs " +
+                            "frame=${target.widthPx}x${target.heightPx} greenScreen=$greenScreenEnabled maskReady=$hasMask",
+                    )
+                }
+            }
+            RECORDER_FRAME_SKIPPED -> recorderFramesSkipped++
+            else -> {
+                val nativeError = try { bridge.nativeLastError(handle) } catch (_: Throwable) { "unavailable" }
+                if (!recorderFailureLogged) {
+                    recorderFailureLogged = true
+                    Log.w(
+                        TAG,
+                        "ANDROID_LIVE_GREENSCREEN_RECORDER_FRAME_FAILED backend=gpu_resident status=$status " +
+                            "error=$nativeError framesSubmitted=$recorderFramesSubmitted",
+                    )
+                }
+                // Tell the recorder first (it stops handing out timestamps and
+                // aborts on its worker), then destroy the EGL wrapper so no
+                // further frame touches the dead surface.
+                try {
+                    target.onSurfaceFailed("gpu_resident_recorder_frame_failed:" + sanitizeReason(nativeError))
+                } catch (t: Throwable) {
+                    Log.w(TAG, "onSurfaceFailed threw: ${t.message}")
+                }
+                detachRecorderQuietly()
+            }
+        }
+    }
+
+    /**
+     * Destroys only the native encoder EGL window surface (never the
+     * recorder-owned Surface behind it) and forgets the target. Idempotent;
+     * tolerates a recorder Surface that is already dead (recorder canceled
+     * first) and a missing native handle.
+     */
+    private fun detachRecorderQuietly() {
+        val target = recorderTarget
+        recorderTarget = null
+        val handle = nativeHandle
+        if (handle != 0L) {
+            try { bridge.nativeDetachRecorderSurface(handle) } catch (_: Throwable) {}
+        }
+        if (target != null) {
+            Log.i(
+                TAG,
+                "ANDROID_LIVE_GREENSCREEN_RECORDER_SURFACE_DETACHED backend=gpu_resident " +
+                    "framesSubmitted=$recorderFramesSubmitted framesSkipped=$recorderFramesSkipped",
+            )
+        }
+    }
+
+    /** Collapses a free-form native error into one whitespace-free reason token. */
+    private fun sanitizeReason(raw: String): String =
+        raw.trim().ifEmpty { "unknown" }.replace(Regex("\\s+"), "_")
+
     // -- Release (terminal, idempotent, never throws) --------------------------
 
     override fun release() {
@@ -493,6 +704,9 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         snapshot["greenScreenEnabled"] = greenScreenEnabled
         snapshot["hasMask"] = hasMask
         snapshot["inferenceDisabled"] = inferenceDisabled
+        snapshot["recorderAttached"] = recorderTarget != null
+        snapshot["recorderFramesSubmitted"] = recorderFramesSubmitted
+        snapshot["recorderFramesSkipped"] = recorderFramesSkipped
         snapshot["frames"] = frameCount
         snapshot["swappedFrames"] = swappedFrameCount
         snapshot["inferences"] = inferenceCount
@@ -1057,16 +1271,20 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
     // -- Teardown ----------------------------------------------------------------
 
     /**
-     * Releases everything this backend owns, in order: interpreter + delegate
-     * (with the native context current), camera Surface + SurfaceTexture, then
-     * the native renderer (window surface, GL objects, context, display).
-     * Never touches the borrowed output Surface. Idempotent.
+     * Releases everything this backend owns, in order: the recorder EGL
+     * wrapper (never the recorder-owned Surface), interpreter + delegate
+     * (with the native context current), camera Surface + SurfaceTexture,
+     * then the native renderer (window surface, GL objects, context,
+     * display). Never touches the borrowed output Surface. Idempotent.
      */
     private fun teardownCoreQuietly() {
         val handle = nativeHandle
         if (handle != 0L) {
             try { bridge.nativeMakeCurrent(handle) } catch (_: Throwable) {}
         }
+        // nativeDestroy below would destroy the recorder surface too, but the
+        // target must be forgotten before the handle goes away.
+        detachRecorderQuietly()
         model?.closeQuietly()
         model = null
 

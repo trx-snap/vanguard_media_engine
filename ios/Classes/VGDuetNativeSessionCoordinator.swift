@@ -108,6 +108,13 @@ final class VGDuetNativeSession {
     // resume) so the clamped clock never re-emits while held at trim end.
     var autoStopEmitted: Bool = false
 
+    // One-shot latch for the live-composite recording diagnostic (Green
+    // Screen only): set the first time a take's presentHandler appends the
+    // already-composited preview frame to currentRecorder, reset each time a
+    // take begins (start or resume) so it logs once per take, mirroring
+    // autoStopEmitted's reset policy above.
+    var hasLoggedLiveGreenScreenCompositeFirstFrame: Bool = false
+
     init(sessionId: String,
          sourceMap: [String: Any],
          trimWindowMap: [String: Any],
@@ -177,9 +184,21 @@ final class VGDuetNativeSession {
 
     func buildStopResult() -> [String: Any] {
         let segmentMaps = previewClock.segments.map { $0.toMap() }
+        // Live-composite recording: every Green Screen frame recorded during
+        // .recording state is now the ALREADY-COMPOSITED preview frame (see
+        // presentHandler in makePreviewRenderLoop), not a raw camera frame.
+        // Mark isPreComposited so VGDuetExportSession skips its offline
+        // Vision re-composite fallback for this segment and instead muxes
+        // audio directly onto (or renders overlays over) the recorded video
+        // as-is. Only greenScreen carries the flag; PiP/Split descriptors
+        // are untouched.
+        var effectiveLayoutConfigMap = layoutConfigMap
+        if (layoutConfigMap["mode"] as? String) == "greenScreen" {
+            effectiveLayoutConfigMap["isPreComposited"] = true
+        }
         let descriptor: [String: Any] = [
             "source":           sourceMap,
-            "layoutConfig":     layoutConfigMap,
+            "layoutConfig":     effectiveLayoutConfigMap,
             "trimWindow":       trimWindowMap,
             "initialSpeed":     speedMultiplier,
             "segments":         segmentMaps,
@@ -630,17 +649,46 @@ final class VGDuetNativeSessionCoordinator {
                         presentationTimeMs: decoder.lastPresentationTimeMs))
                 }
             },
-            presentHandler: { pixelBuffer in
+            presentHandler: { [weak session] pixelBuffer in
                 // Loop invokes this on main, only while not stopped.
                 texture.update(pixelBuffer: pixelBuffer)
                 registry.textureFrameAvailable(textureId)
+
+                // Live-composite recording (Green Screen only): pixelBuffer
+                // here is the FINAL composited frame the compositor just drew
+                // (source background + keyed/opaque foreground already
+                // blended) -- the same buffer handed to the Flutter texture
+                // above. Recording it directly means export never needs to
+                // re-run offline Vision keying. PiP/Split keep recording the
+                // raw camera frame via foregroundSampleProvider below, so
+                // their export behavior is unchanged.
+                if let session = session, session.state == .recording,
+                   let recorder = session.currentRecorder,
+                   (session.layoutConfigMap["mode"] as? String) == "greenScreen" {
+                    let currentPtsMs = session.previewClock.currentOutputPtsMs() - session.previewClock.outputCursorMs
+                    let pts = CMTimeMake(value: Int64(max(0, currentPtsMs)), timescale: 1000)
+                    recorder.appendVideoPixelBuffer(pixelBuffer, presentationTime: pts)
+                    if !session.hasLoggedLiveGreenScreenCompositeFirstFrame {
+                        session.hasLoggedLiveGreenScreenCompositeFirstFrame = true
+                        NSLog("[VGDuetNativeSessionCoordinator] IOS_DUET_LIVE_GREENSCREEN_COMPOSITE_RECORDING_FIRST_FRAME session=%@ ptsMs=%d",
+                              session.sessionId, Int(max(0, currentPtsMs)))
+                    }
+                }
             },
             foregroundSampleProvider: { [weak session] in
                 // Called on main or renderQueue; nil when no camera frame yet or
                 // after the provider was stopped.  The provider decides whether
-                // the sample carries a matte (keyed) or not.
+                // the sample carries a matte (keyed) or not.  The returned
+                // sample still feeds the compositor for every layout mode
+                // (including greenScreen, whose composited output presentHandler
+                // above then records) -- only the RAW-camera recording append
+                // below is mode-gated.
                 guard let sample = session?.foregroundProvider?.sampleRetained() else { return nil }
-                if let session = session, session.state == .recording, let recorder = session.currentRecorder {
+                if let session = session, session.state == .recording, let recorder = session.currentRecorder,
+                   (session.layoutConfigMap["mode"] as? String) != "greenScreen" {
+                    // PiP/Split real-take recording: unchanged raw camera
+                    // frame capture. Green Screen is recorded from the final
+                    // composite in presentHandler above instead.
                     let pixelBuffer = sample.frame.takeUnretainedValue()
                     let currentPtsMs = session.previewClock.currentOutputPtsMs() - session.previewClock.outputCursorMs
                     let pts = CMTimeMake(value: Int64(max(0, currentPtsMs)), timescale: 1000)
@@ -957,6 +1005,7 @@ final class VGDuetNativeSessionCoordinator {
         do {
             let recorder = try VGDuetSegmentRecorder(outputURL: segURL, videoSize: CGSize(width: width, height: height))
             session.currentRecorder = recorder
+            session.hasLoggedLiveGreenScreenCompositeFirstFrame = false
         } catch {
             reply(nil, FlutterError(code: "recording_start_failed", message: "Failed to initialize segment recorder: \(error.localizedDescription)", details: nil))
             return
@@ -1056,6 +1105,7 @@ final class VGDuetNativeSessionCoordinator {
         do {
             let recorder = try VGDuetSegmentRecorder(outputURL: segURL, videoSize: CGSize(width: width, height: height))
             session.currentRecorder = recorder
+            session.hasLoggedLiveGreenScreenCompositeFirstFrame = false
         } catch {
             reply(nil, FlutterError(code: "recording_resume_failed", message: "Failed to initialize segment recorder: \(error.localizedDescription)", details: nil))
             return
