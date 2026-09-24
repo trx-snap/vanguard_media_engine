@@ -838,7 +838,8 @@ class VGMultiCamRenderTextureSession {
           outputHeight == other.outputHeight;
 
   @override
-  int get hashCode => Object.hash(textureId, backTextureId, outputWidth, outputHeight);
+  int get hashCode =>
+      Object.hash(textureId, backTextureId, outputWidth, outputHeight);
 
   @override
   String toString() =>
@@ -1733,8 +1734,9 @@ final class VGCameraSession {
   /// Discovers available cameras, facings, and candidate dual-camera pairs.
   static Future<Map<String, dynamic>?> discoverDualCameraPairs() async {
     try {
-      final raw = await _channel
-          .invokeMethod<Map<Object?, Object?>>('discoverDualCameraPairs');
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'discoverDualCameraPairs',
+      );
       if (raw == null) return null;
       return raw.map((k, v) => MapEntry(k.toString(), v));
     } on PlatformException {
@@ -1748,11 +1750,10 @@ final class VGCameraSession {
     required String backDeviceId,
   }) async {
     try {
-      final raw = await _channel
-          .invokeMethod<Map<Object?, Object?>>('probeDualCameraPair', {
-            'frontDeviceId': frontDeviceId,
-            'backDeviceId': backDeviceId,
-          });
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'probeDualCameraPair',
+        {'frontDeviceId': frontDeviceId, 'backDeviceId': backDeviceId},
+      );
       if (raw == null) return null;
       return raw.map((k, v) => MapEntry(k.toString(), v));
     } on PlatformException {
@@ -1902,18 +1903,21 @@ final class VGCameraSession {
   /// [startMultiCamPreview] must be active before calling this.
   ///
   /// ## Error behaviour
-  /// Returns silently on any failure:
+  /// Returns `false` on any failure instead of throwing:
   ///   - `NOT_RUNNING`  — MultiCam preview is not active.
   ///   - `INVALID_ARG`  — Internal: config serialisation error (should not occur).
-  static Future<void> updateMultiCamPreviewConfig(
+  ///
+  /// Returns `true` when the native layout update call succeeds.
+  static Future<bool> updateMultiCamPreviewConfig(
     VGLivePreviewConfig config,
   ) async {
     try {
       await _channel.invokeMethod<void>('updateMultiCamPreviewConfig', {
         'config': config.toMap(),
       });
+      return true;
     } on PlatformException {
-      // Silent: caller does not need to handle layout-update failures.
+      return false;
     }
   }
 

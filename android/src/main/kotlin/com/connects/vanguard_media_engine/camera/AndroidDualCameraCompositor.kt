@@ -73,6 +73,7 @@ class AndroidDualCameraCompositor(
         val pipCenterX: Double = 0.5,             // normalized [0,1]; only used when anchor == "freeFloating"
         val pipCenterY: Double = 0.5,             // normalized [0,1]; only used when anchor == "freeFloating"
         val pipCornerRadius: Double = 24.0,
+        val isFrontPrimary: Boolean = false,      // front feed occupies the primary role when true
     )
 
     companion object {
@@ -100,6 +101,9 @@ class AndroidDualCameraCompositor(
             val splitDirection = (splitMap?.get("direction") as? String) ?: "leftRight"
             val splitRatio = (splitMap?.get("splitRatio") as? Number)?.toDouble() ?: 0.5
 
+            // Flat top-level key — NOT nested under pipLayout/splitLayout.
+            val isFrontPrimary = (config["isFrontPrimary"] as? Boolean) ?: false
+
             return LayoutParams(
                 layoutMode = layoutMode,
                 anchor = anchor,
@@ -109,6 +113,7 @@ class AndroidDualCameraCompositor(
                 pipCenterX = pipCenterX,
                 pipCenterY = pipCenterY,
                 pipCornerRadius = pipCornerRadius,
+                isFrontPrimary = isFrontPrimary,
             )
         }
     }
@@ -555,7 +560,7 @@ class AndroidDualCameraCompositor(
         // Matches the strict resolver in the existing JNI code (ParseLayoutJson).
         // pipCenterX/pipCenterY are passed unconditionally; the C++ side uses
         // them only when anchor == "freeFloating".
-        return """{"layoutMode":"${params.layoutMode}","pipAnchor":"${params.anchor}","splitDirection":"${params.splitDirection}","splitRatio":${params.splitRatio},"pipWidthFraction":${params.pipWidthFraction},"pipCenterX":${params.pipCenterX},"pipCenterY":${params.pipCenterY},"pipCornerRadius":${params.pipCornerRadius}}"""
+        return """{"layoutMode":"${params.layoutMode}","pipAnchor":"${params.anchor}","splitDirection":"${params.splitDirection}","splitRatio":${params.splitRatio},"pipWidthFraction":${params.pipWidthFraction},"pipCenterX":${params.pipCenterX},"pipCenterY":${params.pipCenterY},"pipCornerRadius":${params.pipCornerRadius},"isFrontPrimary":${params.isFrontPrimary}}"""
     }
 
     // ── finalize guard ──────────────────────────────────────────────────────

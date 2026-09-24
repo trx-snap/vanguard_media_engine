@@ -101,6 +101,7 @@ typedef struct {
     VGDualCameraLayoutMode layoutMode;     ///< .pip (0) or .splitScreen (1). Default: .pip.
     VGPiPLayoutConfig      pipConfig;     ///< PiP geometry. Default: bottomRight, 0.35, 0.018, 24pt.
     VGSplitScreenLayoutConfig splitConfig; ///< Split-screen geometry. Default: ratio 0.5.
+    BOOL isFrontPrimary;                   ///< Front feed occupies the primary role. Default: NO (back primary).
 } VGMCRDLayoutConfig;
 
 /// Returns the default layout config (bottom-right PiP, 35% width).
@@ -117,6 +118,7 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
     c.pipConfig.centerY        = 0.5;
     c.splitConfig.splitRatio   = 0.5;
     c.splitConfig.direction    = VGSplitScreenDirectionTopBottom;
+    c.isFrontPrimary           = NO;
     return c;
 }
 

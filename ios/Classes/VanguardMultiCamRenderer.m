@@ -471,6 +471,12 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         }
     }
 
+    // isFrontPrimary — flat top-level key, defaults to NO.
+    NSNumber *frontPrimary = [map objectForKey:@"isFrontPrimary"];
+    if ([frontPrimary isKindOfClass:[NSNumber class]]) {
+        cfg.isFrontPrimary = [frontPrimary boolValue];
+    }
+
     return cfg;
 }
 
@@ -1087,8 +1093,10 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 - (void)_renderPairedFrame:(VanguardMultiCamPairedFrame *)frame {
     if (_stopped) return;
 
-    CVPixelBufferRef primaryBuf   = frame.backBuffer;   // back = full canvas
-    CVPixelBufferRef secondaryBuf = frame.frontBuffer;  // front = PiP/secondary
+    // MC-DC1: which physical feed fills the primary (full-canvas) role is
+    // dynamic — swap Dual Camera flips this without restarting the session.
+    CVPixelBufferRef primaryBuf   = _layoutConfig.isFrontPrimary ? frame.frontBuffer : frame.backBuffer;
+    CVPixelBufferRef secondaryBuf = _layoutConfig.isFrontPrimary ? frame.backBuffer  : frame.frontBuffer;
 
     if (!primaryBuf || !secondaryBuf) {
         NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "

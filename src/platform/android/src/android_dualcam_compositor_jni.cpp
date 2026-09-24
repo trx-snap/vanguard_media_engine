@@ -85,6 +85,7 @@ struct ParsedLayoutParams {
     double pipCenterX         = 0.5; // normalized [0,1]; used only when anchor == kFreeFloating
     double pipCenterY         = 0.5; // normalized [0,1]; used only when anchor == kFreeFloating
     double pipCornerRadius    = 24.0;
+    bool isFrontPrimary       = false; // front feed occupies the primary role when true
 };
 
 // Minimal JSON value extraction — looks for "key":"value" or "key":number.
@@ -104,6 +105,16 @@ static double ExtractJsonDouble(const std::string& json, const std::string& key,
     if (pos == std::string::npos) return fallback;
     pos += search.size();
     try { return std::stod(json.substr(pos)); } catch (...) { return fallback; }
+}
+
+static bool ExtractJsonBool(const std::string& json, const std::string& key, bool fallback) {
+    std::string search = "\"" + key + "\":";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return fallback;
+    pos += search.size();
+    if (json.compare(pos, 4, "true") == 0) return true;
+    if (json.compare(pos, 5, "false") == 0) return false;
+    return fallback;
 }
 
 static ParsedLayoutParams ParseLayoutJson(const std::string& json) {
@@ -134,6 +145,7 @@ static ParsedLayoutParams ParseLayoutJson(const std::string& json) {
     out.pipCenterX       = ExtractJsonDouble(json, "pipCenterX", 0.5);
     out.pipCenterY       = ExtractJsonDouble(json, "pipCenterY", 0.5);
     out.pipCornerRadius  = ExtractJsonDouble(json, "pipCornerRadius", 24.0);
+    out.isFrontPrimary   = ExtractJsonBool(json, "isFrontPrimary", false);
     out.ok = true;
     return out;
 }
@@ -354,14 +366,17 @@ static bool VulkanCompositeFrame(VulkanDualCamSession& s,
 
     const MultiCamLayoutResult res = ComputeMultiCamLayout(mcl);
 
-    RenderDestinationRect backRect{
+    // Role rects: which canvas region is the primary (full-canvas) slot and
+    // which is the secondary (PiP/half) slot, independent of which physical
+    // feed (front/back) fills each role.
+    RenderDestinationRect primaryRect{
         static_cast<int32_t>(std::round(res.primaryViewport.x * canvasW)),
         static_cast<int32_t>(std::round(res.primaryViewport.y * canvasH)),
         static_cast<int32_t>(std::round(res.primaryViewport.width * canvasW)),
         static_cast<int32_t>(std::round(res.primaryViewport.height * canvasH)),
     };
 
-    RenderDestinationRect frontRect{
+    RenderDestinationRect secondaryRect{
         static_cast<int32_t>(std::round(res.secondaryViewport.x * canvasW)),
         static_cast<int32_t>(std::round(res.secondaryViewport.y * canvasH)),
         static_cast<int32_t>(std::round(res.secondaryViewport.width * canvasW)),
@@ -393,9 +408,16 @@ static bool VulkanCompositeFrame(VulkanDualCamSession& s,
                 static_cast<int32_t>(std::round(fittedH)),
             };
         };
-        backRect = fitToSlot(res.primaryViewport);
-        frontRect = fitToSlot(res.secondaryViewport);
+        primaryRect = fitToSlot(res.primaryViewport);
+        secondaryRect = fitToSlot(res.secondaryViewport);
     }
+
+    // MC-DC1: route the role rects to whichever physical feed (back/front)
+    // currently occupies that role. backHandle/frontHandle and their
+    // rotation/mirror arguments below stay tied to physical feed identity —
+    // only which RECT each buffer draws into changes with isFrontPrimary.
+    const RenderDestinationRect& backRect = layout.isFrontPrimary ? secondaryRect : primaryRect;
+    const RenderDestinationRect& frontRect = layout.isFrontPrimary ? primaryRect : secondaryRect;
 
     const float cameraCornerRadiusPx = static_cast<float>(
         std::max(0.0, res.secondaryCornerRadiusFractionOfCanvasWidth * canvasW));

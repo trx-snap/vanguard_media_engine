@@ -67,6 +67,7 @@ class VGLivePreviewConfig {
     this.layoutMode = VGDualCameraLayoutMode.pip,
     this.pipLayout = const VGPiPLayoutDescriptor(),
     this.splitLayout = const VGSplitScreenLayoutDescriptor(),
+    this.isFrontPrimary = false,
   });
 
   /// The spatial layout mode: PiP or split-screen.
@@ -78,6 +79,13 @@ class VGLivePreviewConfig {
   /// Split-screen geometry configuration. Active when [layoutMode] is [VGDualCameraLayoutMode.splitScreen].
   final VGSplitScreenLayoutDescriptor splitLayout;
 
+  /// Whether the front camera feed should occupy the primary role
+  /// (full split-screen slot / PiP background) instead of the back camera.
+  ///
+  /// Defaults to `false`, preserving the existing back-primary/front-secondary
+  /// role assignment.
+  final bool isFrontPrimary;
+
   // ── copyWith ───────────────────────────────────────────────────────────────
 
   /// Returns a copy of this config with the specified fields replaced.
@@ -85,11 +93,13 @@ class VGLivePreviewConfig {
     VGDualCameraLayoutMode? layoutMode,
     VGPiPLayoutDescriptor? pipLayout,
     VGSplitScreenLayoutDescriptor? splitLayout,
+    bool? isFrontPrimary,
   }) {
     return VGLivePreviewConfig(
       layoutMode: layoutMode ?? this.layoutMode,
       pipLayout: pipLayout ?? this.pipLayout,
       splitLayout: splitLayout ?? this.splitLayout,
+      isFrontPrimary: isFrontPrimary ?? this.isFrontPrimary,
     );
   }
 
@@ -110,6 +120,7 @@ class VGLivePreviewConfig {
       'layoutMode': layoutMode.value,
       'pipLayout': pipLayout.toMap(),
       'splitLayout': splitLayout.toMap(),
+      'isFrontPrimary': isFrontPrimary,
     };
   }
 
@@ -146,10 +157,17 @@ class VGLivePreviewConfig {
         VGSplitScreenLayoutDescriptor.fromMap(splitLayoutMap) ??
         const VGSplitScreenLayoutDescriptor();
 
+    // isFrontPrimary — missing or malformed value defaults to false.
+    final isFrontPrimaryRaw = map['isFrontPrimary'];
+    final isFrontPrimary = isFrontPrimaryRaw is bool
+        ? isFrontPrimaryRaw
+        : false;
+
     return VGLivePreviewConfig(
       layoutMode: layoutMode,
       pipLayout: pipLayout,
       splitLayout: splitLayout,
+      isFrontPrimary: isFrontPrimary,
     );
   }
 
@@ -162,15 +180,18 @@ class VGLivePreviewConfig {
           runtimeType == other.runtimeType &&
           layoutMode == other.layoutMode &&
           pipLayout == other.pipLayout &&
-          splitLayout == other.splitLayout;
+          splitLayout == other.splitLayout &&
+          isFrontPrimary == other.isFrontPrimary;
 
   @override
-  int get hashCode => Object.hash(layoutMode, pipLayout, splitLayout);
+  int get hashCode =>
+      Object.hash(layoutMode, pipLayout, splitLayout, isFrontPrimary);
 
   @override
   String toString() =>
       'VGLivePreviewConfig('
       'layoutMode: $layoutMode, '
       'pipLayout: $pipLayout, '
-      'splitLayout: $splitLayout)';
+      'splitLayout: $splitLayout, '
+      'isFrontPrimary: $isFrontPrimary)';
 }
