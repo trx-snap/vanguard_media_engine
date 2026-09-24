@@ -746,9 +746,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // audioSidecarPlan may be nil (silent mode). durationSeconds must be > 0.
         audioSidecarPlan: VGAudioSidecarPlan? = nil,
         durationSeconds: Double = 0.0,
+        // MULTI-VIDEO-BLURFILL: the draft's canvas.contentMode wire value
+        // ("fit" | "fill" | "blurFill"); nil keeps the compositor's default
+        // ("fit"). Threaded into VGTimelineCompositorNode as
+        // "canvasContentMode" so a blurFill canvas renders its eligible clips
+        // as blurred-fill background + sharp fit foreground in preview exactly
+        // as VGTimelineExportHelper does for export.
+        canvasContentMode: String? = nil,
         result: @escaping FlutterResult
     ) {
-        let compositorParams: [String: Any] = [
+        var compositorParams: [String: Any] = [
             "descriptorStage": "7.5_executable",
             "clips":           clipDicts,
             "transitions":     transitionDicts,
@@ -758,6 +765,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             "canvasWidth":     width,
             "canvasHeight":    height,
         ]
+        if let canvasContentMode = canvasContentMode, !canvasContentMode.isEmpty {
+            compositorParams["canvasContentMode"] = canvasContentMode
+        }
 
         let videoOutPort = VGMediaPort.outputPort("video_out", mediaType: .video)
         let ports: [VGMediaPort] = [videoOutPort]
@@ -3432,6 +3442,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             let canvasWidth  = (draftMap["canvasWidth"]  as? NSNumber)?.intValue ?? 640
             let canvasHeight = (draftMap["canvasHeight"] as? NSNumber)?.intValue ?? 360
+            // MULTI-VIDEO-BLURFILL: the nested canvas map is present only when
+            // VGEditorDraft.canvas is non-nil; its contentMode is forwarded as-is.
+            let createCanvasContentMode =
+                (draftMap["canvas"] as? [String: Any])?["contentMode"] as? String
             // fps is informational in Phase 7.8 — not enforced natively.
             let _ = (draftMap["fps"] as? NSNumber)?.intValue ?? 30
 
@@ -3485,6 +3499,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 height: canvasHeight,
                 audioSidecarPlan: createAudioSidecar,
                 durationSeconds: createDurationSeconds,
+                canvasContentMode: createCanvasContentMode,
                 result: result)
 
         case "updateTimeline":
@@ -3514,6 +3529,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             let updateWidth  = (draftMapU["canvasWidth"]  as? NSNumber)?.intValue ?? 640
             let updateHeight = (draftMapU["canvasHeight"] as? NSNumber)?.intValue ?? 360
+            // MULTI-VIDEO-BLURFILL: forward the draft canvas contentMode (see create).
+            let updateCanvasContentMode =
+                (draftMapU["canvas"] as? [String: Any])?["contentMode"] as? String
 
             guard let clipDictsU = draftMapU["clips"] as? [[String: Any]],
                   !clipDictsU.isEmpty else {
@@ -3564,6 +3582,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 height: updateHeight,
                 audioSidecarPlan: updateAudioSidecar,
                 durationSeconds: updateDurationSeconds,
+                canvasContentMode: updateCanvasContentMode,
                 result: result)
 
         case "timelinePlay":

@@ -156,13 +156,13 @@ void main() {
       expect(report.diagnostics['hasAudioSidecarPlan'], isTrue);
     });
 
-    test('canvas contentMode other than fit blocks readiness', () {
-      final fillCanvas = VGCanvasDescriptor(
+    test('canvas contentMode stretch blocks readiness', () {
+      final stretchCanvas = VGCanvasDescriptor(
         width: 1080,
         height: 1920,
-        contentMode: VGCanvasContentMode.fill,
+        contentMode: VGCanvasContentMode.stretch,
       );
-      final draft = makeSingleClipDraft(canvas: fillCanvas);
+      final draft = makeSingleClipDraft(canvas: stretchCanvas);
 
       final report = evaluator.evaluate(draft: draft);
 
@@ -173,7 +173,51 @@ void main() {
             i.code ==
             VGEditorExportReadinessIssueCode.unsupportedCanvasContentMode,
       );
-      expect(issue.message, contains("contentMode 'fill' is not supported"));
+      expect(issue.message, contains("contentMode 'stretch' is not supported"));
+    });
+
+    test('canvas contentMode blurFill does not block readiness', () {
+      final blurFillCanvas = VGCanvasDescriptor(
+        width: 1080,
+        height: 1920,
+        contentMode: VGCanvasContentMode.blurFill,
+      );
+      final draft = makeSingleClipDraft(canvas: blurFillCanvas);
+
+      final report = evaluator.evaluate(draft: draft);
+
+      expect(report.decision, VGEditorExportReadinessDecision.ready);
+      expect(report.canUseAndroidEditorExportRoute, isTrue);
+      expect(
+        report.issues.where(
+          (i) =>
+              i.code ==
+              VGEditorExportReadinessIssueCode.unsupportedCanvasContentMode,
+        ),
+        isEmpty,
+      );
+    });
+
+    test('canvas contentMode fill does not block readiness', () {
+      final fillCanvas = VGCanvasDescriptor(
+        width: 1080,
+        height: 608,
+        contentMode: VGCanvasContentMode.fill,
+      );
+      final draft = makeSingleClipDraft(canvas: fillCanvas);
+
+      final report = evaluator.evaluate(draft: draft);
+
+      expect(report.decision, VGEditorExportReadinessDecision.ready);
+      expect(report.canUseAndroidEditorExportRoute, isTrue);
+      expect(
+        report.issues.where(
+          (i) =>
+              i.code ==
+              VGEditorExportReadinessIssueCode.unsupportedCanvasContentMode,
+        ),
+        isEmpty,
+      );
     });
 
     test('odd draft canvas dimensions block readiness', () {
@@ -741,7 +785,7 @@ void main() {
         canvas: VGCanvasDescriptor(
           width: 1080,
           height: 1920,
-          contentMode: VGCanvasContentMode.fill,
+          contentMode: VGCanvasContentMode.stretch,
         ),
       );
 

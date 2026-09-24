@@ -89,6 +89,18 @@ NS_ASSUME_NONNULL_BEGIN
 ///                     - @"descriptorStage": @"7.5_executable"
 ///                     - @"clips": NSArray<NSDictionary *>
 ///                     - @"transitions": NSArray<NSDictionary *> (may be empty)
+///                   May contain:
+///                     - @"canvasWidth" / @"canvasHeight": NSNumber (Phase 7.9
+///                       aspect-fit canvas normalization when both > 0)
+///                     - @"canvasContentMode": NSString, the draft canvas
+///                       contentMode wire value ("fit" | "fill" | "blurFill";
+///                       default "fit"). "blurFill" renders every eligible
+///                       ordinary video clip (no freezePTS, not reversed, not
+///                       dual-camera, no non-identity transform, no
+///                       transformTrack) whose display aspect differs from the
+///                       canvas as a blurred/dimmed aspect-fill background under
+///                       a sharp aspect-fit foreground, canvas-sized; every other
+///                       clip keeps the Phase 7.9 aspect-fit behaviour.
 /// @param ports      The ports array from VGGraphNodeDescriptor.
 ///
 /// Returns nil if:

@@ -116,6 +116,14 @@ class AndroidTimelineVideoEncoder(
     // other open failure -- it never crashes the encode. Diagnostics/harness
     // constructors keep working unchanged via the default.
     private val context: Context? = null,
+    /**
+     * Wire `canvas.contentMode` ("fit" | "fill"; only these two reach this
+     * encoder). "fit" (default, byte-equivalent to this encoder's original
+     * behaviour) letterboxes/pillarboxes each clip inside the canvas
+     * (scale = min(canvas/display)). "fill" centers and crops each clip to
+     * cover the canvas (scale = max(canvas/display)).
+     */
+    private val contentMode: String = "fit",
 ) : AndroidTimelineVideoPassEncoder {
     data class ClipInput(
         val sourcePath: String,

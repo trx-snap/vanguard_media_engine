@@ -450,15 +450,15 @@ class AndroidTimelineExportSession(
             }
 
         val rawCanvas = draftMap["canvas"] as? Map<*, *>
-        if (rawCanvas != null) {
-            val contentMode = rawCanvas["contentMode"] as? String ?: "fit"
-            if (contentMode != "fit") {
-                onError(
-                    "UNSUPPORTED_EXPORT_FEATURE",
-                    "exportTimeline: canvas contentMode '$contentMode' is not supported",
-                )
-                return
-            }
+        val canvasContentMode = (rawCanvas?.get("contentMode") as? String) ?: "fit"
+        if (rawCanvas != null && canvasContentMode != "fit" && canvasContentMode != "fill" &&
+            canvasContentMode != "blurFill"
+        ) {
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: canvas contentMode '$canvasContentMode' is not supported",
+            )
+            return
         }
 
         val draftCanvasWidth = (draftMap["canvasWidth"] as? Number)?.toInt()
@@ -1242,6 +1242,7 @@ class AndroidTimelineExportSession(
             requestedHeight = requestHeight,
             transitions = transitions,
             overlays = overlays,
+            canvasContentMode = canvasContentMode,
         )
         val backendDecision = AndroidExportRenderBackendSelector().select(
             exportScope,
@@ -1402,6 +1403,24 @@ class AndroidTimelineExportSession(
         // `content://` clip source admitted above can be opened by its
         // MediaExtractor/MediaMetadataRetriever through the ContentResolver
         // (AndroidUriDataSourceHelper); POSIX sources are unaffected.
+        // MULTI-VIDEO-BLURFILL: a hard-cut-only multi-clip "blurFill" draft is
+        // rendered by AndroidTimelineGlesTransitionVideoEncoder (the only encoder
+        // with the blurred-background seam) exactly as a transition draft would
+        // be, provided every clip is a plain forward video the transition encoder
+        // admits (no freeze, reverse, colour matrix or static transform). Any
+        // other blurFill shape -- a single clip, a still image, a freeze clip --
+        // fails closed to AndroidTimelineVideoEncoder, which treats "blurFill" as
+        // plain "fit" placement.
+        val blurFillGlesTransitionRoute = canvasContentMode == "blurFill" &&
+            pass1ClipInputs.size > 1 &&
+            pass1ClipInputs.all {
+                it.mediaKind == "video" && it.freezePTS == null && !it.isReversed &&
+                    it.colorMatrix == null && it.transform == null
+            }
+        if (blurFillGlesTransitionRoute) {
+            Log.i(TAG, "VG_EXPORT_BLURFILL route=gles_transition_encoder clips=${pass1ClipInputs.size} " +
+                "hardCutOnly=${!hasNonHardCutTransitionForEncoder}")
+        }
         fun buildPass1Encoder(backend: ExportRenderBackend): AndroidTimelineVideoPassEncoder {
             return if (backend == ExportRenderBackend.VULKAN) {
                 AndroidTimelineVulkanVideoEncoder(
@@ -1412,8 +1431,9 @@ class AndroidTimelineExportSession(
                     bitrateBps = requestBitrate,
                     nativeBridge = sessionNativeBridge,
                     context = context,
+                    contentMode = canvasContentMode,
                 )
-            } else if (hasNonHardCutTransitionForEncoder) {
+            } else if (hasNonHardCutTransitionForEncoder || blurFillGlesTransitionRoute) {
                 AndroidTimelineGlesTransitionVideoEncoder(
                     outputPath = videoTempPath,
                     width = requestWidth,
@@ -1422,6 +1442,7 @@ class AndroidTimelineExportSession(
                     bitrateBps = requestBitrate,
                     nativeBridge = sessionNativeBridge,
                     context = context,
+                    contentMode = canvasContentMode,
                 )
             } else {
                 AndroidTimelineVideoEncoder(
@@ -1432,6 +1453,7 @@ class AndroidTimelineExportSession(
                     bitrateBps = requestBitrate,
                     nativeBridge = sessionNativeBridge,
                     context = context,
+                    contentMode = canvasContentMode,
                 )
             }
         }

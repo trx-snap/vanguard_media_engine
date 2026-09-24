@@ -279,8 +279,19 @@ data class ExportRenderScope(
     /// Validated timeline overlays (AndroidTimelineOverlayDescriptor).
     /// Non-empty means the scope requires the Vulkan backend; see the class doc.
     val overlays: List<AndroidTimelineOverlayDescriptor> = emptyList(),
+    /// Wire `canvas.contentMode` ("fit" | "fill" | "blurFill") of the draft
+    /// being exported. "blurFill" (TikTok-style blurred aspect-fill background
+    /// under a sharp aspect-fit foreground for mixed-orientation clips) is
+    /// implemented only by the GLES transition encoder
+    /// (AndroidTimelineGlesTransitionVideoEncoder); Vulkan has no blur seam,
+    /// so [vulkanScopeFailureReason] rejects such a scope with
+    /// `blur_fill_unsupported_by_vulkan` and it resolves to GLES.
+    val canvasContentMode: String = "fit",
 ) {
     val hasNonHardCutTransition: Boolean get() = transitions.any { !it.isHardCut }
+
+    /// True when the draft canvas requests the "blurFill" content mode.
+    val isBlurFillCanvas: Boolean get() = canvasContentMode == "blurFill"
 
     /// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: true when any clip carries a
     /// non-null beautyIntensity. Clip-level Beauty V2 is Vulkan-only with no
@@ -788,6 +799,11 @@ class AndroidExportRenderBackendSelector {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "vulkan_scope_not_supported"
         if (scope.clips.isEmpty()) return "vulkan_scope_not_supported"
         if (scope.requestedWidth <= 0 || scope.requestedHeight <= 0) return "vulkan_scope_not_supported"
+        // MULTI-VIDEO-BLURFILL: the Vulkan encoder renders "fit"/"fill" only;
+        // the blurred/dimmed aspect-fill background of a "blurFill" canvas is a
+        // GLES-only seam, so this precise reason routes the scope to GLES
+        // (AndroidTimelineGlesTransitionVideoEncoder) when it is eligible.
+        if (scope.isBlurFillCanvas) return "blur_fill_unsupported_by_vulkan"
         // P5-REVERSE-EXPORT-EXACT-GLES-ROUTE: reversed clips have no native
         // Vulkan render route in this slice -- a reversed clip always
         // resolves this specific reason rather than the generic

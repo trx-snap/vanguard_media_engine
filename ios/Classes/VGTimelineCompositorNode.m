@@ -173,6 +173,18 @@ static NSString *const kVGTCNDualCameraKey = @"dualCamera";
 // forwarding the asset's native display-size buffers unchanged.
 static NSString *const kVGTCNCanvasWidthKey = @"canvasWidth";
 static NSString *const kVGTCNCanvasHeightKey = @"canvasHeight";
+// ─── MULTI-VIDEO-BLURFILL: canvas content mode key ────────────────────────────
+// Optional NSString wire value of the draft canvas contentMode
+// ("fit" | "fill" | "blurFill"; default "fit"). Only "blurFill" changes
+// behaviour: an eligible ordinary video clip (see
+// -_isBlurFillEligibleClipAtIndex:clip:) skips the Phase 7.9 aspect-fit
+// composition so its reader vends native-size, orientation-normalized frames,
+// and _pullBufferFromReader: then renders each frame into a canvas-sized
+// buffer as a blurred/dimmed aspect-fill background under a sharp aspect-fit
+// foreground (_VGTCNRenderBlurFillFrame). Every ineligible clip keeps the
+// Phase 7.9 aspect-fit path unchanged.
+static NSString *const kVGTCNCanvasContentModeKey = @"canvasContentMode";
+static NSString *const kVGTCNCanvasContentModeBlurFill = @"blurFill";
 
 // ─── Output settings for AVAssetReaderVideoCompositionOutput ─────────────────
 // Match VGExportFileSourceNode output settings: 32BGRA + Metal + IOSurface.
@@ -1724,6 +1736,127 @@ static CVPixelBufferRef _VGTCNApplyTransformAndOpacity(
 // ───────────────────────────────────────────────────────────────────
 static os_log_t sTimelineLog;
 
+// ─── MULTI-VIDEO-BLURFILL: canvas normalization render helper ─────────────────
+//
+// Renders one decoded, orientation-normalized SDR frame into a canvas-sized
+// 32BGRA CVPixelBuffer:
+//   * aspect-matched source (display aspect == canvas aspect within
+//     kVGTCNBlurFillAspectEpsilon): a single sharp aspect-fit frame that covers
+//     the canvas;
+//   * mismatched source: a full-canvas aspect-fill (cover-crop) copy of the same
+//     frame, Gaussian-blurred and dimmed, with the sharp aspect-fit frame centred
+//     on top.
+// Every layer is composited over opaque black so no canvas pixel is undefined.
+// Rendered exactly once through the shared CIContext into kCGColorSpaceSRGB and
+// tagged BT.709, mirroring _VGTCNApplyTransformAndOpacity. Should the blur
+// filter be unavailable the background degrades to the un-blurred dimmed
+// cover-crop (never a partial frame). Returns a new +1 CVPixelBufferRef, or
+// NULL with *outError when the canvas or source geometry is invalid or the
+// output buffer cannot be allocated; the caller owns the returned buffer and
+// keeps ownership of `sourceBuffer`.
+static const CGFloat kVGTCNBlurFillAspectEpsilon = 0.005;
+static const CGFloat kVGTCNBlurFillBlurRadiusFraction = 0.02; // of max(canvasW, canvasH)
+static const CGFloat kVGTCNBlurFillDimFactor = 0.55;
+
+static CVPixelBufferRef _VGTCNRenderBlurFillFrame(CVPixelBufferRef sourceBuffer,
+                                                   CGSize canvas,
+                                                   NSError **outError) {
+  if (!sourceBuffer) {
+    if (outError) {
+      *outError = _VGTCNError(24, @"VGTimelineCompositorNode (BlurFill): NULL source buffer.");
+    }
+    return NULL;
+  }
+  const CGFloat srcW = (CGFloat)CVPixelBufferGetWidth(sourceBuffer);
+  const CGFloat srcH = (CGFloat)CVPixelBufferGetHeight(sourceBuffer);
+  const CGFloat cw = canvas.width;
+  const CGFloat ch = canvas.height;
+  if (srcW <= 0 || srcH <= 0 || cw <= 0 || ch <= 0) {
+    if (outError) {
+      *outError = _VGTCNError(24,
+          ([NSString stringWithFormat:@"VGTimelineCompositorNode (BlurFill): invalid geometry "
+                                       "source=%.0fx%.0f canvas=%.0fx%.0f.",
+                                      srcW, srcH, cw, ch]));
+    }
+    return NULL;
+  }
+
+  const CGRect canvasRect = CGRectMake(0, 0, cw, ch);
+  CIImage *src = [CIImage imageWithCVPixelBuffer:sourceBuffer];
+
+  // Sharp foreground: aspect fit, centred (CoreImage origin is bottom-left; the
+  // centring translation is symmetric so no flip is needed).
+  const CGFloat fitScale = MIN(cw / srcW, ch / srcH);
+  CGAffineTransform fitTx = CGAffineTransformConcat(
+      CGAffineTransformMakeScale(fitScale, fitScale),
+      CGAffineTransformMakeTranslation((cw - srcW * fitScale) / 2.0,
+                                       (ch - srcH * fitScale) / 2.0));
+  CIImage *foreground = [src imageByApplyingTransform:fitTx];
+
+  const BOOL aspectMatched =
+      fabs(srcW * ch - srcH * cw) <= kVGTCNBlurFillAspectEpsilon * srcW * ch;
+
+  CIImage *black =
+      [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0]] imageByCroppingToRect:canvasRect];
+  CIImage *composed = nil;
+
+  if (aspectMatched) {
+    composed = [foreground imageByCompositingOverImage:black];
+  } else {
+    // Blurred/dimmed background: aspect fill (cover-crop), centred, clamped to
+    // its extent so the blur never fades to transparent at the canvas edges.
+    const CGFloat fillScale = MAX(cw / srcW, ch / srcH);
+    CGAffineTransform fillTx = CGAffineTransformConcat(
+        CGAffineTransformMakeScale(fillScale, fillScale),
+        CGAffineTransformMakeTranslation((cw - srcW * fillScale) / 2.0,
+                                         (ch - srcH * fillScale) / 2.0));
+    CIImage *background = [[src imageByApplyingTransform:fillTx] imageByClampingToExtent];
+
+    CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
+    [blur setValue:background forKey:kCIInputImageKey];
+    [blur setValue:@(kVGTCNBlurFillBlurRadiusFraction * MAX(cw, ch)) forKey:kCIInputRadiusKey];
+    CIImage *blurred = blur.outputImage ?: background;
+
+    CIFilter *dim = [CIFilter filterWithName:@"CIColorMatrix"];
+    [dim setValue:blurred forKey:kCIInputImageKey];
+    [dim setValue:[CIVector vectorWithX:kVGTCNBlurFillDimFactor Y:0 Z:0 W:0] forKey:@"inputRVector"];
+    [dim setValue:[CIVector vectorWithX:0 Y:kVGTCNBlurFillDimFactor Z:0 W:0] forKey:@"inputGVector"];
+    [dim setValue:[CIVector vectorWithX:0 Y:0 Z:kVGTCNBlurFillDimFactor W:0] forKey:@"inputBVector"];
+    [dim setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:1] forKey:@"inputAVector"];
+    [dim setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:0] forKey:@"inputBiasVector"];
+    CIImage *dimmed = [(dim.outputImage ?: blurred) imageByCroppingToRect:canvasRect];
+
+    composed = [foreground imageByCompositingOverImage:[dimmed imageByCompositingOverImage:black]];
+  }
+  CIImage *finalCI = [composed imageByCroppingToRect:canvasRect];
+
+  NSDictionary *attrs = @{
+    (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+  CVPixelBufferRef out = NULL;
+  CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault, (size_t)cw, (size_t)ch,
+                                     kCVPixelFormatType_32BGRA,
+                                     (__bridge CFDictionaryRef)attrs, &out);
+  if (ret != kCVReturnSuccess || !out) {
+    if (outError) {
+      *outError = _VGTCNError(25, @"VGTimelineCompositorNode (BlurFill): CVPixelBufferCreate "
+                                   "failed for canvas output buffer.");
+    }
+    return NULL;
+  }
+
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  [_VGTCNSharedCIContext() render:finalCI
+                   toCVPixelBuffer:out
+                             bounds:canvasRect
+                         colorSpace:cs];
+  CGColorSpaceRelease(cs);
+  _VGTCNTagSDR709PixelBuffer(out);
+  return out; // caller owns +1 from CVPixelBufferCreate
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Private state struct for per-clip reader
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1789,6 +1922,13 @@ static os_log_t sTimelineLog;
 // secondary readers look up the correct sourceURL, fitMode, transform, etc.
 // ARC manages lifetime; no manual release needed.
 @property(nonatomic, strong, nullable) VGClipDescriptor *resolvedClip;
+// MULTI-VIDEO-BLURFILL: YES only for a primary ordinary-video reader built while
+// the canvas contentMode is "blurFill" and the clip passed
+// -_isBlurFillEligibleClipAtIndex:clip:. Such a reader was built WITHOUT the
+// Phase 7.9 aspect-fit layer instruction (native display-size frames) and
+// _pullBufferFromReader: renders its frames into the canvas itself. Always NO
+// for still-image, freeze, reversed, dual-camera and secondary readers.
+@property(nonatomic) BOOL blurFillEligible;
 @end
 
 @implementation _VGClipReader
@@ -2168,6 +2308,11 @@ static inline double _VGQuantizePTS(double pts) {
   // Non-zero: aspect-fit source frames into this canvas via layer instruction.
   // Zero (CGSizeZero): legacy bypass — forward asset-native buffers unchanged.
   CGSize _targetRenderSize;
+
+  // ── MULTI-VIDEO-BLURFILL: draft canvas contentMode ────────────────────────
+  // Parsed once at init from parameters[kVGTCNCanvasContentModeKey]; "fit"
+  // when absent. Immutable for the node's lifetime.
+  NSString *_canvasContentMode;
 
   // ── Phase 7.18A: Frame cache + prefetch queue (DEC-151) ──────────────────
   // _frameCache: compositor-private, byte-budgeted (32 MB) LRU cache shared
@@ -2562,6 +2707,22 @@ static inline double _VGQuantizePTS(double pts) {
     _targetRenderSize = CGSizeMake(cw.intValue, ch.intValue);
   } else {
     _targetRenderSize = CGSizeZero;
+  }
+
+  // ── MULTI-VIDEO-BLURFILL: parse canvas contentMode ────────────────────────
+  // Optional; defaults to "fit". Any string other than "blurFill" leaves
+  // every code path exactly as before (the compositor only ever compares
+  // against kVGTCNCanvasContentModeBlurFill).
+  id rawContentMode = parameters[kVGTCNCanvasContentModeKey];
+  _canvasContentMode =
+      ([rawContentMode isKindOfClass:[NSString class]] && ((NSString *)rawContentMode).length > 0)
+          ? [(NSString *)rawContentMode copy]
+          : @"fit";
+  if ([_canvasContentMode isEqualToString:kVGTCNCanvasContentModeBlurFill] &&
+      (_targetRenderSize.width <= 0 || _targetRenderSize.height <= 0)) {
+    os_log(sTimelineLog,
+           "[VGTCNode-BlurFill] canvasContentMode=blurFill without a positive "
+           "canvasWidth/canvasHeight: blurFill disabled, falling back to legacy fit");
   }
 
   // ── Phase 10 Temporal Denoise: parse opt-in flag ──────────────────────────
@@ -4494,6 +4655,36 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     // at creation). Same degraded fallthrough.
   }
 
+  // ── 3c. MULTI-VIDEO-BLURFILL: canvas normalization for eligible readers ────
+  //
+  // Only readers built without the Phase 7.9 aspect-fit instruction reach
+  // here with blurFillEligible == YES; their pb is native display size
+  // (orientation normalized, and already tone-mapped when HLG). Render it
+  // into a canvas-sized buffer: blurred/dimmed aspect-fill background under
+  // the sharp aspect-fit foreground (or a single sharp frame when the aspect
+  // already matches). Ownership: on success the decoded pb is released and
+  // replaced by the +1 helper output; on failure nothing is leaked and the
+  // frame fails closed exactly like a transform failure (NULL + outError),
+  // since a native-size buffer must never reach the canvas-sized consumer.
+  if (reader.blurFillEligible) {
+    NSError *bfErr = nil;
+    CVPixelBufferRef bfOut = _VGTCNRenderBlurFillFrame(pb, _targetRenderSize, &bfErr);
+    if (!bfOut) {
+      CVPixelBufferRelease(pb); // release decoded source buffer
+      CFRelease(sample);
+      os_log_error(sTimelineLog,
+                   "[VGTCNode-BlurFill] render failed clip=%lu: %{public}@",
+                   (unsigned long)reader.clipIndex,
+                   bfErr.localizedDescription ?: @"<no error>");
+      if (outError) {
+        *outError = bfErr ?: _VGTCNError(24, @"VGTimelineCompositorNode (BlurFill): render failed.");
+      }
+      return NULL;
+    }
+    CVPixelBufferRelease(pb); // release decoded (or HLG-rendered) source buffer
+    pb = bfOut;               // adopt canvas-sized output (+1 from helper)
+  }
+
   // ── 4. Apply transform (Phase 7.11 / Phase 7.23B) — SDR frames only ─────────
   //
   // HLG frames that were successfully rendered by _VGTCNRenderHLGFrame already
@@ -4574,6 +4765,29 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   CFRelease(sample); // done with sample; pb is independently retained
 
   return pb; // caller owns +1
+}
+
+/// MULTI-VIDEO-BLURFILL: per-clip eligibility for the blurFill canvas render.
+/// YES only when the canvas contentMode is "blurFill" with a positive target
+/// render size AND the clip is an ordinary primary video: mediaKind video, no
+/// freezePTS, not reversed, no dual-camera descriptor, no non-identity static
+/// transform and no transformTrack. Every other clip fails closed to the
+/// Phase 7.9 aspect-fit behaviour (still images and freeze frames render fit;
+/// dual-camera, transformed and keyframed clips keep their own pipelines).
+- (BOOL)_isBlurFillEligibleClipAtIndex:(NSUInteger)clipIndex
+                                  clip:(VGClipDescriptor *)clip {
+  if (![_canvasContentMode isEqualToString:kVGTCNCanvasContentModeBlurFill]) return NO;
+  if (_targetRenderSize.width <= 0 || _targetRenderSize.height <= 0) return NO;
+  if (clip.mediaKind != VGClipMediaKindVideo) return NO;
+  if (clip.freezePTS != nil) return NO;
+  if (clip.isReversed) return NO;
+  if (clip.transform != nil && !clip.transform.isIdentity) return NO;
+  if (clip.transformTrack != nil) return NO;
+  if (clipIndex < _dualCameraDescDicts.count) {
+    id rawDualCamera = _dualCameraDescDicts[clipIndex];
+    if ([rawDualCamera isKindOfClass:[NSDictionary class]]) return NO;
+  }
+  return YES;
 }
 
 /// Build an AVAssetReader and AVAssetReaderVideoCompositionOutput for the clip
@@ -5020,8 +5234,21 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
       [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
 #pragma clang diagnostic pop
 
+  // ── MULTI-VIDEO-BLURFILL: per-clip eligibility ─────────────────────────────
+  // An eligible clip keeps the auto-generated composition (orientation
+  // normalized, native display size) so no letterbox/pillarbox bars are baked
+  // into the reader output; _pullBufferFromReader: renders each of its frames
+  // into the canvas itself. Every ineligible clip takes the Phase 7.9 path.
+  const BOOL blurFillEligible = [self _isBlurFillEligibleClipAtIndex:clipIndex clip:clip];
+  if (blurFillEligible) {
+    os_log(sTimelineLog,
+           "[VGTCNode-BlurFill] clip=%lu eligible: skipping aspect-fit layer instruction "
+           "(canvas=%.0fx%.0f)",
+           (unsigned long)clipIndex, _targetRenderSize.width, _targetRenderSize.height);
+  }
+
   // ── Apply aspect-fit canvas normalization when _targetRenderSize is set ──────
-  if (_targetRenderSize.width > 0 && _targetRenderSize.height > 0) {
+  if (!blurFillEligible && _targetRenderSize.width > 0 && _targetRenderSize.height > 0) {
     // Step 1: Compute display dimensions after applying preferredTransform.
     CGAffineTransform preferredTx = videoTrack.preferredTransform;
     CGSize naturalSize = videoTrack.naturalSize;
@@ -5156,6 +5383,7 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   // (they return from the mediaKindImage and freezePTS branches above).
   clipReader.isReversed = clip.isReversed;
   clipReader.resolvedClip = clip; // Phase 7.x-Q3A: bind descriptor for pull path.
+  clipReader.blurFillEligible = blurFillEligible; // MULTI-VIDEO-BLURFILL
 
   os_log(sTimelineLog,
          "[VGTCNode] built reader: clip=%lu startAt=%.3fs fps=%.1f isReversed=%d",

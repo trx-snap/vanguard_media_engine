@@ -232,7 +232,9 @@ final class VGEditorExportReadinessReport {
 ///   between clips).
 /// - No transitions ([VGEditorDraft.transitions] must be empty).
 /// - No overlays ([VGEditorDraft.overlays] must be empty).
-/// - Canvas content mode must be [VGCanvasContentMode.fit] (default).
+/// - Canvas content mode must be [VGCanvasContentMode.fit] (default),
+///   [VGCanvasContentMode.fill] or [VGCanvasContentMode.blurFill];
+///   [VGCanvasContentMode.stretch] is rejected.
 /// - Canvas dimensions must be positive even integers.
 /// - Source paths must be non-empty absolute local paths (starting with `/`).
 /// - Trim ranges must have `trimEndSeconds > trimStartSeconds`.
@@ -311,14 +313,17 @@ final class VGEditorExportReadinessEvaluator {
       );
     }
 
-    // Canvas content mode: only 'fit' is supported.
+    // Canvas content mode: 'fit', 'fill' and 'blurFill' are supported;
+    // 'stretch' is not.
     if (draft.canvas != null &&
-        draft.canvas!.contentMode != VGCanvasContentMode.fit) {
+        draft.canvas!.contentMode != VGCanvasContentMode.fit &&
+        draft.canvas!.contentMode != VGCanvasContentMode.fill &&
+        draft.canvas!.contentMode != VGCanvasContentMode.blurFill) {
       issues.add(
         VGEditorExportReadinessIssue(
           code: VGEditorExportReadinessIssueCode.unsupportedCanvasContentMode,
           message:
-              "Canvas contentMode '${draft.canvas!.contentMode.value}' is not supported; only 'fit' is supported on the Android export route.",
+              "Canvas contentMode '${draft.canvas!.contentMode.value}' is not supported; only 'fit', 'fill' and 'blurFill' are supported on the Android export route.",
         ),
       );
     }

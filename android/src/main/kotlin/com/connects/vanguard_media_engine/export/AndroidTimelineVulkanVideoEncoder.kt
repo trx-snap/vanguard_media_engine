@@ -22,6 +22,7 @@ import java.io.File
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
+import kotlin.math.max
 import kotlin.math.min
 
 // ── AndroidTimelineVulkanVideoEncoder (Vulkan-first export, pass-1) ──────────
@@ -136,6 +137,17 @@ class AndroidTimelineVulkanVideoEncoder(
     // open_exception reasons; it never crashes the encode. Harness
     // constructors keep working unchanged via the default.
     private val context: Context? = null,
+    /**
+     * Wire `canvas.contentMode` ("fit" | "fill"; only these two reach this
+     * encoder). "fit" (default, byte-equivalent to this encoder's original
+     * behaviour) is the untransformed centered aspect-fit placement
+     * ([computeAspectFitRect]). "fill" is a centered cover-crop: the full
+     * output canvas as the destination, with the source cropped (never
+     * letterboxed) to the canvas aspect ratio. Only applies to untransformed
+     * clips -- a clip carrying [AndroidTimelineVideoEncoder.StaticClipTransform]
+     * keeps its existing placement regardless of [contentMode].
+     */
+    private val contentMode: String = "fit",
 ) : AndroidTimelineVideoPassEncoder {
 
     @Volatile private var cancelRequested = false
@@ -1308,6 +1320,9 @@ class AndroidTimelineVulkanVideoEncoder(
     private fun computeLayerPlacement(clip: AndroidTimelineVideoEncoder.ClipInput): PlacementResolution {
         val transform = clip.transform
         if (transform == null) {
+            if (contentMode == "fill") {
+                return computeFillLayerPlacement(clip)
+            }
             val fit = computeAspectFitRect(
                 outputWidth = width,
                 outputHeight = height,
@@ -1345,6 +1360,80 @@ class AndroidTimelineVulkanVideoEncoder(
             return PlacementResolution(
                 null,
                 "vulkan_clip_transform_placement_invalid:dest_out_of_bounds:" +
+                    "dest=${dest.x},${dest.y}-${dest.width}x${dest.height}:outW=$width:outH=$height",
+            )
+        }
+        return PlacementResolution(
+            LayerPlacement(
+                placement.sourceLeft, placement.sourceTop, placement.sourceRight, placement.sourceBottom, dest,
+            ),
+            null,
+        )
+    }
+
+    /// Computes an untransformed clip's centered cover-crop [LayerPlacement] for
+    /// "fill" contentMode: the full output canvas as the destination, with the
+    /// source cropped (never letterboxed) to the canvas aspect ratio.
+    ///
+    /// Reuses [AndroidTimelineClipStaticTransformGeometry.compute] -- which
+    /// already derives a rotation-correct, even-aligned decoded-space crop from
+    /// a display-space visible region -- by feeding it a synthetic identity-
+    /// translation transform whose scale is exactly the ratio between the
+    /// "fill" (max) and "fit" (min) canvas/display scale factors. That makes
+    /// the transform's rendered rect fully cover the output on both axes, so
+    /// the visible-region-vs-output intersection [compute] already performs is
+    /// precisely the desired cover-crop, with no new rotation-mapping code.
+    private fun computeFillLayerPlacement(clip: AndroidTimelineVideoEncoder.ClipInput): PlacementResolution {
+        val decodedWidth = clip.decodedWidth
+        val decodedHeight = clip.decodedHeight
+        if (decodedWidth <= 0 || decodedHeight <= 0 || width <= 0 || height <= 0) {
+            return PlacementResolution(
+                null,
+                "vulkan_dest_fit_rect_invalid:" +
+                    "decodedW=$decodedWidth:decodedH=$decodedHeight:" +
+                    "rotation=${clip.rotationDegrees}:outW=$width:outH=$height",
+            )
+        }
+        val (displayWidth, displayHeight) = when (clip.rotationDegrees) {
+            0, 180 -> decodedWidth.toDouble() to decodedHeight.toDouble()
+            90, 270 -> decodedHeight.toDouble() to decodedWidth.toDouble()
+            else -> return PlacementResolution(
+                null,
+                "vulkan_dest_fit_rect_invalid:unsupported_rotation:${clip.rotationDegrees}",
+            )
+        }
+        val ratioW = width.toDouble() / displayWidth
+        val ratioH = height.toDouble() / displayHeight
+        val fitScale = min(ratioW, ratioH)
+        val fillScale = max(ratioW, ratioH)
+        if (fitScale <= 0.0 || !fitScale.isFinite()) {
+            return PlacementResolution(null, "vulkan_dest_fit_rect_invalid:degenerate_fit_scale")
+        }
+        val syntheticTransform = AndroidTimelineVideoEncoder.StaticClipTransform(
+            scale = fillScale / fitScale,
+            translationX = 0.0,
+            translationY = 0.0,
+        )
+        val result = AndroidTimelineClipStaticTransformGeometry.compute(
+            outputWidth = width,
+            outputHeight = height,
+            decodedWidth = decodedWidth,
+            decodedHeight = decodedHeight,
+            rotationDegrees = clip.rotationDegrees,
+            transform = syntheticTransform,
+        )
+        val placement = result.placement
+            ?: return PlacementResolution(
+                null,
+                "vulkan_fill_placement_invalid:${result.failure ?: "unresolved"}",
+            )
+        val dest = DestFitRect(placement.destX, placement.destY, placement.destWidth, placement.destHeight)
+        if (dest.width < 1 || dest.height < 1 || dest.x < 0 || dest.y < 0 ||
+            dest.x + dest.width > width || dest.y + dest.height > height
+        ) {
+            return PlacementResolution(
+                null,
+                "vulkan_fill_placement_invalid:dest_out_of_bounds:" +
                     "dest=${dest.x},${dest.y}-${dest.width}x${dest.height}:outW=$width:outH=$height",
             )
         }

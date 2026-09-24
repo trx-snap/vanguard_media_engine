@@ -81,10 +81,10 @@ void main() {
 
     test('CD-8  toMap() omits safeArea keys when all zero', () {
       final m = VGCanvasDescriptor().toMap();
-      expect(m.containsKey('safeAreaTop'),    isFalse);
+      expect(m.containsKey('safeAreaTop'), isFalse);
       expect(m.containsKey('safeAreaBottom'), isFalse);
-      expect(m.containsKey('safeAreaLeft'),   isFalse);
-      expect(m.containsKey('safeAreaRight'),  isFalse);
+      expect(m.containsKey('safeAreaLeft'), isFalse);
+      expect(m.containsKey('safeAreaRight'), isFalse);
     });
 
     test('CD-9  toMap() includes safeArea keys when non-zero', () {
@@ -95,23 +95,31 @@ void main() {
         safeAreaRight: 0.0,
       );
       final m = canvas.toMap();
-      expect(m['safeAreaTop'],    44.0);
+      expect(m['safeAreaTop'], 44.0);
       expect(m['safeAreaBottom'], 34.0);
-      expect(m.containsKey('safeAreaLeft'),  isFalse);
+      expect(m.containsKey('safeAreaLeft'), isFalse);
       expect(m.containsKey('safeAreaRight'), isFalse);
     });
 
     test('CD-10 toMap() contentMode serializes as wire string', () {
       expect(VGCanvasDescriptor().toMap()['contentMode'], 'fit');
       expect(
-        VGCanvasDescriptor(contentMode: VGCanvasContentMode.fill)
-            .toMap()['contentMode'],
+        VGCanvasDescriptor(
+          contentMode: VGCanvasContentMode.fill,
+        ).toMap()['contentMode'],
         'fill',
       );
       expect(
-        VGCanvasDescriptor(contentMode: VGCanvasContentMode.stretch)
-            .toMap()['contentMode'],
+        VGCanvasDescriptor(
+          contentMode: VGCanvasContentMode.stretch,
+        ).toMap()['contentMode'],
         'stretch',
+      );
+      expect(
+        VGCanvasDescriptor(
+          contentMode: VGCanvasContentMode.blurFill,
+        ).toMap()['contentMode'],
+        'blurFill',
       );
     });
   });
@@ -319,17 +327,20 @@ void main() {
       expect(canvas!.backgroundColor, [0.0, 0.0, 0.0, 1.0]);
     });
 
-    test('CD-24 backgroundColor with wrong number of elements uses default', () {
-      final m = <Object?, Object?>{
-        'width': 1080,
-        'height': 1920,
-        'contentMode': 'fit',
-        'backgroundColor': [1.0, 0.0, 0.0], // only 3 elements
-      };
-      final canvas = VGCanvasDescriptor.fromMap(m);
-      expect(canvas, isNotNull);
-      expect(canvas!.backgroundColor, [0.0, 0.0, 0.0, 1.0]);
-    });
+    test(
+      'CD-24 backgroundColor with wrong number of elements uses default',
+      () {
+        final m = <Object?, Object?>{
+          'width': 1080,
+          'height': 1920,
+          'contentMode': 'fit',
+          'backgroundColor': [1.0, 0.0, 0.0], // only 3 elements
+        };
+        final canvas = VGCanvasDescriptor.fromMap(m);
+        expect(canvas, isNotNull);
+        expect(canvas!.backgroundColor, [0.0, 0.0, 0.0, 1.0]);
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -365,20 +376,23 @@ void main() {
       expect(canvas.backgroundColor[2], closeTo(0.5, 1e-9));
     });
 
-    test('CD-27 mixed out-of-range and valid components are individually clamped', () {
-      final m = <Object?, Object?>{
-        'width': 1080,
-        'height': 1920,
-        'contentMode': 'fit',
-        'backgroundColor': [-1.0, 0.5, 2.0, 0.8],
-      };
-      final canvas = VGCanvasDescriptor.fromMap(m);
-      expect(canvas, isNotNull);
-      expect(canvas!.backgroundColor[0], closeTo(0.0, 1e-9));
-      expect(canvas.backgroundColor[1], closeTo(0.5, 1e-9));
-      expect(canvas.backgroundColor[2], closeTo(1.0, 1e-9));
-      expect(canvas.backgroundColor[3], closeTo(0.8, 1e-9));
-    });
+    test(
+      'CD-27 mixed out-of-range and valid components are individually clamped',
+      () {
+        final m = <Object?, Object?>{
+          'width': 1080,
+          'height': 1920,
+          'contentMode': 'fit',
+          'backgroundColor': [-1.0, 0.5, 2.0, 0.8],
+        };
+        final canvas = VGCanvasDescriptor.fromMap(m);
+        expect(canvas, isNotNull);
+        expect(canvas!.backgroundColor[0], closeTo(0.0, 1e-9));
+        expect(canvas.backgroundColor[1], closeTo(0.5, 1e-9));
+        expect(canvas.backgroundColor[2], closeTo(1.0, 1e-9));
+        expect(canvas.backgroundColor[3], closeTo(0.8, 1e-9));
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -432,11 +446,15 @@ void main() {
       expect(VGCanvasContentMode.fromValue('fit'), VGCanvasContentMode.fit);
 
       final m = <Object?, Object?>{
-        'width': 1080, 'height': 1920,
+        'width': 1080,
+        'height': 1920,
         'contentMode': 'fit',
         'backgroundColor': [0.0, 0.0, 0.0, 1.0],
       };
-      expect(VGCanvasDescriptor.fromMap(m)!.contentMode, VGCanvasContentMode.fit);
+      expect(
+        VGCanvasDescriptor.fromMap(m)!.contentMode,
+        VGCanvasContentMode.fit,
+      );
     });
 
     test('CD-32 VGCanvasContentMode.fill serializes to "fill" and back', () {
@@ -450,16 +468,43 @@ void main() {
       expect(clone!.contentMode, VGCanvasContentMode.fill);
     });
 
-    test('CD-33 VGCanvasContentMode.stretch serializes to "stretch" and back', () {
-      expect(VGCanvasContentMode.stretch.value, 'stretch');
-      expect(VGCanvasContentMode.fromValue('stretch'), VGCanvasContentMode.stretch);
+    test(
+      'CD-33 VGCanvasContentMode.stretch serializes to "stretch" and back',
+      () {
+        expect(VGCanvasContentMode.stretch.value, 'stretch');
+        expect(
+          VGCanvasContentMode.fromValue('stretch'),
+          VGCanvasContentMode.stretch,
+        );
 
-      final canvas = VGCanvasDescriptor(contentMode: VGCanvasContentMode.stretch);
-      final clone = VGCanvasDescriptor.fromMap(
-        Map<Object?, Object?>.from(canvas.toMap()),
-      );
-      expect(clone!.contentMode, VGCanvasContentMode.stretch);
-    });
+        final canvas = VGCanvasDescriptor(
+          contentMode: VGCanvasContentMode.stretch,
+        );
+        final clone = VGCanvasDescriptor.fromMap(
+          Map<Object?, Object?>.from(canvas.toMap()),
+        );
+        expect(clone!.contentMode, VGCanvasContentMode.stretch);
+      },
+    );
+
+    test(
+      'CD-33b VGCanvasContentMode.blurFill serializes to "blurFill" and back',
+      () {
+        expect(VGCanvasContentMode.blurFill.value, 'blurFill');
+        expect(
+          VGCanvasContentMode.fromValue('blurFill'),
+          VGCanvasContentMode.blurFill,
+        );
+
+        final canvas = VGCanvasDescriptor(
+          contentMode: VGCanvasContentMode.blurFill,
+        );
+        final clone = VGCanvasDescriptor.fromMap(
+          Map<Object?, Object?>.from(canvas.toMap()),
+        );
+        expect(clone!.contentMode, VGCanvasContentMode.blurFill);
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@
 // Wire keys (match native VGCanvasDescriptor serialization):
 //   'width'           : int
 //   'height'          : int
-//   'contentMode'     : String — 'fit' | 'fill' | 'stretch'
+//   'contentMode'     : String — 'fit' | 'fill' | 'stretch' | 'blurFill'
 //   'backgroundColor' : List<double> — [r, g, b, a], each in [0.0, 1.0]
 //   'safeAreaTop'     : double (omitted from toMap() when 0)
 //   'safeAreaBottom'  : double (omitted from toMap() when 0)
@@ -49,7 +49,17 @@ enum VGCanvasContentMode {
   /// Scale clip non-proportionally to fill the canvas exactly.
   /// The clip is distorted if its aspect ratio differs from the canvas.
   /// **Phase 8.1**: enum value is present; rendering is deferred to Phase 8.3+.
-  stretch('stretch');
+  stretch('stretch'),
+
+  /// TikTok-style mixed-orientation placement: a clip whose aspect ratio
+  /// differs from the canvas is rendered as a full-canvas blurred and dimmed
+  /// aspect-fill background from the same frame, with the sharp aspect-fit
+  /// frame centred on top. A clip whose aspect ratio already matches the
+  /// canvas renders as a single sharp full-canvas frame. Used by the
+  /// Universal Editor's canonical 1080x1920 multi-video canvas on both
+  /// platforms; still-image, freeze, dual-camera and transformed clips fall
+  /// back to [fit] placement inside such a canvas.
+  blurFill('blurFill');
 
   const VGCanvasContentMode(this.value);
 
@@ -115,19 +125,19 @@ final class VGCanvasDescriptor {
     this.safeAreaBottom = 0.0,
     this.safeAreaLeft = 0.0,
     this.safeAreaRight = 0.0,
-  })  : assert(width > 0, 'width must be > 0'),
-        assert(height > 0, 'height must be > 0'),
-        assert(
-          backgroundColor.length == 4,
-          'backgroundColor must have exactly 4 elements [r, g, b, a]',
-        ),
-        assert(safeAreaTop >= 0.0, 'safeAreaTop must be >= 0'),
-        assert(safeAreaBottom >= 0.0, 'safeAreaBottom must be >= 0'),
-        assert(safeAreaLeft >= 0.0, 'safeAreaLeft must be >= 0'),
-        assert(safeAreaRight >= 0.0, 'safeAreaRight must be >= 0'),
-        backgroundColor = List<double>.unmodifiable(
-          backgroundColor.map(_clampComponent),
-        );
+  }) : assert(width > 0, 'width must be > 0'),
+       assert(height > 0, 'height must be > 0'),
+       assert(
+         backgroundColor.length == 4,
+         'backgroundColor must have exactly 4 elements [r, g, b, a]',
+       ),
+       assert(safeAreaTop >= 0.0, 'safeAreaTop must be >= 0'),
+       assert(safeAreaBottom >= 0.0, 'safeAreaBottom must be >= 0'),
+       assert(safeAreaLeft >= 0.0, 'safeAreaLeft must be >= 0'),
+       assert(safeAreaRight >= 0.0, 'safeAreaRight must be >= 0'),
+       backgroundColor = List<double>.unmodifiable(
+         backgroundColor.map(_clampComponent),
+       );
 
   // ── Dimensions ─────────────────────────────────────────────────────────────
 
@@ -198,10 +208,10 @@ final class VGCanvasDescriptor {
       'backgroundColor': backgroundColor,
     };
     // Omit safe-area inset keys when 0 (minimal wire payload).
-    if (safeAreaTop > 0.0)    m['safeAreaTop']    = safeAreaTop;
-    if (safeAreaBottom > 0.0) m['safeAreaBottom']  = safeAreaBottom;
-    if (safeAreaLeft > 0.0)   m['safeAreaLeft']    = safeAreaLeft;
-    if (safeAreaRight > 0.0)  m['safeAreaRight']   = safeAreaRight;
+    if (safeAreaTop > 0.0) m['safeAreaTop'] = safeAreaTop;
+    if (safeAreaBottom > 0.0) m['safeAreaBottom'] = safeAreaBottom;
+    if (safeAreaLeft > 0.0) m['safeAreaLeft'] = safeAreaLeft;
+    if (safeAreaRight > 0.0) m['safeAreaRight'] = safeAreaRight;
     return m;
   }
 
@@ -260,22 +270,32 @@ final class VGCanvasDescriptor {
     }
 
     // Parse safe-area insets (default: 0; clamp negative values to 0).
-    double safeAreaTop    = 0.0;
+    double safeAreaTop = 0.0;
     double safeAreaBottom = 0.0;
-    double safeAreaLeft   = 0.0;
-    double safeAreaRight  = 0.0;
+    double safeAreaLeft = 0.0;
+    double safeAreaRight = 0.0;
 
     final rawTop = map['safeAreaTop'];
-    if (rawTop is num) safeAreaTop = rawTop.toDouble().clamp(0.0, double.infinity).toDouble();
+    if (rawTop is num)
+      safeAreaTop = rawTop.toDouble().clamp(0.0, double.infinity).toDouble();
 
     final rawBottom = map['safeAreaBottom'];
-    if (rawBottom is num) safeAreaBottom = rawBottom.toDouble().clamp(0.0, double.infinity).toDouble();
+    if (rawBottom is num)
+      safeAreaBottom = rawBottom
+          .toDouble()
+          .clamp(0.0, double.infinity)
+          .toDouble();
 
     final rawLeft = map['safeAreaLeft'];
-    if (rawLeft is num) safeAreaLeft = rawLeft.toDouble().clamp(0.0, double.infinity).toDouble();
+    if (rawLeft is num)
+      safeAreaLeft = rawLeft.toDouble().clamp(0.0, double.infinity).toDouble();
 
     final rawRight = map['safeAreaRight'];
-    if (rawRight is num) safeAreaRight = rawRight.toDouble().clamp(0.0, double.infinity).toDouble();
+    if (rawRight is num)
+      safeAreaRight = rawRight
+          .toDouble()
+          .clamp(0.0, double.infinity)
+          .toDouble();
 
     return VGCanvasDescriptor(
       width: width,
@@ -336,15 +356,15 @@ final class VGCanvasDescriptor {
 
   @override
   int get hashCode => Object.hash(
-        width,
-        height,
-        contentMode,
-        Object.hashAll(backgroundColor),
-        safeAreaTop,
-        safeAreaBottom,
-        safeAreaLeft,
-        safeAreaRight,
-      );
+    width,
+    height,
+    contentMode,
+    Object.hashAll(backgroundColor),
+    safeAreaTop,
+    safeAreaBottom,
+    safeAreaLeft,
+    safeAreaRight,
+  );
 
   @override
   String toString() {

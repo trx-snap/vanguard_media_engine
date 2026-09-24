@@ -24,6 +24,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -179,6 +180,20 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     // `content://` clip with a null Context fails closed through the
     // decoder's existing `gles_transition_decoder_open_failed:...` reason.
     private val context: Context? = null,
+    /**
+     * Wire `canvas.contentMode` ("fit" | "fill" | "blurFill"). "fit" (default,
+     * byte-equivalent to this encoder's original behaviour) letterboxes/
+     * pillarboxes each clip inside the canvas (scale = min(canvas/display)).
+     * "fill" centers and crops each clip to cover the canvas
+     * (scale = max(canvas/display)). "blurFill" (MULTI-VIDEO-BLURFILL) renders
+     * a video clip whose display aspect differs from the canvas as a blurred,
+     * dimmed cover-crop background of the same frame under a centered sharp
+     * aspect-fit foreground -- exactly as the editor preview session does --
+     * and an aspect-matched clip as one sharp full-canvas frame; a still-image
+     * clip stays at plain "fit" placement in this slice. "fit"/"fill"
+     * single-pass drawing is untouched.
+     */
+    private val contentMode: String = "fit",
 ) : AndroidTimelineVideoPassEncoder {
 
     @Volatile private var cancelRequested = false
@@ -236,15 +251,47 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     private var beautyFromFboId = 0
     private var beautyToFboId = 0
 
-    // Single OES program used both for the solo draw (straight to the
+    // Sharp OES program used both for the solo draw (straight to the
     // encoder's EGL surface) and the overlap pre-resolve draw (into an
     // offscreen canvas-sized 2D FBO) -- both are the same "sample one OES
     // texture through its SurfaceTexture transform matrix, draw a fit quad"
     // operation, differing only in which framebuffer is currently bound.
-    private var oesProgram = 0
-    private var aPositionLoc = 0
-    private var aTexCoordLoc = 0
-    private var uSTMatrixLoc = 0
+    // Attribute/uniform locations are per program and never shared with the
+    // blur program below.
+    private class OesProgramHandles(
+        val program: Int,
+        val aPositionLoc: Int,
+        val aTexCoordLoc: Int,
+        val uSTMatrixLoc: Int,
+    )
+
+    // MULTI-VIDEO-BLURFILL: blur OES program (blurred/dimmed cover-crop
+    // background) with its own program and locations. Compiled only when
+    // [contentMode] == "blurFill".
+    private class BlurOesProgramHandles(
+        val program: Int,
+        val aPositionLoc: Int,
+        val aTexCoordLoc: Int,
+        val uSTMatrixLoc: Int,
+        val uTexelStepLoc: Int,
+        val uDimFactorLoc: Int,
+    )
+
+    private var sharpProgram: OesProgramHandles? = null
+    private var blurProgram: BlurOesProgramHandles? = null
+
+    /**
+     * Per video side placement resolved once per segment: the mode-resolved
+     * [quad] ("fit"/"blurFill" -> [fitQuad], "fill" -> [fillQuad]) plus both
+     * quads and the blurFill decision ([blurFillMismatch]: a "blurFill" canvas
+     * and a display aspect that differs from the canvas aspect).
+     */
+    private class VideoLayerGeometry(
+        val quad: FloatArray,
+        val fitQuad: FloatArray,
+        val fillQuad: FloatArray,
+        val blurFillMismatch: Boolean,
+    )
 
     private val texCoords = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
     private val quadBuffer: FloatBuffer = ByteBuffer.allocateDirect(8 * 4)
@@ -514,8 +561,11 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         }
     }
 
-    /// Centered, aspect-preserving "fit" quad (BL, BR, TL, TR NDC pairs) rotated by [rotationDegrees].
-    private fun computeFitQuadOrNull(decodedWidth: Int, decodedHeight: Int, rotationDegrees: Int): FloatArray? {
+    /// Centered, aspect-preserving quad (BL, BR, TL, TR NDC pairs) rotated by
+    /// [rotationDegrees]: aspect fit (scale = min(canvas/display)) with [cover]
+    /// false, cover-crop (scale = max(canvas/display), clipped by the GPU at the
+    /// canvas bounds) with [cover] true.
+    private fun computeFitQuadOrNull(decodedWidth: Int, decodedHeight: Int, rotationDegrees: Int, cover: Boolean): FloatArray? {
         if (decodedWidth <= 0 || decodedHeight <= 0 || width <= 0 || height <= 0) return null
         val displayWidth: Float
         val displayHeight: Float
@@ -526,7 +576,11 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             displayWidth = decodedWidth.toFloat()
             displayHeight = decodedHeight.toFloat()
         }
-        val scale = min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        val scale = if (cover) {
+            max(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        } else {
+            min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        }
         val halfPixelX = decodedWidth.toFloat() * scale / 2f
         val halfPixelY = decodedHeight.toFloat() * scale / 2f
 
@@ -542,6 +596,28 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         val tl = toNdc(rotatedPixel(-halfPixelX, halfPixelY))
         val tr = toNdc(rotatedPixel(halfPixelX, halfPixelY))
         return floatArrayOf(bl[0], bl[1], br[0], br[1], tl[0], tl[1], tr[0], tr[1])
+    }
+
+    /// True when [clip]'s post-rotation display aspect equals the canvas aspect (within tolerance).
+    private fun isAspectMatchedToCanvas(clip: AndroidTimelineVideoEncoder.ClipInput): Boolean {
+        if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0 || width <= 0 || height <= 0) return true
+        val swaps = clip.rotationDegrees == 90 || clip.rotationDegrees == 270
+        val displayWidth = (if (swaps) clip.decodedHeight else clip.decodedWidth).toFloat()
+        val displayHeight = (if (swaps) clip.decodedWidth else clip.decodedHeight).toFloat()
+        val cross = displayWidth * height - displayHeight * width
+        return kotlin.math.abs(cross) <= BLUR_FILL_ASPECT_EPSILON * displayWidth * height
+    }
+
+    /// Resolves both placement quads for a video [clip] and the blurFill
+    /// decision, before any solo or overlap rendering touches the slot.
+    private fun computeVideoLayerGeometryOrNull(clip: AndroidTimelineVideoEncoder.ClipInput): VideoLayerGeometry? {
+        val fitQuad = computeFitQuadOrNull(clip.decodedWidth, clip.decodedHeight, clip.rotationDegrees, cover = false)
+            ?: return null
+        val fillQuad = computeFitQuadOrNull(clip.decodedWidth, clip.decodedHeight, clip.rotationDegrees, cover = true)
+            ?: return null
+        val quad = if (contentMode == "fill") fillQuad else fitQuad
+        val blurFillMismatch = contentMode == "blurFill" && !isAspectMatchedToCanvas(clip)
+        return VideoLayerGeometry(quad, fitQuad, fillQuad, blurFillMismatch)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -561,7 +637,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
 
     private fun renderSoloVideoSegment(segment: AndroidTimelineExportSegment.Solo): String? {
         val clip = segment.clip
-        val quad = computeFitQuadOrNull(clip.decodedWidth, clip.decodedHeight, clip.rotationDegrees)
+        val geometry = computeVideoLayerGeometryOrNull(clip)
             ?: return "gles_transition_invalid_geometry:${clip.sourcePath}"
 
         val decoder = AndroidTimelineGlesTransitionOverlapDecoder(
@@ -580,7 +656,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             while (true) {
                 when (val step = decoder.nextStep()) {
                     is AndroidTimelineGlesTransitionOverlapDecoder.Step.Frames -> {
-                        val drawFailure = drawSoloFrameFromSlot(fromSlot, quad, clip.beautyIntensity)
+                        val drawFailure = drawSoloFrameFromSlot(fromSlot, geometry, clip.beautyIntensity)
                         if (drawFailure != null) return drawFailure
                         drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
                         rendered++
@@ -674,12 +750,10 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
 
     private fun renderOverlapVideoVideoSegment(segment: AndroidTimelineExportSegment.Overlap): String? {
         val transition = segment.transition
-        val fromQuad = computeFitQuadOrNull(
-            segment.fromClip.decodedWidth, segment.fromClip.decodedHeight, segment.fromClip.rotationDegrees,
-        ) ?: return "gles_transition_invalid_geometry:${segment.fromClip.sourcePath}"
-        val toQuad = computeFitQuadOrNull(
-            segment.toClip.decodedWidth, segment.toClip.decodedHeight, segment.toClip.rotationDegrees,
-        ) ?: return "gles_transition_invalid_geometry:${segment.toClip.sourcePath}"
+        val fromGeometry = computeVideoLayerGeometryOrNull(segment.fromClip)
+            ?: return "gles_transition_invalid_geometry:${segment.fromClip.sourcePath}"
+        val toGeometry = computeVideoLayerGeometryOrNull(segment.toClip)
+            ?: return "gles_transition_invalid_geometry:${segment.toClip.sourcePath}"
 
         val decoder = AndroidTimelineGlesTransitionOverlapDecoder(
             fromSource = AndroidTimelineGlesTransitionOverlapDecoder.Source(
@@ -709,13 +783,13 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                         if (step.from != null && step.to != null) {
                             val progress = transition.progressForOverlapFrame(pairsRendered, expectedPairs)
                             drawFailure = drawTransitionPair(
-                                segment.fromClip, segment.toClip, fromQuad, toQuad, progress, transition.type.nativeCode,
+                                segment.fromClip, segment.toClip, fromGeometry, toGeometry, progress, transition.type.nativeCode,
                             )
                             if (drawFailure == null) pairsRendered++
                         } else if (step.from != null) {
-                            drawFailure = drawSoloFrameFromSlot(fromSlot, fromQuad, segment.fromClip.beautyIntensity)
+                            drawFailure = drawSoloFrameFromSlot(fromSlot, fromGeometry, segment.fromClip.beautyIntensity)
                         } else {
-                            drawFailure = drawSoloFrameFromSlot(toSlot, toQuad, segment.toClip.beautyIntensity)
+                            drawFailure = drawSoloFrameFromSlot(toSlot, toGeometry, segment.toClip.beautyIntensity)
                         }
                         if (drawFailure != null) return drawFailure
                         drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
@@ -825,7 +899,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         val videoBeautyFboId = if (fromIsImage) beautyToFboId else beautyFromFboId
         val videoBeautyTextureId = if (fromIsImage) beautyToTextureId else beautyFromTextureId
 
-        val videoQuad = computeFitQuadOrNull(videoClip.decodedWidth, videoClip.decodedHeight, videoClip.rotationDegrees)
+        val videoGeometry = computeVideoLayerGeometryOrNull(videoClip)
             ?: return "gles_transition_invalid_geometry:${videoClip.sourcePath}"
 
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
@@ -862,7 +936,7 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                             if (step.from == null) continue@loop
                             videoDecodedCount++
                             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
-                            val videoResolveFailure = resolveSlotToTexture2d(videoSlot, videoQuad, videoResolveFboId)
+                            val videoResolveFailure = resolveSlotToTexture2d(videoSlot, videoGeometry, videoResolveFboId)
                             if (videoResolveFailure != null) return "gles_transition_resolve_failed:video:$videoResolveFailure"
 
                             var videoActiveTextureId = videoResolveTextureId
@@ -925,21 +999,21 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     /// the plain OES draw -- see [drawOesQuad] vs [applyBeautySeam].
     private fun drawSoloFrameFromSlot(
         slot: AndroidTimelineGlesTransitionDecodeSlot,
-        quad: FloatArray,
+        geometry: VideoLayerGeometry,
         beautyIntensity: Double?,
     ): String? {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
         if (beautyIntensity != null) {
             val resolveFboId = if (slot === fromSlot) fromResolveFboId else toResolveFboId
             val resolveTextureId = if (slot === fromSlot) fromResolveTextureId else toResolveTextureId
-            val resolveFailure = resolveSlotToTexture2d(slot, quad, resolveFboId)
+            val resolveFailure = resolveSlotToTexture2d(slot, geometry, resolveFboId)
             if (resolveFailure != null) return "gles_transition_draw_failed:solo:$resolveFailure"
             val beautyFailure = applyBeautySeam(resolveTextureId, 0, beautyIntensity)
             if (beautyFailure != null) return "gles_transition_draw_failed:solo:$beautyFailure"
             beautyFramesRendered++
         } else {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-            val drawFailure = drawOesQuad(slot, quad)
+            val drawFailure = drawVideoLayerToBoundFramebuffer(slot, geometry)
             if (drawFailure != null) return "gles_transition_draw_failed:solo:$drawFailure"
         }
 
@@ -971,16 +1045,19 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     private fun drawTransitionPair(
         fromClip: AndroidTimelineVideoEncoder.ClipInput,
         toClip: AndroidTimelineVideoEncoder.ClipInput,
-        fromQuad: FloatArray,
-        toQuad: FloatArray,
+        fromGeometry: VideoLayerGeometry,
+        toGeometry: VideoLayerGeometry,
         progress: Double,
         transitionTypeCode: Int,
     ): String? {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
-        val fromResolveFailure = resolveSlotToTexture2d(fromSlot, fromQuad, fromResolveFboId)
+        // Each side is pre-resolved through its full blurFill/fit/fill layer draw, so
+        // the native transition seam below always blends two already-normalized
+        // full-canvas frames.
+        val fromResolveFailure = resolveSlotToTexture2d(fromSlot, fromGeometry, fromResolveFboId)
         if (fromResolveFailure != null) return "gles_transition_resolve_failed:from:$fromResolveFailure"
-        val toResolveFailure = resolveSlotToTexture2d(toSlot, toQuad, toResolveFboId)
+        val toResolveFailure = resolveSlotToTexture2d(toSlot, toGeometry, toResolveFboId)
         if (toResolveFailure != null) return "gles_transition_resolve_failed:to:$toResolveFailure"
 
         var fromActiveTextureId = fromResolveTextureId
@@ -1047,49 +1124,109 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         return null
     }
 
-    /// Draws [slot]'s current OES texture, through [quad]'s fit geometry,
-    /// into [fboId] (a canvas-sized GL_TEXTURE_2D-backed FBO) instead of the
-    /// default framebuffer. Leaves the default framebuffer bound on return.
+    /// Draws [slot]'s current OES texture, through [geometry]'s full layer
+    /// draw (see [drawVideoLayerToBoundFramebuffer]), into [fboId] (a
+    /// canvas-sized GL_TEXTURE_2D-backed FBO) instead of the default
+    /// framebuffer. Leaves the default framebuffer bound on return.
     private fun resolveSlotToTexture2d(
         slot: AndroidTimelineGlesTransitionDecodeSlot,
-        quad: FloatArray,
+        geometry: VideoLayerGeometry,
         fboId: Int,
     ): String? {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
-        val drawFailure = drawOesQuad(slot, quad)
+        val drawFailure = drawVideoLayerToBoundFramebuffer(slot, geometry)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         return drawFailure
     }
 
-    /// Shared draw body for both [drawSoloFrameFromSlot] and
+    /// MULTI-VIDEO-BLURFILL: draws one video frame into the currently bound
+    /// framebuffer according to [geometry]: a "fit"/"fill" clip, or an
+    /// aspect-matched "blurFill" clip, is one sharp draw through
+    /// [VideoLayerGeometry.quad]; a mismatched "blurFill" clip is a clear, the
+    /// blurred/dimmed cover-crop background ([drawBlurOesQuad] with the fill
+    /// quad), then the sharp aspect-fit foreground on top. Both the solo draw
+    /// and the overlap pre-resolve go through here.
+    private fun drawVideoLayerToBoundFramebuffer(
+        slot: AndroidTimelineGlesTransitionDecodeSlot,
+        geometry: VideoLayerGeometry,
+    ): String? {
+        if (!geometry.blurFillMismatch) return drawOesQuad(slot, geometry.quad)
+        val backgroundFailure = drawBlurOesQuad(slot, geometry.fillQuad)
+        if (backgroundFailure != null) return "blur_background_failed:$backgroundFailure"
+        return drawOesQuad(slot, geometry.fitQuad, clear = false)
+    }
+
+    /// Shared sharp draw body for both [drawSoloFrameFromSlot] and
     /// [resolveSlotToTexture2d]: clears the currently-bound framebuffer to
-    /// black, draws [slot]'s OES texture through [quad] using [oesProgram],
-    /// and reports the first GL error observed (if any). Callers own
-    /// framebuffer binding and presentation.
-    private fun drawOesQuad(slot: AndroidTimelineGlesTransitionDecodeSlot, quad: FloatArray): String? {
+    /// black (unless [clear] is false, so a blurFill foreground layers over
+    /// its already-drawn background), draws [slot]'s OES texture through
+    /// [quad] using the sharp program, and reports the first GL error
+    /// observed (if any). Callers own framebuffer binding and presentation.
+    private fun drawOesQuad(slot: AndroidTimelineGlesTransitionDecodeSlot, quad: FloatArray, clear: Boolean = true): String? {
+        val p = sharpProgram ?: return "sharp_program_missing"
         GLES20.glViewport(0, 0, width, height)
-        GLES20.glClearColor(0f, 0f, 0f, 1f)
-        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        GLES20.glUseProgram(oesProgram)
+        if (clear) {
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        }
+        GLES20.glUseProgram(p.program)
 
         quadBuffer.position(0)
         quadBuffer.put(quad)
         quadBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aPositionLoc)
-        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
+        GLES20.glEnableVertexAttribArray(p.aPositionLoc)
+        GLES20.glVertexAttribPointer(p.aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
 
         texBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aTexCoordLoc)
-        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
+        GLES20.glEnableVertexAttribArray(p.aTexCoordLoc)
+        GLES20.glVertexAttribPointer(p.aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, slot.oesTextureId)
-        GLES20.glUniformMatrix4fv(uSTMatrixLoc, 1, false, slot.transformMatrix, 0)
+        GLES20.glUniformMatrix4fv(p.uSTMatrixLoc, 1, false, slot.transformMatrix, 0)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-        GLES20.glDisableVertexAttribArray(aPositionLoc)
-        GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+        GLES20.glDisableVertexAttribArray(p.aPositionLoc)
+        GLES20.glDisableVertexAttribArray(p.aTexCoordLoc)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        GLES20.glUseProgram(0)
+
+        val err = GLES20.glGetError()
+        return if (err == GLES20.GL_NO_ERROR) null else "gl_error:$err"
+    }
+
+    /// MULTI-VIDEO-BLURFILL background: clears the bound framebuffer to black,
+    /// then draws [slot] through [quad] (the cover-crop quad) with the blur
+    /// program -- blurred and dimmed, SurfaceTexture transform applied exactly
+    /// as the sharp draw does.
+    private fun drawBlurOesQuad(slot: AndroidTimelineGlesTransitionDecodeSlot, quad: FloatArray): String? {
+        val p = blurProgram ?: return "blur_program_missing"
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glUseProgram(p.program)
+
+        quadBuffer.position(0)
+        quadBuffer.put(quad)
+        quadBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(p.aPositionLoc)
+        GLES20.glVertexAttribPointer(p.aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
+
+        texBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(p.aTexCoordLoc)
+        GLES20.glVertexAttribPointer(p.aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, slot.oesTextureId)
+        GLES20.glUniformMatrix4fv(p.uSTMatrixLoc, 1, false, slot.transformMatrix, 0)
+        GLES20.glUniform2f(p.uTexelStepLoc, BLUR_FILL_TEXEL_STEP, BLUR_FILL_TEXEL_STEP)
+        GLES20.glUniform1f(p.uDimFactorLoc, BLUR_FILL_DIM_FACTOR)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(p.aPositionLoc)
+        GLES20.glDisableVertexAttribArray(p.aTexCoordLoc)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
         GLES20.glUseProgram(0)
 
@@ -1223,6 +1360,9 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         fromSlot.setup()
         toSlot.setup()
         setupOesProgram()
+        // MULTI-VIDEO-BLURFILL: the blur program is only compiled for a
+        // "blurFill" canvas, mirroring the Beauty/still-image resource gates.
+        if (contentMode == "blurFill") setupBlurOesProgram()
 
         // P5-GLES-EXPORT-STILL-IMAGE-TRANSITIONS: only compiled when this
         // call's clips actually include a still image, mirroring the Beauty
@@ -1295,10 +1435,75 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
             GLES20.glDeleteProgram(program)
             throw IllegalStateException("GL program link failed: $log")
         }
-        oesProgram = program
-        aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
-        aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTextureCoord")
-        uSTMatrixLoc = GLES20.glGetUniformLocation(program, "uSTMatrix")
+        sharpProgram = OesProgramHandles(
+            program = program,
+            aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition"),
+            aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTextureCoord"),
+            uSTMatrixLoc = GLES20.glGetUniformLocation(program, "uSTMatrix"),
+        )
+    }
+
+    /// MULTI-VIDEO-BLURFILL: the blurred/dimmed background program -- the same
+    /// vertex stage as the sharp program (the SurfaceTexture `uSTMatrix` is
+    /// applied identically) and a fragment stage that averages a 5x5
+    /// binomial-weighted tap grid spaced by `uTexelStep` around the
+    /// transformed coordinate, scaled by `uDimFactor`. Single pass straight
+    /// from the OES decoder texture (OES textures cannot be mipmapped), byte-
+    /// identical to AndroidEditorTransitionPlaybackSession's preview shader so
+    /// preview and export match.
+    private fun setupBlurOesProgram() {
+        val vertexSrc = """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            uniform mat4 uSTMatrix;
+            varying vec2 vTextureCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTextureCoord = (uSTMatrix * aTextureCoord).xy;
+            }
+        """.trimIndent()
+        val fragmentSrc = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vTextureCoord;
+            uniform samplerExternalOES sTexture;
+            uniform vec2 uTexelStep;
+            uniform float uDimFactor;
+            void main() {
+                float w[5];
+                w[0] = 1.0; w[1] = 4.0; w[2] = 6.0; w[3] = 4.0; w[4] = 1.0;
+                vec3 acc = vec3(0.0);
+                for (int y = 0; y < 5; y++) {
+                    for (int x = 0; x < 5; x++) {
+                        vec2 offset = vec2(float(x - 2), float(y - 2)) * uTexelStep;
+                        acc += texture2D(sTexture, vTextureCoord + offset).rgb * (w[x] * w[y]);
+                    }
+                }
+                gl_FragColor = vec4(acc * (uDimFactor / 256.0), 1.0);
+            }
+        """.trimIndent()
+
+        val vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexSrc)
+        val fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSrc)
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vertexShader)
+        GLES20.glAttachShader(program, fragmentShader)
+        GLES20.glLinkProgram(program)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            val log = GLES20.glGetProgramInfoLog(program)
+            GLES20.glDeleteProgram(program)
+            throw IllegalStateException("GL blur program link failed: $log")
+        }
+        blurProgram = BlurOesProgramHandles(
+            program = program,
+            aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition"),
+            aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTextureCoord"),
+            uSTMatrixLoc = GLES20.glGetUniformLocation(program, "uSTMatrix"),
+            uTexelStepLoc = GLES20.glGetUniformLocation(program, "uTexelStep"),
+            uDimFactorLoc = GLES20.glGetUniformLocation(program, "uDimFactor"),
+        )
     }
 
     private fun compileShader(type: Int, src: String): Int {
@@ -1411,7 +1616,8 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
                 // requires this same context still current.
                 glesOverlaySession?.close()
                 imageRenderer.release()
-                if (oesProgram != 0) GLES20.glDeleteProgram(oesProgram)
+                sharpProgram?.let { GLES20.glDeleteProgram(it.program) }
+                blurProgram?.let { GLES20.glDeleteProgram(it.program) }
                 if (fromResolveFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(fromResolveFboId), 0)
                 if (toResolveFboId != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(toResolveFboId), 0)
                 if (fromResolveTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(fromResolveTextureId), 0)
@@ -1440,6 +1646,11 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
         // call, mirroring the overlay state reset above.
         beautyFramesRendered = 0
         pendingClipsForSetup = emptyList()
+        // MULTI-VIDEO-BLURFILL: program handles are GL objects of the context
+        // destroyed below; drop them so a reused instance can never draw with a
+        // stale program id.
+        sharpProgram = null
+        blurProgram = null
         beautyFromTextureId = 0
         beautyToTextureId = 0
         beautyFromFboId = 0
@@ -1462,6 +1673,16 @@ internal class AndroidTimelineGlesTransitionVideoEncoder(
     }
 
     companion object {
+        /**
+         * MULTI-VIDEO-BLURFILL: blur tap spacing in normalized OES texture
+         * coordinates (5x5 taps span ±2 steps), dim multiplier for the
+         * background, and the relative aspect tolerance below which a clip is
+         * aspect-matched to the canvas -- identical to
+         * AndroidEditorTransitionPlaybackSession so preview and export match.
+         */
+        private const val BLUR_FILL_TEXEL_STEP = 0.012f
+        private const val BLUR_FILL_DIM_FACTOR = 0.55f
+        private const val BLUR_FILL_ASPECT_EPSILON = 0.005f
         private const val TAG = "VGGlesTransitionEnc"
         private const val DEQUEUE_TIMEOUT_US = 10_000L
         private const val ENCODE_DRAIN_DEADLINE_MS = 2_000L

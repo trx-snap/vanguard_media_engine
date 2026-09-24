@@ -233,6 +233,26 @@ void main() {
       },
     );
 
+    test('canvas contentMode blurFill is ineligible for passthrough remux', () {
+      final blurFillCanvas = VGCanvasDescriptor(
+        width: 1080,
+        height: 1920,
+        contentMode: VGCanvasContentMode.blurFill,
+      );
+      final report = evaluator.evaluate(
+        draft: makeDraft(canvas: blurFillCanvas),
+      );
+      expect(report.decision, VGPassthroughRemuxDecision.ineligible);
+      expect(
+        report.issues.any(
+          (i) =>
+              i.code ==
+              VGPassthroughRemuxIssueCode.unsupportedCanvasContentMode,
+        ),
+        isTrue,
+      );
+    });
+
     test('odd draft canvas dimensions block eligibility', () {
       final draft = makeDraft(canvasWidth: 1081, canvasHeight: 1920);
       final report = evaluator.evaluate(draft: draft);
@@ -381,7 +401,10 @@ void main() {
     });
 
     test('draft with unmodified original audio sidecar plan is eligible', () {
-      final clip = makePlainVideoClip(id: 'clip-1', sourcePath: '/data/source.mp4');
+      final clip = makePlainVideoClip(
+        id: 'clip-1',
+        sourcePath: '/data/source.mp4',
+      );
       final draft = makeDraft(
         singleClip: clip,
         audioSidecarPlan: VGAudioSidecarPlan(
@@ -408,7 +431,10 @@ void main() {
     });
 
     test('draft with modified original audio volume is ineligible', () {
-      final clip = makePlainVideoClip(id: 'clip-1', sourcePath: '/data/source.mp4');
+      final clip = makePlainVideoClip(
+        id: 'clip-1',
+        sourcePath: '/data/source.mp4',
+      );
       final draft = makeDraft(
         singleClip: clip,
         audioSidecarPlan: VGAudioSidecarPlan(

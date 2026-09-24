@@ -366,7 +366,7 @@ static VGTimelineCompositorNode * _Nullable sActiveCompositorNode;
     // → VanguardMediaEnginePlugin.swift → this 12-parameter method.
     // Default: NO (disabled). The compositor reads this key at init and skips
     // the entire denoise block when NO, incurring zero GPU or CPU overhead.
-    NSDictionary<NSString *, id> *compositorParams = @{
+    NSMutableDictionary<NSString *, id> *compositorParams = [@{
         @"descriptorStage":         @"7.5_executable",
         @"clips":                   clips,
         @"transitions":             transitions ?: @[],
@@ -376,7 +376,16 @@ static VGTimelineCompositorNode * _Nullable sActiveCompositorNode;
         @"canvasHeight":            @(height),
         // Phase 10 Temporal Denoise: bind the caller-supplied flag.
         @"temporalDenoiseEnabled":  @(temporalDenoiseEnabled),
-    };
+    } mutableCopy];
+    // MULTI-VIDEO-BLURFILL: thread the draft canvas contentMode
+    // ("fit" | "fill" | "blurFill") into the compositor so export renders a
+    // blurFill canvas exactly as the preview compositor does. Absent or
+    // malformed → key omitted → compositor default ("fit").
+    id canvasContentModeRaw = canvas[@"contentMode"];
+    if ([canvasContentModeRaw isKindOfClass:[NSString class]] &&
+        ((NSString *)canvasContentModeRaw).length > 0) {
+        compositorParams[@"canvasContentMode"] = canvasContentModeRaw;
+    }
 
     VGMediaPort *videoOutPort =
         [VGMediaPort outputPort:@"video_out" mediaType:VGMediaTypeVideo];
@@ -385,7 +394,7 @@ static VGTimelineCompositorNode * _Nullable sActiveCompositorNode;
     NSError *compositorError = nil;
     VGTimelineCompositorNode *compositor =
         [[VGTimelineCompositorNode alloc] initWithNodeId:@"export_timeline_compositor"
-                                              parameters:compositorParams
+                                              parameters:[compositorParams copy]
                                                    ports:compositorPorts
                                                    error:&compositorError];
     if (!compositor) {
