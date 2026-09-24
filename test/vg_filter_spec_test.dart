@@ -600,6 +600,306 @@ void main() {
       reason: 'argb=0x100000000 must throw AssertionError',
     );
   });
+
+  // ── Vanguard Unified Camera Green Screen Contract §3 (Package A) ───────────
+  // packages/UMF/Docs/Vanguard_Unified_Camera_GreenScreen_Contract.md
+  // Canonical VGFilterSpecs.greenScreen() factory: flat backgroundType/
+  // scaleMode/argb/imagePath/scale/offsetX/offsetY keys, no nested transform
+  // map. Distinct from (and does not replace) greenScreenSolidColor /
+  // greenScreenAlpha above, which remain unchanged.
+
+  // ── Test 25 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen(backgroundType: solidColor) serialises exact '
+      'canonical flat keys with no imagePath', () {
+    final spec = VGFilterSpecs.greenScreen(
+      backgroundType: 'solidColor',
+      argb: 0xFF1B5E20,
+    );
+
+    expect(spec.type, equals('greenScreen'));
+    expect(spec.enabled, isTrue);
+    expect(
+      spec.parameters,
+      equals(<String, Object?>{
+        'backgroundType': 'solidColor',
+        'scaleMode': 'aspectFill',
+        'argb': 0xFF1B5E20,
+        'scale': 1.0,
+        'offsetX': 0.0,
+        'offsetY': 0.0,
+      }),
+      reason:
+          'solidColor parameters must be exactly these flat keys — '
+          'no imagePath, no nested transform map',
+    );
+    expect(spec.parameters.containsKey('imagePath'), isFalse);
+  });
+
+  // ── Test 26 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen(backgroundType: imageFile) serialises exact '
+      'canonical flat keys with no argb', () {
+    final spec = VGFilterSpecs.greenScreen(
+      backgroundType: 'imageFile',
+      imagePath: '/data/user/0/com.connects/files/bg.jpg',
+      scaleMode: 'aspectFit',
+      scale: 1.5,
+      offsetX: 0.2,
+      offsetY: -0.3,
+    );
+
+    expect(spec.type, equals('greenScreen'));
+    expect(
+      spec.parameters,
+      equals(<String, Object?>{
+        'backgroundType': 'imageFile',
+        'scaleMode': 'aspectFit',
+        'imagePath': '/data/user/0/com.connects/files/bg.jpg',
+        'scale': 1.5,
+        'offsetX': 0.2,
+        'offsetY': -0.3,
+      }),
+      reason:
+          'imageFile parameters must be exactly these flat keys — '
+          'no argb, no nested transform map',
+    );
+    expect(spec.parameters.containsKey('argb'), isFalse);
+  });
+
+  // ── Test 27 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen() toJson() emits the exact canonical '
+      'wire format for solidColor', () {
+    final spec = VGFilterSpecs.greenScreen(
+      backgroundType: 'solidColor',
+      argb: 0xFF00796B,
+    );
+    final json = spec.toJson();
+
+    expect(
+      json,
+      equals(<String, Object?>{
+        'type': 'greenScreen',
+        'enabled': true,
+        'parameters': <String, Object?>{
+          'backgroundType': 'solidColor',
+          'scaleMode': 'aspectFill',
+          'argb': 0xFF00796B,
+          'scale': 1.0,
+          'offsetX': 0.0,
+          'offsetY': 0.0,
+        },
+      }),
+    );
+  });
+
+  // ── Test 28 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.greenScreen() assertValid() does not throw ("greenScreen" '
+    'is in _validTypes)',
+    () {
+      expect(
+        () => VGFilterSpecs.greenScreen(
+          backgroundType: 'solidColor',
+          argb: 0xFF000000,
+        ).assertValid(),
+        returnsNormally,
+      );
+    },
+  );
+
+  // ── Test 29 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.greenScreen() throws AssertionError for backgroundType == '
+    '"image" (not the canonical "imageFile")',
+    () {
+      expect(
+        () => VGFilterSpecs.greenScreen(
+          backgroundType: 'image',
+          imagePath: '/tmp/bg.jpg',
+        ),
+        throwsA(isA<AssertionError>()),
+      );
+    },
+  );
+
+  // ── Test 30 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen() throws AssertionError for scaleMode not in '
+      '{aspectFill, aspectFit} (cover/contain/fit rejected)', () {
+    for (final badMode in ['cover', 'contain', 'fit']) {
+      expect(
+        () => VGFilterSpecs.greenScreen(
+          backgroundType: 'solidColor',
+          argb: 0xFF000000,
+          scaleMode: badMode,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'scaleMode "$badMode" must not be accepted',
+      );
+    }
+  });
+
+  // ── Test 31 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.greenScreen() throws AssertionError when backgroundType == '
+    '"solidColor" and argb is omitted',
+    () {
+      expect(
+        () => VGFilterSpecs.greenScreen(backgroundType: 'solidColor'),
+        throwsA(isA<AssertionError>()),
+      );
+    },
+  );
+
+  // ── Test 32 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.greenScreen() throws AssertionError when backgroundType == '
+    '"imageFile" and imagePath is omitted, blank, or whitespace-only',
+    () {
+      expect(
+        () => VGFilterSpecs.greenScreen(backgroundType: 'imageFile'),
+        throwsA(isA<AssertionError>()),
+        reason: 'missing imagePath must throw',
+      );
+      expect(
+        () => VGFilterSpecs.greenScreen(
+          backgroundType: 'imageFile',
+          imagePath: '',
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'blank imagePath must throw',
+      );
+      expect(
+        () => VGFilterSpecs.greenScreen(
+          backgroundType: 'imageFile',
+          imagePath: '   ',
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'whitespace-only imagePath must throw',
+      );
+    },
+  );
+
+  // ── Test 33 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen() throws AssertionError for a relative '
+      '(non-absolute) imagePath', () {
+    expect(
+      () => VGFilterSpecs.greenScreen(
+        backgroundType: 'imageFile',
+        imagePath: 'relative/bg.jpg',
+      ),
+      throwsA(isA<AssertionError>()),
+    );
+  });
+
+  // ── Test 34 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen() clamps scale/offsetX/offsetY to the '
+      'canonical ranges', () {
+    final aboveMax = VGFilterSpecs.greenScreen(
+      backgroundType: 'solidColor',
+      argb: 0xFF000000,
+      scale: 5.0,
+      offsetX: 2.0,
+      offsetY: -2.0,
+    );
+    expect(
+      (aboveMax.parameters['scale'] as num).toDouble(),
+      closeTo(3.0, 1e-9),
+    );
+    expect(
+      (aboveMax.parameters['offsetX'] as num).toDouble(),
+      closeTo(1.0, 1e-9),
+    );
+    expect(
+      (aboveMax.parameters['offsetY'] as num).toDouble(),
+      closeTo(-1.0, 1e-9),
+    );
+
+    final belowMin = VGFilterSpecs.greenScreen(
+      backgroundType: 'solidColor',
+      argb: 0xFF000000,
+      scale: 0.0,
+      offsetX: -5.0,
+      offsetY: 5.0,
+    );
+    expect(
+      (belowMin.parameters['scale'] as num).toDouble(),
+      closeTo(0.25, 1e-9),
+    );
+    expect(
+      (belowMin.parameters['offsetX'] as num).toDouble(),
+      closeTo(-1.0, 1e-9),
+    );
+    expect(
+      (belowMin.parameters['offsetY'] as num).toDouble(),
+      closeTo(1.0, 1e-9),
+    );
+  });
+
+  // ── Test 35 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen() defaults scaleMode to aspectFill and '
+      'transform to identity (scale 1.0, offsets 0.0)', () {
+    final spec = VGFilterSpecs.greenScreen(
+      backgroundType: 'solidColor',
+      argb: 0xFF000000,
+    );
+    expect(spec.parameters['scaleMode'], equals('aspectFill'));
+    expect((spec.parameters['scale'] as num).toDouble(), closeTo(1.0, 1e-9));
+    expect((spec.parameters['offsetX'] as num).toDouble(), closeTo(0.0, 1e-9));
+    expect((spec.parameters['offsetY'] as num).toDouble(), closeTo(0.0, 1e-9));
+  });
+
+  // ── Test 36 ───────────────────────────────────────────────────────────────
+  test('VGFilterSpecs.greenScreen() never emits a nested "transform" map — all '
+      'parameters are flat top-level scalars', () {
+    final spec = VGFilterSpecs.greenScreen(
+      backgroundType: 'imageFile',
+      imagePath: '/tmp/bg.jpg',
+      scale: 1.2,
+      offsetX: 0.1,
+      offsetY: 0.1,
+    );
+    expect(
+      spec.parameters.containsKey('transform'),
+      isFalse,
+      reason: 'the canonical contract forbids a nested transform map',
+    );
+    for (final value in spec.parameters.values) {
+      expect(
+        value is Map,
+        isFalse,
+        reason:
+            'every canonical greenScreen parameter must be a flat '
+            'scalar (String/int/double), never a nested Map',
+      );
+    }
+  });
+
+  // ── Test 37 ───────────────────────────────────────────────────────────────
+  test('greenScreenSolidColor() and greenScreenAlpha() remain unchanged '
+      'alongside the new canonical greenScreen() factory', () {
+    // Same exact wire shape as before this Package A addition (Tests 20-24).
+    final solid = VGFilterSpecs.greenScreenSolidColor();
+    expect(
+      solid.parameters,
+      equals(<String, Object?>{
+        'backgroundType': 'solidColor',
+        'argb': 0xFF00796B,
+      }),
+    );
+    final alpha = VGFilterSpecs.greenScreenAlpha();
+    expect(
+      alpha.parameters,
+      equals(<String, Object?>{'backgroundType': 'alpha'}),
+    );
+
+    // The new canonical factory produces a materially different shape
+    // (scaleMode/scale/offsetX/offsetY are never part of the legacy pair).
+    final canonical = VGFilterSpecs.greenScreen(
+      backgroundType: 'solidColor',
+      argb: 0xFF00796B,
+    );
+    expect(canonical.parameters.containsKey('scaleMode'), isTrue);
+    expect(solid.parameters.containsKey('scaleMode'), isFalse);
+  });
 }
 
 // ── AC coverage summary (P4-10 + Phase 10-C-3L.1C) ───────────────────────────
@@ -629,3 +929,18 @@ void main() {
 // GS-ALPHA-03  greenScreenSolidColor() default wire format preserved (Test 22)
 // GS-ALPHA-04  greenScreenSolidColor(argb:) forwards argb, assertValid passes (Test 23)
 // GS-ALPHA-05  greenScreenSolidColor() asserts on out-of-range argb (Test 24)
+//
+// ── Package A: Vanguard Unified Camera Green Screen Contract §3 ─────────────
+// GS-CANON-01  greenScreen() solidColor exact flat keys, no imagePath (Test 25)
+// GS-CANON-02  greenScreen() imageFile exact flat keys, no argb (Test 26)
+// GS-CANON-03  greenScreen() toJson() exact canonical wire format (Test 27)
+// GS-CANON-04  greenScreen() assertValid() passes (Test 28)
+// GS-CANON-05  greenScreen() asserts on backgroundType == "image" (Test 29)
+// GS-CANON-06  greenScreen() asserts on scaleMode cover/contain/fit (Test 30)
+// GS-CANON-07  greenScreen() asserts solidColor without argb (Test 31)
+// GS-CANON-08  greenScreen() asserts imageFile without/blank imagePath (Test 32)
+// GS-CANON-09  greenScreen() asserts relative (non-absolute) imagePath (Test 33)
+// GS-CANON-10  greenScreen() clamps scale/offsetX/offsetY to range (Test 34)
+// GS-CANON-11  greenScreen() defaults: aspectFill, identity transform (Test 35)
+// GS-CANON-12  greenScreen() never emits a nested transform map (Test 36)
+// GS-CANON-13  legacy greenScreenSolidColor/greenScreenAlpha unchanged (Test 37)

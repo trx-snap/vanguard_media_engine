@@ -136,6 +136,35 @@ final class VGGraphTransaction {
         descriptor.applyPolicy;
   }
 
+  /// Queues multiple parameter updates for a single [effectType] in one call.
+  ///
+  /// Convenience batch wrapper over [setParameter]: iterates [values] in
+  /// iteration order and calls [setParameter] for each entry. Delegates
+  /// entirely to [setParameter]'s existing validation and clamping — an
+  /// unknown [effectType], an unknown parameter name, or a type-incompatible
+  /// value throws [ArgumentError] immediately, exactly as a direct
+  /// [setParameter] call would. No platform dispatch occurs here.
+  ///
+  /// Entries applied before a failing key remain queued on the builder when
+  /// [values] contains a bad entry — this mirrors [setParameter]'s own
+  /// fail-fast-per-call semantics rather than adding multi-key rollback.
+  ///
+  /// Feature-agnostic like [setParameter]: [effectType] is any string
+  /// registered in [VGEffectCatalog], not tied to a specific product filter.
+  ///
+  /// ```dart
+  /// tx.setParameters('greenScreen', {
+  ///   'scale': 1.5,
+  ///   'offsetX': 0.2,
+  ///   'offsetY': -0.1,
+  /// });
+  /// ```
+  void setParameters(String effectType, Map<String, dynamic> values) {
+    for (final entry in values.entries) {
+      setParameter(effectType, entry.key, entry.value);
+    }
+  }
+
   /// Queues a structural preset application.
   ///
   /// Any previously queued preset is replaced (last-write-wins).
@@ -186,14 +215,15 @@ final class VGGraphTransaction {
     // then wrap both levels with Map.unmodifiable.
     final typedOuter = <String, Map<String, dynamic>>{};
     for (final entry in _pendingUpdates.entries) {
-      typedOuter[entry.key] = Map.unmodifiable(
-        <String, dynamic>{...entry.value},
-      );
+      typedOuter[entry.key] = Map.unmodifiable(<String, dynamic>{
+        ...entry.value,
+      });
     }
     // Explicitly typed to preserve Map<String, Map<String, dynamic>> through
     // Map.unmodifiable, which would otherwise infer Map<dynamic, dynamic>.
-    final Map<String, Map<String, dynamic>> frozenUpdates =
-        Map.unmodifiable(typedOuter);
+    final Map<String, Map<String, dynamic>> frozenUpdates = Map.unmodifiable(
+      typedOuter,
+    );
 
     final frozenPreset = _pendingPreset;
 

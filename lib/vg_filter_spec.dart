@@ -72,11 +72,16 @@ final class VGFilterSpec {
   /// - `'lut'`          → `'intensity'` (double, 0.0–1.0)
   /// - `'beauty'`       → `'intensity'` (double, 0.0–1.0), `'radius'` (double)
   /// - `'segmentation'` → (none in Phase 3; reserved for Phase 4)
-  /// - `'greenScreen'`  → `'backgroundType'` (`'solidColor'` | `'alpha'`);
-  ///                      `'argb'` (int, 0xAARRGGBB) is required for
-  ///                      `'solidColor'` only and ignored for `'alpha'` — see
+  /// - `'greenScreen'`  → two independent contracts share this type string:
+  ///                      (a) segmentation-only solid-color/alpha output —
+  ///                      `'backgroundType'` (`'solidColor'` | `'alpha'`),
+  ///                      `'argb'` required for `'solidColor'` only — see
   ///                      [VGFilterSpecs.greenScreenSolidColor] and
-  ///                      [VGFilterSpecs.greenScreenAlpha]
+  ///                      [VGFilterSpecs.greenScreenAlpha]; (b) the canonical
+  ///                      unified camera-graph contract — `'backgroundType'`
+  ///                      (`'solidColor'` | `'imageFile'`), `'scaleMode'`,
+  ///                      `'argb'`/`'imagePath'`, `'scale'`, `'offsetX'`,
+  ///                      `'offsetY'` — see [VGFilterSpecs.greenScreen].
   /// - `'colorMatrix'`  → `'matrix'` (`List<double>`, exactly 20 elements,
   ///                      4×5 row-major matching Flutter's [ColorFilter.matrix])
   ///
@@ -407,6 +412,117 @@ extension VGFilterSpecs on VGFilterSpec {
     type: 'greenScreen',
     parameters: {'backgroundType': 'alpha'},
   );
+
+  /// Creates the canonical Green Screen composite filter for the standalone
+  /// Vanguard camera graph (Vanguard Unified Camera Green Screen Contract,
+  /// §3 Canonical Wire Contract).
+  ///
+  /// This is the flat, canonical successor to [greenScreenSolidColor] /
+  /// [greenScreenAlpha] for the unified camera-graph pipeline: it carries the
+  /// full background + foreground-transform contract those two do not
+  /// (`imageFile` backgrounds, `scaleMode`, and subject `scale`/`offsetX`/
+  /// `offsetY`). [greenScreenSolidColor] and [greenScreenAlpha] are unchanged
+  /// and remain valid for their existing callers (segmentation-only
+  /// solid-color/alpha output); this factory does not replace them.
+  ///
+  /// [backgroundType] selects the background asset kind. Must be exactly
+  /// `'solidColor'` or `'imageFile'` — **never** `'image'`. Required.
+  ///
+  /// [argb] is the 32-bit `0xAARRGGBB` background color. Required when
+  /// [backgroundType] is `'solidColor'`; ignored otherwise.
+  ///
+  /// [imagePath] is the absolute local filesystem path to the background
+  /// image. Required (non-blank, absolute) when [backgroundType] is
+  /// `'imageFile'`; ignored otherwise.
+  ///
+  /// [scaleMode] selects the background image fitting policy. Must be
+  /// exactly `'aspectFill'` or `'aspectFit'` — **never** `'cover'`,
+  /// `'contain'`, or `'fit'`. Defaults to `'aspectFill'`.
+  ///
+  /// [scale] is the foreground-subject scale factor, clamped to
+  /// `[0.25, 3.0]`. Defaults to `1.0`.
+  ///
+  /// [offsetX] / [offsetY] are the normalized foreground-subject offsets,
+  /// each clamped to `[-1.0, 1.0]`. Default to `0.0`.
+  ///
+  /// All parameters are emitted as flat top-level keys in
+  /// [VGFilterSpec.parameters] — there is no nested `transform` map. Only the
+  /// key matching [backgroundType] (`argb` or `imagePath`) is present; the
+  /// other background key is omitted entirely, never sent as `null`.
+  ///
+  /// Wire format (`backgroundType: 'solidColor'`):
+  /// ```json
+  /// { "type": "greenScreen", "enabled": true,
+  ///   "parameters": {
+  ///     "backgroundType": "solidColor", "scaleMode": "aspectFill",
+  ///     "argb": 4278483307, "scale": 1.0, "offsetX": 0.0, "offsetY": 0.0
+  ///   } }
+  /// ```
+  ///
+  /// Wire format (`backgroundType: 'imageFile'`):
+  /// ```json
+  /// { "type": "greenScreen", "enabled": true,
+  ///   "parameters": {
+  ///     "backgroundType": "imageFile", "scaleMode": "aspectFit",
+  ///     "imagePath": "/data/.../bg.jpg",
+  ///     "scale": 1.5, "offsetX": 0.2, "offsetY": -0.1
+  ///   } }
+  /// ```
+  ///
+  /// Throws [AssertionError] in debug/test builds (elided in release, per
+  /// Dart `assert` semantics — matches every other factory in this file) for:
+  /// - [backgroundType] not exactly `'solidColor'` or `'imageFile'`.
+  /// - [scaleMode] not exactly `'aspectFill'` or `'aspectFit'`.
+  /// - [backgroundType] `'solidColor'` with a `null` [argb].
+  /// - [backgroundType] `'imageFile'` with a blank, non-absolute, or `null`
+  ///   [imagePath].
+  static VGFilterSpec greenScreen({
+    required String backgroundType,
+    int? argb,
+    String? imagePath,
+    String scaleMode = 'aspectFill',
+    double scale = 1.0,
+    double offsetX = 0.0,
+    double offsetY = 0.0,
+  }) {
+    assert(
+      backgroundType == 'solidColor' || backgroundType == 'imageFile',
+      'VGFilterSpecs.greenScreen: backgroundType must be exactly '
+      '"solidColor" or "imageFile" (never "image"). Got "$backgroundType".',
+    );
+    assert(
+      scaleMode == 'aspectFill' || scaleMode == 'aspectFit',
+      'VGFilterSpecs.greenScreen: scaleMode must be exactly "aspectFill" or '
+      '"aspectFit" (never "cover", "contain", or "fit"). Got "$scaleMode".',
+    );
+    assert(
+      backgroundType != 'solidColor' || argb != null,
+      'VGFilterSpecs.greenScreen: argb is required when backgroundType == '
+      '"solidColor".',
+    );
+    assert(
+      backgroundType != 'imageFile' ||
+          (imagePath != null &&
+              imagePath.trim().isNotEmpty &&
+              imagePath.startsWith('/')),
+      'VGFilterSpecs.greenScreen: imagePath must be a non-blank absolute '
+      'filesystem path when backgroundType == "imageFile". '
+      'Got "$imagePath".',
+    );
+    final clampedScale = scale.clamp(0.25, 3.0).toDouble();
+    final clampedOffsetX = offsetX.clamp(-1.0, 1.0).toDouble();
+    final clampedOffsetY = offsetY.clamp(-1.0, 1.0).toDouble();
+    final params = <String, Object?>{
+      'backgroundType': backgroundType,
+      'scaleMode': scaleMode,
+      if (backgroundType == 'solidColor') 'argb': argb,
+      if (backgroundType == 'imageFile') 'imagePath': imagePath,
+      'scale': clampedScale,
+      'offsetX': clampedOffsetX,
+      'offsetY': clampedOffsetY,
+    };
+    return VGFilterSpec(type: 'greenScreen', parameters: params);
+  }
 
   /// Creates a color-matrix filter for export and timeline pipelines.
   ///

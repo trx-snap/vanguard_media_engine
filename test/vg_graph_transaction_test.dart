@@ -33,6 +33,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_graph_transaction.dart';
 import 'package:vanguard_media_engine/vg_preset_descriptor.dart';
 import 'package:vanguard_media_engine/vg_filter_spec.dart';
+import 'package:vanguard_media_engine/vg_effect_catalog.dart';
+import 'package:vanguard_media_engine/vg_parameter_descriptor.dart';
 
 void main() {
   // ───────────────────────────────────────────────────────────────────────────
@@ -359,9 +361,9 @@ void main() {
       // Supply a typed argument so the Map type-check passes and we reach
       // the UnsupportedError from _UnmodifiableMapMixin, not a _TypeError.
       expect(
-        () => payload.parameterUpdates.addAll(
-          <String, Map<String, dynamic>>{'ghost': {}},
-        ),
+        () => payload.parameterUpdates.addAll(<String, Map<String, dynamic>>{
+          'ghost': {},
+        }),
         throwsUnsupportedError,
       );
     });
@@ -372,7 +374,10 @@ void main() {
       // The inner map is UnmodifiableMapView — casting to Map<dynamic, dynamic>
       // to avoid a type-cast exception before reaching UnsupportedError.
       expect(
-        () => (payload.parameterUpdates['beauty'] as Map<dynamic, dynamic>)['ghost'] = 99,
+        () =>
+            (payload.parameterUpdates['beauty']
+                    as Map<dynamic, dynamic>)['ghost'] =
+                99,
         throwsUnsupportedError,
       );
     });
@@ -529,6 +534,217 @@ void main() {
     test('GT-20c payload with only preset is not isEmpty', () {
       tx.applyPreset(makePreset());
       expect(tx.commit().isEmpty, isFalse);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Package A: Vanguard Unified Camera Green Screen Contract §3
+  // greenScreen registered in VGEffectCatalog + setParameters() convenience.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEffectCatalog — greenScreen registration', () {
+    test('GS-CAT-1  greenScreen is a registered effect', () {
+      expect(VGEffectCatalog.supportsEffect('greenScreen'), isTrue);
+    });
+
+    test('GS-CAT-2  greenScreen accepts all 7 canonical parameters', () {
+      const canonicalParams = [
+        'backgroundType',
+        'argb',
+        'imagePath',
+        'scaleMode',
+        'scale',
+        'offsetX',
+        'offsetY',
+      ];
+      for (final name in canonicalParams) {
+        expect(
+          VGEffectCatalog.supportsParameter('greenScreen', name),
+          isTrue,
+          reason: '"$name" must be a registered greenScreen parameter',
+        );
+      }
+    });
+
+    test('GS-CAT-3  greenScreen rejects an unknown parameter name', () {
+      expect(
+        VGEffectCatalog.supportsParameter('greenScreen', 'transform'),
+        isFalse,
+        reason:
+            'a nested "transform" key is not part of the canonical '
+            'contract and must not be registered',
+      );
+      expect(
+        VGEffectCatalog.supportsParameter('greenScreen', 'backgroundColor'),
+        isFalse,
+      );
+    });
+
+    test(
+      'GS-CAT-4  every greenScreen parameter has VGParameterApplyPolicy.hot',
+      () {
+        final descriptor = VGEffectCatalog.effect('greenScreen')!;
+        for (final entry in descriptor.parameters.entries) {
+          expect(
+            entry.value.applyPolicy,
+            equals(VGParameterApplyPolicy.hot),
+            reason:
+                '"${entry.key}" must be hot — background/transform '
+                'updates must never force a graph rebuild',
+          );
+        }
+      },
+    );
+
+    test(
+      'GS-CAT-5  scale/offsetX/offsetY carry the canonical min/max/default',
+      () {
+        final scale = VGEffectCatalog.parameter('greenScreen', 'scale')!;
+        expect(scale.minValue, equals(0.25));
+        expect(scale.maxValue, equals(3.0));
+        expect(scale.defaultValue, equals(1.0));
+
+        final offsetX = VGEffectCatalog.parameter('greenScreen', 'offsetX')!;
+        expect(offsetX.minValue, equals(-1.0));
+        expect(offsetX.maxValue, equals(1.0));
+        expect(offsetX.defaultValue, equals(0.0));
+
+        final offsetY = VGEffectCatalog.parameter('greenScreen', 'offsetY')!;
+        expect(offsetY.minValue, equals(-1.0));
+        expect(offsetY.maxValue, equals(1.0));
+        expect(offsetY.defaultValue, equals(0.0));
+      },
+    );
+  });
+
+  group('VGGraphTransaction — greenScreen parameter clamping', () {
+    late VGGraphTransaction tx;
+    setUp(() => tx = VGGraphTransaction());
+
+    test('GS-TX-1  scale above max clamps to 3.0', () {
+      tx.setParameter('greenScreen', 'scale', 5.0);
+      final payload = tx.commit();
+      expect(payload.parameterUpdates['greenScreen']!['scale'], 3.0);
+    });
+
+    test('GS-TX-2  scale below min clamps to 0.25', () {
+      tx.setParameter('greenScreen', 'scale', -1.0);
+      final payload = tx.commit();
+      expect(payload.parameterUpdates['greenScreen']!['scale'], 0.25);
+    });
+
+    test('GS-TX-3  offsetX/offsetY clamp to [-1.0, 1.0]', () {
+      tx.setParameter('greenScreen', 'offsetX', 2.0);
+      tx.setParameter('greenScreen', 'offsetY', -2.0);
+      final payload = tx.commit();
+      expect(payload.parameterUpdates['greenScreen']!['offsetX'], 1.0);
+      expect(payload.parameterUpdates['greenScreen']!['offsetY'], -1.0);
+    });
+
+    test('GS-TX-4  backgroundType/argb/imagePath/scaleMode pass through '
+        'unchanged (string/int, no numeric range)', () {
+      tx.setParameter('greenScreen', 'backgroundType', 'imageFile');
+      tx.setParameter('greenScreen', 'imagePath', '/tmp/bg.jpg');
+      tx.setParameter('greenScreen', 'scaleMode', 'aspectFit');
+      tx.setParameter('greenScreen', 'argb', 0xFF1B5E20);
+      final payload = tx.commit();
+      final gs = payload.parameterUpdates['greenScreen']!;
+      expect(gs['backgroundType'], 'imageFile');
+      expect(gs['imagePath'], '/tmp/bg.jpg');
+      expect(gs['scaleMode'], 'aspectFit');
+      expect(gs['argb'], 0xFF1B5E20);
+    });
+
+    test('GS-TX-5  greenScreen parameters set hasHotParameters, never '
+        'requiresRebuild', () {
+      tx.setParameter('greenScreen', 'scale', 1.5);
+      expect(tx.hasHotParameters, isTrue);
+      expect(tx.requiresRebuild, isFalse);
+    });
+
+    test('GS-TX-6  unknown greenScreen parameter throws ArgumentError', () {
+      expect(
+        () => tx.setParameter('greenScreen', 'transform', {'x': 1}),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  group('VGGraphTransaction — setParameters() batch convenience', () {
+    late VGGraphTransaction tx;
+    setUp(() => tx = VGGraphTransaction());
+
+    test(
+      'GS-BATCH-1  setParameters applies every entry through setParameter',
+      () {
+        tx.setParameters('greenScreen', {
+          'scale': 1.5,
+          'offsetX': 0.2,
+          'offsetY': -0.1,
+        });
+        final payload = tx.commit();
+        final gs = payload.parameterUpdates['greenScreen']!;
+        expect(gs['scale'], 1.5);
+        expect(gs['offsetX'], 0.2);
+        expect(gs['offsetY'], -0.1);
+      },
+    );
+
+    test('GS-BATCH-2  setParameters clamps each value exactly like '
+        'setParameter', () {
+      tx.setParameters('greenScreen', {'scale': 10.0, 'offsetX': -10.0});
+      final payload = tx.commit();
+      final gs = payload.parameterUpdates['greenScreen']!;
+      expect(gs['scale'], 3.0);
+      expect(gs['offsetX'], -1.0);
+    });
+
+    test(
+      'GS-BATCH-3  setParameters throws ArgumentError for an unknown effect, '
+      'exactly like setParameter',
+      () {
+        expect(
+          () => tx.setParameters('ghostFilter', {'x': 1}),
+          throwsArgumentError,
+        );
+      },
+    );
+
+    test('GS-BATCH-4  setParameters throws ArgumentError for an unknown '
+        'parameter within the map', () {
+      expect(
+        () => tx.setParameters('greenScreen', {
+          'scale': 1.0,
+          'transform': {'x': 1},
+        }),
+        throwsArgumentError,
+      );
+    });
+
+    test('GS-BATCH-5  entries applied before a failing key remain queued '
+        '(fail-fast-per-call, no multi-key rollback)', () {
+      try {
+        tx.setParameters('greenScreen', {
+          'scale': 1.5, // applied first, valid
+          'transform': {'x': 1}, // fails — Map iteration is insertion order
+        });
+      } catch (_) {}
+      expect(
+        tx.hasHotParameters,
+        isTrue,
+        reason:
+            'the "scale" write before the failing key must remain '
+            'queued on the builder',
+      );
+    });
+
+    test('GS-BATCH-6  setParameters coexists with beauty parameters set via '
+        'plain setParameter', () {
+      tx.setParameter('beauty', 'intensity', 0.6);
+      tx.setParameters('greenScreen', {'scale': 1.2, 'offsetX': 0.0});
+      final payload = tx.commit();
+      expect(payload.parameterUpdates['beauty']!['intensity'], 0.6);
+      expect(payload.parameterUpdates['greenScreen']!['scale'], 1.2);
     });
   });
 }
