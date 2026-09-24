@@ -23,6 +23,7 @@ import android.util.Log
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
+import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.io.File
 import java.nio.ByteBuffer
@@ -87,7 +88,6 @@ object AndroidGreenScreenExportEngine {
         "no_av_sync",
         "no_realtime_clock",
         "no_container_rotation_auto_apply",
-        "no_image_exif_orientation_auto_apply",
         "no_production_duet_wiring",
         "no_connectsapp_or_universal_editor_wiring",
         "fixed_offline_frame_clock_only",
@@ -748,7 +748,8 @@ object AndroidGreenScreenExportEngine {
      * overwritten from the sample index so the clip's timing equals the output
      * clock and the background lane pairs 1:1 with no drops or holds. An image
      * is aspect-filled or aspect-fitted (black letterbox/pillarbox) into the
-     * clip; EXIF orientation is NOT applied. Fails closed on any sample-count
+     * clip; EXIF orientation IS applied so the drawn image matches preview.
+     * Fails closed on any sample-count
      * mismatch. Releases the encoder, surface, and muxer in `finally`; the
      * caller owns deleting [outputFile].
      */
@@ -869,27 +870,39 @@ object AndroidGreenScreenExportEngine {
 
         private fun alignDown(value: Int, alignment: Int): Int = maxOf(alignment, (value / alignment) * alignment)
 
-        /** Decodes with a power-of-two subsample so the bitmap stays bounded relative to the target size. */
+        /**
+         * Decodes with a power-of-two subsample so the bitmap stays bounded
+         * relative to the target size, then applies EXIF orientation so the
+         * returned bitmap has post-EXIF visual dimensions. The subsample size
+         * is computed by [AndroidStillImageDecoder.computeInSampleSize], which
+         * bounds each axis independently against EXIF-adjusted display bounds
+         * so a 90/270-degree-rotated raw decode is compared against
+         * [targetWidth]x[targetHeight] on the correct (post-rotation) axes.
+         */
         private fun decodeImage(path: String, targetWidth: Int, targetHeight: Int): Bitmap? {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(path, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-            val maxWidth = targetWidth * IMAGE_DECODE_MAX_DIMENSION_FACTOR
-            val maxHeight = targetHeight * IMAGE_DECODE_MAX_DIMENSION_FACTOR
-            var sample = 1
-            while (bounds.outWidth / (sample * 2) >= maxWidth && bounds.outHeight / (sample * 2) >= maxHeight) {
-                sample *= 2
-            }
+            val orientation = AndroidStillImageDecoder.readExifOrientation(path)
+            val sample = AndroidStillImageDecoder.computeInSampleSize(
+                rawWidth = bounds.outWidth,
+                rawHeight = bounds.outHeight,
+                targetWidth = targetWidth * IMAGE_DECODE_MAX_DIMENSION_FACTOR,
+                targetHeight = targetHeight * IMAGE_DECODE_MAX_DIMENSION_FACTOR,
+                maxTextureSize = 0,
+                orientation = orientation,
+            )
             val options = BitmapFactory.Options().apply {
                 inSampleSize = sample
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             }
-            return try {
+            val decoded = try {
                 BitmapFactory.decodeFile(path, options)
             } catch (t: Throwable) {
                 Log.w(TAG, "image background decode failed: $t")
                 null
-            }
+            } ?: return null
+            return AndroidStillImageDecoder.applyExifOrientation(decoded, orientation)
         }
 
         private fun placementRect(

@@ -901,77 +901,222 @@ static NSArray<NSDictionary *> *_VGDeepCopyFilterSpecs(NSArray<NSDictionary *> *
 
 // ─── greenScreen spec validation ─────────────────────────────────────────────
 //
-// Parameter contract (Dart: VGFilterSpecs.greenScreenSolidColor / greenScreenAlpha):
-//   parameters.backgroundType  NSString — "solidColor" or "alpha"
+// Canonical flat parameter contract
+// (packages/UMF/Docs/Vanguard_Unified_Camera_GreenScreen_Contract.md, plus the
+// engine-only "alpha" output that predates it):
+//   parameters.backgroundType  NSString — "solidColor" | "imageFile" | "alpha"
 //   parameters.argb            NSNumber — integral, 0 … 0xFFFFFFFF (0xAARRGGBB;
 //                              alpha byte ignored). REQUIRED for "solidColor".
-//                              Not part of the "alpha" contract: ignored if
-//                              present (any type, never validated), outARGB = 0.
+//                              Ignored (never validated) for the other types.
+//   parameters.imagePath       NSString — non-empty ABSOLUTE local path.
+//                              REQUIRED for "imageFile" (existence and
+//                              decodability are checked when the provider is
+//                              built, still before any graph mutation).
+//   parameters.scaleMode       NSString — "aspectFill" (default) | "aspectFit".
+//                              Only meaningful for "imageFile".
+//   parameters.scale           NSNumber — optional, clamped to [0.25, 3.0]
+//   parameters.offsetX         NSNumber — optional, clamped to [-1.0, 1.0]
+//   parameters.offsetY         NSNumber — optional, clamped to [-1.0, 1.0]
+//   parameters.transform       NSDictionary — LEGACY nested {scale, offsetX,
+//                              offsetY}; honoured only when no flat transform
+//                              key is present. The flat keys are canonical.
 //
 // Error mapping (no graph mutation in any case):
 //   INVALID_GREEN_SCREEN_FILTER_SPEC (code 4)  parameters missing / not a dictionary,
 //                                              backgroundType missing / not a string,
 //                                              solidColor argb missing / not a number /
-//                                              out of range / non-integral
+//                                              out of range / non-integral,
+//                                              imageFile imagePath missing / empty /
+//                                              relative / unreadable / undecodable,
+//                                              scaleMode not "aspectFill"/"aspectFit",
+//                                              scale/offsetX/offsetY not a finite number
 //   UNSUPPORTED_FILTER_TYPE          (code 3)  backgroundType is a string other than
-//                                              "solidColor" / "alpha" (image/video
-//                                              backgrounds are known but deferred)
-static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
-                                                 VGGreenScreenFilterNodeOutputMode * _Nullable outOutputMode,
-                                                 uint32_t * _Nullable outARGB,
-                                                 NSError * _Nullable * _Nullable outError) {
-    NSError *(^invalid)(NSString *) = ^NSError *(NSString *message) {
-        return [NSError errorWithDomain:@"INVALID_GREEN_SCREEN_FILTER_SPEC"
-                                   code:4
-                               userInfo:@{NSLocalizedDescriptionKey: message}];
-    };
-    if (![params isKindOfClass:[NSDictionary class]]) {
-        if (outError) *outError = invalid(@"greenScreen spec requires a 'parameters' dictionary "
-                                           "with backgroundType (and argb for solidColor).");
+//                                              "solidColor" / "imageFile" / "alpha"
+//                                              (video backgrounds are v2)
+
+typedef struct {
+    VGGreenScreenFilterNodeOutputMode outputMode;
+    uint32_t                          argb;        // solidColor only, else 0
+    VGGreenScreenBackgroundScaleMode  scaleMode;   // imageFile only, else aspectFill
+    VGGreenScreenForegroundTransform  transform;   // clamped; identity when absent
+} VGGreenScreenParsedSpec;
+
+static NSError *_VGGreenScreenInvalidSpecError(NSString *message) {
+    return [NSError errorWithDomain:@"INVALID_GREEN_SCREEN_FILTER_SPEC"
+                               code:4
+                           userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+// Optional finite number: absent/NSNull → NO change (*outValue untouched), YES.
+// Present number (finite) → *outValue set, *outPresent = YES, YES. Anything
+// else → NO with an INVALID error.
+static BOOL _VGGreenScreenParseOptionalNumber(NSDictionary *dict, NSString *key,
+                                              double *outValue, BOOL *outPresent,
+                                              NSError * _Nullable * _Nullable outError) {
+    id raw = dict[key];
+    if (raw == nil || raw == [NSNull null]) return YES;
+    if (![raw isKindOfClass:[NSNumber class]]) {
+        if (outError) *outError = _VGGreenScreenInvalidSpecError([NSString stringWithFormat:
+            @"greenScreen parameters.%@ must be a number (got %@).", key, raw]);
         return NO;
     }
-    NSDictionary *dict = (NSDictionary *)params;
+    const double value = [(NSNumber *)raw doubleValue];
+    if (!isfinite(value)) {
+        if (outError) *outError = _VGGreenScreenInvalidSpecError([NSString stringWithFormat:
+            @"greenScreen parameters.%@ must be finite.", key]);
+        return NO;
+    }
+    *outValue   = value;
+    *outPresent = YES;
+    return YES;
+}
+
+// Parses the subject transform from a parameter dictionary. Flat keys are
+// canonical; a legacy nested "transform" dictionary is read only when NO flat
+// key is present. Components not present keep the values already in
+// *ioTransform (the caller seeds identity for a new spec, or the node's
+// current transform for a hot update). Reports whether anything was present.
+static BOOL _VGGreenScreenParseTransform(NSDictionary *dict,
+                                         VGGreenScreenForegroundTransform *ioTransform,
+                                         BOOL *outAnyPresent,
+                                         NSError * _Nullable * _Nullable outError) {
+    double scale = ioTransform->scale, offsetX = ioTransform->offsetX, offsetY = ioTransform->offsetY;
+    BOOL scalePresent = NO, offsetXPresent = NO, offsetYPresent = NO;
+    if (!_VGGreenScreenParseOptionalNumber(dict, @"scale",   &scale,   &scalePresent,   outError)) return NO;
+    if (!_VGGreenScreenParseOptionalNumber(dict, @"offsetX", &offsetX, &offsetXPresent, outError)) return NO;
+    if (!_VGGreenScreenParseOptionalNumber(dict, @"offsetY", &offsetY, &offsetYPresent, outError)) return NO;
+    BOOL anyFlat = scalePresent || offsetXPresent || offsetYPresent;
+    if (!anyFlat) {
+        id legacy = dict[@"transform"];
+        if ([legacy isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *legacyDict = (NSDictionary *)legacy;
+            if (!_VGGreenScreenParseOptionalNumber(legacyDict, @"scale",   &scale,   &scalePresent,   outError)) return NO;
+            if (!_VGGreenScreenParseOptionalNumber(legacyDict, @"offsetX", &offsetX, &offsetXPresent, outError)) return NO;
+            if (!_VGGreenScreenParseOptionalNumber(legacyDict, @"offsetY", &offsetY, &offsetYPresent, outError)) return NO;
+            anyFlat = scalePresent || offsetXPresent || offsetYPresent;
+        } else if (legacy != nil && legacy != [NSNull null]) {
+            if (outError) *outError = _VGGreenScreenInvalidSpecError(
+                @"greenScreen parameters.transform (legacy) must be a dictionary; use the flat "
+                 "scale/offsetX/offsetY keys.");
+            return NO;
+        }
+    }
+    *ioTransform   = VGGreenScreenForegroundTransformMakeClamped(scale, offsetX, offsetY);
+    *outAnyPresent = anyFlat;
+    return YES;
+}
+
+// Parses the background part of a parameter dictionary (backgroundType and
+// its dependants). Does not decode the image: that happens when the provider
+// is built, so pass-3 validation stays cheap and the decode runs once.
+static BOOL _VGGreenScreenParseBackground(NSDictionary *dict,
+                                          VGGreenScreenFilterNodeOutputMode *outOutputMode,
+                                          uint32_t *outARGB,
+                                          VGGreenScreenBackgroundScaleMode *outScaleMode,
+                                          NSString * _Nullable __autoreleasing * _Nullable outImagePath,
+                                          NSError * _Nullable * _Nullable outError) {
     id backgroundType = dict[@"backgroundType"];
     if (![backgroundType isKindOfClass:[NSString class]]) {
-        if (outError) *outError = invalid(@"greenScreen spec requires parameters.backgroundType (string).");
+        if (outError) *outError = _VGGreenScreenInvalidSpecError(
+            @"greenScreen spec requires parameters.backgroundType (string).");
         return NO;
     }
+    *outARGB      = 0;
+    *outScaleMode = VGGreenScreenBackgroundScaleModeAspectFill;
+    if (outImagePath) *outImagePath = nil;
+
     if ([backgroundType isEqualToString:VGGreenScreenFilterNodeBackgroundTypeAlpha]) {
         // Alpha output: no background, so argb is outside the contract. Any
         // argb present (of any type) is ignored rather than validated.
-        if (outOutputMode) *outOutputMode = VGGreenScreenFilterNodeOutputModeAlpha;
-        if (outARGB) *outARGB = 0;
+        *outOutputMode = VGGreenScreenFilterNodeOutputModeAlpha;
         return YES;
     }
-    if (![backgroundType isEqualToString:VGGreenScreenFilterNodeBackgroundTypeSolidColor]) {
-        if (outError) {
-            *outError = [NSError
-                errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
-                           code:3
-                       userInfo:@{
-                NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:@"greenScreen backgroundType '%@' is not supported "
-                                                "for the camera graph; only 'solidColor' and "
-                                                "'alpha' are supported in this slice.", backgroundType]
-            }];
+    if ([backgroundType isEqualToString:VGGreenScreenFilterNodeBackgroundTypeSolidColor]) {
+        id argb = dict[@"argb"];
+        if (![argb isKindOfClass:[NSNumber class]]) {
+            if (outError) *outError = _VGGreenScreenInvalidSpecError(
+                @"greenScreen spec requires parameters.argb (integer 0xAARRGGBB).");
+            return NO;
         }
+        const double argbValue = [(NSNumber *)argb doubleValue];
+        // The negated range test also rejects NaN.
+        if (!(argbValue >= 0.0 && argbValue <= 4294967295.0) || argbValue != floor(argbValue)) {
+            if (outError) *outError = _VGGreenScreenInvalidSpecError([NSString stringWithFormat:
+                @"greenScreen parameters.argb must be an integer in 0...0xFFFFFFFF (got %@).", argb]);
+            return NO;
+        }
+        *outOutputMode = VGGreenScreenFilterNodeOutputModeSolidColor;
+        *outARGB       = (uint32_t)[(NSNumber *)argb unsignedLongLongValue];
+        return YES;
+    }
+    if ([backgroundType isEqualToString:VGGreenScreenFilterNodeBackgroundTypeImageFile]) {
+        id imagePath = dict[@"imagePath"];
+        if (![imagePath isKindOfClass:[NSString class]] || [(NSString *)imagePath length] == 0) {
+            if (outError) *outError = _VGGreenScreenInvalidSpecError(
+                @"greenScreen imageFile requires parameters.imagePath (non-empty absolute path).");
+            return NO;
+        }
+        if (![(NSString *)imagePath hasPrefix:@"/"]) {
+            if (outError) *outError = _VGGreenScreenInvalidSpecError([NSString stringWithFormat:
+                @"greenScreen parameters.imagePath must be an absolute local path (got '%@').", imagePath]);
+            return NO;
+        }
+        VGGreenScreenBackgroundScaleMode scaleMode = VGGreenScreenBackgroundScaleModeAspectFill;
+        if (!VGGreenScreenBackgroundScaleModeFromSpecValue(dict[@"scaleMode"], &scaleMode)) {
+            if (outError) *outError = _VGGreenScreenInvalidSpecError([NSString stringWithFormat:
+                @"greenScreen parameters.scaleMode must be 'aspectFill' or 'aspectFit' (got %@).",
+                dict[@"scaleMode"]]);
+            return NO;
+        }
+        *outOutputMode = VGGreenScreenFilterNodeOutputModeImageFile;
+        *outScaleMode  = scaleMode;
+        if (outImagePath) *outImagePath = (NSString *)imagePath;
+        return YES;
+    }
+    if (outError) {
+        *outError = [NSError
+            errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
+                       code:3
+                   userInfo:@{
+            NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"greenScreen backgroundType '%@' is not supported "
+                                            "for the camera graph; only 'solidColor', 'imageFile' "
+                                            "and 'alpha' are supported (video backgrounds are v2).",
+                                            backgroundType]
+        }];
+    }
+    return NO;
+}
+
+// Full spec validation (background + transform). *outImagePath is the
+// imageFile path (nil otherwise). Never mutates anything.
+static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
+                                                 VGGreenScreenParsedSpec * _Nullable outSpec,
+                                                 NSString * _Nullable __autoreleasing * _Nullable outImagePath,
+                                                 NSError * _Nullable * _Nullable outError) {
+    if (![params isKindOfClass:[NSDictionary class]]) {
+        if (outError) *outError = _VGGreenScreenInvalidSpecError(
+            @"greenScreen spec requires a 'parameters' dictionary with backgroundType "
+             "(and argb for solidColor, imagePath for imageFile).");
         return NO;
     }
-    id argb = dict[@"argb"];
-    if (![argb isKindOfClass:[NSNumber class]]) {
-        if (outError) *outError = invalid(@"greenScreen spec requires parameters.argb "
-                                           "(integer 0xAARRGGBB).");
+    NSDictionary *dict = (NSDictionary *)params;
+    VGGreenScreenParsedSpec parsed;
+    parsed.outputMode = VGGreenScreenFilterNodeOutputModeSolidColor;
+    parsed.argb       = 0;
+    parsed.scaleMode  = VGGreenScreenBackgroundScaleModeAspectFill;
+    parsed.transform  = VGGreenScreenForegroundTransformIdentity;
+    NSString *imagePath = nil;
+    if (!_VGGreenScreenParseBackground(dict, &parsed.outputMode, &parsed.argb, &parsed.scaleMode,
+                                       &imagePath, outError)) {
         return NO;
     }
-    const double argbValue = [(NSNumber *)argb doubleValue];
-    // The negated range test also rejects NaN.
-    if (!(argbValue >= 0.0 && argbValue <= 4294967295.0) || argbValue != floor(argbValue)) {
-        if (outError) *outError = invalid([NSString stringWithFormat:
-            @"greenScreen parameters.argb must be an integer in 0...0xFFFFFFFF (got %@).", argb]);
+    BOOL transformPresent = NO;
+    if (!_VGGreenScreenParseTransform(dict, &parsed.transform, &transformPresent, outError)) {
         return NO;
     }
-    if (outOutputMode) *outOutputMode = VGGreenScreenFilterNodeOutputModeSolidColor;
-    if (outARGB) *outARGB = (uint32_t)[(NSNumber *)argb unsignedLongLongValue];
+    if (outSpec) *outSpec = parsed;
+    if (outImagePath) *outImagePath = imagePath;
     return YES;
 }
 
@@ -1035,8 +1180,10 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
     // ── Pass 3: constructable check ───────────────────────────────────────────
     //
     // Constructable: beauty (V1, V2, V2 face-aware) and greenScreen
-    // (backgroundType solidColor or alpha; parameters validated here so a bad
-    // spec is rejected before any node exists).
+    // (backgroundType solidColor, imageFile or alpha; parameters validated
+    // here so a bad spec is rejected before any node exists — an imageFile
+    // path is existence/decode-checked when its provider is built, which is
+    // still before any graph mutation).
     // lut and segmentation are known but deferred.
     for (NSDictionary *spec in specs) {
         NSString *type = spec[@"type"];
@@ -1112,7 +1259,13 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                                                        device:metalDevice];
                 if (v2) {
                     if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
-                        v2.intensity = [params[@"intensity"] floatValue];
+                        float it = [params[@"intensity"] floatValue];
+                        v2.intensity = it;
+                        if ([params[@"tiktokGlowEnabled"] boolValue] || it >= 0.99f) {
+                            v2.tiktokGlowEnabled = YES;
+                        } else {
+                            v2.tiktokGlowEnabled = NO;
+                        }
                     }
                     // Phase 9B-5: parse faceAwareEnabled and mirror it onto the group.
                     BOOL faceAwareEnabled = NO;
@@ -1155,15 +1308,18 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                 [nodes addObject:(id<VGMetalFilterNode>)beauty];
             }
         } else if ([type isEqualToString:@"greenScreen"]) {
-            // ── Green screen (solidColor or alpha output) ─────────────────────
-            // Parameters passed pass-3 validation; re-parse only to extract the
-            // output mode and argb. The node borrows _sessionPool (retains it +1)
-            // and the shared Metal device, exactly like the beauty nodes. It
-            // owns no camera state and composites nothing in alpha mode.
-            VGGreenScreenFilterNodeOutputMode outputMode = VGGreenScreenFilterNodeOutputModeSolidColor;
-            uint32_t backgroundARGB = 0;
+            // ── Green screen (solidColor, imageFile or alpha output) ──────────
+            // Parameters passed pass-3 validation; re-parse to extract the
+            // output mode, background and transform. The node borrows
+            // _sessionPool (retains it +1) and the shared Metal device, exactly
+            // like the beauty nodes. It owns no camera state and composites
+            // nothing in alpha mode. An imageFile background is decoded HERE
+            // (once, bounded); a decode failure returns nil before any graph
+            // mutation, so a bad image can never replace the live chain.
+            VGGreenScreenParsedSpec parsed;
+            NSString *imagePath = nil;
             NSError *specError = nil;
-            if (!_VGValidateGreenScreenSpecParameters(params, &outputMode, &backgroundARGB, &specError)) {
+            if (!_VGValidateGreenScreenSpecParameters(params, &parsed, &imagePath, &specError)) {
                 // Unreachable after pass 3 (same input). Kept so construction can
                 // never proceed on an unvalidated value; still before any mutation.
                 if (outError) *outError = specError;
@@ -1171,25 +1327,54 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                        "failed re-validation at construction — aborting without mutation");
                 return nil;
             }
+            VGGreenScreenBackgroundProvider *provider = nil;
+            if (parsed.outputMode == VGGreenScreenFilterNodeOutputModeImageFile) {
+                NSError *providerError = nil;
+                provider = [VGGreenScreenBackgroundProvider imageFileProviderWithPath:imagePath
+                                                                            scaleMode:parsed.scaleMode
+                                                                                error:&providerError];
+                if (!provider) {
+                    if (outError) *outError = providerError;
+                    NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: greenScreen "
+                           "imageFile background rejected (%@): %@ — aborting without mutation",
+                          providerError.domain, providerError.localizedDescription);
+                    return nil;
+                }
+            } else if (parsed.outputMode == VGGreenScreenFilterNodeOutputModeSolidColor) {
+                provider = [VGGreenScreenBackgroundProvider solidColorProviderWithARGB:parsed.argb];
+            }
             VGGreenScreenFilterNode *greenScreen =
                 [[VGGreenScreenFilterNode alloc] initWithPool:_sessionPool
                                                        device:metalDevice
-                                                   outputMode:outputMode
-                                               backgroundARGB:backgroundARGB];
+                                                   outputMode:parsed.outputMode
+                                           backgroundProvider:provider
+                                          foregroundTransform:parsed.transform];
             greenScreen.enabled = enabled;
             [nodes addObject:(id<VGMetalFilterNode>)greenScreen];
             // outputMode / backgroundType share the spec backgroundType string the
             // node was built from (same mapping the node reports in its own logs
             // and -diagnosticsSnapshot).
-            NSString *greenScreenOutputModeName =
-                (greenScreen.outputMode == VGGreenScreenFilterNodeOutputModeAlpha)
-                    ? VGGreenScreenFilterNodeBackgroundTypeAlpha
-                    : VGGreenScreenFilterNodeBackgroundTypeSolidColor;
+            NSString *greenScreenOutputModeName;
+            switch (greenScreen.outputMode) {
+                case VGGreenScreenFilterNodeOutputModeAlpha:
+                    greenScreenOutputModeName = VGGreenScreenFilterNodeBackgroundTypeAlpha; break;
+                case VGGreenScreenFilterNodeOutputModeImageFile:
+                    greenScreenOutputModeName = VGGreenScreenFilterNodeBackgroundTypeImageFile; break;
+                default:
+                    greenScreenOutputModeName = VGGreenScreenFilterNodeBackgroundTypeSolidColor; break;
+            }
+            const VGGreenScreenForegroundTransform t = greenScreen.foregroundTransform;
             NSLog(@"[VGCameraGraphSession] VGGreenScreenFilterNode constructed "
-                   "(outputMode=%@ backgroundType=%@ argb=0x%08X enabled=%d matteSource=%ld)",
+                   "(outputMode=%@ backgroundType=%@ argb=0x%08X imagePath=%@ scaleMode=%@ "
+                   "scale=%.3f offsetX=%.3f offsetY=%.3f enabled=%d matteSource=%ld)",
                   greenScreenOutputModeName,
                   greenScreenOutputModeName,
-                  greenScreen.backgroundARGB, (int)enabled, (long)greenScreen.matteSource);
+                  greenScreen.backgroundARGB,
+                  imagePath ?: @"",
+                  (parsed.outputMode == VGGreenScreenFilterNodeOutputModeImageFile)
+                      ? VGGreenScreenBackgroundScaleModeName(parsed.scaleMode) : @"",
+                  (double)t.scale, (double)t.offsetX, (double)t.offsetY,
+                  (int)enabled, (long)greenScreen.matteSource);
         }
         // Additional constructable types will be added in future phases.
     }
@@ -1387,22 +1572,54 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
     return success;
 }
 
-// ─── Phase 6C.2B: In-place hot parameter updates ─────────────────────────────
+// ─── Phase 6C.2B / UFM green screen: In-place hot parameter updates ─────────
 //
-// Validation: strictly enforces { "beauty": { "intensity": <number> } }.
-// Any other shape is rejected with UNSUPPORTED_TRANSACTION_POLICY before
-// touching the session queue.
+// Payload policy (effect keys ⊆ {beauty, greenScreen}, at least one):
+//   { "beauty":      { "intensity": <number [0.0, 1.0]> } }            (6C.2B, unchanged)
+//   { "greenScreen": { backgroundType + argb | imagePath [+ scaleMode],
+//                      and/or scale / offsetX / offsetY } }            (contract flat keys)
+// Both may appear in one payload. Any other effect key, any other beauty
+// parameter, any unknown greenScreen key, or a non-dictionary value is
+// rejected with UNSUPPORTED_TRANSACTION_POLICY before touching the session
+// queue.
+//
+// greenScreen semantics:
+//   • A background update needs backgroundType ("solidColor" + argb, or
+//     "imageFile" + imagePath [+ scaleMode]); argb/imagePath/scaleMode
+//     without backgroundType is INVALID_GREEN_SCREEN_FILTER_SPEC. "alpha"
+//     cannot be reached or left by a hot update (UNSUPPORTED_TRANSACTION_POLICY
+//     / HOT_UPDATE_FAIL 409): that is a filter-chain rebuild.
+//   • Transform keys are merged onto the node's CURRENT transform (absent
+//     components keep their value) and clamped to the contract ranges.
+//   • The imageFile background is decoded (once, bounded) on the caller's
+//     thread BEFORE the session queue is entered; a failed decode returns
+//     INVALID_GREEN_SCREEN_FILTER_SPEC and nothing changes.
+//   • The node applies background and transform atomically under its state
+//     lock (VGGreenScreenFilterNode
+//     -applyHotUpdateWithBackgroundProvider:foregroundTransform:error:); the
+//     graph, scheduler, camera and matte pipeline are never rebuilt or
+//     touched. A rejected update leaves the live node exactly as it was.
+//
+// Ordering: every effect is validated and its target node located before
+// anything is written; greenScreen is applied first (the only step that can
+// still fail at the node), then beauty, then _activeFilterSpecs is refreshed.
 //
 // Node lookup: iterates _currentFilterChain which holds the live concrete
-// filter node instances (VanguardBeautyFilterNode or BeautyV2FilterGroup)
-// as constructed by setCameraFilterChainFromSpecs:. No VGLegacyFilterAdapter
-// unwrapping is needed or present — _currentFilterChain never contains adapters.
+// filter node instances (VanguardBeautyFilterNode, BeautyV2FilterGroup,
+// VGGreenScreenFilterNode) as constructed by setCameraFilterChainFromSpecs:.
+// No VGLegacyFilterAdapter unwrapping is needed or present.
 //
-// Queue: all node access and intensity writes are serialized inside
+// Queue: all node access and writes are serialized inside
 // dispatch_sync(_sessionQueue). This is mutually exclusive with graph rebuild,
 // teardown, recording enable/disable, and photo capture arming.
 //
 // MUST NOT be called from _sessionQueue — dispatch_sync would deadlock.
+
+static NSError *_VGHotUpdatePolicyError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
+                               code:code
+                           userInfo:@{NSLocalizedDescriptionKey: message}];
+}
 
 - (BOOL)applyHotParameterUpdates:(NSDictionary<NSString *, NSDictionary<NSString *, id> *> *)updates
                             error:(NSError * _Nullable * _Nullable)outError
@@ -1416,62 +1633,128 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
         return YES;
     }
 
-    // ── Phase 6C.2B policy: exactly one effect key — "beauty" ─────────────────
-    if (updates.count != 1 || !updates[@"beauty"]) {
-        if (outError) {
-            NSString *badEffects = [updates.allKeys componentsJoinedByString:@", "];
-            *outError = [NSError
-                errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
-                           code:1
-                       userInfo:@{
-                NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:
-                        @"applyHotParameterUpdates: only {beauty:{intensity}} is supported "
-                         "in Phase 6C.2B. Received effects: %@.", badEffects]
-            }];
+    // ── Policy: effect keys ⊆ {beauty, greenScreen}, dictionary values ────────
+    for (id key in updates) {
+        if (![key isKindOfClass:[NSString class]] ||
+            !([key isEqualToString:@"beauty"] || [key isEqualToString:@"greenScreen"])) {
+            if (outError) {
+                NSString *badEffects = [updates.allKeys componentsJoinedByString:@", "];
+                *outError = _VGHotUpdatePolicyError(1, [NSString stringWithFormat:
+                    @"applyHotParameterUpdates: only {beauty:{intensity}} and "
+                     "{greenScreen:{backgroundType/argb/imagePath/scaleMode/scale/offsetX/offsetY}} "
+                     "are supported. Received effects: %@.", badEffects]);
+            }
+            return NO;
         }
-        return NO;
+        if (![updates[key] isKindOfClass:[NSDictionary class]]) {
+            if (outError) {
+                *outError = _VGHotUpdatePolicyError(1, [NSString stringWithFormat:
+                    @"applyHotParameterUpdates: the '%@' update must be a dictionary.", key]);
+            }
+            return NO;
+        }
     }
 
+    // ── beauty: validate (6C.2B policy, unchanged) ────────────────────────────
     NSDictionary<NSString *, id> *beautyUpdates = updates[@"beauty"];
-
-    // ── Phase 6C.2B policy: exactly one param key — "intensity" ───────────────
-    if (beautyUpdates.count != 1 || !beautyUpdates[@"intensity"]) {
-        if (outError) {
-            NSString *badParams = [beautyUpdates.allKeys componentsJoinedByString:@", "];
-            *outError = [NSError
-                errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
-                           code:2
-                       userInfo:@{
-                NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:
-                        @"applyHotParameterUpdates: only 'intensity' is a supported "
-                         "hot parameter for beauty in Phase 6C.2B. Received: %@.", badParams]
-            }];
+    const BOOL hasBeauty = (beautyUpdates != nil);
+    float clampedIntensity = 0.0f;
+    if (hasBeauty) {
+        // Exactly one param key — "intensity".
+        if (beautyUpdates.count != 1 || !beautyUpdates[@"intensity"]) {
+            if (outError) {
+                NSString *badParams = [beautyUpdates.allKeys componentsJoinedByString:@", "];
+                *outError = _VGHotUpdatePolicyError(2, [NSString stringWithFormat:
+                    @"applyHotParameterUpdates: only 'intensity' is a supported "
+                     "hot parameter for beauty in Phase 6C.2B. Received: %@.", badParams]);
+            }
+            return NO;
         }
-        return NO;
+        id rawIntensity = beautyUpdates[@"intensity"];
+        // Validate that the value is numeric.
+        if (![rawIntensity respondsToSelector:@selector(floatValue)]) {
+            if (outError) {
+                *outError = _VGHotUpdatePolicyError(3,
+                    @"applyHotParameterUpdates: beauty.intensity value must be numeric.");
+            }
+            return NO;
+        }
+        // Defensive clamp [0.0, 1.0]: Dart already clamps via VGParameterDescriptor,
+        // but native must not assume callers are well-behaved.
+        clampedIntensity = fminf(1.0f, fmaxf(0.0f, [rawIntensity floatValue]));
     }
 
-    id rawIntensity = beautyUpdates[@"intensity"];
-
-    // ── Validate that the value is numeric ────────────────────────────────────
-    if (![rawIntensity respondsToSelector:@selector(floatValue)]) {
-        if (outError) {
-            *outError = [NSError
-                errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
-                           code:3
-                       userInfo:@{
-                NSLocalizedDescriptionKey:
-                    @"applyHotParameterUpdates: beauty.intensity value must be numeric."
-            }];
+    // ── greenScreen: validate + build the new background off the queue ───────
+    NSDictionary<NSString *, id> *gsUpdates = updates[@"greenScreen"];
+    const BOOL hasGreenScreen = (gsUpdates != nil);
+    VGGreenScreenBackgroundProvider *newProvider = nil;   // nil = background unchanged
+    NSString *newImagePath = nil;
+    VGGreenScreenFilterNodeOutputMode newMode = VGGreenScreenFilterNodeOutputModeSolidColor;
+    uint32_t newARGB = 0;
+    VGGreenScreenBackgroundScaleMode newScaleMode = VGGreenScreenBackgroundScaleModeAspectFill;
+    BOOL hasBackgroundUpdate = NO;
+    if (hasGreenScreen) {
+        static NSSet<NSString *> *allowedKeys;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            allowedKeys = [NSSet setWithObjects:@"backgroundType", @"argb", @"imagePath", @"scaleMode",
+                                                @"scale", @"offsetX", @"offsetY", @"transform", nil];
+        });
+        if (gsUpdates.count == 0) {
+            if (outError) {
+                *outError = _VGHotUpdatePolicyError(2,
+                    @"applyHotParameterUpdates: greenScreen update carries no parameters.");
+            }
+            return NO;
         }
-        return NO;
+        for (id key in gsUpdates) {
+            if (![key isKindOfClass:[NSString class]] || ![allowedKeys containsObject:key]) {
+                if (outError) {
+                    NSString *badParams = [gsUpdates.allKeys componentsJoinedByString:@", "];
+                    *outError = _VGHotUpdatePolicyError(2, [NSString stringWithFormat:
+                        @"applyHotParameterUpdates: unsupported greenScreen hot parameter(s): %@. "
+                         "Supported: backgroundType, argb, imagePath, scaleMode, scale, offsetX, offsetY.",
+                        badParams]);
+                }
+                return NO;
+            }
+        }
+        const BOOL hasBackgroundKey =
+            gsUpdates[@"backgroundType"] != nil || gsUpdates[@"argb"] != nil ||
+            gsUpdates[@"imagePath"] != nil || gsUpdates[@"scaleMode"] != nil;
+        if (hasBackgroundKey) {
+            NSError *bgError = nil;
+            if (!_VGGreenScreenParseBackground(gsUpdates, &newMode, &newARGB, &newScaleMode,
+                                               &newImagePath, &bgError)) {
+                if (outError) *outError = bgError;
+                return NO;
+            }
+            if (newMode == VGGreenScreenFilterNodeOutputModeAlpha) {
+                if (outError) {
+                    *outError = _VGHotUpdatePolicyError(4,
+                        @"applyHotParameterUpdates: greenScreen backgroundType 'alpha' cannot be set "
+                         "by a hot update; apply a filter-chain rebuild transaction instead.");
+                }
+                return NO;
+            }
+            if (newMode == VGGreenScreenFilterNodeOutputModeImageFile) {
+                NSError *providerError = nil;
+                newProvider = [VGGreenScreenBackgroundProvider imageFileProviderWithPath:newImagePath
+                                                                               scaleMode:newScaleMode
+                                                                                   error:&providerError];
+                if (!newProvider) {
+                    if (outError) *outError = providerError;
+                    NSLog(@"[VGCameraGraphSession] applyHotParameterUpdates: greenScreen imageFile "
+                           "background rejected (%@): %@ — live background unchanged",
+                          providerError.domain, providerError.localizedDescription);
+                    return NO;
+                }
+            } else {
+                newProvider = [VGGreenScreenBackgroundProvider solidColorProviderWithARGB:newARGB];
+            }
+            hasBackgroundUpdate = YES;
+        }
     }
-
-    // ── Defensive clamp [0.0, 1.0] ───────────────────────────────────────────
-    // Dart already clamps via VGParameterDescriptor, but native must not assume
-    // callers are well-behaved (e.g. direct plugin calls, future bridging).
-    float clamped = fminf(1.0f, fmaxf(0.0f, [rawIntensity floatValue]));
 
     // ── Serialize on session queue ────────────────────────────────────────────
     __block BOOL success = NO;
@@ -1490,24 +1773,22 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
             return;
         }
 
-        // ── Iterate _currentFilterChain ───────────────────────────────────────
-        // _currentFilterChain holds the concrete filter node instances
-        // (VanguardBeautyFilterNode or BeautyV2FilterGroup) — no adapter
-        // wrapping is needed. These are the exact same objects the render loop
-        // accesses through VGLegacyFilterAdapter, so writing intensity here is
-        // immediately visible to the next frame's processEnvelope: call.
-        BOOL foundBeautyNode = NO;
+        // ── Locate every target node BEFORE writing anything ─────────────────
+        // _currentFilterChain holds the concrete filter node instances — no
+        // adapter wrapping is needed. These are the exact same objects the
+        // render loop accesses through VGLegacyFilterAdapter, so a write here
+        // is immediately visible to the next frame's processEnvelope: call.
+        NSMutableArray *beautyNodes = [NSMutableArray array];
+        VGGreenScreenFilterNode *greenScreenNode = nil;
         for (id node in self->_currentFilterChain) {
-            if ([node isKindOfClass:[VanguardBeautyFilterNode class]]) {
-                ((VanguardBeautyFilterNode *)node).intensity = clamped;
-                foundBeautyNode = YES;
-            } else if ([node isKindOfClass:[BeautyV2FilterGroup class]]) {
-                ((BeautyV2FilterGroup *)node).intensity = clamped;
-                foundBeautyNode = YES;
+            if ([node isKindOfClass:[VanguardBeautyFilterNode class]] ||
+                [node isKindOfClass:[BeautyV2FilterGroup class]]) {
+                [beautyNodes addObject:node];
+            } else if (!greenScreenNode && [node isKindOfClass:[VGGreenScreenFilterNode class]]) {
+                greenScreenNode = (VGGreenScreenFilterNode *)node;
             }
         }
-
-        if (!foundBeautyNode) {
+        if (hasBeauty && beautyNodes.count == 0) {
             innerError = [NSError
                 errorWithDomain:@"HOT_UPDATE_FAIL"
                            code:404
@@ -1518,22 +1799,96 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
             }];
             return;
         }
+        if (hasGreenScreen && !greenScreenNode) {
+            innerError = [NSError
+                errorWithDomain:@"HOT_UPDATE_FAIL"
+                           code:404
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    @"applyHotParameterUpdates: no active greenScreen filter node found "
+                     "in the current filter chain."
+            }];
+            return;
+        }
 
-        // [Beauty-Still]: Update the active spec snapshot with the new intensity
-        // so the next high-res still capture uses the current slider value.
+        // ── greenScreen first: merge transform onto the CURRENT one, then apply ─
+        VGGreenScreenForegroundTransform mergedTransform = VGGreenScreenForegroundTransformIdentity;
+        BOOL hasTransformUpdate = NO;
+        if (hasGreenScreen) {
+            mergedTransform = greenScreenNode.foregroundTransform;
+            NSError *transformError = nil;
+            if (!_VGGreenScreenParseTransform(gsUpdates, &mergedTransform, &hasTransformUpdate,
+                                              &transformError)) {
+                innerError = transformError;
+                return;
+            }
+            if (!hasBackgroundUpdate && !hasTransformUpdate) {
+                innerError = _VGHotUpdatePolicyError(2,
+                    @"applyHotParameterUpdates: greenScreen update changes neither the background "
+                     "nor the transform.");
+                return;
+            }
+            NSError *nodeError = nil;
+            if (![greenScreenNode applyHotUpdateWithBackgroundProvider:newProvider
+                                                   foregroundTransform:(hasTransformUpdate ? &mergedTransform : NULL)
+                                                                 error:&nodeError]) {
+                innerError = nodeError;
+                return;
+            }
+        }
+
+        // ── beauty: intensity write (cannot fail once the nodes exist) ────────
+        if (hasBeauty) {
+            for (id node in beautyNodes) {
+                if ([node isKindOfClass:[VanguardBeautyFilterNode class]]) {
+                    ((VanguardBeautyFilterNode *)node).intensity = clampedIntensity;
+                } else if ([node isKindOfClass:[BeautyV2FilterGroup class]]) {
+                    ((BeautyV2FilterGroup *)node).intensity = clampedIntensity;
+                }
+            }
+        }
+
+        // ── Refresh the active spec snapshot ──────────────────────────────────
+        // [Beauty-Still]: beauty.intensity feeds the next high-res still capture.
+        // greenScreen: the committed parameters now describe the live
+        // background/transform so later reads (diagnostics, rebuilds seeded from
+        // the active specs) see the current state.
         if (self->_activeFilterSpecs.count > 0) {
             NSMutableArray<NSDictionary *> *updatedSpecs =
                 [NSMutableArray arrayWithCapacity:self->_activeFilterSpecs.count];
             for (NSDictionary *spec in self->_activeFilterSpecs) {
                 NSString *type = spec[@"type"];
-                if ([type isEqualToString:@"beauty"]) {
+                NSDictionary *oldParams = spec[@"parameters"];
+                NSMutableDictionary *paramsCopy =
+                    [oldParams isKindOfClass:[NSDictionary class]]
+                    ? [oldParams mutableCopy]
+                    : [NSMutableDictionary dictionary];
+                BOOL changed = NO;
+                if (hasBeauty && [type isEqualToString:@"beauty"]) {
+                    paramsCopy[@"intensity"] = @(clampedIntensity);
+                    changed = YES;
+                } else if (hasGreenScreen && [type isEqualToString:@"greenScreen"]) {
+                    if (hasBackgroundUpdate) {
+                        [paramsCopy removeObjectsForKeys:@[@"argb", @"imagePath", @"scaleMode"]];
+                        if (newMode == VGGreenScreenFilterNodeOutputModeImageFile) {
+                            paramsCopy[@"backgroundType"] = VGGreenScreenFilterNodeBackgroundTypeImageFile;
+                            paramsCopy[@"imagePath"]      = newImagePath ?: @"";
+                            paramsCopy[@"scaleMode"]      = VGGreenScreenBackgroundScaleModeName(newScaleMode);
+                        } else {
+                            paramsCopy[@"backgroundType"] = VGGreenScreenFilterNodeBackgroundTypeSolidColor;
+                            paramsCopy[@"argb"]           = @(newARGB);
+                        }
+                    }
+                    if (hasTransformUpdate) {
+                        [paramsCopy removeObjectForKey:@"transform"];   // flat keys are canonical
+                        paramsCopy[@"scale"]   = @((double)mergedTransform.scale);
+                        paramsCopy[@"offsetX"] = @((double)mergedTransform.offsetX);
+                        paramsCopy[@"offsetY"] = @((double)mergedTransform.offsetY);
+                    }
+                    changed = YES;
+                }
+                if (changed) {
                     NSMutableDictionary *specCopy = [spec mutableCopy];
-                    NSDictionary *oldParams = spec[@"parameters"];
-                    NSMutableDictionary *paramsCopy =
-                        [oldParams isKindOfClass:[NSDictionary class]]
-                        ? [oldParams mutableCopy]
-                        : [NSMutableDictionary dictionary];
-                    paramsCopy[@"intensity"] = @(clamped);
                     specCopy[@"parameters"] = [paramsCopy copy];
                     [updatedSpecs addObject:[specCopy copy]];
                 } else {

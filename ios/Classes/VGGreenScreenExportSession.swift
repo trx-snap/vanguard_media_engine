@@ -538,7 +538,11 @@ private final class ExportRun {
         "no_realtime_clock",
         "no_cancellation",
         "no_container_rotation_auto_apply",
-        "no_image_exif_orientation_auto_apply",
+        // EXIF orientation IS applied on the primary bounded-thumbnail decode
+        // path (loadBackgroundImage). This narrower claim covers only the
+        // rare fallback (CGImageSourceCreateImageAtIndex with no transform
+        // option) used when ImageIO's thumbnail generation itself fails.
+        "no_image_exif_orientation_on_thumbnail_fallback_decode",
         "no_production_duet_wiring",
         "no_connectsapp_or_universal_editor_wiring",
         "fixed_offline_frame_clock_only",
@@ -1321,7 +1325,8 @@ private final class ExportRun {
     // MARK: Image / buffer helpers
 
     /// Decodes the background image bounded to `maxPixelSize` on its longer
-    /// side (never upscaled). EXIF orientation is deliberately NOT applied.
+    /// side (never upscaled). EXIF orientation is applied so the returned
+    /// CGImage is in visual (display) orientation, matching preview.
     private static func loadBackgroundImage(path: String, maxPixelSize: Int) -> CGImage? {
         let url = URL(fileURLWithPath: path) as CFURL
         let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
@@ -1331,7 +1336,7 @@ private final class ExportRun {
         }
         let thumbnailOptions: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: false,
+            kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixelSize),
             kCGImageSourceShouldCacheImmediately: true,
         ]

@@ -179,20 +179,35 @@ NS_ASSUME_NONNULL_BEGIN
 ///   - "beauty" (V1: no beautyVersion key or beautyVersion:1; V2: beautyVersion:2,
 ///     optionally faceAwareEnabled — see the implementation for the V2 path).
 ///   - "greenScreen" — live green screen as a camera graph filter
-///     (VGGreenScreenFilterNode). Supports two backgroundType values:
-///       "backgroundType" (NSString) — "solidColor" or "alpha"
+///     (VGGreenScreenFilterNode). Canonical flat parameter keys
+///     (packages/UMF/Docs/Vanguard_Unified_Camera_GreenScreen_Contract.md):
+///       "backgroundType" (NSString) — "solidColor", "imageFile" or "alpha"
 ///       "argb"           (NSNumber) — integer 0xAARRGGBB, 0 … 0xFFFFFFFF
 ///                                     (alpha byte ignored; background is
 ///                                     opaque). Required for "solidColor";
-///                                     ignored for "alpha" (the node emits a
-///                                     straight-alpha keyed stream instead of
-///                                     compositing over a background).
+///                                     ignored otherwise.
+///       "imagePath"      (NSString) — non-empty ABSOLUTE local path of a
+///                                     still image. Required for "imageFile";
+///                                     existence and decodability are checked
+///                                     before any graph mutation.
+///       "scaleMode"      (NSString) — "aspectFill" (default) or "aspectFit";
+///                                     imageFile placement.
+///       "scale"          (NSNumber) — optional subject scale, clamped to
+///                                     [0.25, 3.0] (default 1.0).
+///       "offsetX"/"offsetY" (NSNumber) — optional subject offsets, clamped to
+///                                     [-1.0, 1.0] (default 0.0; offsetY > 0
+///                                     moves the subject down). A legacy nested
+///                                     "transform" dictionary is accepted only
+///                                     when no flat key is present.
+///     "alpha" emits a straight-alpha keyed stream instead of compositing.
 ///     Optional: "enabled" (NSNumber/BOOL, default YES).
 ///     Malformed parameters (missing dictionary, missing/non-string
-///     backgroundType, or — for "solidColor" — missing/non-number/out-of-range
-///     argb) return INVALID_GREEN_SCREEN_FILTER_SPEC. A well-formed
-///     backgroundType other than "solidColor" or "alpha" returns
-///     UNSUPPORTED_FILTER_TYPE. Neither mutates the graph.
+///     backgroundType, solidColor argb missing/non-number/out-of-range,
+///     imageFile imagePath missing/relative/unreadable/undecodable, bad
+///     scaleMode, non-finite transform components) return
+///     INVALID_GREEN_SCREEN_FILTER_SPEC. A well-formed backgroundType other
+///     than the three above (e.g. video) returns UNSUPPORTED_FILTER_TYPE.
+///     Neither mutates the graph.
 ///     The node is a plain transform node: it owns no camera, ARSession or
 ///     texture registration, applies no rotation/mirroring, and fails open to
 ///     the input frame on any per-frame failure. Matte quality is MVP-level
@@ -287,12 +302,27 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Applies in-place hot parameter updates to active camera graph filter nodes.
 ///
-/// Phase 6C.2B scope: supports ONLY the following payload shape:
-///   { "beauty": { "intensity": <number [0.0, 1.0]> } }
+/// Supported payload shapes (both effects may appear in one payload):
+///   { "beauty":      { "intensity": <number [0.0, 1.0]> } }
+///   { "greenScreen": { "backgroundType": "solidColor", "argb": <int> } }
+///   { "greenScreen": { "backgroundType": "imageFile", "imagePath": <abs path>,
+///                      "scaleMode": "aspectFill" | "aspectFit" } }
+///   { "greenScreen": { "scale": <n>, "offsetX": <n>, "offsetY": <n> } }
+///   ... or any greenScreen background + transform combination.
+///
+/// greenScreen updates change the live VGGreenScreenFilterNode IN PLACE
+/// (background swap and/or subject transform); the camera graph is never
+/// rebuilt and the camera never restarts. Transform components not present
+/// keep their current value; all are clamped to the contract ranges. A
+/// failed greenScreen update (bad/undecodable image, alpha-mode node, unknown
+/// key) leaves the live node, background and transform unchanged and applies
+/// nothing else from the payload. backgroundType "alpha" cannot be set or
+/// left by a hot update (use a rebuild transaction).
 ///
 /// Any other effect type, parameter name, or payload shape is rejected with
-/// UNSUPPORTED_TRANSACTION_POLICY.  If no active beauty filter is found in the
-/// current filter chain, returns NO with HOT_UPDATE_FAIL.
+/// UNSUPPORTED_TRANSACTION_POLICY. Malformed greenScreen values return
+/// INVALID_GREEN_SCREEN_FILTER_SPEC. If a requested effect has no active node
+/// in the current filter chain, returns NO with HOT_UPDATE_FAIL.
 ///
 /// Threading:
 ///   - Safe to call from the main/plugin thread.
@@ -304,9 +334,9 @@ NS_ASSUME_NONNULL_BEGIN
 ///                    { effectType (NSString*): { paramName (NSString*): value (NSNumber*) } }
 /// @param outError  On failure, set to a descriptive NSError whose domain is
 ///                  one of: "UNSUPPORTED_TRANSACTION_POLICY", "HOT_UPDATE_FAIL",
-///                  "VGCameraGraphSession".
-/// @return YES on success (intensity applied to all active beauty nodes), NO on
-///         any validation or session failure.
+///                  "INVALID_GREEN_SCREEN_FILTER_SPEC", "VGCameraGraphSession".
+/// @return YES on success (every requested update applied to its active node),
+///         NO on any validation or session failure.
 - (BOOL)applyHotParameterUpdates:(NSDictionary<NSString *, NSDictionary<NSString *, id> *> *)updates
                             error:(NSError * _Nullable * _Nullable)outError;
 

@@ -175,7 +175,8 @@ final class VGLiveGreenScreenStaticBackgroundRenderer {
     }
 
     /// Decodes the image bounded to `maxPixelSize` on its longer side (never
-    /// upscaled). EXIF orientation is deliberately NOT applied.
+    /// upscaled). EXIF orientation is applied so the returned CGImage is in
+    /// visual (display) orientation.
     private static func loadImage(path: String, maxPixelSize: Int) -> CGImage? {
         let url = URL(fileURLWithPath: path) as CFURL
         let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
@@ -185,7 +186,7 @@ final class VGLiveGreenScreenStaticBackgroundRenderer {
         }
         let thumbnailOptions: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: false,
+            kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixelSize),
             kCGImageSourceShouldCacheImmediately: true,
         ]

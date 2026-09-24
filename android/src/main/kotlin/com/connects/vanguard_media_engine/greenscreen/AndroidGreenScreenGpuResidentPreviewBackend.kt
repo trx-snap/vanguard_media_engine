@@ -7,11 +7,13 @@ import android.graphics.SurfaceTexture
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.gpu.GpuDelegateFactory
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
@@ -131,6 +133,15 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         private const val MAX_CONSECUTIVE_INFERENCE_FAILURES = 3
 
         private const val CPU_FALLBACK_THREADS = 4
+
+        /**
+         * App-cache-relative directory for the TFLite GPU delegate's compiled
+         * kernel serialization cache (setSerializationParams). Persists across
+         * process restarts (app cache, not the interpreter/delegate object
+         * itself, which is always closed in [teardownCoreQuietly]) so a warm
+         * second launch can skip GPU shader/kernel recompilation.
+         */
+        private const val GPU_DELEGATE_SERIALIZATION_CACHE_DIR_NAME = "vanguard_gs_tflite_gpu_cache"
 
         // Native camera-layer modes (GlesGreenScreenGpuResidentRenderer::CameraMode).
         private const val CAMERA_MODE_NONE = 0
@@ -986,13 +997,20 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
      * byte sizes. Throws on any unsupported model.
      */
     private fun openModelSession(): ModelSession {
+        val sessionStartNs = System.nanoTime()
+        val loadStartNs = System.nanoTime()
         val modelBytes = loadModelBytes()
         verifyFlatBufferIdentifier(modelBytes)
+        val loadMs = elapsedMs(loadStartNs)
 
         var delegate: GpuDelegate? = null
         var delegateLabel: String
         var options = Interpreter.Options()
+        var gpuOptionsMs = 0.0
+        var gpuDelegateMs = 0.0
+        var serializationApplied = false
         try {
+            val optionsStartNs = System.nanoTime()
             var gpuOptions: GpuDelegateFactory.Options? = null
             var source = "default_options"
             try {
@@ -1011,10 +1029,15 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             val resolved = gpuOptions ?: GpuDelegateFactory.Options()
             resolved.setInferencePreference(GpuDelegateFactory.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
             resolved.setPrecisionLossAllowed(true)
+            serializationApplied = applyGpuDelegateSerialization(resolved)
+            gpuOptionsMs = elapsedMs(optionsStartNs)
+
+            val delegateStartNs = System.nanoTime()
             val gpuDelegate = GpuDelegate(resolved)
+            gpuDelegateMs = elapsedMs(delegateStartNs)
             delegate = gpuDelegate
             options.addDelegate(gpuDelegate)
-            delegateLabel = "gpu:$source"
+            delegateLabel = "gpu:$source${if (serializationApplied) "+cache" else ""}"
         } catch (t: Throwable) {
             Log.w(
                 TAG,
@@ -1027,6 +1050,7 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             delegateLabel = "cpu_xnnpack"
         }
 
+        val interpreterStartNs = System.nanoTime()
         var interpreter: Interpreter
         try {
             interpreter = Interpreter(modelBytes, options)
@@ -1042,9 +1066,12 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             delegateLabel = "cpu_xnnpack"
             interpreter = Interpreter(modelBytes, cpuInterpreterOptions())
         }
+        val interpreterMs = elapsedMs(interpreterStartNs)
 
         try {
+            val allocateStartNs = System.nanoTime()
             interpreter.allocateTensors()
+            val allocateMs = elapsedMs(allocateStartNs)
 
             if (interpreter.inputTensorCount != 1) {
                 throw IllegalStateException("expected 1 input tensor, got ${interpreter.inputTensorCount}")
@@ -1100,6 +1127,14 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             val inputBuffer = ByteBuffer.allocateDirect(inputBytes).order(ByteOrder.nativeOrder())
             val outputBuffer = ByteBuffer.allocateDirect(outputBytes).order(ByteOrder.nativeOrder())
 
+            Log.i(
+                TAG,
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_MODEL_SESSION_TIMING loadMs=$loadMs " +
+                    "gpuOptionsMs=$gpuOptionsMs gpuDelegateMs=$gpuDelegateMs interpreterMs=$interpreterMs " +
+                    "allocateMs=$allocateMs sessionTotalMs=${elapsedMs(sessionStartNs)} " +
+                    "delegate=$delegateLabel serialized=$serializationApplied",
+            )
+
             return ModelSession(
                 interpreter = interpreter,
                 gpuDelegate = delegate,
@@ -1118,6 +1153,69 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             try { delegate?.close() } catch (_: Throwable) {}
             throw t
         }
+    }
+
+    private fun elapsedMs(startNs: Long): Double = (System.nanoTime() - startNs) / 1_000_000.0
+
+    /**
+     * Configures the TFLite GPU delegate's on-disk compiled-kernel
+     * serialization cache (setSerializationParams) so a warm second launch
+     * can skip GPU shader/kernel recompilation, the dominant cost in the
+     * ~1954ms cold ANDROID_GREENSCREEN_GPU_RESIDENT_BACKEND_READY initMs.
+     * This persists a compilation cache on app-cache disk only -- it does
+     * NOT keep the live delegate/interpreter object itself alive across
+     * [teardownCoreQuietly]; a fresh [GpuDelegate] is still created on every
+     * session start, exactly as before.
+     *
+     * Fails soft: any exception (e.g. cache dir not creatable, unwritable
+     * storage) is logged and the GPU delegate still gets created without
+     * serialization, since this must never block Green Screen startup.
+     */
+    private fun applyGpuDelegateSerialization(options: GpuDelegateFactory.Options): Boolean {
+        return try {
+            val cacheDir = File(context.cacheDir, GPU_DELEGATE_SERIALIZATION_CACHE_DIR_NAME)
+            if (!cacheDir.isDirectory && !cacheDir.mkdirs()) {
+                Log.w(
+                    TAG,
+                    "ANDROID_GREENSCREEN_GPU_RESIDENT_SERIALIZATION_CACHE_UNAVAILABLE reason=cache_dir_create_failed",
+                )
+                return false
+            }
+            options.setSerializationParams(cacheDir.absolutePath, gpuDelegateModelToken())
+            true
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "ANDROID_GREENSCREEN_GPU_RESIDENT_SERIALIZATION_CACHE_UNAVAILABLE reason=exception " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            false
+        }
+    }
+
+    /**
+     * Stable token identifying this model asset + app build + delegate
+     * backend, so a cached serialized kernel is only reused across launches
+     * of the exact same app build; a new app version (which is required to
+     * ship any changed model asset, since it is bundled in the APK) gets a
+     * distinct token and therefore a fresh cache entry rather than a stale
+     * or mismatched one. Never throws; falls back to a fixed placeholder if
+     * package info cannot be read.
+     */
+    private fun gpuDelegateModelToken(): String {
+        val assetName = modelAssetPath.substringAfterLast('/')
+        val versionToken = try {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                info.longVersionCode.toString()
+            } else {
+                @Suppress("DEPRECATION")
+                info.versionCode.toString()
+            }
+        } catch (t: Throwable) {
+            "unknown"
+        }
+        return "${assetName}_v${versionToken}_gpu"
     }
 
     private fun cpuInterpreterOptions(): Interpreter.Options =
@@ -1374,7 +1472,11 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
         }
     }
 
-    /** Decodes [path] as ARGB_8888 with the long side bounded to [MAX_BACKGROUND_IMAGE_DIMENSION]. */
+    /**
+     * Decodes [path] as ARGB_8888 with the long side bounded to
+     * [MAX_BACKGROUND_IMAGE_DIMENSION]. EXIF orientation is applied so the
+     * returned bitmap has post-EXIF visual dimensions/orientation.
+     */
     private fun decodeBoundedBitmap(path: String): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
@@ -1388,9 +1490,11 @@ class AndroidGreenScreenGpuResidentPreviewBackend(
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
         val decoded = BitmapFactory.decodeFile(path, options) ?: return null
-        if (decoded.config == Bitmap.Config.ARGB_8888) return decoded
-        val converted = decoded.copy(Bitmap.Config.ARGB_8888, false)
-        decoded.recycle()
+        val orientation = AndroidStillImageDecoder.readExifOrientation(path)
+        val oriented = AndroidStillImageDecoder.applyExifOrientation(decoded, orientation)
+        if (oriented.config == Bitmap.Config.ARGB_8888) return oriented
+        val converted = oriented.copy(Bitmap.Config.ARGB_8888, false)
+        oriented.recycle()
         return converted
     }
 

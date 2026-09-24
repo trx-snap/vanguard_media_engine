@@ -15,7 +15,10 @@
 #import <CoreImage/CoreImage.h>   // S1 matte refinement + CIBlendWithMask composite
 #import <Metal/Metal.h>
 #import <Vision/Vision.h>         // person matte (iOS 15+)
+#import <ImageIO/ImageIO.h>       // still-image background decode (VGGreenScreenBackgroundProvider)
+#import <CoreGraphics/CoreGraphics.h>
 #import <os/lock.h>               // telemetry lock (os_unfair_lock)
+#import <math.h>                  // isfinite (transform clamping)
 #import <stdatomic.h>
 
 // Swift bridge: VGMatteRefinementPipeline + VGMatteRefinementLiveResult
@@ -53,11 +56,19 @@
 //      Each stage fails open to its input mask inside the pipeline and reports
 //      an applied flag; a nil bridge result (never expected) fails the frame
 //      open with reason matte_refinement_failed.
-//   6. Output stage, selected by outputMode (fixed at init):
+//   5b. Subject transform (canonical flat scale/offsetX/offsetY): when not the
+//      identity, the SAME affine transform is applied to the foreground and
+//      to the refined matte (refinement always runs at source scale first, so
+//      matte quality is unchanged by the transform). Read per frame under the
+//      node's state lock together with the current background provider.
+//   6. Output stage, selected by the current outputMode:
 //        solidColor — CIBlendWithMask: inputImage = foreground,
 //                     inputBackgroundImage = solid colour, inputMaskImage =
 //                     refined matte (255 = subject → foreground). Unchanged
 //                     from the MVP; pixel output is identical.
+//        imageFile  — identical blend with inputBackgroundImage = the
+//                     provider's canvas-sized still image (rendered once per
+//                     canvas size; see VGGreenScreenBackgroundProvider).
 //        alpha      — straight-alpha construction
 //                     (_VGGSFNStraightAlphaKeyedImage): CIColorMatrix zeroes
 //                     the foreground's alpha, then CIBlendWithMask mixes the
@@ -75,6 +86,9 @@
 //
 // Logging markers (grep in device logs):
 //   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_NODE_CREATED
+//   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_HOT_UPDATE           (every accepted in-place update)
+//   IOS_CAMERA_GRAPH_GREENSCREEN_BACKGROUND_DECODED          (imageFile provider, once per decode)
+//   IOS_CAMERA_GRAPH_GREENSCREEN_BACKGROUND_CANVAS_RENDERED  (once per canvas size per provider)
 //   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_ALPHA_BYTE_SELF_TEST (alpha mode only, once at init)
 //   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_PROOF_UNAVAILABLE   (iOS < 15 only, once)
 //   IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_FRAME               (frames 1-3, then every 60th)
@@ -89,15 +103,88 @@
 
 NSString * const VGGreenScreenFilterNodeBackgroundTypeSolidColor = @"solidColor";
 NSString * const VGGreenScreenFilterNodeBackgroundTypeAlpha      = @"alpha";
+NSString * const VGGreenScreenFilterNodeBackgroundTypeImageFile  = @"imageFile";
+
+// VGGreenScreenBackgroundProvider.h constants (implementation inlined below).
+NSString * const VGGreenScreenBackgroundTypeImageFile            = @"imageFile";
+NSString * const VGGreenScreenBackgroundScaleModeAspectFillName  = @"aspectFill";
+NSString * const VGGreenScreenBackgroundScaleModeAspectFitName   = @"aspectFit";
+const NSUInteger VGGreenScreenBackgroundImageMaxPixelSize        = 2160;
+
+// Canonical flat foreground transform contract.
+const float VGGreenScreenForegroundScaleMin  = 0.25f;
+const float VGGreenScreenForegroundScaleMax  = 3.0f;
+const float VGGreenScreenForegroundOffsetMin = -1.0f;
+const float VGGreenScreenForegroundOffsetMax = 1.0f;
+const VGGreenScreenForegroundTransform VGGreenScreenForegroundTransformIdentity = {1.0f, 0.0f, 0.0f};
+
+static float _VGGSFNClampComponent(double value, float identity, float lo, float hi) {
+    if (!isfinite(value)) return identity;
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return (float)value;
+}
+
+VGGreenScreenForegroundTransform
+VGGreenScreenForegroundTransformMakeClamped(double scale, double offsetX, double offsetY) {
+    VGGreenScreenForegroundTransform t;
+    t.scale   = _VGGSFNClampComponent(scale,   1.0f, VGGreenScreenForegroundScaleMin,  VGGreenScreenForegroundScaleMax);
+    t.offsetX = _VGGSFNClampComponent(offsetX, 0.0f, VGGreenScreenForegroundOffsetMin, VGGreenScreenForegroundOffsetMax);
+    t.offsetY = _VGGSFNClampComponent(offsetY, 0.0f, VGGreenScreenForegroundOffsetMin, VGGreenScreenForegroundOffsetMax);
+    return t;
+}
+
+BOOL VGGreenScreenForegroundTransformIsIdentity(VGGreenScreenForegroundTransform t) {
+    return t.scale == 1.0f && t.offsetX == 0.0f && t.offsetY == 0.0f;
+}
+
+BOOL VGGreenScreenBackgroundScaleModeFromSpecValue(id _Nullable value,
+                                                   VGGreenScreenBackgroundScaleMode * _Nonnull outMode) {
+    if (value == nil || value == [NSNull null]) {
+        *outMode = VGGreenScreenBackgroundScaleModeAspectFill;   // contract default
+        return YES;
+    }
+    if (![value isKindOfClass:[NSString class]]) return NO;
+    if ([value isEqualToString:VGGreenScreenBackgroundScaleModeAspectFillName]) {
+        *outMode = VGGreenScreenBackgroundScaleModeAspectFill;
+        return YES;
+    }
+    if ([value isEqualToString:VGGreenScreenBackgroundScaleModeAspectFitName]) {
+        *outMode = VGGreenScreenBackgroundScaleModeAspectFit;
+        return YES;
+    }
+    return NO;
+}
+
+NSString *VGGreenScreenBackgroundScaleModeName(VGGreenScreenBackgroundScaleMode mode) {
+    return (mode == VGGreenScreenBackgroundScaleModeAspectFit)
+        ? VGGreenScreenBackgroundScaleModeAspectFitName
+        : VGGreenScreenBackgroundScaleModeAspectFillName;
+}
 
 static const uint64_t kVGGreenScreenFilterLogInterval = 60;
 
 // Output mode → the spec backgroundType string it was built from. Used for
 // logs and -diagnosticsSnapshot (outputMode / backgroundType share the value).
 static NSString *_VGGSFNOutputModeName(VGGreenScreenFilterNodeOutputMode mode) {
-    return (mode == VGGreenScreenFilterNodeOutputModeAlpha)
-        ? VGGreenScreenFilterNodeBackgroundTypeAlpha
-        : VGGreenScreenFilterNodeBackgroundTypeSolidColor;
+    switch (mode) {
+        case VGGreenScreenFilterNodeOutputModeAlpha:     return VGGreenScreenFilterNodeBackgroundTypeAlpha;
+        case VGGreenScreenFilterNodeOutputModeImageFile: return VGGreenScreenFilterNodeBackgroundTypeImageFile;
+        default:                                         return VGGreenScreenFilterNodeBackgroundTypeSolidColor;
+    }
+}
+
+// Subject transform (see the header): the full frame scaled by `scale` about
+// the canvas centre, its centre moved to (cx + offsetX·cx, cy + offsetY·cy) in
+// top-left canvas space. Expressed in Core Image's bottom-left space, so
+// offsetY > 0 (down) becomes a NEGATIVE y translation.
+static CGAffineTransform _VGGSFNSubjectTransform(VGGreenScreenForegroundTransform t, CGRect canvas) {
+    const CGFloat W  = canvas.size.width;
+    const CGFloat H  = canvas.size.height;
+    const CGFloat s  = (CGFloat)t.scale;
+    const CGFloat tx = (W - s * W) * 0.5 + (CGFloat)t.offsetX * W * 0.5;
+    const CGFloat ty = (H - s * H) * 0.5 - (CGFloat)t.offsetY * H * 0.5;
+    return CGAffineTransformMake(s, 0.0, 0.0, s, tx, ty);
 }
 
 // Alpha encoding reported by logs and -diagnosticsSnapshot. "straight" is
@@ -161,6 +248,259 @@ static BOOL _VGGSFNRenderStraightAlpha(id<MTLDevice> device, CIImage *keyed,
     [ctx render:keyed toCVPixelBuffer:output bounds:bounds colorSpace:NULL];
     return YES;
 }
+
+// ─── VGGreenScreenBackgroundProvider (inlined; see VGGreenScreenBackgroundProvider.h) ──
+//
+// Static background source of the composite modes. Immutable after
+// construction (kind / colour / path / scale mode / decoded CGImage); the
+// only mutable state is the single-entry canvas cache below, guarded by
+// _cacheLock. The one-time canvas render goes through the node's shared
+// no-colour-space CIContext into an IOSurface-backed 32BGRA buffer, so the
+// per-frame composite samples one texture and never re-decodes or re-places
+// the image. Beauty runs on the subject upstream and never touches this
+// background, which therefore stays crisp.
+
+static CVPixelBufferRef _Nullable _VGGSFNCreateCanvasBuffer(size_t width, size_t height) {
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferMetalCompatibilityKey:  @YES,
+    };
+    CVPixelBufferRef buffer = NULL;
+    const CVReturn rv = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                                            (__bridge CFDictionaryRef)attrs, &buffer);
+    if (rv != kCVReturnSuccess || !buffer) return NULL;
+    return buffer;
+}
+
+static NSError *_VGGSFNInvalidBackgroundError(NSString *message) {
+    return [NSError errorWithDomain:@"INVALID_GREEN_SCREEN_FILTER_SPEC"
+                               code:4
+                           userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+@implementation VGGreenScreenBackgroundProvider {
+    VGGreenScreenBackgroundKind      _kind;
+    uint32_t                         _argb;
+    NSString                        *_imagePath;
+    VGGreenScreenBackgroundScaleMode _scaleMode;
+    CGImageRef                       _image;          // +1 owned (imageFile); NULL for solidColor
+    size_t                           _imageWidth;
+    size_t                           _imageHeight;
+
+    os_unfair_lock                   _cacheLock;
+    CVPixelBufferRef                 _cachedCanvas;   // +1 owned; imageFile only
+    CIImage                         *_cachedCanvasImage;
+    size_t                           _cachedWidth;
+    size_t                           _cachedHeight;
+}
+
+@synthesize kind        = _kind;
+@synthesize argb        = _argb;
+@synthesize imagePath   = _imagePath;
+@synthesize scaleMode   = _scaleMode;
+@synthesize imageWidth  = _imageWidth;
+@synthesize imageHeight = _imageHeight;
+
+- (instancetype)_initWithKind:(VGGreenScreenBackgroundKind)kind
+                         argb:(uint32_t)argb
+                    imagePath:(nullable NSString *)imagePath
+                    scaleMode:(VGGreenScreenBackgroundScaleMode)scaleMode
+                        image:(nullable CGImageRef)image {
+    self = [super init];
+    if (!self) return nil;
+    _kind       = kind;
+    _argb       = argb;
+    _imagePath  = [imagePath copy];
+    _scaleMode  = scaleMode;
+    _image      = image ? CGImageRetain(image) : NULL;
+    _imageWidth  = image ? CGImageGetWidth(image)  : 0;
+    _imageHeight = image ? CGImageGetHeight(image) : 0;
+    _cacheLock  = OS_UNFAIR_LOCK_INIT;
+    return self;
+}
+
+- (void)dealloc {
+    if (_image) {
+        CGImageRelease(_image);
+        _image = NULL;
+    }
+    if (_cachedCanvas) {
+        CVPixelBufferRelease(_cachedCanvas);
+        _cachedCanvas = NULL;
+    }
+}
+
++ (instancetype)solidColorProviderWithARGB:(uint32_t)argb {
+    return [[self alloc] _initWithKind:VGGreenScreenBackgroundKindSolidColor
+                                  argb:argb
+                             imagePath:nil
+                             scaleMode:VGGreenScreenBackgroundScaleModeAspectFill
+                                 image:NULL];
+}
+
++ (nullable instancetype)imageFileProviderWithPath:(NSString *)imagePath
+                                         scaleMode:(VGGreenScreenBackgroundScaleMode)scaleMode
+                                             error:(NSError * _Nullable * _Nullable)outError {
+    if (![imagePath isKindOfClass:[NSString class]] || imagePath.length == 0) {
+        if (outError) *outError = _VGGSFNInvalidBackgroundError(
+            @"greenScreen imageFile requires parameters.imagePath (non-empty absolute path).");
+        return nil;
+    }
+    if (![imagePath hasPrefix:@"/"]) {
+        if (outError) *outError = _VGGSFNInvalidBackgroundError(
+            [NSString stringWithFormat:@"greenScreen imagePath must be an absolute local path (got '%@').", imagePath]);
+        return nil;
+    }
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:imagePath isDirectory:&isDirectory] || isDirectory) {
+        if (outError) *outError = _VGGSFNInvalidBackgroundError(
+            [NSString stringWithFormat:@"greenScreen imagePath does not exist or is not a file: '%@'.", imagePath]);
+        return nil;
+    }
+
+    // Bounded decode through ImageIO. EXIF orientation IS applied (parity
+    // with VGLiveGreenScreenStaticBackgroundRenderer / the export renderer,
+    // so one path renders identically, in visual orientation, on every surface).
+    NSURL *url = [NSURL fileURLWithPath:imagePath isDirectory:NO];
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url,
+                                                         (__bridge CFDictionaryRef)@{
+        (id)kCGImageSourceShouldCache: @NO,
+    });
+    if (!source) {
+        if (outError) *outError = _VGGSFNInvalidBackgroundError(
+            [NSString stringWithFormat:@"greenScreen imagePath could not be opened as an image: '%@'.", imagePath]);
+        return nil;
+    }
+    CGImageRef image = NULL;
+    if (CGImageSourceGetCount(source) > 0) {
+        NSDictionary *options = @{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceCreateThumbnailWithTransform:   @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize:          @(VGGreenScreenBackgroundImageMaxPixelSize),
+            (id)kCGImageSourceShouldCache:                    @NO,
+        };
+        image = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
+        if (!image) {
+            // Some encoders reject thumbnail generation; fall back to a full decode.
+            image = CGImageSourceCreateImageAtIndex(source, 0, (__bridge CFDictionaryRef)@{
+                (id)kCGImageSourceShouldCache: @NO,
+            });
+        }
+    }
+    CFRelease(source);
+    if (!image || CGImageGetWidth(image) == 0 || CGImageGetHeight(image) == 0) {
+        if (image) CGImageRelease(image);
+        if (outError) *outError = _VGGSFNInvalidBackgroundError(
+            [NSString stringWithFormat:@"greenScreen imagePath could not be decoded as an image: '%@'.", imagePath]);
+        return nil;
+    }
+
+    VGGreenScreenBackgroundProvider *provider =
+        [[self alloc] _initWithKind:VGGreenScreenBackgroundKindImageFile
+                               argb:0
+                          imagePath:imagePath
+                          scaleMode:scaleMode
+                              image:image];
+    CGImageRelease(image);   // the provider retained its own +1
+    NSLog(@"[VGGreenScreenBackgroundProvider] IOS_CAMERA_GRAPH_GREENSCREEN_BACKGROUND_DECODED "
+           "path=%@ size=%zux%zu scaleMode=%@ maxPixelSize=%lu exifApplied=1",
+          imagePath, provider->_imageWidth, provider->_imageHeight,
+          VGGreenScreenBackgroundScaleModeName(scaleMode),
+          (unsigned long)VGGreenScreenBackgroundImageMaxPixelSize);
+    return provider;
+}
+
+- (NSString *)backgroundTypeName {
+    return (_kind == VGGreenScreenBackgroundKindImageFile)
+        ? VGGreenScreenBackgroundTypeImageFile
+        : VGGreenScreenFilterNodeBackgroundTypeSolidColor;
+}
+
+// Places the decoded image into the canvas (Core Image bottom-left space):
+// aspectFill covers and centre-crops, aspectFit contains and centres over
+// opaque black. Returns a lazy recipe cropped exactly to the canvas.
+- (nullable CIImage *)_placedImageForCanvas:(CGRect)canvas {
+    if (!_image || _imageWidth == 0 || _imageHeight == 0) return nil;
+    CIImage *image = [CIImage imageWithCGImage:_image];
+    if (!image) return nil;
+    const CGFloat W  = canvas.size.width;
+    const CGFloat H  = canvas.size.height;
+    const CGFloat sx = W / (CGFloat)_imageWidth;
+    const CGFloat sy = H / (CGFloat)_imageHeight;
+    const CGFloat s  = (_scaleMode == VGGreenScreenBackgroundScaleModeAspectFit) ? MIN(sx, sy) : MAX(sx, sy);
+    const CGFloat tx = (W - (CGFloat)_imageWidth  * s) * 0.5;
+    const CGFloat ty = (H - (CGFloat)_imageHeight * s) * 0.5;
+    CIImage *placed = [image imageByApplyingTransform:CGAffineTransformMake(s, 0.0, 0.0, s, tx, ty)];
+    if (_scaleMode == VGGreenScreenBackgroundScaleModeAspectFit) {
+        CIImage *black = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1.0]]
+                          imageByCroppingToRect:canvas];
+        placed = [placed imageByCompositingOverImage:black];
+    }
+    return [placed imageByCroppingToRect:canvas];
+}
+
+- (nullable CIImage *)canvasImageForWidth:(size_t)width
+                                   height:(size_t)height
+                                   device:(id<MTLDevice>)device {
+    if (width == 0 || height == 0) return nil;
+    const CGRect canvas = CGRectMake(0, 0, (CGFloat)width, (CGFloat)height);
+
+    // Solid colour: an infinite colour image cropped to the canvas is already
+    // the cheapest possible background (no buffer, no render); cache the crop.
+    os_unfair_lock_lock(&_cacheLock);
+    CIImage *cached = (_cachedWidth == width && _cachedHeight == height) ? _cachedCanvasImage : nil;
+    os_unfair_lock_unlock(&_cacheLock);
+    if (cached) return cached;
+
+    CIImage *canvasImage = nil;
+    CVPixelBufferRef canvasBuffer = NULL;
+    if (_kind == VGGreenScreenBackgroundKindSolidColor) {
+        // Raw sRGB components, alpha forced opaque. With the unmanaged CIContext
+        // these component values reach the output bytes as-is (MVP behaviour).
+        const CGFloat r = ((_argb >> 16) & 0xFF) / 255.0;
+        const CGFloat g = ((_argb >>  8) & 0xFF) / 255.0;
+        const CGFloat b = ( _argb        & 0xFF) / 255.0;
+        canvasImage = [[CIImage imageWithColor:[CIColor colorWithRed:r green:g blue:b alpha:1.0]]
+                       imageByCroppingToRect:canvas];
+    } else {
+        CIImage *placed = [self _placedImageForCanvas:canvas];
+        if (!placed) return nil;
+        canvasBuffer = _VGGSFNCreateCanvasBuffer(width, height);
+        if (!canvasBuffer) return nil;
+        // One-time render of the placed still into the canvas buffer through
+        // the shared no-colour-space context (raw bytes, like every frame).
+        [_VGGSFNSharedCIContext(device) render:placed
+                                toCVPixelBuffer:canvasBuffer
+                                         bounds:canvas
+                                     colorSpace:NULL];
+        canvasImage = [CIImage imageWithCVPixelBuffer:canvasBuffer];
+        if (!canvasImage) {
+            CVPixelBufferRelease(canvasBuffer);
+            return nil;
+        }
+        NSLog(@"[VGGreenScreenBackgroundProvider] IOS_CAMERA_GRAPH_GREENSCREEN_BACKGROUND_CANVAS_RENDERED "
+               "canvas=%zux%zu image=%zux%zu scaleMode=%@ path=%@",
+              width, height, _imageWidth, _imageHeight,
+              VGGreenScreenBackgroundScaleModeName(_scaleMode), _imagePath);
+    }
+
+    // Publish the new cache entry; release the previous buffer outside the lock.
+    CVPixelBufferRef previousBuffer = NULL;
+    CIImage *previousImage = nil;
+    os_unfair_lock_lock(&_cacheLock);
+    previousBuffer      = _cachedCanvas;
+    previousImage       = _cachedCanvasImage;
+    _cachedCanvas       = canvasBuffer;   // ownership moves to the cache (+1)
+    _cachedCanvasImage  = canvasImage;
+    _cachedWidth        = width;
+    _cachedHeight       = height;
+    os_unfair_lock_unlock(&_cacheLock);
+    if (previousBuffer) CVPixelBufferRelease(previousBuffer);
+    (void)previousImage;   // released here, after the unlock
+    return canvasImage;
+}
+
+@end
 
 // ─── Live matte refinement (VGMatteRefinementPipeline, Swift; production) ───
 //
@@ -497,8 +837,16 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
 @implementation VGGreenScreenFilterNode {
     CVPixelBufferPoolRef _pool;               // +1 owned; released in dealloc
     id<MTLDevice>        _device;
-    VGGreenScreenFilterNodeOutputMode _outputMode;   // fixed at init
-    CIImage             *_backgroundImage;    // solidColor: infinite-extent solid colour, cropped per frame; alpha: nil
+    // ── Composite state (guarded by _stateLock; read once per frame, written
+    //    only by init and the hot-update API). Alpha is fixed for the node's
+    //    lifetime; SolidColor ⇄ ImageFile swap in place with their provider.
+    os_unfair_lock       _stateLock;
+    VGGreenScreenFilterNodeOutputMode _outputMode;
+    uint32_t             _backgroundARGB;             // solidColor colour; 0 otherwise
+    VGGreenScreenBackgroundProvider *_backgroundProvider;   // composite modes; nil in alpha mode
+    VGGreenScreenForegroundTransform _foregroundTransform;  // clamped; identity unless set
+    uint64_t             _backgroundHotUpdateCount;
+    uint64_t             _transformHotUpdateCount;
     VGMatteRefinementPipeline *_mattePipeline; // Swift live matte refiner (tracks defaultLiveMatteRefinementMode, .s4SoftAlphaR2; stateless per frame)
     // Alpha byte self-test result (alpha mode only). Written once in init and
     // immutable afterwards, so -diagnosticsSnapshot reads it without the lock.
@@ -555,9 +903,37 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
 @synthesize enabled        = _enabled;
 @synthesize nodeId         = _nodeId;
 @synthesize nodeType       = _nodeType;
-@synthesize outputMode     = _outputMode;
-@synthesize backgroundARGB = _backgroundARGB;
 @synthesize matteSource    = _matteSource;
+
+// ─── Composite state accessors (lock-read; see the ivar comment) ──────────────
+
+- (VGGreenScreenFilterNodeOutputMode)outputMode {
+    os_unfair_lock_lock(&_stateLock);
+    const VGGreenScreenFilterNodeOutputMode mode = _outputMode;
+    os_unfair_lock_unlock(&_stateLock);
+    return mode;
+}
+
+- (uint32_t)backgroundARGB {
+    os_unfair_lock_lock(&_stateLock);
+    const uint32_t argb = _backgroundARGB;
+    os_unfair_lock_unlock(&_stateLock);
+    return argb;
+}
+
+- (nullable VGGreenScreenBackgroundProvider *)backgroundProvider {
+    os_unfair_lock_lock(&_stateLock);
+    VGGreenScreenBackgroundProvider *provider = _backgroundProvider;
+    os_unfair_lock_unlock(&_stateLock);
+    return provider;
+}
+
+- (VGGreenScreenForegroundTransform)foregroundTransform {
+    os_unfair_lock_lock(&_stateLock);
+    const VGGreenScreenForegroundTransform t = _foregroundTransform;
+    os_unfair_lock_unlock(&_stateLock);
+    return t;
+}
 @synthesize alphaByteSelfTestPassed = _alphaByteSelfTestPassed;
 @synthesize alphaByteSelfTestReason = _alphaByteSelfTestReason;
 @synthesize alphaByteSelfTestWidth  = _alphaByteSelfTestWidth;
@@ -595,20 +971,51 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
                       device:(id<MTLDevice>)device
                   outputMode:(VGGreenScreenFilterNodeOutputMode)outputMode
               backgroundARGB:(uint32_t)backgroundARGB {
+    const BOOL alpha = (outputMode == VGGreenScreenFilterNodeOutputModeAlpha);
+    VGGreenScreenBackgroundProvider *provider =
+        alpha ? nil : [VGGreenScreenBackgroundProvider solidColorProviderWithARGB:backgroundARGB];
+    return [self initWithPool:pool
+                       device:device
+                   outputMode:(alpha ? VGGreenScreenFilterNodeOutputModeAlpha
+                                     : VGGreenScreenFilterNodeOutputModeSolidColor)
+           backgroundProvider:provider
+          foregroundTransform:VGGreenScreenForegroundTransformIdentity];
+}
+
+- (instancetype)initWithPool:(nullable CVPixelBufferPoolRef)pool
+                      device:(id<MTLDevice>)device
+                  outputMode:(VGGreenScreenFilterNodeOutputMode)outputMode
+          backgroundProvider:(nullable VGGreenScreenBackgroundProvider *)backgroundProvider
+         foregroundTransform:(VGGreenScreenForegroundTransform)foregroundTransform {
     NSParameterAssert(device != nil);
     self = [super init];
     if (!self) return nil;
 
-    // Any value other than Alpha is SolidColor: construction must stay
-    // deterministic (never trap) so filter-chain validation remains atomic.
-    _outputMode     = (outputMode == VGGreenScreenFilterNodeOutputModeAlpha)
-                        ? VGGreenScreenFilterNodeOutputModeAlpha
-                        : VGGreenScreenFilterNodeOutputModeSolidColor;
+    _stateLock = OS_UNFAIR_LOCK_INIT;
+
+    // Deterministic resolution (never trap, so filter-chain validation stays
+    // atomic): Alpha has no background; a composite mode takes its mode from
+    // the provider's kind, and a missing provider degrades to opaque black.
+    if (outputMode == VGGreenScreenFilterNodeOutputModeAlpha) {
+        _outputMode         = VGGreenScreenFilterNodeOutputModeAlpha;
+        _backgroundProvider = nil;
+        _backgroundARGB     = 0;
+    } else {
+        VGGreenScreenBackgroundProvider *resolved =
+            backgroundProvider ?: [VGGreenScreenBackgroundProvider solidColorProviderWithARGB:0xFF000000];
+        _backgroundProvider = resolved;
+        _outputMode         = (resolved.kind == VGGreenScreenBackgroundKindImageFile)
+                                ? VGGreenScreenFilterNodeOutputModeImageFile
+                                : VGGreenScreenFilterNodeOutputModeSolidColor;
+        _backgroundARGB     = (resolved.kind == VGGreenScreenBackgroundKindSolidColor) ? resolved.argb : 0;
+    }
+    _foregroundTransform = VGGreenScreenForegroundTransformMakeClamped(
+        foregroundTransform.scale, foregroundTransform.offsetX, foregroundTransform.offsetY);
+    _backgroundHotUpdateCount = 0;
+    _transformHotUpdateCount  = 0;
+
     _pool           = pool ? (CVPixelBufferPoolRef)CFRetain(pool) : NULL;
     _device         = device;
-    // Alpha mode has no background: argb is not part of its contract and is
-    // normalised to 0 so diagnostics never echo an ignored value.
-    _backgroundARGB = (_outputMode == VGGreenScreenFilterNodeOutputModeAlpha) ? 0 : backgroundARGB;
     _enabled        = YES;
     atomic_init(&_invalidated, NO);
     atomic_init(&_frameCounter, 0);
@@ -635,17 +1042,8 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     // it shares the same live refinement implementation as other green-screen callers.
     _mattePipeline = [[VGMatteRefinementPipeline alloc] init];
 
-    if (_outputMode == VGGreenScreenFilterNodeOutputModeSolidColor) {
-        // Solid background: raw sRGB components, alpha forced opaque. With the
-        // unmanaged CIContext these component values reach the output bytes as-is.
-        CGFloat r = ((backgroundARGB >> 16) & 0xFF) / 255.0;
-        CGFloat g = ((backgroundARGB >>  8) & 0xFF) / 255.0;
-        CGFloat b = ( backgroundARGB        & 0xFF) / 255.0;
-        _backgroundImage = [CIImage imageWithColor:[CIColor colorWithRed:r green:g blue:b alpha:1.0]];
-    } else {
-        // Alpha mode composites nothing; the matte goes to the output alpha.
-        _backgroundImage = nil;
-    }
+    // The background itself (solid colour or still image) lives in
+    // _backgroundProvider; alpha mode composites nothing.
 
     if (@available(iOS 15.0, *)) {
         _matteSource = VGGreenScreenFilterNodeMatteSourceVisionPersonFast;
@@ -681,7 +1079,9 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
 
     NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_NODE_CREATED "
            "proofLevel=liveMatteRefinement matteSource=%@ outputMode=%@ backgroundType=%@ alphaEncoding=%@ "
-           "backgroundARGB=0x%08X alphaByteIgnored=1 pool=%p edgeRefinement=liveMatteRefinement "
+           "backgroundARGB=0x%08X alphaByteIgnored=1 backgroundImagePath=%@ backgroundScaleMode=%@ "
+           "backgroundImageSize=%zux%zu foregroundScale=%.3f foregroundOffsetX=%.3f foregroundOffsetY=%.3f "
+           "pool=%p edgeRefinement=liveMatteRefinement "
            "liveMatteRefinementModeExpected=s4SoftAlphaR2(confirmedPerFrame) "
            "morphologyCloseRadius=%.1f featherRadius=%.1f trimapLow=%.2f trimapHigh=%.2f "
            "guidedEdgeIntensity=%.1f guidedEdgeBlurRadius=%.1f guidedEdgeLow=%.2f "
@@ -690,7 +1090,14 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
               ? @"visionPersonFast" : @"unavailable",
           _VGGSFNOutputModeName(_outputMode), _VGGSFNOutputModeName(_outputMode),
           _VGGSFNAlphaEncodingName(_outputMode, _alphaByteSelfTestPassed),
-          _backgroundARGB, _pool,
+          _backgroundARGB,
+          _backgroundProvider.imagePath ?: @"",
+          (_outputMode == VGGreenScreenFilterNodeOutputModeImageFile)
+              ? VGGreenScreenBackgroundScaleModeName(_backgroundProvider.scaleMode) : @"",
+          _backgroundProvider.imageWidth, _backgroundProvider.imageHeight,
+          (double)_foregroundTransform.scale, (double)_foregroundTransform.offsetX,
+          (double)_foregroundTransform.offsetY,
+          _pool,
           (double)VGMatteRefinementPipeline.greenScreenMaskMorphologyCloseRadius,
           (double)VGMatteRefinementPipeline.greenScreenMaskFeatherRadius,
           (double)VGMatteRefinementPipeline.greenScreenTrimapLow,
@@ -707,6 +1114,83 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
         CVPixelBufferPoolRelease(_pool);
         _pool = NULL;
     }
+}
+
+// ─── Hot updates (no graph rebuild) ──────────────────────────────────────────
+//
+// Validates first, writes second: nothing is stored until every check passed,
+// so a rejected call leaves the live background and transform untouched. The
+// write is a few pointer/scalar stores under _stateLock; the previous provider
+// (and its cached canvas buffer) is released only after the unlock.
+
+- (BOOL)applyHotUpdateWithBackgroundProvider:(nullable VGGreenScreenBackgroundProvider *)backgroundProvider
+                         foregroundTransform:(nullable const VGGreenScreenForegroundTransform *)foregroundTransform
+                                       error:(NSError * _Nullable * _Nullable)outError {
+    if (outError) *outError = nil;
+    if (!backgroundProvider && !foregroundTransform) {
+        if (outError) *outError = [NSError errorWithDomain:@"HOT_UPDATE_FAIL" code:400 userInfo:@{
+            NSLocalizedDescriptionKey: @"greenScreen hot update carries neither a background nor a transform."}];
+        return NO;
+    }
+    if (atomic_load(&_invalidated)) {
+        if (outError) *outError = [NSError errorWithDomain:@"HOT_UPDATE_FAIL" code:410 userInfo:@{
+            NSLocalizedDescriptionKey: @"greenScreen hot update rejected: the node is invalidated."}];
+        return NO;
+    }
+    os_unfair_lock_lock(&_stateLock);
+    const BOOL alphaMode = (_outputMode == VGGreenScreenFilterNodeOutputModeAlpha);
+    os_unfair_lock_unlock(&_stateLock);
+    if (alphaMode && backgroundProvider) {
+        if (outError) *outError = [NSError errorWithDomain:@"HOT_UPDATE_FAIL" code:409 userInfo:@{
+            NSLocalizedDescriptionKey: @"greenScreen alpha output has no background; switching to a "
+                                        "solidColor/imageFile background requires a filter-chain rebuild."}];
+        return NO;
+    }
+
+    VGGreenScreenForegroundTransform clamped = VGGreenScreenForegroundTransformIdentity;
+    if (foregroundTransform) {
+        clamped = VGGreenScreenForegroundTransformMakeClamped(
+            foregroundTransform->scale, foregroundTransform->offsetX, foregroundTransform->offsetY);
+    }
+
+    VGGreenScreenBackgroundProvider *previousProvider = nil;
+    VGGreenScreenFilterNodeOutputMode modeNow;
+    uint32_t argbNow;
+    VGGreenScreenForegroundTransform transformNow;
+    uint64_t backgroundUpdates, transformUpdates;
+    os_unfair_lock_lock(&_stateLock);
+    if (backgroundProvider) {
+        previousProvider    = _backgroundProvider;
+        _backgroundProvider = backgroundProvider;
+        _outputMode         = (backgroundProvider.kind == VGGreenScreenBackgroundKindImageFile)
+                                ? VGGreenScreenFilterNodeOutputModeImageFile
+                                : VGGreenScreenFilterNodeOutputModeSolidColor;
+        _backgroundARGB     = (backgroundProvider.kind == VGGreenScreenBackgroundKindSolidColor)
+                                ? backgroundProvider.argb : 0;
+        _backgroundHotUpdateCount += 1;
+    }
+    if (foregroundTransform) {
+        _foregroundTransform = clamped;
+        _transformHotUpdateCount += 1;
+    }
+    modeNow           = _outputMode;
+    argbNow           = _backgroundARGB;
+    transformNow      = _foregroundTransform;
+    backgroundUpdates = _backgroundHotUpdateCount;
+    transformUpdates  = _transformHotUpdateCount;
+    os_unfair_lock_unlock(&_stateLock);
+    (void)previousProvider;   // released here, after the unlock
+
+    NSLog(@"[VGGreenScreenFilterNode] IOS_CAMERA_GRAPH_GREENSCREEN_FILTER_HOT_UPDATE "
+           "background=%d transform=%d outputMode=%@ backgroundARGB=0x%08X backgroundImagePath=%@ "
+           "foregroundScale=%.3f foregroundOffsetX=%.3f foregroundOffsetY=%.3f "
+           "backgroundHotUpdateCount=%llu transformHotUpdateCount=%llu graphRebuilt=0",
+          (int)(backgroundProvider != nil), (int)(foregroundTransform != NULL),
+          _VGGSFNOutputModeName(modeNow), argbNow,
+          backgroundProvider.imagePath ?: @"",
+          (double)transformNow.scale, (double)transformNow.offsetX, (double)transformNow.offsetY,
+          (unsigned long long)backgroundUpdates, (unsigned long long)transformUpdates);
+    return YES;
 }
 
 // ─── Fail-open helper ─────────────────────────────────────────────────────────
@@ -869,9 +1353,25 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     BOOL s4GuidedAlphaR1Applied       = refinement.s4GuidedAlphaR1Applied;
     BOOL tightAlphaR1Applied          = refinement.tightAlphaR1Applied;
 
+    // ── 3b. Composite state snapshot + subject transform ──────────────────
+    //   One lock-read per frame (pointer + scalar copies; nothing allocated
+    //   while locked). The refined matte and the foreground get the SAME
+    //   affine transform so the key can never slip against the subject;
+    //   refinement already ran at source scale, so matte quality is unchanged.
+    os_unfair_lock_lock(&_stateLock);
+    const VGGreenScreenFilterNodeOutputMode mode = _outputMode;
+    VGGreenScreenBackgroundProvider *provider = _backgroundProvider;
+    const VGGreenScreenForegroundTransform subjectTransform = _foregroundTransform;
+    os_unfair_lock_unlock(&_stateLock);
+    if (!VGGreenScreenForegroundTransformIsIdentity(subjectTransform)) {
+        const CGAffineTransform subject = _VGGSFNSubjectTransform(subjectTransform, srcBounds);
+        foreground = [foreground imageByApplyingTransform:subject];
+        refined    = [refined imageByApplyingTransform:subject];
+    }
+
     // ── 4. Output stage by outputMode ─────────────────────────────────────
     CIImage *keyed = nil;
-    if (_outputMode == VGGreenScreenFilterNodeOutputModeAlpha) {
+    if (mode == VGGreenScreenFilterNodeOutputModeAlpha) {
         //   alpha: (fg.rgb, refined matte) — straight alpha, no background.
         //   Fails open to the input on any filter failure (see helper).
         NSString *alphaFailReason = nil;
@@ -880,11 +1380,18 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
             return [self _failOpenWithInput:input reason:alphaFailReason ?: @"alpha_output_failed"];
         }
     } else {
-        //   solidColor: CIBlendWithMask (unchanged MVP path)
+        //   solidColor / imageFile: CIBlendWithMask (the MVP blend, unchanged)
         //   inputImage           = foreground (camera)
-        //   inputBackgroundImage = solid colour
+        //   inputBackgroundImage = the provider's canvas-sized background
+        //                          (solid colour, or the still image rendered
+        //                          once per canvas size)
         //   inputMaskImage       = refined matte (255/white = subject → foreground)
-        CIImage *background = [_backgroundImage imageByCroppingToRect:srcBounds];
+        CIImage *background = provider
+            ? [provider canvasImageForWidth:srcW height:srcH device:_device]
+            : nil;
+        if (!background) {
+            return [self _failOpenWithInput:input reason:@"background_unavailable"];
+        }
         CIFilter *blend = [CIFilter filterWithName:@"CIBlendWithMask"];
         if (!blend) {
             return [self _failOpenWithInput:input reason:@"blend_filter_unavailable"];
@@ -920,8 +1427,8 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
     // ── 6. Render (NULL colour space: raw bytes, no colour matching) ──────
     //   alpha: the un-premultiplied context (straight bytes); fails open if
     //   that context is unavailable rather than emitting premultiplied bytes.
-    //   solidColor: the shared context, unchanged.
-    if (_outputMode == VGGreenScreenFilterNodeOutputModeAlpha) {
+    //   solidColor / imageFile: the shared context, unchanged.
+    if (mode == VGGreenScreenFilterNodeOutputModeAlpha) {
         if (!_VGGSFNRenderStraightAlpha(_device, keyed, output, srcBounds)) {
             CVPixelBufferRelease(output);
             return [self _failOpenWithInput:input reason:@"alpha_straight_context_unavailable"];
@@ -985,7 +1492,7 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
                "pts=%.3f failOpenCount=%llu",
               (unsigned long long)frameIndex, srcW, srcH, matteW, matteH,
               liveMatteRefinementMode, liveMatteRefinementMode,
-              _VGGSFNOutputModeName(_outputMode),
+              _VGGSFNOutputModeName(mode),
               (int)morphologyCloseApplied, (int)featherApplied, (int)trimapApplied,
               (int)guidedEdgeApplied, (int)s4GuidedAlphaApplied,
               (int)s4GuidedAlphaR1Applied, (int)tightAlphaR1Applied,
@@ -1040,6 +1547,17 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
 // Callable from any thread; changes nothing.
 
 - (NSDictionary<NSString *, id> *)diagnosticsSnapshot {
+    // Composite state (background / transform) under its own lock first.
+    os_unfair_lock_lock(&_stateLock);
+    const VGGreenScreenFilterNodeOutputMode mode = _outputMode;
+    const uint32_t backgroundARGB = _backgroundARGB;
+    VGGreenScreenBackgroundProvider *provider = _backgroundProvider;
+    const VGGreenScreenForegroundTransform transform = _foregroundTransform;
+    const uint64_t backgroundUpdates = _backgroundHotUpdateCount;
+    const uint64_t transformUpdates  = _transformHotUpdateCount;
+    os_unfair_lock_unlock(&_stateLock);
+    const BOOL imageMode = (mode == VGGreenScreenFilterNodeOutputModeImageFile);
+
     os_unfair_lock_lock(&_telemetryLock);
     const uint64_t processed      = _tmProcessedFrameCount;
     const uint64_t allS1Frames    = _tmAllS1StagesAppliedFrameCount;
@@ -1084,19 +1602,29 @@ static BOOL _VGGSFNRunAlphaByteSelfTest(id<MTLDevice> device,
         @"proofLevel":                   liveMatteRefinementMode ?: @"unknown",
         @"edgeRefinement":               liveMatteRefinementMode ?: @"unknown",
         @"liveMatteRefinementMode":      liveMatteRefinementMode ?: @"unknown",
-        @"outputMode":                   _VGGSFNOutputModeName(_outputMode),
-        @"backgroundType":               _VGGSFNOutputModeName(_outputMode),
+        @"outputMode":                   _VGGSFNOutputModeName(mode),
+        @"backgroundType":               _VGGSFNOutputModeName(mode),
+        @"backgroundImagePath":          (imageMode ? (provider.imagePath ?: @"") : @""),
+        @"backgroundScaleMode":          (imageMode ? VGGreenScreenBackgroundScaleModeName(provider.scaleMode) : @""),
+        @"backgroundImageWidth":         @(imageMode ? provider.imageWidth  : 0),
+        @"backgroundImageHeight":        @(imageMode ? provider.imageHeight : 0),
+        @"foregroundScale":              @((double)transform.scale),
+        @"foregroundOffsetX":            @((double)transform.offsetX),
+        @"foregroundOffsetY":            @((double)transform.offsetY),
+        @"foregroundTransformIdentity":  VGGreenScreenForegroundTransformIsIdentity(transform) ? @YES : @NO,
+        @"backgroundHotUpdateCount":     @(backgroundUpdates),
+        @"transformHotUpdateCount":      @(transformUpdates),
         // "opaque" = A is 255 (solidColor). Alpha mode: "straight" (RGB not
         // premultiplied by A) ONLY when the one-time byte self-test below
         // passed through the alpha render path, else "unverified". The
         // alphaByteSelfTest* fields are that MEASUREMENT (immutable after
         // init, no lock needed).
-        @"alphaEncoding":                _VGGSFNAlphaEncodingName(_outputMode, _alphaByteSelfTestPassed),
+        @"alphaEncoding":                _VGGSFNAlphaEncodingName(mode, _alphaByteSelfTestPassed),
         @"alphaByteSelfTestPassed":      _alphaByteSelfTestPassed ? @YES : @NO,
         @"alphaByteSelfTestReason":      _alphaByteSelfTestReason ?: @"unknown",
         @"alphaByteSelfTestWidth":       @(_alphaByteSelfTestWidth),
         @"alphaByteSelfTestHeight":      @(_alphaByteSelfTestHeight),
-        @"backgroundARGB":               @(_backgroundARGB),
+        @"backgroundARGB":               @(backgroundARGB),
         @"frameCount":                   @(atomic_load(&_frameCounter)),
         @"processedFrameCount":          @(processed),
         @"failOpenCount":                @(atomic_load(&_failOpenCounter)),

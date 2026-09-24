@@ -12,6 +12,7 @@ import android.opengl.GLES20
 import android.opengl.Matrix
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -103,6 +104,10 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
         // video size of its own.
         private const val CAMERA_UPRIGHT_ASPECT =
             CAMERA_ST_DEFAULT_HEIGHT.toDouble() / CAMERA_ST_DEFAULT_WIDTH.toDouble()
+
+        // Bounds the background image bitmap decoded for GL texture upload so a
+        // full-size camera JPEG is never decoded at full resolution.
+        private const val MAX_BACKGROUND_IMAGE_DIMENSION = 2048
     }
 
     // -- EGL core (created lazily on first attach, destroyed only in release) --
@@ -1396,7 +1401,7 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
             return
         }
         val bitmap = try {
-            android.graphics.BitmapFactory.decodeFile(path)
+            decodeBoundedBackgroundBitmap(path)
         } catch (t: Throwable) {
             null
         }
@@ -1428,6 +1433,33 @@ class AndroidGreenScreenPreviewCompositor : AndroidGreenScreenPreviewBackend {
         } finally {
             bitmap.recycle()
         }
+    }
+
+    /**
+     * Decodes [path] as ARGB_8888 bounded to [MAX_BACKGROUND_IMAGE_DIMENSION]
+     * on the EXIF-adjusted display axes, with EXIF orientation applied so the
+     * returned bitmap has post-EXIF visual dimensions. Never decodes a
+     * full-size camera JPEG. Returns null on decode failure.
+     */
+    private fun decodeBoundedBackgroundBitmap(path: String): android.graphics.Bitmap? {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        val orientation = AndroidStillImageDecoder.readExifOrientation(path)
+        val sampleSize = AndroidStillImageDecoder.computeInSampleSize(
+            rawWidth = bounds.outWidth,
+            rawHeight = bounds.outHeight,
+            targetWidth = MAX_BACKGROUND_IMAGE_DIMENSION,
+            targetHeight = MAX_BACKGROUND_IMAGE_DIMENSION,
+            maxTextureSize = 0,
+            orientation = orientation,
+        )
+        val decoded = AndroidStillImageDecoder.decodeBitmap(path, sampleSize) ?: return null
+        val oriented = AndroidStillImageDecoder.applyExifOrientation(decoded, orientation)
+        if (oriented.config == android.graphics.Bitmap.Config.ARGB_8888) return oriented
+        val converted = oriented.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+        oriented.recycle()
+        return converted
     }
 
     /**
