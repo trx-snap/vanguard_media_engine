@@ -37,6 +37,16 @@
 //   last-decoded clip, the previous reader is cancelled and the new clip's
 //   reader is rebuilt.
 //
+// Early EOF hold (EARLY-EOF-HOLD):
+//   A clip's reader reads [tAsset, min(trimEnd, asset.duration)], and
+//   asset.duration is the longest track (audio commonly outlasts video by a
+//   frame or two), so a NON-FINAL clip's reader can complete before the clip's
+//   declared timeline slot ends. pullFrame: then delivers the reader's last
+//   decoded frame for the remaining PTSs of that slot instead of returning
+//   skipped — VGExportScheduler never advances past a skipped PTS and would
+//   re-request the same PTS forever. The final clip keeps reporting
+//   endOfStream on reader completion (unchanged).
+//
 // ── APPLE FRAMEWORK CHECKS ───────────────────────────────────────────────────
 //
 // AVAssetReader:
@@ -1929,6 +1939,18 @@ static CVPixelBufferRef _VGTCNRenderBlurFillFrame(CVPixelBufferRef sourceBuffer,
 // _pullBufferFromReader: renders its frames into the canvas itself. Always NO
 // for still-image, freeze, reversed, dual-camera and secondary readers.
 @property(nonatomic) BOOL blurFillEligible;
+// EARLY-EOF-HOLD: latched by _pullBufferFromReader: the first time
+// copyNextSampleBuffer returns NULL while reader.status is
+// AVAssetReaderStatusCompleted. Once YES the AVAssetReader decode path returns
+// NULL (no error) without calling copyNextSampleBuffer again, and
+// lastDeliveredBuffer is preserved as the last-frame hold source. Always NO
+// for static-source and inline-reverse readers (they never reach that path).
+@property(nonatomic) BOOL reachedEndOfStream;
+// EARLY-EOF-HOLD: number of pulls pullFrame: served from the held last frame
+// after this NON-FINAL clip's reader completed before its declared timeline
+// slot ended. Logged once at the first hold and summarized at teardown so the
+// device log proves the path without per-frame spam.
+@property(nonatomic) NSUInteger earlyEOFHoldCount;
 @end
 
 @implementation _VGClipReader
@@ -1939,6 +1961,8 @@ static CVPixelBufferRef _VGTCNRenderBlurFillFrame(CVPixelBufferRef sourceBuffer,
     _lastDeliveredBuffer = NULL;
     _lastDeliveredAssetPTS = -1.0;
     _lastDeliveredAssetDuration = 0.0;
+    _reachedEndOfStream = NO;
+    _earlyEOFHoldCount = 0;
   }
   return self;
 }
@@ -3282,40 +3306,61 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
       blendedPB = outPB;
       outPB = NULL; // ownership transferred
     } else {
-      // Both readers exhausted — skip this frame.
-      return [VGFrameResult skippedWithGeneration:request.generation];
+      // Both readers returned NULL.
+      // EARLY-EOF-HOLD: returning skipped here also stalled the export (the
+      // same PTS was re-requested forever). An incoming-reader error is
+      // reported exactly like the outgoing-present branch above. Otherwise
+      // tear down the exhausted outgoing reader and fall through to the
+      // single-reader path below, which resolves final-clip EOS, non-final
+      // last-frame hold, reader failure, or a genuine skip for the incoming
+      // clip. Nothing is leaked: both buffers are NULL in this branch.
+      if (inErr) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] transition: incoming reader error clip %lu "
+                     "(outgoing exhausted): %{public}@",
+                     (unsigned long)activeClipIndex,
+                     inErr.localizedDescription);
+        return [VGFrameResult errorResult:inErr generation:request.generation];
+      }
+      [self _tearDownOutgoingReader];
+      // blendedPB stays NULL → resolved on the single-reader path.
     }
 
-    if (inPB)  CVPixelBufferRelease(inPB);
-    if (outPB) CVPixelBufferRelease(outPB);
+    if (blendedPB != NULL) {
+      if (inPB)  CVPixelBufferRelease(inPB);
+      if (outPB) CVPixelBufferRelease(outPB);
 
-    // Store blended buffer for node-level envelope lifetime (RR-36).
-    // Per-reader caches own decode pacing; node-level field is only for
-    // extending the blended buffer lifetime through the envelope delivery.
-    _lastDeliveredBuffer = blendedPB;
+      // Store blended buffer for node-level envelope lifetime (RR-36).
+      // Per-reader caches own decode pacing; node-level field is only for
+      // extending the blended buffer lifetime through the envelope delivery.
+      _lastDeliveredBuffer = blendedPB;
 
-    CMTime outputDur =
-        CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
+      CMTime outputDur =
+          CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
 
-    VGFrameEnvelope env;
-    memset(&env, 0, sizeof(env));
-    env.mediaType = VGMediaTypeVideo;
-    env.payload.videoBuffer = (void *)blendedPB; // +0 in envelope; node holds +1
-    env.pts = request.requestedPTS;
-    env.dts = kCMTimeInvalid;
-    env.duration = outputDur;
-    env.generation = request.generation;
-    env.metadata = NULL;
+      VGFrameEnvelope env;
+      memset(&env, 0, sizeof(env));
+      env.mediaType = VGMediaTypeVideo;
+      env.payload.videoBuffer = (void *)blendedPB; // +0 in envelope; node holds +1
+      env.pts = request.requestedPTS;
+      env.dts = kCMTimeInvalid;
+      env.duration = outputDur;
+      env.generation = request.generation;
+      env.metadata = NULL;
 
-    os_log_debug(sTimelineLog,
-                 "[VGTCNode] transition delivered: clip %lu→%lu "
-                 "alpha=%.3f type=%ld",
-                 (unsigned long)outgoingClipIndex,
-                 (unsigned long)activeClipIndex,
-                 blendAlpha, (long)transitionType);
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] transition delivered: clip %lu→%lu "
+                   "alpha=%.3f type=%ld",
+                   (unsigned long)outgoingClipIndex,
+                   (unsigned long)activeClipIndex,
+                   blendAlpha, (long)transitionType);
 
-    return [VGFrameResult deliveredWithEnvelope:env
-                                     generation:request.generation];
+      return [VGFrameResult deliveredWithEnvelope:env
+                                       generation:request.generation];
+    }
+    // EARLY-EOF-HOLD fall-through: both transition readers returned NULL with
+    // no incoming error. _lastDeliveredBuffer is already NULL (released above)
+    // and the outgoing reader is torn down; continue on the normal path.
   }
 
   // ── Normal single-reader path (non-transition) ────────────────────────────
@@ -3348,15 +3393,41 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     // NULL without error: reader completed (EOS) or unknown status.
     AVAssetReaderStatus status = _activeReader.reader.status;
     if (status == AVAssetReaderStatusCompleted) {
-      os_log(sTimelineLog,
-             "[VGTCNode] clip %lu reader completed at requestedPTS=%.3fs",
-             (unsigned long)activeClipIndex, requestedPTSSecs);
       if (activeClipIndex >= _clips.count - 1) {
+        // Final clip: reader exhaustion is the timeline's end of stream.
+        os_log(sTimelineLog,
+               "[VGTCNode] clip %lu reader completed at requestedPTS=%.3fs — EOS",
+               (unsigned long)activeClipIndex, requestedPTSSecs);
         return [VGFrameResult endOfStreamWithGeneration:request.generation];
       }
-      // Not last clip — return skip. Scheduler will request next PTS which
-      // falls in the next clip, building a new reader.
-      return [VGFrameResult skippedWithGeneration:request.generation];
+      // EARLY-EOF-HOLD: a NON-FINAL clip's reader completed before the clip's
+      // declared timeline slot ended (the video track ends a frame or two
+      // before min(trimEnd, asset.duration); audio commonly outlasts video).
+      // Returning skipped here was wrong: VGExportScheduler never advances
+      // past a skipped PTS, so the export re-requested this exact PTS forever
+      // (100% CPU, device heating, progress stuck). Hold the last decoded
+      // frame for the remainder of the slot instead; the first PTS past the
+      // slot selects the next clip and rebuilds the reader exactly as before.
+      pb = [self _retainHeldFrameForEarlyEOFOnReader:_activeReader
+                                            clipIndex:activeClipIndex
+                                         requestedPTS:requestedPTSSecs];
+      if (!pb) {
+        if (request.mode == VGRenderModeExport) {
+          // Export fails closed with a clear error instead of stalling.
+          NSError *holdErr = _VGTCNError(
+              12, ([NSString stringWithFormat:
+                       @"VGTimelineCompositorNode: clip %lu reader completed at "
+                        "%.3fs before its timeline slot ended and no decoded "
+                        "frame is available to hold.",
+                       (unsigned long)activeClipIndex, requestedPTSSecs]));
+          return [VGFrameResult errorResult:holdErr
+                                 generation:request.generation];
+        }
+        // Preview keeps its prior behaviour: the stale frame stays on screen
+        // and the display-link playhead moves into the next clip by itself.
+        return [VGFrameResult skippedWithGeneration:request.generation];
+      }
+      // Fall through with the held frame (+1) exactly like a decoded frame.
     } else if (status == AVAssetReaderStatusFailed) {
       NSError *readerErr =
           _activeReader.reader.error
@@ -3365,9 +3436,10 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                               "with unknown error.");
       return [VGFrameResult errorResult:readerErr
                              generation:request.generation];
+    } else {
+      // Defensive: unknown status — treat as skip.
+      return [VGFrameResult skippedWithGeneration:request.generation];
     }
-    // Defensive: unknown status — treat as skip.
-    return [VGFrameResult skippedWithGeneration:request.generation];
   }
 
   // Store for node-level envelope lifetime (RR-36).
@@ -3914,6 +3986,50 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
 #pragma mark - Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// EARLY-EOF-HOLD: returns the reader's last decoded frame, retained +1 for
+/// the caller, when a NON-FINAL clip's AVAssetReader completed before the
+/// clip's declared timeline slot ended. Returns NULL when the reader never
+/// decoded a frame (the caller decides how to fail closed).
+///
+/// Ownership: reader.lastDeliveredBuffer keeps its own cache +1 (released in
+/// _VGClipReader dealloc or when a later sample replaces it). The returned
+/// reference is an independent +1 that the caller adopts into
+/// _lastDeliveredBuffer exactly like a freshly decoded frame, so the envelope
+/// payload stays +0 and every downstream stage (secondary lockstep, dual-camera
+/// composition, colour matrix, temporal denoise) is unchanged.
+///
+/// Logging: one default-level line at the first hold per reader; later holds
+/// are debug-level. _tearDownActiveReader logs the final hold count.
+- (CVPixelBufferRef)_retainHeldFrameForEarlyEOFOnReader:(_VGClipReader *)reader
+                                              clipIndex:(NSUInteger)clipIndex
+                                           requestedPTS:(double)requestedPTSSecs {
+  CVPixelBufferRef held = reader.lastDeliveredBuffer;
+  if (held == NULL) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode-EarlyEOF] clip %lu reader completed at "
+                 "requestedPTS=%.3fs with no decoded frame to hold",
+                 (unsigned long)clipIndex, requestedPTSSecs);
+    return NULL;
+  }
+  CVPixelBufferRetain(held); // caller-owned +1, independent of the cache's +1
+  if (reader.earlyEOFHoldCount == 0) {
+    VGClipDescriptor *clip = (clipIndex < _clips.count) ? _clips[clipIndex] : nil;
+    os_log(sTimelineLog,
+           "[VGTCNode-EarlyEOF] clip %lu reader completed early: "
+           "requestedPTS=%.3fs slotEnd=%.3fs lastAssetPTS=%.3fs — holding last frame",
+           (unsigned long)clipIndex, requestedPTSSecs,
+           clip ? (clip.startTimeSeconds + clip.timelineDuration) : -1.0,
+           reader.lastDeliveredAssetPTS);
+  } else {
+    os_log_debug(sTimelineLog,
+                 "[VGTCNode-EarlyEOF] clip %lu hold #%lu at requestedPTS=%.3fs",
+                 (unsigned long)clipIndex,
+                 (unsigned long)(reader.earlyEOFHoldCount + 1), requestedPTSSecs);
+  }
+  reader.earlyEOFHoldCount += 1;
+  return held;
+}
+
 /// Phase 7.11 RR-146: Per-reader frame pull with reuse guard, transform, and cache update.
 ///
 /// This helper replaces the inline copyNextSampleBuffer + Phase 7.11 transform
@@ -3933,8 +4049,12 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
 ///   If reader.lastDeliveredBuffer is non-NULL and tAsset falls within
 ///   [reader.lastDeliveredAssetPTS, reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration),
 ///   the cached buffer is returned (retained +1) WITHOUT calling copyNextSampleBuffer.
-///   Otherwise, the previous cache is released, copyNextSampleBuffer is called,
-///   Phase 7.11 transform is applied if non-identity, and the cache is updated.
+///   Otherwise copyNextSampleBuffer is called; once a replacement sample exists
+///   the previous cache is released, Phase 7.11 transform is applied if
+///   non-identity, and the cache is updated. When the reader is exhausted
+///   instead (EARLY-EOF-HOLD) the previous cache is preserved so pullFrame: can
+///   hold the last decoded frame; reader.reachedEndOfStream is latched and later
+///   calls return NULL without re-entering copyNextSampleBuffer.
 ///
 /// Thread safety: must be called on the serial pull queue (_VGTimelinePullQueue).
 - (CVPixelBufferRef)_pullBufferFromReader:(_VGClipReader *)reader
@@ -4570,21 +4690,54 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                    reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration);
       return reader.lastDeliveredBuffer; // caller owns +1
     }
-    // Cache miss: tAsset is past the cached window — release and decode next.
-    CVPixelBufferRelease(reader.lastDeliveredBuffer);
-    reader.lastDeliveredBuffer = NULL;
-    reader.lastDeliveredAssetPTS = -1.0;
-    reader.lastDeliveredAssetDuration = 0.0;
+    // Cache miss: tAsset is past the cached window — decode the next sample.
+    //
+    // EARLY-EOF-HOLD: the cached buffer is deliberately NOT released here. It
+    // is released only once a replacement sample has actually been decoded
+    // (step 3 below). When the reader turns out to be exhausted instead, the
+    // last decoded frame survives in the cache as the hold source for
+    // pullFrame:'s non-final early-EOF path. Ownership is unchanged: the cache
+    // still holds exactly one +1 on the old buffer until it is replaced.
   }
 
   // ── 2. Decode next sample ──────────────────────────────────────────────────
   // copyNextSampleBuffer returns +1 CMSampleBufferRef.
   // Returns NULL when exhausted (reader.status → Completed) or on error.
+  //
+  // EARLY-EOF-HOLD: once completion has been latched, return NULL (no error)
+  // immediately without touching the AVAssetReader again. pullFrame: inspects
+  // reader.status and resolves final-clip EOS or non-final last-frame hold.
+  if (reader.reachedEndOfStream) {
+    if (outError) *outError = nil;
+    return NULL;
+  }
   CMSampleBufferRef sample = [reader.trackOutput copyNextSampleBuffer];
   if (!sample) {
     // NULL without error — caller inspects reader.reader.status for EOS/fail.
+    // Latch completion so subsequent pulls skip the decode call entirely.
+    // A failed reader is NOT latched: pullFrame: reports its error.
+    if (reader.reader.status == AVAssetReaderStatusCompleted) {
+      reader.reachedEndOfStream = YES;
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] reader completed: clip=%lu tAsset=%.3fs "
+                   "lastAssetPTS=%.3fs heldFrame=%d",
+                   (unsigned long)reader.clipIndex, tAsset,
+                   reader.lastDeliveredAssetPTS,
+                   (int)(reader.lastDeliveredBuffer != NULL));
+    }
     if (outError) *outError = nil;
     return NULL;
+  }
+
+  // A replacement sample was decoded: the previously cached frame is now
+  // superseded. Release the cache's +1 here (formerly done before the decode
+  // call) and reset the cache window, so every later failure path in this
+  // method leaves the reader in the same empty-cache state as before.
+  if (reader.lastDeliveredBuffer != NULL) {
+    CVPixelBufferRelease(reader.lastDeliveredBuffer);
+    reader.lastDeliveredBuffer = NULL;
+    reader.lastDeliveredAssetPTS = -1.0;
+    reader.lastDeliveredAssetDuration = 0.0;
   }
 
   // ── 3. Extract pixel buffer ────────────────────────────────────────────────
@@ -5959,6 +6112,14 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
 /// Cancel and nil the active reader, safely releasing AVFoundation resources.
 - (void)_tearDownActiveReader {
   if (_activeReader) {
+    // EARLY-EOF-HOLD: one summary line per reader that held its last frame.
+    if (_activeReader.earlyEOFHoldCount > 0) {
+      os_log(sTimelineLog,
+             "[VGTCNode-EarlyEOF] clip %lu held its last frame for %lu pull(s) "
+             "before reader teardown",
+             (unsigned long)_activeReader.clipIndex,
+             (unsigned long)_activeReader.earlyEOFHoldCount);
+    }
     // Static image readers have reader == nil; nil guard documents intentional no-op.
     if (_activeReader.reader) {
       [_activeReader.reader cancelReading];

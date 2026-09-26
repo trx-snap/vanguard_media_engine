@@ -43,6 +43,16 @@
 // VGNodeRoleMetadata = 4 — same cast pattern as VGGraphSchedulerV2.m line 66.
 static const VGNodeRole kVGExportNodeRoleMetadata = (VGNodeRole)4;
 
+// Fail-closed bound on consecutive VGFrameStatusSkipped results for one frame
+// index. A skipped result does not advance _frameIndex, so the loop re-requests
+// the same PTS. A source that keeps skipping that PTS (an exhausted reader that
+// never reports EOS, a permanent generation mismatch, a timeline gap) would
+// otherwise spin this queue at 100% CPU forever with no progress and no
+// completion. Legitimate skips are transient and few (a timing-only sample, a
+// stale generation), so 120 is far above any real burst while still tripping
+// within milliseconds of a genuine stall.
+static const NSUInteger kVGExportMaxConsecutiveSkips = 120;
+
 static os_log_t sExportSchedulerLog;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +78,10 @@ static os_log_t sExportSchedulerLog;
 
     // Frame counter — monotonically increasing. Drives PTS generation.
     int64_t                               _frameIndex;
+
+    // Consecutive VGFrameStatusSkipped results at the current _frameIndex.
+    // Reset on every delivered frame. Bounded by kVGExportMaxConsecutiveSkips.
+    NSUInteger                            _consecutiveSkips;
 
     // Atomic state flags.
     _Atomic(BOOL)                         _invalidated;
@@ -161,6 +175,7 @@ static os_log_t sExportSchedulerLog;
     atomic_store(&_running, NO);
     atomic_store(&_completionSignaled, 0);
     _frameIndex = 0;
+    _consecutiveSkips = 0;
 
     os_log_debug(sExportSchedulerLog,
                  "[VGExportScheduler] init: execOrder=%lu fps=%d sourceNode=%@",
@@ -290,9 +305,31 @@ static os_log_t sExportSchedulerLog;
 
             case VGFrameStatusSkipped:
                 // Do not increment frameIndex for skipped frames.
+                // Fail closed if the source keeps skipping this same PTS
+                // instead of spinning the export queue forever.
+                _consecutiveSkips++;
+                if (_consecutiveSkips >= kVGExportMaxConsecutiveSkips) {
+                    os_log_error(sExportSchedulerLog,
+                                 "[VGExportScheduler] source skipped frameIndex=%lld "
+                                 "(pts=%.3fs) %lu consecutive times — aborting "
+                                 "export instead of spinning",
+                                 (long long)_frameIndex, CMTimeGetSeconds(pts),
+                                 (unsigned long)_consecutiveSkips);
+                    loopError = [NSError errorWithDomain:@"VGExportScheduler"
+                                                   code:3
+                                               userInfo:@{
+                        NSLocalizedDescriptionKey: [NSString stringWithFormat:
+                            @"Export stalled: source skipped frame %lld (%.3fs) "
+                             "%lu times in a row",
+                            (long long)_frameIndex, CMTimeGetSeconds(pts),
+                            (unsigned long)_consecutiveSkips]
+                    }];
+                    goto loop_exit;
+                }
                 continue;
 
             case VGFrameStatusDelivered:
+                _consecutiveSkips = 0;
                 break; // proceed to transform chain
         }
 
