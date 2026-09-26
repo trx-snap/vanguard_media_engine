@@ -15,6 +15,14 @@ package com.connects.vanguard_media_engine.camera
 //      If intensity == 0: direct 1:1 passthrough blit from intermediate
 //      to output (zero GPU overhead, battery preservation).
 //   4. EGL buffer swap to the CameraX output surface(s).
+//   5. Optional processed-frame egress, only while attachEgressSurface() has a
+//      surface pending or bound (never on the normal path above): the filter
+//      stage renders into finalTexture instead of the output FBO, that texture
+//      is blitted 1:1 to the output surface (pixel-identical) and swapped, then
+//      drawn upright, center-cropped to the egress aspect (720x1280 portrait by
+//      default, never stretched) into the egress surface and swapped; the output
+//      surface is made current again. Egress failures fail closed: the egress is
+//      dropped and the next frame takes the normal path.
 //
 // Threading: all GL work runs on a dedicated HandlerThread ("VGCameraGpuThread").
 // setIntensity() is thread-safe via @Volatile.
@@ -222,6 +230,34 @@ class AndroidCameraBeautySurfaceProcessor(
     private var outputEglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     private var outputSurfaceOutput: SurfaceOutput? = null
 
+    // ── Optional processed-frame egress (GPU thread only) ────────────────────
+    // A second window surface that receives the processed frame, independent
+    // of the CameraX output surface above. Attach/detach requests are posted
+    // to the GPU thread; pendingEgress survives until EGL is ready or detach.
+    private data class EgressRequest(
+        val surface: Surface,
+        val width: Int,
+        val height: Int,
+        val mirror: Boolean,
+    )
+
+    private var pendingEgress: EgressRequest? = null
+    private var egressRenderer: AndroidCameraEgressRenderer? = null
+    private var egressProgram: Int = 0
+    private var egressWaitLogged: Boolean = false
+
+    // Final processed frame (post beauty/color) so preview and egress read the
+    // same pixels. Rendered into only while an egress surface is pending or
+    // bound; the normal preview path never touches these.
+    private var finalTexture: Int = 0
+    private var finalFbo: Int = 0
+
+    // Rotation that makes the camera input upright, as reported by CameraX for
+    // the current input request. Egress only; preview orientation stays
+    // CameraX's job downstream of this processor.
+    private var inputRotationDegrees: Int = 0
+    private var transformationInfoReceived: Boolean = false
+
     // Transform matrices: raw from SurfaceTexture, final after CameraX output transform.
     // Kept distinct because Matrix.multiplyMM inside updateTransformMatrix forbids buffer overlap.
     private val rawTexMatrix = FloatArray(16)
@@ -239,6 +275,21 @@ class AndroidCameraBeautySurfaceProcessor(
                 frameHeight = size.height
                 Log.d(TAG, "onInputSurface: ${frameWidth}×${frameHeight}")
 
+                // Egress orientation: CameraX reports the rotation that makes
+                // this input upright. Only the optional egress path uses it.
+                transformationInfoReceived = false
+                inputRotationDegrees = 0
+                request.setTransformationInfoListener({ cmd -> gpuHandler.post(cmd) }) { info ->
+                    inputRotationDegrees = info.rotationDegrees
+                    transformationInfoReceived = true
+                    egressWaitLogged = false
+                    Log.d(
+                        TAG,
+                        "TransformationInfo: rotation=${info.rotationDegrees} crop=${info.cropRect} " +
+                            "mirroring=${info.isMirroring} hasCameraTransform=${info.hasCameraTransform()}",
+                    )
+                }
+
                 // Initialize EGL + GL resources on first input.
                 if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
                     initEgl()
@@ -247,6 +298,9 @@ class AndroidCameraBeautySurfaceProcessor(
 
                 // Recreate intermediate FBO for new resolution.
                 recreateIntermediateFbo(frameWidth, frameHeight)
+
+                // EGL is ready now: bind an egress surface attached before this point.
+                bindPendingEgressIfNeeded()
 
                 // Create OES texture + SurfaceTexture for camera input.
                 if (oesTexture == 0) {
@@ -301,6 +355,139 @@ class AndroidCameraBeautySurfaceProcessor(
         }
     }
 
+    // ── Optional processed-frame egress surface ──────────────────────────────
+
+    /**
+     * Attaches a second [surface] that receives the already-processed frame,
+     * drawn upright and center-cropped/scaled to [width]x[height] (720x1280
+     * portrait by default, never stretched). [mirror] flips horizontally in
+     * viewer space (front camera).
+     *
+     * Only argument validation runs on the caller thread; all EGL/GL work is
+     * posted to the GPU thread. If EGL is not initialized yet the request is
+     * kept pending and bound once the first camera input arrives. Returns false
+     * only when the request is rejected up-front (processor released or invalid
+     * arguments); true means it was queued. A later EGL failure drops the egress
+     * and leaves the preview unaffected.
+     *
+     * The caller keeps ownership of [surface]; it is never released here.
+     */
+    fun attachEgressSurface(
+        surface: Surface,
+        width: Int = AndroidCameraEgressTransform.DEFAULT_OUTPUT_WIDTH,
+        height: Int = AndroidCameraEgressTransform.DEFAULT_OUTPUT_HEIGHT,
+        mirror: Boolean = false,
+    ): Boolean {
+        if (released.get()) {
+            Log.w(TAG, "attachEgressSurface ignored: processor released")
+            return false
+        }
+        if (width <= 0 || height <= 0) {
+            Log.w(TAG, "attachEgressSurface rejected: invalid size ${width}×${height}")
+            return false
+        }
+        if (!surface.isValid) {
+            Log.w(TAG, "attachEgressSurface rejected: surface is not valid")
+            return false
+        }
+        gpuHandler.post {
+            if (released.get()) return@post
+            releaseEgressRenderer()
+            pendingEgress = EgressRequest(surface, width, height, mirror)
+            egressWaitLogged = false
+            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                bindPendingEgressIfNeeded()
+            } else {
+                Log.d(TAG, "attachEgressSurface: EGL not initialized yet, binding deferred")
+            }
+        }
+        return true
+    }
+
+    /** Detaches the egress surface, if any. Safe to call at any time; idempotent. */
+    fun detachEgressSurface() {
+        gpuHandler.post {
+            pendingEgress = null
+            releaseEgressRenderer()
+        }
+    }
+
+    // GPU thread only.
+    private fun bindPendingEgressIfNeeded() {
+        val request = pendingEgress ?: return
+        val existing = egressRenderer
+        if (existing != null && existing.isBound) return
+        val config = eglConfig
+        if (eglDisplay == EGL14.EGL_NO_DISPLAY || config == null || eglContext == EGL14.EGL_NO_CONTEXT) return
+        val renderer = existing
+            ?: AndroidCameraEgressRenderer(eglDisplay, config, eglContext).also { egressRenderer = it }
+        if (!renderer.bind(request.surface, request.width, request.height, request.mirror)) {
+            Log.e(TAG, "Egress surface creation failed; egress dropped, preview unaffected")
+            pendingEgress = null
+            egressRenderer = null
+        }
+    }
+
+    // GPU thread only. Never destroys a surface while it is current.
+    private fun releaseEgressRenderer() {
+        val renderer = egressRenderer ?: return
+        if (renderer.isBound && eglDisplay != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT) {
+            val fallback = if (outputEglSurface != EGL14.EGL_NO_SURFACE) outputEglSurface else pbufferSurface
+            if (fallback != EGL14.EGL_NO_SURFACE) {
+                EGL14.eglMakeCurrent(eglDisplay, fallback, fallback, eglContext)
+            }
+        }
+        renderer.release()
+        egressRenderer = null
+    }
+
+    // GPU thread only. Fail-closed guard for the egress-active frame path: if
+    // the shared final FBO cannot be created, the egress is dropped and this
+    // frame (and later ones) take the normal preview path.
+    private fun ensureFinalTextureFboOrDropEgress(): Boolean {
+        if (ensureFinalTextureFbo()) return true
+        Log.e(TAG, "Egress dropped: final FBO unavailable, preview unaffected")
+        pendingEgress = null
+        releaseEgressRenderer()
+        return false
+    }
+
+    // GPU thread only. Runs after the preview swap; always leaves
+    // outputEglSurface current on return.
+    private fun renderEgressIfAttached(processedTexture: Int) {
+        if (pendingEgress == null) {
+            if (egressRenderer != null) releaseEgressRenderer()
+            return
+        }
+        if (egressRenderer?.isBound != true) bindPendingEgressIfNeeded()
+        val renderer = egressRenderer ?: return
+        if (!renderer.isBound) return
+        if (!transformationInfoReceived) {
+            if (!egressWaitLogged) {
+                Log.d(TAG, "egress: waiting for CameraX transformation info")
+                egressWaitLogged = true
+            }
+            return
+        }
+        val rotation =
+            if (AndroidCameraEgressTransform.isSupportedRotation(inputRotationDegrees)) inputRotationDegrees else 0
+        val ok = try {
+            renderer.draw(
+                egressProgram, quadVao, processedTexture, frameWidth, frameHeight, rotation,
+                surfaceTexture?.timestamp ?: 0L,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Egress draw threw: ${e.message}", e)
+            false
+        }
+        EGL14.eglMakeCurrent(eglDisplay, outputEglSurface, outputEglSurface, eglContext)
+        if (!ok) {
+            Log.e(TAG, "Egress render failed; egress dropped, preview unaffected")
+            pendingEgress = null
+            releaseEgressRenderer()
+        }
+    }
+
     // ── Per-frame processing ─────────────────────────────────────────────────
 
     private fun onFrameAvailable() {
@@ -334,40 +521,91 @@ class AndroidCameraBeautySurfaceProcessor(
                 activeColorFilter.mode != CameraColorFilterState.FilterMode.PASSTHROUGH &&
                 activeColorFilter.intensity > 0f
 
-            when {
-                hasBeauty && hasColorFilter -> {
-                    // Two-pass pipeline: Beauty into beautyIntermediateFbo, then Color filter to output.
-                    GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, beautyIntermediateFbo)
-                    GLES30.glViewport(0, 0, frameWidth, frameHeight)
-                    val ok = nativeBridge.drawLiveCameraBeauty(
-                        intermediateTexture, beautyIntermediateFbo, frameWidth, frameHeight, currentIntensity
-                    )
-                    val colorInputTex = if (ok) beautyIntermediateTexture else intermediateTexture
-                    blitColorFilter(colorInputTex, 0)
-                }
-                hasBeauty && !hasColorFilter -> {
-                    // Single-pass: Beauty directly to default framebuffer (FBO 0).
-                    GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-                    GLES30.glViewport(0, 0, frameWidth, frameHeight)
-                    val ok = nativeBridge.drawLiveCameraBeauty(
-                        intermediateTexture, 0, frameWidth, frameHeight, currentIntensity
-                    )
-                    if (!ok) {
+            // The egress path only changes the render target while an egress
+            // surface is pending or bound. Otherwise the original direct-to-
+            // output path below runs unchanged — it is what every Android
+            // Vanguard camera user takes.
+            val egressActive = pendingEgress != null && ensureFinalTextureFboOrDropEgress()
+
+            if (!egressActive) {
+                when {
+                    hasBeauty && hasColorFilter -> {
+                        // Two-pass pipeline: Beauty into beautyIntermediateFbo, then Color filter to output.
+                        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, beautyIntermediateFbo)
+                        GLES30.glViewport(0, 0, frameWidth, frameHeight)
+                        val ok = nativeBridge.drawLiveCameraBeauty(
+                            intermediateTexture, beautyIntermediateFbo, frameWidth, frameHeight, currentIntensity
+                        )
+                        val colorInputTex = if (ok) beautyIntermediateTexture else intermediateTexture
+                        blitColorFilter(colorInputTex, 0)
+                    }
+                    hasBeauty && !hasColorFilter -> {
+                        // Single-pass: Beauty directly to default framebuffer (FBO 0).
+                        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+                        GLES30.glViewport(0, 0, frameWidth, frameHeight)
+                        val ok = nativeBridge.drawLiveCameraBeauty(
+                            intermediateTexture, 0, frameWidth, frameHeight, currentIntensity
+                        )
+                        if (!ok) {
+                            blitIntermediateToOutput()
+                        }
+                    }
+                    !hasBeauty && hasColorFilter -> {
+                        // Single-pass: Color filter directly to default framebuffer (FBO 0).
+                        blitColorFilter(intermediateTexture, 0)
+                    }
+                    else -> {
+                        // Passthrough: No filters active (zero filter GPU overhead).
                         blitIntermediateToOutput()
                     }
                 }
-                !hasBeauty && hasColorFilter -> {
-                    // Single-pass: Color filter directly to default framebuffer (FBO 0).
-                    blitColorFilter(intermediateTexture, 0)
-                }
-                else -> {
-                    // Passthrough: No filters active (zero filter GPU overhead).
-                    blitIntermediateToOutput()
-                }
-            }
 
-            // Swap buffers to present the frame.
-            EGL14.eglSwapBuffers(eglDisplay, outputEglSurface)
+                // Swap buffers to present the frame.
+                EGL14.eglSwapBuffers(eglDisplay, outputEglSurface)
+            } else {
+                // Egress active: render the filter stage into finalTexture so the
+                // preview blit and the egress pass share one processed frame.
+                // processedTexture is whichever texture holds the finished frame.
+                val processedTexture: Int = when {
+                    hasBeauty && hasColorFilter -> {
+                        // Two-pass pipeline: Beauty into beautyIntermediateFbo, then Color filter into finalFbo.
+                        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, beautyIntermediateFbo)
+                        GLES30.glViewport(0, 0, frameWidth, frameHeight)
+                        val ok = nativeBridge.drawLiveCameraBeauty(
+                            intermediateTexture, beautyIntermediateFbo, frameWidth, frameHeight, currentIntensity
+                        )
+                        val colorInputTex = if (ok) beautyIntermediateTexture else intermediateTexture
+                        blitColorFilter(colorInputTex, finalFbo)
+                        finalTexture
+                    }
+                    hasBeauty && !hasColorFilter -> {
+                        // Single-pass: Beauty into finalFbo (unprocessed frame on failure, as before).
+                        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, finalFbo)
+                        GLES30.glViewport(0, 0, frameWidth, frameHeight)
+                        val ok = nativeBridge.drawLiveCameraBeauty(
+                            intermediateTexture, finalFbo, frameWidth, frameHeight, currentIntensity
+                        )
+                        if (ok) finalTexture else intermediateTexture
+                    }
+                    !hasBeauty && hasColorFilter -> {
+                        // Single-pass: Color filter into finalFbo.
+                        blitColorFilter(intermediateTexture, finalFbo)
+                        finalTexture
+                    }
+                    else -> {
+                        // Passthrough: No filters active (zero filter GPU overhead).
+                        intermediateTexture
+                    }
+                }
+
+                // Present the processed frame on the CameraX output surface
+                // (1:1 nearest blit) and swap.
+                blitTextureToOutput(processedTexture)
+                EGL14.eglSwapBuffers(eglDisplay, outputEglSurface)
+
+                // Egress pass; always restores outputEglSurface as current.
+                renderEgressIfAttached(processedTexture)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing failed: ${e.message}", e)
         }
@@ -470,6 +708,31 @@ class AndroidCameraBeautySurfaceProcessor(
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
     }
 
+    // ── Processed 2D texture → Output blit (egress-active path only) ─────────
+
+    private fun blitTextureToOutput(srcTexture: Int) {
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glViewport(0, 0, frameWidth, frameHeight)
+
+        GLES30.glUseProgram(passthroughProgram)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, srcTexture)
+        // 1:1 nearest sampling keeps this blit pixel-identical to rendering
+        // straight into the output surface (the egress pass switches the same
+        // texture to linear for its downscale, so reset it every frame).
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+
+        val texLoc = GLES30.glGetUniformLocation(passthroughProgram, "uTex")
+        GLES30.glUniform1i(texLoc, 0)
+
+        GLES30.glBindVertexArray(quadVao)
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
+        GLES30.glBindVertexArray(0)
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+    }
+
     // ── EGL initialization ───────────────────────────────────────────────────
 
     private fun initEgl() {
@@ -522,6 +785,8 @@ class AndroidCameraBeautySurfaceProcessor(
         oesProgram = buildProgram(OES_VERTEX_SHADER, OES_FRAGMENT_SHADER)
         passthroughProgram = buildProgram(PASSTHROUGH_VERTEX_SHADER, PASSTHROUGH_FRAGMENT_SHADER)
         colorFilterProgram = buildProgram(PASSTHROUGH_VERTEX_SHADER, COLOR_FILTER_FRAGMENT_SHADER)
+        // Egress blit: uTexMatrix vertex (rotate/crop/mirror) over a 2D sampler.
+        egressProgram = buildProgram(OES_VERTEX_SHADER, PASSTHROUGH_FRAGMENT_SHADER)
 
         uColorTexLoc = GLES30.glGetUniformLocation(colorFilterProgram, "uTex")
         uColorFilterModeLoc = GLES30.glGetUniformLocation(colorFilterProgram, "uFilterMode")
@@ -648,7 +913,61 @@ class AndroidCameraBeautySurfaceProcessor(
         }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
 
+        // The final (egress-only) texture is sized to the input, so a resolution
+        // change invalidates it; it is re-created lazily on the next egress frame.
+        deleteFinalTextureFbo()
+
         Log.d(TAG, "Intermediate & Beauty FBOs created: ${width}×${height}")
+    }
+
+    // GPU thread only. Creates the final processed-frame texture + FBO at the
+    // current input size on first use. Only the egress-active path calls this,
+    // so the normal preview path allocates nothing extra. Returns false (with
+    // nothing allocated) if the FBO is incomplete.
+    private fun ensureFinalTextureFbo(): Boolean {
+        if (finalFbo != 0) return true
+        if (frameWidth <= 0 || frameHeight <= 0) return false
+
+        val finalTextures = IntArray(1)
+        GLES30.glGenTextures(1, finalTextures, 0)
+        finalTexture = finalTextures[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, finalTexture)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, frameWidth, frameHeight, 0,
+            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+
+        val finalFbos = IntArray(1)
+        GLES30.glGenFramebuffers(1, finalFbos, 0)
+        finalFbo = finalFbos[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, finalFbo)
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D, finalTexture, 0)
+
+        val finalStatus = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        if (finalStatus != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            Log.e(TAG, "Final FBO incomplete: $finalStatus")
+            deleteFinalTextureFbo()
+            return false
+        }
+
+        Log.d(TAG, "Final FBO created for egress: ${frameWidth}×${frameHeight}")
+        return true
+    }
+
+    private fun deleteFinalTextureFbo() {
+        if (finalFbo != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(finalFbo), 0)
+            finalFbo = 0
+        }
+        if (finalTexture != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(finalTexture), 0)
+            finalTexture = 0
+        }
     }
 
     // ── Shader compilation ───────────────────────────────────────────────────
@@ -705,6 +1024,11 @@ class AndroidCameraBeautySurfaceProcessor(
 
         gpuHandler.post {
             try {
+                // Egress first: it needs the display/context alive to make
+                // another surface current before its own surface is destroyed.
+                pendingEgress = null
+                releaseEgressRenderer()
+
                 releaseOutputSurface()
 
                 // Release cached native GL resources (shader programs, FBOs,
@@ -736,6 +1060,11 @@ class AndroidCameraBeautySurfaceProcessor(
                 if (beautyIntermediateFbo != 0) {
                     GLES30.glDeleteFramebuffers(1, intArrayOf(beautyIntermediateFbo), 0)
                     beautyIntermediateFbo = 0
+                }
+                deleteFinalTextureFbo()
+                if (egressProgram != 0) {
+                    GLES30.glDeleteProgram(egressProgram)
+                    egressProgram = 0
                 }
                 if (lutTextureId != 0) {
                     GLES30.glDeleteTextures(1, intArrayOf(lutTextureId), 0)
