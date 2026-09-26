@@ -1240,6 +1240,32 @@ class VanguardCameraSource(
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Processed-frame egress delegation (LiveKit bridge Slice C → processor Slice A)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Forwards an egress [surface] to the live beauty processor, which renders
+     * the already-processed frame into it at [width]x[height] (see
+     * [AndroidCameraBeautySurfaceProcessor.attachEgressSurface]). Returns false
+     * when no processor exists yet (camera not started) or the processor
+     * rejects the request up-front; a later GPU-side failure drops the egress
+     * without affecting the preview.
+     */
+    fun attachEgressSurface(surface: Surface, width: Int, height: Int, mirror: Boolean): Boolean {
+        val processor = beautyProcessor
+        if (processor == null) {
+            Log.w(TAG, "attachEgressSurface: beautyProcessor is null (camera not started)")
+            return false
+        }
+        return processor.attachEgressSurface(surface, width, height, mirror)
+    }
+
+    /** Detaches any egress surface from the live beauty processor. Safe when none is bound. */
+    fun detachEgressSurface() {
+        beautyProcessor?.detachEgressSurface()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Accessors for plugin (Step 2 wiring)
     // ─────────────────────────────────────────────────────────────────────────
 

@@ -618,6 +618,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var cameraSource: VanguardCameraSource? = null
     private var cameraTexture: TextureRegistry.SurfaceTextureEntry? = null
 
+    // ── LiveKit bridge (Slice C): MethodChannel "vanguard_livekit_bridge" ────
+    // Forwards a WebRTC-owned Surface to the active camera source's processor
+    // (Slice A egress). Created in onAttachedToEngine, disposed first thing in
+    // onDetachedFromEngine so egress is released before cameraSource is dropped.
+    private var liveKitBridge: AndroidVanguardLiveKitBridge? = null
+
     // ── UFM-GREENSCREEN-CAM-GRAPH: independent green-screen camera graph ─────
     // source. Selected only when Dart sends
     // cameraCaptureProfile=greenScreenLowLatency to startCamera; mutually
@@ -649,12 +655,50 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         private const val TAG = "VanguardPlugin"
     }
 
+    // ── Slice C: egress delegation to the current camera source ──────────────
+
+    /**
+     * Forwards an egress [surface] to the active [VanguardCameraSource]
+     * (→ its beauty processor, Slice A). Returns false when no camera source
+     * is active or the source/processor rejects the request.
+     */
+    fun attachEgressSurface(surface: android.view.Surface, width: Int, height: Int, mirror: Boolean): Boolean {
+        val source = cameraSource
+        if (source == null) {
+            Log.w(TAG, "attachEgressSurface: cameraSource is null")
+            return false
+        }
+        return source.attachEgressSurface(surface, width, height, mirror)
+    }
+
+    /** Detaches any egress surface from the active camera source. Safe when none is active. */
+    fun detachEgressSurface() {
+        cameraSource?.detachEgressSurface()
+    }
+
     override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         detached = false
         this.binding = binding
         this.context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "vanguard_media_engine")
         channel.setMethodCallHandler(this)
+        liveKitBridge = AndroidVanguardLiveKitBridge(
+            binding.binaryMessenger,
+            object : VanguardEgressHost {
+                override val isCameraActive: Boolean
+                    get() = cameraSource?.running == true
+
+                override fun attachEgressSurface(
+                    surface: android.view.Surface,
+                    width: Int,
+                    height: Int,
+                    mirror: Boolean,
+                ): Boolean = this@VanguardMediaEnginePlugin.attachEgressSurface(surface, width, height, mirror)
+
+                override fun detachEgressSurface() =
+                    this@VanguardMediaEnginePlugin.detachEgressSurface()
+            },
+        )
         thermalStateBridge = AndroidThermalStateBridge(
             context     = binding.applicationContext,
             channel     = channel,
@@ -3645,6 +3689,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         thermalStateBridge?.shutdown()
         thermalStateBridge = null
         channel.setMethodCallHandler(null)
+        // Slice C: release the LiveKit bridge's egress/listener state while the
+        // camera source (and its processor) is still alive, before both are dropped.
+        liveKitBridge?.dispose()
+        liveKitBridge = null
         // B2: Tear down camera session first — prevents leaked CameraX session
         // on hot-restart (Flutter re-attaches the engine to a new surface).
         // UFM-GREENSCREEN-CAM-GRAPH: stop the independent green-screen graph
