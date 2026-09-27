@@ -880,6 +880,28 @@ static NSArray<NSDictionary *> *_VGDeepCopyFilterSpecs(NSArray<NSDictionary *> *
     return success;
 }
 
+// ─── resumeCaptureSourceIfStopped ────────────────────────────────────────────
+//
+// The LiveKit egress bridge connects its receiver (rebuild + startWithClock →
+// source start) while WebRTC's stock capturer still holds the camera, so that
+// start cannot take effect; once the stock capturer has stopped, the bridge
+// calls this to run the same source start path again. Async on _sessionQueue:
+// connectProcessedFrameReceiver: and invalidate dispatch_sync onto that queue
+// from the main thread, and a sync dispatch here would deadlock any caller
+// that is already on it. The graph is not rebuilt.
+- (void)resumeCaptureSourceIfStopped {
+    dispatch_async(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated) || !self->_source) {
+            NSLog(@"[Vanguard] resumeCaptureSourceIfStopped — session invalidated or source nil, ignored");
+            return;
+        }
+        // VanguardCameraMediaSource.start returns at once while the
+        // AVCaptureSession runs and otherwise dispatches startRunning onto the
+        // capture queue, so the session queue never blocks here.
+        [self->_source start];
+    });
+}
+
 // ─── Phase 6A-3D-2: Spec-driven filter construction ──────────────────────────
 //
 // Three-pass atomic validation:

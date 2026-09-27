@@ -145,6 +145,16 @@ NS_ASSUME_NONNULL_BEGIN
 /// releases retained graph resources. Does NOT stop the camera source.
 - (void)invalidate;
 
+/// Asks the camera source to resume capture when its AVCaptureSession is not
+/// running — e.g. after another capture session (WebRTC's stock camera
+/// capturer) released the device. Reuses the scheduler's source start path
+/// (VanguardCameraMediaSource.start, an idempotent no-op while the session
+/// runs) and never rebuilds the graph.
+///
+/// Asynchronous on the session queue, so it is safe from any thread, including
+/// callers that are already on that queue. No-op after invalidate.
+- (void)resumeCaptureSourceIfStopped;
+
 /// Rebuilds the camera graph with the given filter chain and swaps the active
 /// scheduler.
 ///

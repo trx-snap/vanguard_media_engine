@@ -107,6 +107,23 @@ internal extension URL {
 public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     private var registrar: FlutterPluginRegistrar!
     private var channel: FlutterMethodChannel!
+    // iOS LiveKit egress bridge channel ("vanguard_livekit_bridge"). Owned here
+    // because GeneratedPluginRegistrant registers only this plugin; calls are
+    // forwarded to VanguardRTCVideoCapturer, which pulls the active camera graph
+    // session through the provider installed in register(with:).
+    private var liveKitBridgeChannel: FlutterMethodChannel?
+
+    // VanguardRTCVideoCapturer is an ObjC class in this pod's umbrella header,
+    // so it is called through its typed Swift interface. FlutterResult must
+    // reach it as a real block (it is a Swift closure, never bit-castable to
+    // AnyObject).
+    fileprivate static func liveKitBridgeDetach(forGraphSessionTeardown session: VGCameraGraphSession?) {
+        VanguardRTCVideoCapturer.sharedInstance().detach(forGraphSessionTeardown: session)
+    }
+
+    fileprivate static func liveKitBridgeDetach() {
+        VanguardRTCVideoCapturer.sharedInstance().detach()
+    }
 
     // P1-T4: Current mode — transitions require teardown
     var currentMode: VanguardEngineMode = .idle
@@ -515,6 +532,27 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // downloadPhotoVideoReference on this channel (weak; plugin owns it).
         instance.videoAssetPickerHandler.channel = channel
 
+        // iOS LiveKit egress: the bridge channel lives here (this plugin is the
+        // only one registered) and forwards to VanguardRTCVideoCapturer together
+        // with the current camera graph session, so egress binds to the graph's
+        // processed-frame fan-out rather than to any platform view.
+        let liveKitBridgeChannel = FlutterMethodChannel(name: "vanguard_livekit_bridge",
+                                                        binaryMessenger: registrar.messenger())
+        let liveKitCapturer = VanguardRTCVideoCapturer.sharedInstance()
+        // The capturer pulls the *current* graph session at call time.
+        #if VG_USE_CAMERA_GRAPH
+        liveKitCapturer.setGraphSessionProvider { [weak instance] in
+            instance?.cameraGraphSession
+        }
+        #else
+        liveKitCapturer.setGraphSessionProvider { nil }
+        #endif
+        liveKitBridgeChannel.setMethodCallHandler { call, result in
+            // `result` is passed as the FlutterResult block the capturer declares.
+            liveKitCapturer.handle(call, result: result)
+        }
+        instance.liveKitBridgeChannel = liveKitBridgeChannel
+
         // Phase 4C6H3F: register for UIApplicationDelegate callbacks so
         // application(_:handleEventsForBackgroundURLSession:completionHandler:)
         // below is invoked on a background AVAssetDownloadURLSession relaunch.
@@ -616,6 +654,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 // invalidation so no in-flight processed frames append after
                 // finishWritingWithCompletionHandler: is called.
                 session.setRecordingEnabled(false)
+                // iOS LiveKit egress: detach before invalidation so no processed
+                // frame is forwarded from a session that is being torn down.
+                VanguardMediaEnginePlugin.liveKitBridgeDetach(forGraphSessionTeardown: session)
                 session.invalidate()
                 cameraGraphSession = nil
             } else {
@@ -657,6 +698,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     /// Does NOT interact with VanguardEngineMode, switchToMode, AVAudioSession,
     /// LiveKit, WebRTC, cache state, or any other unrelated engine state.
     public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
+        // iOS LiveKit egress: close the bridge before any camera/graph state is
+        // dropped, and stop handling bridge calls for this engine.
+        VanguardMediaEnginePlugin.liveKitBridgeDetach()
+        liveKitBridgeChannel?.setMethodCallHandler(nil)
+        liveKitBridgeChannel = nil
         if _streamingPlaybackCoordinatorCreated {
             streamingPlaybackCoordinator.disposeAll()
         }
@@ -1223,6 +1269,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 // invalidation so no in-flight processed frames append after
                 // finishWritingWithCompletionHandler: is called.
                 session.setRecordingEnabled(false)
+                // iOS LiveKit egress: detach before invalidation so no processed
+                // frame is forwarded from a session that is being torn down.
+                VanguardMediaEnginePlugin.liveKitBridgeDetach(forGraphSessionTeardown: session)
                 session.invalidate()
                 self?.cameraGraphSession = nil
             } else {
@@ -5369,6 +5418,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 // invalidation so no in-flight processed frames append after
                 // finishWritingWithCompletionHandler: is called.
                 session.setRecordingEnabled(false)
+                // iOS LiveKit egress: detach before invalidation so no processed
+                // frame is forwarded from a session that is being torn down.
+                VanguardMediaEnginePlugin.liveKitBridgeDetach(forGraphSessionTeardown: session)
                 session.invalidate()
                 cameraGraphSession = nil
             } else {

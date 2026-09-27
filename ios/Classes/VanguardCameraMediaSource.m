@@ -110,6 +110,18 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   id _thermalObserver;     // NSNotificationCenter token
   id _orientationObserver; // UIDevice orientation change token
 
+  // ── AVCaptureSession interruption / runtime-error recovery ────────────────
+  // Observers on this source's own _session. When another capture session
+  // (e.g. WebRTC's stock camera capturer) takes the device, the system
+  // interrupts this session; when that interruption ends, or media services
+  // are reset, the session is started again on _captureQueue — but only while
+  // capture is intended (start called, no stop since) and the session is not
+  // already running. Inert after stop; removed in dealloc.
+  id _interruptionObserver;
+  id _interruptionEndedObserver;
+  id _runtimeErrorObserver;
+  atomic_bool _captureIntended; // true from start until stop
+
   // ── Device controls & camera switching (Phases 2–3) ──────────────────────
   // _captureDevice: retained reference to the active video device; used by
   //   setZoom:, setFocusPoint:, setTorchMode:, and switchToPosition:.
@@ -418,6 +430,11 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
   _session.automaticallyConfiguresApplicationAudioSession = NO;
   [self _configureSession];
 
+  // Interruption / runtime-error recovery for this session (see the ivar
+  // comment). Capture is not intended until start.
+  atomic_init(&_captureIntended, false);
+  [self _installCaptureSessionRecoveryObservers];
+
   // POC2: raw forwarding gate defaults to YES (POC1 path active by default).
   // Set to NO by VGCameraGraphSession.connectPlatformViewReceiver: when the
   // two-child VGFanOutSink is installed to prevent raw+processed double
@@ -594,6 +611,9 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 #pragma mark - VanguardMediaSource — start / stop
 
 - (void)start {
+  // Capture is intended from here until stop; the interruption-ended and
+  // media-services-reset observers restart the session only while this holds.
+  atomic_store(&_captureIntended, true);
   if (_session.isRunning) {
     NSLog(
         @"[VanguardCamera] start — session already running, idempotent no-op.");
@@ -616,6 +636,8 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 }
 
 - (void)stop {
+  // Intentional stop: recovery observers must not restart the session.
+  atomic_store(&_captureIntended, false);
   [self _stopWatchdog];
   // If recording in progress — finalise first, then stop session
   if (_recordingState == VanguardRecordingStateWriting) {
@@ -633,6 +655,104 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     _latestBuffer = NULL;
   }
   os_unfair_lock_unlock(&_latestBufferLock);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - AVCaptureSession interruption / runtime-error recovery
+
+// Observers are scoped to this source's _session (object:) and delivered on
+// the posting thread; the restart itself always runs on _captureQueue, the
+// same queue start uses for startRunning. Blocks capture self weakly so the
+// observers never extend this object's lifetime.
+- (void)_installCaptureSessionRecoveryObservers {
+  __weak typeof(self) weakSelf = self;
+  NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+
+  _interruptionObserver = [center
+      addObserverForName:AVCaptureSessionWasInterruptedNotification
+                  object:_session
+                   queue:nil
+              usingBlock:^(NSNotification *note) {
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf)
+                  return;
+                NSInteger reason =
+                    [note.userInfo[AVCaptureSessionInterruptionReasonKey]
+                        integerValue];
+                NSLog(@"[VanguardCamera] session interrupted (reason=%ld "
+                      @"running=%d intended=%d)",
+                      (long)reason, strongSelf->_session.isRunning,
+                      atomic_load(&strongSelf->_captureIntended));
+              }];
+
+  _interruptionEndedObserver = [center
+      addObserverForName:AVCaptureSessionInterruptionEndedNotification
+                  object:_session
+                   queue:nil
+              usingBlock:^(NSNotification *note) {
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf)
+                  return;
+                [strongSelf
+                    _resumeCaptureSessionIfIntendedForReason:@"interruption ended"];
+              }];
+
+  _runtimeErrorObserver = [center
+      addObserverForName:AVCaptureSessionRuntimeErrorNotification
+                  object:_session
+                   queue:nil
+              usingBlock:^(NSNotification *note) {
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf)
+                  return;
+                NSError *error = note.userInfo[AVCaptureSessionErrorKey];
+                NSLog(@"[VanguardCamera] session runtime error: %@", error);
+                // The documented recoverable case: media services were reset
+                // and the client must start the session again. Other runtime
+                // errors are logged only.
+                if (error.code == AVErrorMediaServicesWereReset) {
+                  [strongSelf _resumeCaptureSessionIfIntendedForReason:
+                                  @"media services reset"];
+                }
+              }];
+}
+
+- (void)_removeCaptureSessionRecoveryObservers {
+  NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+  if (_interruptionObserver) {
+    [center removeObserver:_interruptionObserver];
+    _interruptionObserver = nil;
+  }
+  if (_interruptionEndedObserver) {
+    [center removeObserver:_interruptionEndedObserver];
+    _interruptionEndedObserver = nil;
+  }
+  if (_runtimeErrorObserver) {
+    [center removeObserver:_runtimeErrorObserver];
+    _runtimeErrorObserver = nil;
+  }
+}
+
+// Starts the session again on _captureQueue when capture is still intended
+// (start without a later stop) and the session is not running. Leaves the
+// watchdog alone: start armed it and only stop cancels it.
+- (void)_resumeCaptureSessionIfIntendedForReason:(NSString *)reason {
+  dispatch_async(_captureQueue, ^{
+    if (!atomic_load(&self->_captureIntended)) {
+      NSLog(@"[VanguardCamera] %@ — capture stopped intentionally, no restart",
+            reason);
+      return;
+    }
+    if (self->_session.isRunning) {
+      NSLog(@"[VanguardCamera] %@ — session already running, no restart",
+            reason);
+      return;
+    }
+    NSLog(@"[VanguardCamera] %@ — restarting session", reason);
+    [self->_session startRunning];
+    NSLog(@"[VanguardCamera] %@ — session running=%d", reason,
+          self->_session.isRunning);
+  });
 }
 
 - (void)seekTo:(CMTime)time { /* no-op: live source */
@@ -2360,6 +2480,7 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
 - (void)dealloc {
 
   [self _stopWatchdog];
+  [self _removeCaptureSessionRecoveryObservers];
   // Phase 6A-3J-F: Remove orientation observer.
   if (_orientationObserver) {
     [NSNotificationCenter.defaultCenter removeObserver:_orientationObserver];

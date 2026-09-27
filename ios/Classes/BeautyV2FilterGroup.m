@@ -11,7 +11,9 @@
 //   Single MTLCommandBuffer, 3 sequential compute encoders:
 //     [1] blur_h    original         → intermediateA  (_beautyPoolA)
 //     [2] blur_v    intermediateA    → intermediateB  (_beautyPoolB)
-//     [3] composite original+B       → outputBuffer   (_pool)  [highpass fused inline]
+//     [3] composite original+B       → outputBuffer   (_pool, or _outputPool when
+//                                                      _pool's dimensions ≠ input)
+//                                                     [highpass fused inline]
 //   [cmd commit]; [cmd waitUntilCompleted];
 //   Intermediates released AFTER waitUntilCompleted — never before (RR-38/39).
 //
@@ -23,6 +25,8 @@
 //
 // CF ownership discipline (mandatory — RR-43/DEC-58):
 //   _beautyPoolA/B  — node-local. CFRelease on replace/nil.
+//   _outputPool     — node-local, sized to the input; exists only while the
+//                     borrowed _pool does not vend input-sized buffers.
 //   _pool           — borrowed (no CFRetain). Caller (runtime) owns lifetime.
 
 #import "BeautyV2FilterGroup.h"
@@ -82,6 +86,38 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     return pool; // +1 from Create — caller owns
 }
 
+/// YES when `pool` vends width×height buffers. Reads the pool's pixel buffer
+/// attributes; if they carry no dimensions, probes one buffer and releases it.
+/// A NULL pool vends nothing. The vended dimensions are reported through
+/// outWidth/outHeight for logging (0 when unknown).
+static BOOL
+_VGBeautyPoolVendsDimensions(CVPixelBufferPoolRef _Nullable pool,
+                             size_t width, size_t height,
+                             size_t *_Nullable outWidth, size_t *_Nullable outHeight) {
+    size_t poolW = 0, poolH = 0;
+    if (pool) {
+        NSDictionary *attrs =
+            (__bridge NSDictionary *)CVPixelBufferPoolGetPixelBufferAttributes(pool);
+        NSNumber *attrW = attrs[(id)kCVPixelBufferWidthKey];
+        NSNumber *attrH = attrs[(id)kCVPixelBufferHeightKey];
+        if ([attrW isKindOfClass:[NSNumber class]] && [attrH isKindOfClass:[NSNumber class]]) {
+            poolW = attrW.unsignedLongValue;
+            poolH = attrH.unsignedLongValue;
+        } else {
+            CVPixelBufferRef probe = NULL;
+            if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &probe) == kCVReturnSuccess &&
+                probe) {
+                poolW = CVPixelBufferGetWidth(probe);
+                poolH = CVPixelBufferGetHeight(probe);
+                CVPixelBufferRelease(probe);
+            }
+        }
+    }
+    if (outWidth)  *outWidth  = poolW;
+    if (outHeight) *outHeight = poolH;
+    return poolW == width && poolH == height;
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -105,6 +141,13 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // _beautyPoolC removed (Phase 9B+ OP-1): highpass now fused into composite.
     CVPixelBufferPoolRef _beautyPoolA;
     CVPixelBufferPoolRef _beautyPoolB;
+    // _outputPool: Pass 3 output, node-owned, sized to the prepared input.
+    // NULL while the borrowed _pool vends input-sized buffers (the common
+    // case); created in prepareWithWidth:height:device:error: when it does not,
+    // e.g. a 720×1280 livestream session whose graph pool was sized 1080×1920
+    // from the device's active format. Pass 3 writes exactly width×height
+    // texels, so a larger output buffer would keep unwritten black bands.
+    CVPixelBufferPoolRef _outputPool;
 
     // ── Prepare state ─────────────────────────────────────────────────────────
     size_t _preparedWidth;
@@ -316,6 +359,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Node-local pools start as NULL — created in prepareWithWidth:height:device:error:
     _beautyPoolA = NULL;
     _beautyPoolB = NULL;
+    _outputPool  = NULL;
     // _beautyPoolC removed (Phase 9B+ OP-1)
 
 #if VG_ENABLE_BEAUTYV2_TIMING_LOGS
@@ -337,6 +381,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Release node-local pools explicitly (CFRelease — not ARC).
     if (_beautyPoolA) { CFRelease(_beautyPoolA); _beautyPoolA = NULL; }
     if (_beautyPoolB) { CFRelease(_beautyPoolB); _beautyPoolB = NULL; }
+    if (_outputPool)  { CFRelease(_outputPool);  _outputPool  = NULL; }
     // _beautyPoolC removed (Phase 9B+ OP-1).
     // _pool is borrowed — do NOT release.
     _queue  = nil;
@@ -365,6 +410,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Dimensions changed or first call — tear down old pools before rebuilding.
     if (_beautyPoolA) { CFRelease(_beautyPoolA); _beautyPoolA = NULL; }
     if (_beautyPoolB) { CFRelease(_beautyPoolB); _beautyPoolB = NULL; }
+    if (_outputPool)  { CFRelease(_outputPool);  _outputPool  = NULL; }
     // _beautyPoolC removed (Phase 9B+ OP-1).
     _poolsReady = NO;
 
@@ -403,9 +449,40 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Phase 9B+ OP-1: Pool C (_beautyPoolC) removed — highpass fused into composite.
     // Two pools are now sufficient.
 
-    // Both pools created — assign (node owns +1 from each Create call).
+    // Output pool: the borrowed session pool is sized once, from the device's
+    // active format, when the graph session is created; the frames the camera
+    // then delivers can be smaller (720×1280 livestream on a 1080×1920 active
+    // format). Pass 3 fills exactly width×height texels, so an oversized output
+    // buffer keeps black bands on the right/bottom. When the borrowed pool does
+    // not vend width×height buffers, Pass 3 draws from a node-local pool of the
+    // input's dimensions instead. No scaling, cropping, or aspect change.
+    CVPixelBufferPoolRef poolOut = NULL;
+    size_t borrowedW = 0, borrowedH = 0;
+    if (!_VGBeautyPoolVendsDimensions(_pool, width, height, &borrowedW, &borrowedH)) {
+        poolOut = _VGBeautyCreatePool(width, height);
+        if (!poolOut) {
+            CFRelease(poolA);
+            CFRelease(poolB);
+            os_unfair_lock_unlock(&_prepareLock);
+            if (error) {
+                *error = [NSError errorWithDomain:@"BeautyV2FilterGroup"
+                                             code:3
+                                         userInfo:@{
+                    NSLocalizedDescriptionKey: @"[BeautyV2] Failed to create _outputPool"
+                }];
+            }
+            return NO;
+        }
+        os_log_info(OS_LOG_DEFAULT,
+                    "[BeautyV2] borrowed output pool vends %zu×%zu but input is %zu×%zu — "
+                    "using a node-local %zu×%zu output pool",
+                    borrowedW, borrowedH, width, height, width, height);
+    }
+
+    // All pools created — assign (node owns +1 from each Create call).
     _beautyPoolA    = poolA;
     _beautyPoolB    = poolB;
+    _outputPool     = poolOut;   // NULL → Pass 3 uses the borrowed _pool
     _preparedWidth  = width;
     _preparedHeight = height;
     _poolsReady     = YES;
@@ -426,6 +503,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     os_unfair_lock_lock(&_prepareLock);
     if (_beautyPoolA) { CFRelease(_beautyPoolA); _beautyPoolA = NULL; }
     if (_beautyPoolB) { CFRelease(_beautyPoolB); _beautyPoolB = NULL; }
+    if (_outputPool)  { CFRelease(_outputPool);  _outputPool  = NULL; }
     // _beautyPoolC removed (Phase 9B+ OP-1).
     _poolsReady = NO;
     os_unfair_lock_unlock(&_prepareLock);
@@ -932,17 +1010,20 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     // Phase 9B+ OP-1: poolC/_beautyPoolC removed — highpass fused into composite.
     CVPixelBufferPoolRef poolA = NULL;
     CVPixelBufferPoolRef poolB = NULL;
+    CVPixelBufferPoolRef poolOut = NULL;  // node-local output pool; NULL → borrowed _pool
 
     os_unfair_lock_lock(&_prepareLock);
     if (_beautyPoolA && _beautyPoolB) {
         poolA = (CVPixelBufferPoolRef)CFRetain(_beautyPoolA);
         poolB = (CVPixelBufferPoolRef)CFRetain(_beautyPoolB);
+        if (_outputPool) poolOut = (CVPixelBufferPoolRef)CFRetain(_outputPool);
     }
     os_unfair_lock_unlock(&_prepareLock);
 
     if (!poolA || !poolB) {
         if (poolA) CFRelease(poolA);
         if (poolB) CFRelease(poolB);
+        if (poolOut) CFRelease(poolOut);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pools unavailable during processing — passthrough");
         return envelope;
     }
@@ -955,24 +1036,30 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
 
     if (CVPixelBufferPoolCreatePixelBuffer(nil, poolA, &bufA) != kCVReturnSuccess) {
         CFRelease(poolA); CFRelease(poolB);
+        if (poolOut) CFRelease(poolOut);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pool A exhausted");
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
     if (CVPixelBufferPoolCreatePixelBuffer(nil, poolB, &bufB) != kCVReturnSuccess) {
         CVPixelBufferRelease(bufA);
         CFRelease(poolA); CFRelease(poolB);
+        if (poolOut) CFRelease(poolOut);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pool B exhausted");
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
-    if (CVPixelBufferPoolCreatePixelBuffer(nil, _pool, &output) != kCVReturnSuccess) {
+    // Output buffer: the node-local input-sized pool when prepare created one
+    // (borrowed pool dimensions ≠ input), otherwise the borrowed session pool.
+    if (CVPixelBufferPoolCreatePixelBuffer(nil, poolOut ? poolOut : _pool, &output) != kCVReturnSuccess) {
         CVPixelBufferRelease(bufA); CVPixelBufferRelease(bufB);
         CFRelease(poolA); CFRelease(poolB);
+        if (poolOut) CFRelease(poolOut);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] output pool exhausted");
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
 
     // Pool snapshots no longer needed — buffers are independently retained.
     CFRelease(poolA); CFRelease(poolB);
+    if (poolOut) CFRelease(poolOut);
 
     // ── Make Metal textures ───────────────────────────────────────────────────
     // Phase 9B+ OP-1: texC removed — no intermediateC pool needed.

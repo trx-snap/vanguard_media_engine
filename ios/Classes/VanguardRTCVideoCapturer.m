@@ -1,14 +1,25 @@
 // VanguardRTCVideoCapturer.m
-// Vanguard Media Engine -> LiveKit LiveStreaming Egress Bridge
-// Isolated Proof of Concept
+// Vanguard Media Engine -> LiveKit LiveStreaming Egress Bridge (iOS)
+//
+// Repair (processed-frame receiver path):
+//   The previous proof-of-concept swizzled VanguardCameraPlatformView.onFrame:pts:
+//   and registered its own channel from +load. Neither ever ran for the
+//   livestream screen: the screen previews through VGCameraSession + a Flutter
+//   Texture (no platform view), and nothing registered the channel. This
+//   implementation instead conforms to VanguardCameraFrameReceiver and is
+//   wired into the active VGCameraGraphSession's fan-out by the plugin via
+//   -connectProcessedFrameReceiver:, so it receives exactly the processed
+//   frames the preview renders. No swizzling, no +load, no self-registration.
 
 #import "VanguardRTCVideoCapturer.h"
-#import <objc/runtime.h>
+#import "VGCameraGraphSession.h"
 #import <os/lock.h>
+#import <time.h>
 
 // ── WebRTC Forward Declarations (Dynamic Runtime Binding) ────────────────────
-// Using forward declarations allows compiling without adding a static pod dependency
-// to vanguard_media_engine.podspec. Symbols are resolved dynamically from WebRTC.framework.
+// Forward declarations let this file compile without a WebRTC pod dependency;
+// the classes are resolved at runtime from WebRTC.framework (RTC_OBJC_TYPE_PREFIX
+// is empty in the bundled SDK, so the unprefixed names are the real ones).
 
 @interface RTCCVPixelBuffer : NSObject
 - (instancetype)initWithPixelBuffer:(CVPixelBufferRef)pixelBuffer;
@@ -22,339 +33,501 @@
 - (void)capturer:(id)capturer didCaptureVideoFrame:(RTCVideoFrame *)frame;
 @end
 
-@interface RTCVideoSource : NSObject <RTCVideoCapturerDelegate>
-- (void)capturer:(id)capturer didCaptureVideoFrame:(RTCVideoFrame *)frame;
-@end
+// flutter_webrtc's per-track stop handler: ^(CompletionHandler handler).
+typedef void (^VGRTCCompletionHandler)(void);
+typedef void (^VGRTCCapturerStopHandler)(VGRTCCompletionHandler _Nonnull handler);
+
+static NSString *const kVGRTCTag = @"[VanguardRTC]";
+static const int64_t kVGRTCStockStopTimeoutNs = 1 * NSEC_PER_SEC;
+static const uint64_t kVGRTCPeriodicLogFrames = 300;
+
+static NSString *VGRTCFourCC(OSType fmt) {
+    char c[5] = { (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, 0 };
+    return [NSString stringWithUTF8String:c] ?: [NSString stringWithFormat:@"0x%08x", (unsigned)fmt];
+}
 
 // ── Private Interface ────────────────────────────────────────────────────────
 
 @interface VanguardRTCVideoCapturer () {
     os_unfair_lock _lock;
-    id _activeVideoSource;
-    uint64_t _framesDelivered;
-    BOOL _isStreaming;
+
+    // ── Guarded by _lock ─────────────────────────────────────────────────────
+    id _activeVideoSource;              // RTCVideoSource (an RTCVideoCapturerDelegate)
     NSString *_attachedTrackId;
+    BOOL _gateOpen;                     // frames are forwarded only while YES
+    BOOL _stockStopConfirmed;
+    BOOL _attachInProgress;             // between stock-stop request and gate open
+    uint64_t _attachGeneration;         // invalidates stale completion/timeout blocks
+    uint64_t _framesDelivered;
+    FlutterResult _pendingAttachResult; // replied exactly once by whoever takes it
+    __weak VGCameraGraphSession *_connectedGraphSession;
+    VGRTCGraphSessionProvider _graphSessionProvider;
+
+    // ── Resolved on first attach; immutable afterwards ───────────────────────
+    Class _rtcPixelBufferClass;
+    Class _rtcVideoFrameClass;
 }
 @end
 
 @implementation VanguardRTCVideoCapturer
 
-static VanguardRTCVideoCapturer *_sharedInstance = nil;
-static FlutterMethodChannel *_methodChannel = nil;
-static BOOL _swizzleInstalled = NO;
-
 + (instancetype)sharedInstance {
+    static VanguardRTCVideoCapturer *shared = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        _sharedInstance = [[VanguardRTCVideoCapturer alloc] init];
+        shared = [[VanguardRTCVideoCapturer alloc] init];
     });
-    return _sharedInstance;
+    return shared;
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
         _lock = OS_UNFAIR_LOCK_INIT;
-        _activeVideoSource = nil;
-        _framesDelivered = 0;
-        _isStreaming = NO;
-        _attachedTrackId = nil;
     }
     return self;
 }
 
-// ── Auto-Registration on Startup ─────────────────────────────────────────────
+// ── Flutter Method Routing (main thread) ─────────────────────────────────────
 
-+ (void)load {
-    // Automatically install hooks when framework is mapped into process space.
-    static dispatch_once_t loadToken;
-    dispatch_once(&loadToken, ^{
-        [self installSwizzles];
-    });
+- (void)setGraphSessionProvider:(VGRTCGraphSessionProvider)provider {
+    VGRTCGraphSessionProvider copied = [provider copy];
+    os_unfair_lock_lock(&_lock);
+    _graphSessionProvider = copied;
+    os_unfair_lock_unlock(&_lock);
+    NSLog(@"%@ graph session provider %@", kVGRTCTag, provider ? @"installed" : @"cleared");
 }
-
-+ (void)installSwizzles {
-    // 1. Swizzle VanguardCameraPlatformView.onFrame:pts:
-    // This allows capturing Metal-processed frames without altering VanguardCameraPlatformView.swift.
-    Class pvClass = NSClassFromString(@"vanguard_media_engine.VanguardCameraPlatformView");
-    if (!pvClass) {
-        pvClass = NSClassFromString(@"VanguardCameraPlatformView");
-    }
-
-    if (pvClass) {
-        SEL originalSel = NSSelectorFromString(@"onFrame:pts:");
-        SEL swizzledSel = @selector(vanguardRTC_swizzled_onFrame:pts:);
-
-        Method origMethod = class_getInstanceMethod(pvClass, originalSel);
-        Method swizMethod = class_getInstanceMethod([self class], swizzledSel);
-
-        if (origMethod && swizMethod) {
-            BOOL didAdd = class_addMethod(pvClass,
-                                          swizzledSel,
-                                          method_getImplementation(origMethod),
-                                          method_getTypeEncoding(origMethod));
-            if (didAdd) {
-                class_replaceMethod(pvClass,
-                                    originalSel,
-                                    method_getImplementation(swizMethod),
-                                    method_getTypeEncoding(swizMethod));
-            } else {
-                method_exchangeImplementations(origMethod, swizMethod);
-            }
-            NSLog(@"[VanguardRTC] Swizzled VanguardCameraPlatformView.onFrame:pts: successfully ✓");
-            _swizzleInstalled = YES;
-        }
-    } else {
-        NSLog(@"[VanguardRTC] Note: VanguardCameraPlatformView class not found yet during +load. Will retry on attach.");
-    }
-}
-
-// Swizzled method injected into VanguardCameraPlatformView
-- (void)vanguardRTC_swizzled_onFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts {
-    // 1. Call original VanguardCameraPlatformView implementation (renders to MTKView)
-    [self vanguardRTC_swizzled_onFrame:pixelBuffer pts:pts];
-
-    // 2. Deliver zero-copy frame to WebRTC if streaming
-    [VanguardRTCVideoCapturer deliverFrame:pixelBuffer pts:pts];
-}
-
-// ── MethodChannel Setup ──────────────────────────────────────────────────────
-
-+ (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
-    [self setupMethodChannelWithMessenger:[registrar messenger]];
-}
-
-+ (void)setupMethodChannelWithMessenger:(NSObject<FlutterBinaryMessenger> *)messenger {
-    static dispatch_once_t channelToken;
-    dispatch_once(&channelToken, ^{
-        _methodChannel = [FlutterMethodChannel methodChannelWithName:@"vanguard_livekit_bridge"
-                                                     binaryMessenger:messenger];
-        [_methodChannel setMethodCallHandler:^(FlutterMethodCall *call, FlutterResult result) {
-            [[VanguardRTCVideoCapturer sharedInstance] handleMethodCall:call result:result];
-        }];
-        NSLog(@"[VanguardRTC] MethodChannel 'vanguard_livekit_bridge' registered successfully ✓");
-    });
-}
-
-// ── Flutter Method Routing ───────────────────────────────────────────────────
 
 - (void)handleMethodCall:(FlutterMethodCall *)call result:(FlutterResult)result {
     if ([@"attachVanguardToLiveKitTrack" isEqualToString:call.method]) {
-        NSDictionary *args = [call arguments];
-        NSString *trackId = args[@"trackId"];
-        if (!trackId || ![trackId isKindOfClass:[NSString class]]) {
-            result([FlutterError errorWithCode:@"INVALID_ARGUMENT"
-                                       message:@"trackId must be a non-empty string"
-                                       details:nil]);
-            return;
-        }
-
-        NSError *error = nil;
-        BOOL ok = [self attachToTrackId:trackId error:&error];
-        if (ok) {
-            result(@{
-                @"status": @"attached",
-                @"trackId": trackId,
-                @"framesDelivered": @(_framesDelivered)
-            });
-        } else {
-            result([FlutterError errorWithCode:@"ATTACH_FAILED"
-                                       message:error.localizedDescription ?: @"Failed to attach to WebRTC track"
-                                       details:nil]);
-        }
+        os_unfair_lock_lock(&_lock);
+        VGRTCGraphSessionProvider provider = _graphSessionProvider;
+        os_unfair_lock_unlock(&_lock);
+        VGCameraGraphSession *graphSession = provider ? provider() : nil;
+        [self attachWithArguments:call.arguments graphSession:graphSession result:result];
     } else if ([@"detachVanguard" isEqualToString:call.method]) {
         [self detach];
-        result(@{@"status": @"detached"});
+        result(@{ @"status": @"detached" });
     } else if ([@"getStats" isEqualToString:call.method]) {
-        os_unfair_lock_lock(&_lock);
-        uint64_t count = _framesDelivered;
-        BOOL streaming = _isStreaming;
-        NSString *tid = _attachedTrackId ?: @"";
-        os_unfair_lock_unlock(&_lock);
-
-        result(@{
-            @"isStreaming": @(streaming),
-            @"framesDelivered": @(count),
-            @"trackId": tid,
-            @"swizzleInstalled": @(_swizzleInstalled)
-        });
+        result([self statsSnapshot]);
     } else {
         result(FlutterMethodNotImplemented);
     }
 }
 
-// ── WebRTC Attach / Detach ───────────────────────────────────────────────────
+// ── Attach ───────────────────────────────────────────────────────────────────
 
-- (BOOL)attachToTrackId:(NSString *)trackId error:(NSError **)error {
-    // Ensure swizzle is active
-    if (!_swizzleInstalled) {
-        [VanguardRTCVideoCapturer installSwizzles];
-    }
-
-    // 1. Locate FlutterWebRTCPlugin singleton
-    Class webrtcPluginClass = NSClassFromString(@"FlutterWebRTCPlugin");
-    if (!webrtcPluginClass) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"VanguardRTC"
-                                         code:101
-                                     userInfo:@{NSLocalizedDescriptionKey: @"FlutterWebRTCPlugin class not loaded"}];
+- (void)attachWithArguments:(id)arguments
+               graphSession:(VGCameraGraphSession *)graphSession
+                     result:(FlutterResult)result {
+    NSString *trackId = nil;
+    if ([arguments isKindOfClass:[NSDictionary class]]) {
+        id raw = ((NSDictionary *)arguments)[@"trackId"];
+        if ([raw isKindOfClass:[NSString class]] && [(NSString *)raw length] > 0) {
+            trackId = raw;
         }
-        return NO;
+    }
+    if (!trackId) {
+        result([FlutterError errorWithCode:@"INVALID_ARGUMENT"
+                                   message:@"trackId must be a non-empty string"
+                                   details:nil]);
+        return;
+    }
+    if (!graphSession) {
+        // Nothing has been touched: the stock capturer keeps publishing.
+        result([FlutterError errorWithCode:@"NO_CAMERA_GRAPH"
+                                   message:@"No active Vanguard camera graph session"
+                                   details:nil]);
+        return;
     }
 
-    SEL sharedSingletonSel = NSSelectorFromString(@"sharedSingleton");
-    if (![webrtcPluginClass respondsToSelector:sharedSingletonSel]) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"VanguardRTC"
-                                         code:102
-                                     userInfo:@{NSLocalizedDescriptionKey: @"FlutterWebRTCPlugin.sharedSingleton not found"}];
-        }
-        return NO;
-    }
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    NSObject *plugin = [webrtcPluginClass performSelector:sharedSingletonSel];
-#pragma clang diagnostic pop
-
-    if (!plugin) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"VanguardRTC"
-                                         code:103
-                                     userInfo:@{NSLocalizedDescriptionKey: @"FlutterWebRTCPlugin.sharedSingleton returned nil"}];
-        }
-        return NO;
-    }
-
-    // Ensure our method channel is ready
-    NSObject<FlutterBinaryMessenger> *messenger = [plugin valueForKey:@"messenger"];
-    if (messenger && !_methodChannel) {
-        [VanguardRTCVideoCapturer setupMethodChannelWithMessenger:messenger];
-    }
-
-    // 2. Locate local track in plugin.localTracks
-    NSDictionary *localTracks = [plugin valueForKey:@"localTracks"];
-    id localTrack = localTracks[trackId];
-    if (!localTrack) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"VanguardRTC"
-                                         code:104
-                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Track %@ not found in localTracks", trackId]}];
-        }
-        return NO;
-    }
-
-    // 3. Extract the underlying RTCVideoSource
-    id videoSource = nil;
-    @try {
-        id processing = [localTrack valueForKey:@"processing"];
-        if (processing && [processing respondsToSelector:NSSelectorFromString(@"source")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            videoSource = [processing performSelector:NSSelectorFromString(@"source")];
-#pragma clang diagnostic pop
-        }
-        if (!videoSource) {
-            id vt = [localTrack valueForKey:@"videoTrack"];
-            if (vt && [vt respondsToSelector:NSSelectorFromString(@"source")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                videoSource = [vt performSelector:NSSelectorFromString(@"source")];
-#pragma clang diagnostic pop
-            }
-        }
-    } @catch (NSException *ex) {
-        NSLog(@"[VanguardRTC] Exception finding videoSource: %@", ex);
-    }
-
-    if (!videoSource) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"VanguardRTC"
-                                         code:105
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Could not find RTCVideoSource on track"}];
-        }
-        return NO;
-    }
-
-    // 4. Stop stock camera capturer to avoid AVCaptureSession hardware contention
-    @try {
-        id stockCapturer = [plugin valueForKey:@"videoCapturer"];
-        if (stockCapturer && [stockCapturer respondsToSelector:NSSelectorFromString(@"stopCapture")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            [stockCapturer performSelector:NSSelectorFromString(@"stopCapture")];
-#pragma clang diagnostic pop
-            NSLog(@"[VanguardRTC] Stock RTCCameraVideoCapturer stopped to prevent hardware contention ✓");
-        }
-    } @catch (NSException *ex) {
-        NSLog(@"[VanguardRTC] Note: Could not stop stock capturer: %@", ex);
-    }
-
-    // 5. Activate streaming
+    // Idempotency / concurrency guards.
     os_unfair_lock_lock(&_lock);
+    BOOL inProgress = _attachInProgress;
+    BOOL sameTrackActive = (_activeVideoSource != nil && [_attachedTrackId isEqualToString:trackId]);
+    BOOL otherTrackActive = (_activeVideoSource != nil && !sameTrackActive);
+    os_unfair_lock_unlock(&_lock);
+    if (inProgress) {
+        result([FlutterError errorWithCode:@"ATTACH_IN_PROGRESS"
+                                   message:@"An attach is already in progress"
+                                   details:nil]);
+        return;
+    }
+    if (sameTrackActive) {
+        result([self attachedReply]);
+        return;
+    }
+    if (otherTrackActive) {
+        [self detach];
+    }
+
+    // Resolve flutter_webrtc internals. No side effects yet.
+    id videoSource = nil;
+    VGRTCCapturerStopHandler stopHandler = nil;
+    id stockCapturer = nil;
+    NSString *failureCode = nil;
+    NSString *failureMessage = nil;
+    if (![self resolveWebRTCForTrackId:trackId
+                           videoSource:&videoSource
+                           stopHandler:&stopHandler
+                         stockCapturer:&stockCapturer
+                           failureCode:&failureCode
+                               message:&failureMessage]) {
+        NSLog(@"%@ attach rejected (%@): %@", kVGRTCTag, failureCode, failureMessage);
+        result([FlutterError errorWithCode:failureCode message:failureMessage details:nil]);
+        return;
+    }
+
+    if (!_rtcPixelBufferClass) _rtcPixelBufferClass = NSClassFromString(@"RTCCVPixelBuffer");
+    if (!_rtcVideoFrameClass) _rtcVideoFrameClass = NSClassFromString(@"RTCVideoFrame");
+    if (!_rtcPixelBufferClass || !_rtcVideoFrameClass) {
+        result([FlutterError errorWithCode:@"WEBRTC_INTERNALS_UNAVAILABLE"
+                                   message:@"RTCCVPixelBuffer / RTCVideoFrame classes are not loaded"
+                                   details:nil]);
+        return;
+    }
+
+    // Connect this receiver to the graph unless it already is: one fan-out
+    // rebuild per graph session, and none on re-attach after a detach.
+    os_unfair_lock_lock(&_lock);
+    BOOL alreadyConnected = (_connectedGraphSession != nil && _connectedGraphSession == graphSession);
+    os_unfair_lock_unlock(&_lock);
+    if (!alreadyConnected) {
+        if (![graphSession connectProcessedFrameReceiver:self]) {
+            // The session keeps its previous graph; the stock capturer is untouched.
+            result([FlutterError errorWithCode:@"GRAPH_CONNECT_FAILED"
+                                       message:@"VGCameraGraphSession refused the processed-frame receiver"
+                                       details:nil]);
+            return;
+        }
+        os_unfair_lock_lock(&_lock);
+        _connectedGraphSession = graphSession;
+        os_unfair_lock_unlock(&_lock);
+        NSLog(@"%@ receiver connected to graph session %p (fan-out rebuilt)", kVGRTCTag, graphSession);
+    } else {
+        NSLog(@"%@ receiver already connected to graph session %p (reused)", kVGRTCTag, graphSession);
+    }
+
+    // Arm the attach. The gate stays closed until the stock capturer stops so
+    // stock and processed frames never interleave on the same track.
+    uint64_t generation;
+    os_unfair_lock_lock(&_lock);
+    _attachGeneration += 1;
+    generation = _attachGeneration;
+    _attachInProgress = YES;
+    _gateOpen = NO;
+    _stockStopConfirmed = NO;
     _activeVideoSource = videoSource;
     _attachedTrackId = [trackId copy];
     _framesDelivered = 0;
-    _isStreaming = YES;
+    _pendingAttachResult = [result copy];
     os_unfair_lock_unlock(&_lock);
 
-    NSLog(@"[VanguardRTC] Attached to track %@ successfully. Egress active ✓", trackId);
+    __weak typeof(self) weakSelf = self;
+    void (^openGate)(BOOL) = ^(BOOL confirmed) {
+        [weakSelf finishAttachForGeneration:generation stockStopConfirmed:confirmed];
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kVGRTCStockStopTimeoutNs),
+                   dispatch_get_main_queue(), ^{
+        openGate(NO);
+    });
+
+    if (stopHandler) {
+        NSLog(@"%@ stopping stock capturer for track %@ via per-track stop handler", kVGRTCTag, trackId);
+        stopHandler(^{
+            dispatch_async(dispatch_get_main_queue(), ^{ openGate(YES); });
+        });
+    } else {
+        NSLog(@"%@ stopping stock capturer for track %@ via stopCaptureWithCompletionHandler:", kVGRTCTag, trackId);
+        SEL stopSel = NSSelectorFromString(@"stopCaptureWithCompletionHandler:");
+        VGRTCCompletionHandler completion = ^{
+            dispatch_async(dispatch_get_main_queue(), ^{ openGate(YES); });
+        };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [stockCapturer performSelector:stopSel withObject:completion];
+#pragma clang diagnostic pop
+    }
+}
+
+// Main thread. Called by the stock-stop completion (confirmed=YES) and by the
+// 1 s timeout (confirmed=NO); only the first caller for a generation replies.
+- (void)finishAttachForGeneration:(uint64_t)generation stockStopConfirmed:(BOOL)confirmed {
+    FlutterResult reply = nil;
+    NSDictionary *payload = nil;
+    BOOL opened = NO;
+    BOOL lateConfirmation = NO;
+    VGCameraGraphSession *graphSession = nil;
+
+    os_unfair_lock_lock(&_lock);
+    if (generation == _attachGeneration) {
+        if (_attachInProgress) {
+            _attachInProgress = NO;
+            _gateOpen = YES;
+            _stockStopConfirmed = confirmed;
+            opened = YES;
+            reply = _pendingAttachResult;
+            _pendingAttachResult = nil;
+            payload = @{
+                @"status": @"attached",
+                @"trackId": _attachedTrackId ?: @"",
+                @"framesDelivered": @(_framesDelivered),
+                @"stockStopConfirmed": @(confirmed),
+            };
+        } else if (confirmed && _gateOpen && !_stockStopConfirmed) {
+            // Timeout won the race; record the late confirmation for getStats.
+            _stockStopConfirmed = YES;
+            lateConfirmation = YES;
+        }
+        graphSession = _connectedGraphSession;
+    }
+    os_unfair_lock_unlock(&_lock);
+
+    if (opened) {
+        NSLog(@"%@ egress gate open (stockStopConfirmed=%d)", kVGRTCTag, confirmed);
+    } else if (lateConfirmation) {
+        NSLog(@"%@ stock capturer stop confirmed after the 1 s timeout", kVGRTCTag);
+    }
+
+    // Capture resume kick. connectProcessedFrameReceiver: ran the source start
+    // path while the stock capturer still held the camera, so the Vanguard
+    // AVCaptureSession may be stopped/interrupted; nothing else restarts it
+    // until a filter transaction rebuilds the graph. Once the stock capturer
+    // has confirmed its stop (immediately or late), run that same start path
+    // again. Idempotent: it is a no-op while the session already runs, and it
+    // never rebuilds the graph.
+    if (confirmed && (opened || lateConfirmation)) {
+        if (graphSession) {
+            NSLog(@"%@ stock capturer stopped — resuming Vanguard capture source", kVGRTCTag);
+            [graphSession resumeCaptureSourceIfStopped];
+        } else {
+            NSLog(@"%@ stock capturer stopped but no connected graph session to resume", kVGRTCTag);
+        }
+    } else if (opened) {
+        NSLog(@"%@ gate opened on timeout; capture resume waits for the stock stop confirmation", kVGRTCTag);
+    }
+
+    if (reply) {
+        reply(payload);
+    }
+}
+
+- (NSDictionary *)attachedReply {
+    os_unfair_lock_lock(&_lock);
+    NSDictionary *payload = @{
+        @"status": @"attached",
+        @"trackId": _attachedTrackId ?: @"",
+        @"framesDelivered": @(_framesDelivered),
+        @"stockStopConfirmed": @(_stockStopConfirmed),
+    };
+    os_unfair_lock_unlock(&_lock);
+    return payload;
+}
+
+// ── flutter_webrtc resolution (no side effects) ──────────────────────────────
+
+- (BOOL)resolveWebRTCForTrackId:(NSString *)trackId
+                    videoSource:(id *)outVideoSource
+                    stopHandler:(VGRTCCapturerStopHandler *)outStopHandler
+                  stockCapturer:(id *)outStockCapturer
+                    failureCode:(NSString **)outCode
+                        message:(NSString **)outMessage {
+    Class webrtcPluginClass = NSClassFromString(@"FlutterWebRTCPlugin");
+    SEL sharedSingletonSel = NSSelectorFromString(@"sharedSingleton");
+    if (!webrtcPluginClass || ![webrtcPluginClass respondsToSelector:sharedSingletonSel]) {
+        *outCode = @"WEBRTC_INTERNALS_UNAVAILABLE";
+        *outMessage = @"flutter_webrtc plugin class or sharedSingleton not found";
+        return NO;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    id plugin = [webrtcPluginClass performSelector:sharedSingletonSel];
+#pragma clang diagnostic pop
+    if (!plugin) {
+        *outCode = @"WEBRTC_INTERNALS_UNAVAILABLE";
+        *outMessage = @"flutter_webrtc sharedSingleton returned nil";
+        return NO;
+    }
+
+    id localTrack = nil;
+    id videoSource = nil;
+    id stopHandler = nil;
+    id stockCapturer = nil;
+    @try {
+        id localTracks = [plugin valueForKey:@"localTracks"];
+        if ([localTracks isKindOfClass:[NSDictionary class]]) {
+            localTrack = ((NSDictionary *)localTracks)[trackId];
+        }
+        if (localTrack) {
+            SEL sourceSel = NSSelectorFromString(@"source");
+            id processing = [localTrack valueForKey:@"processing"];
+            if (processing && [processing respondsToSelector:sourceSel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                videoSource = [processing performSelector:sourceSel];
+#pragma clang diagnostic pop
+            }
+            if (!videoSource) {
+                id videoTrack = [localTrack valueForKey:@"videoTrack"];
+                if (videoTrack && [videoTrack respondsToSelector:sourceSel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    videoSource = [videoTrack performSelector:sourceSel];
+#pragma clang diagnostic pop
+                }
+            }
+        }
+        id handlers = [plugin valueForKey:@"videoCapturerStopHandlers"];
+        if ([handlers isKindOfClass:[NSDictionary class]]) {
+            stopHandler = ((NSDictionary *)handlers)[trackId];
+        }
+        stockCapturer = [plugin valueForKey:@"videoCapturer"];
+    } @catch (NSException *exception) {
+        *outCode = @"WEBRTC_INTERNALS_UNAVAILABLE";
+        *outMessage = [NSString stringWithFormat:@"flutter_webrtc internals changed: %@", exception.reason];
+        return NO;
+    }
+
+    if (!localTrack) {
+        *outCode = @"TRACK_NOT_FOUND";
+        *outMessage = [NSString stringWithFormat:@"Track %@ not found in flutter_webrtc local tracks", trackId];
+        return NO;
+    }
+    if (!videoSource || ![videoSource respondsToSelector:@selector(capturer:didCaptureVideoFrame:)]) {
+        *outCode = @"WEBRTC_INTERNALS_UNAVAILABLE";
+        *outMessage = @"RTCVideoSource not found on the local track";
+        return NO;
+    }
+    SEL stopSel = NSSelectorFromString(@"stopCaptureWithCompletionHandler:");
+    BOOL capturerCanStop = (stockCapturer != nil && [stockCapturer respondsToSelector:stopSel]);
+    if (!stopHandler && !capturerCanStop) {
+        *outCode = @"WEBRTC_INTERNALS_UNAVAILABLE";
+        *outMessage = @"No stock capturer stop path for the local track";
+        return NO;
+    }
+
+    *outVideoSource = videoSource;
+    *outStopHandler = (VGRTCCapturerStopHandler)stopHandler;
+    *outStockCapturer = capturerCanStop ? stockCapturer : nil;
     return YES;
 }
 
+// ── Detach ───────────────────────────────────────────────────────────────────
+
 - (void)detach {
+    FlutterResult pending = nil;
+    NSString *trackId = nil;
+    uint64_t frames = 0;
+    BOOL wasActive = NO;
+
     os_unfair_lock_lock(&_lock);
-    _isStreaming = NO;
+    _attachGeneration += 1;  // any in-flight stock-stop completion / timeout is now stale
+    pending = _pendingAttachResult;
+    _pendingAttachResult = nil;
+    trackId = _attachedTrackId;
+    frames = _framesDelivered;
+    wasActive = (_activeVideoSource != nil) || _attachInProgress;
+    _gateOpen = NO;
+    _attachInProgress = NO;
+    _stockStopConfirmed = NO;
     _activeVideoSource = nil;
     _attachedTrackId = nil;
     os_unfair_lock_unlock(&_lock);
 
-    NSLog(@"[VanguardRTC] Detached. Egress stopped ✓");
-}
-
-// ── Zero-Copy Frame Delivery ─────────────────────────────────────────────────
-
-+ (void)deliverFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts {
-    VanguardRTCVideoCapturer *capturer = [VanguardRTCVideoCapturer sharedInstance];
-    if (!capturer->_isStreaming) return;
-
-    os_unfair_lock_lock(&capturer->_lock);
-    id videoSource = capturer->_activeVideoSource;
-    BOOL streaming = capturer->_isStreaming;
-    os_unfair_lock_unlock(&capturer->_lock);
-
-    if (!streaming || !videoSource) return;
-
-    // Resolve WebRTC classes dynamically
-    Class rtcPixelBufferClass = NSClassFromString(@"RTCCVPixelBuffer");
-    Class rtcVideoFrameClass = NSClassFromString(@"RTCVideoFrame");
-    if (!rtcPixelBufferClass || !rtcVideoFrameClass) return;
-
-    // 1. Wrap CVPixelBufferRef into RTCCVPixelBuffer (Zero-copy CoreVideo buffer)
-    RTCCVPixelBuffer *rtcBuffer = [[rtcPixelBufferClass alloc] initWithPixelBuffer:pixelBuffer];
-    if (!rtcBuffer) return;
-
-    // 2. Wrap into RTCVideoFrame with nanosecond timestamp
-    int64_t timeStampNs = (int64_t)(CMTimeGetSeconds(pts) * 1000000000.0);
-    RTCVideoFrame *frame = [[rtcVideoFrameClass alloc] initWithBuffer:rtcBuffer
-                                                             rotation:0
-                                                          timeStampNs:timeStampNs];
-    if (!frame) return;
-
-    // 3. Deliver to WebRTC RTCVideoSource
-    [(id<RTCVideoCapturerDelegate>)videoSource capturer:capturer didCaptureVideoFrame:frame];
-
-    os_unfair_lock_lock(&capturer->_lock);
-    capturer->_framesDelivered++;
-    uint64_t count = capturer->_framesDelivered;
-    os_unfair_lock_unlock(&capturer->_lock);
-
-    if (count == 1 || count % 300 == 0) {
-        NSLog(@"[VanguardRTC] Delivered %llu frames to WebRTC hardware encoder ✓", count);
+    if (pending) {
+        pending([FlutterError errorWithCode:@"ATTACH_CANCELLED"
+                                    message:@"Detached before the attach completed"
+                                    details:nil]);
+    }
+    // The receiver stays connected to the graph (inert while the gate is
+    // closed); the graph is never rebuilt and the stock capturer never
+    // restarted here.
+    if (wasActive) {
+        NSLog(@"%@ detached from track %@ after %llu frames. Egress stopped", kVGRTCTag, trackId, frames);
     }
 }
 
-// ── Properties ───────────────────────────────────────────────────────────────
+- (void)detachForGraphSessionTeardown:(VGCameraGraphSession *)session {
+    os_unfair_lock_lock(&_lock);
+    VGCameraGraphSession *connected = _connectedGraphSession;
+    BOOL matches = (session == nil) || (connected == nil) || (connected == session);
+    if (matches) {
+        _connectedGraphSession = nil;
+    }
+    os_unfair_lock_unlock(&_lock);
+
+    if (matches) {
+        [self detach];
+        NSLog(@"%@ graph session %p tearing down: egress detached, receiver dropped", kVGRTCTag, session);
+    } else {
+        NSLog(@"%@ graph session %p tearing down but egress is bound to %p: ignored", kVGRTCTag, session, connected);
+    }
+}
+
+// ── VanguardCameraFrameReceiver (graph execution queue) ──────────────────────
+
+- (void)onFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts {
+    if (!pixelBuffer) return;
+
+    os_unfair_lock_lock(&_lock);
+    id source = _gateOpen ? _activeVideoSource : nil;
+    Class pixelBufferClass = _rtcPixelBufferClass;
+    Class videoFrameClass = _rtcVideoFrameClass;
+    os_unfair_lock_unlock(&_lock);
+    if (!source || !pixelBufferClass || !videoFrameClass) return;
+
+    // RTCCVPixelBuffer retains the CVPixelBuffer, so +0 delivery from the
+    // fan-out is safe; the graph may recycle its buffer after we return.
+    RTCCVPixelBuffer *rtcBuffer = [[pixelBufferClass alloc] initWithPixelBuffer:pixelBuffer];
+    if (!rtcBuffer) return;
+
+    int64_t timeStampNs;
+    if (CMTIME_IS_NUMERIC(pts)) {
+        timeStampNs = (int64_t)(CMTimeGetSeconds(pts) * 1000000000.0);
+    } else {
+        timeStampNs = (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    }
+    RTCVideoFrame *frame = [[videoFrameClass alloc] initWithBuffer:rtcBuffer
+                                                          rotation:0
+                                                       timeStampNs:timeStampNs];
+    if (!frame) return;
+
+    [(id<RTCVideoCapturerDelegate>)source capturer:self didCaptureVideoFrame:frame];
+
+    os_unfair_lock_lock(&_lock);
+    uint64_t count = ++_framesDelivered;
+    os_unfair_lock_unlock(&_lock);
+
+    if (count == 1 || count % kVGRTCPeriodicLogFrames == 0) {
+        NSLog(@"%@ delivered %llu frames to WebRTC (%zux%zu %@)",
+              kVGRTCTag, count,
+              CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+              VGRTCFourCC(CVPixelBufferGetPixelFormatType(pixelBuffer)));
+    }
+}
+
+// Required by VanguardCameraFrameReceiver; only the preview MTKView cares about
+// the throttle hint. Egress forwards whatever the graph emits.
+- (void)setPreviewFPS:(NSInteger)fps {
+    (void)fps;
+}
+
+// ── Stats / Properties ───────────────────────────────────────────────────────
+
+- (NSDictionary *)statsSnapshot {
+    os_unfair_lock_lock(&_lock);
+    NSDictionary *snapshot = @{
+        @"isStreaming": @(_gateOpen && _activeVideoSource != nil),
+        @"framesDelivered": @(_framesDelivered),
+        @"trackId": _attachedTrackId ?: @"",
+        @"stockStopConfirmed": @(_stockStopConfirmed),
+        @"attachInProgress": @(_attachInProgress),
+        @"receiverConnected": @(_connectedGraphSession != nil),
+    };
+    os_unfair_lock_unlock(&_lock);
+    return snapshot;
+}
 
 - (uint64_t)framesDelivered {
     os_unfair_lock_lock(&_lock);
@@ -365,7 +538,7 @@ static BOOL _swizzleInstalled = NO;
 
 - (BOOL)isStreaming {
     os_unfair_lock_lock(&_lock);
-    BOOL streaming = _isStreaming;
+    BOOL streaming = _gateOpen && _activeVideoSource != nil;
     os_unfair_lock_unlock(&_lock);
     return streaming;
 }
