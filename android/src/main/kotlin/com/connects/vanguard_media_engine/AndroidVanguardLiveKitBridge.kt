@@ -34,6 +34,23 @@ package com.connects.vanguard_media_engine
 // framesDelivered (volatile) and forwards frames to the track.
 //
 // Debug/POC only: no R8 keep rules exist for these names yet (contract Slice E).
+//
+// ── Virtual camera provider (Option C, local flutter_webrtc fork) ────────────
+//
+// When the app's flutter_webrtc exposes the external video source SPI
+// (com.cloudwebrtc.webrtc.ExternalVideoSourceProvider +
+// FlutterWebRTCPlugin.registerExternalVideoSourceProvider), this bridge
+// registers itself for deviceId "vanguard_virtual_camera". A LiveKit
+// createCameraTrack with that deviceId then never opens a stock camera:
+// flutter_webrtc creates the track, its SurfaceTextureHelper and a Surface, and
+// calls onStart(trackId, surface, framesDelivered); the bridge hands that
+// Surface to the Vanguard egress seam (720x1280, rotation 0, unmirrored).
+// Track dispose calls onStop, which detaches the egress; flutter_webrtc
+// releases the Surface/helper after its grace delay. Only public SPI members
+// are bound (Class.forName + getMethod, and a Proxy for the interface), so this
+// module still builds and runs against a stock flutter_webrtc, where the
+// provider is simply not registered and Dart falls back to the attach path
+// above.
 
 import android.graphics.SurfaceTexture
 import android.os.Handler
@@ -47,6 +64,7 @@ import java.lang.reflect.Field
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import java.util.concurrent.atomic.AtomicLong
 
 /** What the bridge needs from the engine: the active camera's egress seam. */
 internal interface VanguardEgressHost {
@@ -82,12 +100,24 @@ internal class AndroidVanguardLiveKitBridge(
         // Give the GPU thread time to destroy its EGL surface (Slice A posts
         // that on detach) before the wrapper Surface is released.
         private const val SURFACE_RELEASE_DELAY_MS = 200L
+
+        /** deviceId the livestream passes to LiveKit's createCameraTrack. */
+        const val VIRTUAL_CAMERA_DEVICE_ID = "vanguard_virtual_camera"
+        const val VIRTUAL_CAMERA_FPS = 30
+
+        private const val SPI_PROVIDER_CLASS = "com.cloudwebrtc.webrtc.ExternalVideoSourceProvider"
+        private const val SPI_PLUGIN_CLASS = "com.cloudwebrtc.webrtc.FlutterWebRTCPlugin"
     }
 
     private val channel: MethodChannel = MethodChannel(messenger, CHANNEL_NAME).also {
         it.setMethodCallHandler(this)
     }
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // ── Virtual camera provider state (main thread) ──────────────────────────
+    private var virtualTrackId: String? = null
+    private var virtualFramesDelivered: AtomicLong? = null
+    private var providerRegistration: ProviderRegistration? = null  // set in init, after all state
 
     // ── Bridge-owned attached state (main thread) ────────────────────────────
     private var attachedTrackId: String? = null
@@ -114,12 +144,19 @@ internal class AndroidVanguardLiveKitBridge(
     private var pendingAttach: PendingAttach? = null
     private val continueAttachRunnable = Runnable { continueAttach() }
 
+    init {
+        // Last: every property above is initialized before flutter_webrtc can
+        // call the provider.
+        providerRegistration = registerVirtualCameraProvider()
+    }
+
     // ── MethodChannel ────────────────────────────────────────────────────────
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "attachVanguardToLiveKitTrack" -> attach(call, result)
             "detachVanguard" -> {
+                stopVirtualEgress(reason = "detachVanguard")
                 detachInternal(reason = "detachVanguard")
                 result.success(mapOf("status" to "detached"))
             }
@@ -130,15 +167,148 @@ internal class AndroidVanguardLiveKitBridge(
 
     /** Engine teardown: detach bridge-owned state, then drop the channel. */
     fun dispose() {
+        providerRegistration?.unregister()
+        providerRegistration = null
+        stopVirtualEgress(reason = "engine detached")
         detachInternal(reason = "engine detached", releaseSurfaceImmediately = true)
         channel.setMethodCallHandler(null)
     }
 
-    private fun stats(): Map<String, Any?> = mapOf(
-        "isStreaming" to (attachedTrackId != null),
-        "framesDelivered" to framesDelivered,
-        "trackId" to attachedTrackId,
-    )
+    private fun stats(): Map<String, Any?> {
+        val virtualId = virtualTrackId
+        if (virtualId != null) {
+            return mapOf(
+                "isStreaming" to true,
+                "framesDelivered" to (virtualFramesDelivered?.get() ?: 0L),
+                "trackId" to virtualId,
+                "mode" to "virtual",
+            )
+        }
+        return mapOf(
+            "isStreaming" to (attachedTrackId != null),
+            "framesDelivered" to framesDelivered,
+            "trackId" to attachedTrackId,
+            "mode" to if (attachedTrackId != null) "attached" else "idle",
+        )
+    }
+
+    // ── Virtual camera provider (flutter_webrtc external video source SPI) ────
+
+    /** The public SPI binding: the Proxy we registered and how to unregister it. */
+    private class ProviderRegistration(
+        private val unregisterMethod: Method,
+        private val proxy: Any,
+    ) {
+        fun unregister() {
+            try {
+                unregisterMethod.invoke(null, VIRTUAL_CAMERA_DEVICE_ID, proxy)
+                Log.i(TAG, "virtual camera provider unregistered")
+            } catch (e: Exception) {
+                Log.w(TAG, "virtual camera provider unregister failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+
+    // Binds only public SPI members; returns null (legacy attach path only)
+    // when this app's flutter_webrtc does not provide the SPI.
+    private fun registerVirtualCameraProvider(): ProviderRegistration? {
+        val loader = javaClass.classLoader
+        val providerInterface: Class<*>
+        val registerMethod: Method
+        val unregisterMethod: Method
+        try {
+            providerInterface = Class.forName(SPI_PROVIDER_CLASS, true, loader)
+            val pluginClass = Class.forName(SPI_PLUGIN_CLASS, true, loader)
+            registerMethod = pluginClass.getMethod(
+                "registerExternalVideoSourceProvider", String::class.java, providerInterface,
+            )
+            unregisterMethod = pluginClass.getMethod(
+                "unregisterExternalVideoSourceProvider", String::class.java, providerInterface,
+            )
+        } catch (e: ReflectiveOperationException) {
+            Log.i(TAG, "flutter_webrtc external video source SPI not present; virtual camera unavailable (${e.javaClass.simpleName})")
+            return null
+        }
+        val proxy = Proxy.newProxyInstance(providerInterface.classLoader, arrayOf(providerInterface)) { proxy, method, args ->
+            when (method.name) {
+                "getOutputFormat" -> intArrayOf(EGRESS_WIDTH, EGRESS_HEIGHT, VIRTUAL_CAMERA_FPS)
+                "onStart" -> startVirtualEgress(
+                    trackId = args?.getOrNull(0) as? String,
+                    surface = args?.getOrNull(1) as? Surface,
+                    counter = args?.getOrNull(2) as? AtomicLong,
+                )
+                "onStop" -> {
+                    (args?.getOrNull(0) as? String)?.let { onVirtualTrackStopped(it) }
+                    null
+                }
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.getOrNull(0)
+                "toString" -> "VanguardVirtualCameraProvider"
+                else -> null
+            }
+        }
+        return try {
+            registerMethod.invoke(null, VIRTUAL_CAMERA_DEVICE_ID, proxy)
+            Log.i(TAG, "virtual camera provider registered for deviceId $VIRTUAL_CAMERA_DEVICE_ID")
+            ProviderRegistration(unregisterMethod, proxy)
+        } catch (e: Exception) {
+            Log.e(TAG, "virtual camera provider registration failed: ${describe(e)}")
+            null
+        }
+    }
+
+    // Main thread (flutter_webrtc getUserMedia). Returns false to refuse the
+    // track; flutter_webrtc then fails getUserMedia without opening a camera.
+    private fun startVirtualEgress(trackId: String?, surface: Surface?, counter: AtomicLong?): Boolean {
+        if (trackId.isNullOrBlank() || surface == null || counter == null) {
+            Log.e(TAG, "virtual camera onStart rejected: invalid arguments")
+            return false
+        }
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            Log.e(TAG, "virtual camera onStart rejected: not on the main thread")
+            return false
+        }
+        if (!host.isCameraActive) {
+            Log.e(TAG, "virtual camera onStart rejected for $trackId: Vanguard camera is not running")
+            return false
+        }
+        // One egress at a time: a legacy attach or an earlier virtual track
+        // (e.g. a LiveKit restartTrack) gives way to the new track.
+        stopVirtualEgress(reason = "virtual track $trackId starting")
+        detachInternal(reason = "virtual track $trackId starting")
+        if (!host.attachEgressSurface(surface, EGRESS_WIDTH, EGRESS_HEIGHT, EGRESS_MIRROR)) {
+            Log.e(TAG, "virtual camera onStart rejected for $trackId: Vanguard egress attach was rejected")
+            return false
+        }
+        virtualTrackId = trackId
+        virtualFramesDelivered = counter
+        Log.i(TAG, "virtual camera started for track $trackId: egress ${EGRESS_WIDTH}x${EGRESS_HEIGHT} mirror=$EGRESS_MIRROR (no stock capturer)")
+        return true
+    }
+
+    // Main thread (flutter_webrtc track/stream dispose). flutter_webrtc owns and
+    // releases the Surface after this returns (with a grace delay).
+    private fun onVirtualTrackStopped(trackId: String) {
+        if (trackId != virtualTrackId) {
+            Log.i(TAG, "virtual camera onStop for $trackId ignored (active: $virtualTrackId)")
+            return
+        }
+        stopVirtualEgress(reason = "track $trackId disposed")
+    }
+
+    // Main thread. Idempotent. Detaches the Vanguard egress from the virtual
+    // track's Surface; the Surface itself belongs to flutter_webrtc.
+    private fun stopVirtualEgress(reason: String) {
+        val trackId = virtualTrackId ?: return
+        try {
+            host.detachEgressSurface()
+        } catch (e: Exception) {
+            Log.w(TAG, "virtual camera: detachEgressSurface failed: ${describe(e)}")
+        }
+        Log.i(TAG, "virtual camera stopped for track $trackId ($reason) after ${virtualFramesDelivered?.get() ?: 0L} frames")
+        virtualTrackId = null
+        virtualFramesDelivered = null
+    }
 
     // ── Attach ───────────────────────────────────────────────────────────────
 
@@ -159,6 +329,21 @@ internal class AndroidVanguardLiveKitBridge(
             result.success(mapOf("status" to "attached", "trackId" to trackId, "framesDelivered" to framesDelivered))
             return
         }
+        if (virtualTrackId == trackId) {
+            // Already fed through the virtual camera provider; there is no
+            // stock capturer to take over.
+            result.success(
+                mapOf(
+                    "status" to "attached",
+                    "trackId" to trackId,
+                    "framesDelivered" to (virtualFramesDelivered?.get() ?: 0L),
+                    "mode" to "virtual",
+                ),
+            )
+            return
+        }
+        // A legacy attach replaces any virtual egress (one egress at a time).
+        stopVirtualEgress(reason = "legacy attach to $trackId")
         if (pendingAttach != null) {
             result.error("ATTACH_IN_PROGRESS", "An attach is already in progress", null)
             return

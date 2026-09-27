@@ -10,6 +10,11 @@
 //   wired into the active VGCameraGraphSession's fan-out by the plugin via
 //   -connectProcessedFrameReceiver:, so it receives exactly the processed
 //   frames the preview renders. No swizzling, no +load, no self-registration.
+//
+// Virtual camera (Option C): with the local flutter_webrtc fork's external
+// video source SPI, the same receiver/gate path feeds a track flutter_webrtc
+// created without any camera (-startExternalVideoSourceForTrackId:sink:), so
+// the stock-capturer stop below is not needed on that path.
 
 #import "VanguardRTCVideoCapturer.h"
 #import "VGCameraGraphSession.h"
@@ -41,6 +46,12 @@ static NSString *const kVGRTCTag = @"[VanguardRTC]";
 static const int64_t kVGRTCStockStopTimeoutNs = 1 * NSEC_PER_SEC;
 static const uint64_t kVGRTCPeriodicLogFrames = 300;
 
+// Virtual camera provider (flutter_webrtc external video source SPI).
+static NSString *const kVGRTCVirtualCameraDeviceId = @"vanguard_virtual_camera";
+static const NSInteger kVGRTCVirtualCameraWidth = 720;
+static const NSInteger kVGRTCVirtualCameraHeight = 1280;
+static const NSInteger kVGRTCVirtualCameraFps = 30;
+
 static NSString *VGRTCFourCC(OSType fmt) {
     char c[5] = { (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, 0 };
     return [NSString stringWithUTF8String:c] ?: [NSString stringWithFormat:@"0x%08x", (unsigned)fmt];
@@ -62,6 +73,7 @@ static NSString *VGRTCFourCC(OSType fmt) {
     FlutterResult _pendingAttachResult; // replied exactly once by whoever takes it
     __weak VGCameraGraphSession *_connectedGraphSession;
     VGRTCGraphSessionProvider _graphSessionProvider;
+    BOOL _virtualSource;                // egress bound through the virtual camera provider
 
     // ── Resolved on first attach; immutable afterwards ───────────────────────
     Class _rtcPixelBufferClass;
@@ -178,34 +190,19 @@ static NSString *VGRTCFourCC(OSType fmt) {
         return;
     }
 
-    if (!_rtcPixelBufferClass) _rtcPixelBufferClass = NSClassFromString(@"RTCCVPixelBuffer");
-    if (!_rtcVideoFrameClass) _rtcVideoFrameClass = NSClassFromString(@"RTCVideoFrame");
-    if (!_rtcPixelBufferClass || !_rtcVideoFrameClass) {
+    if (![self resolveRTCFrameClasses]) {
         result([FlutterError errorWithCode:@"WEBRTC_INTERNALS_UNAVAILABLE"
                                    message:@"RTCCVPixelBuffer / RTCVideoFrame classes are not loaded"
                                    details:nil]);
         return;
     }
 
-    // Connect this receiver to the graph unless it already is: one fan-out
-    // rebuild per graph session, and none on re-attach after a detach.
-    os_unfair_lock_lock(&_lock);
-    BOOL alreadyConnected = (_connectedGraphSession != nil && _connectedGraphSession == graphSession);
-    os_unfair_lock_unlock(&_lock);
-    if (!alreadyConnected) {
-        if (![graphSession connectProcessedFrameReceiver:self]) {
-            // The session keeps its previous graph; the stock capturer is untouched.
-            result([FlutterError errorWithCode:@"GRAPH_CONNECT_FAILED"
-                                       message:@"VGCameraGraphSession refused the processed-frame receiver"
-                                       details:nil]);
-            return;
-        }
-        os_unfair_lock_lock(&_lock);
-        _connectedGraphSession = graphSession;
-        os_unfair_lock_unlock(&_lock);
-        NSLog(@"%@ receiver connected to graph session %p (fan-out rebuilt)", kVGRTCTag, graphSession);
-    } else {
-        NSLog(@"%@ receiver already connected to graph session %p (reused)", kVGRTCTag, graphSession);
+    if (![self ensureReceiverConnectedToGraphSession:graphSession]) {
+        // The session keeps its previous graph; the stock capturer is untouched.
+        result([FlutterError errorWithCode:@"GRAPH_CONNECT_FAILED"
+                                   message:@"VGCameraGraphSession refused the processed-frame receiver"
+                                   details:nil]);
+        return;
     }
 
     // Arm the attach. The gate stays closed until the stock capturer stops so
@@ -248,6 +245,35 @@ static NSString *VGRTCFourCC(OSType fmt) {
         [stockCapturer performSelector:stopSel withObject:completion];
 #pragma clang diagnostic pop
     }
+}
+
+// Main thread. Resolves the WebRTC frame classes once (immutable afterwards,
+// set before any gate opens). NO when WebRTC.framework does not provide them.
+- (BOOL)resolveRTCFrameClasses {
+    if (!_rtcPixelBufferClass) _rtcPixelBufferClass = NSClassFromString(@"RTCCVPixelBuffer");
+    if (!_rtcVideoFrameClass) _rtcVideoFrameClass = NSClassFromString(@"RTCVideoFrame");
+    return _rtcPixelBufferClass != nil && _rtcVideoFrameClass != nil;
+}
+
+// Main thread. Connects this receiver to the graph unless it already is: one
+// fan-out rebuild per graph session, and none on re-attach after a detach.
+// NO when the session refused the receiver (it keeps its previous graph).
+- (BOOL)ensureReceiverConnectedToGraphSession:(VGCameraGraphSession *)graphSession {
+    os_unfair_lock_lock(&_lock);
+    BOOL alreadyConnected = (_connectedGraphSession != nil && _connectedGraphSession == graphSession);
+    os_unfair_lock_unlock(&_lock);
+    if (alreadyConnected) {
+        NSLog(@"%@ receiver already connected to graph session %p (reused)", kVGRTCTag, graphSession);
+        return YES;
+    }
+    if (![graphSession connectProcessedFrameReceiver:self]) {
+        return NO;
+    }
+    os_unfair_lock_lock(&_lock);
+    _connectedGraphSession = graphSession;
+    os_unfair_lock_unlock(&_lock);
+    NSLog(@"%@ receiver connected to graph session %p (fan-out rebuilt)", kVGRTCTag, graphSession);
+    return YES;
 }
 
 // Main thread. Called by the stock-stop completion (confirmed=YES) and by the
@@ -433,6 +459,7 @@ static NSString *VGRTCFourCC(OSType fmt) {
     _stockStopConfirmed = NO;
     _activeVideoSource = nil;
     _attachedTrackId = nil;
+    _virtualSource = NO;
     os_unfair_lock_unlock(&_lock);
 
     if (pending) {
@@ -446,6 +473,102 @@ static NSString *VGRTCFourCC(OSType fmt) {
     if (wasActive) {
         NSLog(@"%@ detached from track %@ after %llu frames. Egress stopped", kVGRTCTag, trackId, frames);
     }
+}
+
+// ── Virtual camera provider (flutter_webrtc external video source SPI) ───────
+
+- (BOOL)registerAsVirtualCameraProvider {
+    Class pluginClass = NSClassFromString(@"FlutterWebRTCPlugin");
+    SEL registerSel = NSSelectorFromString(@"registerExternalVideoSourceProvider:forDeviceId:");
+    if (!pluginClass || ![pluginClass respondsToSelector:registerSel]) {
+        NSLog(@"%@ flutter_webrtc external video source SPI not present; virtual camera unavailable", kVGRTCTag);
+        return NO;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    [pluginClass performSelector:registerSel withObject:self withObject:kVGRTCVirtualCameraDeviceId];
+#pragma clang diagnostic pop
+    NSLog(@"%@ virtual camera provider registered for deviceId %@", kVGRTCTag, kVGRTCVirtualCameraDeviceId);
+    return YES;
+}
+
+- (void)unregisterAsVirtualCameraProvider {
+    Class pluginClass = NSClassFromString(@"FlutterWebRTCPlugin");
+    SEL unregisterSel = NSSelectorFromString(@"unregisterExternalVideoSourceProviderForDeviceId:");
+    if (!pluginClass || ![pluginClass respondsToSelector:unregisterSel]) {
+        return;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    [pluginClass performSelector:unregisterSel withObject:kVGRTCVirtualCameraDeviceId];
+#pragma clang diagnostic pop
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)externalVideoSourceOutputFormat {
+    return @{
+        @"width": @(kVGRTCVirtualCameraWidth),
+        @"height": @(kVGRTCVirtualCameraHeight),
+        @"frameRate": @(kVGRTCVirtualCameraFps),
+    };
+}
+
+- (BOOL)startExternalVideoSourceForTrackId:(NSString *)trackId sink:(id)sink {
+    if (trackId.length == 0 || ![sink respondsToSelector:@selector(capturer:didCaptureVideoFrame:)]) {
+        NSLog(@"%@ virtual camera start rejected: invalid track id or sink", kVGRTCTag);
+        return NO;
+    }
+    os_unfair_lock_lock(&_lock);
+    VGRTCGraphSessionProvider provider = _graphSessionProvider;
+    os_unfair_lock_unlock(&_lock);
+    VGCameraGraphSession *graphSession = provider ? provider() : nil;
+    if (!graphSession) {
+        NSLog(@"%@ virtual camera start rejected for %@: no active Vanguard camera graph session", kVGRTCTag, trackId);
+        return NO;
+    }
+    if (![self resolveRTCFrameClasses]) {
+        NSLog(@"%@ virtual camera start rejected for %@: RTCCVPixelBuffer / RTCVideoFrame not loaded", kVGRTCTag, trackId);
+        return NO;
+    }
+
+    // One egress at a time: a legacy attach or an earlier virtual track (e.g.
+    // a LiveKit restartTrack) gives way to this one.
+    [self detach];
+
+    if (![self ensureReceiverConnectedToGraphSession:graphSession]) {
+        NSLog(@"%@ virtual camera start rejected for %@: graph session refused the receiver", kVGRTCTag, trackId);
+        return NO;
+    }
+
+    // No stock capturer exists for this track, so the gate opens at once.
+    os_unfair_lock_lock(&_lock);
+    _attachGeneration += 1;
+    _activeVideoSource = sink;
+    _attachedTrackId = [trackId copy];
+    _framesDelivered = 0;
+    _attachInProgress = NO;
+    _stockStopConfirmed = NO;
+    _virtualSource = YES;
+    _gateOpen = YES;
+    os_unfair_lock_unlock(&_lock);
+
+    // No-op while the Vanguard AVCaptureSession runs (nothing contends for the
+    // camera on this path); restarts it if it was interrupted.
+    [graphSession resumeCaptureSourceIfStopped];
+    NSLog(@"%@ virtual camera started for track %@ (%ldx%ld@%ld, no stock capturer)", kVGRTCTag, trackId,
+          (long)kVGRTCVirtualCameraWidth, (long)kVGRTCVirtualCameraHeight, (long)kVGRTCVirtualCameraFps);
+    return YES;
+}
+
+- (void)stopExternalVideoSourceForTrackId:(NSString *)trackId {
+    os_unfair_lock_lock(&_lock);
+    BOOL matches = _virtualSource && [_attachedTrackId isEqualToString:trackId];
+    os_unfair_lock_unlock(&_lock);
+    if (!matches) {
+        NSLog(@"%@ virtual camera stop for %@ ignored (egress not bound to it)", kVGRTCTag, trackId);
+        return;
+    }
+    [self detach];
+    NSLog(@"%@ virtual camera stopped for track %@", kVGRTCTag, trackId);
 }
 
 - (void)detachForGraphSessionTeardown:(VGCameraGraphSession *)session {
@@ -524,6 +647,7 @@ static NSString *VGRTCFourCC(OSType fmt) {
         @"stockStopConfirmed": @(_stockStopConfirmed),
         @"attachInProgress": @(_attachInProgress),
         @"receiverConnected": @(_connectedGraphSession != nil),
+        @"mode": _virtualSource ? @"virtual" : (_activeVideoSource != nil ? @"attached" : @"idle"),
     };
     os_unfair_lock_unlock(&_lock);
     return snapshot;

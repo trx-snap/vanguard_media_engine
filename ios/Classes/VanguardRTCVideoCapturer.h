@@ -52,6 +52,35 @@ typedef VGCameraGraphSession * _Nullable (^VGRTCGraphSessionProvider)(void);
 /// Idempotent. Never rebuilds the graph and never restarts the stock capturer.
 - (void)detach;
 
+// ── Virtual camera provider (Option C, local flutter_webrtc fork) ────────────
+//
+// With the fork's external video source SPI, a LiveKit createCameraTrack with
+// deviceId "vanguard_virtual_camera" gets a track fed only by this capturer:
+// flutter_webrtc opens no camera and calls the three provider methods below.
+// The same gate/receiver path as the attach flow carries the frames, minus the
+// stock-capturer stop.
+
+/// Registers this capturer with flutter_webrtc's external video source SPI
+/// for deviceId "vanguard_virtual_camera", by name through the ObjC runtime
+/// (this pod has no flutter_webrtc dependency). Returns NO and logs when the
+/// app's flutter_webrtc has no SPI; the attach flow still works then.
+- (BOOL)registerAsVirtualCameraProvider;
+
+/// Removes the registration made by -registerAsVirtualCameraProvider, if any.
+- (void)unregisterAsVirtualCameraProvider;
+
+/// FlutterWebRTCExternalVideoSourceProvider: 720×1280 @ 30.
+- (NSDictionary<NSString *, NSNumber *> *)externalVideoSourceOutputFormat;
+
+/// FlutterWebRTCExternalVideoSourceProvider. Main thread. Binds egress to
+/// @c sink (the track's RTCVideoCapturerDelegate) and opens the gate at once;
+/// NO when there is no active camera graph or the receiver cannot connect.
+- (BOOL)startExternalVideoSourceForTrackId:(NSString *)trackId sink:(id)sink;
+
+/// FlutterWebRTCExternalVideoSourceProvider. Main thread. Detaches egress if
+/// it is still bound to @c trackId; otherwise a no-op.
+- (void)stopExternalVideoSourceForTrackId:(NSString *)trackId;
+
 /// Number of frames forwarded to WebRTC since the current attach.
 @property (nonatomic, readonly) uint64_t framesDelivered;
 

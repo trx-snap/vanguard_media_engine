@@ -552,6 +552,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             liveKitCapturer.handle(call, result: result)
         }
         instance.liveKitBridgeChannel = liveKitBridgeChannel
+        // Virtual camera: with the app's flutter_webrtc external video source
+        // SPI, LiveKit tracks for deviceId "vanguard_virtual_camera" are fed by
+        // the capturer directly and no stock camera is opened. Without the SPI
+        // this logs and the attach flow above remains the only path.
+        _ = liveKitCapturer.registerAsVirtualCameraProvider()
 
         // Phase 4C6H3F: register for UIApplicationDelegate callbacks so
         // application(_:handleEventsForBackgroundURLSession:completionHandler:)
@@ -701,6 +706,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // iOS LiveKit egress: close the bridge before any camera/graph state is
         // dropped, and stop handling bridge calls for this engine.
         VanguardMediaEnginePlugin.liveKitBridgeDetach()
+        VanguardRTCVideoCapturer.sharedInstance().unregisterAsVirtualCameraProvider()
         liveKitBridgeChannel?.setMethodCallHandler(nil)
         liveKitBridgeChannel = nil
         if _streamingPlaybackCoordinatorCreated {
