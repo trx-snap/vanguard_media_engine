@@ -79,6 +79,7 @@ import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
 import com.connects.vanguard_media_engine.camera.AndroidCameraBeautySurfaceProcessor
 import com.connects.vanguard_media_engine.camera.AndroidCameraXThermalFpsActuator
 import com.connects.vanguard_media_engine.camera.CameraColorFilterState
+import com.connects.vanguard_media_engine.camera.CameraGreenScreenState
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.concurrent.Executor
@@ -225,6 +226,9 @@ class VanguardCameraSource(
     private var beautyProcessor: AndroidCameraBeautySurfaceProcessor? = null
     @Volatile private var beautyIntensity: Float = 0f
     @Volatile private var activeColorFilter: CameraColorFilterState? = null
+    // F2: green-screen state; held at the source level so restart/rebind can reapply it.
+    // Not nulled on stop() — state is kept across rebinds per task requirement.
+    @Volatile private var activeGreenScreenState: CameraGreenScreenState? = null
 
     // Telemetry from the most recent applyThermalTargetFps() attempt (any
     // outcome -- applied, rejected, or stale). Reset to null on every fresh
@@ -537,9 +541,11 @@ class VanguardCameraSource(
                 null
             )
         }
-        val processor = AndroidCameraBeautySurfaceProcessor(bridge).also {
+        val processor = AndroidCameraBeautySurfaceProcessor(bridge, context).also {
             it.intensity = beautyIntensity
             it.setColorFilter(activeColorFilter)
+            // F2: reapply green-screen state so restart/rebind preserves the GS configuration.
+            it.setGreenScreen(activeGreenScreenState)
             beautyProcessor = it
         }
 
@@ -1366,6 +1372,34 @@ class VanguardCameraSource(
             CameraColorFilterState.fromPreset("warm", intensity)
         }
         setColorFilter(updated)
+    }
+
+    /**
+     * F2: Sets or clears the active camera green-screen state.
+     * Thread-safe: stored in [activeGreenScreenState] and forwarded to the GPU
+     * processor's volatile field. State is kept across camera restarts/rebinds
+     * so the green screen is reapplied automatically.
+     */
+    fun setGreenScreen(state: CameraGreenScreenState?) {
+        activeGreenScreenState = state
+        beautyProcessor?.setGreenScreen(state)
+        Log.d(TAG, "setGreenScreen: enabled=${state?.enabled} type=${state?.backgroundType}")
+    }
+
+    /**
+     * F2: Hot-update green-screen parameters. Returns false if no active state exists
+     * or the update fails validation. Merges [params] into the active state.
+     */
+    fun updateGreenScreenParameters(params: Map<*, *>): Boolean {
+        val current = activeGreenScreenState ?: return false
+        return try {
+            val updated = current.mergeUpdates(params)
+            setGreenScreen(updated)
+            true
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "updateGreenScreenParameters rejected: ${e.message}")
+            false
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

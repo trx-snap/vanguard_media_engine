@@ -29,9 +29,16 @@ import io.flutter.plugin.common.MethodChannel
  *  - unrecognized filter type                             -> UNKNOWN_FILTER
  *  - any enabled LUT or segmentation filter               -> GRAPH_MODE_DISABLED
  *
- * The known filter type set `{ "lut", "beauty", "segmentation" }` mirrors the
- * native runtime authority used by AndroidTimelineLiveControlCoordinator and
+ * The known filter type set `{ "lut", "beauty", "colorMatrix", "segmentation",
+ * "greenScreen" }` mirrors the native runtime authority used by
+ * AndroidTimelineLiveControlCoordinator and
  * ios/Classes/VanguardGraphRuntime.m:1305.
+ *
+ * F2: greenScreen and greenscreen are now accepted in KNOWN_FILTER_TYPES and
+ * routed to the active VanguardCameraSource / AndroidCameraBeautySurfaceProcessor
+ * via the [setGreenScreen] callback. This eliminates the UNKNOWN_FILTER response
+ * for greenScreen and routes it through the existing CameraX GPU path without
+ * starting any standalone green-screen camera source or session coordinator.
  *
  * Stateless: holds no native resources, runs no async work, and does no I/O.
  * Calls arrive on the platform main thread and this route replies
@@ -42,9 +49,22 @@ class AndroidCameraGraphTransactionCoordinator(
     private val setBeautyIntensity: (Float) -> Unit = {},
     private val setColorFilter: (CameraColorFilterState?) -> Unit = {},
     private val updateColorFilterIntensity: ((Float) -> Unit)? = null,
+    // F2: green-screen route callbacks. Null = coordinator accepts the type but
+    // is a no-op (wiring not yet connected); non-null = forwarded to the
+    // active VanguardCameraSource. Rebuilds carry a full filterStack entry
+    // (setGreenScreen); hot updates carry a partial parameter map that only
+    // the source can merge into its active state (updateGreenScreen returns
+    // false when nothing is active or the update is invalid — no mutation).
+    private val setGreenScreen: ((CameraGreenScreenState?) -> Unit)? = null,
+    private val updateGreenScreen: ((Map<*, *>) -> Boolean)? = null,
 ) {
     companion object {
-        private val KNOWN_FILTER_TYPES = setOf("lut", "beauty", "colormatrix", "colorMatrix", "segmentation")
+        private val KNOWN_FILTER_TYPES = setOf(
+            "lut", "beauty", "colormatrix", "colorMatrix",
+            "segmentation",
+            // F2: greenScreen / greenscreen accepted; no longer returns UNKNOWN_FILTER.
+            "greenscreen", "greenScreen",
+        )
 
         private val OWNED_METHODS = setOf(
             "applyGraphTransaction",
@@ -124,10 +144,11 @@ class AndroidCameraGraphTransactionCoordinator(
             }
 
             // Empty filter list -- "no filters are applied" is trivially satisfied.
-            // Also reset beauty and color filters to passthrough.
+            // Also reset beauty, color filters, and green screen to passthrough.
             if (rawFilterStack.isEmpty()) {
                 setBeautyIntensity(0f)
                 setColorFilter(null)
+                setGreenScreen?.invoke(null)
                 result.success(null)
                 return
             }
@@ -139,14 +160,17 @@ class AndroidCameraGraphTransactionCoordinator(
                 // All filters disabled — reset to passthrough.
                 setBeautyIntensity(0f)
                 setColorFilter(null)
+                setGreenScreen?.invoke(null)
                 result.success(null)
                 return
             }
 
             // CAM-01 / LIVE-CAMERA-BEAUTY-PARITY: route beauty and color/LUT filters to
             // the live camera beauty SurfaceProcessor pipeline.
+            // F2: route greenScreen/greenscreen to the green-screen processor.
             var beautyHandled = false
             var colorFilterHandled = false
+            var greenScreenHandled = false
             var hasUnsupportedEnabled = false
 
             for (filter in filterStack) {
@@ -165,6 +189,21 @@ class AndroidCameraGraphTransactionCoordinator(
                         setColorFilter(filterState)
                         colorFilterHandled = true
                     }
+                    "greenscreen" -> {
+                        // F2: parse and forward to processor via setGreenScreen callback.
+                        try {
+                            val gsState = CameraGreenScreenState.fromFilterMap(filter)
+                            setGreenScreen?.invoke(gsState)
+                            greenScreenHandled = true
+                        } catch (e: IllegalArgumentException) {
+                            result.error(
+                                "BAD_ARGS",
+                                "applyGraphTransaction greenScreen: ${e.message}",
+                                null,
+                            )
+                            return
+                        }
+                    }
                     else -> {
                         // Segmentation — not yet available on Android live camera.
                         hasUnsupportedEnabled = true
@@ -179,12 +218,15 @@ class AndroidCameraGraphTransactionCoordinator(
             if (!colorFilterHandled) {
                 setColorFilter(null)
             }
+            if (!greenScreenHandled) {
+                setGreenScreen?.invoke(null)
+            }
 
-            if (hasUnsupportedEnabled && !beautyHandled && !colorFilterHandled) {
+            if (hasUnsupportedEnabled && !beautyHandled && !colorFilterHandled && !greenScreenHandled) {
                 // Only unsupported (e.g. segmentation) filters present — fail closed.
                 result.error(
                     "GRAPH_MODE_DISABLED",
-                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT filters.",
+                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT/non-greenScreen filters.",
                     null,
                 )
                 return
@@ -201,7 +243,7 @@ class AndroidCameraGraphTransactionCoordinator(
             return
         }
 
-        // ── C. Hot parameter path — route beauty & LUT parameter updates ────────────
+        // ── C. Hot parameter path — route beauty, LUT, greenScreen parameter updates ────────────
         @Suppress("UNCHECKED_CAST")
         val parameterUpdates = rawParameterUpdates as? Map<String, Any?>
         var handledAny = false
@@ -231,6 +273,44 @@ class AndroidCameraGraphTransactionCoordinator(
                     handledAny = true
                 }
             }
+
+            // F2: greenScreen / greenscreen hot parameter updates. The map is a
+            // partial canonical parameter set (background swap or transform),
+            // NOT a filterStack entry, so it is merged into the active state by
+            // the source through updateGreenScreen. An explicit enabled=false
+            // clears the green screen instead.
+            val gsParams = (parameterUpdates["greenScreen"] ?: parameterUpdates["greenscreen"]) as? Map<*, *>
+            if (gsParams != null) {
+                val enabled = gsParams["enabled"] as? Boolean
+                if (enabled == false) {
+                    if (setGreenScreen == null) {
+                        result.error(
+                            "GRAPH_MODE_DISABLED",
+                            "applyGraphTransaction greenScreen hot-update: green screen is not wired on this camera route.",
+                            null,
+                        )
+                        return
+                    }
+                    setGreenScreen.invoke(null)
+                    handledAny = true
+                } else {
+                    val hotParams = gsParams.filterKeys { it != "enabled" }
+                    val applied = updateGreenScreen?.invoke(hotParams) ?: false
+                    if (!applied) {
+                        // Nothing was mutated: no active green screen to update,
+                        // an invalid parameter, or no route wired.
+                        result.error(
+                            "BAD_ARGS",
+                            "applyGraphTransaction greenScreen hot-update rejected: no active green screen " +
+                                "or invalid parameters (keys=${hotParams.keys}). Enable green screen with a " +
+                                "rebuild transaction first.",
+                            null,
+                        )
+                        return
+                    }
+                    handledAny = true
+                }
+            }
         }
 
         if (handledAny) {
@@ -241,7 +321,7 @@ class AndroidCameraGraphTransactionCoordinator(
         // Non-supported hot parameter updates — fail closed.
         result.error(
             "GRAPH_MODE_DISABLED",
-            "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT parameter updates.",
+            "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT/non-greenScreen parameter updates.",
             null,
         )
     }

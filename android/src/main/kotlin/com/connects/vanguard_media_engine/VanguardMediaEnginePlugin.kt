@@ -753,6 +753,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             setBeautyIntensity = { intensity -> cameraSource?.setBeautyIntensity(intensity) },
             setColorFilter = { filterState -> cameraSource?.setColorFilter(filterState) },
             updateColorFilterIntensity = { intensity -> cameraSource?.updateColorFilterIntensity(intensity) },
+            // F2: livestream green screen rides the same VanguardCameraSource
+            // (single CameraX owner); the standalone green-screen sources are
+            // never started from this route.
+            setGreenScreen = { state -> cameraSource?.setGreenScreen(state) },
+            updateGreenScreen = { updates -> cameraSource?.updateGreenScreenParameters(updates) ?: false },
         )
         multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
             context               = binding.applicationContext,

@@ -54,6 +54,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidCameraBeautySurfaceProcessor(
     private val nativeBridge: VanguardNativeBridge,
+    // F2: context for AndroidCameraGreenScreenProcessor TFLite asset loading.
+    // Null-safe: GS processor will fail-closed with bypass if context is missing.
+    private val context: android.content.Context? = null,
 ) : SurfaceProcessor {
 
     companion object {
@@ -174,16 +177,27 @@ class AndroidCameraBeautySurfaceProcessor(
     // ── Thread-safe filter controls ───────────────────────────────────────────
     @Volatile var intensity: Float = 0f
     @Volatile var colorFilterState: CameraColorFilterState? = null
+    // F2: green-screen state. Volatile so the main-thread coordinator write is
+    // visible to the GPU thread on the next frame.
+    @Volatile var greenScreenState: CameraGreenScreenState? = null
 
     fun setColorFilter(state: CameraColorFilterState?) {
         colorFilterState = state
         Log.d(TAG, "setColorFilter: mode=${state?.mode}, intensity=${state?.intensity}")
     }
 
+    // F2: called from VanguardCameraSource on the main thread.
+    fun setGreenScreen(state: CameraGreenScreenState?) {
+        greenScreenState = state
+        Log.d(TAG, "setGreenScreen: enabled=${state?.enabled} type=${state?.backgroundType}")
+    }
+
     // ── GPU thread ───────────────────────────────────────────────────────────
     private val gpuThread = HandlerThread("VGCameraGpuThread").also { it.start() }
     private val gpuHandler = Handler(gpuThread.looper)
     private val released = AtomicBoolean(false)
+    // F2: green-screen processor (GPU thread only; created lazily, released in release()).
+    private var greenScreenProcessor: AndroidCameraGreenScreenProcessor? = null
 
     // ── EGL state (GPU thread only) ──────────────────────────────────────────
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -256,6 +270,7 @@ class AndroidCameraBeautySurfaceProcessor(
     // the current input request. Egress only; preview orientation stays
     // CameraX's job downstream of this processor.
     private var inputRotationDegrees: Int = 0
+    private var inputMirroring: Boolean = false
     private var transformationInfoReceived: Boolean = false
 
     // Transform matrices: raw from SurfaceTexture, final after CameraX output transform.
@@ -281,6 +296,7 @@ class AndroidCameraBeautySurfaceProcessor(
                 inputRotationDegrees = 0
                 request.setTransformationInfoListener({ cmd -> gpuHandler.post(cmd) }) { info ->
                     inputRotationDegrees = info.rotationDegrees
+                    inputMirroring = info.isMirroring
                     transformationInfoReceived = true
                     egressWaitLogged = false
                     Log.d(
@@ -521,13 +537,17 @@ class AndroidCameraBeautySurfaceProcessor(
                 activeColorFilter.mode != CameraColorFilterState.FilterMode.PASSTHROUGH &&
                 activeColorFilter.intensity > 0f
 
-            // The egress path only changes the render target while an egress
-            // surface is pending or bound. Otherwise the original direct-to-
-            // output path below runs unchanged — it is what every Android
-            // Vanguard camera user takes.
-            val egressActive = pendingEgress != null && ensureFinalTextureFboOrDropEgress()
+            // F2: green-screen state snapshot (volatile read, once per frame).
+            val activeGreenScreen = greenScreenState?.takeIf { it.enabled }
+            val hasGreenScreen = activeGreenScreen != null
+
+            // The egress path (and now also the green-screen path) requires finalFbo
+            // so that the preview blit and the egress / GS pass share one processed frame.
+            val needsFinalFbo = pendingEgress != null || hasGreenScreen
+            val egressActive = needsFinalFbo && ensureFinalTextureFboOrDropEgress()
 
             if (!egressActive) {
+                // Normal (no egress, no green screen) path — direct to FBO 0.
                 when {
                     hasBeauty && hasColorFilter -> {
                         // Two-pass pipeline: Beauty into beautyIntermediateFbo, then Color filter to output.
@@ -563,10 +583,10 @@ class AndroidCameraBeautySurfaceProcessor(
                 // Swap buffers to present the frame.
                 EGL14.eglSwapBuffers(eglDisplay, outputEglSurface)
             } else {
-                // Egress active: render the filter stage into finalTexture so the
-                // preview blit and the egress pass share one processed frame.
-                // processedTexture is whichever texture holds the finished frame.
-                val processedTexture: Int = when {
+                // Egress or green-screen active: render the filter stage into finalTexture so the
+                // preview blit and the egress / GS pass share one processed frame.
+                // processedTexture is whichever texture holds the post-beauty/color frame.
+                val postBeautyColorTexture: Int = when {
                     hasBeauty && hasColorFilter -> {
                         // Two-pass pipeline: Beauty into beautyIntermediateFbo, then Color filter into finalFbo.
                         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, beautyIntermediateFbo)
@@ -593,9 +613,49 @@ class AndroidCameraBeautySurfaceProcessor(
                         finalTexture
                     }
                     else -> {
-                        // Passthrough: No filters active (zero filter GPU overhead).
+                        // Passthrough: No filters active.
                         intermediateTexture
                     }
+                }
+
+                // Step 3 (F2): Green-screen compositing, if active.
+                // Processing order: camera 720p → beauty → green screen → preview/egress.
+                // The GS processor runs segmentation + composite in its own internal output FBO.
+                // Returns: output texture id (same dims as input, quad space) or 0 to bypass.
+                val processedTexture: Int = if (hasGreenScreen && activeGreenScreen != null) {
+                    // Lazy-create processor; pass context for TFLite asset loading.
+                    val gsp = greenScreenProcessor ?: AndroidCameraGreenScreenProcessor(context).also {
+                        greenScreenProcessor = it
+                    }
+                    // Deliver current state (setState clears sticky failure on state change).
+                    gsp.setState(activeGreenScreen)
+                    // rotation/mirror derived from CameraX TransformationInfo (never
+                    // hardcoded); the egress path keeps its own mirror policy.
+                    val rotation = if (transformationInfoReceived) inputRotationDegrees else 0
+                    val mirror = inputMirroring
+                    // composite() returns output texture id or 0 (bypass fail-closed).
+                    val gsOut = gsp.composite(
+                        processedTexture = postBeautyColorTexture,
+                        cameraOesTexture = oesTexture,
+                        cameraStMatrix = finalTexMatrix,
+                        width = frameWidth,
+                        height = frameHeight,
+                        rotationDegrees = rotation,
+                        rotationKnown = transformationInfoReceived,
+                        mirror = mirror,
+                        quadVao = quadVao,
+                    )
+                    // 0 = bypass: the green-screen processor already logged the
+                    // (sticky) reason once; keep presenting the beauty/color frame.
+                    if (gsOut != 0) gsOut else postBeautyColorTexture
+                } else {
+                    // Green screen not active this frame.
+                    if (!hasGreenScreen) {
+                        // Release processor if state was cleared.
+                        greenScreenProcessor?.release()
+                        greenScreenProcessor = null
+                    }
+                    postBeautyColorTexture
                 }
 
                 // Present the processed frame on the CameraX output surface
@@ -610,6 +670,7 @@ class AndroidCameraBeautySurfaceProcessor(
             Log.e(TAG, "Frame processing failed: ${e.message}", e)
         }
     }
+
 
     // ── OES → Intermediate 2D blit ──────────────────────────────────────────
 
@@ -1033,6 +1094,9 @@ class AndroidCameraBeautySurfaceProcessor(
 
                 // Release cached native GL resources (shader programs, FBOs,
                 // textures, VAO/VBO) while the EGL context is still current.
+                // F2: Release green-screen processor first (it owns shader programs and textures).
+                greenScreenProcessor?.release()
+                greenScreenProcessor = null
                 nativeBridge.releaseLiveCameraBeauty()
 
                 surfaceTexture?.setOnFrameAvailableListener(null)
