@@ -233,6 +233,10 @@ export 'vg_overlay_descriptor.dart';
 // P5-OVERLAYS-KEYFRAME-INTERP: Dynamic overlay keyframe/spatial transform interpolation
 export 'src/overlay/vg_overlay_keyframe.dart';
 export 'src/overlay/vg_overlay_transform_evaluator.dart';
+// Slice G1-A: livestream static text/sticker overlay contract (camera-graph
+// counterpart of the timeline VGOverlayDescriptor above — no PTS window, no
+// keyframes, pinned 720×1280 canvas).
+export 'src/overlay/vg_livestream_overlay_item.dart';
 // P5-OVERLAYS-GLES-RENDER: Android True-DAG GlesOverlayCompositor multi-layer shader/raster smoke foundation.
 export 'vg_timeline_overlay_gles_render_smoke.dart';
 // P5-OVERLAYS-VULKAN-RENDER: Android True-DAG VulkanOverlayCompositor multi-layer shader/raster smoke foundation.

@@ -22,6 +22,8 @@
 //   `toJson()` produces the canonical payload map expected by the native handler:
 //   { 'type': String, 'enabled': bool, 'parameters': Map<String, Object?> }
 
+import 'src/overlay/vg_livestream_overlay_item.dart';
+
 /// A transport-safe description of a single GPU filter in a [VGPlaybackSession]
 /// filter chain.
 ///
@@ -146,6 +148,7 @@ const Set<String> _validTypes = {
   'greenScreen',
   'colorMatrix',
   'transform',
+  'overlay',
 };
 
 /// Typed factory constructors and validation for [VGFilterSpec].
@@ -645,6 +648,54 @@ extension VGFilterSpecs on VGFilterSpec {
       if (cropRect != null) 'cropRect': List<double>.unmodifiable(cropRect),
     };
     return VGFilterSpec(type: 'transform', parameters: params);
+  }
+
+  /// Creates a livestream static text/sticker overlay filter (Slice G1-A).
+  ///
+  /// This is the camera-graph counterpart of the timeline/export overlay
+  /// model ([VGOverlayDescriptor]): no PTS window, no keyframes/animation,
+  /// coordinates normalized against the pinned [VGLivestreamOverlayCanvas]
+  /// (720×1280 portrait) rather than arbitrary canvas pixels. The full
+  /// [items] list replaces whatever overlay list was previously active —
+  /// there is no per-item hot update in V1.
+  ///
+  /// [items] must contain at most 8 entries — throws [ArgumentError]
+  /// otherwise.
+  ///
+  /// [enabled] is combined with "the list is non-empty": the emitted spec's
+  /// `enabled` is `enabled && items.isNotEmpty`, so passing an empty [items]
+  /// list (with any [enabled] value) always produces a disabled spec — the
+  /// same shape [CameraGraphComposer.clearOverlays] dispatches to remove
+  /// every overlay from the graph.
+  ///
+  /// Wire format:
+  /// ```json
+  /// { "type": "overlay", "enabled": true,
+  ///   "parameters": {
+  ///     "canvas": { "width": 720, "height": 1280 },
+  ///     "items": [ { "id": "t1", "kind": "text", "x": 0.05, "y": 0.8,
+  ///                  "w": 0.4, "h": 0.08, "opacity": 1.0, "text": "LIVE" } ]
+  ///   } }
+  /// ```
+  static VGFilterSpec overlay({
+    required List<VGLivestreamOverlayItem> items,
+    bool enabled = true,
+  }) {
+    if (items.length > 8) {
+      throw ArgumentError.value(
+        items.length,
+        'items',
+        'must contain at most 8 overlay items',
+      );
+    }
+    return VGFilterSpec(
+      type: 'overlay',
+      enabled: enabled && items.isNotEmpty,
+      parameters: <String, Object?>{
+        'canvas': VGLivestreamOverlayCanvas.instance.toJson(),
+        'items': items.map((item) => item.toJson()).toList(growable: false),
+      },
+    );
   }
 
   /// Asserts that this spec's [type] is recognised by the native plugin.
