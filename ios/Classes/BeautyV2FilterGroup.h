@@ -104,6 +104,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// individual properties (radius/sigma/etc.) are used as-is.
 @property (nonatomic, assign) float intensity;
 
+/// Set by the camera graph when the caller passes `tiktokGlowEnabled` or an
+/// intensity at the top of the range. Declared so the flag can be carried on
+/// the group; no shader pass reads it yet.
+@property (nonatomic, assign) BOOL tiktokGlowEnabled;
+
 /// Controls whether `intensity` drives the parameter ramp each frame.
 ///
 /// - YES (default): intensity → {radius, sigma, smoothStrength, sharpenStrength,
