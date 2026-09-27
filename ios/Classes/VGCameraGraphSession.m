@@ -1281,13 +1281,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                                                        device:metalDevice];
                 if (v2) {
                     if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
-                        float it = [params[@"intensity"] floatValue];
-                        v2.intensity = it;
-                        if ([params[@"tiktokGlowEnabled"] boolValue] || it >= 0.99f) {
-                            v2.tiktokGlowEnabled = YES;
-                        } else {
-                            v2.tiktokGlowEnabled = NO;
-                        }
+                        v2.intensity = [params[@"intensity"] floatValue];
                     }
                     // Phase 9B-5: parse faceAwareEnabled and mirror it onto the group.
                     BOOL faceAwareEnabled = NO;

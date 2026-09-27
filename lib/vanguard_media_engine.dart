@@ -670,6 +670,16 @@ enum VanguardCameraCaptureProfile {
   /// the greenScreen S1 path drops from roughly 23 ms at 1080x1920 to roughly
   /// 14.6 ms at 540x960.
   greenScreenLowLatency,
+
+  /// Livestream single-camera capture that requests a 720p-class native
+  /// stream before beauty processing and LiveKit egress, so capture and
+  /// processing cost tracks the 720×1280 egress instead of 1080p. iOS maps this
+  /// to the 1280x720 session preset; Android caps Preview candidates to
+  /// 720p-class, uses HD/lower-only VideoCapture, and does not bind ImageCapture
+  /// for livestream. The negotiated size is device-dependent and is verified
+  /// from native logs, not assumed. Only the livestream session opts in; every
+  /// other camera caller keeps [defaultQuality].
+  livestream720p,
 }
 
 class VanguardEngine {
@@ -982,12 +992,12 @@ class VanguardEngine {
     if (trimmed != null && trimmed.isNotEmpty) {
       // Explicit preset override wins; do not also force a profile.
       args['sessionPreset'] = trimmed;
-    } else if (captureProfile ==
-        VanguardCameraCaptureProfile.greenScreenLowLatency) {
-      // Platform-neutral profile token; native maps it to its own ordered
-      // capture preference. defaultQuality intentionally sends nothing so the
-      // historical native default path is byte-for-byte unchanged.
-      args['cameraCaptureProfile'] = 'greenScreenLowLatency';
+    } else if (captureProfile != VanguardCameraCaptureProfile.defaultQuality) {
+      // Platform-neutral profile token (the enum name); native maps it to its
+      // own ordered capture preference. defaultQuality intentionally sends
+      // nothing so the historical native default path is byte-for-byte
+      // unchanged.
+      args['cameraCaptureProfile'] = captureProfile.name;
     }
     final id = await _cameraChannel.invokeMethod<int>('startCamera', args);
     if (id == null || id < 0) {

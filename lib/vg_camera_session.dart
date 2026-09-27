@@ -24,6 +24,7 @@
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'vanguard_media_engine.dart' show VanguardCameraCaptureProfile;
 import 'vg_camera_zoom_capabilities.dart';
 import 'vg_filter_spec.dart';
 import 'vg_graph_transaction.dart';
@@ -1125,18 +1126,25 @@ final class VGCameraSession {
   ///
   /// [position] — sensor to use; defaults to [VGCameraPosition.back].
   /// [fps]      — target frame rate; 30 is recommended for all devices.
+  /// [captureProfile] — native capture profile, fixed for the lifetime of the
+  ///   session. The default, [VanguardCameraCaptureProfile.defaultQuality],
+  ///   sends no profile argument and leaves native capture behavior unchanged;
+  ///   any other profile is sent as `cameraCaptureProfile` (its enum name).
   ///
   /// Throws [StateError] if native returns a null or negative texture ID.
   /// Throws [PlatformException] for native-reported errors (e.g. no camera permission).
   static Future<VGCameraSession> create({
     VGCameraPosition position = VGCameraPosition.back,
     int fps = 30,
+    VanguardCameraCaptureProfile captureProfile =
+        VanguardCameraCaptureProfile.defaultQuality,
   }) async {
     final positionInt = position == VGCameraPosition.front ? 2 : 1;
-    final id = await _channel.invokeMethod<int>('startCamera', {
-      'position': positionInt,
-      'fps': fps,
-    });
+    final args = <String, dynamic>{'position': positionInt, 'fps': fps};
+    if (captureProfile != VanguardCameraCaptureProfile.defaultQuality) {
+      args['cameraCaptureProfile'] = captureProfile.name;
+    }
+    final id = await _channel.invokeMethod<int>('startCamera', args);
     if (id == null || id < 0) {
       throw StateError(
         '[VGCameraSession] startCamera: native returned no texture id',

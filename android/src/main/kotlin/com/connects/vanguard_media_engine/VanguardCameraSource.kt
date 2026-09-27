@@ -41,6 +41,7 @@ import android.hardware.camera2.TotalCaptureResult
 import android.net.Uri
 import android.util.Log
 import android.util.Range
+import android.util.Size
 import android.view.Surface
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -54,6 +55,9 @@ import androidx.camera.core.MirrorMode
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.SurfaceProcessor
+import androidx.camera.core.SurfaceOutput
+import androidx.camera.core.DynamicRange
+import androidx.camera.core.resolutionselector.ResolutionFilter
 import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -92,6 +96,10 @@ import java.util.concurrent.TimeUnit
  *   will receive camera preview frames.
  * @param lensFacing Initial lens — [CameraSelector.LENS_FACING_BACK] or FRONT.
  * @param frameRate Target frame rate for the camera session (default 30).
+ * @param captureProfile Optional capture profile token from Dart. null keeps
+ *   the existing default use-case selection unchanged;
+ *   [CAPTURE_PROFILE_LIVESTREAM_720P] requests a 720p-class stream (see
+ *   [bindUseCases]). The size CameraX negotiates is logged, not assumed.
  */
 class VanguardCameraSource(
     private val context: Context,
@@ -99,10 +107,23 @@ class VanguardCameraSource(
     private var lensFacing: Int = CameraSelector.LENS_FACING_BACK,
     private val frameRate: Int = 30,
     private val nativeBridge: VanguardNativeBridge? = null,
+    private val captureProfile: String? = null,
 ) {
 
     companion object {
         private const val TAG = "VanguardCameraSource"
+
+        /** Livestream single-camera profile: request 720p-class capture. */
+        const val CAPTURE_PROFILE_LIVESTREAM_720P = "livestream720p"
+
+        // livestream720p size cap (orientation-independent: long edge ≤ 1280,
+        // short edge ≤ 720, i.e. 1280×720 / 720×1280 or smaller).
+        private const val LIVESTREAM_MAX_LONG_EDGE = 1280
+        private const val LIVESTREAM_MAX_SHORT_EDGE = 720
+
+        private fun isLivestream720pClass(width: Int, height: Int): Boolean =
+            maxOf(width, height) <= LIVESTREAM_MAX_LONG_EDGE &&
+                minOf(width, height) <= LIVESTREAM_MAX_SHORT_EDGE
 
         // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: proof-boundary telemetry
         // constants shared by the thermal FPS apply-result and diagnostics maps.
@@ -329,6 +350,26 @@ class VanguardCameraSource(
             .requireLensFacing(lensFacing)
             .build()
 
+        // ── Capture profile ──────────────────────────────────────────────────
+        // livestream720p (livestream single camera only) targets a 720p-class
+        // beauty/effect INPUT, not just a 720p preview. The effect targets
+        // PREVIEW|VIDEO_CAPTURE, so CameraX feeds it one shared (StreamSharing)
+        // camera stream whose size is merged from the Preview and VideoCapture
+        // children's candidate size lists; any child candidate above 720p lets
+        // CameraX keep a larger parent (observed: 1920×1080 input, 720×1280
+        // preview, egress downscaling 1.5×). So for livestream720p:
+        //   - Preview candidates are capped at ≤1280×720 (ResolutionFilter),
+        //   - VideoCapture falls back to LOWER qualities only when HD/SD exists,
+        //   - ImageCapture is not bound (the livestream takes no stills).
+        // Preview + VideoCapture stay bound on purpose: that StreamSharing
+        // topology is what the beauty processor's output path is built for
+        // (its effect output keeps the input orientation/size). The size CameraX
+        // actually negotiates is logged by the effect-input probe and
+        // provideSurface(); nothing here guarantees 720p on every device.
+        // Any other profile keeps the default selection below byte-for-byte.
+        val livestream720p = captureProfile == CAPTURE_PROFILE_LIVESTREAM_720P
+        val profileLabel = captureProfile ?: "default"
+
         // ── Resolution selector ──────────────────────────────────────────────
         // Negotiates a 16:9 buffer family (falling back automatically if the
         // device has no exact 16:9 stream) so Preview and ImageCapture agree on
@@ -336,6 +377,27 @@ class VanguardCameraSource(
         // preset — matching the app's fixed 9:16 FittedBox(BoxFit.cover) layout.
         val resolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+            .apply {
+                if (livestream720p) {
+                    setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1280, 720),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                        )
+                    )
+                    // Drop every candidate above 720p-class so the shared
+                    // stream merge cannot keep a larger parent for Preview.
+                    setResolutionFilter(ResolutionFilter { sizes, _ ->
+                        val capped = sizes.filter { isLivestream720pClass(it.width, it.height) }
+                        if (capped.isEmpty()) {
+                            Log.w(TAG, "bindUseCases(profile=livestream720p) PARTIAL: no preview size ≤1280×720 among ${sizes.size} candidates; preview left uncapped")
+                            sizes
+                        } else {
+                            capped
+                        }
+                    })
+                }
+            }
             .build()
 
         // ── Preview use-case ─────────────────────────────────────────────────
@@ -396,28 +458,64 @@ class VanguardCameraSource(
         // Negotiates the highest 16:9 resolution supported by the camera hardware
         // sensor (e.g. 9–12+ Megapixels), matching the 9:16 viewfinder framing with
         // full ISP sharpness, rather than defaulting to the 1080p preview stream.
-        val photoResolutionSelector = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
-            .build()
+        // livestream720p: not bound (the livestream takes no stills); takePhoto
+        // then reports "ImageCapture use-case not bound" as for an unstarted source.
+        val imageCaptureUseCase: ImageCapture? = if (livestream720p) {
+            null
+        } else {
+            val photoResolutionSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                .build()
 
-        val imageCaptureUseCase = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-            .setResolutionSelector(photoResolutionSelector)
-            .build()
-            .also { imageCapture = it }
+            ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .setResolutionSelector(photoResolutionSelector)
+                .build()
+        }
+        imageCapture = imageCaptureUseCase
 
         // ── VideoCapture use-case (Recorder) ──────────────────────────────────
-        // QualitySelector prefers 1080p — falls back to highest available if the
-        // device doesn't support it (matches iOS AVCaptureSessionPreset1920x1080
-        // fallback to 1280x720).
-        val recorder = Recorder.Builder()
-            .setQualitySelector(
+        // Default: QualitySelector prefers 1080p — falls back to highest
+        // available if the device doesn't support it (matches iOS
+        // AVCaptureSessionPreset1920x1080 fallback to 1280x720).
+        // livestream720p: prefers HD (720p). The fallback is LOWER-only when the
+        // camera supports HD or SD, so no VideoCapture candidate above 720p can
+        // enlarge the shared effect stream. Only when neither is supported (or
+        // the capability probe fails) is a higher fallback allowed, logged as a
+        // partial-proof condition.
+        var livestreamVideoFallback = "n/a"
+        val qualitySelector = if (livestream720p) {
+            val hdOrLowerSupported = try {
+                Recorder.getVideoCapabilities(provider.getCameraInfo(selector))
+                    .getSupportedQualities(DynamicRange.SDR)
+                    .any { it == Quality.HD || it == Quality.SD }
+            } catch (e: Exception) {
+                Log.w(TAG, "bindUseCases(profile=livestream720p): video capability probe failed — ${e.message}")
+                false
+            }
+            if (hdOrLowerSupported) {
+                livestreamVideoFallback = "HD, lower-only"
                 QualitySelector.from(
-                    Quality.FHD,                   // 1080p preferred
-                    FallbackStrategy.higherQualityOrLowerThan(Quality.HD)
+                    Quality.HD,
+                    FallbackStrategy.lowerQualityThan(Quality.HD)
                 )
+            } else {
+                livestreamVideoFallback = "HD, lower-then-higher"
+                Log.w(TAG, "bindUseCases(profile=livestream720p) PARTIAL: no HD/SD video quality reported; VideoCapture may fall back above 720p")
+                QualitySelector.from(
+                    Quality.HD,
+                    FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)
+                )
+            }
+        } else {
+            QualitySelector.from(
+                Quality.FHD,                   // 1080p preferred
+                FallbackStrategy.higherQualityOrLowerThan(Quality.HD)
             )
+        }
+        val recorder = Recorder.Builder()
+            .setQualitySelector(qualitySelector)
             .build()
         // Front-camera WYSIWYG parity (matches iOS videoMirrored = front):
         // saved video is mirrored like the preview for FRONT only; BACK stays normal.
@@ -445,9 +543,14 @@ class VanguardCameraSource(
             beautyProcessor = it
         }
 
+        // livestream720p: the effect sees the same processor behind a probe
+        // that logs the negotiated effect-input size (the proof gate).
+        val effectProcessor: SurfaceProcessor =
+            if (livestream720p) LivestreamEffectInputProbe(processor) else processor
+
         val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder()
             .addUseCase(previewUseCase)
-            .addUseCase(imageCaptureUseCase)
+            .apply { if (imageCaptureUseCase != null) addUseCase(imageCaptureUseCase) }
             .addUseCase(videoCaptureUseCase)
             .apply {
                 if (processor != null) {
@@ -455,7 +558,7 @@ class VanguardCameraSource(
                         CameraBeautyEffect(
                             CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE,
                             mainExecutor,
-                            processor,
+                            effectProcessor,
                         )
                     )
                 }
@@ -477,7 +580,32 @@ class VanguardCameraSource(
         // the freshly-bound Camera instance for this bind generation.
         thermalFpsActuator = AndroidCameraXThermalFpsActuator(boundCamera, mainExecutor)
 
-        Log.d(TAG, "bindUseCases() — bound Preview + ImageCapture + VideoCapture + BeautyEffect")
+        if (livestream720p) {
+            Log.d(TAG, "bindUseCases(profile=$profileLabel) — bound Preview + VideoCapture + BeautyEffect (no ImageCapture); preview ≤1280×720, video $livestreamVideoFallback")
+        } else {
+            Log.d(TAG, "bindUseCases(profile=$profileLabel) — bound Preview + ImageCapture + VideoCapture + BeautyEffect")
+        }
+    }
+
+    // livestream720p proof probe: passes every call straight to the beauty
+    // processor and logs the effect-input size CameraX negotiated. Above
+    // 720p-class it logs a PARTIAL diagnostic instead of implying success.
+    private class LivestreamEffectInputProbe(
+        private val delegate: SurfaceProcessor,
+    ) : SurfaceProcessor {
+        override fun onInputSurface(request: SurfaceRequest) {
+            val size = request.resolution
+            if (isLivestream720pClass(size.width, size.height)) {
+                Log.i(TAG, "livestream720p effect input ${size.width}×${size.height} (720p-class)")
+            } else {
+                Log.w(TAG, "livestream720p PARTIAL: effect input ${size.width}×${size.height} is above 720p-class; beauty runs above 720p and egress downscales — mark physical proof partial")
+            }
+            delegate.onInputSurface(request)
+        }
+
+        override fun onOutputSurface(surfaceOutput: SurfaceOutput) {
+            delegate.onOutputSurface(surfaceOutput)
+        }
     }
 
     // ── SurfaceProvider — bridges CameraX Preview → Flutter SurfaceTexture ───
@@ -506,7 +634,8 @@ class VanguardCameraSource(
             surface.release()
         }
 
-        Log.d(TAG, "provideSurface: ${size.width}×${size.height} → Flutter textureId=${textureEntry.id()}")
+        // Negotiated size (proof gate reads this; the profile only requests).
+        Log.d(TAG, "provideSurface(profile=${captureProfile ?: "default"}): SurfaceRequest.resolution=${size.width}×${size.height} → Flutter textureId=${textureEntry.id()}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────

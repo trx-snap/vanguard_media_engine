@@ -2868,12 +2868,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
             "startCamera" -> {
                 // UFM-GREENSCREEN-CAM-GRAPH: an explicit, non-empty
-                // cameraCaptureProfile other than "greenScreenLowLatency" is
-                // rejected before touching any existing session. Absent/empty
-                // profile preserves the default CameraX path unchanged below.
+                // cameraCaptureProfile other than "greenScreenLowLatency" or
+                // "livestream720p" is rejected before touching any existing
+                // session. Absent/empty profile preserves the default CameraX
+                // path unchanged below; "livestream720p" takes that same path
+                // with a 720p-class capture request on the source.
                 val captureProfile = (args?.get("cameraCaptureProfile") as? String)
                     ?.takeIf { it.isNotEmpty() }
-                if (captureProfile != null && captureProfile != "greenScreenLowLatency") {
+                if (captureProfile != null &&
+                    captureProfile != "greenScreenLowLatency" &&
+                    captureProfile != VanguardCameraSource.CAPTURE_PROFILE_LIVESTREAM_720P
+                ) {
                     result.error(
                         "INVALID_CAMERA_CAPTURE_PROFILE",
                         "Unknown cameraCaptureProfile: $captureProfile",
@@ -2987,6 +2992,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     textureEntry = textureEntry,
                     lensFacing   = lensFacing,
                     frameRate    = fps,
+                    // null (default) or "livestream720p" here; greenScreen returned above.
+                    captureProfile = captureProfile,
                 )
                 cameraTexture = textureEntry
                 cameraSource  = source

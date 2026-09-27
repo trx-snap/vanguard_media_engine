@@ -4982,11 +4982,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         AVCaptureSession.Preset.iFrame960x540.rawValue,
                         AVCaptureSession.Preset.hd1280x720.rawValue,
                     ]
+                case "livestream720p":
+                    // Livestream single camera: request a 720p-class session
+                    // so beauty processing and the 720×1280 egress do not run
+                    // on 1080p. The source logs the preset it actually selects.
+                    profilePresets = [
+                        AVCaptureSession.Preset.hd1280x720.rawValue,
+                    ]
                 default:
                     result(FlutterError(
                         code: "INVALID_CAMERA_CAPTURE_PROFILE",
                         message: "Unknown cameraCaptureProfile '\(profile)'. "
-                            + "Supported: greenScreenLowLatency (or omit for default quality).",
+                            + "Supported: greenScreenLowLatency, livestream720p (or omit for default quality).",
                         details: nil
                     ))
                     return
