@@ -8,7 +8,8 @@ package com.connects.vanguard_media_engine.camera
 //
 //   backgroundType  "solidColor" | "imageFile"
 //   argb            required for solidColor (0xAARRGGBB; alpha byte ignored)
-//   imagePath       required for imageFile (non-empty absolute local path)
+//   imagePath       required for imageFile (non-empty absolute path to an
+//                   existing regular file; checked at parse time)
 //   scaleMode       "aspectFill" (default) | "aspectFit"; imageFile only
 //   scale           foreground scale, clamped to [0.25, 3.0]
 //   offsetX/offsetY foreground offset, each clamped to [-1.0, 1.0]
@@ -19,7 +20,13 @@ package com.connects.vanguard_media_engine.camera
 // into a copy through the same validation ([mergeUpdates]); the previous
 // instance is untouched.
 //
-// Pure Kotlin: no GL, no Android framework types, no I/O.
+// Pure Kotlin: no GL, no Android framework types. The only I/O is the
+// imageFile existence check (java.io.File.isFile), so a nonexistent or
+// non-file path fails the transaction here (Dart rolls back) instead of
+// reaching the GPU thread — the same check iOS makes in
+// VGGreenScreenBackgroundProvider.imageFileProviderWithPath.
+
+import java.io.File
 
 data class CameraGreenScreenState(
     val backgroundType: BackgroundType,
@@ -134,7 +141,8 @@ data class CameraGreenScreenState(
          * Validates and clamps a canonical parameter map.
          *
          * @throws IllegalArgumentException for unknown keys, invalid
-         *   vocabulary, missing required fields or non-numeric transform values.
+         *   vocabulary, missing required fields, an imageFile path that is not
+         *   an existing regular file, or non-numeric transform values.
          */
         fun fromParameters(params: Map<*, *>, enabled: Boolean): CameraGreenScreenState {
             for (rawKey in params.keys) {
@@ -174,6 +182,9 @@ data class CameraGreenScreenState(
                     val rawPath = (params[KEY_IMAGE_PATH] as? String)?.trim()
                     require(!rawPath.isNullOrEmpty()) { "greenScreen: imageFile requires a non-empty \"imagePath\"" }
                     require(rawPath.startsWith("/")) { "greenScreen: imagePath must be an absolute path, got $rawPath" }
+                    require(File(rawPath).isFile) {
+                        "greenScreen: imagePath does not exist or is not a file: $rawPath"
+                    }
                     imagePath = rawPath
                 }
             }

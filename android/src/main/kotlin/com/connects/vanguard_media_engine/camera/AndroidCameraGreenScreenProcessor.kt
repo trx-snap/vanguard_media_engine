@@ -35,6 +35,12 @@ package com.connects.vanguard_media_engine.camera
 // ANDROID_LIVESTREAM_GREENSCREEN_BYPASS and returns 0 from composite(); the
 // caller then presents the previous beauty/camera output for that frame.
 // Failures stick until the requested state changes (no per-frame retry storm).
+//
+// F3 (live background updates): an image background swap is atomic. The new
+// image is decoded and uploaded into a NEW texture first; the current
+// background texture/path/dimensions are replaced only after both succeeded,
+// so a failed swap never destroys the live background. Only a solidColor
+// state (or release) clears the image texture.
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -65,10 +71,20 @@ class AndroidCameraGreenScreenProcessor(
         private const val MAX_BACKGROUND_IMAGE_DIMENSION = 2048
         private const val FRAME_LOG_INTERVAL = 300L
 
-        // Same proven toggles as the Duet host compositor's GPU segmenter.
+        // Same proven segmenter toggles as the Duet host compositor's GPU
+        // segmenter, except despill: livestream quality tuning keeps it off.
         private const val GUIDED_FILTER_ENABLED = true
         private const val TEMPORAL_STABILIZER_ENABLED = false
-        private const val DESPILL_ENABLED = true
+        private const val DESPILL_ENABLED = false
+
+        // Composite edge policy. The Hermite-sampled mask alpha maps straight
+        // through smoothstep(ALPHA_EDGE_LOW, ALPHA_EDGE_HIGH) with no inward min
+        // erosion. The same literals feed FRAGMENT_SHADER and the READY log.
+        private const val ALPHA_EDGE_LOW = "0.35"
+        private const val ALPHA_EDGE_HIGH = "0.75"
+        private const val EDGE_EROSION = "none"
+        private const val QUALITY_CONFIG =
+            "despill=$DESPILL_ENABLED;alphaRange=[$ALPHA_EDGE_LOW,$ALPHA_EDGE_HIGH];erosion=$EDGE_EROSION"
 
         private const val VERTEX_SHADER =
             "#version 300 es\n" +
@@ -156,21 +172,13 @@ class AndroidCameraGreenScreenProcessor(
             "    vec2 uv = fromUpright(c);\n" +
             "    vec3 cameraColor = texture(uProcessed, uv).rgb;\n" +
             "    float alpha = sampleHermiteAlpha(uv);\n" +
-            "    vec2 px = 1.5 / uAlphaResolution;\n" +
-            "    float aN = sampleHermiteAlpha(uv + vec2(0.0, px.y));\n" +
-            "    float aS = sampleHermiteAlpha(uv - vec2(0.0, px.y));\n" +
-            "    float aE = sampleHermiteAlpha(uv + vec2(px.x, 0.0));\n" +
-            "    float aW = sampleHermiteAlpha(uv - vec2(px.x, 0.0));\n" +
-            "    vec2 dPx = px * 0.7071068;\n" +
-            "    float aNE = sampleHermiteAlpha(uv + vec2( dPx.x,  dPx.y));\n" +
-            "    float aNW = sampleHermiteAlpha(uv + vec2(-dPx.x,  dPx.y));\n" +
-            "    float aSE = sampleHermiteAlpha(uv + vec2( dPx.x, -dPx.y));\n" +
-            "    float aSW = sampleHermiteAlpha(uv + vec2(-dPx.x, -dPx.y));\n" +
-            "    float isotropicMin = min(min(min(aN, aS), min(aE, aW)), min(min(aNE, aNW), min(aSE, aSW)));\n" +
-            "    float boundaryT = smoothstep(0.10, 0.85, alpha);\n" +
-            "    float softAlpha = mix(isotropicMin, alpha, boundaryT);\n" +
-            "    float compAlpha = smoothstep(0.05, 0.95, softAlpha);\n" +
+            "    float compAlpha = smoothstep($ALPHA_EDGE_LOW, $ALPHA_EDGE_HIGH, alpha);\n" +
             "    if (uDespill == 1 && compAlpha > 0.02 && compAlpha < 0.90) {\n" +
+            "        vec2 px = 1.5 / uAlphaResolution;\n" +
+            "        float aN = sampleHermiteAlpha(uv + vec2(0.0, px.y));\n" +
+            "        float aS = sampleHermiteAlpha(uv - vec2(0.0, px.y));\n" +
+            "        float aE = sampleHermiteAlpha(uv + vec2(px.x, 0.0));\n" +
+            "        float aW = sampleHermiteAlpha(uv - vec2(px.x, 0.0));\n" +
             "        vec2 grad = vec2(aE - aW, aN - aS);\n" +
             "        float gradLen = length(grad);\n" +
             "        if (gradLen > 0.001) {\n" +
@@ -310,7 +318,8 @@ class AndroidCameraGreenScreenProcessor(
                 "ANDROID_LIVESTREAM_GREENSCREEN_READY source=${width}x$height output=${outputWidth}x$outputHeight " +
                     "alpha=${alphaWidth}x$alphaHeight rotation=$rotation rotationKnown=$rotationKnown mirror=$mirror " +
                     "gles=$glesMajor.$glesMinor delegate=${model?.delegateLabel} " +
-                    "background=${state.backgroundType.wire} scaleMode=${state.scaleMode.wire}",
+                    "background=${state.backgroundType.wire} scaleMode=${state.scaleMode.wire} " +
+                    "quality=$QUALITY_CONFIG",
             )
         }
         if (frameCount == 1L || frameCount % FRAME_LOG_INTERVAL == 0L) {
@@ -624,31 +633,57 @@ class AndroidCameraGreenScreenProcessor(
             CameraGreenScreenState.BackgroundType.IMAGE_FILE -> {
                 val path = state.imagePath ?: return fail(state, "background_image_path_missing")
                 if (backgroundTexture != 0 && backgroundImagePath == path) return true
-                deleteBackgroundTexture()
+                // Atomic swap: decode + upload the new image into a NEW texture
+                // before touching the current background. A decode/upload
+                // failure leaves backgroundTexture/backgroundImagePath/
+                // backgroundImageWidth/Height exactly as they were.
                 val bitmap = decodeBoundedBitmap(path) ?: return fail(state, "background_image_unavailable")
-                val textures = IntArray(1)
-                GLES30.glGenTextures(1, textures, 0)
-                val tex = textures[0]
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
-                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
-                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
-                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
-                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
-                GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bitmap, 0)
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
-                val err = GLES30.glGetError()
-                backgroundImageWidth = bitmap.width
-                backgroundImageHeight = bitmap.height
-                bitmap.recycle()
-                if (err != GLES30.GL_NO_ERROR) {
-                    GLES30.glDeleteTextures(1, intArrayOf(tex), 0)
-                    return fail(state, "background_image_upload_failed:0x${Integer.toHexString(err)}")
+                val width = bitmap.width
+                val height = bitmap.height
+                val tex = try {
+                    uploadBackgroundBitmap(bitmap)
+                } catch (t: Throwable) {
+                    return fail(state, "background_image_upload_failed:${t.message}")
                 }
+                deleteBackgroundTexture()
                 backgroundTexture = tex
                 backgroundImagePath = path
-                Log.i(TAG, "background image loaded ${backgroundImageWidth}x$backgroundImageHeight path=$path")
+                backgroundImageWidth = width
+                backgroundImageHeight = height
+                Log.i(TAG, "background image loaded ${width}x$height path=$path")
                 return true
             }
+        }
+    }
+
+    /**
+     * Uploads [bitmap] into a freshly generated GL_TEXTURE_2D and returns its
+     * id. [bitmap] is always recycled. On any failure the new texture is
+     * deleted and an exception carrying the GL error (or the thrown cause) is
+     * rethrown; no processor state is touched.
+     */
+    private fun uploadBackgroundBitmap(bitmap: Bitmap): Int {
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        val tex = textures[0]
+        try {
+            check(tex != 0) { "glGenTextures returned 0" }
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bitmap, 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+            val err = GLES30.glGetError()
+            check(err == GLES30.GL_NO_ERROR) { "0x${Integer.toHexString(err)}" }
+            return tex
+        } catch (t: Throwable) {
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+            if (tex != 0) GLES30.glDeleteTextures(1, intArrayOf(tex), 0)
+            throw t
+        } finally {
+            bitmap.recycle()
         }
     }
 
