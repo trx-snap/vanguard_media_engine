@@ -40,6 +40,14 @@ import io.flutter.plugin.common.MethodChannel
  * for greenScreen and routes it through the existing CameraX GPU path without
  * starting any standalone green-screen camera source or session coordinator.
  *
+ * G1-B: "overlay" (the G1-A `VGFilterSpecs.overlay` wire shape) is accepted in
+ * KNOWN_FILTER_TYPES and routed via [setOverlay]. Overlays are rebuild-only:
+ * the whole item list is parsed by [CameraOverlayState.fromFilterMap] BEFORE
+ * any effect is mutated (malformed → BAD_ARGS with nothing applied), an absent,
+ * disabled or empty overlay entry clears the overlay, and overlay
+ * `parameterUpdates` are rejected (UNSUPPORTED_TRANSACTION_POLICY) before any
+ * other hot update in the same transaction is applied.
+ *
  * Stateless: holds no native resources, runs no async work, and does no I/O.
  * Calls arrive on the platform main thread and this route replies
  * synchronously exactly once per call.
@@ -57,6 +65,9 @@ class AndroidCameraGraphTransactionCoordinator(
     // false when nothing is active or the update is invalid — no mutation).
     private val setGreenScreen: ((CameraGreenScreenState?) -> Unit)? = null,
     private val updateGreenScreen: ((Map<*, *>) -> Boolean)? = null,
+    // G1-B: overlay route callback. Null = accepted but no-op; non-null =
+    // forwarded to the active VanguardCameraSource. null state clears.
+    private val setOverlay: ((CameraOverlayState?) -> Unit)? = null,
 ) {
     companion object {
         private val KNOWN_FILTER_TYPES = setOf(
@@ -64,6 +75,8 @@ class AndroidCameraGraphTransactionCoordinator(
             "segmentation",
             // F2: greenScreen / greenscreen accepted; no longer returns UNKNOWN_FILTER.
             "greenscreen", "greenScreen",
+            // G1-B: livestream text/sticker overlay (rebuild-only).
+            CameraOverlayState.FILTER_TYPE,
         )
 
         private val OWNED_METHODS = setOf(
@@ -125,6 +138,11 @@ class AndroidCameraGraphTransactionCoordinator(
                 return
             }
 
+            // G1-B: the overlay entry is parsed in this validation pass, before
+            // any effect is mutated, so a malformed overlay returns BAD_ARGS with
+            // beauty/color/green-screen untouched. An enabled=false or empty
+            // overlay parses to an inactive state, which clears the overlay.
+            var parsedOverlay: CameraOverlayState? = null
             for (rawFilter in rawFilterStack) {
                 val filter = rawFilter as? Map<*, *>
                 val type = filter?.get("type")
@@ -141,14 +159,23 @@ class AndroidCameraGraphTransactionCoordinator(
                     result.error("UNKNOWN_FILTER", "applyGraphTransaction: unrecognized filter type: $type", null)
                     return
                 }
+                if (CameraOverlayState.isOverlayType(type)) {
+                    try {
+                        parsedOverlay = CameraOverlayState.fromFilterMap(filter)
+                    } catch (e: IllegalArgumentException) {
+                        result.error("BAD_ARGS", "applyGraphTransaction overlay: ${e.message}", null)
+                        return
+                    }
+                }
             }
 
             // Empty filter list -- "no filters are applied" is trivially satisfied.
-            // Also reset beauty, color filters, and green screen to passthrough.
+            // Also reset beauty, color filters, green screen and overlay to passthrough.
             if (rawFilterStack.isEmpty()) {
                 setBeautyIntensity(0f)
                 setColorFilter(null)
                 setGreenScreen?.invoke(null)
+                setOverlay?.invoke(null)
                 result.success(null)
                 return
             }
@@ -161,6 +188,7 @@ class AndroidCameraGraphTransactionCoordinator(
                 setBeautyIntensity(0f)
                 setColorFilter(null)
                 setGreenScreen?.invoke(null)
+                setOverlay?.invoke(null)
                 result.success(null)
                 return
             }
@@ -168,9 +196,11 @@ class AndroidCameraGraphTransactionCoordinator(
             // CAM-01 / LIVE-CAMERA-BEAUTY-PARITY: route beauty and color/LUT filters to
             // the live camera beauty SurfaceProcessor pipeline.
             // F2: route greenScreen/greenscreen to the green-screen processor.
+            // G1-B: route overlay to the overlay compositor.
             var beautyHandled = false
             var colorFilterHandled = false
             var greenScreenHandled = false
+            var overlayHandled = false
             var hasUnsupportedEnabled = false
 
             for (filter in filterStack) {
@@ -204,6 +234,14 @@ class AndroidCameraGraphTransactionCoordinator(
                             return
                         }
                     }
+                    CameraOverlayState.FILTER_TYPE -> {
+                        // G1-B: already validated above. An active state carries
+                        // the sorted item list; an enabled-but-empty list is
+                        // inactive and clears like an absent entry.
+                        val overlay = parsedOverlay?.takeIf { it.isActive }
+                        setOverlay?.invoke(overlay)
+                        overlayHandled = overlay != null
+                    }
                     else -> {
                         // Segmentation — not yet available on Android live camera.
                         hasUnsupportedEnabled = true
@@ -221,12 +259,15 @@ class AndroidCameraGraphTransactionCoordinator(
             if (!greenScreenHandled) {
                 setGreenScreen?.invoke(null)
             }
+            if (!overlayHandled) {
+                setOverlay?.invoke(null)
+            }
 
-            if (hasUnsupportedEnabled && !beautyHandled && !colorFilterHandled && !greenScreenHandled) {
+            if (hasUnsupportedEnabled && !beautyHandled && !colorFilterHandled && !greenScreenHandled && !overlayHandled) {
                 // Only unsupported (e.g. segmentation) filters present — fail closed.
                 result.error(
                     "GRAPH_MODE_DISABLED",
-                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT/non-greenScreen filters.",
+                    "applyGraphTransaction: Android camera graph/filter execution is not available for non-beauty/non-LUT/non-greenScreen/non-overlay filters.",
                     null,
                 )
                 return
@@ -247,6 +288,18 @@ class AndroidCameraGraphTransactionCoordinator(
         @Suppress("UNCHECKED_CAST")
         val parameterUpdates = rawParameterUpdates as? Map<String, Any?>
         var handledAny = false
+
+        // G1-B: overlays are rebuild-only. Fail closed BEFORE any other hot
+        // update in this transaction is applied, so nothing is partially mutated.
+        if (parameterUpdates != null && parameterUpdates.keys.any { CameraOverlayState.isOverlayType(it) }) {
+            result.error(
+                "UNSUPPORTED_TRANSACTION_POLICY",
+                "applyGraphTransaction overlay: hot parameterUpdates are not supported; " +
+                    "replace the overlay list with a preset rebuild transaction.",
+                null,
+            )
+            return
+        }
 
         if (parameterUpdates != null) {
             // Check for beauty intensity in parameter updates.

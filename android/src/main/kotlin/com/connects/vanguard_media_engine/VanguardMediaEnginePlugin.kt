@@ -758,6 +758,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             // never started from this route.
             setGreenScreen = { state -> cameraSource?.setGreenScreen(state) },
             updateGreenScreen = { updates -> cameraSource?.updateGreenScreenParameters(updates) ?: false },
+            // G1-B: livestream text/sticker overlay rides the same source and
+            // beauty SurfaceProcessor, after green screen, before preview/egress.
+            setOverlay = { state -> cameraSource?.setOverlay(state) },
         )
         multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
             context               = binding.applicationContext,
