@@ -8,6 +8,7 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.Looper
+import com.connects.vanguard_media_engine.livestream.AndroidLivestreamMediaSourceCoordinator
 import android.util.Log
 import androidx.annotation.NonNull
 import com.connects.vanguard_media_engine.audio.AndroidWaveformCacheCoordinator
@@ -624,6 +625,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // onDetachedFromEngine so egress is released before cameraSource is dropped.
     private var liveKitBridge: AndroidVanguardLiveKitBridge? = null
 
+    // ── I1: livestream live media source switching (camera ↔ still image) ───
+    // Owns the image pump and producer mode for the virtual camera track;
+    // routed from the bridge's "setMediaSource". Told before every camera
+    // source stop so the pump never outlives its camera, and disposed before
+    // the bridge in onDetachedFromEngine.
+    private var livestreamMediaSourceCoordinator: AndroidLivestreamMediaSourceCoordinator? = null
+
     // ── UFM-GREENSCREEN-CAM-GRAPH: independent green-screen camera graph ─────
     // source. Selected only when Dart sends
     // cameraCaptureProfile=greenScreenLowLatency to startCamera; mutually
@@ -699,6 +707,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     this@VanguardMediaEnginePlugin.detachEgressSurface()
             },
         )
+        livestreamMediaSourceCoordinator = AndroidLivestreamMediaSourceCoordinator(
+            cameraSourceProvider = { cameraSource },
+            retainedSurfaceProvider = { liveKitBridge?.retainedVirtualSurface },
+            egressWidth = AndroidVanguardLiveKitBridge.EGRESS_WIDTH,
+            egressHeight = AndroidVanguardLiveKitBridge.EGRESS_HEIGHT,
+            egressMirror = AndroidVanguardLiveKitBridge.EGRESS_MIRROR,
+            egressFps = AndroidVanguardLiveKitBridge.VIRTUAL_CAMERA_FPS,
+        ).also { liveKitBridge?.mediaSourceCoordinator = it }
         thermalStateBridge = AndroidThermalStateBridge(
             context     = binding.applicationContext,
             channel     = channel,
@@ -760,7 +776,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             updateGreenScreen = { updates -> cameraSource?.updateGreenScreenParameters(updates) ?: false },
             // G1-B: livestream text/sticker overlay rides the same source and
             // beauty SurfaceProcessor, after green screen, before preview/egress.
-            setOverlay = { state -> cameraSource?.setOverlay(state) },
+            // I1: the still-image producer burns the same list into its frames.
+            setOverlay = { state ->
+                cameraSource?.setOverlay(state)
+                livestreamMediaSourceCoordinator?.onOverlayStateChanged(state)
+            },
         )
         multiCamPreviewCoordinator = AndroidCamera2MultiCamPreviewCoordinator(
             context               = binding.applicationContext,
@@ -2897,6 +2917,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
                 if (captureProfile == "greenScreenLowLatency") {
                     // Stop any existing legacy camera session first.
+                    if (cameraSource != null) livestreamMediaSourceCoordinator?.onCameraSourceStopping()
                     cameraSource?.stop()
                     cameraSource = null
                     val prevTex = cameraTexture
@@ -2983,6 +3004,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 val prev = cameraSource
                 if (prev != null) {
                     Log.w(TAG, "startCamera: previous session still active — stopping first")
+                    livestreamMediaSourceCoordinator?.onCameraSourceStopping()
                     prev.stop()
                     cameraSource = null
                     val prevTex = cameraTexture
@@ -3033,6 +3055,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 greenScreenFilterActive = false
                 greenScreenBackgroundARGB = null
                 greenScreenActiveFilterTypes = emptyList()
+                // I1: an image producer never outlives its camera source.
+                if (cameraSource != null) livestreamMediaSourceCoordinator?.onCameraSourceStopping()
                 cameraSource?.stop()
                 cameraSource = null
                 val tex = cameraTexture
@@ -3704,6 +3728,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         thermalStateBridge?.shutdown()
         thermalStateBridge = null
         channel.setMethodCallHandler(null)
+        // I1: stop any image producer first (no camera resume: it is being torn
+        // down), then release the bridge's egress/listener state.
+        livestreamMediaSourceCoordinator?.dispose()
+        livestreamMediaSourceCoordinator = null
         // Slice C: release the LiveKit bridge's egress/listener state while the
         // camera source (and its processor) is still alive, before both are dropped.
         liveKitBridge?.dispose()

@@ -29,6 +29,13 @@ NS_ASSUME_NONNULL_BEGIN
 @class VanguardCameraMediaSource;
 @class VanguardMetalRenderer;
 
+/// I1: which producer feeds the live camera graph (see the livestream media
+/// source section at the end of the interface).
+typedef NS_ENUM(NSInteger, VGLivestreamMediaSourceMode) {
+    VGLivestreamMediaSourceModeCamera = 0,
+    VGLivestreamMediaSourceModeImage  = 1,
+};
+
 @interface VGCameraGraphSession : NSObject
 
 /// Designated initializer.
@@ -430,6 +437,49 @@ NS_ASSUME_NONNULL_BEGIN
 /// POC2-era selector kept for existing callers (VanguardCameraPlatformView /
 /// MTKView delivery). Identical to -connectProcessedFrameReceiver:.
 - (BOOL)connectPlatformViewReceiver:(id<VanguardCameraFrameReceiver>)receiver;
+
+// ─── I1: Livestream live media source switching (camera ↔ still image) ───────
+//
+// The live producer of this session's graph can be swapped between the camera
+// source and a 30 fps still-image pump without rebuilding the graph, touching
+// the WebRTC track, or changing any sink. Image frames enter through the same
+// raw-frame boundary as camera frames (didReceiveRawFrame: → graph execution
+// queue), so beauty, green screen, the overlay node, the preview and every
+// fan-out sink (including the LiveKit egress receiver) see them exactly like
+// camera frames. Implementation is inlined in VGCameraGraphSession.m.
+
+/// Wire name of the committed livestream media source: "camera" or "image".
+/// Serialized on the session queue; MUST NOT be called from it.
+- (NSString *)livestreamMediaSourceModeName;
+
+/// The committed still-image path, or nil in camera mode. Same threading.
+- (nullable NSString *)livestreamMediaSourceImagePath;
+
+/// Switches the live producer to the still image at @c imagePath.
+///
+/// Order: the path is validated at once (INVALID_IMAGE_PATH); the image is
+/// decoded EXIF-upright and aspect-filled into a frame-sized 32BGRA buffer off
+/// the hot path (IMAGE_DECODE_FAILED); the pump starts injecting it at 30 fps;
+/// only after the first pump frame has been dispatched are camera-origin
+/// frames gated and the camera source stopped; then the mode commits. While
+/// the pump already runs (image → image) the buffer is hot-swapped in place.
+/// A later request supersedes an in-flight one (SUPERSEDED); NO_CAMERA_GRAPH
+/// after invalidate. On any failure the current producer is preserved.
+/// @c completion is invoked exactly once, on the main queue.
+- (void)setLivestreamMediaSourceImageAtPath:(NSString *)imagePath
+                                 completion:(nullable void (^)(NSError * _Nullable error))completion;
+
+/// Switches the live producer back to the camera: restarts the camera source,
+/// keeps the image pump ticking until the first camera-origin frame reaches
+/// didReceiveRawFrame:, then mutes and stops the pump and commits. Idempotent
+/// in camera mode. CAMERA_RESUME_TIMEOUT when no camera frame arrives in time
+/// (the image producer keeps running); SUPERSEDED / NO_CAMERA_GRAPH as above.
+- (void)setLivestreamMediaSourceCameraWithCompletion:(nullable void (^)(NSError * _Nullable error))completion;
+
+/// Egress teardown hook (the WebRTC track stopped): performs the camera switch
+/// above with no completion when the image source is active, so the session
+/// returns to its camera-first baseline. No-op in camera mode / after invalidate.
+- (void)restoreLivestreamCameraSourceForEgressStop;
 
 @end
 

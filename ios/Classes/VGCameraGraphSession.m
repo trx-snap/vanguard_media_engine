@@ -1094,11 +1094,151 @@ static NSString *_VGLSOCaptureMirrorDescription(VanguardCameraMediaSource * _Nul
     return @"unknown";
 }
 
+// ─── I1: livestream media source helpers (still-image decode) ────────────────
+//
+// Error codes travel as NSError.domain, the convention the RTC bridge maps to
+// FlutterError codes: INVALID_IMAGE_PATH, IMAGE_DECODE_FAILED, NO_CAMERA_GRAPH,
+// SUPERSEDED, CAMERA_RESUME_TIMEOUT, CANCELLED.
+
+static NSString *const kVGLMSTag                     = @"[VGLivestreamMediaSource]";
+static const uint64_t  kVGLMSPumpFps                 = 30;
+static const uint64_t  kVGLMSPumpFrameLogInterval    = 300;
+static const int64_t   kVGLMSCameraResumeTimeoutNs   = 6 * NSEC_PER_SEC;
+static const size_t    kVGLMSDefaultFrameWidth       = 720;
+static const size_t    kVGLMSDefaultFrameHeight      = 1280;
+static const size_t    kVGLMSMaxDecodeLongEdge       = 3840;
+
+static NSError *_VGLMSError(NSString *code, NSString *message) {
+    return [NSError errorWithDomain:code code:1 userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+// Cheap synchronous checks only (no decode). Returns the rejection reason or nil.
+static NSString * _Nullable _VGLMSValidateImagePath(id _Nullable rawPath) {
+    if (![rawPath isKindOfClass:[NSString class]] || [(NSString *)rawPath length] == 0) {
+        return @"imagePath is required.";
+    }
+    NSString *path = (NSString *)rawPath;
+    if ([path containsString:@"://"]) {
+        return [NSString stringWithFormat:@"imagePath must be a local filesystem path, not a URI: %@", path];
+    }
+    if (![path hasPrefix:@"/"]) {
+        return [NSString stringWithFormat:@"imagePath must be absolute: %@", path];
+    }
+    BOOL isDirectory = NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path isDirectory:&isDirectory] || isDirectory) {
+        return [NSString stringWithFormat:@"imagePath does not exist or is not a file: %@", path];
+    }
+    if (![fm isReadableFileAtPath:path]) {
+        return [NSString stringWithFormat:@"imagePath is not readable: %@", path];
+    }
+    return nil;
+}
+
+// Decodes `path` EXIF-upright (bounded by the source's own pixel size, never
+// upsampled at decode) and draws it aspect-filled — centered, cropped, never
+// stretched — over black into a NEW width x height 32BGRA IOSurface/Metal
+// compatible buffer: the same format the camera source delivers, so every
+// filter node and sink treats it as a camera frame. The bitmap context's first
+// row is the buffer's top row, so CG-upright drawing is buffer-upright.
+// Returns +1, or NULL with *outError. Blocking: call off the hot path.
+static CVPixelBufferRef _Nullable _VGLMSCreateImageBuffer(NSString *path, size_t width, size_t height,
+                                                          NSError * _Nullable * _Nullable outError) CF_RETURNS_RETAINED {
+    NSURL *url = [NSURL fileURLWithPath:path];
+    NSDictionary *sourceOptions = @{(__bridge NSString *)kCGImageSourceShouldCache: @NO};
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url,
+                                                         (__bridge CFDictionaryRef)sourceOptions);
+    if (!source) {
+        if (outError) *outError = _VGLMSError(@"IMAGE_DECODE_FAILED",
+            [NSString stringWithFormat:@"Cannot open image: %@", path]);
+        return NULL;
+    }
+    if (CGImageSourceGetCount(source) < 1) {
+        CFRelease(source);
+        if (outError) *outError = _VGLMSError(@"IMAGE_DECODE_FAILED",
+            [NSString stringWithFormat:@"Image has no decodable frame: %@", path]);
+        return NULL;
+    }
+    size_t maxPixel = kVGLMSMaxDecodeLongEdge;
+    NSDictionary *props = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+    NSNumber *pixelWidth  = props[(__bridge NSString *)kCGImagePropertyPixelWidth];
+    NSNumber *pixelHeight = props[(__bridge NSString *)kCGImagePropertyPixelHeight];
+    if ([pixelWidth isKindOfClass:[NSNumber class]] && [pixelHeight isKindOfClass:[NSNumber class]] &&
+        pixelWidth.unsignedLongValue > 0 && pixelHeight.unsignedLongValue > 0) {
+        maxPixel = MIN(kVGLMSMaxDecodeLongEdge, MAX(pixelWidth.unsignedLongValue, pixelHeight.unsignedLongValue));
+    }
+    NSDictionary *thumbOptions = @{
+        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform:   @YES,
+        (__bridge NSString *)kCGImageSourceShouldCacheImmediately:         @YES,
+        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(maxPixel, (size_t)1)),
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)thumbOptions);
+    CFRelease(source);
+    if (!image || CGImageGetWidth(image) == 0 || CGImageGetHeight(image) == 0) {
+        if (image) CGImageRelease(image);
+        if (outError) *outError = _VGLMSError(@"IMAGE_DECODE_FAILED",
+            [NSString stringWithFormat:@"Image decode failed: %@", path]);
+        return NULL;
+    }
+
+    NSDictionary *attrs = @{
+        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:          @{},
+        (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey:           @YES,
+        (__bridge NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+    };
+    CVPixelBufferRef buffer = NULL;
+    const CVReturn rv = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                                            (__bridge CFDictionaryRef)attrs, &buffer);
+    if (rv != kCVReturnSuccess || !buffer) {
+        CGImageRelease(image);
+        if (outError) *outError = _VGLMSError(@"IMAGE_DECODE_FAILED",
+            [NSString stringWithFormat:@"Frame buffer allocation failed (%d) for %zux%zu", (int)rv, width, height]);
+        return NULL;
+    }
+    if (CVPixelBufferLockBaseAddress(buffer, 0) != kCVReturnSuccess) {
+        CGImageRelease(image);
+        CVPixelBufferRelease(buffer);
+        if (outError) *outError = _VGLMSError(@"IMAGE_DECODE_FAILED", @"Frame buffer lock failed.");
+        return NULL;
+    }
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buffer), width, height, 8,
+                                             CVPixelBufferGetBytesPerRow(buffer), colorSpace,
+                                             (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) {
+        CVPixelBufferUnlockBaseAddress(buffer, 0);
+        CGImageRelease(image);
+        CVPixelBufferRelease(buffer);
+        if (outError) *outError = _VGLMSError(@"IMAGE_DECODE_FAILED", @"Frame bitmap context creation failed.");
+        return NULL;
+    }
+    CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
+    CGContextFillRect(ctx, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    const double imageWidth  = (double)CGImageGetWidth(image);
+    const double imageHeight = (double)CGImageGetHeight(image);
+    const double scale = MAX((double)width / imageWidth, (double)height / imageHeight);
+    const double drawWidth  = imageWidth * scale;
+    const double drawHeight = imageHeight * scale;
+    CGContextDrawImage(ctx, CGRectMake(((double)width - drawWidth) / 2.0, ((double)height - drawHeight) / 2.0,
+                                       drawWidth, drawHeight), image);
+    CGContextFlush(ctx);
+    CGContextRelease(ctx);
+    CVPixelBufferUnlockBaseAddress(buffer, 0);
+    CGImageRelease(image);
+    return buffer;
+}
+
 // 3G-C: VGCameraGraphSession adopts VGFrameDelegate so it can act as the
 // renderer.frameDelegate instead of _scheduler. This gives the session full
 // control over the async handoff boundary.
 @interface VGCameraGraphSession () <VGFrameDelegate>
 - (BOOL)_queryDimensionsWidth:(size_t *)outWidth height:(size_t *)outHeight;
+// I1: shared raw-frame boundary for both producers (camera frames reach it via
+// didReceiveRawFrame:, image-pump frames call it directly).
+- (void)_dispatchRawFrame:(VGFrameEnvelope)envelope;
 - (id)_sessionPool;
 - (NSUInteger)_sessionPoolBytes;
 // Shared body of both designated initializers. Exactly one of renderer /
@@ -1172,6 +1312,30 @@ static NSString *_VGLSOCaptureMirrorDescription(VanguardCameraMediaSource * _Nul
     // Delta-since-commit count of frames dropped by the _graphInFlight guard
     // (incremented on the capture queue in didReceiveRawFrame:).
     _Atomic(uint64_t) _graphDroppedBusyCounter;
+
+    // ── I1 livestream media source (still-image pump) ────────────────────────
+    // Owned by _sessionQueue: mode, committed path, generation, pending
+    // completion, pump timer lifecycle, pump buffer dimensions.
+    // _pumpBuffer is read on _imagePumpQueue under _mediaSourceLock.
+    // The atomics are read on the capture and pump queues (see
+    // didReceiveRawFrame: / _lmsPumpTickForGeneration:).
+    dispatch_queue_t            _imagePumpQueue;
+    dispatch_source_t           _imagePumpTimer;
+    os_unfair_lock              _mediaSourceLock;
+    CVPixelBufferRef            _pumpBuffer;              // +1 owned; guarded by _mediaSourceLock
+    size_t                      _pumpBufferWidth;
+    size_t                      _pumpBufferHeight;
+    NSString                   *_pumpImagePath;
+    _Atomic(BOOL)               _pumpDelivering;          // pump ticks inject frames only while YES
+    _Atomic(BOOL)               _cameraFramesGated;       // camera-origin frames dropped while YES
+    _Atomic(BOOL)               _awaitingCameraFrame;     // next camera-origin frame completes image → camera
+    _Atomic(uint64_t)           _pumpFramesDelivered;
+    uint64_t                    _mediaSourceGeneration;
+    BOOL                        _mediaSourcePendingActive;
+    VGLivestreamMediaSourceMode _mediaSourcePendingTarget;
+    void                      (^_mediaSourcePendingCompletion)(NSError * _Nullable);
+    VGLivestreamMediaSourceMode _mediaSourceMode;
+    NSString                   *_mediaSourceImagePath;
 }
 
 // Deep-copies a validated specs array (including nested "parameters" dictionaries)
@@ -1318,6 +1482,18 @@ static NSArray<NSDictionary *> *_VGDeepCopyFilterSpecs(NSArray<NSDictionary *> *
                                   QOS_CLASS_USER_INTERACTIVE, 0));
     _sessionPool = NULL;
     _sessionPoolBytes = 0;
+
+    // I1: livestream media source starts camera-first; the pump queue exists
+    // for the session lifetime, the timer only while an image is live.
+    _imagePumpQueue = dispatch_queue_create("com.vanguard.livestreamImagePump",
+                                            dispatch_queue_attr_make_with_qos_class(
+                                                DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    _mediaSourceLock = OS_UNFAIR_LOCK_INIT;
+    atomic_init(&_pumpDelivering, NO);
+    atomic_init(&_cameraFramesGated, NO);
+    atomic_init(&_awaitingCameraFrame, NO);
+    atomic_init(&_pumpFramesDelivered, 0);
+    _mediaSourceMode = VGLivestreamMediaSourceModeCamera;
 
     size_t width = 0;
     size_t height = 0;
@@ -2955,6 +3131,10 @@ static NSError *_VGHotUpdatePolicyError(NSInteger code, NSString *message) {
             }];
         }
 
+        // I1: stop the image pump and fail any in-flight media source request
+        // before the scheduler goes (the pump injects through _dispatchRawFrame:).
+        [self _lmsTeardownLocked];
+
         [self->_scheduler invalidate];
 
         if (self->_sessionPool) {
@@ -3003,6 +3183,14 @@ static NSError *_VGHotUpdatePolicyError(NSInteger code, NSString *message) {
 }
 
 - (void)dealloc {
+    if (_imagePumpTimer) {
+        dispatch_source_cancel(_imagePumpTimer);
+        _imagePumpTimer = nil;
+    }
+    if (_pumpBuffer) {
+        CVPixelBufferRelease(_pumpBuffer);
+        _pumpBuffer = NULL;
+    }
     if (_sessionPool) {
         CVPixelBufferPoolRelease(_sessionPool);
         _sessionPool = NULL;
@@ -3114,6 +3302,26 @@ static NSError *_VGHotUpdatePolicyError(NSInteger code, NSString *message) {
 //   backlog on the execution queue and matches the AVFoundation drop-latest
 //   model (alwaysDiscardsLateVideoFrames companion on the CPU side).
 - (void)didReceiveRawFrame:(VGFrameEnvelope)envelope {
+    // ── I1: camera-origin gates ───────────────────────────────────────────────
+    // Only camera frames arrive here (the image pump calls _dispatchRawFrame:
+    // directly, so origin is structural, never inferred from the buffer).
+    // While the image source is committed they are dropped; the first one after
+    // an image → camera request completes that switch.
+    if (atomic_load(&_cameraFramesGated)) return;
+    BOOL awaiting = YES;
+    if (atomic_compare_exchange_strong(&_awaitingCameraFrame, &awaiting, NO)) {
+        // Mute the pump at once so no image frame can follow this camera frame,
+        // then finish the switch on the session queue.
+        atomic_store(&_pumpDelivering, NO);
+        __weak __typeof(self) weakSelf = self;
+        dispatch_async(_sessionQueue, ^{ [weakSelf _lmsCameraFrameArrived]; });
+    }
+    [self _dispatchRawFrame:envelope];
+}
+
+// Shared raw-frame boundary (body of the original didReceiveRawFrame:). The
+// caller owns envelope.payload.videoBuffer for the duration of this call.
+- (void)_dispatchRawFrame:(VGFrameEnvelope)envelope {
     // ── Guard: invalidated ────────────────────────────────────────────────────
     if (atomic_load(&_invalidated)) return;
 
@@ -3185,6 +3393,363 @@ static NSError *_VGHotUpdatePolicyError(NSInteger code, NSString *message) {
             atomic_store(&strongSelf->_graphInFlight, NO);
         }
     });
+}
+
+// ─── I1: Livestream live media source switching ──────────────────────────────
+//
+// Contract: VGCameraGraphSession.h. State ownership: see the ivar block.
+// Every public entry point dispatches async onto _sessionQueue (never sync, so
+// callers already on that queue cannot deadlock) and replies exactly once on
+// the main queue. Generation rule: a request that is superseded, cancelled or
+// stale never commits or replies success; its side effects are reconciled by
+// the newer request from the actual pump/camera state.
+
+#pragma mark - I1 livestream media source
+
+- (NSString *)livestreamMediaSourceModeName {
+    __block VGLivestreamMediaSourceMode mode = VGLivestreamMediaSourceModeCamera;
+    dispatch_sync(_sessionQueue, ^{ mode = self->_mediaSourceMode; });
+    return mode == VGLivestreamMediaSourceModeImage ? @"image" : @"camera";
+}
+
+- (nullable NSString *)livestreamMediaSourceImagePath {
+    __block NSString *path = nil;
+    dispatch_sync(_sessionQueue, ^{ path = [self->_mediaSourceImagePath copy]; });
+    return path;
+}
+
+- (void)setLivestreamMediaSourceImageAtPath:(NSString *)imagePath
+                                 completion:(nullable void (^)(NSError * _Nullable))completion {
+    NSString *reason = _VGLMSValidateImagePath(imagePath);
+    if (reason) {
+        NSLog(@"%@ image request rejected (INVALID_IMAGE_PATH): %@", kVGLMSTag, reason);
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(_VGLMSError(@"INVALID_IMAGE_PATH", reason)); });
+        }
+        return;
+    }
+    NSString *path = [imagePath copy];
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(_sessionQueue, ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || atomic_load(&strongSelf->_invalidated) || !strongSelf->_source) {
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(_VGLMSError(@"NO_CAMERA_GRAPH", @"The camera graph session is not live."));
+                });
+            }
+            return;
+        }
+        // Idempotent: this image is already the committed, running producer.
+        if (!strongSelf->_mediaSourcePendingActive &&
+            strongSelf->_mediaSourceMode == VGLivestreamMediaSourceModeImage &&
+            strongSelf->_imagePumpTimer != nil &&
+            [strongSelf->_mediaSourceImagePath isEqualToString:path]) {
+            if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+            return;
+        }
+        const uint64_t gen = [strongSelf _lmsBeginRequestWithTarget:VGLivestreamMediaSourceModeImage
+                                                          completion:completion];
+        // Frame size: keep a running pump's size across hot swaps; otherwise
+        // the camera's active format (what the session pool was sized for).
+        size_t width = strongSelf->_pumpBufferWidth;
+        size_t height = strongSelf->_pumpBufferHeight;
+        if (width == 0 || height == 0) {
+            if (![strongSelf _queryDimensionsWidth:&width height:&height] || width == 0 || height == 0) {
+                width = kVGLMSDefaultFrameWidth;
+                height = kVGLMSDefaultFrameHeight;
+            }
+        }
+        NSLog(@"%@ image request gen=%llu path=%@ frame=%zux%zu pumpRunning=%d",
+              kVGLMSTag, (unsigned long long)gen, path, width, height, strongSelf->_imagePumpTimer != nil);
+        // Decode off the hot path (never on the session, capture or graph queue).
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSError *decodeError = nil;
+            CVPixelBufferRef buffer = _VGLMSCreateImageBuffer(path, width, height, &decodeError);
+            __strong __typeof(weakSelf) decodeSelf = weakSelf;
+            if (!decodeSelf) {
+                if (buffer) CVPixelBufferRelease(buffer);
+                return;
+            }
+            dispatch_async(decodeSelf->_sessionQueue, ^{
+                [decodeSelf _lmsApplyDecodedBuffer:buffer path:path error:decodeError generation:gen];
+            });
+        });
+    });
+}
+
+- (void)setLivestreamMediaSourceCameraWithCompletion:(nullable void (^)(NSError * _Nullable))completion {
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(_sessionQueue, ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || atomic_load(&strongSelf->_invalidated) || !strongSelf->_source) {
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(_VGLMSError(@"NO_CAMERA_GRAPH", @"The camera graph session is not live."));
+                });
+            }
+            return;
+        }
+        const BOOL pumpRunning = (strongSelf->_imagePumpTimer != nil);
+        if (!pumpRunning && !strongSelf->_mediaSourcePendingActive &&
+            strongSelf->_mediaSourceMode == VGLivestreamMediaSourceModeCamera) {
+            if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+            return;
+        }
+        const uint64_t gen = [strongSelf _lmsBeginRequestWithTarget:VGLivestreamMediaSourceModeCamera
+                                                          completion:completion];
+        if (!pumpRunning) {
+            // Nothing to hand off (an image request superseded mid-decode): the
+            // camera source was never stopped.
+            atomic_store(&strongSelf->_cameraFramesGated, NO);
+            strongSelf->_mediaSourceMode = VGLivestreamMediaSourceModeCamera;
+            strongSelf->_mediaSourceImagePath = nil;
+            [strongSelf _lmsFinishGeneration:gen error:nil];
+            return;
+        }
+        // Image → camera: restart the camera; the pump keeps ticking until the
+        // first camera-origin frame reaches didReceiveRawFrame:.
+        atomic_store(&strongSelf->_cameraFramesGated, NO);
+        atomic_store(&strongSelf->_awaitingCameraFrame, YES);
+        [strongSelf->_source start];
+        NSLog(@"%@ camera request gen=%llu — camera source restarting, image pump keeps ticking",
+              kVGLMSTag, (unsigned long long)gen);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kVGLMSCameraResumeTimeoutNs), strongSelf->_sessionQueue, ^{
+            __strong __typeof(weakSelf) timeoutSelf = weakSelf;
+            if (!timeoutSelf || atomic_load(&timeoutSelf->_invalidated)) return;
+            if (!timeoutSelf->_mediaSourcePendingActive || gen != timeoutSelf->_mediaSourceGeneration) return;
+            // No camera frame: keep the image producer, re-gate camera frames,
+            // stop the camera again and report.
+            atomic_store(&timeoutSelf->_awaitingCameraFrame, NO);
+            atomic_store(&timeoutSelf->_cameraFramesGated, YES);
+            atomic_store(&timeoutSelf->_pumpDelivering, timeoutSelf->_imagePumpTimer != nil);
+            [timeoutSelf->_source stop];
+            [timeoutSelf _lmsFinishGeneration:gen
+                                        error:_VGLMSError(@"CAMERA_RESUME_TIMEOUT",
+                                                          @"No camera frame arrived in time; the image producer keeps running.")];
+        });
+    });
+}
+
+- (void)restoreLivestreamCameraSourceForEgressStop {
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(_sessionQueue, ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || atomic_load(&strongSelf->_invalidated)) return;
+        if (strongSelf->_imagePumpTimer == nil &&
+            strongSelf->_mediaSourceMode == VGLivestreamMediaSourceModeCamera &&
+            !strongSelf->_mediaSourcePendingActive) {
+            return;
+        }
+        NSLog(@"%@ egress stopped — restoring the camera producer", kVGLMSTag);
+        [strongSelf setLivestreamMediaSourceCameraWithCompletion:nil];
+    });
+}
+
+// ── Session-queue internals ───────────────────────────────────────────────────
+
+// Replies exactly once (main queue) and clears the pending slot. No-op for a
+// stale generation.
+- (void)_lmsFinishGeneration:(uint64_t)gen error:(nullable NSError *)error {
+    if (!_mediaSourcePendingActive || gen != _mediaSourceGeneration) return;
+    _mediaSourcePendingActive = NO;
+    void (^completion)(NSError * _Nullable) = _mediaSourcePendingCompletion;
+    _mediaSourcePendingCompletion = nil;
+    if (error) {
+        NSLog(@"%@ request gen=%llu failed (%@): %@", kVGLMSTag, (unsigned long long)gen,
+              error.domain, error.localizedDescription);
+    }
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(error); });
+    }
+}
+
+// Supersedes any in-flight request and opens a new generation.
+- (uint64_t)_lmsBeginRequestWithTarget:(VGLivestreamMediaSourceMode)target
+                            completion:(nullable void (^)(NSError * _Nullable))completion {
+    if (_mediaSourcePendingActive) {
+        const BOOL cameraSwitchInFlight =
+            (_mediaSourcePendingTarget == VGLivestreamMediaSourceModeCamera) && _imagePumpTimer != nil;
+        NSLog(@"%@ request gen=%llu superseded", kVGLMSTag, (unsigned long long)_mediaSourceGeneration);
+        [self _lmsFinishGeneration:_mediaSourceGeneration
+                             error:_VGLMSError(@"SUPERSEDED", @"A newer setMediaSource request replaced this one.")];
+        if (cameraSwitchInFlight && target == VGLivestreamMediaSourceModeImage) {
+            // The superseded switch had restarted the camera and ungated its
+            // frames while the pump kept running: return to the image steady
+            // state before the new image is decoded.
+            atomic_store(&_awaitingCameraFrame, NO);
+            atomic_store(&_cameraFramesGated, YES);
+            atomic_store(&_pumpDelivering, YES);
+            [_source stop];
+        }
+    }
+    atomic_store(&_awaitingCameraFrame, NO);
+    _mediaSourceGeneration += 1;
+    _mediaSourcePendingActive = YES;
+    _mediaSourcePendingTarget = target;
+    _mediaSourcePendingCompletion = [completion copy];
+    return _mediaSourceGeneration;
+}
+
+// Consumes the +1 buffer (or nil with error) produced for `gen`.
+- (void)_lmsApplyDecodedBuffer:(nullable CVPixelBufferRef)buffer
+                          path:(NSString *)path
+                         error:(nullable NSError *)error
+                    generation:(uint64_t)gen {
+    if (atomic_load(&_invalidated) || !_mediaSourcePendingActive || gen != _mediaSourceGeneration) {
+        // Superseded or cancelled while decoding: the newer request owns the state.
+        if (buffer) CVPixelBufferRelease(buffer);
+        NSLog(@"%@ decoded image for stale gen=%llu dropped", kVGLMSTag, (unsigned long long)gen);
+        return;
+    }
+    if (!buffer) {
+        [self _lmsFinishGeneration:gen
+                             error:(error ?: _VGLMSError(@"IMAGE_DECODE_FAILED", @"The image could not be decoded."))];
+        return;
+    }
+    os_unfair_lock_lock(&_mediaSourceLock);
+    CVPixelBufferRef previous = _pumpBuffer;
+    _pumpBuffer = buffer;   // adopt the +1
+    os_unfair_lock_unlock(&_mediaSourceLock);
+    if (previous) CVPixelBufferRelease(previous);
+    _pumpBufferWidth = CVPixelBufferGetWidth(buffer);
+    _pumpBufferHeight = CVPixelBufferGetHeight(buffer);
+    _pumpImagePath = [path copy];
+
+    if (_imagePumpTimer) {
+        // Image → image: the running pump presents the new buffer on its next tick.
+        atomic_store(&_pumpDelivering, YES);
+        _mediaSourceMode = VGLivestreamMediaSourceModeImage;
+        _mediaSourceImagePath = [path copy];
+        NSLog(@"%@ IOS_LIVESTREAM_MEDIA_SOURCE_COMMITTED mode=image swap=hot path=%@", kVGLMSTag, path);
+        [self _lmsFinishGeneration:gen error:nil];
+        return;
+    }
+    [self _lmsStartPumpForGeneration:gen];
+}
+
+// Starts the 30 fps timer on the pump queue. The camera is stopped only once
+// the first pump frame has been dispatched (see _lmsPumpDidDeliverFirstFrame).
+- (void)_lmsStartPumpForGeneration:(uint64_t)gen {
+    atomic_store(&_pumpFramesDelivered, 0);
+    atomic_store(&_pumpDelivering, YES);
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _imagePumpQueue);
+    const uint64_t interval = NSEC_PER_SEC / kVGLMSPumpFps;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), interval, interval / 10);
+    __weak __typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{ [weakSelf _lmsPumpTickForGeneration:gen]; });
+    _imagePumpTimer = timer;
+    dispatch_resume(timer);
+    NSLog(@"%@ image pump started gen=%llu %zux%zu@%llu fps path=%@",
+          kVGLMSTag, (unsigned long long)gen, _pumpBufferWidth, _pumpBufferHeight,
+          (unsigned long long)kVGLMSPumpFps, _pumpImagePath);
+}
+
+// Pump queue. Injects the still image through the shared raw-frame boundary
+// with a host-clock pts (the same clock AVCapture stamps camera frames with).
+- (void)_lmsPumpTickForGeneration:(uint64_t)gen {
+    if (atomic_load(&_invalidated) || !atomic_load(&_pumpDelivering)) return;
+    os_unfair_lock_lock(&_mediaSourceLock);
+    CVPixelBufferRef buffer = _pumpBuffer;
+    if (buffer) CVPixelBufferRetain(buffer);
+    os_unfair_lock_unlock(&_mediaSourceLock);
+    if (!buffer) return;
+
+    VGFrameEnvelope envelope;
+    memset(&envelope, 0, sizeof(VGFrameEnvelope));
+    const CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
+    envelope.pts = now;
+    envelope.dts = now;
+    envelope.duration = CMTimeMake(1, (int32_t)kVGLMSPumpFps);
+    envelope.mediaType = VGMediaTypeVideo;
+    envelope.payload.videoBuffer = buffer;
+    envelope.metadata = NULL;   // DEC-102
+    const size_t frameWidth = CVPixelBufferGetWidth(buffer);
+    const size_t frameHeight = CVPixelBufferGetHeight(buffer);
+    [self _dispatchRawFrame:envelope];   // takes its own +1 when it accepts the frame
+    CVPixelBufferRelease(buffer);
+
+    const uint64_t count = atomic_fetch_add(&_pumpFramesDelivered, 1) + 1;
+    if (count == 1) {
+        NSLog(@"%@ IOS_LIVESTREAM_IMAGE_PUMP_READY gen=%llu %zux%zu fps=%llu",
+              kVGLMSTag, (unsigned long long)gen, frameWidth, frameHeight,
+              (unsigned long long)kVGLMSPumpFps);
+        __weak __typeof(self) weakSelf = self;
+        dispatch_async(_sessionQueue, ^{ [weakSelf _lmsPumpDidDeliverFirstFrameForGeneration:gen]; });
+    } else if (count % kVGLMSPumpFrameLogInterval == 0) {
+        NSLog(@"%@ IOS_LIVESTREAM_IMAGE_PUMP_FRAME frame=%llu", kVGLMSTag, (unsigned long long)count);
+    }
+}
+
+// Session queue. The pump is ticking: now — and only now — gate camera frames,
+// stop the camera source and commit image mode.
+- (void)_lmsPumpDidDeliverFirstFrameForGeneration:(uint64_t)gen {
+    if (atomic_load(&_invalidated) || _imagePumpTimer == nil) return;
+    if (!_mediaSourcePendingActive || gen != _mediaSourceGeneration ||
+        _mediaSourcePendingTarget != VGLivestreamMediaSourceModeImage) {
+        // Superseded: the newer request reconciles from the pump/camera state.
+        return;
+    }
+    atomic_store(&_cameraFramesGated, YES);
+    [_source stop];
+    _mediaSourceMode = VGLivestreamMediaSourceModeImage;
+    _mediaSourceImagePath = [_pumpImagePath copy];
+    NSLog(@"%@ IOS_LIVESTREAM_MEDIA_SOURCE_COMMITTED mode=image cameraStopped=1 path=%@",
+          kVGLMSTag, _mediaSourceImagePath);
+    [self _lmsFinishGeneration:gen error:nil];
+}
+
+// Session queue. The first camera-origin frame of an image → camera switch has
+// been dispatched (and the pump muted by the capture queue).
+- (void)_lmsCameraFrameArrived {
+    if (atomic_load(&_invalidated)) return;
+    if (!_mediaSourcePendingActive || _mediaSourcePendingTarget != VGLivestreamMediaSourceModeCamera) {
+        // Stale (a newer request landed in between): if the pump is still the
+        // producer, make sure the capture-queue mute did not stick.
+        if (_imagePumpTimer != nil && _mediaSourceMode == VGLivestreamMediaSourceModeImage) {
+            atomic_store(&_pumpDelivering, YES);
+        }
+        return;
+    }
+    const uint64_t gen = _mediaSourceGeneration;
+    [self _lmsStopPumpLocked];
+    _mediaSourceMode = VGLivestreamMediaSourceModeCamera;
+    _mediaSourceImagePath = nil;
+    NSLog(@"%@ IOS_LIVESTREAM_MEDIA_SOURCE_COMMITTED mode=camera", kVGLMSTag);
+    [self _lmsFinishGeneration:gen error:nil];
+}
+
+// Session queue. Cancels the timer, drops the buffer, clears every gate.
+- (void)_lmsStopPumpLocked {
+    if (_imagePumpTimer) {
+        dispatch_source_cancel(_imagePumpTimer);
+        _imagePumpTimer = nil;
+        NSLog(@"%@ IOS_LIVESTREAM_IMAGE_PUMP_STOPPED frames=%llu path=%@",
+              kVGLMSTag, (unsigned long long)atomic_load(&_pumpFramesDelivered), _pumpImagePath);
+    }
+    atomic_store(&_pumpDelivering, NO);
+    atomic_store(&_awaitingCameraFrame, NO);
+    atomic_store(&_cameraFramesGated, NO);
+    os_unfair_lock_lock(&_mediaSourceLock);
+    CVPixelBufferRef buffer = _pumpBuffer;
+    _pumpBuffer = NULL;
+    os_unfair_lock_unlock(&_mediaSourceLock);
+    if (buffer) CVPixelBufferRelease(buffer);
+    _pumpBufferWidth = 0;
+    _pumpBufferHeight = 0;
+    _pumpImagePath = nil;
+}
+
+// Session queue, from invalidate. The camera source is not restarted here
+// (invalidate never touches the source's run state).
+- (void)_lmsTeardownLocked {
+    [self _lmsStopPumpLocked];
+    if (_mediaSourcePendingActive) {
+        [self _lmsFinishGeneration:_mediaSourceGeneration
+                             error:_VGLMSError(@"CANCELLED", @"The camera graph session was invalidated.")];
+    }
+    _mediaSourceMode = VGLivestreamMediaSourceModeCamera;
+    _mediaSourceImagePath = nil;
 }
 
 @end

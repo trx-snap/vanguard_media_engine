@@ -51,12 +51,22 @@ package com.connects.vanguard_media_engine
 // module still builds and runs against a stock flutter_webrtc, where the
 // provider is simply not registered and Dart falls back to the attach path
 // above.
+//
+// ── I1: live media source switching ──────────────────────────────────────────
+//
+// "setMediaSource" ({mode: camera|image, imagePath}) is routed to the
+// AndroidLivestreamMediaSourceCoordinator the plugin installs. The bridge stays
+// the SPI owner: it retains (never owns) the virtual track's Surface for the
+// track lifetime so the coordinator can hand it between the camera egress and
+// the still-image pump, and it tells the coordinator when the track stops so
+// the pump is torn down and the camera producer restored.
 
 import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.livestream.AndroidLivestreamMediaSourceCoordinator
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -119,6 +129,18 @@ internal class AndroidVanguardLiveKitBridge(
     private var virtualFramesDelivered: AtomicLong? = null
     private var providerRegistration: ProviderRegistration? = null  // set in init, after all state
 
+    // ── I1: live media source switching (camera ↔ still image) ──────────────
+    // Installed by the plugin right after construction. Main thread.
+    var mediaSourceCoordinator: AndroidLivestreamMediaSourceCoordinator? = null
+
+    // The flutter_webrtc-owned Surface of the active virtual camera track,
+    // retained (not owned) for the track lifetime so the image producer can
+    // bind it once the camera egress has let go. Cleared in stopVirtualEgress.
+    private var virtualSurface: Surface? = null
+
+    /** The live virtual track's Surface, or null when no virtual track is active. Main thread. */
+    val retainedVirtualSurface: Surface? get() = virtualSurface
+
     // ── Bridge-owned attached state (main thread) ────────────────────────────
     private var attachedTrackId: String? = null
     private var attachedHelper: Any? = null      // org.webrtc.SurfaceTextureHelper
@@ -161,6 +183,14 @@ internal class AndroidVanguardLiveKitBridge(
                 result.success(mapOf("status" to "detached"))
             }
             "getStats" -> result.success(stats())
+            "setMediaSource" -> {
+                val coordinator = mediaSourceCoordinator
+                if (coordinator == null) {
+                    result.error("UNAVAILABLE", "Livestream media source coordinator is not installed", null)
+                } else {
+                    coordinator.handleSetMediaSource(call, result)
+                }
+            }
             else -> result.notImplemented()
         }
     }
@@ -182,7 +212,7 @@ internal class AndroidVanguardLiveKitBridge(
                 "framesDelivered" to (virtualFramesDelivered?.get() ?: 0L),
                 "trackId" to virtualId,
                 "mode" to "virtual",
-            )
+            ) + (mediaSourceCoordinator?.statsFields() ?: emptyMap())
         }
         return mapOf(
             "isStreaming" to (attachedTrackId != null),
@@ -282,6 +312,7 @@ internal class AndroidVanguardLiveKitBridge(
         }
         virtualTrackId = trackId
         virtualFramesDelivered = counter
+        virtualSurface = surface
         Log.i(TAG, "virtual camera started for track $trackId: egress ${EGRESS_WIDTH}x${EGRESS_HEIGHT} mirror=$EGRESS_MIRROR (no stock capturer)")
         return true
     }
@@ -300,6 +331,13 @@ internal class AndroidVanguardLiveKitBridge(
     // track's Surface; the Surface itself belongs to flutter_webrtc.
     private fun stopVirtualEgress(reason: String) {
         val trackId = virtualTrackId ?: return
+        // I1: the track is going away — stop any image producer bound to its
+        // Surface and restore the camera producer BEFORE the egress detaches.
+        try {
+            mediaSourceCoordinator?.onEgressStopping(reason)
+        } catch (e: Exception) {
+            Log.w(TAG, "virtual camera: media source reset failed: ${describe(e)}")
+        }
         try {
             host.detachEgressSurface()
         } catch (e: Exception) {
@@ -308,6 +346,7 @@ internal class AndroidVanguardLiveKitBridge(
         Log.i(TAG, "virtual camera stopped for track $trackId ($reason) after ${virtualFramesDelivered?.get() ?: 0L} frames")
         virtualTrackId = null
         virtualFramesDelivered = null
+        virtualSurface = null
     }
 
     // ── Attach ───────────────────────────────────────────────────────────────

@@ -85,6 +85,7 @@ import io.flutter.view.TextureRegistry
 import java.io.File
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * VanguardCameraSource — CameraX-backed camera session for Android.
@@ -200,6 +201,20 @@ class VanguardCameraSource(
     // session without touching the already-released SurfaceTexture.
     // Reset to false at the start of each new start() call.
     @Volatile private var stopRequested = false
+
+    // ── I1 livestream media source: capture suspension ──────────────────────
+    // True between suspendCapture() and resumeCapture(): the use cases are
+    // unbound (CameraX closes the camera device once nothing is bound) and the
+    // beauty processor is released, while isRunning, the lifecycle owner, the
+    // provider, the Flutter texture and every beauty/color/green-screen/overlay
+    // state stay put so resumeCapture() rebinds through the normal
+    // bindUseCases() path. Main thread only.
+    private var captureSuspended = false
+
+    // One-shot first-completed-capture listener armed by resumeCapture() and
+    // fired exactly once, on the main executor, from the Camera2Interop capture
+    // callback below (which runs off the main thread).
+    private val firstFrameListener = AtomicReference<(() -> Unit)?>(null)
 
     // ── Main-thread executor (callbacks from CameraX → plugin) ───────────────
     private val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
@@ -428,6 +443,9 @@ class VanguardCameraSource(
                     result: TotalCaptureResult,
                 ) {
                     cameraReadyFlag = true
+                    // I1: a resumeCapture() caller waits for this first real
+                    // capture before handing the egress back to the camera.
+                    firstFrameListener.getAndSet(null)?.let { listener -> mainExecutor.execute { listener() } }
 
                     // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: observe the AE
                     // target FPS range actually in effect for this completed
@@ -701,6 +719,8 @@ class VanguardCameraSource(
         cameraProvider = null
         isRunning     = false
         cameraReadyFlag = false
+        captureSuspended = false
+        firstFrameListener.set(null)
 
         // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: deliberately do NOT cancel a
         // still-in-flight thermal FPS actuation here -- that would suppress
@@ -734,6 +754,15 @@ class VanguardCameraSource(
             CameraSelector.LENS_FACING_FRONT
         else
             CameraSelector.LENS_FACING_BACK
+
+        // I1: while capture is suspended (livestream image mode) only the lens
+        // choice changes; resumeCapture() binds with the new selector. Binding
+        // here would silently bring the camera hardware back.
+        if (captureSuspended) {
+            Log.i(TAG, "switchCamera() — capture suspended; lens recorded, rebind deferred to resumeCapture()")
+            onStarted()
+            return
+        }
 
         // Re-bind use-cases with the new selector.
         // We do NOT call stop()/start() because that would destroy and recreate
@@ -1421,6 +1450,96 @@ class VanguardCameraSource(
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // I1 livestream media source: capture suspension / resumption
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** True between [suspendCapture] and [resumeCapture]. Main thread. */
+    val isCaptureSuspended: Boolean get() = captureSuspended
+
+    /** The overlay list currently applied to this source (reapplied on every rebind). */
+    val currentOverlayState: CameraOverlayState? get() = activeOverlayState
+
+    /**
+     * Suspends camera capture without ending the session: unbinds every use
+     * case (CameraX closes the camera device) and releases the beauty
+     * processor, keeping [isRunning], the provider, the lifecycle owner, the
+     * Flutter texture and all beauty/color/green-screen/overlay state so
+     * [resumeCapture] can rebind exactly as [switchCamera] does. Any egress
+     * surface must already be detached by the caller (the processor is gone).
+     *
+     * Returns false (nothing changed) when the session is not running or is
+     * stopping, has no provider, or a recording is active. Idempotent while
+     * suspended. Main thread only.
+     */
+    fun suspendCapture(): Boolean {
+        if (!isRunning || stopRequested) {
+            Log.w(TAG, "suspendCapture rejected: session not running")
+            return false
+        }
+        if (captureSuspended) return true
+        val provider = cameraProvider
+        if (provider == null) {
+            Log.w(TAG, "suspendCapture rejected: no camera provider")
+            return false
+        }
+        if (isRecording) {
+            Log.w(TAG, "suspendCapture rejected: recording active")
+            return false
+        }
+        firstFrameListener.set(null)
+        provider.unbindAll()
+        beautyProcessor?.release()
+        beautyProcessor = null
+        camera = null
+        preview = null
+        imageCapture = null
+        videoCapture = null
+        thermalFpsActuator = null
+        cameraReadyFlag = false
+        captureSuspended = true
+        Log.i(TAG, "suspendCapture — use-cases unbound, processor released; beauty/GS/overlay state retained")
+        return true
+    }
+
+    /**
+     * Rebinds the use cases after [suspendCapture] through [bindUseCases]
+     * (same path as [switchCamera]: fresh beauty processor with the retained
+     * beauty/color/green-screen/overlay state). [onFirstFrame] runs once, on
+     * the main thread, when the Camera2 session reports its first completed
+     * capture; [onError] runs (synchronously) when the resume is refused or
+     * the bind throws, in which case the source stays suspended. Main thread.
+     */
+    fun resumeCapture(
+        onFirstFrame: () -> Unit,
+        onError: (Exception) -> Unit,
+    ) {
+        if (!captureSuspended) {
+            onError(IllegalStateException("resumeCapture: capture is not suspended"))
+            return
+        }
+        if (!isRunning || stopRequested) {
+            onError(IllegalStateException("resumeCapture: camera session not running"))
+            return
+        }
+        val provider = cameraProvider
+        if (provider == null) {
+            onError(IllegalStateException("resumeCapture: no camera provider"))
+            return
+        }
+        cameraReadyFlag = false
+        firstFrameListener.set(onFirstFrame)
+        try {
+            bindUseCases(provider)
+            captureSuspended = false
+            Log.i(TAG, "resumeCapture — use-cases rebound; waiting for the first completed capture")
+        } catch (e: Exception) {
+            firstFrameListener.set(null)
+            Log.e(TAG, "resumeCapture — bindUseCases failed: $e")
+            onError(e)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Processed-frame egress delegation (LiveKit bridge Slice C → processor Slice A)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1435,7 +1554,11 @@ class VanguardCameraSource(
     fun attachEgressSurface(surface: Surface, width: Int, height: Int, mirror: Boolean): Boolean {
         val processor = beautyProcessor
         if (processor == null) {
-            Log.w(TAG, "attachEgressSurface: beautyProcessor is null (camera not started)")
+            Log.w(
+                TAG,
+                "attachEgressSurface: beautyProcessor is null " +
+                    (if (captureSuspended) "(capture suspended)" else "(camera not started)"),
+            )
             return false
         }
         return processor.attachEgressSurface(surface, width, height, mirror)

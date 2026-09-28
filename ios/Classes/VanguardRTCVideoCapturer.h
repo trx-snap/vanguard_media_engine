@@ -37,7 +37,10 @@ typedef VGCameraGraphSession * _Nullable (^VGRTCGraphSessionProvider)(void);
 /// that is live at call time, not the one that existed at registration.
 - (void)setGraphSessionProvider:(nullable VGRTCGraphSessionProvider)provider;
 
-/// Routes attachVanguardToLiveKitTrack / detachVanguard / getStats.
+/// Routes attachVanguardToLiveKitTrack / detachVanguard / getStats, and (I1)
+/// setMediaSource ({mode: "camera" | "image", imagePath}), which is forwarded
+/// to the live VGCameraGraphSession's livestream media source API while a
+/// Vanguard-fed track is streaming; the RTC sink/track is never touched.
 /// Replies exactly once, possibly asynchronously. Main thread.
 /// `result` is a real FlutterResult block (never a bit-cast object).
 - (void)handleMethodCall:(FlutterMethodCall *)call

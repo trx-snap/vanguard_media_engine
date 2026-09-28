@@ -237,6 +237,10 @@ export 'src/overlay/vg_overlay_transform_evaluator.dart';
 // counterpart of the timeline VGOverlayDescriptor above — no PTS window, no
 // keyframes, pinned 720×1280 canvas).
 export 'src/overlay/vg_livestream_overlay_item.dart';
+// Slice I1: livestream live media source switching (camera ↔ still image on
+// the running virtual camera track) and the Dart-owned image playlist model.
+// Native receives single image switches only; playlist timing stays in Dart.
+export 'src/livestream/vg_livestream_media_source.dart';
 // P5-OVERLAYS-GLES-RENDER: Android True-DAG GlesOverlayCompositor multi-layer shader/raster smoke foundation.
 export 'vg_timeline_overlay_gles_render_smoke.dart';
 // P5-OVERLAYS-VULKAN-RENDER: Android True-DAG VulkanOverlayCompositor multi-layer shader/raster smoke foundation.

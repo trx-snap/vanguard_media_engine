@@ -122,8 +122,76 @@ static NSString *VGRTCFourCC(OSType fmt) {
         result(@{ @"status": @"detached" });
     } else if ([@"getStats" isEqualToString:call.method]) {
         result([self statsSnapshot]);
+    } else if ([@"setMediaSource" isEqualToString:call.method]) {
+        [self setMediaSourceWithArguments:call.arguments result:result];
     } else {
         result(FlutterMethodNotImplemented);
+    }
+}
+
+// ── I1: live media source switching ─────────────────────────────────────────
+//
+// Routes setMediaSource to the live graph session, which swaps its producer
+// (camera ↔ still-image pump) upstream of the fan-out. This capturer keeps the
+// RTC sink/track exactly as they are: onFrame:pts: simply keeps receiving
+// whatever the graph emits. Main thread; replies exactly once.
+- (void)setMediaSourceWithArguments:(id)arguments result:(FlutterResult)result {
+    NSDictionary *args = [arguments isKindOfClass:[NSDictionary class]] ? (NSDictionary *)arguments : nil;
+    NSString *mode = [args[@"mode"] isKindOfClass:[NSString class]] ? (NSString *)args[@"mode"] : nil;
+    id rawPath = args[@"imagePath"];
+    NSString *imagePath = [rawPath isKindOfClass:[NSString class]] ? (NSString *)rawPath : nil;
+    const BOOL wantsCamera = [mode isEqualToString:@"camera"];
+    const BOOL wantsImage = [mode isEqualToString:@"image"];
+    if (!wantsCamera && !wantsImage) {
+        result([FlutterError errorWithCode:@"INVALID_ARGUMENT"
+                                   message:@"mode must be \"camera\" or \"image\""
+                                   details:nil]);
+        return;
+    }
+
+    os_unfair_lock_lock(&_lock);
+    const BOOL streaming = (_gateOpen && _activeVideoSource != nil);
+    VGRTCGraphSessionProvider provider = _graphSessionProvider;
+    os_unfair_lock_unlock(&_lock);
+    if (!streaming) {
+        result([FlutterError errorWithCode:@"NO_ACTIVE_STREAM"
+                                   message:@"No Vanguard-fed LiveKit track is live"
+                                   details:nil]);
+        return;
+    }
+    VGCameraGraphSession *graphSession = provider ? provider() : nil;
+    if (!graphSession) {
+        result([FlutterError errorWithCode:@"NO_CAMERA_GRAPH"
+                                   message:@"No active Vanguard camera graph session"
+                                   details:nil]);
+        return;
+    }
+
+    __block FlutterResult pendingResult = [result copy];
+    void (^reply)(NSError * _Nullable) = ^(NSError * _Nullable error) {
+        FlutterResult outstanding = pendingResult;
+        pendingResult = nil;
+        if (!outstanding) return;
+        if (error) {
+            NSLog(@"%@ setMediaSource(%@) failed (%@): %@", kVGRTCTag, mode, error.domain, error.localizedDescription);
+            outstanding([FlutterError errorWithCode:(error.domain ?: @"MEDIA_SOURCE_FAILED")
+                                            message:error.localizedDescription
+                                            details:nil]);
+            return;
+        }
+        NSString *committedMode = [graphSession livestreamMediaSourceModeName];
+        NSString *committedPath = [graphSession livestreamMediaSourceImagePath];
+        NSLog(@"%@ setMediaSource committed mode=%@ path=%@", kVGRTCTag, committedMode, committedPath ?: @"");
+        outstanding(@{
+            @"status": @"committed",
+            @"mode": committedMode,
+            @"imagePath": committedPath ?: [NSNull null],
+        });
+    };
+    if (wantsImage) {
+        [graphSession setLivestreamMediaSourceImageAtPath:(imagePath ?: @"") completion:reply];
+    } else {
+        [graphSession setLivestreamMediaSourceCameraWithCompletion:reply];
     }
 }
 
@@ -442,12 +510,22 @@ static NSString *VGRTCFourCC(OSType fmt) {
 // ── Detach ───────────────────────────────────────────────────────────────────
 
 - (void)detach {
+    [self detachRestoringLivestreamMediaSource:YES];
+}
+
+// I1: with `restore`, an image source left live on the connected graph session
+// is switched back to the camera once the egress is gone (WebRTC onStop,
+// explicit detach, track replacement). Graph teardown passes NO because the
+// session is about to be invalidated anyway.
+- (void)detachRestoringLivestreamMediaSource:(BOOL)restore {
     FlutterResult pending = nil;
     NSString *trackId = nil;
     uint64_t frames = 0;
     BOOL wasActive = NO;
+    VGCameraGraphSession *graphSession = nil;
 
     os_unfair_lock_lock(&_lock);
+    graphSession = _connectedGraphSession;
     _attachGeneration += 1;  // any in-flight stock-stop completion / timeout is now stale
     pending = _pendingAttachResult;
     _pendingAttachResult = nil;
@@ -472,6 +550,10 @@ static NSString *VGRTCFourCC(OSType fmt) {
     // restarted here.
     if (wasActive) {
         NSLog(@"%@ detached from track %@ after %llu frames. Egress stopped", kVGRTCTag, trackId, frames);
+    }
+    if (restore && wasActive && graphSession) {
+        // Camera-first baseline for whatever track comes next; no-op in camera mode.
+        [graphSession restoreLivestreamCameraSourceForEgressStop];
     }
 }
 
@@ -581,7 +663,7 @@ static NSString *VGRTCFourCC(OSType fmt) {
     os_unfair_lock_unlock(&_lock);
 
     if (matches) {
-        [self detach];
+        [self detachRestoringLivestreamMediaSource:NO];
         NSLog(@"%@ graph session %p tearing down: egress detached, receiver dropped", kVGRTCTag, session);
     } else {
         NSLog(@"%@ graph session %p tearing down but egress is bound to %p: ignored", kVGRTCTag, session, connected);
@@ -639,6 +721,16 @@ static NSString *VGRTCFourCC(OSType fmt) {
 // ── Stats / Properties ───────────────────────────────────────────────────────
 
 - (NSDictionary *)statsSnapshot {
+    // I1: the committed producer comes from the graph session (serialized on
+    // its own queue; stats are read from the main thread, never from it).
+    os_unfair_lock_lock(&_lock);
+    const BOOL streamingNow = (_gateOpen && _activeVideoSource != nil);
+    VGRTCGraphSessionProvider provider = _graphSessionProvider;
+    os_unfair_lock_unlock(&_lock);
+    VGCameraGraphSession *graphSession = (streamingNow && provider) ? provider() : nil;
+    NSString *mediaSource = graphSession ? [graphSession livestreamMediaSourceModeName] : @"camera";
+    NSString *mediaSourceImagePath = graphSession ? [graphSession livestreamMediaSourceImagePath] : nil;
+
     os_unfair_lock_lock(&_lock);
     NSDictionary *snapshot = @{
         @"isStreaming": @(_gateOpen && _activeVideoSource != nil),
@@ -648,6 +740,8 @@ static NSString *VGRTCFourCC(OSType fmt) {
         @"attachInProgress": @(_attachInProgress),
         @"receiverConnected": @(_connectedGraphSession != nil),
         @"mode": _virtualSource ? @"virtual" : (_activeVideoSource != nil ? @"attached" : @"idle"),
+        @"mediaSource": mediaSource,
+        @"mediaSourceImagePath": mediaSourceImagePath ?: [NSNull null],
     };
     os_unfair_lock_unlock(&_lock);
     return snapshot;
