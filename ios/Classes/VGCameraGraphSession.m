@@ -63,6 +63,7 @@
 #import "BeautyV2FilterGroup.h"
 #import "VGSegmentationNode.h"  // Phase 9B-5: segmentation auto-insertion before BeautyV2
 #import "VGGreenScreenFilterNode.h"  // UMF camera graph green screen (spec type "greenScreen")
+#import "VGLivestreamOverlayFilterNode.h"  // G1-C livestream text/sticker overlay (spec type "overlay")
 // [Beauty-Still]: VGOfflineFilterBundle and VGStillImageFilterFactory declarations
 // are provided through VGCameraGraphSession.h (already imported above).
 // Their @implementation blocks are inlined later in this file.
@@ -77,6 +78,11 @@
 #import <time.h>                  // filter-chain timing: clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreImage/CoreImage.h>    // G1-C overlay: source-over composite
+#import <CoreText/CoreText.h>      // G1-C overlay: text rasterization
+#import <ImageIO/ImageIO.h>        // G1-C overlay: bounded sticker decode
+#import <os/lock.h>
+#import <math.h>
 
 // [Beauty-Still]: VGOfflineFilterBundle implementation inlined here so the class is compiled
 // as part of VGCameraGraphSession.m without requiring a new Pods project source-file entry.
@@ -246,6 +252,847 @@ _VGStillCreatePool(size_t width, size_t height) {
 }
 
 @end
+
+// ─── G1-C: VGLivestreamOverlayFilterNode ─────────────────────────────────────
+//
+// Contract, orientation policy and resource model: VGLivestreamOverlayFilterNode.h.
+// The implementation is inlined here for the same reason as
+// VGOfflineFilterBundle above: both Pods projects list engine sources file by
+// file, so a new .m would not be compiled until an authorized `pod install`.
+// Move this section into VGLivestreamOverlayFilterNode.m with that regeneration.
+
+NSString *const VGLivestreamOverlayInvalidSpecErrorDomain = @"INVALID_OVERLAY_FILTER_SPEC";
+
+static const double    kVGLSOCanvasWidth              = 720.0;
+static const double    kVGLSOCanvasHeight             = 1280.0;
+static const NSUInteger kVGLSOMaxItems                = 8;
+static const NSUInteger kVGLSOMaxTextLength           = 120;
+static const double    kVGLSOMinZ                     = 0.0;
+static const double    kVGLSOMaxZ                     = 1024.0;
+static const uint64_t  kVGLSOFrameLogInterval         = 300;
+static const uint64_t  kVGLSOBypassLogBurst           = 3;
+static const CGFloat   kVGLSOMinTextSize              = 8.0;
+static const CGFloat   kVGLSOTextBackgroundAlpha      = 140.0 / 255.0;
+// Sticker decode bound: the item's largest canvas-pixel edge at up to a
+// 1080x1920 frame (1.5x the 1280-high canvas), clamped.
+static const double    kVGLSOStickerFrameScale        = 1.5;
+static const size_t    kVGLSOMinStickerDecodeDimension = 64;
+static const size_t    kVGLSOMaxStickerDecodeDimension = 1920;
+
+static NSError *_VGLSOInvalidSpec(NSString *message) {
+    return [NSError errorWithDomain:VGLivestreamOverlayInvalidSpecErrorDomain
+                               code:1
+                           userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+static BOOL _VGLSOIsAbsent(id _Nullable value) {
+    return value == nil || value == (id)[NSNull null];
+}
+
+// A JSON number: NSNumber that is not a CFBoolean (Dart bools arrive as CFBoolean).
+static BOOL _VGLSOIsNumber(id _Nullable value) {
+    return [value isKindOfClass:[NSNumber class]] &&
+           CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID();
+}
+
+static BOOL _VGLSOReadFiniteNumber(id _Nullable raw, NSString *label, double *outValue,
+                                   NSError * _Nullable * _Nullable outError) {
+    if (!_VGLSOIsNumber(raw)) {
+        if (outError) *outError = _VGLSOInvalidSpec(
+            [NSString stringWithFormat:@"%@ must be a number (got %@).", label, raw ?: @"nil"]);
+        return NO;
+    }
+    const double value = [(NSNumber *)raw doubleValue];
+    if (!isfinite(value)) {
+        if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@ must be finite.", label]);
+        return NO;
+    }
+    *outValue = value;
+    return YES;
+}
+
+@interface VGLivestreamOverlayItemSpec ()
+- (instancetype)_initWithId:(NSString *)itemId
+                       kind:(VGLivestreamOverlayItemKind)kind
+                          x:(double)x
+                          y:(double)y
+                          w:(double)w
+                          h:(double)h
+                    opacity:(double)opacity
+                          z:(NSInteger)z
+                       text:(nullable NSString *)text
+                  assetPath:(nullable NSString *)assetPath;
+@end
+
+@implementation VGLivestreamOverlayItemSpec
+
+- (instancetype)_initWithId:(NSString *)itemId
+                       kind:(VGLivestreamOverlayItemKind)kind
+                          x:(double)x
+                          y:(double)y
+                          w:(double)w
+                          h:(double)h
+                    opacity:(double)opacity
+                          z:(NSInteger)z
+                       text:(nullable NSString *)text
+                  assetPath:(nullable NSString *)assetPath {
+    self = [super init];
+    if (!self) return nil;
+    _itemId    = [itemId copy];
+    _kind      = kind;
+    _x         = x;
+    _y         = y;
+    _w         = w;
+    _h         = h;
+    _opacity   = opacity;
+    _z         = z;
+    _text      = [text copy];
+    _assetPath = [assetPath copy];
+    return self;
+}
+
+@end
+
+// Parses one items[] entry. Mirrors the Dart VGLivestreamOverlayItem constructor
+// and the Android CameraOverlayState.parseItem rules exactly.
+static VGLivestreamOverlayItemSpec * _Nullable _VGLSOParseItem(id _Nullable rawItem, NSUInteger index,
+                                                               NSError * _Nullable * _Nullable outError) {
+    static NSSet<NSString *> *itemKeys;
+    static dispatch_once_t itemKeysOnce;
+    dispatch_once(&itemKeysOnce, ^{
+        itemKeys = [NSSet setWithObjects:@"id", @"kind", @"x", @"y", @"w", @"h",
+                                         @"opacity", @"z", @"text", @"assetPath", nil];
+    });
+    NSString *where = [NSString stringWithFormat:@"overlay items[%lu]", (unsigned long)index];
+
+    if (![rawItem isKindOfClass:[NSDictionary class]]) {
+        if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@ must be a dictionary.", where]);
+        return nil;
+    }
+    NSDictionary *item = (NSDictionary *)rawItem;
+    for (id key in item) {
+        if (![key isKindOfClass:[NSString class]] || ![itemKeys containsObject:key]) {
+            if (outError) *outError = _VGLSOInvalidSpec(
+                [NSString stringWithFormat:@"%@ has unknown field '%@'.", where, key]);
+            return nil;
+        }
+    }
+
+    id rawId = item[@"id"];
+    if (![rawId isKindOfClass:[NSString class]] || [(NSString *)rawId length] == 0) {
+        if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@.id must be a non-empty string.", where]);
+        return nil;
+    }
+
+    id rawKind = item[@"kind"];
+    VGLivestreamOverlayItemKind kind;
+    if ([rawKind isKindOfClass:[NSString class]] && [rawKind isEqualToString:@"text"]) {
+        kind = VGLivestreamOverlayItemKindText;
+    } else if ([rawKind isKindOfClass:[NSString class]] && [rawKind isEqualToString:@"sticker"]) {
+        kind = VGLivestreamOverlayItemKindSticker;
+    } else {
+        if (outError) *outError = _VGLSOInvalidSpec(
+            [NSString stringWithFormat:@"%@.kind must be \"text\" or \"sticker\" (got %@).", where, rawKind ?: @"nil"]);
+        return nil;
+    }
+
+    double x = 0, y = 0, w = 0, h = 0;
+    if (!_VGLSOReadFiniteNumber(item[@"x"], [where stringByAppendingString:@".x"], &x, outError)) return nil;
+    if (!_VGLSOReadFiniteNumber(item[@"y"], [where stringByAppendingString:@".y"], &y, outError)) return nil;
+    if (!_VGLSOReadFiniteNumber(item[@"w"], [where stringByAppendingString:@".w"], &w, outError)) return nil;
+    if (!_VGLSOReadFiniteNumber(item[@"h"], [where stringByAppendingString:@".h"], &h, outError)) return nil;
+    if (x < 0.0 || x > 1.0 || y < 0.0 || y > 1.0) {
+        if (outError) *outError = _VGLSOInvalidSpec(
+            [NSString stringWithFormat:@"%@ x/y must be in [0, 1] (got %g, %g).", where, x, y]);
+        return nil;
+    }
+    if (w <= 0.0 || w > 1.0 || h <= 0.0 || h > 1.0) {
+        if (outError) *outError = _VGLSOInvalidSpec(
+            [NSString stringWithFormat:@"%@ w/h must be in (0, 1] (got %g, %g).", where, w, h]);
+        return nil;
+    }
+
+    double opacity = 1.0;
+    if (!_VGLSOIsAbsent(item[@"opacity"])) {
+        if (!_VGLSOReadFiniteNumber(item[@"opacity"], [where stringByAppendingString:@".opacity"], &opacity, outError)) return nil;
+        if (opacity < 0.0 || opacity > 1.0) {
+            if (outError) *outError = _VGLSOInvalidSpec(
+                [NSString stringWithFormat:@"%@.opacity must be in [0, 1] (got %g).", where, opacity]);
+            return nil;
+        }
+    }
+
+    // z: absent/null → 0; a number is truncated toward zero exactly like Dart
+    // num.toInt() and Kotlin Double.toInt(), then range-checked.
+    NSInteger z = 0;
+    if (!_VGLSOIsAbsent(item[@"z"])) {
+        double rawZ = 0;
+        if (!_VGLSOReadFiniteNumber(item[@"z"], [where stringByAppendingString:@".z"], &rawZ, outError)) return nil;
+        const double truncated = trunc(rawZ);
+        if (truncated < kVGLSOMinZ || truncated > kVGLSOMaxZ) {
+            if (outError) *outError = _VGLSOInvalidSpec(
+                [NSString stringWithFormat:@"%@.z must be in [0, 1024] (got %g).", where, rawZ]);
+            return nil;
+        }
+        z = (NSInteger)truncated;
+    }
+
+    id rawText = item[@"text"];
+    id rawAssetPath = item[@"assetPath"];
+    NSString *text = nil;
+    NSString *assetPath = nil;
+    if (!_VGLSOIsAbsent(rawText)) {
+        if (![rawText isKindOfClass:[NSString class]]) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@.text must be a string or absent.", where]);
+            return nil;
+        }
+        text = rawText;
+    }
+    if (!_VGLSOIsAbsent(rawAssetPath)) {
+        if (![rawAssetPath isKindOfClass:[NSString class]]) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@.assetPath must be a string or absent.", where]);
+            return nil;
+        }
+        assetPath = rawAssetPath;
+    }
+
+    if (kind == VGLivestreamOverlayItemKindText) {
+        if (text.length == 0) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@ text overlay requires non-empty text.", where]);
+            return nil;
+        }
+        if (text.length > kVGLSOMaxTextLength) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+                @"%@.text must be at most %lu characters (got %lu).", where,
+                (unsigned long)kVGLSOMaxTextLength, (unsigned long)text.length]);
+            return nil;
+        }
+        if (assetPath) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@ text overlay must not carry assetPath.", where]);
+            return nil;
+        }
+    } else {
+        if (text) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"%@ sticker overlay must not carry text.", where]);
+            return nil;
+        }
+        NSString *trimmed = [assetPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length == 0) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+                @"%@ sticker overlay requires a non-empty absolute local assetPath.", where]);
+            return nil;
+        }
+        if ([assetPath containsString:@"://"]) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+                @"%@.assetPath must be a local filesystem path, not a remote/URI path (got '%@').", where, assetPath]);
+            return nil;
+        }
+        if (![assetPath hasPrefix:@"/"]) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+                @"%@.assetPath must be an absolute path starting with '/' (got '%@').", where, assetPath]);
+            return nil;
+        }
+        NSString *lower = assetPath.lowercaseString;
+        if (!([lower hasSuffix:@".png"] || [lower hasSuffix:@".jpg"] || [lower hasSuffix:@".jpeg"])) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+                @"%@.assetPath must end in .png, .jpg or .jpeg (got '%@').", where, assetPath]);
+            return nil;
+        }
+    }
+
+    return [[VGLivestreamOverlayItemSpec alloc] _initWithId:rawId
+                                                       kind:kind
+                                                          x:x
+                                                          y:y
+                                                          w:w
+                                                          h:h
+                                                    opacity:opacity
+                                                          z:z
+                                                       text:text
+                                                  assetPath:assetPath];
+}
+
+// Canvas dimensions must be integral and exactly 720x1280.
+static BOOL _VGLSOValidateCanvasDimension(NSDictionary *canvas, NSString *key, double expected,
+                                          NSError * _Nullable * _Nullable outError) {
+    double value = 0;
+    NSString *label = [@"overlay parameters.canvas." stringByAppendingString:key];
+    if (!_VGLSOReadFiniteNumber(canvas[key], label, &value, outError)) return NO;
+    if (value != floor(value) || value != expected) {
+        if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+            @"overlay canvas must be exactly 720x1280 (got %@=%g).", key, value]);
+        return NO;
+    }
+    return YES;
+}
+
+// Shared context with NO working colour space (raw bytes in, raw bytes out),
+// the same policy VGGreenScreenFilterNode uses so camera pixels pass unchanged.
+static CIContext *_VGLSOSharedCIContext(id<MTLDevice> _Nullable device) {
+    static CIContext *ctx;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *opts = @{
+            kCIContextWorkingColorSpace:  [NSNull null],
+            kCIContextCacheIntermediates: @NO,
+        };
+        ctx = device ? [CIContext contextWithMTLDevice:device options:opts]
+                     : [CIContext contextWithOptions:opts];
+    });
+    return ctx;
+}
+
+static NSDictionary *_VGLSORawImageOptions(void) {
+    static NSDictionary *opts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        opts = @{kCIImageColorSpace: [NSNull null]};
+    });
+    return opts;
+}
+
+// Decodes a sticker once, EXIF-upright and bounded to maxPixel on its long
+// edge. Returns +1 CGImage or NULL with *outReason.
+static CGImageRef _Nullable _VGLSOCreateStickerImage(NSString *path, size_t maxPixel,
+                                                     NSString * _Nullable * _Nullable outReason) CF_RETURNS_RETAINED {
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory] || isDirectory ||
+        ![[NSFileManager defaultManager] isReadableFileAtPath:path]) {
+        if (outReason) *outReason = @"asset_file_unreadable";
+        return NULL;
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    NSDictionary *sourceOptions = @{(__bridge NSString *)kCGImageSourceShouldCache: @NO};
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url,
+                                                         (__bridge CFDictionaryRef)sourceOptions);
+    if (!source) {
+        if (outReason) *outReason = @"asset_source_unavailable";
+        return NULL;
+    }
+    if (CGImageSourceGetCount(source) < 1) {
+        CFRelease(source);
+        if (outReason) *outReason = @"asset_decode_failed";
+        return NULL;
+    }
+    NSDictionary *thumbOptions = @{
+        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform:   @YES,
+        (__bridge NSString *)kCGImageSourceShouldCacheImmediately:         @YES,
+        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize:          @(maxPixel),
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)thumbOptions);
+    CFRelease(source);
+    if (!image || CGImageGetWidth(image) == 0 || CGImageGetHeight(image) == 0) {
+        if (image) CGImageRelease(image);
+        if (outReason) *outReason = @"asset_decode_failed";
+        return NULL;
+    }
+    return image;
+}
+
+static CTFramesetterRef _Nullable _VGLSOCreateFramesetter(NSString *text, CGFloat fontSize) CF_RETURNS_RETAINED {
+    CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, fontSize, NULL);
+    if (!font) font = CTFontCreateWithName(CFSTR("Helvetica-Bold"), fontSize, NULL);
+    if (!font) return NULL;
+    CTTextAlignment alignment = kCTTextAlignmentCenter;
+    CTParagraphStyleSetting settings[] = {
+        { kCTParagraphStyleSpecifierAlignment, sizeof(alignment), &alignment },
+    };
+    CTParagraphStyleRef paragraph = CTParagraphStyleCreate(settings, 1);
+    CGColorSpaceRef rgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    const CGFloat whiteComponents[4] = {1.0, 1.0, 1.0, 1.0};
+    CGColorRef white = CGColorCreate(rgb, whiteComponents);
+    CGColorSpaceRelease(rgb);
+    NSDictionary *attributes = @{
+        (__bridge NSString *)kCTFontAttributeName:            (__bridge id)font,
+        (__bridge NSString *)kCTForegroundColorAttributeName: (__bridge id)white,
+        (__bridge NSString *)kCTParagraphStyleAttributeName:  (__bridge id)paragraph,
+    };
+    NSAttributedString *attributed = [[NSAttributedString alloc] initWithString:text attributes:attributes];
+    CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)attributed);
+    CFRelease(font);
+    CFRelease(paragraph);
+    CGColorRelease(white);
+    return framesetter;
+}
+
+// Draws one text item into `rect` (CG coordinates, y up) with the Android
+// G1-B style: white bold centered text over a translucent black rounded box,
+// shrunk until the wrapped text fits (once per layer build, never per frame).
+static BOOL _VGLSODrawTextItem(CGContextRef ctx, NSString *text, CGRect rect) {
+    const CGFloat w = rect.size.width;
+    const CGFloat h = rect.size.height;
+    const CGFloat minSide = MIN(w, h);
+    const CGFloat padding = MIN(MAX(minSide * 0.06, 2.0), 16.0);
+    CGFloat radius = MIN(MAX(minSide * 0.1, 4.0), 16.0);
+    radius = MIN(radius, minSide / 2.0);
+
+    CGPathRef box = CGPathCreateWithRoundedRect(rect, radius, radius, NULL);
+    CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, kVGLSOTextBackgroundAlpha);
+    CGContextAddPath(ctx, box);
+    CGContextFillPath(ctx);
+    CGPathRelease(box);
+
+    const CGFloat layoutWidth = MAX(1.0, floor(w - 2.0 * padding));
+    const CGFloat maxLayoutHeight = MAX(1.0, h - 2.0 * padding);
+    CGFloat fontSize = MAX(kVGLSOMinTextSize, h * 0.6);
+    CTFramesetterRef framesetter = _VGLSOCreateFramesetter(text, fontSize);
+    if (!framesetter) return NO;
+    CGSize suggested = CTFramesetterSuggestFrameSizeWithConstraints(
+        framesetter, CFRangeMake(0, 0), NULL, CGSizeMake(layoutWidth, CGFLOAT_MAX), NULL);
+    while (suggested.height > maxLayoutHeight && fontSize > kVGLSOMinTextSize) {
+        fontSize = MAX(kVGLSOMinTextSize, fontSize * 0.85);
+        CFRelease(framesetter);
+        framesetter = _VGLSOCreateFramesetter(text, fontSize);
+        if (!framesetter) return NO;
+        suggested = CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter, CFRangeMake(0, 0), NULL, CGSizeMake(layoutWidth, CGFLOAT_MAX), NULL);
+    }
+
+    // +1 so rounding in the suggestion can never drop the last line.
+    const CGFloat textHeight = ceil(suggested.height) + 1.0;
+    const CGFloat offsetTop = MAX(padding, (h - textHeight) / 2.0);
+    const CGRect textRect = CGRectMake(rect.origin.x + padding,
+                                       CGRectGetMaxY(rect) - offsetTop - textHeight,
+                                       layoutWidth,
+                                       textHeight);
+    CGPathRef textPath = CGPathCreateWithRect(textRect, NULL);
+    CTFrameRef frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, 0), textPath, NULL);
+    CGPathRelease(textPath);
+    CFRelease(framesetter);
+    if (!frame) return NO;
+    CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
+    CTFrameDraw(frame, ctx);
+    CFRelease(frame);
+    return YES;
+}
+
+@implementation VGLivestreamOverlayFilterNode {
+    CVPixelBufferPoolRef _pool;                           // +1 owned; released in dealloc
+    id<MTLDevice>        _device;
+    NSArray<VGLivestreamOverlayItemSpec *> *_items;       // paint order (ascending z, stable)
+    // Parallel to _items: NSString text, a bridged CGImage sticker, or NSNull
+    // for a skipped item. Immutable after init.
+    NSArray              *_itemContent;
+    NSUInteger           _drawableCount;
+    _Atomic(BOOL)        _invalidated;
+    _Atomic(BOOL)        _loggedNoDrawable;
+    _Atomic(uint64_t)    _bypassCounter;
+
+    // Layer state: built lazily per frame size. Guarded by _layerLock; the
+    // graph execution queue is the only caller, so the lock is uncontended.
+    os_unfair_lock       _layerLock;
+    CVPixelBufferRef     _layerBuffer;                    // +1 owned
+    CIImage             *_layerImage;
+    size_t               _layerWidth;
+    size_t               _layerHeight;
+    size_t               _failedLayerWidth;               // sticky build failure for this size
+    size_t               _failedLayerHeight;
+    NSUInteger           _layerDrawnItems;
+    BOOL                 _readyLogPending;
+    uint64_t             _compositedFrames;
+}
+
+@synthesize nodeId     = _nodeId;
+@synthesize nodeType   = _nodeType;
+@synthesize filterName = _filterName;
+@synthesize enabled    = _enabled;
+
++ (nullable NSArray<VGLivestreamOverlayItemSpec *> *)parseItemsFromParameters:(nullable id)parameters
+                                                                        error:(NSError * _Nullable * _Nullable)outError {
+    if (![parameters isKindOfClass:[NSDictionary class]]) {
+        if (outError) *outError = _VGLSOInvalidSpec(@"overlay spec requires a 'parameters' dictionary with canvas and items.");
+        return nil;
+    }
+    NSDictionary *params = (NSDictionary *)parameters;
+    for (id key in params) {
+        if (![key isKindOfClass:[NSString class]] ||
+            !([key isEqualToString:@"canvas"] || [key isEqualToString:@"items"])) {
+            if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:@"overlay has unknown parameter '%@'.", key]);
+            return nil;
+        }
+    }
+
+    id canvas = params[@"canvas"];
+    if (![canvas isKindOfClass:[NSDictionary class]]) {
+        if (outError) *outError = _VGLSOInvalidSpec(@"overlay parameters.canvas must be a {width, height} dictionary.");
+        return nil;
+    }
+    if (!_VGLSOValidateCanvasDimension(canvas, @"width", kVGLSOCanvasWidth, outError)) return nil;
+    if (!_VGLSOValidateCanvasDimension(canvas, @"height", kVGLSOCanvasHeight, outError)) return nil;
+
+    id rawItems = params[@"items"];
+    if (![rawItems isKindOfClass:[NSArray class]]) {
+        if (outError) *outError = _VGLSOInvalidSpec(@"overlay parameters.items must be a list.");
+        return nil;
+    }
+    NSArray *itemList = (NSArray *)rawItems;
+    if (itemList.count > kVGLSOMaxItems) {
+        if (outError) *outError = _VGLSOInvalidSpec([NSString stringWithFormat:
+            @"overlay allows at most %lu items (got %lu).",
+            (unsigned long)kVGLSOMaxItems, (unsigned long)itemList.count]);
+        return nil;
+    }
+
+    NSMutableArray<VGLivestreamOverlayItemSpec *> *parsed = [NSMutableArray arrayWithCapacity:itemList.count];
+    for (NSUInteger i = 0; i < itemList.count; i++) {
+        VGLivestreamOverlayItemSpec *item = _VGLSOParseItem(itemList[i], i, outError);
+        if (!item) return nil;
+        [parsed addObject:item];
+    }
+    // NSSortStable: equal z keeps the original list order.
+    return [parsed sortedArrayWithOptions:NSSortStable
+                          usingComparator:^NSComparisonResult(VGLivestreamOverlayItemSpec *a,
+                                                              VGLivestreamOverlayItemSpec *b) {
+        if (a.z < b.z) return NSOrderedAscending;
+        if (a.z > b.z) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+}
+
+- (instancetype)initWithPool:(nullable CVPixelBufferPoolRef)pool
+                      device:(id<MTLDevice>)device
+                       items:(NSArray<VGLivestreamOverlayItemSpec *> *)items {
+    self = [super init];
+    if (!self) return nil;
+    _nodeId     = [[NSUUID UUID] UUIDString];
+    _nodeType   = @"VGLivestreamOverlayFilterNode";
+    _filterName = @"LivestreamOverlay";
+    _enabled    = YES;
+    _pool       = pool ? CVPixelBufferPoolRetain(pool) : NULL;
+    _device     = device;
+    _items      = [items copy] ?: @[];
+    atomic_init(&_invalidated, NO);
+    atomic_init(&_loggedNoDrawable, NO);
+    atomic_init(&_bypassCounter, 0);
+    _layerLock  = OS_UNFAIR_LOCK_INIT;
+
+    NSMutableArray *content = [NSMutableArray arrayWithCapacity:_items.count];
+    NSUInteger drawable = 0;
+    for (VGLivestreamOverlayItemSpec *item in _items) {
+        if (item.kind == VGLivestreamOverlayItemKindText) {
+            [content addObject:item.text];
+            drawable++;
+            continue;
+        }
+        const double canvasEdge = MAX(item.w * kVGLSOCanvasWidth, item.h * kVGLSOCanvasHeight);
+        size_t maxPixel = (size_t)ceil(canvasEdge * kVGLSOStickerFrameScale);
+        maxPixel = MAX(kVGLSOMinStickerDecodeDimension, MIN(kVGLSOMaxStickerDecodeDimension, maxPixel));
+        NSString *reason = nil;
+        CGImageRef image = _VGLSOCreateStickerImage(item.assetPath, maxPixel, &reason);
+        if (image) {
+            [content addObject:(__bridge_transfer id)image];
+            drawable++;
+        } else {
+            NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_ITEM_SKIPPED id=%@ reason=%@ path=%@",
+                  item.itemId, reason ?: @"unknown", item.assetPath);
+            [content addObject:[NSNull null]];
+        }
+    }
+    _itemContent   = [content copy];
+    _drawableCount = drawable;
+    NSLog(@"[VGLivestreamOverlayFilterNode] constructed requested=%lu drawable=%lu",
+          (unsigned long)_items.count, (unsigned long)drawable);
+    return self;
+}
+
+- (void)dealloc {
+    if (_pool) {
+        CVPixelBufferPoolRelease(_pool);
+        _pool = NULL;
+    }
+    if (_layerBuffer) {
+        CVPixelBufferRelease(_layerBuffer);
+        _layerBuffer = NULL;
+    }
+}
+
+- (NSUInteger)requestedItemCount { return _items.count; }
+- (NSUInteger)drawableItemCount  { return _drawableCount; }
+- (BOOL)isExpensive              { return NO; }
+- (float)estimatedGPUCostMs      { return 1.5f; }
+- (VGNodeRole)nodeRole           { return VGNodeRoleFilter; }
+
+- (void)prepareWithCompletion:(void (^)(NSError * _Nullable))completion {
+    if (completion) completion(nil);
+}
+
+- (void)invalidate {
+    atomic_store(&_invalidated, YES);
+}
+
+// Returns the input (+1) unchanged. First few events and then every 300th
+// are logged so a physical run can count bypasses without log spam.
+- (CVPixelBufferRef)_bypassWithInput:(CVPixelBufferRef)input reason:(NSString *)reason {
+    const uint64_t n = atomic_fetch_add(&_bypassCounter, 1) + 1;
+    if (n <= kVGLSOBypassLogBurst || (n % kVGLSOFrameLogInterval) == 0) {
+        NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_BYPASS reason=%@ count=%llu",
+              reason, (unsigned long long)n);
+    }
+    CVPixelBufferRetain(input);
+    return input;
+}
+
+// Called with _layerLock held. Rasterizes every drawable item once into a new
+// premultiplied BGRA layer of the frame size. Returns nil on success, or a
+// failure reason (nothing is kept on failure).
+- (nullable NSString *)_rebuildLayerLockedWithWidth:(size_t)width height:(size_t)height {
+    if (_layerBuffer) {
+        CVPixelBufferRelease(_layerBuffer);
+        _layerBuffer = NULL;
+    }
+    _layerImage = nil;
+    _layerWidth = 0;
+    _layerHeight = 0;
+    _layerDrawnItems = 0;
+
+    NSDictionary *attrs = @{
+        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:          @{},
+        (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey:           @YES,
+        (__bridge NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+    };
+    CVPixelBufferRef layer = NULL;
+    const CVReturn rv = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                                            (__bridge CFDictionaryRef)attrs, &layer);
+    if (rv != kCVReturnSuccess || !layer) {
+        return [NSString stringWithFormat:@"layer_buffer_create_failed(%d)", (int)rv];
+    }
+    if (CVPixelBufferLockBaseAddress(layer, 0) != kCVReturnSuccess) {
+        CVPixelBufferRelease(layer);
+        return @"layer_lock_failed";
+    }
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(layer), width, height, 8,
+                                             CVPixelBufferGetBytesPerRow(layer), colorSpace,
+                                             (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) {
+        CVPixelBufferUnlockBaseAddress(layer, 0);
+        CVPixelBufferRelease(layer);
+        return @"layer_context_create_failed";
+    }
+    CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    CGContextSetShouldAntialias(ctx, true);
+
+    // Canvas window: the centered 720:1280 region of the frame, top-left
+    // origin (the whole frame for the 720x1280 livestream capture).
+    const double frameAspect  = (double)width / (double)height;
+    const double canvasAspect = kVGLSOCanvasWidth / kVGLSOCanvasHeight;
+    double winW, winH, offX, offY;
+    if (frameAspect > canvasAspect) {
+        winH = (double)height;
+        winW = winH * canvasAspect;
+        offX = ((double)width - winW) / 2.0;
+        offY = 0.0;
+    } else {
+        winW = (double)width;
+        winH = winW / canvasAspect;
+        offX = 0.0;
+        offY = ((double)height - winH) / 2.0;
+    }
+
+    NSUInteger drawn = 0;
+    for (NSUInteger i = 0; i < _items.count; i++) {
+        id content = _itemContent[i];
+        if (content == (id)[NSNull null]) continue;
+        VGLivestreamOverlayItemSpec *item = _items[i];
+        if (item.opacity <= 0.0) continue;
+
+        const double left   = round(offX + item.x * winW);
+        const double top    = round(offY + item.y * winH);
+        const double right  = MAX(left + 1.0, round(offX + (item.x + item.w) * winW));
+        const double bottom = MAX(top + 1.0, round(offY + (item.y + item.h) * winH));
+        // Top-left pixel rect → CG (y up). The bitmap's first row is the
+        // buffer's top row, so CG-upright drawing is buffer-upright: nothing is
+        // flipped or mirrored.
+        const CGRect rect = CGRectMake(left, (double)height - bottom, right - left, bottom - top);
+
+        CGContextSaveGState(ctx);
+        CGContextClipToRect(ctx, rect);
+        // The item is rendered as one group, then faded by its opacity (matches
+        // Android: rasterize at full alpha, multiply by opacity at blend).
+        CGContextSetAlpha(ctx, (CGFloat)item.opacity);
+        CGContextBeginTransparencyLayer(ctx, NULL);
+        BOOL ok = YES;
+        if (item.kind == VGLivestreamOverlayItemKindSticker) {
+            CGContextDrawImage(ctx, rect, (__bridge CGImageRef)content);
+        } else {
+            ok = _VGLSODrawTextItem(ctx, (NSString *)content, rect);
+        }
+        CGContextEndTransparencyLayer(ctx);
+        CGContextRestoreGState(ctx);
+        if (ok) {
+            drawn++;
+        } else {
+            NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_ITEM_SKIPPED id=%@ reason=text_layout_failed",
+                  item.itemId);
+        }
+    }
+    CGContextFlush(ctx);
+    CGContextRelease(ctx);
+    CVPixelBufferUnlockBaseAddress(layer, 0);
+
+    if (drawn == 0) {
+        CVPixelBufferRelease(layer);
+        return @"no_drawable_items";
+    }
+    CIImage *layerImage = [CIImage imageWithCVPixelBuffer:layer options:_VGLSORawImageOptions()];
+    if (!layerImage) {
+        CVPixelBufferRelease(layer);
+        return @"layer_ciimage_failed";
+    }
+    _layerBuffer     = layer;                             // adopt the +1 from Create
+    _layerImage      = layerImage;
+    _layerWidth      = width;
+    _layerHeight     = height;
+    _layerDrawnItems = drawn;
+    _readyLogPending = YES;
+    _compositedFrames = 0;
+    NSLog(@"[VGLivestreamOverlayFilterNode] layer built items=%lu target=%zux%zu window=%.0fx%.0f@%.0f,%.0f",
+          (unsigned long)drawn, width, height, winW, winH, offX, offY);
+    return nil;
+}
+
+- (CVPixelBufferRef)processBuffer:(CVPixelBufferRef)input
+                           atTime:(CMTime)time
+                           device:(id<MTLDevice>)device {
+    if (!_enabled || atomic_load(&_invalidated)) {
+        CVPixelBufferRetain(input);
+        return input;
+    }
+    if (_drawableCount == 0) {
+        BOOL expected = NO;
+        if (atomic_compare_exchange_strong(&_loggedNoDrawable, &expected, YES)) {
+            NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_BYPASS reason=no_drawable_items requested=%lu",
+                  (unsigned long)_items.count);
+        }
+        CVPixelBufferRetain(input);
+        return input;
+    }
+    if (!_pool) {
+        return [self _bypassWithInput:input reason:@"pool_null"];
+    }
+    const size_t width  = CVPixelBufferGetWidth(input);
+    const size_t height = CVPixelBufferGetHeight(input);
+    if (width == 0 || height == 0) {
+        return [self _bypassWithInput:input reason:@"zero_dimension_input"];
+    }
+
+    CIImage *layerImage = nil;
+    NSString *buildFailure = nil;
+    BOOL logReady = NO;
+    NSUInteger drawnItems = 0;
+    uint64_t frameIndex = 0;
+    os_unfair_lock_lock(&_layerLock);
+    if ((_layerWidth != width || _layerHeight != height) &&
+        !(_failedLayerWidth == width && _failedLayerHeight == height)) {
+        buildFailure = [self _rebuildLayerLockedWithWidth:width height:height];
+        if (buildFailure) {
+            _failedLayerWidth  = width;
+            _failedLayerHeight = height;
+        }
+    }
+    if (_layerImage && _layerWidth == width && _layerHeight == height) {
+        layerImage = _layerImage;
+        drawnItems = _layerDrawnItems;
+    }
+    os_unfair_lock_unlock(&_layerLock);
+
+    if (!layerImage) {
+        if (buildFailure) {
+            // Sticky for this frame size: logged once here, later frames of
+            // the same size pass through silently.
+            NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_BYPASS reason=%@ target=%zux%zu",
+                  buildFailure, width, height);
+        }
+        CVPixelBufferRetain(input);
+        return input;
+    }
+
+    CVPixelBufferRef output = NULL;
+    const CVReturn rv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &output);
+    if (rv != kCVReturnSuccess || !output) {
+        return [self _bypassWithInput:input reason:[NSString stringWithFormat:@"pool_alloc_failed(%d)", (int)rv]];
+    }
+    if (CVPixelBufferGetWidth(output) != width || CVPixelBufferGetHeight(output) != height) {
+        CVPixelBufferRelease(output);
+        return [self _bypassWithInput:input reason:@"pool_dimension_mismatch"];
+    }
+    CIImage *frameImage = [CIImage imageWithCVPixelBuffer:input options:_VGLSORawImageOptions()];
+    CIImage *composite = frameImage ? [layerImage imageByCompositingOverImage:frameImage] : nil;
+    CIContext *ciContext = _VGLSOSharedCIContext(_device ?: device);
+    if (!composite || !ciContext) {
+        CVPixelBufferRelease(output);
+        return [self _bypassWithInput:input reason:@"composite_unavailable"];
+    }
+    [ciContext render:composite
+      toCVPixelBuffer:output
+               bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height)
+           colorSpace:NULL];
+
+    os_unfair_lock_lock(&_layerLock);
+    frameIndex = ++_compositedFrames;
+    if (_readyLogPending) {
+        _readyLogPending = NO;
+        logReady = YES;
+    }
+    os_unfair_lock_unlock(&_layerLock);
+
+    if (logReady) {
+        NSString * (^provider)(void) = self.mirrorDescriptionProvider;
+        NSString *mirror = provider ? (provider() ?: @"unknown") : @"unknown";
+        NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_READY items=%lu canvas=720x1280 "
+               "target=%zux%zu mirror=%@ overlayMirrored=0",
+              (unsigned long)drawnItems, width, height, mirror);
+    }
+    if (frameIndex == 1 || (frameIndex % kVGLSOFrameLogInterval) == 0) {
+        NSLog(@"[VGLivestreamOverlayFilterNode] IOS_LIVESTREAM_OVERLAY_FRAME items=%lu target=%zux%zu frame=%llu",
+              (unsigned long)drawnItems, width, height, (unsigned long long)frameIndex);
+    }
+    return output;
+}
+
+// DEC-44: VGFrameEnvelope is taken and returned by value; the input buffer is
+// never released here.
+- (VGFrameEnvelope)processEnvelope:(VGFrameEnvelope)envelope
+                             device:(id<MTLDevice>)device {
+    if (!_enabled || atomic_load(&_invalidated)) {
+        return envelope;
+    }
+    CVPixelBufferRef input = (CVPixelBufferRef)envelope.payload.videoBuffer;
+    if (!input) return envelope;
+
+    CVPixelBufferRef output = [self processBuffer:input atTime:envelope.pts device:device];
+    if (output == input) {
+        CVPixelBufferRelease(output);   // the passthrough path's extra +1
+        return envelope;
+    }
+    if (!output) {
+        VGFrameEnvelope failed = envelope;
+        failed.payload.videoBuffer = NULL;
+        return failed;
+    }
+    VGFrameEnvelope out = envelope;
+    out.payload.videoBuffer = output;
+    return out;
+}
+
+@end
+
+// Log-only: the capture connection's mirroring, which is baked into the frame
+// pixels before the graph (the overlay itself is never mirrored).
+static NSString *_VGLSOCaptureMirrorDescription(VanguardCameraMediaSource * _Nullable source) {
+    if (!source) return @"unknown";
+    for (AVCaptureOutput *output in source.captureSession.outputs) {
+        if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
+            AVCaptureConnection *connection = [output connectionWithMediaType:AVMediaTypeVideo];
+            if (!connection) return @"unknown";
+            return connection.isVideoMirrored ? @"1(capture-baked)" : @"0";
+        }
+    }
+    return @"unknown";
+}
 
 // 3G-C: VGCameraGraphSession adopts VGFrameDelegate so it can act as the
 // renderer.frameDelegate instead of _scheduler. This gives the session full
@@ -907,9 +1754,10 @@ static NSArray<NSDictionary *> *_VGDeepCopyFilterSpecs(NSArray<NSDictionary *> *
 // Three-pass atomic validation:
 //   Pass 1 — resource contract: pool and Metal device must exist.
 //   Pass 2 — known-type check: every spec type must be in
-//            {beauty, lut, segmentation, greenScreen}.
+//            {beauty, lut, segmentation, greenScreen, overlay}.
 //   Pass 3 — constructable check: type must be camera-constructable in this
-//            phase, and greenScreen parameters must satisfy their contract.
+//            phase, and greenScreen / overlay parameters must satisfy their
+//            contract (overlay: INVALID_OVERLAY_FILTER_SPEC on any violation).
 // Only after all three passes succeed are nodes constructed and the graph mutated.
 //
 // Known-but-unsupported types (lut, segmentation) return UNSUPPORTED_FILTER_TYPE
@@ -1177,7 +2025,7 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
     static dispatch_once_t knownTypesToken;
     dispatch_once(&knownTypesToken, ^{
         knownTypes = [NSSet setWithObjects:@"beauty", @"lut", @"segmentation",
-                                           @"greenScreen", nil];
+                                           @"greenScreen", @"overlay", nil];
     });
 
     for (NSDictionary *spec in specs) {
@@ -1207,9 +2055,43 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
     // path is existence/decode-checked when its provider is built, which is
     // still before any graph mutation).
     // lut and segmentation are known but deferred.
+    // G1-C: overlay is fully parsed here (G1-A schema), so a malformed overlay
+    // returns INVALID_OVERLAY_FILTER_SPEC before any node exists. At most one
+    // overlay spec is accepted; enabled=false or an empty item list clears it.
+    NSArray<VGLivestreamOverlayItemSpec *> *overlayItems = nil;
+    BOOL overlayEnabled = NO;
+    BOOL overlaySeen = NO;
     for (NSDictionary *spec in specs) {
         NSString *type = spec[@"type"];
         NSDictionary *params = spec[@"parameters"];
+
+        if ([type isEqualToString:@"overlay"]) {
+            NSError *specError = nil;
+            if (overlaySeen) {
+                specError = _VGLSOInvalidSpec(@"at most one overlay spec is allowed per filter chain.");
+            }
+            id rawEnabled = spec[@"enabled"];
+            if (!specError && !_VGLSOIsAbsent(rawEnabled) &&
+                !([rawEnabled isKindOfClass:[NSNumber class]] &&
+                  CFGetTypeID((__bridge CFTypeRef)rawEnabled) == CFBooleanGetTypeID())) {
+                specError = _VGLSOInvalidSpec([NSString stringWithFormat:
+                    @"overlay 'enabled' must be a boolean (got %@).", rawEnabled]);
+            }
+            NSArray<VGLivestreamOverlayItemSpec *> *items = nil;
+            if (!specError) {
+                items = [VGLivestreamOverlayFilterNode parseItemsFromParameters:params error:&specError];
+            }
+            if (!items) {
+                if (outError) *outError = specError;
+                NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: overlay "
+                       "rejected (%@): %@", specError.domain, specError.localizedDescription);
+                return nil;
+            }
+            overlaySeen = YES;
+            overlayItems = items;
+            overlayEnabled = _VGLSOIsAbsent(rawEnabled) ? YES : [rawEnabled boolValue];
+            continue;
+        }
 
         if ([type isEqualToString:@"lut"]) {
             if (outError) {
@@ -1392,7 +2274,34 @@ static BOOL _VGValidateGreenScreenSpecParameters(id _Nullable params,
                   (double)t.scale, (double)t.offsetX, (double)t.offsetY,
                   (int)enabled, (long)greenScreen.matteSource);
         }
-        // Additional constructable types will be added in future phases.
+        // overlay is appended after this loop (always last); additional
+        // constructable types will be added in future phases.
+    }
+
+    // ── G1-C: livestream overlay, always LAST ────────────────────────────────
+    // After beauty and VGGreenScreenFilterNode and immediately before the
+    // VGFanOutSink, whatever the spec's position in the stack, so preview,
+    // processed-frame receiver (WebRTC egress), recording and photo all see the
+    // overlaid frame and no later filter can alter the overlay pixels.
+    if (overlayEnabled && overlayItems.count > 0) {
+        VGLivestreamOverlayFilterNode *overlay =
+            [[VGLivestreamOverlayFilterNode alloc] initWithPool:_sessionPool
+                                                         device:metalDevice
+                                                          items:overlayItems];
+        __weak VanguardCameraMediaSource *weakSource = _source;
+        overlay.mirrorDescriptionProvider = ^NSString * {
+            return _VGLSOCaptureMirrorDescription(weakSource);
+        };
+        [nodes addObject:(id<VGMetalFilterNode>)overlay];
+        NSLog(@"[VGCameraGraphSession] VGLivestreamOverlayFilterNode constructed last in chain "
+               "(requested=%lu drawable=%lu position=%lu)",
+              (unsigned long)overlay.requestedItemCount,
+              (unsigned long)overlay.drawableItemCount,
+              (unsigned long)nodes.count);
+    } else if (overlaySeen) {
+        NSLog(@"[VGCameraGraphSession] overlay spec present but inactive "
+               "(enabled=%d items=%lu) — no overlay node",
+              (int)overlayEnabled, (unsigned long)overlayItems.count);
     }
 
     NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: constructed %lu node(s)",
