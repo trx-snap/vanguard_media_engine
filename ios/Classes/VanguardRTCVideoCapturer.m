@@ -57,6 +57,33 @@ static NSString *VGRTCFourCC(OSType fmt) {
     return [NSString stringWithUTF8String:c] ?: [NSString stringWithFormat:@"0x%08x", (unsigned)fmt];
 }
 
+// ── I2: image-first (standalone pump, no camera graph) ───────────────────────
+static NSString *const kVGRTCInitialModeImage = @"image";
+static const int64_t kVGRTCImageFirstCameraTimeoutNs = 6 * NSEC_PER_SEC;
+
+// Cheap synchronous checks only (no decode). Returns the rejection reason or nil.
+static NSString * _Nullable VGRTCValidateImagePath(id _Nullable rawPath) {
+    if (![rawPath isKindOfClass:[NSString class]] || [(NSString *)rawPath length] == 0) {
+        return @"imagePath is required.";
+    }
+    NSString *path = (NSString *)rawPath;
+    if ([path containsString:@"://"]) {
+        return [NSString stringWithFormat:@"imagePath must be a local filesystem path, not a URI: %@", path];
+    }
+    if (![path hasPrefix:@"/"]) {
+        return [NSString stringWithFormat:@"imagePath must be absolute: %@", path];
+    }
+    BOOL isDirectory = NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path isDirectory:&isDirectory] || isDirectory) {
+        return [NSString stringWithFormat:@"imagePath does not exist or is not a file: %@", path];
+    }
+    if (![fm isReadableFileAtPath:path]) {
+        return [NSString stringWithFormat:@"imagePath is not readable: %@", path];
+    }
+    return nil;
+}
+
 // ── Private Interface ────────────────────────────────────────────────────────
 
 @interface VanguardRTCVideoCapturer () {
@@ -78,6 +105,27 @@ static NSString *VGRTCFourCC(OSType fmt) {
     // ── Resolved on first attach; immutable afterwards ───────────────────────
     Class _rtcPixelBufferClass;
     Class _rtcVideoFrameClass;
+
+    // ── I2: image-first — armed state and standalone pump (guarded by _lock) ─
+    // Armed by setInitialMediaSource (decoded before the reply), consumed by
+    // the next startExternalVideoSourceForTrackId:sink:, cleared by detach.
+    NSString *_pendingInitialMode;           // kVGRTCInitialModeImage or nil
+    NSString *_pendingInitialImagePath;
+    CVPixelBufferRef _pendingInitialBuffer;  // +1 owned
+    uint64_t _initialGeneration;             // drops stale arm decodes
+    // While YES the standalone pump (not a camera graph) feeds the sink.
+    BOOL _imageFirstActive;
+    CVPixelBufferRef _imagePumpBuffer;       // +1 owned; the still the pump repeats
+    NSString *_imagePumpPath;
+    BOOL _imagePumpMuted;
+    uint64_t _imagePumpFrames;
+    uint64_t _imagePumpSwapGeneration;       // drops stale hot-swap decodes
+    dispatch_source_t _imagePumpTimer;       // fires on _imagePumpQueue
+    dispatch_queue_t _imagePumpQueue;
+    // image-first → camera hand-over: the first camera-graph frame completes it.
+    BOOL _awaitingGraphFrame;
+    uint64_t _imageFirstSwitchGeneration;
+    FlutterResult _pendingImageFirstSwitchResult;
 }
 @end
 
@@ -96,6 +144,9 @@ static NSString *VGRTCFourCC(OSType fmt) {
     self = [super init];
     if (self) {
         _lock = OS_UNFAIR_LOCK_INIT;
+        _imagePumpQueue = dispatch_queue_create("com.vanguard.livestreamImageFirstPump",
+                                                dispatch_queue_attr_make_with_qos_class(
+                                                    DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     }
     return self;
 }
@@ -124,8 +175,334 @@ static NSString *VGRTCFourCC(OSType fmt) {
         result([self statsSnapshot]);
     } else if ([@"setMediaSource" isEqualToString:call.method]) {
         [self setMediaSourceWithArguments:call.arguments result:result];
+    } else if ([@"setInitialMediaSource" isEqualToString:call.method]) {
+        [self setInitialMediaSourceWithArguments:call.arguments result:result];
     } else {
         result(FlutterMethodNotImplemented);
+    }
+}
+
+// ── I2: image-first start ────────────────────────────────────────────────────
+//
+// setInitialMediaSource arms what the NEXT virtual track starts from. Camera
+// (the default) clears any armed image and leaves the camera-first path
+// untouched. Image validates the path at once, decodes it off the main thread
+// through VGCreateLivestreamImageBuffer (720x1280 BGRA, the egress format) and
+// replies only once that succeeded, so Dart aborts before any track exists on
+// a bad image. The decoded buffer is consumed by the next
+// startExternalVideoSourceForTrackId:sink:, which then feeds the sink from a
+// standalone 30 fps pump without any VGCameraGraphSession: the camera hardware
+// stays closed until the app creates a camera and requests
+// setMediaSource(camera). Main thread; replies exactly once.
+- (void)setInitialMediaSourceWithArguments:(id)arguments result:(FlutterResult)result {
+    NSDictionary *args = [arguments isKindOfClass:[NSDictionary class]] ? (NSDictionary *)arguments : nil;
+    NSString *mode = [args[@"mode"] isKindOfClass:[NSString class]] ? (NSString *)args[@"mode"] : nil;
+    id rawPath = args[@"imagePath"];
+    if ([mode isEqualToString:@"camera"]) {
+        [self clearPendingInitialMediaSourceWithReason:@"initial source camera"];
+        result(@{ @"status": @"armed", @"mode": @"camera", @"imagePath": [NSNull null] });
+        return;
+    }
+    if (![mode isEqualToString:kVGRTCInitialModeImage]) {
+        result([FlutterError errorWithCode:@"INVALID_ARGUMENT"
+                                   message:@"mode must be \"camera\" or \"image\""
+                                   details:nil]);
+        return;
+    }
+    NSString *reason = VGRTCValidateImagePath(rawPath);
+    if (reason) {
+        NSLog(@"%@ setInitialMediaSource(image) rejected (INVALID_IMAGE_PATH): %@", kVGRTCTag, reason);
+        result([FlutterError errorWithCode:@"INVALID_IMAGE_PATH" message:reason details:nil]);
+        return;
+    }
+    NSString *path = [(NSString *)rawPath copy];
+
+    // A new arm replaces the previous one (its buffer is dropped now).
+    CVPixelBufferRef previous = NULL;
+    uint64_t generation = 0;
+    os_unfair_lock_lock(&_lock);
+    generation = ++_initialGeneration;
+    previous = _pendingInitialBuffer;
+    _pendingInitialBuffer = NULL;
+    _pendingInitialMode = nil;
+    _pendingInitialImagePath = nil;
+    os_unfair_lock_unlock(&_lock);
+    if (previous) CVPixelBufferRelease(previous);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *decodeError = nil;
+        CVPixelBufferRef buffer = VGCreateLivestreamImageBuffer(path, (size_t)kVGRTCVirtualCameraWidth,
+                                                                (size_t)kVGRTCVirtualCameraHeight, &decodeError);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                if (buffer) CVPixelBufferRelease(buffer);
+                return;
+            }
+            if (!buffer) {
+                NSLog(@"%@ setInitialMediaSource(image) decode failed: %@", kVGRTCTag, decodeError.localizedDescription);
+                result([FlutterError errorWithCode:@"IMAGE_DECODE_FAILED"
+                                           message:(decodeError.localizedDescription ?: @"The image could not be decoded.")
+                                           details:nil]);
+                return;
+            }
+            os_unfair_lock_lock(&strongSelf->_lock);
+            const BOOL stale = (generation != strongSelf->_initialGeneration);
+            if (!stale) {
+                strongSelf->_pendingInitialBuffer = buffer;   // adopt the +1
+                strongSelf->_pendingInitialMode = kVGRTCInitialModeImage;
+                strongSelf->_pendingInitialImagePath = path;
+            }
+            os_unfair_lock_unlock(&strongSelf->_lock);
+            if (stale) {
+                CVPixelBufferRelease(buffer);
+                result([FlutterError errorWithCode:@"SUPERSEDED"
+                                           message:@"A newer initial media source replaced this one"
+                                           details:nil]);
+                return;
+            }
+            NSLog(@"%@ initial media source armed: image %@ (%zux%zu)", kVGRTCTag, path,
+                  CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer));
+            result(@{ @"status": @"armed", @"mode": kVGRTCInitialModeImage, @"imagePath": path });
+        });
+    });
+}
+
+// Drops the armed initial source (and supersedes an in-flight arm decode).
+- (void)clearPendingInitialMediaSourceWithReason:(NSString *)reason {
+    CVPixelBufferRef buffer = NULL;
+    BOOL hadArmed = NO;
+    os_unfair_lock_lock(&_lock);
+    _initialGeneration += 1;
+    buffer = _pendingInitialBuffer;
+    _pendingInitialBuffer = NULL;
+    hadArmed = (_pendingInitialMode != nil);
+    _pendingInitialMode = nil;
+    _pendingInitialImagePath = nil;
+    os_unfair_lock_unlock(&_lock);
+    if (buffer) CVPixelBufferRelease(buffer);
+    if (hadArmed) NSLog(@"%@ initial media source cleared (%@)", kVGRTCTag, reason);
+}
+
+// Main thread. Starts the standalone timer; the pump state was installed by
+// the caller under _lock.
+- (void)startImagePumpTimer {
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _imagePumpQueue);
+    const uint64_t interval = NSEC_PER_SEC / (uint64_t)kVGRTCVirtualCameraFps;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), interval, interval / 10);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{ [weakSelf imagePumpTick]; });
+    os_unfair_lock_lock(&_lock);
+    _imagePumpTimer = timer;
+    os_unfair_lock_unlock(&_lock);
+    dispatch_resume(timer);
+}
+
+// Any thread. Cancels the standalone pump, drops its buffer and leaves
+// image-first mode. Idempotent. Never touches the sink/track or the gate.
+- (void)stopImagePump {
+    dispatch_source_t timer = nil;
+    CVPixelBufferRef buffer = NULL;
+    NSString *path = nil;
+    uint64_t frames = 0;
+    BOOL wasActive = NO;
+    os_unfair_lock_lock(&_lock);
+    timer = _imagePumpTimer;
+    _imagePumpTimer = nil;
+    buffer = _imagePumpBuffer;
+    _imagePumpBuffer = NULL;
+    path = _imagePumpPath;
+    _imagePumpPath = nil;
+    frames = _imagePumpFrames;
+    wasActive = _imageFirstActive;
+    _imageFirstActive = NO;
+    _imagePumpMuted = YES;
+    _awaitingGraphFrame = NO;
+    os_unfair_lock_unlock(&_lock);
+    if (timer) dispatch_source_cancel(timer);
+    if (buffer) CVPixelBufferRelease(buffer);
+    if (wasActive) {
+        NSLog(@"%@ IOS_LIVESTREAM_IMAGE_FIRST_PUMP_STOPPED frames=%llu path=%@", kVGRTCTag,
+              (unsigned long long)frames, path ?: @"");
+    }
+}
+
+// Pump queue. Repeats the still into the sink as RTCVideoFrames with a
+// monotonic timestamp (the same clock onFrame:pts: falls back to).
+- (void)imagePumpTick {
+    os_unfair_lock_lock(&_lock);
+    if (_imagePumpMuted || !_imageFirstActive || !_gateOpen) {
+        os_unfair_lock_unlock(&_lock);
+        return;
+    }
+    id sink = _activeVideoSource;
+    CVPixelBufferRef buffer = _imagePumpBuffer;
+    if (buffer) CVPixelBufferRetain(buffer);
+    Class pixelBufferClass = _rtcPixelBufferClass;
+    Class videoFrameClass = _rtcVideoFrameClass;
+    os_unfair_lock_unlock(&_lock);
+    if (!sink || !buffer || !pixelBufferClass || !videoFrameClass) {
+        if (buffer) CVPixelBufferRelease(buffer);
+        return;
+    }
+
+    const size_t width = CVPixelBufferGetWidth(buffer);
+    const size_t height = CVPixelBufferGetHeight(buffer);
+    RTCCVPixelBuffer *rtcBuffer = [[pixelBufferClass alloc] initWithPixelBuffer:buffer];
+    RTCVideoFrame *frame = rtcBuffer
+        ? [[videoFrameClass alloc] initWithBuffer:rtcBuffer
+                                         rotation:0
+                                      timeStampNs:(int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC)]
+        : nil;
+    if (frame) {
+        [(id<RTCVideoCapturerDelegate>)sink capturer:self didCaptureVideoFrame:frame];
+    }
+    CVPixelBufferRelease(buffer);
+    if (!frame) return;
+
+    os_unfair_lock_lock(&_lock);
+    const uint64_t count = ++_imagePumpFrames;
+    ++_framesDelivered;
+    os_unfair_lock_unlock(&_lock);
+    if (count == 1) {
+        NSLog(@"%@ IOS_LIVESTREAM_IMAGE_FIRST_PUMP_READY %zux%zu fps=%ld (camera closed)", kVGRTCTag,
+              width, height, (long)kVGRTCVirtualCameraFps);
+    } else if (count % kVGRTCPeriodicLogFrames == 0) {
+        NSLog(@"%@ IOS_LIVESTREAM_IMAGE_FIRST_PUMP_FRAME frame=%llu", kVGRTCTag, (unsigned long long)count);
+    }
+}
+
+// Main thread. image → image while the standalone pump is the producer: the
+// old still keeps streaming until the new one is decoded, then the buffer is
+// swapped under _lock.
+- (void)imageFirstReplaceImageAtPath:(NSString *)imagePath result:(FlutterResult)result {
+    NSString *reason = VGRTCValidateImagePath(imagePath);
+    if (reason) {
+        result([FlutterError errorWithCode:@"INVALID_IMAGE_PATH" message:reason details:nil]);
+        return;
+    }
+    NSString *path = [imagePath copy];
+    uint64_t generation = 0;
+    os_unfair_lock_lock(&_lock);
+    generation = ++_imagePumpSwapGeneration;
+    os_unfair_lock_unlock(&_lock);
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *decodeError = nil;
+        CVPixelBufferRef buffer = VGCreateLivestreamImageBuffer(path, (size_t)kVGRTCVirtualCameraWidth,
+                                                                (size_t)kVGRTCVirtualCameraHeight, &decodeError);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                if (buffer) CVPixelBufferRelease(buffer);
+                return;
+            }
+            if (!buffer) {
+                result([FlutterError errorWithCode:@"IMAGE_DECODE_FAILED"
+                                           message:(decodeError.localizedDescription ?: @"The image could not be decoded.")
+                                           details:nil]);
+                return;
+            }
+            CVPixelBufferRef previous = NULL;
+            NSString *failure = nil;
+            os_unfair_lock_lock(&strongSelf->_lock);
+            if (!strongSelf->_imageFirstActive) {
+                failure = @"NO_ACTIVE_STREAM";
+            } else if (generation != strongSelf->_imagePumpSwapGeneration) {
+                failure = @"SUPERSEDED";
+            } else {
+                previous = strongSelf->_imagePumpBuffer;
+                strongSelf->_imagePumpBuffer = buffer;   // adopt the +1
+                strongSelf->_imagePumpPath = path;
+            }
+            os_unfair_lock_unlock(&strongSelf->_lock);
+            if (failure) {
+                CVPixelBufferRelease(buffer);
+                result([FlutterError errorWithCode:failure
+                                           message:@"The image-first producer is no longer the target of this request"
+                                           details:nil]);
+                return;
+            }
+            if (previous) CVPixelBufferRelease(previous);
+            NSLog(@"%@ IOS_LIVESTREAM_MEDIA_SOURCE_COMMITTED mode=image imageFirst=1 swap=hot path=%@", kVGRTCTag, path);
+            result(@{ @"status": @"committed", @"mode": kVGRTCInitialModeImage, @"imagePath": path });
+        });
+    });
+}
+
+// Main thread. image-first → camera: the app has created a camera graph
+// meanwhile; connect this receiver to it, start its capture, and keep the
+// standalone pump ticking until the first graph frame reaches onFrame:pts:.
+// That frame mutes the pump and finishImageFirstSwitchToCamera commits.
+- (void)imageFirstSwitchToCameraWithGraphSession:(VGCameraGraphSession *)graphSession
+                                          result:(FlutterResult)result {
+    if (!graphSession) {
+        result([FlutterError errorWithCode:@"NO_CAMERA_GRAPH"
+                                   message:@"No Vanguard camera graph session; create the camera before switching"
+                                   details:nil]);
+        return;
+    }
+    if (![self ensureReceiverConnectedToGraphSession:graphSession]) {
+        result([FlutterError errorWithCode:@"GRAPH_CONNECT_FAILED"
+                                   message:@"VGCameraGraphSession refused the processed-frame receiver; image producer kept"
+                                   details:nil]);
+        return;
+    }
+    FlutterResult superseded = nil;
+    uint64_t generation = 0;
+    os_unfair_lock_lock(&_lock);
+    superseded = _pendingImageFirstSwitchResult;
+    _pendingImageFirstSwitchResult = [result copy];
+    generation = ++_imageFirstSwitchGeneration;
+    _awaitingGraphFrame = YES;
+    os_unfair_lock_unlock(&_lock);
+    if (superseded) {
+        superseded([FlutterError errorWithCode:@"SUPERSEDED"
+                                       message:@"A newer setMediaSource request replaced this one"
+                                       details:nil]);
+    }
+    // The camera hardware starts now — on the app's explicit request only.
+    [graphSession resumeCaptureSourceIfStopped];
+    NSLog(@"%@ image-first → camera: graph session %p connected, waiting for its first frame", kVGRTCTag, graphSession);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kVGRTCImageFirstCameraTimeoutNs), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        FlutterResult pending = nil;
+        os_unfair_lock_lock(&strongSelf->_lock);
+        if (generation == strongSelf->_imageFirstSwitchGeneration && strongSelf->_awaitingGraphFrame) {
+            strongSelf->_awaitingGraphFrame = NO;
+            pending = strongSelf->_pendingImageFirstSwitchResult;
+            strongSelf->_pendingImageFirstSwitchResult = nil;
+        }
+        os_unfair_lock_unlock(&strongSelf->_lock);
+        if (pending) {
+            NSLog(@"%@ image-first → camera: no camera frame in time; image producer kept", kVGRTCTag);
+            pending([FlutterError errorWithCode:@"CAMERA_RESUME_TIMEOUT"
+                                        message:@"No camera frame arrived in time; the image producer keeps running"
+                                        details:nil]);
+        }
+    });
+}
+
+// Main thread. The first camera-graph frame was forwarded (onFrame:pts:
+// already muted the pump): stop the pump and commit camera mode.
+- (void)finishImageFirstSwitchToCamera {
+    FlutterResult pending = nil;
+    os_unfair_lock_lock(&_lock);
+    const BOOL active = _imageFirstActive;
+    if (active) {
+        pending = _pendingImageFirstSwitchResult;
+        _pendingImageFirstSwitchResult = nil;
+    }
+    os_unfair_lock_unlock(&_lock);
+    if (!active) return;
+    [self stopImagePump];
+    NSLog(@"%@ IOS_LIVESTREAM_MEDIA_SOURCE_COMMITTED mode=camera imageFirst=0 (camera graph now feeds the track)", kVGRTCTag);
+    if (pending) {
+        pending(@{ @"status": @"committed", @"mode": @"camera", @"imagePath": [NSNull null] });
     }
 }
 
@@ -151,6 +528,7 @@ static NSString *VGRTCFourCC(OSType fmt) {
 
     os_unfair_lock_lock(&_lock);
     const BOOL streaming = (_gateOpen && _activeVideoSource != nil);
+    const BOOL imageFirst = _imageFirstActive;
     VGRTCGraphSessionProvider provider = _graphSessionProvider;
     os_unfair_lock_unlock(&_lock);
     if (!streaming) {
@@ -160,6 +538,17 @@ static NSString *VGRTCFourCC(OSType fmt) {
         return;
     }
     VGCameraGraphSession *graphSession = provider ? provider() : nil;
+    if (imageFirst) {
+        // I2: the standalone pump is the producer; no graph session is
+        // involved for an image swap, and the camera hand-over needs the graph
+        // session the app created since.
+        if (wantsImage) {
+            [self imageFirstReplaceImageAtPath:(imagePath ?: @"") result:result];
+        } else {
+            [self imageFirstSwitchToCameraWithGraphSession:graphSession result:result];
+        }
+        return;
+    }
     if (!graphSession) {
         result([FlutterError errorWithCode:@"NO_CAMERA_GRAPH"
                                    message:@"No active Vanguard camera graph session"
@@ -519,16 +908,25 @@ static NSString *VGRTCFourCC(OSType fmt) {
 // session is about to be invalidated anyway.
 - (void)detachRestoringLivestreamMediaSource:(BOOL)restore {
     FlutterResult pending = nil;
+    FlutterResult pendingSwitch = nil;
     NSString *trackId = nil;
     uint64_t frames = 0;
     BOOL wasActive = NO;
     VGCameraGraphSession *graphSession = nil;
+
+    // I2: the standalone pump and any armed initial source never outlive the
+    // egress; an in-flight image-first → camera hand-over is cancelled.
+    [self stopImagePump];
+    [self clearPendingInitialMediaSourceWithReason:@"detach"];
 
     os_unfair_lock_lock(&_lock);
     graphSession = _connectedGraphSession;
     _attachGeneration += 1;  // any in-flight stock-stop completion / timeout is now stale
     pending = _pendingAttachResult;
     _pendingAttachResult = nil;
+    pendingSwitch = _pendingImageFirstSwitchResult;
+    _pendingImageFirstSwitchResult = nil;
+    _imageFirstSwitchGeneration += 1;
     trackId = _attachedTrackId;
     frames = _framesDelivered;
     wasActive = (_activeVideoSource != nil) || _attachInProgress;
@@ -544,6 +942,11 @@ static NSString *VGRTCFourCC(OSType fmt) {
         pending([FlutterError errorWithCode:@"ATTACH_CANCELLED"
                                     message:@"Detached before the attach completed"
                                     details:nil]);
+    }
+    if (pendingSwitch) {
+        pendingSwitch([FlutterError errorWithCode:@"EGRESS_STOPPED"
+                                          message:@"Detached before the camera hand-over completed"
+                                          details:nil]);
     }
     // The receiver stays connected to the graph (inert while the gate is
     // closed); the graph is never rebuilt and the stock capturer never
@@ -599,6 +1002,54 @@ static NSString *VGRTCFourCC(OSType fmt) {
         NSLog(@"%@ virtual camera start rejected: invalid track id or sink", kVGRTCTag);
         return NO;
     }
+
+    // I2: consume an armed image start FIRST (the detach below would clear
+    // it). With one, no camera graph is required and none is touched.
+    CVPixelBufferRef initialBuffer = NULL;
+    NSString *initialPath = nil;
+    os_unfair_lock_lock(&_lock);
+    if ([_pendingInitialMode isEqualToString:kVGRTCInitialModeImage] && _pendingInitialBuffer) {
+        initialBuffer = _pendingInitialBuffer;
+        _pendingInitialBuffer = NULL;
+        initialPath = _pendingInitialImagePath;
+    }
+    _pendingInitialMode = nil;
+    _pendingInitialImagePath = nil;
+    _initialGeneration += 1;
+    os_unfair_lock_unlock(&_lock);
+
+    if (initialBuffer) {
+        if (![self resolveRTCFrameClasses]) {
+            CVPixelBufferRelease(initialBuffer);
+            NSLog(@"%@ image-first start rejected for %@: RTCCVPixelBuffer / RTCVideoFrame not loaded", kVGRTCTag, trackId);
+            return NO;
+        }
+        // One egress at a time (also stops any older standalone pump).
+        [self detach];
+        os_unfair_lock_lock(&_lock);
+        _attachGeneration += 1;
+        _activeVideoSource = sink;
+        _attachedTrackId = [trackId copy];
+        _framesDelivered = 0;
+        _attachInProgress = NO;
+        _stockStopConfirmed = NO;
+        _virtualSource = YES;
+        _gateOpen = YES;
+        _imageFirstActive = YES;
+        _awaitingGraphFrame = NO;
+        _imagePumpBuffer = initialBuffer;   // adopt the +1
+        _imagePumpPath = initialPath;
+        _imagePumpMuted = NO;
+        _imagePumpFrames = 0;
+        os_unfair_lock_unlock(&_lock);
+        [self startImagePumpTimer];
+        NSLog(@"%@ virtual camera started image-first for track %@ (%ldx%ld@%ld, path=%@, camera closed, no stock capturer)",
+              kVGRTCTag, trackId, (long)kVGRTCVirtualCameraWidth, (long)kVGRTCVirtualCameraHeight,
+              (long)kVGRTCVirtualCameraFps, initialPath ?: @"");
+        return YES;
+    }
+
+    // Camera-first (default, unchanged below): the live camera graph feeds the track.
     os_unfair_lock_lock(&_lock);
     VGRTCGraphSessionProvider provider = _graphSessionProvider;
     os_unfair_lock_unlock(&_lock);
@@ -657,11 +1108,30 @@ static NSString *VGRTCFourCC(OSType fmt) {
     os_unfair_lock_lock(&_lock);
     VGCameraGraphSession *connected = _connectedGraphSession;
     BOOL matches = (session == nil) || (connected == nil) || (connected == session);
+    const BOOL imageFirst = _imageFirstActive;
+    FlutterResult pendingSwitch = nil;
     if (matches) {
         _connectedGraphSession = nil;
+        if (imageFirst) {
+            // I2: the standalone pump does not depend on any camera graph; an
+            // unfinished hand-over to this session is cancelled, the pump stays.
+            _awaitingGraphFrame = NO;
+            _imageFirstSwitchGeneration += 1;
+            pendingSwitch = _pendingImageFirstSwitchResult;
+            _pendingImageFirstSwitchResult = nil;
+        }
     }
     os_unfair_lock_unlock(&_lock);
 
+    if (matches && imageFirst) {
+        if (pendingSwitch) {
+            pendingSwitch([FlutterError errorWithCode:@"CAMERA_STOPPED"
+                                              message:@"The camera graph was torn down before the hand-over; image producer kept"
+                                              details:nil]);
+        }
+        NSLog(@"%@ graph session %p tearing down while image-first: receiver dropped, image producer kept", kVGRTCTag, session);
+        return;
+    }
     if (matches) {
         [self detachRestoringLivestreamMediaSource:NO];
         NSLog(@"%@ graph session %p tearing down: egress detached, receiver dropped", kVGRTCTag, session);
@@ -675,11 +1145,28 @@ static NSString *VGRTCFourCC(OSType fmt) {
 - (void)onFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts {
     if (!pixelBuffer) return;
 
+    BOOL handOver = NO;
     os_unfair_lock_lock(&_lock);
+    if (_imageFirstActive) {
+        // I2: while the standalone pump is the producer, camera-graph frames
+        // are not forwarded — except the first one after an image-first →
+        // camera request, which mutes the pump and completes the hand-over.
+        if (!_awaitingGraphFrame) {
+            os_unfair_lock_unlock(&_lock);
+            return;
+        }
+        _awaitingGraphFrame = NO;
+        _imagePumpMuted = YES;
+        handOver = YES;
+    }
     id source = _gateOpen ? _activeVideoSource : nil;
     Class pixelBufferClass = _rtcPixelBufferClass;
     Class videoFrameClass = _rtcVideoFrameClass;
     os_unfair_lock_unlock(&_lock);
+    if (handOver) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf finishImageFirstSwitchToCamera]; });
+    }
     if (!source || !pixelBufferClass || !videoFrameClass) return;
 
     // RTCCVPixelBuffer retains the CVPixelBuffer, so +0 delivery from the
@@ -725,11 +1212,22 @@ static NSString *VGRTCFourCC(OSType fmt) {
     // its own queue; stats are read from the main thread, never from it).
     os_unfair_lock_lock(&_lock);
     const BOOL streamingNow = (_gateOpen && _activeVideoSource != nil);
+    const BOOL imageFirstNow = _imageFirstActive;
+    NSString *imageFirstPath = _imagePumpPath;
+    NSString *pendingInitialMode = _pendingInitialMode;
     VGRTCGraphSessionProvider provider = _graphSessionProvider;
     os_unfair_lock_unlock(&_lock);
-    VGCameraGraphSession *graphSession = (streamingNow && provider) ? provider() : nil;
-    NSString *mediaSource = graphSession ? [graphSession livestreamMediaSourceModeName] : @"camera";
-    NSString *mediaSourceImagePath = graphSession ? [graphSession livestreamMediaSourceImagePath] : nil;
+    NSString *mediaSource = @"camera";
+    NSString *mediaSourceImagePath = nil;
+    if (imageFirstNow) {
+        // I2: the standalone pump is the producer; no graph session is asked.
+        mediaSource = kVGRTCInitialModeImage;
+        mediaSourceImagePath = imageFirstPath;
+    } else {
+        VGCameraGraphSession *graphSession = (streamingNow && provider) ? provider() : nil;
+        mediaSource = graphSession ? [graphSession livestreamMediaSourceModeName] : @"camera";
+        mediaSourceImagePath = graphSession ? [graphSession livestreamMediaSourceImagePath] : nil;
+    }
 
     os_unfair_lock_lock(&_lock);
     NSDictionary *snapshot = @{
@@ -742,6 +1240,8 @@ static NSString *VGRTCFourCC(OSType fmt) {
         @"mode": _virtualSource ? @"virtual" : (_activeVideoSource != nil ? @"attached" : @"idle"),
         @"mediaSource": mediaSource,
         @"mediaSourceImagePath": mediaSourceImagePath ?: [NSNull null],
+        @"imageFirst": @(imageFirstNow),
+        @"pendingInitialMediaSource": pendingInitialMode ?: [NSNull null],
     };
     os_unfair_lock_unlock(&_lock);
     return snapshot;

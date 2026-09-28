@@ -22,6 +22,7 @@
 #pragma once
 
 #import <Foundation/Foundation.h>
+#import <CoreVideo/CoreVideo.h>
 #import "VanguardCameraMediaSource.h"  // VanguardCameraFrameReceiver
 
 NS_ASSUME_NONNULL_BEGIN
@@ -35,6 +36,21 @@ typedef NS_ENUM(NSInteger, VGLivestreamMediaSourceMode) {
     VGLivestreamMediaSourceModeCamera = 0,
     VGLivestreamMediaSourceModeImage  = 1,
 };
+
+/// I1/I2: decodes the still at @c path EXIF-upright (bounded by the source's
+/// own pixel size, never upsampled at decode) and draws it aspect-filled —
+/// centered, cropped, never stretched — over black into a NEW width x height
+/// 32BGRA IOSurface/Metal-compatible buffer, the camera frame format every
+/// filter node, sink and the WebRTC egress accept. Blocking: call off the hot
+/// path. Returns +1, or NULL with @c *outError whose domain is
+/// IMAGE_DECODE_FAILED. Shared by the graph session's image pump (I1) and the
+/// RTC capturer's standalone image-first pump (I2); implemented in
+/// VGCameraGraphSession.m.
+FOUNDATION_EXTERN CVPixelBufferRef _Nullable VGCreateLivestreamImageBuffer(NSString *path,
+                                                                            size_t width,
+                                                                            size_t height,
+                                                                            NSError * _Nullable * _Nullable outError)
+    CF_RETURNS_RETAINED;
 
 @interface VGCameraGraphSession : NSObject
 

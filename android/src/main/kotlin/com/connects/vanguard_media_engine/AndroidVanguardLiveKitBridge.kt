@@ -60,6 +60,17 @@ package com.connects.vanguard_media_engine
 // track lifetime so the coordinator can hand it between the camera egress and
 // the still-image pump, and it tells the coordinator when the track stops so
 // the pump is torn down and the camera producer restored.
+//
+// ── I2: image-first start ────────────────────────────────────────────────────
+//
+// "setInitialMediaSource" ({mode: camera|image, imagePath}) arms what the NEXT
+// virtual track starts from. For image the coordinator validates and decodes
+// the still before the reply, so Dart aborts before any track exists on a bad
+// image. When flutter_webrtc then calls onStart, an armed image start bypasses
+// the camera checks entirely: no Vanguard camera has to exist, nothing is
+// attached to the camera egress, and the retained Surface goes straight to
+// AndroidLivestreamMediaSourceCoordinator.startImageFirst. The armed state is
+// consumed by that onStart and cleared by detachVanguard / engine teardown.
 
 import android.graphics.SurfaceTexture
 import android.os.Handler
@@ -141,6 +152,12 @@ internal class AndroidVanguardLiveKitBridge(
     /** The live virtual track's Surface, or null when no virtual track is active. Main thread. */
     val retainedVirtualSurface: Surface? get() = virtualSurface
 
+    // ── I2: armed initial media source for the next virtual track ────────────
+    // Set only after the coordinator decoded the image; consumed by the next
+    // onStart, cleared by detachVanguard and dispose. Main thread.
+    private var pendingInitialMode: String? = null
+    private var pendingInitialImagePath: String? = null
+
     // ── Bridge-owned attached state (main thread) ────────────────────────────
     private var attachedTrackId: String? = null
     private var attachedHelper: Any? = null      // org.webrtc.SurfaceTextureHelper
@@ -178,10 +195,14 @@ internal class AndroidVanguardLiveKitBridge(
         when (call.method) {
             "attachVanguardToLiveKitTrack" -> attach(call, result)
             "detachVanguard" -> {
+                // I2: a track that never started (creation threw) leaves an
+                // armed initial source behind; detach clears it.
+                clearPendingInitialMediaSource(reason = "detachVanguard")
                 stopVirtualEgress(reason = "detachVanguard")
                 detachInternal(reason = "detachVanguard")
                 result.success(mapOf("status" to "detached"))
             }
+            "setInitialMediaSource" -> setInitialMediaSource(call, result)
             "getStats" -> result.success(stats())
             "setMediaSource" -> {
                 val coordinator = mediaSourceCoordinator
@@ -199,6 +220,7 @@ internal class AndroidVanguardLiveKitBridge(
     fun dispose() {
         providerRegistration?.unregister()
         providerRegistration = null
+        clearPendingInitialMediaSource(reason = "engine detached")
         stopVirtualEgress(reason = "engine detached")
         detachInternal(reason = "engine detached", releaseSurfaceImmediately = true)
         channel.setMethodCallHandler(null)
@@ -219,7 +241,58 @@ internal class AndroidVanguardLiveKitBridge(
             "framesDelivered" to framesDelivered,
             "trackId" to attachedTrackId,
             "mode" to if (attachedTrackId != null) "attached" else "idle",
+            "pendingInitialMediaSource" to pendingInitialMode,
+            "pendingInitialImagePath" to pendingInitialImagePath,
         )
+    }
+
+    // ── I2: initial media source (armed before the next virtual track) ───────
+
+    // Main thread (MethodChannel). {mode: "camera"} clears any armed image;
+    // {mode: "image", imagePath} validates and decodes the still through the
+    // coordinator and replies only once that succeeded, so Dart can abort
+    // before creating a track on a bad image.
+    private fun setInitialMediaSource(call: MethodCall, result: MethodChannel.Result) {
+        val args = call.arguments as? Map<*, *>
+        val mode = args?.get("mode") as? String
+        when (mode) {
+            AndroidLivestreamMediaSourceCoordinator.MODE_CAMERA -> {
+                clearPendingInitialMediaSource(reason = "initial source camera")
+                result.success(
+                    mapOf("status" to "armed", "mode" to AndroidLivestreamMediaSourceCoordinator.MODE_CAMERA, "imagePath" to null),
+                )
+            }
+            AndroidLivestreamMediaSourceCoordinator.MODE_IMAGE -> {
+                val coordinator = mediaSourceCoordinator
+                if (coordinator == null) {
+                    result.error("UNAVAILABLE", "Livestream media source coordinator is not installed", null)
+                    return
+                }
+                // A new arm replaces the previous one; the coordinator recycles it.
+                pendingInitialMode = null
+                pendingInitialImagePath = null
+                coordinator.prepareInitialImage(
+                    imagePath = args?.get("imagePath") as? String,
+                    result = result,
+                    onArmed = { path ->
+                        pendingInitialMode = AndroidLivestreamMediaSourceCoordinator.MODE_IMAGE
+                        pendingInitialImagePath = path
+                        Log.i(TAG, "initial media source armed: image $path")
+                    },
+                )
+            }
+            else -> result.error("INVALID_ARGUMENT", "mode must be \"camera\" or \"image\" (got $mode)", null)
+        }
+    }
+
+    // Main thread. Drops the armed initial source (and its decoded image).
+    private fun clearPendingInitialMediaSource(reason: String) {
+        if (pendingInitialMode != null) {
+            Log.i(TAG, "initial media source cleared ($reason)")
+        }
+        pendingInitialMode = null
+        pendingInitialImagePath = null
+        mediaSourceCoordinator?.clearInitialMediaSource()
     }
 
     // ── Virtual camera provider (flutter_webrtc external video source SPI) ────
@@ -298,6 +371,39 @@ internal class AndroidVanguardLiveKitBridge(
             Log.e(TAG, "virtual camera onStart rejected: not on the main thread")
             return false
         }
+
+        // I2: an armed image start is consumed here and never touches the
+        // camera: no Vanguard camera is required and nothing is attached to the
+        // camera egress. The still-image pump is the track's first producer.
+        val initialImagePath = pendingInitialImagePath
+        if (pendingInitialMode == AndroidLivestreamMediaSourceCoordinator.MODE_IMAGE && initialImagePath != null) {
+            pendingInitialMode = null
+            pendingInitialImagePath = null
+            val coordinator = mediaSourceCoordinator
+            if (coordinator == null) {
+                Log.e(TAG, "virtual camera onStart rejected for $trackId: image-first armed but no coordinator")
+                return false
+            }
+            stopVirtualEgress(reason = "virtual track $trackId starting (image-first)")
+            detachInternal(reason = "virtual track $trackId starting (image-first)")
+            if (!coordinator.startImageFirst(surface, initialImagePath)) {
+                Log.e(TAG, "virtual camera onStart rejected for $trackId: image-first producer could not start")
+                return false
+            }
+            virtualTrackId = trackId
+            virtualFramesDelivered = counter
+            virtualSurface = surface
+            Log.i(
+                TAG,
+                "virtual camera started for track $trackId: image-first ${EGRESS_WIDTH}x${EGRESS_HEIGHT} " +
+                    "path=$initialImagePath (camera closed, no stock capturer)",
+            )
+            return true
+        }
+        // Camera-first (default, unchanged): the Vanguard camera must be
+        // running and its egress takes the Surface.
+        pendingInitialMode = null
+        pendingInitialImagePath = null
         if (!host.isCameraActive) {
             Log.e(TAG, "virtual camera onStart rejected for $trackId: Vanguard camera is not running")
             return false

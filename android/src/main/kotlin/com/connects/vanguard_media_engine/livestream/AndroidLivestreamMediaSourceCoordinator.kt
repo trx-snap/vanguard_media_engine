@@ -48,6 +48,15 @@ package com.connects.vanguard_media_engine.livestream
 // keeps the image producer running (re-suspending the camera). Every reply is
 // delivered exactly once.
 //
+// I2 (image-first start): prepareInitialImage validates and decodes the still
+// BEFORE the track exists (the bridge replies to setInitialMediaSource only
+// then), startImageFirst makes the pump the track's first producer with no
+// camera source at all, and the pump outlives camera source stops: the camera
+// is created later by the app and setMediaSource(camera) hands the Surface
+// over exactly as an image → camera switch does (the freshly created camera is
+// already capturing, so the hand-off needs no resume). Overlays reach the pump
+// only once a camera graph exists (they are camera-graph transactions).
+//
 // Threading: main thread only (MethodChannel calls, bridge callbacks, camera
 // first-frame callbacks which VanguardCameraSource already posts to the main
 // executor). Pump callbacks arrive on the pump thread and are re-posted here.
@@ -115,6 +124,21 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     private var pump: AndroidLivestreamImagePump? = null
     private var cameraSuspended = false
 
+    // ── I2: image-first ──────────────────────────────────────────────────────
+    // The still decoded by prepareInitialImage, waiting for the next virtual
+    // track; recycled when replaced, cleared or consumed. initialGeneration
+    // drops stale decodes.
+    private var initialImage: AndroidLivestreamImagePump.DecodedImage? = null
+    private var initialGeneration = 0L
+
+    // A pump started by startImageFirst that has not rendered yet: committed
+    // (or failed closed) from its first frame, bounded by a timeout. There is
+    // no MethodChannel request behind it — the track's onStart already returned.
+    private class ImageFirstStart(val pump: AndroidLivestreamImagePump, val path: String) {
+        var timeout: Runnable? = null
+    }
+    private var imageFirstStart: ImageFirstStart? = null
+
     private val pumpListener = object : AndroidLivestreamImagePump.Listener {
         override fun onFirstFrameRendered(pump: AndroidLivestreamImagePump) {
             mainHandler.post { onPumpFirstFrame(pump) }
@@ -156,6 +180,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         if (disposed) return
         val hadPump = pump != null
         cancelPending("EGRESS_STOPPED", "The livestream egress stopped ($reason)")
+        clearImageFirstStart()
         stopPump()
         if (cameraSuspended) {
             cameraSuspended = false
@@ -184,22 +209,37 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     }
 
     /**
-     * The camera source is about to stop (stopCamera / restart / engine
-     * detach). Cancels any in-flight request and stops the pump; the camera is
-     * NOT resumed because it is being torn down. Main thread.
+     * The camera source is about to stop (stopCamera / restart). Cancels any
+     * in-flight request (it may depend on that camera). I2: a running image
+     * pump does NOT depend on the camera and keeps feeding the track; the app
+     * may create a new camera later and switch back. Without a pump the camera
+     * egress dies with its processor, so no producer is bound any more and the
+     * stats say so. The camera is never resumed here. Main thread.
      */
     fun onCameraSourceStopping() {
         if (disposed) return
         cancelPending("CAMERA_STOPPED", "The Vanguard camera stopped")
-        stopPump()
         cameraSuspended = false
-        commit(MODE_CAMERA, null)
+        if (pump != null) {
+            Log.i(TAG, "camera source stopping; image producer kept (mode=$committedMode)")
+            if (committedMode != MODE_IMAGE) commit(MODE_NONE, null)
+            return
+        }
+        if (committedMode == MODE_CAMERA) {
+            Log.i(TAG, "camera source stopping; camera egress goes with it — no producer bound")
+        }
+        commit(MODE_NONE, null)
     }
 
     /** Engine teardown. Idempotent; the coordinator is inert afterwards. */
     fun dispose() {
         if (disposed) return
-        onCameraSourceStopping()
+        cancelPending("DISPOSED", "The livestream media source coordinator was disposed")
+        clearImageFirstStart()
+        stopPump()
+        clearInitialMediaSource()
+        cameraSuspended = false
+        commit(MODE_CAMERA, null)
         disposed = true
         decodeExecutor.shutdownNow()
     }
@@ -211,14 +251,159 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         "imagePumpFrames" to (pump?.framesRendered ?: 0L),
         "imagePumpImagePath" to pump?.imagePath,
         "cameraSuspended" to cameraSuspended,
+        "cameraSourcePresent" to (cameraSourceProvider() != null),
+        "imageFirstPending" to (imageFirstStart != null),
     )
+
+    // ── I2: image-first start ────────────────────────────────────────────────
+
+    /**
+     * Arms the next virtual track's initial still image: validates
+     * [imagePath] synchronously, decodes it on the decode thread and, only once
+     * that succeeded, calls [onArmed] and replies `{status: "armed"}`. Any
+     * failure replies an error (INVALID_IMAGE_PATH / IMAGE_DECODE_FAILED) and
+     * leaves nothing armed, so the caller can abort before creating a track.
+     * A newer call or [clearInitialMediaSource] supersedes an in-flight decode.
+     * Needs neither a camera source nor a Surface. Main thread.
+     */
+    fun prepareInitialImage(imagePath: String?, result: MethodChannel.Result, onArmed: (String) -> Unit) {
+        if (disposed) {
+            result.error("UNAVAILABLE", "Livestream media source coordinator is disposed", null)
+            return
+        }
+        val invalid = validateImagePath(imagePath)
+        if (invalid != null) {
+            result.error("INVALID_IMAGE_PATH", invalid, null)
+            return
+        }
+        val path = imagePath!!
+        initialImage?.recycle()
+        initialImage = null
+        val gen = ++initialGeneration
+        val width = egressWidth
+        val height = egressHeight
+        Log.i(TAG, "initial image decode gen=$gen path=$path")
+        decodeExecutor.execute {
+            val decoded = try {
+                AndroidLivestreamImagePump.decode(path, width, height)
+            } catch (t: Throwable) {
+                val message = "${t.javaClass.simpleName}: ${t.message}"
+                mainHandler.post {
+                    if (gen == initialGeneration) {
+                        result.error("IMAGE_DECODE_FAILED", message, null)
+                    } else {
+                        result.error("SUPERSEDED", "A newer initial media source replaced this one", null)
+                    }
+                }
+                return@execute
+            }
+            mainHandler.post {
+                if (disposed || gen != initialGeneration) {
+                    decoded.recycle()
+                    result.error("SUPERSEDED", "A newer initial media source replaced this one", null)
+                    return@post
+                }
+                initialImage = decoded
+                onArmed(path)
+                result.success(mapOf("status" to "armed", "mode" to MODE_IMAGE, "imagePath" to path))
+            }
+        }
+    }
+
+    /** Drops the armed initial image (and supersedes an in-flight decode). Main thread. */
+    fun clearInitialMediaSource() {
+        initialGeneration++
+        initialImage?.recycle()
+        initialImage = null
+    }
+
+    /**
+     * I2: makes the still-image pump the FIRST producer of a virtual track
+     * that is starting on [surface] (bridge onStart, main thread). Uses the
+     * image armed by [prepareInitialImage] when its path matches, otherwise
+     * decodes [imagePath] now. Requires no camera source: the camera stays
+     * closed until the app creates one and requests setMediaSource(camera).
+     * Returns false (nothing started) when a pump already exists or the pump
+     * could not be created; true once the pump is starting — image mode is
+     * committed from its first frame, or fails closed (stats report "none").
+     */
+    fun startImageFirst(surface: Surface, imagePath: String): Boolean {
+        if (disposed) return false
+        if (pump != null) {
+            Log.e(TAG, "startImageFirst rejected: an image producer is already running")
+            return false
+        }
+        if (!surface.isValid) {
+            Log.e(TAG, "startImageFirst rejected: virtual camera surface invalid")
+            return false
+        }
+        cancelPending("SUPERSEDED", "A new image-first track is starting")
+        clearImageFirstStart()
+
+        val armed = initialImage
+        initialImage = null
+        initialGeneration++
+        val started = AndroidLivestreamImagePump(surface, egressWidth, egressHeight, egressFps, pumpListener)
+        pump = started
+        // Overlays are camera-graph transactions; with no camera yet there are
+        // none to burn in. A camera that already exists contributes its list.
+        started.setOverlay(cameraSourceProvider()?.currentOverlayState)
+        val start = ImageFirstStart(started, imagePath)
+        imageFirstStart = start
+        cameraSuspended = false
+        commit(MODE_NONE, null) // nothing is on the Surface until the first frame
+
+        if (armed != null && armed.path == imagePath) {
+            started.start(armed)
+        } else {
+            armed?.recycle()
+            Log.w(TAG, "startImageFirst: no armed image for $imagePath; decoding now")
+            val width = egressWidth
+            val height = egressHeight
+            decodeExecutor.execute {
+                val decoded = try {
+                    AndroidLivestreamImagePump.decode(imagePath, width, height)
+                } catch (t: Throwable) {
+                    val reason = "decode_failed:${t.javaClass.simpleName}:${t.message}"
+                    mainHandler.post { onPumpFailed(started, reason) }
+                    return@execute
+                }
+                mainHandler.post {
+                    if (pump === started) started.start(decoded) else decoded.recycle()
+                }
+            }
+        }
+        val timeout = Runnable {
+            val current = imageFirstStart
+            if (current !== start) return@Runnable
+            current.timeout = null
+            imageFirstStart = null
+            Log.e(TAG, "image-first pump did not render within ${PUMP_START_TIMEOUT_MS}ms")
+            stopPump()
+            commit(MODE_NONE, null)
+            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=image_first_timeout")
+        }
+        start.timeout = timeout
+        mainHandler.postDelayed(timeout, PUMP_START_TIMEOUT_MS)
+        Log.i(TAG, "image-first producer starting path=$imagePath armed=${armed != null}")
+        return true
+    }
+
+    private fun clearImageFirstStart() {
+        val start = imageFirstStart ?: return
+        start.timeout?.let { mainHandler.removeCallbacks(it) }
+        start.timeout = null
+        imageFirstStart = null
+    }
 
     // ── Requests ─────────────────────────────────────────────────────────────
 
     private fun requestImage(imagePath: String?, result: MethodChannel.Result) {
-        // Camera source and retained Surface only gate the request here; both
-        // are re-resolved once the background decode finishes.
-        if (requireRunningCamera(result) == null) return
+        // The retained Surface (and, only when no image producer is running
+        // yet, a running camera) gate the request here; both are re-resolved
+        // once the background decode finishes. I2: with a pump running the
+        // camera may not exist at all (image-first) — a hot swap needs none.
+        if (pump == null && requireRunningCamera(result) == null) return
         if (requireRetainedSurface(result) == null) return
         val invalid = validateImagePath(imagePath)
         if (invalid != null) {
@@ -257,13 +442,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
             Log.i(TAG, "decoded image for stale gen=$gen dropped")
             return
         }
-        val source = cameraSourceProvider()
         val surface = retainedSurfaceProvider()
-        if (source == null || !source.running) {
-            decoded.recycle()
-            failRequest(gen, "NO_ACTIVE_CAMERA", "Vanguard camera stopped while decoding the image")
-            return
-        }
         if (surface == null || !surface.isValid) {
             decoded.recycle()
             failRequest(gen, "NO_ACTIVE_STREAM", "The virtual camera track went away while decoding the image")
@@ -274,6 +453,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         if (existing != null) {
             // Image → image: the running pump keeps streaming the old image
             // until the new texture is uploaded; commit only from that result.
+            // No camera is involved (I2: there may be none).
             existing.replaceImage(decoded) { ok, reason ->
                 mainHandler.post { onImageReplaced(gen, existing, path, ok, reason) }
             }
@@ -284,6 +464,13 @@ internal class AndroidLivestreamMediaSourceCoordinator(
                     "The image upload did not complete within ${IMAGE_REPLACE_TIMEOUT_MS}ms; the previous image keeps streaming",
                 )
             }
+            return
+        }
+
+        val source = cameraSourceProvider()
+        if (source == null || !source.running) {
+            decoded.recycle()
+            failRequest(gen, "NO_ACTIVE_CAMERA", "Vanguard camera stopped while decoding the image")
             return
         }
 
@@ -335,6 +522,29 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     // Main thread. The pump's first frame is on the Surface.
     private fun onPumpFirstFrame(rendered: AndroidLivestreamImagePump) {
         if (disposed || pump !== rendered) return
+
+        // I2: an image-first pump commits from its first frame with the camera
+        // closed. If a camera source happens to exist (created before the
+        // track started), it is suspended like any image mode; a refusal is
+        // logged but never fails the producer — there is no camera egress to
+        // roll back to.
+        val imageFirst = imageFirstStart
+        if (imageFirst != null && imageFirst.pump === rendered) {
+            clearImageFirstStart()
+            val source = cameraSourceProvider()
+            if (!cameraSuspended && source != null && source.running) {
+                cameraSuspended = source.suspendCapture()
+                if (!cameraSuspended) Log.w(TAG, "image-first: existing camera could not be suspended; image producer kept")
+            }
+            commit(MODE_IMAGE, imageFirst.path)
+            Log.i(
+                TAG,
+                "ANDROID_LIVESTREAM_MEDIA_SOURCE_COMMITTED mode=image imageFirst=true path=${imageFirst.path} " +
+                    "cameraPresent=${source != null} cameraSuspended=$cameraSuspended",
+            )
+            return
+        }
+
         val request = pending
         if (request == null || request.targetMode != MODE_IMAGE) {
             // Superseded by a camera request that already reconciled (or is
@@ -365,6 +575,16 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     // Main thread. The pump failed (bind/draw); bring the camera producer back.
     private fun onPumpFailed(failedPump: AndroidLivestreamImagePump, reason: String) {
         if (disposed || pump !== failedPump) return
+        val imageFirst = imageFirstStart
+        if (imageFirst != null && imageFirst.pump === failedPump) {
+            // I2: the image-first producer never came up; there is no camera
+            // producer to fall back to (the camera is closed by design).
+            clearImageFirstStart()
+            stopPump()
+            commit(MODE_NONE, null)
+            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=image_first_failed reason=$reason")
+            return
+        }
         Log.e(TAG, "image pump failed ($reason); restoring camera producer")
         stopPump()
         val request = pending
@@ -429,8 +649,10 @@ internal class AndroidLivestreamMediaSourceCoordinator(
             armTimeout(gen, CAMERA_RESUME_TIMEOUT_MS) { onCameraResumeTimeout(gen) }
             return
         }
-        // Camera already capturing (e.g. a superseded switch left the pump
-        // running): hand the Surface back right away.
+        // Camera already capturing (a superseded switch left the pump running,
+        // or — I2 — the app created the camera after an image-first start):
+        // hand the Surface back right away; the egress binds on the camera's
+        // next processed frame.
         finishCameraSwitch(gen)
     }
 

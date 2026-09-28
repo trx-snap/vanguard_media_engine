@@ -37,10 +37,16 @@ typedef VGCameraGraphSession * _Nullable (^VGRTCGraphSessionProvider)(void);
 /// that is live at call time, not the one that existed at registration.
 - (void)setGraphSessionProvider:(nullable VGRTCGraphSessionProvider)provider;
 
-/// Routes attachVanguardToLiveKitTrack / detachVanguard / getStats, and (I1)
-/// setMediaSource ({mode: "camera" | "image", imagePath}), which is forwarded
-/// to the live VGCameraGraphSession's livestream media source API while a
-/// Vanguard-fed track is streaming; the RTC sink/track is never touched.
+/// Routes attachVanguardToLiveKitTrack / detachVanguard / getStats, (I1)
+/// setMediaSource ({mode: "camera" | "image", imagePath}) and (I2)
+/// setInitialMediaSource (same shape). setMediaSource is forwarded to the live
+/// VGCameraGraphSession while the camera graph is the producer; while the
+/// standalone image-first pump is the producer it is handled here (image hot
+/// swap, or the hand-over to a camera graph the app created meanwhile).
+/// setInitialMediaSource arms what the NEXT virtual track starts from: image is
+/// validated and decoded (VGCreateLivestreamImageBuffer) before the reply so
+/// Dart can abort before any track exists; camera clears the armed state. The
+/// RTC sink/track is never touched by any of these.
 /// Replies exactly once, possibly asynchronously. Main thread.
 /// `result` is a real FlutterResult block (never a bit-cast object).
 - (void)handleMethodCall:(FlutterMethodCall *)call
@@ -78,6 +84,10 @@ typedef VGCameraGraphSession * _Nullable (^VGRTCGraphSessionProvider)(void);
 /// FlutterWebRTCExternalVideoSourceProvider. Main thread. Binds egress to
 /// @c sink (the track's RTCVideoCapturerDelegate) and opens the gate at once;
 /// NO when there is no active camera graph or the receiver cannot connect.
+/// I2: when an image start was armed by setInitialMediaSource, no camera graph
+/// is required — a standalone 30 fps pump repeating the decoded still feeds
+/// @c sink directly and the camera hardware stays closed until the app
+/// creates a camera and requests setMediaSource(camera).
 - (BOOL)startExternalVideoSourceForTrackId:(NSString *)trackId sink:(id)sink;
 
 /// FlutterWebRTCExternalVideoSourceProvider. Main thread. Detaches egress if

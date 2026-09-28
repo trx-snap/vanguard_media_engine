@@ -1142,8 +1142,10 @@ static NSString * _Nullable _VGLMSValidateImagePath(id _Nullable rawPath) {
 // filter node and sink treats it as a camera frame. The bitmap context's first
 // row is the buffer's top row, so CG-upright drawing is buffer-upright.
 // Returns +1, or NULL with *outError. Blocking: call off the hot path.
-static CVPixelBufferRef _Nullable _VGLMSCreateImageBuffer(NSString *path, size_t width, size_t height,
-                                                          NSError * _Nullable * _Nullable outError) CF_RETURNS_RETAINED {
+// I2: exported (VGCameraGraphSession.h) so VanguardRTCVideoCapturer's
+// standalone image-first pump decodes through the exact same path.
+CVPixelBufferRef _Nullable VGCreateLivestreamImageBuffer(NSString *path, size_t width, size_t height,
+                                                         NSError * _Nullable * _Nullable outError) {
     NSURL *url = [NSURL fileURLWithPath:path];
     NSDictionary *sourceOptions = @{(__bridge NSString *)kCGImageSourceShouldCache: @NO};
     CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url,
@@ -3465,7 +3467,7 @@ static NSError *_VGHotUpdatePolicyError(NSInteger code, NSString *message) {
         // Decode off the hot path (never on the session, capture or graph queue).
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSError *decodeError = nil;
-            CVPixelBufferRef buffer = _VGLMSCreateImageBuffer(path, width, height, &decodeError);
+            CVPixelBufferRef buffer = VGCreateLivestreamImageBuffer(path, width, height, &decodeError);
             __strong __typeof(weakSelf) decodeSelf = weakSelf;
             if (!decodeSelf) {
                 if (buffer) CVPixelBufferRelease(buffer);
