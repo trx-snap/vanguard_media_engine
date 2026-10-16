@@ -3028,6 +3028,15 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 cameraTexture = textureEntry
                 cameraSource  = source
 
+                // A session that fails closed after start/switch already replied
+                // (livestream720p effect input re-issued at another size) has
+                // torn itself down: drop it exactly as stopCamera would, with no
+                // MethodChannel reply left to make.
+                source.onSessionInvalidated = { e ->
+                    Log.e(TAG, "camera session invalidated — ${e.message}")
+                    dropCameraSourceIfCurrent(source, "invalidated")
+                }
+
                 source.start(
                     onStarted = {
                         Log.d(TAG, "startCamera: live, textureId=${textureEntry.id()}")
@@ -3035,13 +3044,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                     },
                     onError = { e ->
                         Log.e(TAG, "startCamera: failed — ${e.message}")
-                        cameraSource = null
-                        val errTex = cameraTexture
-                        if (errTex != null) {
-                            Log.i("VanguardTex", "[RELEASE/error] textureId=${errTex.id()}")
-                            errTex.release()
-                        }
-                        cameraTexture = null
+                        dropCameraSourceIfCurrent(source, "error")
                         result.error("CAMERA_ERROR", e.message, null)
                     }
                 )
@@ -3090,7 +3093,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 }
                 src.switchCamera(
                     onStarted = { result.success(null) },
-                    onError   = { e -> result.error("CAMERA_ERROR", e.message, null) }
+                    onError   = { e ->
+                        // A switch refused while another validation is pending
+                        // leaves the source untouched. Every other failure has
+                        // already torn the source down (its previous camera was
+                        // unbound by the rebind): drop it like stopCamera would.
+                        if (src.isTornDown) dropCameraSourceIfCurrent(src, "switch-error")
+                        result.error("CAMERA_ERROR", e.message, null)
+                    }
                 )
             }
 
@@ -3719,6 +3729,30 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             try { videoEx.release() } catch (_: Exception) {}
             try { audioEx.release() } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Drops [source] as the active camera session — notifying the livestream
+     * coordinator, clearing [cameraSource] and releasing the texture it owns —
+     * but only while it is still the current one, so a late callback from a
+     * failed or invalidated source can never clear a newer session. The source
+     * has already torn itself down (or is being discarded after a failed
+     * start). Returns true when something was dropped. Main thread.
+     */
+    private fun dropCameraSourceIfCurrent(source: VanguardCameraSource, reason: String): Boolean {
+        if (cameraSource !== source) {
+            Log.w(TAG, "dropCameraSource($reason): source is no longer current — ignored")
+            return false
+        }
+        livestreamMediaSourceCoordinator?.onCameraSourceStopping()
+        cameraSource = null
+        val tex = cameraTexture
+        if (tex != null && tex.id() == source.textureId) {
+            Log.i("VanguardTex", "[RELEASE/$reason] textureId=${tex.id()}")
+            tex.release()
+            cameraTexture = null
+        }
+        return true
     }
 
         override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {

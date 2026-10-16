@@ -30,7 +30,11 @@ package com.connects.vanguard_media_engine.livestream
 //     1. resume CameraX (VanguardCameraSource.resumeCapture rebinds through the
 //        normal bindUseCases path); the image pump keeps ticking and the
 //        request stays pending — bounded by CAMERA_RESUME_TIMEOUT_MS — until
-//        the first completed camera capture, an error, or supersession;
+//        the first completed camera capture, an error, or supersession. The
+//        resume may refuse synchronously or fail later (the livestream720p
+//        exact-input gate settles asynchronously): one ResumeAttempt tracks
+//        it, cameraSuspended stays true until it settles, and a newer camera
+//        request adopts the attempt in flight instead of starting another;
 //     2. on the first completed capture: verify every up-front reason the
 //        egress attach could be refused while the pump still owns the Surface,
 //        then stop the pump (blocking, so the Surface is disconnected) and
@@ -124,6 +128,29 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     private var pump: AndroidLivestreamImagePump? = null
     private var cameraSuspended = false
 
+    // A camera resume (VanguardCameraSource.resumeCapture) that has not settled
+    // yet: neither its first completed capture nor its error — synchronous, or
+    // asynchronous for livestream720p — has arrived. While one is in flight
+    // cameraSuspended stays true (the camera feeds nothing yet), no second
+    // resume is started, and a newer camera request adopts it explicitly
+    // (requestGen). Settled by identity, exactly once; when the coordinator
+    // itself ends it (image mode took over, the request it answered expired
+    // with nothing to restore, camera source stopping, dispose) its identity
+    // is invalidated BEFORE the source is touched, so a re-entrant or late
+    // callback is ignored. A recovery resume (egress-stop baseline, pump
+    // failure rollback) outlives an expired request that adopted it.
+    private class ResumeAttempt(val id: Long, val context: String, val recovery: Boolean) {
+        // The camera request this resume currently answers: its first frame
+        // finishes that request's hand-off and its failure fails that request.
+        // Set only by the request that started it or explicitly adopted it;
+        // cleared when that request ends (completed, failed, timed out,
+        // superseded, cancelled), after which the resume answers no request
+        // and follows the producer state alone.
+        var requestGen: Long? = null
+    }
+    private var resumeInFlight: ResumeAttempt? = null
+    private var resumeSerial = 0L
+
     // ── I2: image-first ──────────────────────────────────────────────────────
     // The still decoded by prepareInitialImage, waiting for the next virtual
     // track; recycled when replaced, cleared or consumed. initialGeneration
@@ -182,27 +209,29 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         cancelPending("EGRESS_STOPPED", "The livestream egress stopped ($reason)")
         clearImageFirstStart()
         stopPump()
+        if (hadPump) Log.i(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_RESET reason=$reason")
         if (cameraSuspended) {
-            cameraSuspended = false
+            val inFlight = resumeInFlight
+            if (inFlight != null) {
+                // Already resuming (a cancelled camera request or a rollback):
+                // its settle restores the camera-first baseline or reports the
+                // loss; nothing is bound meanwhile.
+                commit(MODE_NONE, null)
+                Log.i(TAG, "egress stop ($reason): camera resume #${inFlight.id} (${inFlight.context}) still in flight")
+                return
+            }
             val source = cameraSourceProvider()
             if (source != null && source.isCaptureSuspended) {
-                var refused = false
-                source.resumeCapture(
-                    onFirstFrame = { Log.i(TAG, "camera resumed after egress stop ($reason)") },
-                    onError = { e ->
-                        refused = true
-                        Log.e(TAG, "camera resume after egress stop failed: ${e.message}")
-                    },
-                )
-                if (refused) {
-                    cameraSuspended = source.isCaptureSuspended
-                    commit(MODE_NONE, null)
-                    Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=egress_stop cameraSuspended=$cameraSuspended")
-                    return
-                }
+                // Nothing is bound until the camera is back: onResumeFirstFrame
+                // commits MODE_CAMERA (camera-first baseline, no track to bind
+                // to) and onResumeFailed — synchronous or later — reports
+                // PRODUCER_LOST with the camera left suspended.
+                commit(MODE_NONE, null)
+                beginResume("egress_stop:$reason")
+                return
             }
+            cameraSuspended = false
         }
-        if (hadPump) Log.i(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_RESET reason=$reason")
         // No track remains, so "camera" here means the camera capture is (being)
         // restored as the only producer the next track can start from.
         commit(MODE_CAMERA, null)
@@ -219,6 +248,9 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     fun onCameraSourceStopping() {
         if (disposed) return
         cancelPending("CAMERA_STOPPED", "The Vanguard camera stopped")
+        // A resume still in flight belongs to that camera: its callbacks are
+        // stale from here on (settled by identity).
+        resumeInFlight = null
         cameraSuspended = false
         if (pump != null) {
             Log.i(TAG, "camera source stopping; image producer kept (mode=$committedMode)")
@@ -238,6 +270,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         clearImageFirstStart()
         stopPump()
         clearInitialMediaSource()
+        resumeInFlight = null
         cameraSuspended = false
         commit(MODE_CAMERA, null)
         disposed = true
@@ -251,6 +284,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         "imagePumpFrames" to (pump?.framesRendered ?: 0L),
         "imagePumpImagePath" to pump?.imagePath,
         "cameraSuspended" to cameraSuspended,
+        "cameraResumePending" to (resumeInFlight != null),
         "cameraSourcePresent" to (cameraSourceProvider() != null),
         "imageFirstPending" to (imageFirstStart != null),
     )
@@ -350,7 +384,9 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         started.setOverlay(cameraSourceProvider()?.currentOverlayState)
         val start = ImageFirstStart(started, imagePath)
         imageFirstStart = start
-        cameraSuspended = false
+        // A camera resume still in flight keeps cameraSuspended truthful; the
+        // pump's first frame re-suspends (and thereby cancels) it either way.
+        if (resumeInFlight == null) cameraSuspended = false
         commit(MODE_NONE, null) // nothing is on the Surface until the first frame
 
         if (armed != null && armed.path == imagePath) {
@@ -532,7 +568,10 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         if (imageFirst != null && imageFirst.pump === rendered) {
             clearImageFirstStart()
             val source = cameraSourceProvider()
-            if (!cameraSuspended && source != null && source.running) {
+            if ((!cameraSuspended || resumeInFlight != null) && source != null && source.running) {
+                // A resume still in flight is invalidated first; suspendCapture()
+                // then also cancels it at the source.
+                invalidateResume("image_first")
                 cameraSuspended = source.suspendCapture()
                 if (!cameraSuspended) Log.w(TAG, "image-first: existing camera could not be suspended; image producer kept")
             }
@@ -553,8 +592,12 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         }
         val gen = request.generation
         clearTimeout(request)
-        if (!cameraSuspended) {
+        if (!cameraSuspended || resumeInFlight != null) {
             val source = cameraSourceProvider()
+            // A resume still in flight (from a superseded camera request) is
+            // invalidated first; suspendCapture() then also cancels it at the
+            // source: image mode keeps the camera suspended.
+            invalidateResume("image_mode")
             val suspended = source != null && source.suspendCapture()
             if (!suspended) {
                 // The invariant "camera suspended in image mode" cannot be met
@@ -588,15 +631,14 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         Log.e(TAG, "image pump failed ($reason); restoring camera producer")
         stopPump()
         val request = pending
-        if (request != null && request.targetMode == MODE_CAMERA) {
-            // A camera switch is already in flight (resume accepted): its first
-            // frame / timeout path finishes the hand-off and replies.
-            if (!cameraSuspended) {
-                // No producer is bound until that hand-off lands; say so in stats.
-                commit(MODE_NONE, null)
-                Log.i(TAG, "camera switch gen=${request.generation} pending; egress attach deferred to its first frame")
-                return
-            }
+        if (request != null && request.targetMode == MODE_CAMERA && (resumeInFlight != null || !cameraSuspended)) {
+            // A camera switch is already in flight (resume pending, or the
+            // camera capturing): its first frame / timeout path finishes the
+            // hand-off and replies. No producer is bound until that lands; say
+            // so in stats.
+            commit(MODE_NONE, null)
+            Log.i(TAG, "camera switch gen=${request.generation} pending; egress attach deferred to its first frame")
+            return
         }
         restoreCameraProducer("pump_failed:$reason")
         if (request != null && request.targetMode == MODE_IMAGE) {
@@ -629,24 +671,33 @@ internal class AndroidLivestreamMediaSourceCoordinator(
             return
         }
         if (cameraSuspended) {
-            // Resume CameraX first; the pump keeps feeding the track meanwhile.
-            var refused = false
-            source.resumeCapture(
-                onFirstFrame = { onCameraFirstFrame(gen) },
-                onError = { e ->
-                    refused = true
-                    failRequest(gen, "CAMERA_RESUME_FAILED", "${e.javaClass.simpleName}: ${e.message}")
-                },
-            )
-            if (refused) {
-                // Image producer untouched; the source reports whether it is still suspended.
-                cameraSuspended = source.isCaptureSuspended
+            val inFlight = resumeInFlight
+            if (inFlight != null) {
+                // A resume is already in flight (a superseded request, an egress
+                // stop or a rollback): this request adopts it explicitly — its
+                // first frame finishes this hand-off (onResumeFirstFrame),
+                // bounded by this request's own timeout. No second resume is
+                // started.
+                inFlight.requestGen = gen
+                Log.i(TAG, "camera request gen=$gen adopts camera resume #${inFlight.id} (${inFlight.context})")
+                armTimeout(gen, CAMERA_RESUME_TIMEOUT_MS) { onCameraResumeTimeout(gen) }
                 return
             }
-            cameraSuspended = false
-            // Accepted: the request stays pending until the first completed
-            // capture (onCameraFirstFrame), supersession, or this timeout.
-            armTimeout(gen, CAMERA_RESUME_TIMEOUT_MS) { onCameraResumeTimeout(gen) }
+            // Resume CameraX first; the pump keeps feeding the track meanwhile.
+            // A synchronous refusal has already failed this request (image
+            // producer untouched, cameraSuspended taken from the source) by the
+            // time beginResume returns.
+            val attempt = beginResume("camera_request", requestGen = gen)
+            if (attempt == null) {
+                failRequest(gen, "NO_ACTIVE_CAMERA", "Vanguard camera is not running")
+                return
+            }
+            if (resumeInFlight === attempt) {
+                // Accepted so far: the request stays pending until the first
+                // completed capture (onResumeFirstFrame), a later failure
+                // (onResumeFailed), supersession, or this timeout.
+                armTimeout(gen, CAMERA_RESUME_TIMEOUT_MS) { onCameraResumeTimeout(gen) }
+            }
             return
         }
         // Camera already capturing (a superseded switch left the pump running,
@@ -656,29 +707,41 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         finishCameraSwitch(gen)
     }
 
-    // Main thread (VanguardCameraSource posts to the main executor).
-    private fun onCameraFirstFrame(gen: Long) {
-        if (disposed) return
-        val request = pending
-        if (request == null || request.generation != gen || request.targetMode != MODE_CAMERA) return
-        finishCameraSwitch(gen)
-    }
-
-    // Main thread. No completed capture arrived after the resume was accepted.
+    // Main thread. No completed capture arrived for the pending camera request
+    // (its own resume, or the one it adopted) within the bound. The timeout
+    // owns only that request: it never completes or binds on its behalf.
     private fun onCameraResumeTimeout(gen: Long) {
         Log.e(TAG, "no camera frame within ${CAMERA_RESUME_TIMEOUT_MS}ms after resume (gen=$gen)")
-        if (pump != null) {
-            // Image producer kept; return the camera to the suspended steady state.
-            returnToImageSteadyState("camera_resume_timeout")
-        } else {
-            commit(MODE_NONE, null)
-            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=camera_resume_timeout (no pump)")
-        }
+        // The request is over first, so nothing below can reply to it again,
+        // and a resume still in flight stops answering for it.
         failRequest(
             gen,
             "CAMERA_RESUME_TIMEOUT",
             "No camera frame within ${CAMERA_RESUME_TIMEOUT_MS}ms; the image producer keeps running",
         )
+        detachResumeFrom(gen)
+        if (pump != null) {
+            // Image producer kept; return the camera to the suspended steady
+            // state (a resume still in flight is invalidated, then cancelled).
+            returnToImageSteadyState("camera_resume_timeout")
+            return
+        }
+        commit(MODE_NONE, null)
+        val attempt = resumeInFlight
+        if (attempt == null) {
+            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=camera_resume_timeout (no pump)")
+        } else if (attempt.recovery) {
+            // The resume was already restoring the camera producer on its own
+            // (egress-stop baseline or pump-failure rollback) and keeps doing
+            // so; its completion follows that state only, never this request.
+            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=camera_resume_timeout (no pump; recovery resume #${attempt.id} (${attempt.context}) continues)")
+        } else {
+            // The resume existed solely for the expired request: nothing is
+            // left for it to answer or bind, so it is cancelled and the camera
+            // returned to suspended for the next request to retry.
+            cancelResume("camera_resume_timeout")
+            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=camera_resume_timeout (no pump; request-owned resume cancelled, cameraSuspended=$cameraSuspended)")
+        }
     }
 
     // Main thread. Hands the Surface from the pump to the camera egress and
@@ -755,8 +818,14 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     // The camera was resumed for a switch that did not complete while the pump
     // is still the producer: re-suspend it so image mode keeps its invariant.
     private fun returnToImageSteadyState(reason: String) {
-        if (pump == null || cameraSuspended) return
+        if (pump == null) return
+        if (cameraSuspended && resumeInFlight == null) return
         val source = cameraSourceProvider() ?: return
+        // A resume still in flight is invalidated first: suspendCapture() then
+        // cancels a validation still pending (its error callback runs inside
+        // the call) or unbinds an accepted camera that has not captured yet
+        // (no callback at all); either way nothing answers for it any more.
+        invalidateResume(reason)
         val suspended = source.suspendCapture()
         cameraSuspended = suspended || source.isCaptureSuspended
         Log.w(TAG, "camera re-suspended=$cameraSuspended after $reason; image producer kept")
@@ -769,32 +838,133 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     private fun restoreCameraProducer(context: String) {
         val source = cameraSourceProvider()
         if (cameraSuspended) {
-            cameraSuspended = false
+            val inFlight = resumeInFlight
+            if (inFlight != null) {
+                // Already resuming: its first frame binds the egress once nothing
+                // newer took over (onResumeFirstFrame) or it reports the loss.
+                commit(MODE_NONE, null)
+                Log.w(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_RESTORE_PENDING context=$context camera resume #${inFlight.id} (${inFlight.context}) still in flight")
+                return
+            }
             if (source != null && source.isCaptureSuspended) {
                 commit(MODE_NONE, null)
                 Log.w(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_RESTORE_PENDING context=$context resuming camera before egress re-bind")
-                var refused = false
-                source.resumeCapture(
-                    onFirstFrame = {
-                        // Still unbound and nothing newer took over: bind now.
-                        if (!disposed && pump == null && !cameraSuspended && committedMode == MODE_NONE) {
-                            bindCameraEgressOrFailClosed("restore:$context")
-                        }
-                    },
-                    onError = { e ->
-                        refused = true
-                        Log.e(TAG, "camera resume during rollback failed: ${e.message}")
-                    },
-                )
-                if (refused) {
-                    cameraSuspended = source.isCaptureSuspended
-                    commit(MODE_NONE, null)
-                    Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=$context (camera resume refused)")
-                }
+                // Pending: onResumeFirstFrame binds the egress once nothing
+                // newer took over; a refusal — synchronous or later — is
+                // reported by onResumeFailed (PRODUCER_LOST, camera suspended).
+                beginResume("restore:$context")
                 return
             }
+            cameraSuspended = false
         }
         bindCameraEgressOrFailClosed(context)
+    }
+
+    // ── Camera resume tracking (main thread) ─────────────────────────────────
+
+    // Starts the one camera resume: for a camera request (requestGen, which it
+    // answers) or as independent recovery (null). Returns null when there is
+    // no camera source (nothing started). Otherwise the attempt is in flight —
+    // unless the source refused synchronously, in which case onResumeFailed
+    // has already settled it before this returns; callers check
+    // `resumeInFlight === attempt`.
+    private fun beginResume(context: String, requestGen: Long? = null): ResumeAttempt? {
+        val source = cameraSourceProvider() ?: return null
+        val attempt = ResumeAttempt(++resumeSerial, context, recovery = requestGen == null)
+        attempt.requestGen = requestGen
+        resumeInFlight = attempt
+        cameraSuspended = true
+        Log.i(TAG, "camera resume #${attempt.id} ($context) started" + (requestGen?.let { " for request gen=$it" } ?: " (recovery)"))
+        source.resumeCapture(
+            onFirstFrame = { onResumeFirstFrame(attempt) },
+            onError = { e -> onResumeFailed(attempt, "${e.javaClass.simpleName}: ${e.message}") },
+        )
+        return attempt
+    }
+
+    // Main thread (VanguardCameraSource posts to the main executor): the resumed
+    // camera passed its validation and completed its first capture. Reconciles
+    // from the actual state: the camera request this resume currently answers
+    // (requestGen — the one that started or explicitly adopted it) finishes
+    // its hand-off; otherwise the camera-first baseline or the unbound egress
+    // is restored. An expired or superseded request is never answered.
+    private fun onResumeFirstFrame(attempt: ResumeAttempt) {
+        if (disposed || resumeInFlight !== attempt) return
+        resumeInFlight = null
+        cameraSuspended = false
+        val request = pending
+        val surface = retainedSurfaceProvider()
+        when {
+            request != null && request.targetMode == MODE_CAMERA && attempt.requestGen == request.generation ->
+                finishCameraSwitch(request.generation)
+            pump != null ->
+                // Superseded by an image request meanwhile: the image producer
+                // keeps the Surface; the next camera request hands it over.
+                Log.i(TAG, "camera resume #${attempt.id} (${attempt.context}) landed while the image producer is bound; image producer kept")
+            surface == null || !surface.isValid -> {
+                // No track (egress stopped): the camera capture is the only
+                // producer the next track can start from.
+                commit(MODE_CAMERA, null)
+                Log.i(TAG, "camera resume #${attempt.id} (${attempt.context}) landed; camera-first baseline restored")
+            }
+            committedMode == MODE_NONE -> bindCameraEgressOrFailClosed("resume:${attempt.context}")
+            else -> Log.i(TAG, "camera resume #${attempt.id} (${attempt.context}) landed; mode=$committedMode unchanged")
+        }
+    }
+
+    // The resume was refused (synchronously) or failed later (livestream720p
+    // gate rejection/timeout): the source stays suspended and retryable, the
+    // image producer — if any — keeps feeding the track, and camera is never
+    // reported as active. A pending camera request fails once.
+    private fun onResumeFailed(attempt: ResumeAttempt, message: String) {
+        if (disposed || resumeInFlight !== attempt) return
+        resumeInFlight = null
+        cameraSuspended = cameraSourceProvider()?.isCaptureSuspended ?: false
+        Log.e(TAG, "camera resume #${attempt.id} (${attempt.context}) failed: $message")
+        val request = pending
+        if (request != null && request.targetMode == MODE_CAMERA && attempt.requestGen == request.generation) {
+            failRequest(request.generation, "CAMERA_RESUME_FAILED", message)
+        }
+        if (pump != null) {
+            Log.w(TAG, "image producer kept after failed camera resume (cameraSuspended=$cameraSuspended)")
+        } else {
+            commit(MODE_NONE, null)
+            Log.e(TAG, "ANDROID_LIVESTREAM_MEDIA_SOURCE_PRODUCER_LOST context=${attempt.context} cameraSuspended=$cameraSuspended")
+        }
+    }
+
+    // Ends the coordinator's interest in the resume in flight BEFORE the source
+    // is touched: from here on its first-frame/error callbacks — re-entrant
+    // from suspendCapture(), or late — are ignored by identity, and nothing
+    // answers for it. cameraSuspended is re-read from the source; a caller
+    // that suspends the source afterwards overwrites it with that result.
+    private fun invalidateResume(reason: String) {
+        val attempt = resumeInFlight ?: return
+        resumeInFlight = null
+        cameraSuspended = cameraSourceProvider()?.isCaptureSuspended ?: false
+        Log.i(TAG, "camera resume #${attempt.id} (${attempt.context}) invalidated ($reason); cameraSuspended=$cameraSuspended")
+    }
+
+    // Cancels a resume that answers for nothing any more (the request it
+    // served expired with no producer to restore): identity invalidated first,
+    // then the source returned to suspended — which cancels a validation still
+    // pending or unbinds an accepted camera that has not captured yet — so the
+    // camera is not left capturing for nobody.
+    private fun cancelResume(reason: String) {
+        if (resumeInFlight == null) return
+        invalidateResume(reason)
+        val source = cameraSourceProvider() ?: return
+        val suspended = source.suspendCapture()
+        cameraSuspended = suspended || source.isCaptureSuspended
+        Log.w(TAG, "camera re-suspended=$cameraSuspended after $reason; no producer bound")
+    }
+
+    // The request is over (completed, failed, timed out, superseded or
+    // cancelled): a resume still in flight that answered for it answers for
+    // nothing until a newer request adopts it explicitly.
+    private fun detachResumeFrom(gen: Long) {
+        val attempt = resumeInFlight ?: return
+        if (attempt.requestGen == gen) attempt.requestGen = null
     }
 
     private fun commit(mode: String, imagePath: String?) {
@@ -807,6 +977,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     private fun beginRequest(result: MethodChannel.Result, targetMode: String, imagePath: String?): Long {
         pending?.let { old ->
             clearTimeout(old)
+            detachResumeFrom(old.generation)
             Log.i(TAG, "request gen=${old.generation} superseded")
             old.result.error("SUPERSEDED", "A newer setMediaSource request replaced this one", null)
         }
@@ -819,6 +990,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         val request = pending ?: return
         if (request.generation != gen) return
         clearTimeout(request)
+        detachResumeFrom(gen)
         pending = null
         request.result.success(payload)
     }
@@ -827,6 +999,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
         val request = pending ?: return
         if (request.generation != gen) return
         clearTimeout(request)
+        detachResumeFrom(gen)
         pending = null
         Log.w(TAG, "setMediaSource gen=$gen failed: $code: $message")
         request.result.error(code, message, null)
@@ -835,6 +1008,7 @@ internal class AndroidLivestreamMediaSourceCoordinator(
     private fun cancelPending(code: String, message: String) {
         val request = pending ?: return
         clearTimeout(request)
+        detachResumeFrom(request.generation)
         pending = null
         generation++
         request.result.error(code, message, null)

@@ -39,6 +39,8 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -101,8 +103,9 @@ import java.util.concurrent.atomic.AtomicReference
  * @param frameRate Target frame rate for the camera session (default 30).
  * @param captureProfile Optional capture profile token from Dart. null keeps
  *   the existing default use-case selection unchanged;
- *   [CAPTURE_PROFILE_LIVESTREAM_720P] requests a 720p-class stream (see
- *   [bindUseCases]). The size CameraX negotiates is logged, not assumed.
+ *   [CAPTURE_PROFILE_LIVESTREAM_720P] requires an exact 1280×720 effect input
+ *   (see [bindUseCases]): the size CameraX negotiates is validated by the
+ *   effect-input gate before start/switch/resume report success.
  */
 class VanguardCameraSource(
     private val context: Context,
@@ -116,17 +119,22 @@ class VanguardCameraSource(
     companion object {
         private const val TAG = "VanguardCameraSource"
 
-        /** Livestream single-camera profile: request 720p-class capture. */
+        /** Livestream single-camera profile: exactly 1280×720 capture, or nothing. */
         const val CAPTURE_PROFILE_LIVESTREAM_720P = "livestream720p"
 
-        // livestream720p size cap (orientation-independent: long edge ≤ 1280,
-        // short edge ≤ 720, i.e. 1280×720 / 720×1280 or smaller).
-        private const val LIVESTREAM_MAX_LONG_EDGE = 1280
-        private const val LIVESTREAM_MAX_SHORT_EDGE = 720
+        // livestream720p raster: exactly 1280×720 pixels. 720×1280 is the same
+        // 16:9 raster transposed by the sensor orientation and is the only
+        // other accepted form; 960×540 and every other size are rejected.
+        private const val LIVESTREAM_WIDTH = 1280
+        private const val LIVESTREAM_HEIGHT = 720
 
-        private fun isLivestream720pClass(width: Int, height: Int): Boolean =
-            maxOf(width, height) <= LIVESTREAM_MAX_LONG_EDGE &&
-                minOf(width, height) <= LIVESTREAM_MAX_SHORT_EDGE
+        // Upper bound on how long a livestream720p bind may wait for CameraX's
+        // effect-input SurfaceRequest before the operation fails.
+        private const val LIVESTREAM_INPUT_GATE_TIMEOUT_MS = 10_000L
+
+        private fun isLivestreamExactRaster(width: Int, height: Int): Boolean =
+            (width == LIVESTREAM_WIDTH && height == LIVESTREAM_HEIGHT) ||
+                (width == LIVESTREAM_HEIGHT && height == LIVESTREAM_WIDTH)
 
         // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: proof-boundary telemetry
         // constants shared by the thermal FPS apply-result and diagnostics maps.
@@ -216,6 +224,65 @@ class VanguardCameraSource(
     // callback below (which runs off the main thread).
     private val firstFrameListener = AtomicReference<(() -> Unit)?>(null)
 
+    // ── livestream720p exact effect-input gate ───────────────────────────────
+    // Non-null from a successful livestream720p bindToLifecycle() until CameraX
+    // delivers the effect-input SurfaceRequest (accepted or rejected), the
+    // 10 s timeout fires, or stop()/suspendCapture()/a rebind cancels it. The
+    // start()/switchCamera()/resumeCapture() completion that armed it is
+    // reported exactly once, through the gate. Main thread only.
+    private var livestreamInputGate: LivestreamInputGate? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // ── start() attempt awaiting its ProcessCameraProvider lookup ────────────
+    // Non-null from start() until the provider listener takes over (bind) or
+    // stop() settles the attempt: teardown plus its onError, exactly once. The
+    // listener ignores an attempt that is no longer current and never touches
+    // the process-wide provider for it (a newer source may already be bound on
+    // it). start()/switchCamera() treat a pending attempt as an owned session.
+    // The attempt also owns the start's terminal callback: exactly one of
+    // onStarted/onError is ever selected, and once selected, an exception the
+    // consumer throws from it is the consumer's own — it never selects the
+    // opposite callback, is never delivered twice, and never rolls the
+    // reported outcome back. Main thread only.
+    private class StartAttempt(
+        private val onStarted: () -> Unit,
+        private val onError: (Exception) -> Unit,
+    ) {
+        /** True once onStarted or onError has been selected (whether or not it threw). */
+        var isSettled = false
+            private set
+
+        fun reportStarted() {
+            if (isSettled) return
+            isSettled = true
+            onStarted()
+        }
+
+        fun reportError(error: Exception) {
+            if (isSettled) {
+                Log.w(TAG, "start() — terminal callback already selected; later error ignored: $error")
+                return
+            }
+            isSettled = true
+            onError(error)
+        }
+    }
+    private var pendingStart: StartAttempt? = null
+
+    // True once teardownSession() has run (stop(), a failed start()/switchCamera(),
+    // or an invalidated session) until the next start(): the source owns no
+    // camera, processor or lifecycle any more and its owner should drop it.
+    @Volatile private var tornDown = false
+
+    /**
+     * Owner hook for a session that fails closed AFTER its start/switch already
+     * reported success (CameraX re-issued the livestream720p effect input at a
+     * size other than 1280×720/720×1280). Called once, on the main thread, after
+     * the source tore itself down ([isTornDown]); no MethodChannel result is
+     * pending for it, so the owner only drops the source.
+     */
+    var onSessionInvalidated: ((Exception) -> Unit)? = null
+
     // ── Main-thread executor (callbacks from CameraX → plugin) ───────────────
     private val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
 
@@ -283,15 +350,26 @@ class VanguardCameraSource(
      * [ProcessCameraProvider.getInstance] on its own thread.
      *
      * @param onStarted Called on the main thread when the preview is live and
-     *   [textureEntry.id()] is valid for Flutter's `Texture` widget.
-     * @param onError Called on the main thread if the camera cannot be opened.
+     *   [textureEntry.id()] is valid for Flutter's `Texture` widget. For
+     *   [CAPTURE_PROFILE_LIVESTREAM_720P] this is only after CameraX's effect
+     *   input was validated as exactly 1280×720 (or 720×1280 transposed).
+     * @param onError Called on the main thread if the camera cannot be opened,
+     *   if [stop] cancels the start while the camera provider is still being
+     *   looked up, or (livestream720p) if the effect input has another size,
+     *   does not arrive within 10 s, or the session is stopped before
+     *   validation. Exactly one of [onStarted]/[onError] is selected per
+     *   accepted start(); an exception thrown by the selected callback is the
+     *   caller's own and propagates without selecting the other one or
+     *   rolling the session back.
      */
     fun start(
         onStarted: () -> Unit = {},
         onError: (Exception) -> Unit = {},
     ) {
-        // I-2 guard: prevent double-start
-        if (isRunning) {
+        // I-2 guard: prevent double-start. A start whose provider lookup is
+        // still in flight, or a livestream720p bind still awaiting its
+        // exact-input validation, is an owned session and counts as running.
+        if (isRunning || pendingStart != null || livestreamInputGate != null) {
             Log.w(TAG, "start() called on already-running camera — ignored")
             return
         }
@@ -300,6 +378,7 @@ class VanguardCameraSource(
 
         // Reset cancellation flag for this fresh start attempt.
         stopRequested = false
+        tornDown = false
 
         // Reset readiness — a new session has not delivered a capture yet.
         cameraReadyFlag = false
@@ -309,42 +388,122 @@ class VanguardCameraSource(
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
 
-        val providerFuture = ProcessCameraProvider.getInstance(context)
-        providerFuture.addListener({
-            try {
-                val provider = providerFuture.get()
+        // This attempt owns the session until the provider resolves. stop()
+        // settles it meanwhile (teardown + onError, once); the listener below
+        // then finds it is no longer current and does nothing.
+        val attempt = StartAttempt(onStarted, onError)
+        pendingStart = attempt
 
-                // Check if stop() was called while the provider was resolving.
-                // If so, the plugin has already released the SurfaceTexture —
-                // calling bindUseCases()/provideSurface() on a released texture
-                // crashes. Abort cleanly without touching any hardware resource.
-                if (stopRequested) {
-                    Log.w(TAG, "start() listener: stop was requested during async gap — aborting bind")
-                    provider.unbindAll()
+        try {
+            val providerFuture = ProcessCameraProvider.getInstance(context)
+            providerFuture.addListener({
+                if (pendingStart !== attempt) {
+                    // stop() settled this attempt while the provider was resolving:
+                    // its onError already ran and the plugin may have released the
+                    // SurfaceTexture, so nothing may be bound. Nothing of this
+                    // attempt is bound, and the provider is shared process-wide (a
+                    // newer source may be bound on it), so it is left untouched.
+                    Log.w(TAG, "start() listener: this start was cancelled during the provider lookup — ignored")
                     return@addListener
                 }
+                pendingStart = null
+                try {
+                    val provider = providerFuture.get()
+                    cameraProvider = provider
 
-                cameraProvider = provider
-
-                // Build and bind all use-cases in one call.
-                bindUseCases(provider)
-
-                isRunning = true
-                Log.d(TAG, "start() — camera session live, textureId=${textureEntry.id()}")
-                onStarted()
-            } catch (e: Exception) {
-                Log.e(TAG, "start() — ProcessCameraProvider failed: $e")
-                onError(e)
+                    // Build and bind all use-cases in one call. livestream720p
+                    // completes through the exact effect-input gate (asynchronously,
+                    // once CameraX reports the negotiated input size); every other
+                    // profile completes synchronously inside bindUseCases().
+                    bindUseCases(
+                        provider,
+                        operation = "start",
+                        onBound = {
+                            isRunning = true
+                            Log.d(TAG, "start() — camera session live, textureId=${textureEntry.id()}")
+                            attempt.reportStarted()
+                        },
+                        onFailed = { e, cleanUp ->
+                            if (cleanUp) teardownSession()
+                            Log.e(TAG, "start() — livestream720p exact-input gate failed: $e")
+                            attempt.reportError(e)
+                        },
+                    )
+                } catch (e: Exception) {
+                    if (attempt.isSettled) {
+                        // The terminal callback had already been selected and
+                        // delivered when this was thrown (onStarted/onError ran
+                        // synchronously inside bindUseCases): it is the
+                        // consumer's own exception, not a startup failure. The
+                        // reported outcome stands — no teardown, no opposite
+                        // callback — and the exception propagates unchanged.
+                        Log.e(TAG, "start() — consumer callback threw after the start outcome was reported; propagating: $e")
+                        throw e
+                    }
+                    // Provider resolution or bind failed before any outcome was
+                    // selected: nothing usable remains, so tear the session down
+                    // before reporting, and the owner never keeps a half-started
+                    // source with a live lifecycle or provider.
+                    Log.e(TAG, "start() — ProcessCameraProvider/bind failed; session torn down: $e")
+                    teardownSession()
+                    attempt.reportError(e)
+                }
+            }, mainExecutor)
+        } catch (e: Exception) {
+            if (attempt.isSettled) {
+                // Only reachable if the listener ran inline and its consumer
+                // callback threw: the consumer's own exception, see above.
+                Log.e(TAG, "start() — consumer callback threw after the start outcome was reported; propagating: $e")
+                throw e
             }
-        }, mainExecutor)
+            // getInstance()/addListener() threw synchronously: no listener will
+            // ever run for this attempt. Settle it through the same identity
+            // guard as the asynchronous path, exactly once, with its session
+            // torn down. Nothing is bound and cameraProvider is still null, so
+            // the shared provider is not touched.
+            if (pendingStart !== attempt) {
+                Log.w(TAG, "start() — provider setup failed after this start was already settled — ignored: $e")
+                return
+            }
+            Log.e(TAG, "start() — ProcessCameraProvider setup failed synchronously; session torn down: $e")
+            teardownSession()
+            attempt.reportError(e)
+        }
     }
 
     // ── Use-case construction + binding ──────────────────────────────────────
 
+    /**
+     * Builds and binds the use cases for the current [lensFacing]. [onBound]
+     * runs once the bind is complete: synchronously for the default profile,
+     * and for [CAPTURE_PROFILE_LIVESTREAM_720P] only after the exact
+     * effect-input gate accepted CameraX's negotiated input. [onFailed] runs
+     * once, instead, when that gate rejects the input, times out, or is
+     * cancelled by stop()/suspendCapture()/a rebind; `cleanUp` is true when the
+     * caller must still unbind/tear down the session (false when the canceller
+     * already did). A synchronous bind failure throws instead, with nothing
+     * bound and no processor left behind. Main thread only.
+     */
     @OptIn(ExperimentalCamera2Interop::class)
-    private fun bindUseCases(provider: ProcessCameraProvider) {
-        // Tear down any previously bound use-cases first.
+    private fun bindUseCases(
+        provider: ProcessCameraProvider,
+        operation: String,
+        onBound: () -> Unit,
+        onFailed: (error: Exception, cleanUp: Boolean) -> Unit,
+    ) {
+        // A rebind supersedes a livestream720p bind still awaiting its
+        // exact-input validation: cancel its timer and report that operation
+        // once, as an error, so it can never succeed late against this bind.
+        livestreamInputGate?.fail(
+            IllegalStateException("livestream720p exact-input validation superseded by $operation rebind"),
+            cleanUp = false,
+        )
+
+        // Tear down any previously bound use-cases first. From here on the
+        // previous camera is gone: readiness is false until the new session
+        // completes a capture, and every failure below leaves nothing bound.
         provider.unbindAll()
+        cameraReadyFlag = false
 
         // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: a fresh bind invalidates any
         // previously-observed/applied AE FPS state and the actuator bound to
@@ -374,21 +533,24 @@ class VanguardCameraSource(
             .build()
 
         // ── Capture profile ──────────────────────────────────────────────────
-        // livestream720p (livestream single camera only) targets a 720p-class
-        // beauty/effect INPUT, not just a 720p preview. The effect targets
-        // PREVIEW|VIDEO_CAPTURE, so CameraX feeds it one shared (StreamSharing)
-        // camera stream whose size is merged from the Preview and VideoCapture
-        // children's candidate size lists; any child candidate above 720p lets
-        // CameraX keep a larger parent (observed: 1920×1080 input, 720×1280
-        // preview, egress downscaling 1.5×). So for livestream720p:
-        //   - Preview candidates are capped at ≤1280×720 (ResolutionFilter),
-        //   - VideoCapture falls back to LOWER qualities only when HD/SD exists,
-        //   - ImageCapture is not bound (the livestream takes no stills).
+        // livestream720p (livestream single camera only) requires an exactly
+        // 1280×720 beauty/effect INPUT, not just a 720p preview. The effect
+        // targets PREVIEW|VIDEO_CAPTURE, so CameraX feeds it one shared
+        // (StreamSharing) camera stream whose size is merged from the Preview
+        // and VideoCapture children's candidate size lists; any child candidate
+        // of another size lets CameraX pick another parent (observed: 1920×1080
+        // and 960×540 inputs). So for livestream720p:
+        //   - Preview candidates are exactly 1280×720 (FALLBACK_RULE_NONE plus a
+        //     ResolutionFilter that also admits the 720×1280 transposition),
+        //   - VideoCapture is Quality.HD with no fallback, and HD must be a
+        //     supported SDR quality before anything is bound,
+        //   - ImageCapture is not bound (the livestream takes no stills),
+        //   - the effect input CameraX actually negotiates is checked by the
+        //     LivestreamEffectInputProbe gate: anything but 1280×720 (or its
+        //     720×1280 transposition) is withheld and the bind fails.
         // Preview + VideoCapture stay bound on purpose: that StreamSharing
         // topology is what the beauty processor's output path is built for
-        // (its effect output keeps the input orientation/size). The size CameraX
-        // actually negotiates is logged by the effect-input probe and
-        // provideSurface(); nothing here guarantees 720p on every device.
+        // (its effect output keeps the input orientation/size).
         // Any other profile keeps the default selection below byte-for-byte.
         val livestream720p = captureProfile == CAPTURE_PROFILE_LIVESTREAM_720P
         val profileLabel = captureProfile ?: "default"
@@ -398,26 +560,29 @@ class VanguardCameraSource(
         // device has no exact 16:9 stream) so Preview and ImageCapture agree on
         // the same portrait-compatible aspect ratio as the iOS 1080×1920/16:9
         // preset — matching the app's fixed 9:16 FittedBox(BoxFit.cover) layout.
+        // livestream720p: exact 1280×720 with FALLBACK_RULE_NONE, and the filter
+        // keeps only that raster (or its 720×1280 transposition). An empty
+        // candidate list makes bindToLifecycle() throw — no fallback size.
+        var livestreamExactCandidates = -1 // set by the livestream720p filter; -1 = not consulted
         val resolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
             .apply {
                 if (livestream720p) {
                     setResolutionStrategy(
                         ResolutionStrategy(
-                            Size(1280, 720),
-                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                            Size(LIVESTREAM_WIDTH, LIVESTREAM_HEIGHT),
+                            ResolutionStrategy.FALLBACK_RULE_NONE,
                         )
                     )
-                    // Drop every candidate above 720p-class so the shared
-                    // stream merge cannot keep a larger parent for Preview.
                     setResolutionFilter(ResolutionFilter { sizes, _ ->
-                        val capped = sizes.filter { isLivestream720pClass(it.width, it.height) }
-                        if (capped.isEmpty()) {
-                            Log.w(TAG, "bindUseCases(profile=livestream720p) PARTIAL: no preview size ≤1280×720 among ${sizes.size} candidates; preview left uncapped")
-                            sizes
+                        val exact = sizes.filter { isLivestreamExactRaster(it.width, it.height) }
+                        livestreamExactCandidates = exact.size
+                        if (exact.isEmpty()) {
+                            Log.e(TAG, "bindUseCases(profile=livestream720p): no exact 1280×720 (or 720×1280) preview candidate among [${sizes.joinToString { "${it.width}×${it.height}" }}] — bind fails, no fallback")
                         } else {
-                            capped
+                            Log.i(TAG, "bindUseCases(profile=livestream720p): exact preview candidates [${exact.joinToString { "${it.width}×${it.height}" }}]")
                         }
+                        exact
                     })
                 }
             }
@@ -505,35 +670,22 @@ class VanguardCameraSource(
         // Default: QualitySelector prefers 1080p — falls back to highest
         // available if the device doesn't support it (matches iOS
         // AVCaptureSessionPreset1920x1080 fallback to 1280x720).
-        // livestream720p: prefers HD (720p). The fallback is LOWER-only when the
-        // camera supports HD or SD, so no VideoCapture candidate above 720p can
-        // enlarge the shared effect stream. Only when neither is supported (or
-        // the capability probe fails) is a higher fallback allowed, logged as a
-        // partial-proof condition.
-        var livestreamVideoFallback = "n/a"
+        // livestream720p: Quality.HD (1280×720) only. The camera must report HD
+        // among its supported SDR qualities before anything is bound, and no
+        // FallbackStrategy is attached, so VideoCapture cannot select another
+        // quality and move the shared effect stream off 1280×720. Should CameraX
+        // still negotiate another input size, the effect-input gate rejects it.
         val qualitySelector = if (livestream720p) {
-            val hdOrLowerSupported = try {
+            val hdSupported = try {
                 Recorder.getVideoCapabilities(provider.getCameraInfo(selector))
-                    .getSupportedQualities(DynamicRange.SDR)
-                    .any { it == Quality.HD || it == Quality.SD }
+                    .isQualitySupported(Quality.HD, DynamicRange.SDR)
             } catch (e: Exception) {
-                Log.w(TAG, "bindUseCases(profile=livestream720p): video capability probe failed — ${e.message}")
-                false
+                throw IllegalStateException("livestream720p: video capability probe failed — ${e.message}", e)
             }
-            if (hdOrLowerSupported) {
-                livestreamVideoFallback = "HD, lower-only"
-                QualitySelector.from(
-                    Quality.HD,
-                    FallbackStrategy.lowerQualityThan(Quality.HD)
-                )
-            } else {
-                livestreamVideoFallback = "HD, lower-then-higher"
-                Log.w(TAG, "bindUseCases(profile=livestream720p) PARTIAL: no HD/SD video quality reported; VideoCapture may fall back above 720p")
-                QualitySelector.from(
-                    Quality.HD,
-                    FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)
-                )
+            if (!hdSupported) {
+                throw IllegalStateException("livestream720p: camera reports no Quality.HD (1280×720) SDR video quality — refusing to bind")
             }
+            QualitySelector.from(Quality.HD)
         } else {
             QualitySelector.from(
                 Quality.FHD,                   // 1080p preferred
@@ -573,10 +725,17 @@ class VanguardCameraSource(
             beautyProcessor = it
         }
 
-        // livestream720p: the effect sees the same processor behind a probe
-        // that logs the negotiated effect-input size (the proof gate).
+        // livestream720p: the effect sees the processor behind the exact-input
+        // gate, which forwards CameraX's input surface only when it is exactly
+        // 1280×720 (or 720×1280 transposed) and otherwise withholds it and
+        // fails this bind. The gate is tied to this bind generation.
+        val gate: LivestreamInputGate? = if (livestream720p) {
+            LivestreamInputGate(bindGeneration, operation, onBound, onFailed)
+        } else {
+            null
+        }
         val effectProcessor: SurfaceProcessor =
-            if (livestream720p) LivestreamEffectInputProbe(processor) else processor
+            if (gate != null) LivestreamEffectInputProbe(processor, gate) else processor
 
         val useCaseGroup = androidx.camera.core.UseCaseGroup.Builder()
             .addUseCase(previewUseCase)
@@ -599,42 +758,156 @@ class VanguardCameraSource(
         // CameraX manages the camera session lifecycle internally.
         // All use-cases bound in one call via UseCaseGroup to include the
         // CameraEffect for the beauty SurfaceProcessor pipeline.
-        val boundCamera = provider.bindToLifecycle(
-            lifecycleOwner,
-            selector,
-            useCaseGroup,
-        )
+        val boundCamera = try {
+            provider.bindToLifecycle(
+                lifecycleOwner,
+                selector,
+                useCaseGroup,
+            )
+        } catch (e: Exception) {
+            // Nothing is bound: release the processor created for this bind and
+            // clear the use-case and camera state (the previous camera was
+            // unbound above) so the caller's error leaves no leak or stale field.
+            processor.release()
+            beautyProcessor = null
+            camera = null
+            preview = null
+            imageCapture = null
+            videoCapture = null
+            if (livestreamExactCandidates == 0) {
+                throw IllegalStateException("livestream720p: camera offers no exact 1280×720 (or 720×1280) preview size — refusing to bind", e)
+            }
+            throw e
+        }
         camera = boundCamera
 
         // P3-CAM-THERMAL-ACT-CAMERAX-FPS-BRIDGE: recreate the actuator against
         // the freshly-bound Camera instance for this bind generation.
         thermalFpsActuator = AndroidCameraXThermalFpsActuator(boundCamera, mainExecutor)
 
-        if (livestream720p) {
-            Log.d(TAG, "bindUseCases(profile=$profileLabel) — bound Preview + VideoCapture + BeautyEffect (no ImageCapture); preview ≤1280×720, video $livestreamVideoFallback")
+        if (gate != null) {
+            // Bound, not yet valid: success is reported by the gate once CameraX
+            // delivers an exactly 1280×720 effect input, failure on any other
+            // size or after LIVESTREAM_INPUT_GATE_TIMEOUT_MS without one.
+            livestreamInputGate = gate
+            gate.arm()
+            Log.d(TAG, "bindUseCases(profile=$profileLabel) — bound Preview + VideoCapture + BeautyEffect (no ImageCapture); exact 1280×720 input required, awaiting effect-input validation (bind generation ${gate.generation}, timeout ${LIVESTREAM_INPUT_GATE_TIMEOUT_MS} ms)")
         } else {
             Log.d(TAG, "bindUseCases(profile=$profileLabel) — bound Preview + ImageCapture + VideoCapture + BeautyEffect")
+            onBound()
         }
     }
 
-    // livestream720p proof probe: passes every call straight to the beauty
-    // processor and logs the effect-input size CameraX negotiated. Above
-    // 720p-class it logs a PARTIAL diagnostic instead of implying success.
-    private class LivestreamEffectInputProbe(
+    // Gate states of one livestream720p bind (see LivestreamInputGate).
+    private enum class LivestreamGateState { PENDING, ACCEPTED, FAILED }
+
+    // livestream720p exact effect-input gate. CameraX hands the shared effect
+    // input (the Preview + VideoCapture StreamSharing parent) to this processor
+    // on the effect executor (main thread). The input is forwarded to the beauty
+    // processor only when it is exactly 1280×720, or 720×1280 when the sensor
+    // orientation transposes the same 16:9 raster; any other size (960×540
+    // included) is withheld with willNotProvideSurface() and fails the bind.
+    // Requests for a superseded bind generation or a failed gate are withheld
+    // the same way, and output surfaces are forwarded only once the input of
+    // the current generation was accepted — otherwise they are closed here.
+    private inner class LivestreamEffectInputProbe(
         private val delegate: SurfaceProcessor,
+        private val gate: LivestreamInputGate,
     ) : SurfaceProcessor {
         override fun onInputSurface(request: SurfaceRequest) {
             val size = request.resolution
-            if (isLivestream720pClass(size.width, size.height)) {
-                Log.i(TAG, "livestream720p effect input ${size.width}×${size.height} (720p-class)")
-            } else {
-                Log.w(TAG, "livestream720p PARTIAL: effect input ${size.width}×${size.height} is above 720p-class; beauty runs above 720p and egress downscales — mark physical proof partial")
+            val generation = gate.generation
+            val exact = isLivestreamExactRaster(size.width, size.height)
+            when {
+                generation != bindGeneration || gate.state == LivestreamGateState.FAILED || delegate !== beautyProcessor -> {
+                    Log.w(TAG, "livestream720p effect input ${size.width}×${size.height} for bind generation $generation is stale (current $bindGeneration, gate ${gate.state}, processor live=${delegate === beautyProcessor}) — surface withheld")
+                    request.willNotProvideSurface()
+                }
+                gate.state == LivestreamGateState.ACCEPTED && exact -> {
+                    // CameraX rebuilt its pipeline for this still-current bind:
+                    // the same exact input keeps flowing to the processor.
+                    Log.i(TAG, "livestream720p effect input ${size.width}×${size.height} re-issued for accepted bind generation $generation — forwarded")
+                    delegate.onInputSurface(request)
+                }
+                gate.state == LivestreamGateState.ACCEPTED -> {
+                    // The session already reported success: fail closed. The
+                    // teardown (which releases this delegate) runs on the main
+                    // thread after this SurfaceProcessor callback has returned.
+                    Log.e(TAG, "livestream720p effect input ${size.width}×${size.height} re-issued after acceptance is not the exact 1280×720 raster (720×1280 transposed is the only other accepted size) — surface withheld, session invalidated (bind generation $generation)")
+                    request.willNotProvideSurface()
+                    val error = IllegalStateException("livestream720p effect input re-issued as ${size.width}×${size.height}, not exactly 1280×720 (or 720×1280 transposed)")
+                    mainHandler.post { invalidateSession(generation, error) }
+                }
+                !exact -> {
+                    // Pending gate, wrong size: withhold now; the operation fails
+                    // (and tears down) once this callback has returned.
+                    Log.e(TAG, "livestream720p effect input ${size.width}×${size.height} is not the exact 1280×720 raster (720×1280 transposed is the only other accepted size) — gate REJECTED, surface withheld (bind generation $generation)")
+                    request.willNotProvideSurface()
+                    val error = IllegalStateException("livestream720p effect input ${size.width}×${size.height} is not exactly 1280×720 (or 720×1280 transposed)")
+                    mainHandler.post { gate.fail(error, cleanUp = true) }
+                }
+                else -> {
+                    Log.i(TAG, "livestream720p effect input ${size.width}×${size.height} — exact 1280×720 raster, gate ACCEPTED (bind generation $generation)")
+                    delegate.onInputSurface(request)
+                    gate.accept()
+                }
             }
-            delegate.onInputSurface(request)
         }
 
         override fun onOutputSurface(surfaceOutput: SurfaceOutput) {
-            delegate.onOutputSurface(surfaceOutput)
+            if (gate.generation == bindGeneration && gate.state == LivestreamGateState.ACCEPTED && delegate === beautyProcessor) {
+                delegate.onOutputSurface(surfaceOutput)
+            } else {
+                val size = surfaceOutput.size
+                Log.w(TAG, "livestream720p effect output ${size.width}×${size.height} for bind generation ${gate.generation} without an accepted input (gate ${gate.state}, current generation $bindGeneration) — closed")
+                surfaceOutput.close()
+            }
+        }
+    }
+
+    // Exactly-once completion of one livestream720p bind: accepted by the probe
+    // (exact input forwarded), or failed by the probe (another size), by the
+    // 10 s timeout, or by stop()/suspendCapture()/a rebind cancelling it. The
+    // timer is cancelled on every settle, and a settled gate ignores every
+    // later accept/fail, so the operation that armed it hears back exactly
+    // once. Main thread only.
+    private inner class LivestreamInputGate(
+        val generation: Int,
+        private val operation: String,
+        private val onAccepted: () -> Unit,
+        private val onFailed: (error: Exception, cleanUp: Boolean) -> Unit,
+    ) {
+        var state = LivestreamGateState.PENDING
+            private set
+
+        private val timeout = Runnable {
+            Log.e(TAG, "livestream720p effect input not delivered within ${LIVESTREAM_INPUT_GATE_TIMEOUT_MS} ms — $operation failed (bind generation $generation)")
+            fail(
+                IllegalStateException("livestream720p: no effect input within ${LIVESTREAM_INPUT_GATE_TIMEOUT_MS} ms ($operation, bind generation $generation)"),
+                cleanUp = true,
+            )
+        }
+
+        fun arm() {
+            mainHandler.postDelayed(timeout, LIVESTREAM_INPUT_GATE_TIMEOUT_MS)
+        }
+
+        fun accept() {
+            if (!settle(LivestreamGateState.ACCEPTED)) return
+            onAccepted()
+        }
+
+        fun fail(error: Exception, cleanUp: Boolean) {
+            if (!settle(LivestreamGateState.FAILED)) return
+            onFailed(error, cleanUp)
+        }
+
+        private fun settle(next: LivestreamGateState): Boolean {
+            if (state != LivestreamGateState.PENDING) return false
+            state = next
+            mainHandler.removeCallbacks(timeout)
+            if (livestreamInputGate === this) livestreamInputGate = null
+            return true
         }
     }
 
@@ -679,19 +952,52 @@ class VanguardCameraSource(
      * If a recording is in progress it is finalized before the session closes.
      * Callers that need the finalized file path should call [stopRecording]
      * first, then [stop]. (The plugin's teardown path follows this pattern.)
+     *
+     * A start() still waiting for its camera provider, or a livestream720p bind
+     * still awaiting its exact-input validation, is an owned session with
+     * [isRunning] still false: it is torn down here all the same (lifecycle
+     * destroyed, nothing bound), and the start/switch/resume behind it is
+     * reported once, as an error. The provider listener of a cancelled start
+     * then does nothing, so no bind ever follows against a released texture.
      */
     fun stop() {
-        // Always set stopRequested — this cancels any in-flight start() that is
-        // still waiting for ProcessCameraProvider.getInstance() to complete.
-        // Without this, the async listener fires after stop() returns, tries to
-        // bind use-cases against an already-released SurfaceTexture, and crashes.
+        // Always set stopRequested — the session is stopping for every later
+        // caller (thermal apply, suspend/resume) even when nothing was bound.
         stopRequested = true
 
-        if (!isRunning) {
+        val pendingGate = livestreamInputGate
+        val startAttempt = pendingStart
+        if (!isRunning && pendingGate == null && startAttempt == null) {
             Log.d(TAG, "stop() called on already-stopped camera — state cleared, no-op for CameraX")
             return
         }
+        if (startAttempt != null) {
+            Log.w(TAG, "stop() — cancelling the start() whose camera provider lookup is still in flight")
+        }
+        if (pendingGate != null) {
+            Log.w(TAG, "stop() — cancelling the pending livestream720p exact-input gate (bind generation ${pendingGate.generation})")
+        }
         Log.d(TAG, "stop() — unbinding all use-cases")
+        teardownSession()
+        // Resolve the pending operation exactly once, after the teardown, so its
+        // callback observes a stopped source. cleanUp=false: done just above.
+        pendingGate?.fail(
+            IllegalStateException("camera stopped before livestream720p exact-input validation completed"),
+            cleanUp = false,
+        )
+        startAttempt?.reportError(IllegalStateException("camera stopped while the camera provider was starting"))
+
+        Log.d(TAG, "stop() — complete")
+    }
+
+    // Full teardown shared by stop(), a failed start()/switchCamera() and
+    // invalidateSession(): ends any recording, destroys the fake lifecycle,
+    // unbinds everything, releases the processor and clears every
+    // session/readiness/use-case field. Afterwards isTornDown is true and the
+    // owner is expected to drop this source.
+    private fun teardownSession() {
+        tornDown = true
+        pendingStart = null
 
         // If recording is active, stop it synchronously before unbinding.
         // This matches iOS teardownCameraAsync which calls stopRecording first.
@@ -729,8 +1035,42 @@ class VanguardCameraSource(
         // and reaches applyThermalTargetFps()'s stopped-check branch below,
         // which still replies exactly once (STOPPED).
         thermalFpsActuator = null
+    }
 
-        Log.d(TAG, "stop() — complete")
+    // Unbinds the current use cases and releases the processor while keeping
+    // isRunning, the provider, the lifecycle owner, the Flutter texture and all
+    // beauty/color/green-screen/overlay state: the suspended shape that
+    // suspendCapture() establishes and that a rejected/timed-out
+    // resumeCapture() bind falls back to (a failed switchCamera() tears the
+    // whole source down instead). Main thread only.
+    private fun unbindSession() {
+        firstFrameListener.set(null)
+        cameraProvider?.unbindAll()
+        beautyProcessor?.release()
+        beautyProcessor = null
+        camera = null
+        preview = null
+        imageCapture = null
+        videoCapture = null
+        thermalFpsActuator = null
+        cameraReadyFlag = false
+    }
+
+    // Fails an already-accepted livestream720p session closed: CameraX re-issued
+    // its effect input at a size other than 1280×720/720×1280 after start or
+    // switch reported success. Runs on the main thread after the
+    // SurfaceProcessor callback that detected it has returned. Tears the source
+    // down once — only while that bind generation is still the live, running
+    // session — and tells the owner through onSessionInvalidated; no
+    // MethodChannel result is pending for it any more.
+    private fun invalidateSession(generation: Int, error: Exception) {
+        if (tornDown || !isRunning || captureSuspended || generation != bindGeneration) {
+            Log.w(TAG, "invalidateSession(bind generation $generation) ignored — stale (current $bindGeneration, running=$isRunning, suspended=$captureSuspended, tornDown=$tornDown): ${error.message}")
+            return
+        }
+        Log.e(TAG, "invalidateSession(bind generation $generation) — tearing the session down: ${error.message}")
+        teardownSession()
+        onSessionInvalidated?.invoke(error)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -743,12 +1083,40 @@ class VanguardCameraSource(
      * handler guards this with [isRecording].
      *
      * @param onStarted Forwarded to the new [start] call — called when the
-     *   new camera session is live.
+     *   new camera session is live. For [CAPTURE_PROFILE_LIVESTREAM_720P] that
+     *   is only after the rebound session's exact effect-input validation.
+     * @param onError Called once if the bind throws or the exact-input gate
+     *   rejects or times out — the previous camera is already unbound by then,
+     *   so the source is fully torn down first ([isTornDown] is true) and the
+     *   owner must drop it — or, with the source left untouched (lens not
+     *   flipped, nothing scheduled), when the camera is still starting, another
+     *   validation is still pending, or the source is already torn down.
      */
     fun switchCamera(
         onStarted: () -> Unit = {},
         onError: (Exception) -> Unit = {},
     ) {
+        // One bind validation at a time: a livestream720p bind still awaiting
+        // its exact-input gate is neither superseded nor flipped underneath.
+        val pendingGate = livestreamInputGate
+        if (pendingGate != null) {
+            Log.w(TAG, "switchCamera() — rejected: livestream720p exact-input validation pending (bind generation ${pendingGate.generation})")
+            onError(IllegalStateException("switchCamera: livestream720p exact-input validation still pending"))
+            return
+        }
+        // A start whose provider lookup is still in flight owns the session:
+        // flipping the lens or scheduling a second start would race its bind
+        // (or its cancellation) and its single MethodChannel reply.
+        if (pendingStart != null) {
+            Log.w(TAG, "switchCamera() — rejected: camera is still starting (provider lookup in flight)")
+            onError(IllegalStateException("switchCamera: camera is still starting"))
+            return
+        }
+        if (tornDown) {
+            Log.w(TAG, "switchCamera() — rejected: camera source is torn down")
+            onError(IllegalStateException("switchCamera: camera source is torn down"))
+            return
+        }
         Log.d(TAG, "switchCamera() — flipping lens")
         lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
             CameraSelector.LENS_FACING_FRONT
@@ -771,17 +1139,34 @@ class VanguardCameraSource(
         // transition is as fast as possible.
         val provider = cameraProvider
         if (provider == null) {
-            // No provider: full restart needed.
+            // Never started (a torn-down or starting source was refused above):
+            // start now with the flipped lens.
             start(onStarted, onError)
             return
         }
 
+        // From the first line of bindUseCases() the previous camera is unbound,
+        // so every failure past this point leaves no usable session: tear the
+        // source down fully (isTornDown) before the single error callback, so
+        // the owner drops it instead of keeping a "running" shell with stale
+        // camera/processor state.
         try {
-            bindUseCases(provider)
-            onStarted()
-            Log.d(TAG, "switchCamera() — complete; lensNow=${if (lensFacing == CameraSelector.LENS_FACING_FRONT) "FRONT" else "BACK"}")
+            bindUseCases(
+                provider,
+                operation = "switchCamera",
+                onBound = {
+                    onStarted()
+                    Log.d(TAG, "switchCamera() — complete; lensNow=${if (lensFacing == CameraSelector.LENS_FACING_FRONT) "FRONT" else "BACK"}")
+                },
+                onFailed = { e, cleanUp ->
+                    if (cleanUp) teardownSession()
+                    Log.e(TAG, "switchCamera() — livestream720p exact-input gate failed; session torn down: $e")
+                    onError(e)
+                },
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "switchCamera() — bindUseCases failed: $e")
+            Log.e(TAG, "switchCamera() — bindUseCases failed; session torn down: $e")
+            teardownSession()
             onError(e)
         }
     }
@@ -1469,14 +1854,17 @@ class VanguardCameraSource(
      *
      * Returns false (nothing changed) when the session is not running or is
      * stopping, has no provider, or a recording is active. Idempotent while
-     * suspended. Main thread only.
+     * suspended. A switchCamera()/resumeCapture() bind still awaiting its
+     * livestream720p exact-input validation is unbound here like a live
+     * session and its operation is reported once, as an error. Main thread only.
      */
     fun suspendCapture(): Boolean {
         if (!isRunning || stopRequested) {
             Log.w(TAG, "suspendCapture rejected: session not running")
             return false
         }
-        if (captureSuspended) return true
+        val pendingGate = livestreamInputGate
+        if (captureSuspended && pendingGate == null) return true
         val provider = cameraProvider
         if (provider == null) {
             Log.w(TAG, "suspendCapture rejected: no camera provider")
@@ -1486,17 +1874,15 @@ class VanguardCameraSource(
             Log.w(TAG, "suspendCapture rejected: recording active")
             return false
         }
-        firstFrameListener.set(null)
-        provider.unbindAll()
-        beautyProcessor?.release()
-        beautyProcessor = null
-        camera = null
-        preview = null
-        imageCapture = null
-        videoCapture = null
-        thermalFpsActuator = null
-        cameraReadyFlag = false
+        if (pendingGate != null) {
+            Log.w(TAG, "suspendCapture — cancelling the pending livestream720p exact-input gate (bind generation ${pendingGate.generation})")
+        }
+        unbindSession()
         captureSuspended = true
+        pendingGate?.fail(
+            IllegalStateException("capture suspended before livestream720p exact-input validation completed"),
+            cleanUp = false,
+        )
         Log.i(TAG, "suspendCapture — use-cases unbound, processor released; beauty/GS/overlay state retained")
         return true
     }
@@ -1506,8 +1892,11 @@ class VanguardCameraSource(
      * (same path as [switchCamera]: fresh beauty processor with the retained
      * beauty/color/green-screen/overlay state). [onFirstFrame] runs once, on
      * the main thread, when the Camera2 session reports its first completed
-     * capture; [onError] runs (synchronously) when the resume is refused or
-     * the bind throws, in which case the source stays suspended. Main thread.
+     * capture — for [CAPTURE_PROFILE_LIVESTREAM_720P] only after the exact
+     * effect-input validation has also passed. [onError] runs once when the
+     * resume is refused or the bind throws (synchronously), or when the
+     * exact-input gate rejects or times out (asynchronously); in every case
+     * the source stays suspended and a later resume may retry. Main thread.
      */
     fun resumeCapture(
         onFirstFrame: () -> Unit,
@@ -1521,17 +1910,38 @@ class VanguardCameraSource(
             onError(IllegalStateException("resumeCapture: camera session not running"))
             return
         }
+        if (livestreamInputGate != null) {
+            onError(IllegalStateException("resumeCapture: livestream720p exact-input validation still pending"))
+            return
+        }
         val provider = cameraProvider
         if (provider == null) {
             onError(IllegalStateException("resumeCapture: no camera provider"))
             return
         }
         cameraReadyFlag = false
-        firstFrameListener.set(onFirstFrame)
         try {
-            bindUseCases(provider)
-            captureSuspended = false
-            Log.i(TAG, "resumeCapture — use-cases rebound; waiting for the first completed capture")
+            bindUseCases(
+                provider,
+                operation = "resumeCapture",
+                onBound = {
+                    captureSuspended = false
+                    // The first frame needs both the (now passed) input
+                    // validation and a completed capture: arm the one-shot
+                    // listener, and fire it here if a capture already completed.
+                    firstFrameListener.set(onFirstFrame)
+                    if (cameraReadyFlag) {
+                        firstFrameListener.getAndSet(null)?.let { listener -> mainExecutor.execute { listener() } }
+                    }
+                    Log.i(TAG, "resumeCapture — use-cases rebound; waiting for the first completed capture")
+                },
+                onFailed = { e, cleanUp ->
+                    firstFrameListener.set(null)
+                    if (cleanUp) unbindSession()
+                    Log.e(TAG, "resumeCapture — livestream720p exact-input gate failed; capture stays suspended: $e")
+                    onError(e)
+                },
+            )
         } catch (e: Exception) {
             firstFrameListener.set(null)
             Log.e(TAG, "resumeCapture — bindUseCases failed: $e")
@@ -1581,6 +1991,13 @@ class VanguardCameraSource(
 
     /** True when camera session is active. */
     val running: Boolean get() = isRunning
+
+    /**
+     * True once this source has torn itself down (stop(), a failed start or
+     * switch, or an invalidated session) and owns no camera, processor or
+     * lifecycle any more. Owners drop such a source instead of reusing it.
+     */
+    val isTornDown: Boolean get() = tornDown
 
     /**
      * True once the Camera2 capture session behind the Preview use-case has
