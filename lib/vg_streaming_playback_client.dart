@@ -291,6 +291,41 @@ class VGStreamingPlaybackSession {
   /// Reason string for the last ignored cache event, or `null` if none occurred.
   final String? playbackCacheLastIgnoredReason;
 
+  /// AVPlayer `timeControlStatus` (`paused`, `waitingToPlayAtSpecifiedRate`,
+  /// `playing`) when the backend reports it (iOS); `null` otherwise.
+  final String? playerTimeControlStatus;
+
+  /// AVPlayer `reasonForWaitingToPlay` while it is waiting; `null` when it is
+  /// not waiting or the backend does not report it.
+  final String? playerWaitingReason;
+
+  /// AVPlayerItem `isPlaybackBufferEmpty`; `null` when not reported.
+  final bool? isPlaybackBufferEmpty;
+
+  /// AVPlayerItem `isPlaybackLikelyToKeepUp`; `null` when not reported.
+  final bool? isPlaybackLikelyToKeepUp;
+
+  /// Session-scoped count of playback-stalled notifications; `null` when not
+  /// reported.
+  final int? playbackStalledCount;
+
+  /// Milliseconds since the last playback-stalled notification; `null` when
+  /// none occurred yet or the backend does not report it.
+  final int? msSinceLastPlaybackStall;
+
+  /// Session-scoped count of pixel buffers copied from the platform video
+  /// output. A copy is not proof of visible presentation. `null` when not
+  /// reported.
+  final int? copiedPixelBufferCount;
+
+  /// Item time in milliseconds of the most recently copied pixel buffer;
+  /// `null` before the first copy or when not reported.
+  final int? lastCopiedItemTimeMs;
+
+  /// Milliseconds since [lastCopiedItemTimeMs] last changed; `null` before the
+  /// first copy or when not reported.
+  final int? msSinceCopiedItemTimeAdvanced;
+
   /// Raw diagnostic status string from platform engine.
   final String raw;
 
@@ -322,6 +357,15 @@ class VGStreamingPlaybackSession {
     this.playbackCacheSizeBytes = 0,
     this.playbackCacheIgnoredCount = 0,
     this.playbackCacheLastIgnoredReason,
+    this.playerTimeControlStatus,
+    this.playerWaitingReason,
+    this.isPlaybackBufferEmpty,
+    this.isPlaybackLikelyToKeepUp,
+    this.playbackStalledCount,
+    this.msSinceLastPlaybackStall,
+    this.copiedPixelBufferCount,
+    this.lastCopiedItemTimeMs,
+    this.msSinceCopiedItemTimeAdvanced,
     required this.raw,
     required this.diagnostics,
   });
@@ -463,6 +507,20 @@ class VGStreamingPlaybackSession {
       playbackCacheSizeBytes: playbackCacheSizeBytes,
       playbackCacheIgnoredCount: playbackCacheIgnoredCount,
       playbackCacheLastIgnoredReason: playbackCacheLastIgnoredReason,
+      playerTimeControlStatus: stringMap['playerTimeControlStatus'] as String?,
+      playerWaitingReason: stringMap['playerWaitingReason'] as String?,
+      isPlaybackBufferEmpty: stringMap['isPlaybackBufferEmpty'] as bool?,
+      isPlaybackLikelyToKeepUp: stringMap['isPlaybackLikelyToKeepUp'] as bool?,
+      playbackStalledCount: (stringMap['playbackStalledCount'] as num?)
+          ?.toInt(),
+      msSinceLastPlaybackStall: (stringMap['msSinceLastPlaybackStall'] as num?)
+          ?.toInt(),
+      copiedPixelBufferCount: (stringMap['copiedPixelBufferCount'] as num?)
+          ?.toInt(),
+      lastCopiedItemTimeMs: (stringMap['lastCopiedItemTimeMs'] as num?)
+          ?.toInt(),
+      msSinceCopiedItemTimeAdvanced:
+          (stringMap['msSinceCopiedItemTimeAdvanced'] as num?)?.toInt(),
       raw: raw,
       diagnostics: stringMap,
     );

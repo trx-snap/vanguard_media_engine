@@ -1,6 +1,9 @@
 // VGStreamingPlaybackCoordinator.swift
 // Phase 4C8A — Native iOS Public Streaming Playback Parity Scaffold
 // Phase 4C8Y — iOS playback network-profile policy parity with Android Phase 4C5B
+// LOW_LATENCY live-edge experiment — stay within 2 s of the live edge (VGLiveEdgePolicy)
+// LOW_LATENCY startup alignment experiment (Debug or explicit Release opt-in) — VGHLSStartupAlignment
+// LOW_LATENCY interruption recovery experiment (same gating) — VGHLSRecovery over VGPlaybackGraph
 //
 // Implements AVPlayer HLS / LL-HLS backend for VGStreamingPlaybackClient
 // public Dart routes. Owns FlutterTextureRegistry, session map, AVURLAsset,
@@ -19,6 +22,7 @@ import AVFoundation
 import Flutter
 import Network
 import UIKit
+import os
 
 // MARK: - Network-profile policy (Phase 4C8Y)
 
@@ -34,6 +38,13 @@ import UIKit
 ///   CONSTRAINED — min/max/start/rebuffer = 25000/60000/5000/8000 ms,
 ///                  maxVideoBitrate=800000, maxAudioBitrate=96000.
 ///   LOW_LATENCY — min/max/start/rebuffer = 3000/10000/1000/1500 ms, no bitrate cap.
+///
+/// iOS LOW_LATENCY additionally prioritises the live edge: a 1.2 s forward buffer,
+/// AVPlayer's default waiting to minimise stalls, a configuredTimeOffsetFromLive of
+/// 1.2 s and automaticallyPreservesTimeOffsetFromLive, so AVPlayer itself starts
+/// and rebuffers at that offset. The coordinator's own live-position seeks
+/// (VGLiveEdgePolicy) are disabled by livePositionSeeksEnabled. The other profiles
+/// keep AVPlayer's live-offset defaults.
 private struct VGStreamingNetworkPolicy {
 
     // ── Normalised profile ─────────────────────────────────────────────────────
@@ -55,6 +66,12 @@ private struct VGStreamingNetworkPolicy {
     let preferredForwardBufferDurationSeconds: Double
     let preferredPeakBitRate:                  Double
     let automaticallyWaitsToMinimizeStalling:  Bool
+    /// AVPlayerItem.configuredTimeOffsetFromLive in seconds; nil leaves the default.
+    let configuredTimeOffsetFromLiveSeconds:   Double?
+
+    /// Whether the coordinator seeks the session to the live position at playback
+    /// start and catches up when it falls behind (VGLiveEdgePolicy).
+    var prioritisesLiveEdge: Bool { return configuredTimeOffsetFromLiveSeconds != nil }
 
     // MARK: Factory
 
@@ -84,6 +101,7 @@ private struct VGStreamingNetworkPolicy {
             preferredForwardBufferDurationSeconds = 15.0
             preferredPeakBitRate                = 0.0
             automaticallyWaitsToMinimizeStalling = true
+            configuredTimeOffsetFromLiveSeconds = nil
 
         case "CONSTRAINED":
             customPolicyEnabled                 = true
@@ -98,6 +116,7 @@ private struct VGStreamingNetworkPolicy {
             preferredForwardBufferDurationSeconds = 25.0
             preferredPeakBitRate                = 896_000.0  // 800000 + 96000
             automaticallyWaitsToMinimizeStalling = true
+            configuredTimeOffsetFromLiveSeconds = nil
 
         case "LOW_LATENCY":
             customPolicyEnabled                 = true
@@ -109,9 +128,10 @@ private struct VGStreamingNetworkPolicy {
             maxAudioBitrate                     = nil
             forceLowestBitrate                  = false
             exceedVideoConstraintsIfNecessary   = true
-            preferredForwardBufferDurationSeconds = 3.0
+            preferredForwardBufferDurationSeconds = 1.2
             preferredPeakBitRate                = 0.0
-            automaticallyWaitsToMinimizeStalling = false
+            automaticallyWaitsToMinimizeStalling = true
+            configuredTimeOffsetFromLiveSeconds = 1.2
 
         default: // AUTO — preserve AVPlayer defaults
             customPolicyEnabled                 = false
@@ -126,15 +146,26 @@ private struct VGStreamingNetworkPolicy {
             preferredForwardBufferDurationSeconds = 0.0
             preferredPeakBitRate                = 0.0
             automaticallyWaitsToMinimizeStalling = true
+            configuredTimeOffsetFromLiveSeconds = nil
         }
     }
 
     // MARK: AVFoundation application
 
     /// Applies the policy to `item` immediately after item creation.
+    ///
+    /// configuredTimeOffsetFromLive (iOS 13+) is where live playback begins after a
+    /// live start or a seek to kCMTimePositiveInfinity. The item's
+    /// automaticallyPreservesTimeOffsetFromLive is set to true, so AVPlayer seeks
+    /// forward on its own after buffering to restore that offset. The coordinator's
+    /// own catch-up seeks (VGLiveEdgePolicy) are disabled by livePositionSeeksEnabled.
     func apply(to item: AVPlayerItem) {
         item.preferredForwardBufferDuration = preferredForwardBufferDurationSeconds
         item.preferredPeakBitRate           = preferredPeakBitRate
+        if let offsetSeconds = configuredTimeOffsetFromLiveSeconds {
+            item.automaticallyPreservesTimeOffsetFromLive = true
+            item.configuredTimeOffsetFromLive = CMTime(seconds: offsetSeconds, preferredTimescale: 600)
+        }
     }
 
     /// Applies the policy to `player` immediately after player creation.
@@ -163,7 +194,58 @@ private struct VGStreamingNetworkPolicy {
         map["bufferForPlaybackAfterRebufferMs"] = bufferForPlaybackAfterRebufferMs.map { $0 as Any } ?? NSNull()
         map["maxVideoBitrate"]                  = maxVideoBitrate.map { $0 as Any } ?? NSNull()
         map["maxAudioBitrate"]                  = maxAudioBitrate.map { $0 as Any } ?? NSNull()
+        map["configuredTimeOffsetFromLiveSeconds"] = configuredTimeOffsetFromLiveSeconds.map { $0 as Any } ?? NSNull()
         return map
+    }
+}
+
+// MARK: - Live-edge policy (LOW_LATENCY)
+
+/// The LOW_LATENCY experiment: stay within catchUpThresholdSeconds of the live edge,
+/// accepting an occasional visible jump over continued high latency. The offset is
+/// the valid seekable range's end minus the playhead, sampled about once a second
+/// from the display link while the session plays a confirmed live item; two
+/// consecutive samples over the threshold issue one seek to the live position
+/// (kCMTimePositiveInfinity, which AVPlayer resolves to configuredTimeOffsetFromLive
+/// behind the latest content), and nothing more until that seek completes and a
+/// sample at or under reArmThresholdSeconds re-arms it. This is a playback policy;
+/// it does not show that AVPlayer requested or negotiated LL-HLS.
+private enum VGLiveEdgePolicy {
+    static let sampleIntervalSeconds:   CFTimeInterval = 1.0
+    static let catchUpThresholdSeconds: Double = 2.0
+    static let reArmThresholdSeconds:   Double = 1.5
+    static let consecutiveSamples:      Int = 2
+
+    /// Experiment switch for the two coordinator seeks to the live position: the
+    /// initial seek and the catch-up seek. false issues neither: the initial seek is
+    /// decided as skipped (never pending, issued or retried), the sampler still runs
+    /// but issues and counts no catch-up, and the only live positioning is AVPlayer's
+    /// own live start at configuredTimeOffsetFromLive. true restores both seeks.
+    static let livePositionSeeksEnabled: Bool = false
+}
+
+// MARK: - AVPlayer time-control status
+
+private extension AVPlayer.TimeControlStatus {
+    /// The session state this status stands for; nil for a status this build does
+    /// not know, which leaves the state as it is.
+    var vgSessionState: String? {
+        switch self {
+        case .playing:                      return "playing"
+        case .waitingToPlayAtSpecifiedRate: return "buffering"
+        case .paused:                       return "paused"
+        @unknown default:                   return nil
+        }
+    }
+
+    /// Diagnostic label reported in the snapshot.
+    var vgLabel: String {
+        switch self {
+        case .playing:                      return "playing"
+        case .waitingToPlayAtSpecifiedRate: return "waitingToPlayAtSpecifiedRate"
+        case .paused:                       return "paused"
+        @unknown default:                   return "unknown"
+        }
     }
 }
 
@@ -185,11 +267,17 @@ private final class VGPlaybackSession {
     // ── Network policy (Phase 4C8Y) ───────────────────────────────────────────
     let networkPolicy: VGStreamingNetworkPolicy
 
-    // ── AVFoundation objects ──────────────────────────────────────────────────
-    let asset:       AVURLAsset
-    let item:        AVPlayerItem
-    let player:      AVPlayer
-    let videoOutput: AVPlayerItemVideoOutput
+    // ── AVFoundation graph ────────────────────────────────────────────────────
+    /// The current asset/item/player/videoOutput. Replaced whole by an interruption
+    /// recovery (VGHLSRecovery); the public identity above never changes.
+    var graph: VGPlaybackGraph
+    /// What the graph was built from, so a replacement is built the same way.
+    let sourceURL:          URL
+    let sourceAssetOptions: [String: Any]?
+    var asset:       AVURLAsset              { return graph.asset }
+    var item:        AVPlayerItem            { return graph.item }
+    var player:      AVPlayer                { return graph.player }
+    var videoOutput: AVPlayerItemVideoOutput { return graph.videoOutput }
 
     // ── Flutter texture ───────────────────────────────────────────────────────
     let texture:   VGPlaybackFlutterTexture
@@ -206,9 +294,67 @@ private final class VGPlaybackSession {
     var renderedFrames: Int = 0
     var decodedFrames:  Int = 0
 
-    // ── KVO tokens ────────────────────────────────────────────────────────────
+    // ── Playback-health diagnostics (session-scoped, monotonic) ──────────────
+    // AVPlayerItemPlaybackStalled notifications and AVPlayerItemVideoOutput copy
+    // evidence. Times are CACurrentMediaTime() seconds. None of this proves that
+    // a frame was composited or visible on screen.
+    var playbackStalledCount:         Int = 0
+    var lastPlaybackStalledAt:        CFTimeInterval? = nil
+    var copiedPixelBufferCount:       Int = 0
+    var lastCopiedItemTimeMs:         Int? = nil
+    var lastCopiedItemTimeAdvancedAt: CFTimeInterval? = nil
+
+    // ── KVO / notification tokens (current graph) ─────────────────────────────
     var statusObservation:       NSKeyValueObservation?
     var playerStatusObservation: NSKeyValueObservation?
+    var timeControlStatusObservation: NSKeyValueObservation?
+    var playedToEndToken:        NSObjectProtocol?
+    var playbackStalledToken:    NSObjectProtocol?
+
+    // ── Latency sampling (unified log) ────────────────────────────────────────
+    var latencyRecorder: VGHLSLatencyRecorder?
+
+    // ── Startup alignment and recovery (Debug / Release opt-in, LOW_LATENCY; main thread) ──
+    /// Owns the current attempt's timing and native effects; the coordinator owns
+    /// intent, the public state and the routes. Nil once ended or cancelled.
+    var startupAlignment: VGHLSStartupAlignment?
+    /// Eligibility, the generation, the phase and the attempt history; the
+    /// coordinator feeds it events and acts on its decisions.
+    var recoveryPolicy = VGHLSRecoveryPolicy(eligible: false)
+    /// Watches ordinary fallback playback for an unowned pause; nil while a helper
+    /// exists or outside the fallback phase.
+    var fallbackObserver: VGHLSFallbackInterruptionObserver?
+    /// The last valid presentation size and rotation, kept across a replacement
+    /// until the fresh item reports its own.
+    var cachedVideoWidth:      Int? = nil
+    var cachedVideoHeight:     Int? = nil
+    var cachedRotationDegrees: Int? = nil
+    /// Whether the caller's last control asked for playback (play or autoPlay)
+    /// rather than a pause, stop, end or failure.
+    var intendedPlaying: Bool = false
+    /// Advanced by every control and terminal transition; a seek completion that
+    /// finds another epoch leaves the state alone.
+    var controlEpoch: Int = 0
+    /// The state the first of overlapping seeks returns to; cleared by the completion
+    /// that applies it and retired by every other control or terminal transition.
+    var seekReturnState: String? = nil
+
+    // ── Live-edge policy (LOW_LATENCY only; main thread) ─────────────────────
+    // See VGLiveEdgePolicy and VGStreamingPlaybackCoordinator.sampleLiveEdge.
+    /// Armed at the first playback start; cleared once the initial seek is issued
+    /// or the item proves not to be live.
+    var liveEdgeInitialSeekPending: Bool = false
+    /// True once the initial seek was issued, ruled out, or pre-empted by a caller
+    /// start position, so pause/resume and later Play calls never repeat it.
+    var liveEdgeInitialSeekDecided: Bool = false
+    var liveEdgeInitialSeekIssued:  Bool = false
+    /// A live-position seek was issued and has not completed; nothing else is issued.
+    var liveEdgeSeekInFlight:       Bool = false
+    /// Cleared by a catch-up seek; set again by a sample at or under the re-arm threshold.
+    var liveEdgeCatchUpArmed:       Bool = true
+    var liveEdgeHighOffsetSamples:  Int  = 0
+    var liveEdgeCatchUpSeekCount:   Int  = 0
+    var lastLiveEdgeSampleAt:       CFTimeInterval? = nil
 
     // ── Disposed guard ────────────────────────────────────────────────────────
     var disposed = false
@@ -224,32 +370,30 @@ private final class VGPlaybackSession {
     var playbackCacheIgnoredCount: Int = 0
 
     init(
-        textureId:      Int64,
-        sessionId:      String,
-        initialWidth:   Int,
-        initialHeight:  Int,
-        formatHint:     String,
-        networkPolicy:  VGStreamingNetworkPolicy,
-        asset:          AVURLAsset,
-        item:           AVPlayerItem,
-        player:         AVPlayer,
-        videoOutput:    AVPlayerItemVideoOutput,
-        texture:        VGPlaybackFlutterTexture,
-        registry:       FlutterTextureRegistry
+        textureId:          Int64,
+        sessionId:          String,
+        initialWidth:       Int,
+        initialHeight:      Int,
+        formatHint:         String,
+        networkPolicy:      VGStreamingNetworkPolicy,
+        graph:              VGPlaybackGraph,
+        sourceURL:          URL,
+        sourceAssetOptions: [String: Any]?,
+        texture:            VGPlaybackFlutterTexture,
+        registry:           FlutterTextureRegistry
     ) {
-        self.textureId      = textureId
-        self.sessionId      = sessionId
-        self.initialWidth   = initialWidth
-        self.initialHeight  = initialHeight
-        self.formatHint     = formatHint
-        self.networkProfile = networkPolicy.profile
-        self.networkPolicy  = networkPolicy
-        self.asset          = asset
-        self.item           = item
-        self.player         = player
-        self.videoOutput    = videoOutput
-        self.texture        = texture
-        self.registry       = registry
+        self.textureId          = textureId
+        self.sessionId          = sessionId
+        self.initialWidth       = initialWidth
+        self.initialHeight      = initialHeight
+        self.formatHint         = formatHint
+        self.networkProfile     = networkPolicy.profile
+        self.networkPolicy      = networkPolicy
+        self.graph              = graph
+        self.sourceURL          = sourceURL
+        self.sourceAssetOptions = sourceAssetOptions
+        self.texture            = texture
+        self.registry           = registry
     }
 }
 
@@ -267,6 +411,12 @@ final class VGPlaybackFlutterTexture: NSObject, FlutterTexture {
     private let lock = NSLock()
     private var _latestPixelBuffer: CVPixelBuffer?
 
+    // Diagnostic-only cumulative counters, guarded by `lock`. They record Flutter
+    // copyPixelBuffer() callback activity; they do not prove GPU composition or
+    // visible display.
+    private var _copyPixelBufferRequestCount: Int = 0
+    private var _copyPixelBufferReturnedCount: Int = 0
+
     /// Called from the display-link callback with a newly pulled BGRA buffer.
     /// Thread-safe; retains `buffer` and releases the previous one.
     func update(pixelBuffer: CVPixelBuffer) {
@@ -278,10 +428,20 @@ final class VGPlaybackFlutterTexture: NSObject, FlutterTexture {
     /// Called by Flutter's compositor raster thread.
     func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
         lock.lock()
+        _copyPixelBufferRequestCount += 1
         let buf = _latestPixelBuffer
+        if buf != nil { _copyPixelBufferReturnedCount += 1 }
         lock.unlock()
         guard let buf = buf else { return nil }
         return Unmanaged.passRetained(buf)
+    }
+
+    /// Thread-safe snapshot of cumulative copyPixelBuffer() request and
+    /// non-nil-return counts (diagnostic only).
+    func callbackCounters() -> (requests: Int, returned: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (_copyPixelBufferRequestCount, _copyPixelBufferReturnedCount)
     }
 
     /// Drops the retained buffer. Call on dispose to release GPU memory.
@@ -465,22 +625,14 @@ final class VGStreamingPlaybackCoordinator {
             }
         }
 
-        let asset = AVURLAsset(url: assetURL, options: assetOptions.isEmpty ? nil : assetOptions)
-
-        // ── 6. Build AVPlayerItem + AVPlayerItemVideoOutput ────────────────────
-        let outputSettings: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: outputSettings)
-        let item = AVPlayerItem(asset: asset)
-        item.add(videoOutput)
-        // Apply network-profile policy to item (Phase 4C8Y).
-        networkPolicy.apply(to: item)
-
-        // ── 7. Build AVPlayer ─────────────────────────────────────────────────
-        let player = AVPlayer(playerItem: item)
-        // Apply network-profile policy to player (Phase 4C8Y).
-        networkPolicy.apply(to: player)
+        // ── 6–7. Build the graph: asset, output, item, player (Phase 4C8Y policy) ──
+        let sourceAssetOptions: [String: Any]? = assetOptions.isEmpty ? nil : assetOptions
+        let graph = VGPlaybackGraph.build(
+            url:               assetURL,
+            assetOptions:      sourceAssetOptions,
+            applyItemPolicy:   { networkPolicy.apply(to: $0) },
+            applyPlayerPolicy: { networkPolicy.apply(to: $0) }
+        )
 
         // ── 8. Register Flutter texture ───────────────────────────────────────
         let texture   = VGPlaybackFlutterTexture()
@@ -492,18 +644,17 @@ final class VGStreamingPlaybackCoordinator {
 
         // ── 10. Build and store session record ────────────────────────────────
         let session = VGPlaybackSession(
-            textureId:     textureId,
-            sessionId:     sessionId,
-            initialWidth:  initialWidth,
-            initialHeight: initialHeight,
-            formatHint:    formatHint,
-            networkPolicy: networkPolicy,
-            asset:         asset,
-            item:          item,
-            player:        player,
-            videoOutput:   videoOutput,
-            texture:       texture,
-            registry:      textureRegistry
+            textureId:          textureId,
+            sessionId:          sessionId,
+            initialWidth:       initialWidth,
+            initialHeight:      initialHeight,
+            formatHint:         formatHint,
+            networkPolicy:      networkPolicy,
+            graph:              graph,
+            sourceURL:          assetURL,
+            sourceAssetOptions: sourceAssetOptions,
+            texture:            texture,
+            registry:           textureRegistry
         )
         // ── Phase 4C6H2A: populate proxy state on session ─────────────────────
         session.playbackCacheEnabled          = cacheEnabled
@@ -512,23 +663,30 @@ final class VGStreamingPlaybackCoordinator {
         session.playbackCacheIgnoredCount     = sessionCacheIgnored
         sessions[textureId] = session
 
-        // ── 11. Observe item status ───────────────────────────────────────────
-        session.statusObservation = item.observe(\.status, options: [.new]) { [weak self, weak session] _, _ in
-            guard let self = self, let session = session, !session.disposed else { return }
-            DispatchQueue.main.async { self.handleItemStatusChange(session: session) }
-        }
-        session.playerStatusObservation = player.observe(\.status, options: [.new]) { [weak self, weak session] _, _ in
-            guard let self = self, let session = session, !session.disposed else { return }
-            DispatchQueue.main.async { self.handlePlayerStatusChange(session: session) }
-        }
+        // ── 11. Observe the graph and start latency sampling (Debug only) ─────
+        attachGraphObservers(session: session, generation: 1)
+        installLatencyRecorder(session: session)
 
-        // Observe playback-to-end notification for this item.
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(playerItemDidPlayToEnd(_:)),
-            name: .AVPlayerItemDidPlayToEndTime,
-            object: item
-        )
+        // ── 11b. LOW_LATENCY startup alignment and recovery eligibility ──────
+        // Active in Debug builds and explicit Release opt-in builds
+        // (VG_HLS_STARTUP_ALIGNMENT_EXPERIMENT). Only when the coordinator's own
+        // live-position seeks are disabled, the caller chose no start position
+        // (that position is kept) and playback is direct: a proxy route that
+        // failed to attach still counts as direct. The attempt itself starts with
+        // the first playback intent, and a ready item with a definite duration
+        // skips it and rules out recovery. Other profiles and unflagged Release
+        // builds never attempt one and never reconstruct.
+        let alignmentEligible: Bool
+        #if DEBUG || VG_HLS_STARTUP_ALIGNMENT_EXPERIMENT
+        let hasExplicitStartPosition = startPositionMs.map { $0 >= 0 } ?? false
+        alignmentEligible = networkPolicy.profile == "LOW_LATENCY"
+            && !VGLiveEdgePolicy.livePositionSeeksEnabled
+            && !hasExplicitStartPosition
+            && sessionProxyRouteId == nil
+        #else
+        alignmentEligible = false
+        #endif
+        session.recoveryPolicy = VGHLSRecoveryPolicy(eligible: alignmentEligible)
 
         // ── 12. Install display link ──────────────────────────────────────────
         installDisplayLink(session: session)
@@ -536,13 +694,19 @@ final class VGStreamingPlaybackCoordinator {
         // ── 13. Initial seek if requested ─────────────────────────────────────
         if let ms = startPositionMs, ms >= 0 {
             let seekTime = CMTimeMakeWithSeconds(Double(ms) / 1000.0, preferredTimescale: 600)
-            player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero)
+            graph.player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero)
+            // The caller's start position takes precedence over the live-edge policy's
+            // initial seek; the catch-up still applies once playing.
+            session.liveEdgeInitialSeekDecided = true
         }
 
         // ── 14. Auto-play ─────────────────────────────────────────────────────
         if autoPlay {
-            player.play()
+            session.intendedPlaying = true
+            graph.player.play()
             session.state = "buffering"
+            armInitialLiveEdgeSeek(session: session)
+            startStartupAlignmentIfEligible(session: session)
         } else {
             session.state = "opening"
         }
@@ -555,11 +719,44 @@ final class VGStreamingPlaybackCoordinator {
 
     func play(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let session = resolveSession(args: args, result: result) else { return }
+        // The retained observation first: a queued unowned pause or interruption is
+        // applied now, so the policy sees it before it answers this Play. A Play
+        // during an attempt is answered with a snapshot and interrupts nothing; an
+        // armed session in the background keeps its permission and stays paused; an
+        // armed session in the foreground is rebuilt by this one Play.
+        session.startupAlignment?.refreshExternalState()
+        session.fallbackObserver?.refreshExternalState()
+        let applicationActive = UIApplication.shared.applicationState == .active
+        switch applyRecovery(session, .explicitPlay(applicationActive: applicationActive)) {
+        case .snapshotOnly:
+            if case .armed = session.recoveryPolicy.phase {
+                logRecovery("playDeferred", session: session, ["applicationActive=\(applicationActive)"])
+            }
+            result(snapshot(session: session))
+            return
+        case .reconstruct(let generation):
+            reconstructGraph(session: session, generation: generation)
+            result(snapshot(session: session))
+            return
+        case .ordinaryPlay, .startAlignment, .none:
+            break
+        }
+        session.intendedPlaying = true
+        session.controlEpoch += 1
+        session.seekReturnState = nil
         session.player.play()
-        if session.state == "paused" || session.state == "idle" || session.state == "opening" {
+        if session.state == "seeking" {
+            // A Play supersedes a pending seek: the state follows the player again and
+            // the seek's completion, now on an older epoch, is ignored.
+            session.state = nativeRunningState(session: session) ?? "buffering"
+        } else if session.state == "paused" || session.state == "idle" || session.state == "opening" {
             session.state = "buffering"
         }
         resumeDisplayLink(session: session)
+        // The first Play of a session created without autoPlay is its initial playback
+        // start; once decided, this is a no-op for every later resume.
+        armInitialLiveEdgeSeek(session: session)
+        startStartupAlignmentIfEligible(session: session)
         result(snapshot(session: session))
     }
 
@@ -567,6 +764,11 @@ final class VGStreamingPlaybackCoordinator {
 
     func pause(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let session = resolveSession(args: args, result: result) else { return }
+        // Ends any alignment attempt before the player is touched; never retried.
+        disqualifyStartupAlignment(session: session, reason: "pause")
+        session.intendedPlaying = false
+        session.controlEpoch += 1
+        session.seekReturnState = nil
         session.player.pause()
         session.state = "paused"
         result(snapshot(session: session))
@@ -587,14 +789,51 @@ final class VGStreamingPlaybackCoordinator {
             return
         }
 
+        // The user's chosen position is kept: the alignment attempt ends for this
+        // session before the seek. A pause the attempt owned is undone first when
+        // playback is still intended, so the seek lands in a playing session; an
+        // ordinary paused seek stays paused.
+        let ownedPause = disqualifyStartupAlignment(session: session, reason: "seek")
+        session.controlEpoch += 1
+        if ownedPause, session.intendedPlaying,
+           session.player.currentItem === session.item,
+           session.player.status != .failed, session.item.status != .failed,
+           UIApplication.shared.applicationState == .active {
+            session.player.play()
+        }
+
         let prevState = session.state
+        let epoch = session.controlEpoch
+        // The first of overlapping seeks owns the state to return to; a later one
+        // must not return to "seeking".
+        if session.state != "seeking" {
+            session.seekReturnState = session.state
+        }
         session.state = "seeking"
         let seekTime = CMTimeMakeWithSeconds(Double(positionMs) / 1000.0, preferredTimescale: 600)
-        session.player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak session] finished in
-            guard let session = session, !session.disposed else { return }
+        // Diagnostic record for LOW_LATENCY sessions only; playback never reads the id.
+        let diagnosticOperationId: UInt64? = session.networkProfile == "LOW_LATENCY"
+            ? session.latencyRecorder?.beginSeek(reason: .user, target: seekTime)
+            : nil
+        let generation = session.recoveryPolicy.generation
+        let graph = session.graph
+        session.player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak session, weak graph] finished in
+            let callbackArrivalSeconds = CACurrentMediaTime()
             DispatchQueue.main.async {
-                if finished {
-                    session.state = (prevState == "playing" || prevState == "buffering") ? "buffering" : prevState
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph) else { return }
+                // A later control or terminal transition owns the state by now; the
+                // first of overlapping seeks chose the state to return to.
+                if finished, session.controlEpoch == epoch {
+                    let returnState = session.seekReturnState ?? prevState
+                    session.seekReturnState = nil
+                    session.state = (returnState == "playing" || returnState == "buffering" || returnState == "seeking")
+                        ? (session.player.timeControlStatus.vgSessionState ?? "buffering")
+                        : returnState
+                }
+                if let operationId = diagnosticOperationId {
+                    session.latencyRecorder?.completeSeek(
+                        operationId: operationId, finished: finished, callbackArrivalSeconds: callbackArrivalSeconds)
                 }
             }
         }
@@ -605,6 +844,11 @@ final class VGStreamingPlaybackCoordinator {
 
     func stop(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let session = resolveSession(args: args, result: result) else { return }
+        // Ends any alignment attempt before the player is touched; never retried.
+        disqualifyStartupAlignment(session: session, reason: "stop")
+        session.intendedPlaying = false
+        session.controlEpoch += 1
+        session.seekReturnState = nil
         session.player.pause()
         session.player.seek(to: .zero)
         session.state = "idle"
@@ -669,10 +913,12 @@ final class VGStreamingPlaybackCoordinator {
         switch session.item.status {
         case .readyToPlay:
             if session.state == "opening" || session.state == "buffering" {
-                session.state = (session.player.rate > 0) ? "playing" : "paused"
+                session.state = nativeRunningState(session: session)
+                    ?? ((session.player.rate > 0) ? "playing" : "paused")
             }
+            attemptInitialLiveEdgeSeek(session: session)
         case .failed:
-            session.state = "failed"
+            markNativeFailure(session: session, reason: "item_failed")
         default:
             break
         }
@@ -680,14 +926,63 @@ final class VGStreamingPlaybackCoordinator {
 
     private func handlePlayerStatusChange(session: VGPlaybackSession) {
         if session.player.status == .failed {
-            session.state = "failed"
+            markNativeFailure(session: session, reason: "player_failed")
         }
     }
 
-    @objc private func playerItemDidPlayToEnd(_ notification: Notification) {
-        guard let item = notification.object as? AVPlayerItem,
-              let session = sessions.values.first(where: { $0.item === item }) else { return }
+    /// A native failure: the policy fails first, then the attempt and the fallback
+    /// observation end without a resume; failed is final for the session.
+    private func markNativeFailure(session: VGPlaybackSession, reason: String) {
+        applyRecovery(session, .failed(generation: session.recoveryPolicy.generation))
+        cancelStartupAlignment(session: session, reason: reason)
+        invalidateFallbackObserver(session: session)
+        session.intendedPlaying = false
+        session.controlEpoch += 1
+        session.seekReturnState = nil
+        if session.state != "failed", !session.recoveryPolicy.isDisabled {
+            logRecovery("failed", session: session, ["reason=\(reason)"])
+        }
+        session.state = "failed"
+    }
+
+    /// Keeps the reported state in step with AVPlayer: waiting is buffering, playing
+    /// is playing, and a pause AVPlayer took on its own is paused. Only the running
+    /// states move; paused, idle, seeking, ended and failed are owned by the routes
+    /// and the other callbacks. The current status is read, not the KVO change, so a
+    /// late callback cannot report an older transition.
+    private func handleTimeControlStatusChange(session: VGPlaybackSession) {
+        guard session.state == "playing" || session.state == "buffering" else { return }
+        if let next = nativeRunningState(session: session) {
+            session.state = next
+        }
+    }
+
+    /// AVPlayer's time-control status as a session state, with one exception: a
+    /// pause the alignment attempt owns is still reported as buffering.
+    private func nativeRunningState(session: VGPlaybackSession) -> String? {
+        guard let next = session.player.timeControlStatus.vgSessionState else { return nil }
+        if next == "paused", session.startupAlignment?.ownsPause == true { return "buffering" }
+        return next
+    }
+
+    /// AVPlayerItemDidPlayToEndTime for the current item: ended is final for the
+    /// session, and no reconstruction follows.
+    private func handlePlayedToEnd(session: VGPlaybackSession) {
+        applyRecovery(session, .eof(generation: session.recoveryPolicy.generation))
+        cancelStartupAlignment(session: session, reason: "played_to_end")
+        invalidateFallbackObserver(session: session)
+        session.intendedPlaying = false
+        session.controlEpoch += 1
+        session.seekReturnState = nil
         session.state = "ended"
+    }
+
+    /// AVPlayerItemPlaybackStalled for the current item: counted, and forwarded to
+    /// an attempt in progress only. A stall in ordinary playback changes nothing else.
+    private func handlePlaybackStalled(session: VGPlaybackSession) {
+        session.playbackStalledCount += 1
+        session.lastPlaybackStalledAt = CACurrentMediaTime()
+        session.startupAlignment?.playbackStalled()
     }
 
     // MARK: - Display link
@@ -718,9 +1013,13 @@ final class VGStreamingPlaybackCoordinator {
     // Called by VGDisplayLinkProxy — internal (not private) so the proxy defined
     // in the same file can call it without exposing the method as public API.
     func displayLinkFired(_ sender: CADisplayLink) {
+        let now = CACurrentMediaTime()
         // Pull new pixel buffers for all active sessions.
         for session in sessions.values {
             guard !session.disposed else { continue }
+
+            // The live-edge policy samples here, about once a second per session.
+            sampleLiveEdge(session: session, now: now)
 
             // Convert the display link's host timestamp to the player item's timeline.
             //
@@ -743,7 +1042,9 @@ final class VGStreamingPlaybackCoordinator {
             let itemTime = session.videoOutput.itemTime(forHostTime: hostSeconds)
             guard itemTime.isValid else { continue }
             guard session.videoOutput.hasNewPixelBuffer(forItemTime: itemTime) else { continue }
-            var actualItemTime = CMTime.zero
+            // The alignment path starts from an invalid display time, so a copy that
+            // leaves it unwritten is never read as time zero.
+            var actualItemTime: CMTime = session.startupAlignment != nil ? .invalid : .zero
             guard let pixelBuffer = session.videoOutput.copyPixelBuffer(
                 forItemTime: itemTime, itemTimeForDisplay: &actualItemTime
             ) else { continue }
@@ -751,11 +1052,480 @@ final class VGStreamingPlaybackCoordinator {
             session.renderedFrames += 1
             session.decodedFrames  += 1
             session.registry.textureFrameAvailable(session.textureId)
-            // Promote buffering → playing when frames are arriving.
-            if session.state == "buffering" || session.state == "opening" {
-                session.state = "playing"
+            // Copy evidence only: a buffer left AVPlayerItemVideoOutput. The state is not
+            // promoted here; it follows AVPlayer's time-control status.
+            session.copiedPixelBufferCount += 1
+            let copiedItemTimeMs: Int? = actualItemTime.isNumeric ? Int(actualItemTime.seconds * 1000) : nil
+            if copiedItemTimeMs != session.lastCopiedItemTimeMs {
+                session.lastCopiedItemTimeMs = copiedItemTimeMs
+                session.lastCopiedItemTimeAdvancedAt = CACurrentMediaTime()
+            }
+            // Copied-frame evidence for the alignment attempt; it only records here.
+            session.startupAlignment?.observeCopiedFrame(
+                displayTime: actualItemTime, queryTime: itemTime, hostSeconds: hostSeconds)
+        }
+    }
+
+    // MARK: - Live-edge policy (LOW_LATENCY)
+
+    /// Arms the one initial seek to the live position at a LOW_LATENCY session's first
+    /// playback start and tries it at once. A no-op once decided: issued, ruled out
+    /// for a non-live item, pre-empted by a caller start position, or skipped by
+    /// VGLiveEdgePolicy.livePositionSeeksEnabled.
+    private func armInitialLiveEdgeSeek(session: VGPlaybackSession) {
+        guard session.networkPolicy.prioritisesLiveEdge, !session.liveEdgeInitialSeekDecided else { return }
+        guard VGLiveEdgePolicy.livePositionSeeksEnabled else {
+            // Experiment: skipped and decided; never pending, issued or retried.
+            session.liveEdgeInitialSeekDecided = true
+            return
+        }
+        session.liveEdgeInitialSeekPending = true
+        attemptInitialLiveEdgeSeek(session: session)
+    }
+
+    /// Issues the pending initial seek once the item is ready, confirmed live and has a
+    /// valid seekable range, and playback is not paused. A ready item with a definite
+    /// duration rules the seek out: VOD is never seeked to an edge. Otherwise it waits
+    /// and is tried again by the item-status callback, the next Play and the sampler.
+    private func attemptInitialLiveEdgeSeek(session: VGPlaybackSession) {
+        guard session.liveEdgeInitialSeekPending, !session.disposed,
+              session.item.status == .readyToPlay, session.player.status != .failed else { return }
+        guard isLiveItem(session.item) else {
+            session.liveEdgeInitialSeekPending = false
+            session.liveEdgeInitialSeekDecided = true
+            return
+        }
+        guard session.player.rate > 0, liveSeekableEndSeconds(item: session.item) != nil else { return }
+        session.liveEdgeInitialSeekPending = false
+        session.liveEdgeInitialSeekDecided = true
+        session.liveEdgeInitialSeekIssued  = true
+        seekToLivePosition(session: session, reason: .initialLiveEdge)
+    }
+
+    /// Samples the live offset for a LOW_LATENCY session: the valid seekable range's
+    /// end minus the playhead, once per VGLiveEdgePolicy.sampleIntervalSeconds, only
+    /// while the session is playing a ready live item and no live-position seek is in
+    /// flight. Two consecutive samples over catchUpThresholdSeconds issue one seek,
+    /// which disarms the catch-up until a sample at or under reArmThresholdSeconds.
+    /// VOD, an item without a valid live seekable range, paused, waiting or seeking
+    /// playback, and a disposed or failed session take no sample, and the consecutive
+    /// count starts over after any such gap. A pending initial seek is tried instead.
+    /// With VGLiveEdgePolicy.livePositionSeeksEnabled false the samples are still
+    /// taken but no seek is issued or counted.
+    private func sampleLiveEdge(session: VGPlaybackSession, now: CFTimeInterval) {
+        guard session.networkPolicy.prioritisesLiveEdge, !session.disposed else { return }
+        if let last = session.lastLiveEdgeSampleAt, now - last < VGLiveEdgePolicy.sampleIntervalSeconds { return }
+        session.lastLiveEdgeSampleAt = now
+        if session.liveEdgeInitialSeekPending {
+            attemptInitialLiveEdgeSeek(session: session)
+            return
+        }
+        guard !session.liveEdgeSeekInFlight else { return }
+        let player = session.player
+        let item   = session.item
+        let positionSeconds = player.currentTime().seconds
+        guard session.state == "playing", player.timeControlStatus == .playing,
+              player.status != .failed, item.status == .readyToPlay,
+              !positionSeconds.isNaN, !positionSeconds.isInfinite,
+              let seekableEndSeconds = liveSeekableEndSeconds(item: item) else {
+            session.liveEdgeHighOffsetSamples = 0
+            return
+        }
+        let offsetSeconds = max(0.0, seekableEndSeconds - positionSeconds)
+        if offsetSeconds <= VGLiveEdgePolicy.reArmThresholdSeconds {
+            session.liveEdgeCatchUpArmed = true
+        }
+        guard offsetSeconds > VGLiveEdgePolicy.catchUpThresholdSeconds else {
+            session.liveEdgeHighOffsetSamples = 0
+            return
+        }
+        session.liveEdgeHighOffsetSamples += 1
+        // Experiment: the sample is taken, but no catch-up is issued or counted.
+        guard VGLiveEdgePolicy.livePositionSeeksEnabled else { return }
+        if session.liveEdgeCatchUpArmed && session.liveEdgeHighOffsetSamples >= VGLiveEdgePolicy.consecutiveSamples {
+            session.liveEdgeCatchUpArmed = false
+            session.liveEdgeCatchUpSeekCount += 1
+            seekToLivePosition(session: session, reason: .catchUpLiveEdge)
+        }
+    }
+
+    /// One seek to the live position: kCMTimePositiveInfinity, which AVPlayer resolves
+    /// to configuredTimeOffsetFromLive behind the latest content. The reported state is
+    /// left to AVPlayer's time-control status. The completion only clears the in-flight
+    /// flag, and is ignored after teardown or a graph replacement. `reason` and the
+    /// recorder calls are diagnostic only; the seek itself is unchanged.
+    private func seekToLivePosition(session: VGPlaybackSession, reason: VGHLSSeekReason) {
+        // Recorded before the flag writes below, so the snapshot still shows the
+        // consecutive-high count that triggered a catch-up.
+        let diagnosticOperationId = session.latencyRecorder?.beginSeek(reason: reason, target: .positiveInfinity)
+        session.liveEdgeSeekInFlight      = true
+        session.liveEdgeHighOffsetSamples = 0
+        let generation = session.recoveryPolicy.generation
+        let graph = session.graph
+        session.player.seek(to: .positiveInfinity) { [weak self, weak session, weak graph] finished in
+            let callbackArrivalSeconds = CACurrentMediaTime()
+            DispatchQueue.main.async {
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph) else { return }
+                session.liveEdgeSeekInFlight = false
+                if let operationId = diagnosticOperationId {
+                    session.latencyRecorder?.completeSeek(
+                        operationId: operationId, finished: finished, callbackArrivalSeconds: callbackArrivalSeconds)
+                }
             }
         }
+    }
+
+    /// Whether the item is live: no definite duration. Meaningful once the item is ready.
+    private func isLiveItem(_ item: AVPlayerItem) -> Bool {
+        let seconds = item.duration.seconds
+        return item.duration.isIndefinite || seconds.isNaN || seconds.isInfinite
+    }
+
+    /// The end of the item's valid live seekable range in seconds: the latest finite
+    /// end over the seekable ranges with a positive finite duration; nil for an item
+    /// that is not live or has no such range.
+    private func liveSeekableEndSeconds(item: AVPlayerItem) -> Double? {
+        guard isLiveItem(item) else { return nil }
+        var maxEndSeconds: Double = -1.0
+        for rangeValue in item.seekableTimeRanges {
+            let range = rangeValue.timeRangeValue
+            let startSeconds = range.start.seconds
+            let durSeconds   = range.duration.seconds
+            guard !startSeconds.isNaN, !startSeconds.isInfinite,
+                  !durSeconds.isNaN, !durSeconds.isInfinite, durSeconds > 0 else { continue }
+            let endSeconds = startSeconds + durSeconds
+            if !endSeconds.isNaN && !endSeconds.isInfinite && endSeconds > maxEndSeconds {
+                maxEndSeconds = endSeconds
+            }
+        }
+        return maxEndSeconds >= 0 ? maxEndSeconds : nil
+    }
+
+    // MARK: - Startup alignment and recovery (Debug / Release opt-in, LOW_LATENCY)
+
+    private static let recoveryLogger = Logger(subsystem: "com.vanguard.engine", category: "hls-startup")
+
+    /// Feeds one event to the session's recovery policy and returns its decision.
+    @discardableResult
+    private func applyRecovery(_ session: VGPlaybackSession,
+                               _ event: VGHLSRecoveryPolicy.Event) -> VGHLSRecoveryPolicy.Decision {
+        return session.recoveryPolicy.handle(event)
+    }
+
+    /// Whether the current item is ready and live: what an interruption needs to
+    /// arm a reconstruction.
+    private func isReadyLive(_ session: VGPlaybackSession) -> Bool {
+        return session.item.status == .readyToPlay && session.player.status != .failed
+            && isLiveItem(session.item)
+    }
+
+    /// The helper's and the recorder's session id: the public id for generation 1,
+    /// "<id>.g<n>" for a rebuilt generation. Diagnostics only; the public id is fixed.
+    private func diagnosticSessionId(_ session: VGPlaybackSession) -> String {
+        let generation = session.recoveryPolicy.generation
+        return generation > 1 ? "\(session.sessionId).g\(generation)" : session.sessionId
+    }
+
+    /// One record per recovery transition, in the helper's key=value form; never a
+    /// URL or a header.
+    private func logRecovery(_ event: String, session: VGPlaybackSession, _ fields: [String] = []) {
+        let policy = session.recoveryPolicy
+        let line = (["hls-recovery", "event=\(event)", "sessionId=\(session.sessionId)",
+                     "generation=\(policy.generation)", "phase=\(policy.phaseName)"] + fields)
+            .joined(separator: " ")
+        Self.recoveryLogger.notice("\(line, privacy: .public)")
+    }
+
+    /// Starts an attempt when the policy allows one: the generation-one attempt at
+    /// the session's first playback intent, or the fresh generation's right after a
+    /// reconstruction. Debug builds or explicit Release opt-in builds only. The helper
+    /// owns the timing and the native effects; its outcomes arrive in
+    /// handleStartupAlignmentEvent, possibly synchronously from start().
+    private func startStartupAlignmentIfEligible(session: VGPlaybackSession) {
+        #if DEBUG || VG_HLS_STARTUP_ALIGNMENT_EXPERIMENT
+        guard !session.disposed, session.intendedPlaying, session.startupAlignment == nil else { return }
+        let generation = session.recoveryPolicy.generation
+        guard case .startAlignment = applyRecovery(session, .beginAlignment(generation: generation)) else { return }
+        let graph = session.graph
+        let alignment = VGHLSStartupAlignment(
+            player:    graph.player,
+            item:      graph.item,
+            sessionId: diagnosticSessionId(session),
+            isCurrentAndIntended: { [weak self, weak session, weak graph] in
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph) else { return false }
+                return session.intendedPlaying && session.startupAlignment != nil
+            },
+            isLive: { [weak self, weak graph] in
+                guard let self = self, let graph = graph else { return false }
+                return self.isLiveItem(graph.item)
+            },
+            onEvent: { [weak self, weak session, weak graph] event in
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph) else { return }
+                self.handleStartupAlignmentEvent(session: session, generation: generation, event: event)
+            }
+        )
+        // Assigned, with the policy already aligning, before start() can end synchronously.
+        session.startupAlignment = alignment
+        alignment.start()
+        #endif
+    }
+
+    /// Cancels the session's attempt, if any, and forgets it. Returns whether the
+    /// attempt owned the player's pause; a cancel delivers no outcome, and the policy
+    /// only records it.
+    @discardableResult
+    private func cancelStartupAlignment(session: VGPlaybackSession, reason: String) -> Bool {
+        guard let alignment = session.startupAlignment else { return false }
+        session.startupAlignment = nil
+        applyRecovery(session, .cancelled(reason: reason, generation: session.recoveryPolicy.generation))
+        return alignment.cancel(reason: reason)
+    }
+
+    /// A Pause, Stop or Seek: the policy is disqualified first, then the attempt and
+    /// the fallback observation end. No reconstruction for the session's life.
+    @discardableResult
+    private func disqualifyStartupAlignment(session: VGPlaybackSession, reason: String) -> Bool {
+        applyRecovery(session, .disqualify(reason: reason))
+        invalidateFallbackObserver(session: session)
+        return cancelStartupAlignment(session: session, reason: reason)
+    }
+
+    private func invalidateFallbackObserver(session: VGPlaybackSession) {
+        session.fallbackObserver?.invalidate()
+        session.fallbackObserver = nil
+    }
+
+    /// Applies one helper outcome: the policy event, then the existing resume or
+    /// interruption effects. The helper has already restored its owned overrides.
+    private func handleStartupAlignmentEvent(session: VGPlaybackSession, generation: UInt64,
+                                             event: VGHLSStartupAlignment.Event) {
+        guard session.startupAlignment != nil else { return }
+        switch event {
+        case .aligned:
+            // Playback continues under AVPlayer's own status; nothing to write.
+            applyRecovery(session, .aligned(generation: generation))
+            if generation > 1 {
+                // Copied-frame confirmation on the fresh item, not measured visible latency.
+                logRecovery("recoveryAligned", session: session)
+            }
+        case .ended(let reason, let ownedPause):
+            session.startupAlignment = nil
+            switch reason.disposition {
+            case .externalInterruption:
+                // An unowned pause, inactivity, interruption or stall: playback stays
+                // paused until the caller plays again; nothing restarts on its own.
+                let readyLive = isReadyLive(session)
+                session.intendedPlaying = false
+                session.controlEpoch += 1
+                session.seekReturnState = nil
+                session.player.pause()
+                session.state = "paused"
+                applyRecovery(session, .interrupted(reason: reason, generation: generation, readyLive: readyLive))
+                logInterruption(session: session, reason: reason, readyLive: readyLive, source: "helper")
+                installFallbackObserver(session: session)
+            case .nativeFailure:
+                // Failed at once, whether or not the status callbacks have arrived yet.
+                markNativeFailure(session: session, reason: "alignment_" + reason.rawValue)
+            case .fallback:
+                applyRecovery(session, .fallback(reason: reason, generation: generation))
+                logRecovery("fallback", session: session, ["reason=\(reason.rawValue)"])
+                // Ordinary playback. A pause the attempt owned is undone only for a
+                // session still intended to play, still holding its item, foreground and
+                // not failed; otherwise the state follows the player as it is now.
+                if ownedPause, session.intendedPlaying,
+                   session.player.currentItem === session.item,
+                   session.player.status != .failed, session.item.status != .failed,
+                   UIApplication.shared.applicationState == .active {
+                    session.player.play()
+                    session.state = "buffering"
+                } else if session.state == "playing" || session.state == "buffering",
+                          let next = session.player.timeControlStatus.vgSessionState {
+                    session.state = next
+                }
+                installFallbackObserver(session: session)
+            }
+        }
+    }
+
+    /// Logs whether an interruption armed a reconstruction or left the session in
+    /// an unarmed fallback.
+    private func logInterruption(session: VGPlaybackSession, reason: VGHLSStartupEndReason,
+                                 readyLive: Bool, source: String) {
+        let armed: Bool
+        if case .armed = session.recoveryPolicy.phase { armed = true } else { armed = false }
+        logRecovery(armed ? "armed" : "unarmed", session: session,
+                    ["reason=\(reason.rawValue)", "readyLive=\(readyLive)", "source=\(source)"])
+    }
+
+    /// Observes ordinary fallback playback for an unowned pause. Installed after an
+    /// ordinary or an unarmed fallback only, never beside a helper; idle until the
+    /// session intends to play, and only for a ready live item of the current graph.
+    private func installFallbackObserver(session: VGPlaybackSession) {
+        invalidateFallbackObserver(session: session)
+        guard !session.disposed, session.startupAlignment == nil,
+              case .fallback(let generation) = session.recoveryPolicy.phase else { return }
+        let graph = session.graph
+        session.fallbackObserver = VGHLSFallbackInterruptionObserver(
+            player: graph.player,
+            item:   graph.item,
+            canObserve: { [weak self, weak session, weak graph] in
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph),
+                      session.intendedPlaying, session.startupAlignment == nil, session.fallbackObserver != nil,
+                      case .fallback(let current) = session.recoveryPolicy.phase, current == generation
+                else { return false }
+                return self.isReadyLive(session)
+            },
+            onInterruption: { [weak self, weak session, weak graph] reason in
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph) else { return }
+                self.handleFallbackInterruption(session: session, generation: generation, reason: reason)
+            }
+        )
+    }
+
+    /// The fallback observer found the player paused by something other than the
+    /// caller: the same effects as a helper interruption, then the policy decides
+    /// whether the next explicit Play may reconstruct.
+    private func handleFallbackInterruption(session: VGPlaybackSession, generation: UInt64,
+                                            reason: VGHLSStartupEndReason) {
+        session.fallbackObserver = nil
+        let readyLive = isReadyLive(session)
+        session.intendedPlaying = false
+        session.controlEpoch += 1
+        session.seekReturnState = nil
+        session.player.pause()
+        session.state = "paused"
+        applyRecovery(session, .interrupted(reason: reason, generation: generation, readyLive: readyLive))
+        logInterruption(session: session, reason: reason, readyLive: readyLive, source: "fallback")
+        installFallbackObserver(session: session)
+    }
+
+    /// Replaces the session's graph for the fresh generation the policy just
+    /// entered, in this one main-thread turn, then plays it and starts that
+    /// generation's attempt. The public session and texture identities are untouched,
+    /// and the texture keeps its last buffer until the fresh item copies one. The
+    /// retired graph is never reconnected.
+    private func reconstructGraph(session: VGPlaybackSession, generation: UInt64) {
+        session.controlEpoch += 1
+        session.seekReturnState = nil
+        // Cleanup only: the policy has already consumed the permission.
+        if let alignment = session.startupAlignment {
+            session.startupAlignment = nil
+            alignment.cancel(reason: "reconstruct")
+        }
+        invalidateFallbackObserver(session: session)
+        session.latencyRecorder?.stop()
+        session.latencyRecorder = nil
+        detachGraphObservers(session: session)
+        session.graph.retireForReplacement()
+        let policy = session.networkPolicy
+        session.graph = VGPlaybackGraph.build(
+            url:               session.sourceURL,
+            assetOptions:      session.sourceAssetOptions,
+            applyItemPolicy:   { policy.apply(to: $0) },
+            applyPlayerPolicy: { policy.apply(to: $0) }
+        )
+        attachGraphObservers(session: session, generation: generation)
+        installLatencyRecorder(session: session)
+        // Per-item bookkeeping starts over; the session-wide counters carry on.
+        session.lastCopiedItemTimeMs         = nil
+        session.lastCopiedItemTimeAdvancedAt = nil
+        session.liveEdgeSeekInFlight         = false
+        session.liveEdgeHighOffsetSamples    = 0
+        session.lastLiveEdgeSampleAt         = nil
+        session.intendedPlaying = true
+        session.state = "buffering"
+        resumeDisplayLink(session: session)
+        session.player.play()
+        logRecovery("reconstruct", session: session, ["attempt=\(session.recoveryPolicy.attemptCount)"])
+        startStartupAlignmentIfEligible(session: session)
+    }
+
+    // MARK: - Graph observers and latency sampling
+
+    /// A main-thread hop that runs `body` only for a session still registered, not
+    /// disposed, at `generation` and still holding `graph`: a callback queued before
+    /// a dispose or a replacement finds out here, where the session map and the
+    /// state live.
+    private func onMainIfCurrent(_ session: VGPlaybackSession, generation: UInt64, graph: VGPlaybackGraph,
+                                 _ body: @escaping (VGStreamingPlaybackCoordinator, VGPlaybackSession) -> Void)
+        -> () -> Void {
+        return { [weak self, weak session, weak graph] in
+            DispatchQueue.main.async {
+                guard let self = self, let session = session, let graph = graph,
+                      self.isCurrent(session, generation: generation, graph: graph) else { return }
+                body(self, session)
+            }
+        }
+    }
+
+    /// Installs the KVO and the two item notifications on the session's current graph.
+    private func attachGraphObservers(session: VGPlaybackSession, generation: UInt64) {
+        let graph = session.graph
+        let onItemStatus   = onMainIfCurrent(session, generation: generation, graph: graph) { $0.handleItemStatusChange(session: $1) }
+        let onPlayerStatus = onMainIfCurrent(session, generation: generation, graph: graph) { $0.handlePlayerStatusChange(session: $1) }
+        // AVPlayer's own waiting/playing/paused transitions drive the reported state.
+        let onTimeControl  = onMainIfCurrent(session, generation: generation, graph: graph) { $0.handleTimeControlStatusChange(session: $1) }
+        let onPlayedToEnd  = onMainIfCurrent(session, generation: generation, graph: graph) { $0.handlePlayedToEnd(session: $1) }
+        let onStalled      = onMainIfCurrent(session, generation: generation, graph: graph) { $0.handlePlaybackStalled(session: $1) }
+        session.statusObservation            = graph.item.observe(\.status, options: [.new]) { _, _ in onItemStatus() }
+        session.playerStatusObservation      = graph.player.observe(\.status, options: [.new]) { _, _ in onPlayerStatus() }
+        session.timeControlStatusObservation = graph.player.observe(\.timeControlStatus, options: [.new]) { _, _ in onTimeControl() }
+        let center = NotificationCenter.default
+        session.playedToEndToken     = center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: graph.item, queue: nil) { _ in onPlayedToEnd() }
+        session.playbackStalledToken = center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: graph.item, queue: nil) { _ in onStalled() }
+    }
+
+    /// Removes what attachGraphObservers installed; called before the graph changes.
+    private func detachGraphObservers(session: VGPlaybackSession) {
+        session.statusObservation?.invalidate()
+        session.statusObservation = nil
+        session.playerStatusObservation?.invalidate()
+        session.playerStatusObservation = nil
+        session.timeControlStatusObservation?.invalidate()
+        session.timeControlStatusObservation = nil
+        let center = NotificationCenter.default
+        if let token = session.playedToEndToken { center.removeObserver(token) }
+        session.playedToEndToken = nil
+        if let token = session.playbackStalledToken { center.removeObserver(token) }
+        session.playbackStalledToken = nil
+    }
+
+    /// Starts per-session latency sampling on the current graph, Debug builds only:
+    /// this coordinator also serves ordinary playback and .notice samples persist to
+    /// the device log, so Release builds emit none.
+    private func installLatencyRecorder(session: VGPlaybackSession) {
+        #if DEBUG
+        let latencyRecorder = VGHLSLatencyRecorder(
+            sessionId:   diagnosticSessionId(session),
+            player:      session.player,
+            item:        session.item,
+            stallCount:  { [weak session] in session?.playbackStalledCount ?? 0 },
+            diagnostics: { [weak session] in
+                // Value-only copy for the seek records; neutral once the session is gone.
+                guard let session = session else { return .unavailable }
+                return VGHLSDiagnosticSnapshot(
+                    networkProfile:         session.networkProfile,
+                    sessionState:           session.state,
+                    initialSeekPending:     session.liveEdgeInitialSeekPending,
+                    initialSeekDecided:     session.liveEdgeInitialSeekDecided,
+                    initialSeekIssued:      session.liveEdgeInitialSeekIssued,
+                    liveSeekInFlight:       session.liveEdgeSeekInFlight,
+                    catchUpArmed:           session.liveEdgeCatchUpArmed,
+                    consecutiveHighSamples: session.liveEdgeHighOffsetSamples,
+                    catchUpSeekCount:       session.liveEdgeCatchUpSeekCount,
+                    copiedPixelBufferCount: session.copiedPixelBufferCount,
+                    lastCopiedItemTimeMs:   session.lastCopiedItemTimeMs
+                )
+            }
+        )
+        latencyRecorder.start()
+        session.latencyRecorder = latencyRecorder
+        #endif
     }
 
 
@@ -764,6 +1534,19 @@ final class VGStreamingPlaybackCoordinator {
     private func teardown(session: VGPlaybackSession) {
         guard !session.disposed else { return }
         session.disposed = true
+        // Intent, the control epoch and the recovery policy are retired at once, so
+        // nothing queued behind this teardown can resume the player, write a state or
+        // reconstruct.
+        session.intendedPlaying = false
+        session.controlEpoch += 1
+        session.seekReturnState = nil
+        applyRecovery(session, .dispose)
+
+        // The alignment attempt and the fallback observation end next, before the
+        // proxy route and the player are touched; no outcome is delivered for a
+        // disposed session.
+        cancelStartupAlignment(session: session, reason: "dispose")
+        invalidateFallbackObserver(session: session)
 
         // ── Phase 4C6H2A: release proxy route before player cleanup ───────────
         if let routeId = session.proxyRouteId {
@@ -774,17 +1557,15 @@ final class VGStreamingPlaybackCoordinator {
         session.displayLink?.invalidate()
         session.displayLink = nil
 
+        // Stop latency sampling.
+        session.latencyRecorder?.stop()
+        session.latencyRecorder = nil
+
         // Pause player.
         session.player.pause()
 
-        // Remove KVO observers.
-        session.statusObservation?.invalidate()
-        session.statusObservation = nil
-        session.playerStatusObservation?.invalidate()
-        session.playerStatusObservation = nil
-
-        // Remove NotificationCenter observer for this specific item.
-        NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: session.item)
+        // Remove KVO and NotificationCenter observers for the current graph.
+        detachGraphObservers(session: session)
 
         // Remove video output from item.
         session.item.remove(session.videoOutput)
@@ -825,19 +1606,48 @@ final class VGStreamingPlaybackCoordinator {
             bufferedPercent = min(100, Int(Double(bufferedPositionMs) / Double(durationMs) * 100))
         }
 
-        // ── Video dimensions + rotation ───────────────────────────────────────
-        var videoWidth    = session.initialWidth
-        var videoHeight   = session.initialHeight
-        var rotationDeg   = 0
-        var displayWidth  = session.initialWidth
-        var displayHeight = session.initialHeight
+        // ── Live offset / seekable range diagnostics ──────────────────────────
+        var liveOffsetMs: Int? = nil
+        var seekableStartMs: Int? = nil
+        var seekableEndMs: Int? = nil
 
+        let isLiveItem = item.duration.isIndefinite || durationSeconds.isNaN || durationSeconds.isInfinite || durationMs == -1
+        if isLiveItem {
+            var minStartSec: Double = .greatestFiniteMagnitude
+            var maxEndSec: Double = -1.0
+            var hasValidSeekable = false
+
+            for rangeValue in item.seekableTimeRanges {
+                let range = rangeValue.timeRangeValue
+                let startSec = range.start.seconds
+                let durSec = range.duration.seconds
+                if !startSec.isNaN && !startSec.isInfinite && !durSec.isNaN && !durSec.isInfinite && durSec > 0 {
+                    let endSec = startSec + durSec
+                    if !endSec.isNaN && !endSec.isInfinite {
+                        if startSec < minStartSec { minStartSec = startSec }
+                        if endSec > maxEndSec { maxEndSec = endSec }
+                        hasValidSeekable = true
+                    }
+                }
+            }
+
+            if hasValidSeekable && maxEndSec >= 0 {
+                seekableStartMs = max(0, Int(minStartSec * 1000))
+                seekableEndMs = max(0, Int(maxEndSec * 1000))
+                if !positionSeconds.isNaN && !positionSeconds.isInfinite {
+                    let offsetSec = max(0.0, maxEndSec - positionSeconds)
+                    liveOffsetMs = Int(offsetSec * 1000)
+                }
+            }
+        }
+
+        // ── Video dimensions + rotation ───────────────────────────────────────
+        // The last valid values are kept across a graph replacement until the fresh
+        // item reports its own.
         let presentationSize = item.presentationSize
         if presentationSize.width > 0 && presentationSize.height > 0 {
-            videoWidth    = Int(presentationSize.width)
-            videoHeight   = Int(presentationSize.height)
-            displayWidth  = videoWidth
-            displayHeight = videoHeight
+            session.cachedVideoWidth  = Int(presentationSize.width)
+            session.cachedVideoHeight = Int(presentationSize.height)
         }
 
         // Derive rotation from preferred transform of the first video track.
@@ -847,14 +1657,20 @@ final class VGStreamingPlaybackCoordinator {
             let degreesRaw = Int((angleRad * 180.0 / .pi).rounded())
             let normalized = ((degreesRaw % 360) + 360) % 360
             switch normalized {
-            case  45 ..< 135:  rotationDeg = 90
-            case 135 ..< 225:  rotationDeg = 180
-            case 225 ..< 315:  rotationDeg = 270
-            default:           rotationDeg = 0
+            case  45 ..< 135:  session.cachedRotationDegrees = 90
+            case 135 ..< 225:  session.cachedRotationDegrees = 180
+            case 225 ..< 315:  session.cachedRotationDegrees = 270
+            default:           session.cachedRotationDegrees = 0
             }
-            if rotationDeg == 90 || rotationDeg == 270 {
-                swap(&displayWidth, &displayHeight)
-            }
+        }
+
+        let videoWidth    = session.cachedVideoWidth  ?? session.initialWidth
+        let videoHeight   = session.cachedVideoHeight ?? session.initialHeight
+        let rotationDeg   = session.cachedRotationDegrees ?? 0
+        var displayWidth  = videoWidth
+        var displayHeight = videoHeight
+        if rotationDeg == 90 || rotationDeg == 270 {
+            swap(&displayWidth, &displayHeight)
         }
 
         // ── Format string ─────────────────────────────────────────────────────
@@ -872,6 +1688,23 @@ final class VGStreamingPlaybackCoordinator {
 
         // ── Network policy diagnostics (Phase 4C8Y) ───────────────────────────
         let policy = session.networkPolicy
+        let textureCallbackCounters = session.texture.callbackCounters()
+
+        // ── Playback-health diagnostics ───────────────────────────────────────
+        // AVPlayer's own waiting/playing account, the item's buffer flags, stall
+        // notifications and AVPlayerItemVideoOutput copy evidence. None of this
+        // proves that a frame was composited or visible on screen.
+        let now = CACurrentMediaTime()
+        let waitingReason: Any = player.reasonForWaitingToPlay.map { reason -> String in
+            switch reason {
+            case .toMinimizeStalls:        return "toMinimizeStalls"
+            case .evaluatingBufferingRate: return "evaluatingBufferingRate"
+            case .noItemToPlay:            return "noItemToPlay"
+            default:                       return vgSanitizeRawToken(reason.rawValue)
+            }
+        } ?? NSNull()
+        let msSinceLastStall: Any = session.lastPlaybackStalledAt.map { Int((now - $0) * 1000) } ?? NSNull()
+        let msSinceCopiedItemTimeAdvanced: Any = session.lastCopiedItemTimeAdvancedAt.map { Int((now - $0) * 1000) } ?? NSNull()
 
         var map: [String: Any] = [
             "pass":      pass,
@@ -884,6 +1717,13 @@ final class VGStreamingPlaybackCoordinator {
             "positionMs":                    positionMs,
             "bufferedPositionMs":             bufferedPositionMs,
             "bufferedPercent":               bufferedPercent,
+            "liveOffsetMs":                  liveOffsetMs ?? NSNull(),
+            "seekableStartMs":               seekableStartMs ?? NSNull(),
+            "seekableEndMs":                 seekableEndMs ?? NSNull(),
+            // Live-edge policy (LOW_LATENCY only; diagnostic only).
+            "liveEdgeInitialSeekIssued":     session.liveEdgeInitialSeekIssued,
+            "liveEdgeCatchUpSeekCount":      session.liveEdgeCatchUpSeekCount,
+            "liveEdgeSeekInFlight":          session.liveEdgeSeekInFlight,
             "videoWidth":                    videoWidth,
             "videoHeight":                   videoHeight,
             "rotationDegrees":               rotationDeg,
@@ -891,6 +1731,21 @@ final class VGStreamingPlaybackCoordinator {
             "displayHeight":                 displayHeight,
             "renderedFrames":                session.renderedFrames,
             "decodedFrames":                 session.decodedFrames,
+            // Flutter copyPixelBuffer() callback activity (diagnostic only; not proof
+            // of GPU composition or visible display).
+            "textureCopyPixelBufferRequestCount":  textureCallbackCounters.requests,
+            "textureCopyPixelBufferReturnedCount": textureCallbackCounters.returned,
+            // Playback-health diagnostics (diagnostic only; not proof of visible
+            // presentation).
+            "playerTimeControlStatus":       player.timeControlStatus.vgLabel,
+            "playerWaitingReason":           waitingReason,
+            "isPlaybackBufferEmpty":         item.isPlaybackBufferEmpty,
+            "isPlaybackLikelyToKeepUp":      item.isPlaybackLikelyToKeepUp,
+            "playbackStalledCount":          session.playbackStalledCount,
+            "msSinceLastPlaybackStall":      msSinceLastStall,
+            "copiedPixelBufferCount":        session.copiedPixelBufferCount,
+            "lastCopiedItemTimeMs":          session.lastCopiedItemTimeMs ?? NSNull(),
+            "msSinceCopiedItemTimeAdvanced": msSinceCopiedItemTimeAdvanced,
             "playbackCacheEnabled":           session.playbackCacheEnabled,
             "playbackCacheTelemetryAttached": session.playbackCacheTelemetryAttached,
             "playbackCacheBytesRead":         {
@@ -909,7 +1764,8 @@ final class VGStreamingPlaybackCoordinator {
             "streamingNetworkPolicy":                    policy.diagnosticsMap(),
             "preferredForwardBufferDurationSeconds":     policy.preferredForwardBufferDurationSeconds,
             "preferredPeakBitRate":                      policy.preferredPeakBitRate,
-            "automaticallyWaitsToMinimizeStalling":      policy.automaticallyWaitsToMinimizeStalling,
+            // The player's actual value: an alignment attempt may have changed it.
+            "automaticallyWaitsToMinimizeStalling":      player.automaticallyWaitsToMinimizeStalling,
             "raw": "phase=Phase4C8A;sessionId=\(session.sessionId);state=\(stateStr);format=\(formatStr)"
                   + vgRawDiagnosticsSuffix(session: session)
         ]
@@ -970,6 +1826,24 @@ final class VGStreamingPlaybackCoordinator {
             }
         }
 
+        // ── Startup alignment and recovery (Debug / Release opt-in, LOW_LATENCY) ──
+        // The existing keys keep their meaning (the outcome is the last helper's);
+        // the generation-one history and the recovery state are separate tokens.
+        let recovery = session.recoveryPolicy
+        if recovery.initialAttempted {
+            parts.append("startupAlignmentPhase=\(vgSanitizeRawToken(session.startupAlignment?.phaseName ?? "none"))")
+            parts.append("startupAlignmentOutcome=\(vgSanitizeRawToken(recovery.lastHelperOutcome))")
+            parts.append("startupAlignmentOwnsPause=\(session.startupAlignment?.ownsPause ?? false)")
+            parts.append("startupInitialOutcome=\(vgSanitizeRawToken(recovery.initialOutcome))")
+        }
+        if recovery.initialAttempted || !recovery.isDisabled {
+            parts.append("recoveryPhase=\(vgSanitizeRawToken(recovery.phaseName))")
+            parts.append("recoveryGeneration=\(recovery.generation)")
+            parts.append("recoveryAttempts=\(recovery.attemptCount)")
+            parts.append("recoveryAligned=\(recovery.alignedCount)")
+            parts.append("recoveryTrigger=\(vgSanitizeRawToken(recovery.triggerReason?.rawValue ?? "none"))")
+        }
+
         guard !parts.isEmpty else { return "" }
         return ";" + parts.joined(separator: ";")
     }
@@ -988,6 +1862,13 @@ final class VGStreamingPlaybackCoordinator {
     }
 
     // MARK: - Helpers
+
+    /// Whether `session` is still registered for its texture, not disposed, at
+    /// `generation` and still holding `graph`: what every queued callback requires.
+    private func isCurrent(_ session: VGPlaybackSession, generation: UInt64, graph: VGPlaybackGraph) -> Bool {
+        return !session.disposed && sessions[session.textureId] === session
+            && session.recoveryPolicy.generation == generation && session.graph === graph
+    }
 
     /// Looks up the session for the `textureId` in `args`.
     /// Returns `nil` and calls `result` with a typed failure map when not found.
