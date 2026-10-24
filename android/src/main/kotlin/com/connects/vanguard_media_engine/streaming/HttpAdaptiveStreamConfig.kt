@@ -44,6 +44,11 @@ enum class AdaptiveStreamFormat {
  *                       Defaults to [AndroidDagPlaybackCacheConfig] with `enabled = false`, which
  *                       preserves all pre-4C6B playback behaviour; existing callers that do not
  *                       pass this parameter compile and behave identically to before.
+ * @param androidLlhlsExperiment Explicit opt-in to the default-off Android LL-HLS experimental
+ *                       profile ([AndroidLlhlsProfile]). Opting in is necessary but not
+ *                       sufficient: [AndroidLlhlsProfile.isEligible] also requires explicit HLS,
+ *                       LOW_LATENCY, no start position, disabled cache and API >= 29. Defaults to
+ *                       `false`, which preserves all existing behaviour.
  */
 data class HttpAdaptiveStreamConfig(
     val uri: String,
@@ -53,6 +58,7 @@ data class HttpAdaptiveStreamConfig(
     val autoPlay: Boolean = true,
     val networkProfile: AdaptiveStreamingNetworkProfile = AdaptiveStreamingNetworkProfile.AUTO,
     val cacheConfig: AndroidDagPlaybackCacheConfig = AndroidDagPlaybackCacheConfig(),
+    val androidLlhlsExperiment: Boolean = false,
 ) {
     init {
         require(uri.isNotBlank()) {

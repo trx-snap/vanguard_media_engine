@@ -5,6 +5,7 @@
 package com.connects.vanguard_media_engine.streaming
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
@@ -49,6 +50,17 @@ class AndroidDagStreamingPlaybackSession(
     @Volatile
     var state: AndroidDagPlaybackState = AndroidDagPlaybackState.Idle
         private set
+
+    // Android LL-HLS experiment: eligibility is decided exactly once here and never re-evaluated.
+    // Ordinary sessions (experimentalLlhls=false) keep every pre-existing code path unchanged.
+    private val experimentalLlhls: Boolean =
+        AndroidLlhlsProfile.isEligible(streamConfig, Build.VERSION.SDK_INT)
+
+    /** Sticky non-surface failure latch (experimental only). Never cleared. */
+    private val experimentalFailed = AtomicBoolean(false)
+
+    /** Stop latch (experimental only): a stopped experimental session requires a new open. */
+    private val experimentalStopped = AtomicBoolean(false)
 
     private val diagnostics = VanguardDiagnostics()
     private val lifecycleObserver = VanguardLifecycleObserver(diagnostics)
@@ -149,23 +161,105 @@ class AndroidDagStreamingPlaybackSession(
         }
     }
 
+    /**
+     * Single write path for [state]. Ordinary sessions assign directly (unchanged behaviour).
+     * Experimental sessions apply, under renderLock, the latch priority
+     * Disposed > sticky Failed > stopped Idle > ordinary transition, so late adapter callbacks
+     * (Idle after Failed, Ready/Playing after Stop) can neither mask a terminal failure nor revive
+     * a stopped session.
+     */
+    private fun setState(next: AndroidDagPlaybackState) {
+        if (!experimentalLlhls) {
+            state = next
+            return
+        }
+        synchronized(renderLock) {
+            state = when {
+                disposed.get() -> AndroidDagPlaybackState.Disposed
+                experimentalFailed.get() -> AndroidDagPlaybackState.Failed
+                experimentalStopped.get() -> AndroidDagPlaybackState.Idle
+                else -> next
+            }
+        }
+    }
+
+    /**
+     * State as reported by diagnostics. Ordinary sessions report [state] as-is. Experimental
+     * sessions apply the same latch priority as [setState], so a latch set on the adapter thread
+     * is visible even before its matching state write lands.
+     */
+    private fun reportedState(): AndroidDagPlaybackState {
+        val current = state
+        if (!experimentalLlhls) return current
+        return when {
+            current == AndroidDagPlaybackState.Disposed || disposed.get() -> AndroidDagPlaybackState.Disposed
+            experimentalFailed.get() -> AndroidDagPlaybackState.Failed
+            experimentalStopped.get() -> AndroidDagPlaybackState.Idle
+            else -> current
+        }
+    }
+
+    /**
+     * Android LL-HLS experiment: Play and Seek are rejected after a sticky failure or after Stop.
+     * Returns the rejection result, or null when the control may proceed. Ordinary sessions never
+     * reject here.
+     */
+    private fun experimentalControlRejection(): Map<String, Any?>? {
+        if (!experimentalLlhls) return null
+        if (experimentalFailed.get()) {
+            return diagnosticMap(pass = false, raw = "status=FAIL;reason=failed_session;state=Failed;lastError=${lastError ?: "unknown"}")
+        }
+        if (experimentalStopped.get()) {
+            return diagnosticMap(pass = false, raw = "status=FAIL;reason=stopped_requires_new_session")
+        }
+        return null
+    }
+
+    /** Experimental terminal condition; native-affecting paths evaluate it under renderLock. */
+    private fun experimentalTerminal(): Boolean =
+        experimentalLlhls && (experimentalFailed.get() || experimentalStopped.get())
+
+    /**
+     * Experimental sessions serialize control acceptance, state write, adapter dispatch and the
+     * result snapshot under renderLock, so a failure latched on the adapter thread cannot land
+     * between the terminal check and the reported result. Ordinary sessions run [block] directly.
+     * Callers publish adapter intent/stop markers (synchronous atomics) before entering.
+     */
+    private inline fun <T> controlSection(block: () -> T): T =
+        if (experimentalLlhls) synchronized(renderLock, block) else block()
+
+    /**
+     * Control result snapshot. Ordinary sessions report the requested state literally (unchanged).
+     * Experimental sessions report the latched state so results always agree with diagnostics.
+     */
+    private fun controlResult(okState: AndroidDagPlaybackState, extra: String = ""): Map<String, Any?> {
+        if (!experimentalLlhls) return diagnosticMap(pass = true, raw = "status=OK;state=${okState.name}$extra")
+        return when (val reported = reportedState()) {
+            AndroidDagPlaybackState.Failed ->
+                diagnosticMap(pass = false, raw = "status=FAIL;reason=failed_session;state=Failed;lastError=${lastError ?: "unknown"}")
+            AndroidDagPlaybackState.Disposed ->
+                diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed")
+            else -> diagnosticMap(pass = true, raw = "status=OK;state=${reported.name}$extra")
+        }
+    }
+
     /** Prepares adaptive streaming playback and native True-DAG rendering pipeline. */
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
         if (disposed.get()) {
-            state = AndroidDagPlaybackState.Failed
+            setState(AndroidDagPlaybackState.Failed)
             onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed"))
             return
         }
 
         synchronized(renderLock) {
             if (disposed.get()) {
-                state = AndroidDagPlaybackState.Failed
+                setState(AndroidDagPlaybackState.Failed)
                 onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed"))
                 return
             }
 
             try {
-                state = AndroidDagPlaybackState.Preparing
+                setState(AndroidDagPlaybackState.Preparing)
 
                 val adapterShim = AndroidDagSurfaceProducerLifecycleAdapter(
                     onAvailable = { handleSurfaceAvailable() },
@@ -238,11 +332,11 @@ class AndroidDagStreamingPlaybackSession(
                     override fun onStateChanged(newState: HttpAdaptivePlaybackState) {
                         if (disposed.get() || surfaceLost.get()) return
                         when (newState) {
-                            is HttpAdaptivePlaybackState.Idle -> state = AndroidDagPlaybackState.Idle
-                            is HttpAdaptivePlaybackState.Preparing -> state = AndroidDagPlaybackState.Preparing
+                            is HttpAdaptivePlaybackState.Idle -> setState(AndroidDagPlaybackState.Idle)
+                            is HttpAdaptivePlaybackState.Preparing -> setState(AndroidDagPlaybackState.Preparing)
                             is HttpAdaptivePlaybackState.Ready -> {
                                 recordPlaybackTelemetry(durationMs = newState.durationMs)
-                                state = AndroidDagPlaybackState.Prepared
+                                setState(AndroidDagPlaybackState.Prepared)
                             }
                             is HttpAdaptivePlaybackState.Playing -> {
                                 recordPlaybackTelemetry(
@@ -250,22 +344,22 @@ class AndroidDagStreamingPlaybackSession(
                                     durationMs = newState.durationMs,
                                     bufferedPercent = newState.bufferedPercent,
                                 )
-                                state = AndroidDagPlaybackState.Playing
+                                setState(AndroidDagPlaybackState.Playing)
                             }
                             is HttpAdaptivePlaybackState.Paused -> {
                                 recordPlaybackTelemetry(
                                     positionMs = newState.positionMs,
                                     durationMs = newState.durationMs,
                                 )
-                                state = AndroidDagPlaybackState.Paused
+                                setState(AndroidDagPlaybackState.Paused)
                             }
                             is HttpAdaptivePlaybackState.Buffering -> {
                                 recordPlaybackTelemetry(bufferedPercent = newState.bufferedPercent)
-                                if (state == AndroidDagPlaybackState.Preparing) state = AndroidDagPlaybackState.Preparing
+                                if (state == AndroidDagPlaybackState.Preparing) setState(AndroidDagPlaybackState.Preparing)
                             }
                             is HttpAdaptivePlaybackState.Seeking -> {
                                 recordPlaybackTelemetry(positionMs = newState.targetPositionMs)
-                                state = AndroidDagPlaybackState.Seeking
+                                setState(AndroidDagPlaybackState.Seeking)
                             }
                             is HttpAdaptivePlaybackState.Ended -> {
                                 recordPlaybackTelemetry(
@@ -273,12 +367,12 @@ class AndroidDagStreamingPlaybackSession(
                                     durationMs = newState.durationMs,
                                     bufferedPercent = 100,
                                 )
-                                state = AndroidDagPlaybackState.Completed
+                                setState(AndroidDagPlaybackState.Completed)
                             }
                             is HttpAdaptivePlaybackState.Failed -> {
                                 failAndDestroyNativeSession("adapter_error:${newState.errorCode}:${newState.message}")
                             }
-                            is HttpAdaptivePlaybackState.Released -> state = AndroidDagPlaybackState.Disposed
+                            is HttpAdaptivePlaybackState.Released -> setState(AndroidDagPlaybackState.Disposed)
                         }
                     }
 
@@ -310,10 +404,14 @@ class AndroidDagStreamingPlaybackSession(
                     }
                 }
 
-                val ad = HttpAdaptivePlaybackAdapter(context, playbackListener).also { adapter = it }
+                val ad = HttpAdaptivePlaybackAdapter(
+                    context = context,
+                    listener = playbackListener,
+                    experimentalLlhls = experimentalLlhls,
+                ).also { adapter = it }
                 ad.enableHeadlessFrameBridge(initialWidth, initialHeight) { frame -> handleDecodedFrame(frame) }
                 ad.prepare(streamConfig)
-                state = AndroidDagPlaybackState.Prepared
+                setState(AndroidDagPlaybackState.Prepared)
 
                 onResult(diagnosticMap(pass = true, raw = createResult))
             } catch (t: Throwable) {
@@ -325,34 +423,54 @@ class AndroidDagStreamingPlaybackSession(
         }
     }
 
-    /** Starts or resumes streaming playback. */
+    /** Starts or resumes streaming playback. Ordinary resume; experimental recovery is never re-armed. */
     fun play(onResult: (Map<String, Any?>) -> Unit) {
-        if (disposed.get()) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed"))
-        if (surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=surface_lost"))
-        val ad = adapter ?: return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null"))
-        state = AndroidDagPlaybackState.Playing
-        ad.play()
-        onResult(diagnosticMap(pass = true, raw = "status=OK;state=Playing"))
+        onResult(controlSection { playLocked() })
     }
 
-    /** Pauses streaming playback while preserving buffers. */
+    private fun playLocked(): Map<String, Any?> {
+        if (disposed.get()) return diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed")
+        experimentalControlRejection()?.let { return it }
+        if (surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost) return diagnosticMap(pass = false, raw = "status=FAIL;reason=surface_lost")
+        val ad = adapter ?: return diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null")
+        setState(AndroidDagPlaybackState.Playing)
+        ad.play()
+        return controlResult(AndroidDagPlaybackState.Playing)
+    }
+
+    /**
+     * Pauses streaming playback while preserving buffers. The adapter publishes paused intent and
+     * revokes experimental recovery synchronously before any lock wait. After a sticky experimental
+     * failure the pause still dispatches (resource cleanup) but reports the preserved Failed state.
+     */
     fun pause(onResult: (Map<String, Any?>) -> Unit) {
         if (disposed.get()) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed"))
         val ad = adapter ?: return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null"))
-        if (state != AndroidDagPlaybackState.Disposed && state != AndroidDagPlaybackState.Failed && state != AndroidDagPlaybackState.SurfaceLost) {
-            state = AndroidDagPlaybackState.Paused
-        }
         ad.pause()
-        onResult(diagnosticMap(pass = true, raw = "status=OK;state=Paused"))
+        onResult(controlSection {
+            if (state != AndroidDagPlaybackState.Disposed && state != AndroidDagPlaybackState.Failed && state != AndroidDagPlaybackState.SurfaceLost) {
+                setState(AndroidDagPlaybackState.Paused)
+            }
+            controlResult(AndroidDagPlaybackState.Paused)
+        })
     }
 
-    /** Seeks to [positionMs] milliseconds. Bumps DAG generation before dispatching seek to adapter. */
+    /**
+     * Seeks to [positionMs] milliseconds. Ordinary sessions keep the existing path: DAG generation
+     * bump, then the seek is dispatched to the adapter. Experimental sessions use the adapter's
+     * staged reservation ([seekExperimental]).
+     */
     fun seekTo(positionMs: Long, onResult: (Map<String, Any?>) -> Unit) {
         if (disposed.get()) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed"))
         if (positionMs < 0L) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=invalid_position;positionMs=$positionMs"))
-        if (surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=surface_lost"))
-        val ad = adapter ?: return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null"))
-        state = AndroidDagPlaybackState.Seeking
+        if (experimentalLlhls) return onResult(seekExperimental(positionMs))
+        onResult(seekOrdinary(positionMs))
+    }
+
+    private fun seekOrdinary(positionMs: Long): Map<String, Any?> {
+        if (surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost) return diagnosticMap(pass = false, raw = "status=FAIL;reason=surface_lost")
+        val ad = adapter ?: return diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null")
+        setState(AndroidDagPlaybackState.Seeking)
         recordPlaybackTelemetry(positionMs = positionMs)
         synchronized(renderLock) {
             val sid = sessionId
@@ -369,16 +487,78 @@ class AndroidDagStreamingPlaybackSession(
             adaptiveTimelineNeedsFrameAnchor = true
         }
         ad.seekTo(positionMs)
-        onResult(diagnosticMap(pass = true, raw = "status=OK;state=Seeking;positionMs=$positionMs;generationId=$generationId"))
+        return controlResult(AndroidDagPlaybackState.Seeking, ";positionMs=$positionMs;generationId=$generationId")
     }
 
-    /** Stops streaming playback and resets adapter to idle. */
+    /**
+     * Android LL-HLS experiment: staged seek. The reservation (version, target, playback hold) is
+     * published and recovery revoked through [HttpAdaptivePlaybackAdapter.beginSeek] before any
+     * lock wait. Under renderLock the session rechecks disposed / failed / stopped / surface state
+     * and native-session availability, performs the native generation work, then commits (the
+     * adapter issues the SDK seek on its owner thread). Every non-committed exit cancels only this
+     * ticket; a native failure uses the existing failure handling and issues no SDK seek.
+     */
+    private fun seekExperimental(positionMs: Long): Map<String, Any?> {
+        val ad = adapter ?: return diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null")
+        val ticket = ad.beginSeek(positionMs)
+        if (ticket == HttpAdaptivePlaybackControlState.NO_SEEK_TICKET) {
+            return experimentalControlRejection()
+                ?: diagnosticMap(pass = false, raw = "status=FAIL;reason=seek_rejected;positionMs=$positionMs")
+        }
+        var committed = false
+        try {
+            return synchronized(renderLock) {
+                if (disposed.get()) return diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed")
+                experimentalControlRejection()?.let { return it }
+                if (surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost) return diagnosticMap(pass = false, raw = "status=FAIL;reason=surface_lost")
+                val sid = sessionId ?: return diagnosticMap(pass = false, raw = "status=FAIL;reason=native_session_unavailable")
+
+                // Native generation work precedes commit; a native failure issues no SDK seek.
+                val bumpRes = nativeBridge.bumpAndroidDagPhase4B1TexturePlaybackGeneration(sid)
+                if (!bumpRes.startsWith("status=OK;")) {
+                    failAndDestroyNativeSession("generation_bump_failed_on_seek;$bumpRes", surfaceRelated = bumpRes.contains("surface_lost"))
+                    return diagnosticMap(pass = false, raw = "status=FAIL;reason=generation_bump_failed_on_seek;$bumpRes")
+                }
+                val parsedGen = bumpRes.substringAfter("generationId=").substringBefore(";").toLongOrNull()
+                if (parsedGen == null || parsedGen <= 0L) {
+                    failAndDestroyNativeSession("generation_parse_failed_on_seek;$bumpRes", surfaceRelated = false)
+                    return diagnosticMap(pass = false, raw = "status=FAIL;reason=generation_parse_failed_on_seek;$bumpRes")
+                }
+                generationId = parsedGen
+                // Rebase adaptive timeline on seek -- diagnostic-only, does not affect rendering.
+                adaptiveTimelineController.rebase("seek", System.nanoTime(), positionMs * 1000L)
+                // Next decoded frame must re-anchor to actual post-seek PTS before evaluate().
+                adaptiveTimelineNeedsFrameAnchor = true
+
+                if (!ad.commitSeek(ticket)) {
+                    // Superseded by a newer reservation, or invalidated by stop / release.
+                    return diagnosticMap(pass = false, raw = "status=FAIL;reason=seek_superseded;positionMs=$positionMs;ticket=$ticket")
+                }
+                committed = true
+                setState(AndroidDagPlaybackState.Seeking)
+                recordPlaybackTelemetry(positionMs = positionMs)
+                controlResult(AndroidDagPlaybackState.Seeking, ";positionMs=$positionMs;generationId=$generationId;ticket=$ticket")
+            }
+        } finally {
+            if (!committed) ad.cancelSeek(ticket)
+        }
+    }
+
+    /**
+     * Stops streaming playback and resets adapter to idle. An experimental session latches
+     * `stopped` and publishes the adapter stop marker synchronously before any lock wait: later
+     * Play/Seek are rejected and a new open is required. After a sticky experimental failure the
+     * stop still dispatches but reports the preserved Failed state.
+     */
     fun stop(onResult: (Map<String, Any?>) -> Unit) {
         if (disposed.get()) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=disposed"))
         val ad = adapter ?: return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null"))
-        if (state != AndroidDagPlaybackState.Disposed && state != AndroidDagPlaybackState.Failed) state = AndroidDagPlaybackState.Idle
+        if (experimentalLlhls) experimentalStopped.set(true)
         ad.stop()
-        onResult(diagnosticMap(pass = true, raw = "status=OK;state=Idle"))
+        onResult(controlSection {
+            if (state != AndroidDagPlaybackState.Disposed && state != AndroidDagPlaybackState.Failed) setState(AndroidDagPlaybackState.Idle)
+            controlResult(AndroidDagPlaybackState.Idle)
+        })
     }
 
     /** Diagnostic seam: triggers surface cleanup handling. */
@@ -397,15 +577,16 @@ class AndroidDagStreamingPlaybackSession(
 
     /** Returns a diagnostic snapshot of current session state. */
     fun diagnosticState(): Map<String, Any?> {
-        val isSurfaceLost = surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost
-        val rawStatus = if (state == AndroidDagPlaybackState.Failed) "status=FAIL;state=${state.name};reason=${lastError ?: "unknown"}" else "status=OK;state=${state.name}"
+        val reported = reportedState()
+        val isSurfaceLost = surfaceLost.get() || reported == AndroidDagPlaybackState.SurfaceLost
+        val rawStatus = if (reported == AndroidDagPlaybackState.Failed) "status=FAIL;state=${reported.name};reason=${lastError ?: "unknown"}" else "status=OK;state=${reported.name}"
         // Include adaptive timeline telemetry -- diagnostic-only.
         val tlSnapshot = adaptiveTimelineController.snapshot()
         // Phase 4C5B: streaming network profile/policy diagnostics -- diagnostic-only.
         val netPolicy = AdaptiveStreamingNetworkPolicy.forProfile(streamConfig.networkProfile)
         return mapOf(
-            "pass" to (state != AndroidDagPlaybackState.Failed),
-            "state" to state.name,
+            "pass" to (reported != AndroidDagPlaybackState.Failed),
+            "state" to reported.name,
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
@@ -441,8 +622,18 @@ class AndroidDagStreamingPlaybackSession(
             "playbackCacheSizeBytes" to playbackCacheSizeBytes,
             "playbackCacheIgnoredCount" to playbackCacheIgnoredCount,
             "playbackCacheLastIgnoredReason" to playbackCacheLastIgnoredReason,
-        )
+        ) + experimentalDiagnostics()
     }
+
+    /** Android LL-HLS experiment diagnostics (diagnostic-only; latches are authoritative). */
+    private fun experimentalDiagnostics(): Map<String, Any?> = mapOf(
+        "androidLlhlsExperimentRequested" to streamConfig.androidLlhlsExperiment,
+        "androidLlhlsExperimentActive" to experimentalLlhls,
+        "androidLlhlsFailedLatched" to experimentalFailed.get(),
+        "androidLlhlsStoppedLatched" to experimentalStopped.get(),
+        "androidLlhlsRecovery" to adapter?.recoveryDiagnostic(),
+        "androidLlhlsProfile" to if (experimentalLlhls) AndroidLlhlsProfile.toDiagnosticMap() else null,
+    )
 
     /** Disposes session resources idempotently. Does NOT release SurfaceProducer. */
     fun dispose(onResult: ((Map<String, Any?>) -> Unit)? = null) {
@@ -473,11 +664,11 @@ class AndroidDagStreamingPlaybackSession(
                 Log.w(TAG, "Error clearing SurfaceProducer callback during dispose", t)
             }
             lifecycleAdapter = null
-            state = AndroidDagPlaybackState.Disposed
+            setState(AndroidDagPlaybackState.Disposed)
             onResult?.invoke(diagnosticMap(pass = true, raw = "status=OK;disposed=true"))
         } catch (t: Throwable) {
             Log.e(TAG, "Error during dispose", t)
-            state = AndroidDagPlaybackState.Disposed
+            setState(AndroidDagPlaybackState.Disposed)
             onResult?.invoke(diagnosticMap(pass = true, raw = "status=OK;disposed_with_error:${t.javaClass.simpleName}"))
         }
     }
@@ -486,6 +677,20 @@ class AndroidDagStreamingPlaybackSession(
         try {
             synchronized(renderLock) {
                 lastError = reason
+                // Android LL-HLS experiment: latch before native destruction so no late callback
+                // can clear the failure. Surface loss only revokes recovery; restoration stays
+                // possible through the existing handleSurfaceAvailable path. Disposal dominates.
+                if (experimentalLlhls && !disposed.get()) {
+                    if (surfaceRelated) {
+                        adapter?.disableRecovery("surface_loss:$reason")
+                    } else {
+                        experimentalFailed.set(true)
+                        adapter?.disableRecovery("failure:$reason")
+                        // Fatal: dispatch the existing stop cleanup (synchronous stop marker plus
+                        // queued player stop). The latch keeps Failed over the resulting Idle.
+                        adapter?.stop()
+                    }
+                }
                 val sid = sessionId
                 sessionId = null
                 if (sid != null) {
@@ -499,10 +704,10 @@ class AndroidDagStreamingPlaybackSession(
                 if (!disposed.get()) {
                     if (surfaceRelated) {
                         surfaceLost.set(true)
-                        state = AndroidDagPlaybackState.SurfaceLost
+                        setState(AndroidDagPlaybackState.SurfaceLost)
                     } else {
                         surfaceLost.set(false)
-                        state = AndroidDagPlaybackState.Failed
+                        setState(AndroidDagPlaybackState.Failed)
                     }
                 }
             }
@@ -516,6 +721,7 @@ class AndroidDagStreamingPlaybackSession(
     private fun handleDecodedFrame(frame: HttpAdaptiveDecodedFrame) {
         synchronized(renderLock) {
             if (disposed.get() || surfaceLost.get()) return
+            if (experimentalTerminal()) return
             val sid = sessionId ?: return
             val hwBuf = frame.hardwareBuffer
             val ptsUs = frame.ptsUs
@@ -585,6 +791,9 @@ class AndroidDagStreamingPlaybackSession(
         if (width <= 0 || height <= 0) return
 
         synchronized(renderLock) {
+            // Android LL-HLS experiment: a latched failure or stop is terminal; late size
+            // callbacks must not recreate native rendering.
+            if (experimentalTerminal()) return
             currentWidth = width
             currentHeight = height
             currentRotationDegrees = rotationDegrees
@@ -673,6 +882,11 @@ class AndroidDagStreamingPlaybackSession(
                 Log.d(TAG, "handleSurfaceAvailable: not surface-lost; ignoring spurious callback")
                 return
             }
+            // Android LL-HLS experiment: no restoration after a latched failure or stop.
+            if (experimentalTerminal()) {
+                Log.d(TAG, "handleSurfaceAvailable: experimental session is terminal; not restoring")
+                return
+            }
 
             try {
                 val restoreDisplayWidth = if (currentDisplayWidth > 0) currentDisplayWidth else if (currentWidth > 0) currentWidth else initialWidth
@@ -712,7 +926,7 @@ class AndroidDagStreamingPlaybackSession(
                 adaptiveTimelineController.rebase("surface_available", System.nanoTime(), rebaseMediaPtsUs)
                 // Next decoded frame must re-anchor to actual post-restore PTS before evaluate().
                 adaptiveTimelineNeedsFrameAnchor = true
-                if (!disposed.get()) state = AndroidDagPlaybackState.Paused
+                if (!disposed.get()) setState(AndroidDagPlaybackState.Paused)
             } catch (t: Throwable) {
                 Log.e(TAG, "Exception during handleSurfaceAvailable", t)
                 failAndDestroyNativeSession("surface_available_exception:${t.javaClass.simpleName}:${t.message}", surfaceRelated = true)
@@ -734,14 +948,15 @@ class AndroidDagStreamingPlaybackSession(
     }
 
     private fun diagnosticMap(pass: Boolean, raw: String): Map<String, Any?> {
-        val isSurfaceLost = surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost
+        val reported = reportedState()
+        val isSurfaceLost = surfaceLost.get() || reported == AndroidDagPlaybackState.SurfaceLost
         // Include adaptive timeline telemetry -- diagnostic-only.
         val tlSnapshot = adaptiveTimelineController.snapshot()
         // Phase 4C5B: streaming network profile/policy diagnostics -- diagnostic-only.
         val netPolicy = AdaptiveStreamingNetworkPolicy.forProfile(streamConfig.networkProfile)
         return mapOf(
             "pass" to pass,
-            "state" to state.name,
+            "state" to reported.name,
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
@@ -777,6 +992,6 @@ class AndroidDagStreamingPlaybackSession(
             "playbackCacheSizeBytes" to playbackCacheSizeBytes,
             "playbackCacheIgnoredCount" to playbackCacheIgnoredCount,
             "playbackCacheLastIgnoredReason" to playbackCacheLastIgnoredReason,
-        )
+        ) + experimentalDiagnostics()
     }
 }

@@ -144,6 +144,10 @@ class AndroidDagStreamingPlaybackCoordinator(
 
         val autoPlay = (args["autoPlay"] as? Boolean) ?: true
 
+        // Android LL-HLS experiment: explicit, default-false opt-in. Parsed and passed only;
+        // eligibility is decided by AndroidLlhlsProfile at session construction.
+        val androidLlhlsExperiment = (args["androidLlhlsExperiment"] as? Boolean) ?: false
+
         val networkProfileStr = (args["networkProfile"] as? String)?.trim()?.uppercase() ?: "AUTO"
         val networkProfile = when (networkProfileStr) {
             "AUTO"        -> AdaptiveStreamingNetworkProfile.AUTO
@@ -201,6 +205,7 @@ class AndroidDagStreamingPlaybackCoordinator(
                 autoPlay = autoPlay,
                 networkProfile = networkProfile,
                 cacheConfig = cacheConfig,
+                androidLlhlsExperiment = androidLlhlsExperiment,
             )
         } catch (t: Throwable) {
             result.error("INVALID_ARG", "createAndroidDagPhase4C1D1StreamingPlayback: invalid config: ${t.message}", null)
