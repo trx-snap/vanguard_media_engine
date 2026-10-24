@@ -4,11 +4,12 @@
 // After an external interruption ends a startup-alignment attempt, or pauses a
 // session that fell back to ordinary playback, one later explicit Play may replace
 // the whole AVFoundation graph and run the frozen startup protocol
-// (VGHLSStartupAlignment) again on the fresh item, as a new generation. Nothing
-// resumes, retries, rebuilds or seeks on its own: the permission is granted by an
-// interruption on a ready live item, consumed by exactly one explicit Play in the
-// foreground, and cleared by every user control, native failure, end of stream and
-// disposal.
+// (VGHLSStartupAlignment) again on the fresh item, as a new generation. A manual
+// Pause of a ready live item that has already played live grants the same
+// permission. Nothing resumes, retries, rebuilds or seeks on its own: the
+// permission is granted by an interruption or a qualifying manual Pause, consumed
+// by exactly one explicit Play in the foreground, and cleared by Seek, Stop, native
+// failure, end of stream and disposal.
 //
 // Layout:
 //   Pure policy (Foundation only; compiles on macOS for tests):
@@ -35,11 +36,15 @@ struct VGHLSRecoveryPolicy {
         case aligned(generation: UInt64)
         /// An interruption on a ready live item; one explicit Play may reconstruct.
         case armed(generation: UInt64, reason: VGHLSStartupEndReason)
+        /// A manual Pause of a ready live item that has played live; one explicit
+        /// Play may reconstruct, exactly as from armed.
+        case manuallyPaused(generation: UInt64)
         /// The permission is consumed; the fresh generation awaits beginAlignment.
         case reconstructing(generation: UInt64)
         /// Ordinary playback after an attempt; a later interruption may arm.
         case fallback(generation: UInt64)
-        /// A Pause, Seek or Stop: no reconstruction for the session's life.
+        /// A Seek or Stop: no reconstruction, except that a qualifying manual Pause
+        /// after a completed Seek may arm again.
         case disqualified(reason: String)
         case failed
         case ended
@@ -50,6 +55,9 @@ struct VGHLSRecoveryPolicy {
         case beginAlignment(generation: UInt64)
         case explicitPlay(applicationActive: Bool)
         case interrupted(reason: VGHLSStartupEndReason, generation: UInt64, readyLive: Bool)
+        /// The caller's Pause, after its helper was cancelled; what the coordinator
+        /// observed right before it cleared intent and the seek state.
+        case manualPause(generation: UInt64, readyLive: Bool, hasPlayedLive: Bool, seekPending: Bool)
         case aligned(generation: UInt64)
         case fallback(reason: VGHLSStartupEndReason, generation: UInt64)
         /// Diagnostic only: a helper cancelled by a control, a terminal path or a rebuild.
@@ -68,6 +76,19 @@ struct VGHLSRecoveryPolicy {
         case reconstruct(generation: UInt64)
     }
 
+    /// What last granted the reconstruction permission.
+    enum ResumeTrigger: Equatable {
+        case manualPause
+        case external(VGHLSStartupEndReason)
+
+        var rawValue: String {
+            switch self {
+            case .manualPause:          return "manualPause"
+            case .external(let reason): return reason.rawValue
+            }
+        }
+    }
+
     /// The current graph's generation; 1 is the graph the session was created with.
     private(set) var generation: UInt64 = 1
     private(set) var phase: Phase
@@ -76,8 +97,14 @@ struct VGHLSRecoveryPolicy {
     private(set) var initialOutcome   = "none"
     /// The last helper outcome or cancellation of any generation.
     private(set) var lastHelperOutcome = "none"
-    /// The interruption that last armed a reconstruction.
-    private(set) var triggerReason: VGHLSStartupEndReason?
+    /// The interruption or manual Pause that last armed a reconstruction.
+    private(set) var resumeTrigger: ResumeTrigger?
+    /// Compatibility view of `resumeTrigger`: the external reason, or nil for a
+    /// manual Pause or no trigger yet.
+    var triggerReason: VGHLSStartupEndReason? {
+        if case .external(let reason)? = resumeTrigger { return reason }
+        return nil
+    }
     /// Reconstructions consumed, and recovery generations that aligned.
     private(set) var attemptCount = 0
     private(set) var alignedCount = 0
@@ -95,6 +122,7 @@ struct VGHLSRecoveryPolicy {
         case .aligning:       return "aligning"
         case .aligned:        return "aligned"
         case .armed:          return "armed"
+        case .manuallyPaused: return "manuallyPaused"
         case .reconstructing: return "reconstructing"
         case .fallback:       return "fallback"
         case .disqualified:   return "disqualified"
@@ -137,7 +165,7 @@ struct VGHLSRecoveryPolicy {
             switch phase {
             case .aligning:
                 return .snapshotOnly
-            case .armed:
+            case .armed, .manuallyPaused:
                 guard applicationActive else { return .snapshotOnly }
                 generation   += 1
                 attemptCount += 1
@@ -158,11 +186,38 @@ struct VGHLSRecoveryPolicy {
                 return .none
             }
             if readyLive {
-                triggerReason = reason
+                resumeTrigger = .external(reason)
                 phase = .armed(generation: g, reason: reason)
             } else {
                 // Unproven live: paused with intent cleared, but no permission.
                 phase = .fallback(generation: g)
+            }
+            return .none
+
+        case .manualPause(let g, let readyLive, let hasPlayedLive, let seekPending):
+            // The helper, if any, was cancelled already and recorded cancelled_pause;
+            // this event changes no history. A Pause before the first start (unused),
+            // after a Stop, or in a terminal phase is ignored.
+            guard g == generation else { return .none }
+            let qualifying = readyLive && hasPlayedLive && !seekPending
+            switch phase {
+            case .aligning, .aligned, .fallback, .armed, .manuallyPaused, .reconstructing:
+                if qualifying {
+                    resumeTrigger = .manualPause
+                    phase = .manuallyPaused(generation: g)
+                } else {
+                    // Ordinary paused playback: a cancelled helper never leaves the
+                    // next Play answered as a duplicate of an attempt.
+                    phase = .fallback(generation: g)
+                }
+            case .disqualified(let reason) where reason == "seek":
+                // Only a fresh Pause after the seek completed lifts the disqualification.
+                if qualifying {
+                    resumeTrigger = .manualPause
+                    phase = .manuallyPaused(generation: g)
+                }
+            default:
+                break
             }
             return .none
 

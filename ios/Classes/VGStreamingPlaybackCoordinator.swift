@@ -332,6 +332,10 @@ private final class VGPlaybackSession {
     /// Whether the caller's last control asked for playback (play or autoPlay)
     /// rather than a pause, stop, end or failure.
     var intendedPlaying: Bool = false
+    /// Session-scoped and kept across graph replacements: a buffer was copied from
+    /// a ready live item while playback was intended and AVPlayer reported playing.
+    /// A poster frame of a paused item never sets it. Read by the manual-pause policy.
+    var hasStartedLivePlayback: Bool = false
     /// Advanced by every control and terminal transition; a seek completion that
     /// finds another epoch leaves the state alone.
     var controlEpoch: Int = 0
@@ -722,15 +726,18 @@ final class VGStreamingPlaybackCoordinator {
         // The retained observation first: a queued unowned pause or interruption is
         // applied now, so the policy sees it before it answers this Play. A Play
         // during an attempt is answered with a snapshot and interrupts nothing; an
-        // armed session in the background keeps its permission and stays paused; an
-        // armed session in the foreground is rebuilt by this one Play.
+        // armed or manually paused session in the background keeps its permission
+        // and stays paused; in the foreground it is rebuilt by this one Play.
         session.startupAlignment?.refreshExternalState()
         session.fallbackObserver?.refreshExternalState()
         let applicationActive = UIApplication.shared.applicationState == .active
         switch applyRecovery(session, .explicitPlay(applicationActive: applicationActive)) {
         case .snapshotOnly:
-            if case .armed = session.recoveryPolicy.phase {
+            switch session.recoveryPolicy.phase {
+            case .armed, .manuallyPaused:
                 logRecovery("playDeferred", session: session, ["applicationActive=\(applicationActive)"])
+            default:
+                break
             }
             result(snapshot(session: session))
             return
@@ -764,13 +771,41 @@ final class VGStreamingPlaybackCoordinator {
 
     func pause(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let session = resolveSession(args: args, result: result) else { return }
-        // Ends any alignment attempt before the player is touched; never retried.
-        disqualifyStartupAlignment(session: session, reason: "pause")
+        // What the policy judges is read before this route changes any of it: the
+        // generation, whether the item is ready and live, whether this session has
+        // played live, and whether a seek is still pending.
+        let generation    = session.recoveryPolicy.generation
+        let readyLive     = isReadyLive(session)
+        let hasPlayedLive = session.hasStartedLivePlayback
+        let seekPending   = session.state == "seeking" || session.seekReturnState != nil
+        let phaseBefore   = session.recoveryPolicy.phase
+        // Ends any alignment attempt and fallback observation before the player is
+        // touched; the attempt is never retried. The policy then decides whether this
+        // Pause lets one later explicit Play reconstruct.
+        invalidateFallbackObserver(session: session)
+        cancelStartupAlignment(session: session, reason: "pause")
+        applyRecovery(session, .manualPause(generation: generation, readyLive: readyLive,
+                                            hasPlayedLive: hasPlayedLive, seekPending: seekPending))
+        // One record per Pause the policy weighed; a Pause it ignored logs nothing.
+        let weighed: Bool
+        switch phaseBefore {
+        case .aligning, .aligned, .fallback, .armed, .manuallyPaused, .reconstructing: weighed = true
+        case .disqualified(let reason):                                                weighed = reason == "seek"
+        default:                                                                       weighed = false
+        }
+        if weighed {
+            let armed: Bool
+            if case .manuallyPaused = session.recoveryPolicy.phase { armed = true } else { armed = false }
+            logRecovery(armed ? "manualPauseArmed" : "manualPauseDeclined", session: session,
+                        ["readyLive=\(readyLive)", "hasPlayedLive=\(hasPlayedLive)", "seekPending=\(seekPending)"])
+        }
         session.intendedPlaying = false
         session.controlEpoch += 1
         session.seekReturnState = nil
         session.player.pause()
         session.state = "paused"
+        // Only a resulting fallback phase gets an observer; it is idle while intent is false.
+        installFallbackObserver(session: session)
         result(snapshot(session: session))
     }
 
@@ -1059,6 +1094,12 @@ final class VGStreamingPlaybackCoordinator {
             if copiedItemTimeMs != session.lastCopiedItemTimeMs {
                 session.lastCopiedItemTimeMs = copiedItemTimeMs
                 session.lastCopiedItemTimeAdvancedAt = CACurrentMediaTime()
+            }
+            // Live playback history for the manual-pause policy: a copy from a ready
+            // live item while intended and natively playing. Never cleared.
+            if !session.hasStartedLivePlayback, session.intendedPlaying,
+               session.player.timeControlStatus == .playing, isReadyLive(session) {
+                session.hasStartedLivePlayback = true
             }
             // Copied-frame evidence for the alignment attempt; it only records here.
             session.startupAlignment?.observeCopiedFrame(
@@ -1441,7 +1482,9 @@ final class VGStreamingPlaybackCoordinator {
         session.state = "buffering"
         resumeDisplayLink(session: session)
         session.player.play()
-        logRecovery("reconstruct", session: session, ["attempt=\(session.recoveryPolicy.attemptCount)"])
+        logRecovery("reconstruct", session: session,
+                    ["attempt=\(session.recoveryPolicy.attemptCount)",
+                     "trigger=\(session.recoveryPolicy.resumeTrigger?.rawValue ?? "none")"])
         startStartupAlignmentIfEligible(session: session)
     }
 
@@ -1841,7 +1884,7 @@ final class VGStreamingPlaybackCoordinator {
             parts.append("recoveryGeneration=\(recovery.generation)")
             parts.append("recoveryAttempts=\(recovery.attemptCount)")
             parts.append("recoveryAligned=\(recovery.alignedCount)")
-            parts.append("recoveryTrigger=\(vgSanitizeRawToken(recovery.triggerReason?.rawValue ?? "none"))")
+            parts.append("recoveryTrigger=\(vgSanitizeRawToken(recovery.resumeTrigger?.rawValue ?? "none"))")
         }
 
         guard !parts.isEmpty else { return "" }
